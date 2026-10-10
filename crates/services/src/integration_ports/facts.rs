@@ -179,10 +179,18 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             .git_query(WorkspaceGitQuery::RebaseInProgress, false)
             .await?
             .is_some_and(|value| value.trim() == "true");
-        // A daemon-owned default checkout is not readable from here; its
-        // owner refuses a fast-forward into a dirty checkout itself.
+        // A daemon-owned default checkout is read on its daemon, through the
+        // Task's placement when the Task is placed in it. From another clone
+        // of that daemon it is not readable here; the owner then refuses a
+        // fast-forward into a dirty checkout itself.
         let target_dirty = match target_path.as_deref() {
             Some(path) => !git::is_worktree_clean(path).await?,
+            None if shared => !resolved
+                .git_query(WorkspaceGitQuery::TargetStatusPorcelain, false)
+                .await?
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
             None => false,
         };
         let task_target_tip = if shared {

@@ -136,7 +136,19 @@ impl IntegrationStepPort for TaskStepIntegrationPort {
             None => IntegrationStepState::Missing,
             Some("pending" | "claimed" | "parked") => IntegrationStepState::Live,
             Some("done") => IntegrationStepState::Done,
-            Some(_) => IntegrationStepState::Dead,
+            Some(_) => {
+                let left: bool = sqlx::query_scalar(
+                    "SELECT NOT EXISTS(SELECT 1 FROM integration_attempt a JOIN task t ON t.id=a.task_ref WHERE a.id=? AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch AND t.deleted_at IS NULL)",
+                )
+                .bind(&request.attempt_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                if left {
+                    IntegrationStepState::TaskLeft
+                } else {
+                    IntegrationStepState::Dead
+                }
+            }
         })
     }
 }

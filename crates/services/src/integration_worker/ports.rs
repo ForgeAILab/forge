@@ -195,6 +195,9 @@ pub enum IntegrationStepState {
     /// Settled without applying: its handler failed for good, or a
     /// preempting command dropped it. It will not answer.
     Dead,
+    /// Settled without applying because the Task is no longer in the status
+    /// entry the attempt was admitted in. Asking again cannot change that.
+    TaskLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +296,11 @@ pub trait ObjectTransferPort: Send + Sync {
     /// in flight: remove what a crashed transfer left in the server-owned
     /// checkouts and the imported refs of attempts that hold no slot.
     async fn sweep_at_start(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Called on every sweep: releases `sweep_at_start` found for owners that
+    /// were not connected then. Cheap when nothing is owed.
+    async fn sweep_owners(&self) -> Result<()> {
         Ok(())
     }
 }

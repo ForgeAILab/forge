@@ -163,6 +163,25 @@ impl ResolvedWorkspace {
                     .map(|paths| Some(paths.join("\n")))
                     .map_err(Into::into);
             }
+            if query == WorkspaceGitQuery::TargetStatusPorcelain {
+                // The main worktree of the Task's worktree is the checkout
+                // its repo location names.
+                let listed = git::command_output(&path, &["worktree", "list", "--porcelain"])
+                    .await?;
+                let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+                let main = listed
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("worktree "))
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation("the Task worktree names no checkout")
+                    })?;
+                return Ok(Some(
+                    git::status_porcelain(std::path::Path::new(main))
+                        .await?
+                        .join("\n"),
+                ));
+            }
             let args = git_query_args(&query);
             return path
                 .git_read(
@@ -720,7 +739,9 @@ fn git_query_args(query: &WorkspaceGitQuery) -> Vec<String> {
                 format!("refs/heads/{branch}"),
             ]
         }
-        WorkspaceGitQuery::RebaseInProgress => unreachable!("rebase state is read through git"),
+        WorkspaceGitQuery::RebaseInProgress | WorkspaceGitQuery::TargetStatusPorcelain => {
+            unreachable!("read through git by the caller")
+        }
     }
 }
 

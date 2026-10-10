@@ -1901,10 +1901,31 @@ async fn twenty_members_drain_in_order_under_the_supervised_loop() {
     let worker = world.worker();
     let (stop, shutdown) = watch::channel(false);
     let running = tokio::spawn(worker.clone().run(shutdown));
-    wait_for!("the queue to drain", {
+    // Bounded by progress, not by a total: under a loaded machine twenty
+    // heads take as long as they take, and only a queue that stops moving is
+    // a failure. One head never needs a minute.
+    let mut completed = 0;
+    let mut stalled = tokio::time::Instant::now();
+    loop {
         world.steps.answer(&world.db).await;
-        world.attempt(&attempts[19].id).await.state == S::Completed
-    });
+        let mut now = 0;
+        for attempt in &attempts {
+            now += usize::from(world.attempt(&attempt.id).await.state == S::Completed);
+        }
+        if now == attempts.len() {
+            break;
+        }
+        if now > completed {
+            completed = now;
+            stalled = tokio::time::Instant::now();
+        }
+        assert!(
+            stalled.elapsed() < Duration::from_secs(60),
+            "the queue stopped draining at {completed} of {}",
+            attempts.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     stop.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), running)
         .await
@@ -2157,4 +2178,78 @@ async fn a_waiting_check_is_asked_again_and_an_applied_head_re_arms_its_result()
     world.steps.unhold("a", IntegrationStepAction::Result);
     world.settle(&mut pump).await;
     assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+}
+
+/// Blocker 6 of the D2a review. A released attempt's `send_back` step that
+/// settled without applying is asked again by the sweep under a new
+/// `effect_seq`, three times; then the queue says so in `last_error` and the
+/// attempt is left alone. A step that answers ends the asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_release_step_is_asked_again_three_times_then_the_queue_says_so() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "base", "from a\n").await;
+    let b = world.add_task("r", "b", "base", "from b\n").await;
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    let ejected = world.attempt(&b.id).await;
+    assert_eq!(ejected.state, S::Ejected);
+    let send_backs = || -> Vec<i64> {
+        world
+            .steps
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.task_id == "b" && request.action == IntegrationStepAction::SendBack
+            })
+            .map(|request| request.effect_seq)
+            .collect()
+    };
+    let kill = |seq: i64| {
+        world
+            .steps
+            .dead
+            .lock()
+            .unwrap()
+            .insert(format!("b|integration:{}:{seq}:send_back", b.id));
+    };
+    // A healthy step is never asked again.
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    assert_eq!(send_backs(), vec![ejected.effect_seq]);
+    // The step died: three re-asks, each under the next `effect_seq`.
+    for round in 0..3 {
+        kill(ejected.effect_seq + round);
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+        let now = world.attempt(&b.id).await;
+        assert_eq!(now.state, S::Ejected);
+        assert_eq!(now.effect_seq, ejected.effect_seq + round + 1);
+        assert_eq!(send_backs().len() as i64, round + 2);
+        // Asked once per death, not once per sweep.
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+        assert_eq!(send_backs().len() as i64, round + 2);
+        assert!(world.queue_of(&b).await.last_error.is_none());
+    }
+    // The third re-ask died too: the queue's owner is told, once.
+    kill(ejected.effect_seq + 3);
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    let queue = world.queue_of(&b).await;
+    let message = queue.last_error.clone().unwrap();
+    assert!(
+        message.starts_with("task_step_failed: the `send_back` step of Task b"),
+        "{message}"
+    );
+    assert_eq!(
+        queue.last_error_kind,
+        Some(IntegrationFailureKind::Infrastructure)
+    );
+    let (revision, attempt_revision) = (queue.revision, world.attempt(&b.id).await.revision);
+    for _ in 0..3 {
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    }
+    assert_eq!(send_backs().len(), 4, "the first ask and three re-asks");
+    assert_eq!(world.queue_of(&b).await.revision, revision);
+    assert_eq!(world.attempt(&b.id).await.revision, attempt_revision);
+    assert_eq!(world.attempt(&b.id).await.state, S::Ejected);
 }

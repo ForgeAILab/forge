@@ -429,6 +429,10 @@ impl HeadDriver {
             .steps
             .step_state(&IntegrationQueueWorker::step_request(a, action))
             .await?;
+        if state == IntegrationStepState::TaskLeft {
+            // The Task moved on by another route; nothing is left to decide.
+            return self.release_cancelled(a).await.map(Some);
+        }
         if state != IntegrationStepState::Dead {
             return Ok(None);
         }

@@ -172,6 +172,10 @@ impl DaemonWorkspaceBackend {
                     format!("refs/heads/{branch}"),
                 ]
             }
+            WorkspaceGitQuery::TargetStatusPorcelain => {
+                path = self.location_path(&owned.repo_location_id).await?.1;
+                vec!["status".into(), "--porcelain".into()]
+            }
             WorkspaceGitQuery::RebaseInProgress => unreachable!(),
         };
         let output = git_output(&path, &args, usize::try_from(limit).unwrap_or(usize::MAX)).await?;

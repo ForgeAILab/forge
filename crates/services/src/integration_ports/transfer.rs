@@ -38,7 +38,22 @@ pub struct OwnerObjectTransfer {
     fences: Arc<DaemonFences>,
     /// Bundles in flight on this server. Private to this instance.
     staging: PathBuf,
+    /// Releases of ended attempts' refs owed by daemon-owned checkouts, found
+    /// at start: `(endpoint, attempt, failed tries)`.
+    owed: std::sync::Mutex<Vec<(OwedEnd, String, u32)>>,
 }
+
+#[derive(Clone)]
+struct OwedEnd {
+    daemon_id: String,
+    runtime_id: String,
+    repo_location_id: String,
+}
+/// An ended attempt older than this has had its refs released by an earlier
+/// start, or its checkout is gone.
+const OWED_RELEASE_WINDOW_DAYS: i64 = 30;
+const OWED_RELEASE_MAX: u32 = 4096;
+const OWED_RELEASE_TRIES: u32 = 3;
 
 enum End<'a> {
     Server { location_id: &'a str },
@@ -86,6 +101,7 @@ impl OwnerObjectTransfer {
             client,
             fences,
             staging: staging_root.join(db::new_uuid_v4()),
+            owed: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -380,6 +396,85 @@ impl ObjectTransferPort for OwnerObjectTransfer {
                 tracing::info!(target: "services::integration_ports", %location_id, leftovers, released, "removed leftovers of ended integration transfers");
             }
         }
+        // Daemon-owned checkouts cannot be listed from here. Every attempt
+        // that once held a slot, holds none now, and whose Task was placed in
+        // another checkout than its queue's target may have left refs on a
+        // daemon end (the server stopped between the transfer and the
+        // release). One release per such attempt and daemon end, by the
+        // existing wire; it is idempotent and deletes nothing else.
+        let since = (chrono::Utc::now() - chrono::Duration::days(OWED_RELEASE_WINDOW_DAYS))
+            .to_rfc3339();
+        let owed: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT a.id,l.id,l.daemon_id,l.runtime_id FROM integration_attempt a \
+             JOIN integration_queue q ON q.id=a.queue_id \
+             JOIN repo_location l ON l.id IN (a.repo_location_id,q.target_location_id) \
+             WHERE l.owner_kind='daemon' AND l.daemon_id IS NOT NULL AND l.runtime_id IS NOT NULL \
+               AND a.repo_location_id IS NOT NULL AND q.target_location_id IS NOT NULL \
+               AND a.repo_location_id<>q.target_location_id \
+               AND (q.head_attempt_id IS NULL OR q.head_attempt_id<>a.id) \
+               AND a.started_at IS NOT NULL AND a.updated_at>=? ORDER BY a.updated_at DESC,a.id LIMIT ?",
+        )
+        .bind(&since)
+        .bind(OWED_RELEASE_MAX)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        *self.owed.lock().expect("owed releases") = owed
+            .into_iter()
+            .map(|(attempt_id, repo_location_id, daemon_id, runtime_id)| {
+                (
+                    OwedEnd {
+                        daemon_id,
+                        runtime_id,
+                        repo_location_id,
+                    },
+                    attempt_id,
+                    0,
+                )
+            })
+            .collect();
+        self.sweep_owners().await
+    }
+
+    async fn sweep_owners(&self) -> Result<()> {
+        let owed = std::mem::take(&mut *self.owed.lock().expect("owed releases"));
+        if owed.is_empty() {
+            return Ok(());
+        }
+        let mut left = Vec::new();
+        for (end, attempt_id, tries) in owed {
+            // An owner that is not connected is asked when it is back.
+            if self.client.connection_id(&end.daemon_id).is_none() {
+                left.push((end, attempt_id, tries));
+                continue;
+            }
+            let released = self
+                .client
+                .release_attempt_objects(
+                    DaemonObjectEndpoint {
+                        daemon_id: &end.daemon_id,
+                        runtime_id: &end.runtime_id,
+                        repo_location_id: &end.repo_location_id,
+                    },
+                    &attempt_id,
+                )
+                .await;
+            match released {
+                Ok(removed) => {
+                    if removed > 0 {
+                        tracing::info!(target: "services::integration_ports", daemon_id = %end.daemon_id, location_id = %end.repo_location_id, %attempt_id, removed, "released refs of an ended integration attempt");
+                    }
+                }
+                Err(error) if tries + 1 < OWED_RELEASE_TRIES => {
+                    tracing::debug!(target: "services::integration_ports", daemon_id = %end.daemon_id, %attempt_id, error = %client_error(error), "release of an ended attempt's refs failed; it is tried again");
+                    left.push((end, attempt_id, tries + 1));
+                }
+                Err(error) => {
+                    tracing::warn!(target: "services::integration_ports", daemon_id = %end.daemon_id, location_id = %end.repo_location_id, %attempt_id, error = %client_error(error), "refs of an ended integration attempt were not released");
+                }
+            }
+        }
+        self.owed.lock().expect("owed releases").extend(left);
         Ok(())
     }
 }

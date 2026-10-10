@@ -4344,6 +4344,49 @@ async fn integration_objects_move_between_daemon_and_server_owners_by_key() {
         git_sync(&fixture.checkout, &["rev-parse", "HEAD"]),
         daemon_head
     );
+
+    // The server stopped between a transfer and its release: the attempt is
+    // off the slot and its ref is still on the daemon-owned checkout. The
+    // next start releases it there, by the release wire, per ended attempt.
+    let has_ref = |reference: String| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.checkout)
+            .args(["rev-parse", "--verify", "--quiet", &reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let inbound_ref = format!("refs/forge/integration/{inbound}");
+    assert!(has_ref(inbound_ref.clone()));
+    sqlx::query("UPDATE integration_attempt SET repo_location_id='server-clone',started_at=?,updated_at=?,revision=revision+1 WHERE id=?")
+        .bind(&now).bind(db::now_rfc3339()).bind(&attempt_id)
+        .execute(database.pool()).await.unwrap();
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,revision=revision+1 WHERE head_attempt_id=?")
+        .bind(&attempt_id)
+        .execute(database.pool()).await.unwrap();
+    let transfer = services::integration_ports::OwnerObjectTransfer::new(
+        database.clone(),
+        Arc::new(ServerIntegrationOwner::new(database.clone())),
+        client.clone(),
+        Arc::new(services::integration_ports::DaemonFences::new(
+            database.clone(),
+            client.clone(),
+        )),
+        &fixture.server_root.path().join("sweep-staging"),
+    );
+    services::integration_worker::ObjectTransferPort::sweep_at_start(&transfer)
+        .await
+        .unwrap();
+    assert!(
+        !has_ref(inbound_ref),
+        "the ended attempt's ref is gone from the daemon-owned checkout"
+    );
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "HEAD"]),
+        daemon_head
+    );
 }
 
 #[tokio::test]
@@ -4641,6 +4684,41 @@ async fn queue_worker_rebases_checks_and_fast_forwards_on_a_daemon_owned_target(
     .await
     .unwrap();
     assert_eq!(checks, vec![(tip.clone(), "pass".to_owned())]);
+}
+
+/// A daemon-owned default checkout with uncommitted changes: the worker
+/// reads that on the daemon and parks the head `target_dirty` at once, before
+/// any effect, instead of spending rounds on the owner's refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_parks_target_dirty_at_once_on_a_daemon_owned_target() {
+    let fixture = Fixture::new("forge-queue-daemon-dirty").await;
+    let head = admit_queue_head(&fixture, &[]).await;
+    std::fs::write(fixture.checkout.join("uncommitted.txt"), "dirty\n").unwrap();
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the head to park", {
+        queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Parked
+    });
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert!(
+        attempt
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("target_dirty")),
+        "{:?}",
+        attempt.failure_message
+    );
+    assert_eq!(attempt.available_at, None, "the owner decides, no retry");
+    assert_eq!(
+        attempt.phase_timings.as_ref().map(|timings| timings.rounds),
+        Some(1)
+    );
+    let link = fixture.link.as_ref().unwrap();
+    assert!(attempt_requests(link, METHOD_WORKSPACE_MERGE).is_empty());
+    assert!(attempt_requests(link, METHOD_WORKSPACE_RESET).is_empty());
+    assert_eq!(attempt.effect_receipts_json, json!([]));
+    assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
 }
 
 /// The daemon finishes the queue's rebase but the reply is lost with the

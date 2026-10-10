@@ -546,6 +546,10 @@ pub enum WorkspaceGitQuery {
     TargetHead {
         branch: String,
     },
+    /// `git status --porcelain` of the checkout the workspace's repo location
+    /// names (the default checkout when the Task is placed in it), not of the
+    /// Task's own worktree.
+    TargetStatusPorcelain,
 }
 
 /// Additional structured workspace.read inputs used by owner-local services.

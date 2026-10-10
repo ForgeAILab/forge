@@ -131,6 +131,10 @@ struct Shared {
     reconcile_after: HashMap<String, DateTime<Utc>>,
 }
 
+/// Times a released attempt's Task step (`send_back`, `park`, `clear`) is
+/// asked again after it settled without applying.
+pub(crate) const RELEASE_REASKS: usize = 3;
+
 /// Bound of the worker's own journal on an attempt (`operation_receipts_json`).
 pub(crate) const JOURNAL_MAX: usize = 64;
 pub(crate) fn journal_push(attempt: &mut IntegrationAttempt, entry: serde_json::Value) {
@@ -267,6 +271,11 @@ impl IntegrationQueueWorker {
             if *shutdown.borrow_and_update() {
                 break;
             }
+            // Releases a daemon owner still owes from before this start; a
+            // no-op once they are done.
+            if let Err(error) = self.transfer.sweep_owners().await {
+                tracing::warn!(target: "services::integration_worker", %error, "integration transfer release on daemon owners failed; the next sweep retries");
+            }
             match self.sweep_once().await {
                 Ok(drivers) => {
                     for driver in drivers {
@@ -402,7 +411,163 @@ impl IntegrationQueueWorker {
     pub async fn sweep_once(self: &Arc<Self>) -> Result<Vec<HeadDriver>> {
         self.sweep_cancel_requests().await?;
         self.sweep_due_parked().await?;
+        if let Err(error) = self.sweep_dead_release_steps().await {
+            tracing::warn!(target: "services::integration_worker", %error, "integration release-step sweep failed; the next sweep retries");
+        }
         self.sweep_claims().await
+    }
+
+    /// A released attempt tells its Task what happened through one Task step:
+    /// `send_back` (ejected, needs review), `park` (parked), `clear`
+    /// (cancelled). A step that settled without applying (its handler failed
+    /// for good, or a preempting command dropped it) leaves the Task showing
+    /// a wait that is over. Such a step is asked again under a new
+    /// `effect_seq`, at most [`RELEASE_REASKS`] times; then the queue says so
+    /// in `last_error` and the attempt is left alone.
+    ///
+    /// Read: released attempts whose present `effect_seq` has no
+    /// acknowledgment (`send_back` and `park` acknowledge; `clear` does not,
+    /// so cancelled attempts are read for a day after they ended).
+    async fn sweep_dead_release_steps(&self) -> Result<()> {
+        let recent = stamp(self.clock.now() - chrono::Duration::days(1));
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .db
+                .untold_released_integration_attempts(&recent, after.as_deref(), self.config.page)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id.clone());
+            let full = page.len() as u32 >= self.config.page;
+            for attempt in page {
+                match self.reask_dead_release_step(&attempt).await {
+                    Ok(()) => {}
+                    Err(error) if is_conflict(&error) => {}
+                    Err(error) => {
+                        tracing::warn!(target: "services::integration_worker", attempt_id = %attempt.id, %error, "integration release step was not asked again");
+                    }
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn reask_dead_release_step(&self, attempt: &IntegrationAttempt) -> Result<()> {
+        use IntegrationAttemptState as S;
+        let action = match attempt.state {
+            S::Ejected | S::NeedsReview => IntegrationStepAction::SendBack,
+            S::Parked => IntegrationStepAction::Park,
+            S::Cancelled => IntegrationStepAction::Clear,
+            _ => return Ok(()),
+        };
+        let request = Self::step_request(attempt, action);
+        let state = self.steps.step_state(&request).await?;
+        if !matches!(
+            state,
+            IntegrationStepState::Dead | IntegrationStepState::TaskLeft
+        ) {
+            return Ok(());
+        }
+        // A Task that left the status entry the attempt was admitted in has
+        // moved on by another route: there is nothing left to tell it.
+        let live = state == IntegrationStepState::Dead;
+        if attempt.state == S::Cancelled {
+            // A terminal row is not written again. The `clear` handler does
+            // not bind `effect_seq`, so the re-asks are told apart by their
+            // keys alone.
+            for extra in 1..=RELEASE_REASKS as i64 {
+                let mut again = request.clone();
+                again.effect_seq = attempt.effect_seq + extra;
+                match self.steps.step_state(&again).await? {
+                    IntegrationStepState::Missing => return self.steps.enqueue_step(&again).await,
+                    IntegrationStepState::Live | IntegrationStepState::Done => return Ok(()),
+                    IntegrationStepState::Dead | IntegrationStepState::TaskLeft => {}
+                }
+            }
+            // A cancelled attempt's Task has left its entry by definition;
+            // the step still had a reason of this attempt to clear.
+            return self.tell_queue_owner(attempt, action).await;
+        }
+        let at = stamp(self.clock.now());
+        let asked = attempt
+            .operation_receipts_json
+            .as_array()
+            .map_or(0, |journal| {
+                journal
+                    .iter()
+                    .filter(|entry| {
+                        entry["kind"] == "worker_reask" && entry["action"] == action.as_str()
+                    })
+                    .count()
+            });
+        if !live || asked >= RELEASE_REASKS {
+            if live {
+                self.tell_queue_owner(attempt, action).await?;
+            }
+            let reason = if live { "asks_exhausted" } else { "task_left" };
+            self.advance_if(&attempt.id, attempt.state, move |attempt| {
+                journal_push(
+                    attempt,
+                    serde_json::json!({"kind":"worker_reask_exhausted","action":action.as_str(),"reason":reason,"at":at}),
+                );
+                true
+            })
+            .await?;
+            return Ok(());
+        }
+        // Enqueued first, like every step: one whose attempt is not at its
+        // `effect_seq` yet retries.
+        let seq = attempt.effect_seq + 1;
+        let mut again = request;
+        again.effect_seq = seq;
+        self.steps.enqueue_step(&again).await?;
+        self.advance_if(&attempt.id, attempt.state, move |attempt| {
+            if attempt.effect_seq + 1 != seq {
+                return false;
+            }
+            attempt.effect_seq = seq;
+            attempt.effect_ack_json = None;
+            attempt.acknowledged_at = None;
+            journal_push(
+                attempt,
+                serde_json::json!({"kind":"worker_reask","action":action.as_str(),"effect_seq":seq,"at":at}),
+            );
+            true
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The queue's `last_error` names a Task that could not be told what its
+    /// attempt came to. Written once per message.
+    async fn tell_queue_owner(
+        &self,
+        attempt: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<()> {
+        let Some(queue_id) = attempt.queue_id.as_deref() else {
+            return Ok(());
+        };
+        let message = format!(
+            "task_step_failed: the `{}` step of Task {} (attempt {}, {}) failed {} times; the Task was not told",
+            action.as_str(),
+            attempt.task_ref,
+            attempt.id,
+            attempt.state,
+            RELEASE_REASKS + 1
+        );
+        self.db
+            .note_integration_queue_error(
+                queue_id,
+                db::IntegrationFailureKind::Infrastructure,
+                &message,
+                &stamp(self.clock.now()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Cancel requests on attempts that hold no slot. A flagged head is its

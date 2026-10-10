@@ -349,6 +349,27 @@ pub trait IntegrationActivationRepo: Send + Sync {
         after_attempt_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<IntegrationAttempt>>;
+    /// Released attempts whose Task may not have been told, in `id` order:
+    /// `ejected`, `needs_review` and `parked` attempts without an
+    /// acknowledgment at their present `effect_seq` and without the worker's
+    /// `worker_reask_exhausted` mark, and `cancelled` attempts updated at or
+    /// after `cancelled_since` (their `clear` step writes no acknowledgment).
+    /// Attempts with a cancel request are left to the cancel sweep.
+    async fn untold_released_integration_attempts(
+        &self,
+        cancelled_since: &str,
+        after_attempt_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<IntegrationAttempt>>;
+    /// Write the queue's `last_error` without changing its state. `false`:
+    /// the queue is gone or already says exactly this.
+    async fn note_integration_queue_error(
+        &self,
+        queue_id: &str,
+        kind: IntegrationFailureKind,
+        message: &str,
+        now: &str,
+    ) -> Result<bool>;
     /// The live lease holder starts another round for its head: a new fence
     /// generation and lease, with the same takeover rules as a claim (a ready
     /// permit is dropped, an in-flight effect must reconcile). One generation
@@ -528,6 +549,54 @@ impl IntegrationActivationRepo for SqliteDb {
             .into_iter()
             .map(map_attempt)
             .collect()
+    }
+    async fn untold_released_integration_attempts(
+        &self,
+        cancelled_since: &str,
+        after_attempt_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<IntegrationAttempt>> {
+        integration_time(cancelled_since)?;
+        sqlx::query(
+            "SELECT * FROM integration_attempt WHERE id>? AND queue_id IS NOT NULL AND cancel_requested_at IS NULL \
+             AND ((state IN ('ejected','needs_review','parked') \
+                   AND (acknowledged_at IS NULL OR json_extract(effect_ack_json,'$.effect_seq') IS NOT effect_seq) \
+                   AND instr(operation_receipts_json,'worker_reask_exhausted')=0) \
+               OR (state='cancelled' AND updated_at>=?)) ORDER BY id LIMIT ?",
+        )
+        .bind(after_attempt_id.unwrap_or(""))
+        .bind(cancelled_since)
+        .bind(page(limit))
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(map_attempt)
+        .collect()
+    }
+    async fn note_integration_queue_error(
+        &self,
+        queue_id: &str,
+        kind: IntegrationFailureKind,
+        message: &str,
+        now: &str,
+    ) -> Result<bool> {
+        if message.len() > 4096 {
+            return Err(DbError::Check(
+                "integration diagnostic exceeds bound".into(),
+            ));
+        }
+        let written = sqlx::query(
+            "UPDATE integration_queue SET last_error_kind=?,last_error=?,revision=revision+1,updated_at=? WHERE id=? AND last_error IS NOT ?",
+        )
+        .bind(kind.to_string())
+        .bind(message)
+        .bind(now)
+        .bind(queue_id)
+        .bind(message)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(written == 1)
     }
     async fn start_integration_round(
         &self,
