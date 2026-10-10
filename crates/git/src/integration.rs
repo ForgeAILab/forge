@@ -269,7 +269,24 @@ fn invalid(context: &str, output: &std::process::Output) -> ObjectTransferError 
     }
 }
 
+// Cancelling a transfer means dropping its future, and a dropped transfer
+// must have left nothing behind by the time the drop returns. Three rules
+// keep that true:
+//
+// 1. Every file system effect of a transfer is a synchronous `std::fs` call.
+//    A `tokio::fs` call runs on the blocking pool and is not stopped when the
+//    future that asked for it is dropped: it would create the quarantine
+//    directory, or publish a pack, after the guards below had already run.
+// 2. A guard is declared before the command that writes what it removes. A
+//    dropped future drops the running command first, and the process
+//    supervisor stops and reaps that command's process group before its drop
+//    returns, so no child is left to write when the guard removes its path.
+// 3. Publishing (the step that changes the repository) has no await point:
+//    see `bind_imported`.
+
 /// Removes a path when dropped, so a cancelled transfer leaves nothing behind.
+/// For a file, Git's `<path>.lock` goes with it: a killed `git bundle create`
+/// cannot remove its own lock file.
 struct RemoveOnDrop {
     path: std::path::PathBuf,
     armed: bool,
@@ -279,12 +296,39 @@ impl Drop for RemoveOnDrop {
         if !self.armed {
             return;
         }
-        if self.path.is_dir() {
-            let _ = std::fs::remove_dir_all(&self.path);
-        } else {
-            let _ = std::fs::remove_file(&self.path);
+        let mut lock = self.path.clone().into_os_string();
+        lock.push(".lock");
+        // A process that outlived the supervisor's stop sequence (it ignored
+        // TERM and was then killed without a wait) can add an entry while the
+        // tree is removed. Retry until the path is gone, for a bounded time.
+        for _ in 0..REMOVE_ATTEMPTS {
+            let _ = std::fs::remove_file(&lock);
+            let removed = match std::fs::symlink_metadata(&self.path) {
+                Ok(found) if found.is_dir() => std::fs::remove_dir_all(&self.path),
+                Ok(_) => std::fs::remove_file(&self.path),
+                Err(error) => Err(error),
+            };
+            match removed {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
         }
     }
+}
+const REMOVE_ATTEMPTS: usize = 200;
+
+/// Run Git to completion on the calling thread. A transfer uses it where a
+/// step must not be interrupted by its future being dropped.
+fn git_blocking(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
 }
 
 /// Deletes the export's temporary ref even when the export future is dropped.
@@ -294,16 +338,21 @@ struct ExportRef<'a> {
 }
 impl Drop for ExportRef<'_> {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("git")
-            .args([NO_HOOKS[0], NO_HOOKS[1], "update-ref", "-d", &self.name])
-            .current_dir(self.repo)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // The command that pins the ref is stopped before this runs. If it
+        // was stopped while it held the ref's lock file and could not remove
+        // it, the lock would refuse this delete and every later export of the
+        // key. Only this export writes the ref, so the lock is its own.
+        let lock = format!("{}.lock", self.name);
+        if let Ok(output) = git_blocking(self.repo, &["rev-parse", "--git-path", &lock]) {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout);
+                let _ = std::fs::remove_file(self.repo.join(path.trim()));
+            }
+        }
+        let _ = git_blocking(
+            self.repo,
+            &[NO_HOOKS[0], NO_HOOKS[1], "update-ref", "-d", &self.name],
+        );
     }
 }
 
@@ -439,7 +488,7 @@ pub async fn export_objects(
     if !output.status.success() {
         return Err(invalid("could not write the bundle", &output));
     }
-    let total_bytes = tokio::fs::metadata(dest).await?.len();
+    let total_bytes = std::fs::metadata(dest)?.len();
     if total_bytes > max_bytes {
         return Err(ObjectTransferError::TooLarge {
             bytes: total_bytes,
@@ -480,6 +529,12 @@ async fn quarantined(
 /// bundle are never used, no other ref moves, nothing is checked out. A
 /// refused, failed or dropped import leaves the repository as it was. A key
 /// that was already imported returns its receipt without reading the bundle.
+///
+/// Dropping the returned future cancels the import. Until the objects have
+/// passed every check nothing outside the quarantine directory is written,
+/// and the drop removes that directory after its Git processes are gone.
+/// Publishing the checked objects and binding the ref then runs without an
+/// await point, so a cancelled import either changed nothing or completed.
 pub async fn import_objects(
     repo: &Path,
     key: &str,
@@ -497,7 +552,7 @@ pub async fn import_objects(
     }
     let ref_name = transfer_ref(key)?;
     if let Some(bundle) = bundle {
-        let bytes = tokio::fs::metadata(bundle).await?.len();
+        let bytes = std::fs::metadata(bundle)?.len();
         if bytes > max_bytes {
             return Err(ObjectTransferError::TooLarge { bytes, max_bytes });
         }
@@ -539,7 +594,7 @@ pub async fn import_objects(
             )),
             armed: true,
         };
-        tokio::fs::create_dir_all(quarantine.path.join("pack")).await?;
+        std::fs::create_dir_all(quarantine.path.join("pack"))?;
         let output = quarantined(
             repo,
             &quarantine.path,
@@ -551,9 +606,8 @@ pub async fn import_objects(
             return Err(invalid("bundle could not be unpacked", &output));
         }
         let mut packs = Vec::new();
-        let mut entries = tokio::fs::read_dir(quarantine.path.join("pack")).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            packs.push(entry.path());
+        for entry in std::fs::read_dir(quarantine.path.join("pack"))? {
+            packs.push(entry?.path());
         }
         packs.sort();
         for (index, pack) in packs
@@ -610,53 +664,94 @@ pub async fn import_objects(
             return Err(invalid("imported history is not fully connected", &output));
         }
         // Publish: an index last, so Git never sees an index without its pack.
-        tokio::fs::create_dir_all(objects.join("pack")).await?;
         packs.sort_by_key(|path| path.extension().is_some_and(|ext| ext == "idx"));
-        for path in &packs {
-            let Some(name) = path.file_name() else {
-                continue;
-            };
-            let dest = objects.join("pack").join(name);
-            if tokio::fs::try_exists(&dest).await? {
-                continue;
-            }
-            tokio::fs::rename(path, &dest).await?;
-        }
-    } else if !commit_exists(repo, expected_tip).await? {
+        return bind_imported(repo, &ref_name, expected_tip, Some((&objects, &packs)));
+    }
+    if !commit_exists(repo, expected_tip).await? {
         return Err(ObjectTransferError::Invalid {
             reason: "target does not hold the expected tip and no objects were sent".into(),
         });
     }
-    if !commit_exists(repo, expected_tip).await? {
+    bind_imported(repo, &ref_name, expected_tip, None)
+}
+
+/// The only step of an import that changes the repository: move the checked
+/// packs into the object store and bind the transfer ref.
+///
+/// It is synchronous on purpose. With no await point it cannot be interrupted
+/// by a dropped future, so cancellation never leaves published packs without
+/// their ref, or a ref the caller was told had been cancelled. It is short:
+/// renames inside one file system and two Git commands that run no hook.
+fn bind_imported(
+    repo: &Path,
+    ref_name: &str,
+    expected_tip: &str,
+    publish: Option<(&Path, &[std::path::PathBuf])>,
+) -> TransferResult<ObjectImport> {
+    if let Some((objects, packs)) = publish {
+        std::fs::create_dir_all(objects.join("pack"))?;
+        for path in packs {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let dest = objects.join("pack").join(name);
+            if dest.try_exists()? {
+                continue;
+            }
+            std::fs::rename(path, &dest)?;
+        }
+    }
+    let tip = format!("{expected_tip}^{{commit}}");
+    if !git_blocking(repo, &["cat-file", "-e", &tip])?
+        .status
+        .success()
+    {
         return Err(ObjectTransferError::Invalid {
             reason: "expected tip is missing after the import".into(),
         });
     }
     // Create-only: a concurrent import of another object under this key loses.
     let zero = "0".repeat(expected_tip.len());
-    let output = crate::command_output(
+    let output = git_blocking(
         repo,
         &[
             NO_HOOKS[0],
             NO_HOOKS[1],
             "update-ref",
-            &ref_name,
+            ref_name,
             expected_tip,
             &zero,
         ],
-    )
-    .await?;
-    if !output.status.success() {
-        return match imported_objects(repo, key, expected_tip).await? {
-            Some(replay) => Ok(replay),
-            None => Err(invalid("could not bind the transfer ref", &output)),
-        };
+    )?;
+    if output.status.success() {
+        return Ok(ObjectImport {
+            tip_sha: expected_tip.into(),
+            ref_name: ref_name.into(),
+            replayed: false,
+        });
     }
-    Ok(ObjectImport {
-        tip_sha: expected_tip.into(),
-        ref_name,
-        replayed: false,
-    })
+    let bound = git_blocking(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            ref_name,
+        ],
+    )?;
+    let existing = String::from_utf8_lossy(&bound.stdout).trim().to_owned();
+    match (bound.status.success(), existing == expected_tip) {
+        (true, true) => Ok(ObjectImport {
+            tip_sha: existing,
+            ref_name: ref_name.into(),
+            replayed: true,
+        }),
+        (true, false) => Err(ObjectTransferError::KeyConflict {
+            existing_sha: existing,
+        }),
+        (false, _) => Err(invalid("could not bind the transfer ref", &output)),
+    }
 }
 
 #[cfg(test)]
@@ -1016,6 +1111,200 @@ mod transfer_tests {
             }
         }
         assert!(cancelled > 0, "no run was cancelled");
+    }
+
+    /// Poll `transfer` at most `polls` times, a millisecond apart, and drop it
+    /// immediately after the last poll. `None` when it was dropped unfinished.
+    async fn drop_after_polls<T>(
+        transfer: impl std::future::Future<Output = T>,
+        polls: usize,
+    ) -> Option<T> {
+        use std::task::Poll;
+        let mut transfer = Box::pin(transfer);
+        for poll in 0..polls {
+            if poll > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let polled =
+                std::future::poll_fn(|context| Poll::Ready(transfer.as_mut().poll(context))).await;
+            if let Poll::Ready(output) = polled {
+                return Some(output);
+            }
+        }
+        // Dropped right after a poll: whatever that poll started is under way.
+        None
+    }
+
+    /// How many polls each run of the sweep below gets: every count up to 48,
+    /// then steps of an eighth, so a slow machine costs time in proportion.
+    fn poll_counts() -> impl Iterator<Item = usize> {
+        std::iter::successors(Some(0usize), |polls| {
+            Some(polls + (polls / 8).saturating_sub(5).max(1))
+        })
+        .take_while(|polls| *polls < 20_000)
+    }
+
+    /// Cancellation is a dropped future, and a future can be dropped at any
+    /// of its await points. Drop one transfer after 0 polls, the next after
+    /// 1, and so on until one finishes, and compare the repository the
+    /// moment each drop returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transfer_dropped_at_any_await_point_leaves_nothing_behind() {
+        let pair = pair();
+        let bundle = pair.staging.join("a.bundle");
+        let lock = pair.staging.join("a.bundle.lock");
+        let ref_lock = pair.source.join(".git/refs/forge/export/k.lock");
+        let source_before = snapshot(&pair.source);
+        let mut finished = false;
+        for polls in poll_counts() {
+            let export = export_objects(&pair.source, "k", &[], &pair.tip, &bundle, u64::MAX);
+            if let Some(result) = drop_after_polls(export, polls).await {
+                result.unwrap();
+                finished = true;
+                break;
+            }
+            assert!(!bundle.exists(), "export dropped after {polls} polls");
+            assert!(!lock.exists(), "export dropped after {polls} polls");
+            assert!(!ref_lock.exists(), "export dropped after {polls} polls");
+            assert_eq!(snapshot(&pair.source), source_before, "{polls} polls");
+        }
+        assert!(finished, "the export never finished");
+        assert_eq!(snapshot(&pair.source), source_before);
+
+        let target_before = snapshot(&pair.target);
+        let mut finished = false;
+        for polls in poll_counts() {
+            let import = import_objects(&pair.target, "k", Some(&bundle), &pair.tip, u64::MAX);
+            if let Some(result) = drop_after_polls(import, polls).await {
+                assert!(!result.unwrap().replayed);
+                finished = true;
+                break;
+            }
+            assert_eq!(
+                snapshot(&pair.target),
+                target_before,
+                "import dropped after {polls} polls"
+            );
+        }
+        assert!(finished, "the import never finished");
+        assert_eq!(
+            git(&pair.target, &["rev-parse", "refs/forge/integration/k"]),
+            pair.tip
+        );
+        git(&pair.target, &["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// Bytes Git cannot compress, so the bundle is larger than a pipe buffer.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    /// The import is cancelled while its Git child is stalled in the middle
+    /// of unpacking, holding an open pack file inside the quarantine
+    /// directory. The bundle is a FIFO fed by the test, so the child stalls
+    /// exactly there. When the drop returns the child must be gone (the FIFO
+    /// has no reader left) and the quarantine directory with it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_import_dropped_while_its_child_holds_the_quarantine_leaves_nothing() {
+        use std::io::Write;
+        let pair = pair();
+        std::fs::write(pair.source.join("big.bin"), noise(1024 * 1024)).unwrap();
+        git(&pair.source, &["add", "."]);
+        git(&pair.source, &["commit", "-q", "-m", "big"]);
+        let tip = git(&pair.source, &["rev-parse", "HEAD"]);
+        let bundle = pair.staging.join("a.bundle");
+        export_objects(&pair.source, "k", &[], &tip, &bundle, u64::MAX)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&bundle).unwrap();
+        assert!(bytes.len() > 512 * 1024, "{} bytes", bytes.len());
+        // The import opens the bundle three times: verify, list-heads, unbundle.
+        // `slow.bundle` is a link the feeder points at a fresh FIFO before it
+        // answers each open, so every Git command reads its own pipe. The
+        // first two read the header and close, which ends that write with a
+        // broken pipe. The third is fed half the pack and then nothing.
+        let slow = pair.staging.join("slow.bundle");
+        let fifos: Vec<PathBuf> = (0..3)
+            .map(|index| pair.staging.join(format!("fifo-{index}")))
+            .collect();
+        for fifo in &fifos {
+            assert!(std::process::Command::new("mkfifo")
+                .arg(fifo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::os::unix::fs::symlink(&fifos[0], &slow).unwrap();
+        let (stalled_tx, stalled_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let (link, staging, half) = (slow.clone(), pair.staging.clone(), bytes.len() / 2);
+        let feeder = std::thread::spawn(move || {
+            // Blocks until a Git command has opened this FIFO for reading.
+            let open = |fifo: &Path| std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            for index in 0..2 {
+                let mut pipe = open(&fifos[index]);
+                // The reader cannot finish before it is fed, so the next
+                // command finds the link already pointing at the next FIFO.
+                let next = staging.join("next");
+                std::os::unix::fs::symlink(&fifos[index + 1], &next).unwrap();
+                std::fs::rename(&next, &link).unwrap();
+                let _ = pipe.write_all(&bytes);
+            }
+            let mut pipe = open(&fifos[2]);
+            pipe.write_all(&bytes[..half]).unwrap();
+            stalled_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            // With no reader left the rest cannot be written.
+            pipe.write_all(&bytes[half..]).map_err(|error| error.kind())
+        });
+
+        let target_before = snapshot(&pair.target);
+        let git_dir = pair.target.join(".git");
+        let child_holds_quarantine = async {
+            loop {
+                let holding = stalled_rx.try_recv().is_ok()
+                    && std::fs::read_dir(&git_dir).unwrap().flatten().any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("forge-incoming-")
+                            && std::fs::read_dir(entry.path().join("pack"))
+                                .is_ok_and(|pack| pack.count() > 0)
+                    });
+                if holding {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        };
+        // `select!` drops the unfinished import when the other branch wins.
+        tokio::select! {
+            result = import_objects(&pair.target, "k", Some(&slow), &tip, u64::MAX) => {
+                panic!("the import finished on half a bundle: {result:?}")
+            }
+            _ = child_holds_quarantine => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                panic!("the import never reached its unpack step")
+            }
+        }
+        assert_eq!(snapshot(&pair.target), target_before);
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            feeder.join().unwrap(),
+            Err(std::io::ErrorKind::BrokenPipe),
+            "a Git child still had the bundle open after the drop returned"
+        );
+        assert_eq!(snapshot(&pair.target), target_before);
+        assert_eq!(sweep_transfer_leftovers(&pair.target), 0);
     }
 
     /// A hook that would fire on any ref write or object arrival.

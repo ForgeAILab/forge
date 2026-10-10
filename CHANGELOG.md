@@ -47,7 +47,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   marks any effect of it started, so `unknown` only arises when a machine
   lost its state, never for a frame that simply did not arrive. An
   interrupted transfer is restarted from its first chunk, not resumed. The
-  transfer runs no repository hook. `journal.ack` of a queue attempt entry no
+  transfer runs no repository hook. A cancelled transfer has left nothing in
+  either checkout by the time the cancelled call returns: an import that
+  had not yet published its objects changes nothing, and one that had is
+  completed. `journal.ack` of a queue attempt entry no
   longer keeps the entry forever: it is deleted once a newer claim of the
   same queue is recorded, or 7 days after the acknowledgement. Staging under
   `.forge/transfer` and leftovers of a killed transfer are removed when the
@@ -832,6 +835,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unchanged. Workspaces whose recorded path is not
   `<workspace root>/<task_id>/<name>` keep the previous behaviour.
 
+- **Integration queue worker, not started yet (3.2 stage D, part 1d).** The
+  server has the worker that will drive the per-branch merge queue (rebase,
+  check, fast-forward, takeover after a crash), but nothing starts it:
+  merging works exactly as before. Moving commits between machines and
+  targets on a daemon-owned checkout are not wired into it yet.
 - **Task conditions can say a Task is waiting on its checks (3.3 stage D
   part 1).** The public Task condition gains the reason
   `{ "kind": "check", "wait": { "phase", "consumer_id", "origin" } }` with
