@@ -308,7 +308,7 @@ impl WorkflowExecution<'_> {
         let current_status = payload.from.clone();
         let target_state = payload.to.clone();
         let actor = payload.actor.clone();
-        let authority = match (
+        let mut authority = match (
             payload.authority,
             definition.project_workflow_definition.as_ref(),
         ) {
@@ -319,6 +319,33 @@ impl WorkflowExecution<'_> {
             }),
             _ => None,
         };
+        // A step that waited for a check can have waited for minutes, and
+        // the Project may have moved meanwhile for a reason that does not
+        // concern this entry (it was paused or resumed, renamed, its limits
+        // changed). The frozen Project version would then cost the Task its
+        // finished check: the hook failed with a version conflict and the
+        // recovery dispatched a reviewer without the CI result. What this
+        // entry was admitted under is the workflow and the two state
+        // configurations; while those are unchanged the step continues under
+        // the Project's current version. A changed workflow or state
+        // configuration still ends it.
+        if let (Some(authority), true) = (authority.as_mut(), step.awaited_consumer_id.is_some()) {
+            let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            if project.version != authority.project_version
+                && project.workflow_definition == authority.workflow_definition
+                && merged_state_config(
+                    from_state,
+                    Some(&project),
+                    task.task_state_config.as_deref(),
+                ) == payload.from_config
+                && merged_state_config(to_state, Some(&project), task.task_state_config.as_deref())
+                    == payload.to_config
+            {
+                authority.project_version = project.version;
+            }
+        }
         let transition_log_id = payload.transition_log_id.clone();
         let transition_log = TransitionLogRepo::list_by_task(&*self.db, &task_id)
             .await?

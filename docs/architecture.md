@@ -8786,10 +8786,31 @@ live consumer (`CONSUMER_LIVENESS_INTERVAL`; the lease is renewed every 15 s)
 and cancels a run nobody waits for, so its machine slot is freed promptly.
 An unreachable daemon keeps the run `uncertain` (slot and single-flight
 identity retained) until it confirms the stop, is removed, or passes the
-disconnected-owner bound. Deleting the Project removes the Task, its
-steps (the suspended one included) and its check rows by cascade; the worker
-driving the run finds no consumer at its next look, tells the owner to stop
-(best effort when the run row is already gone) and drops the run.
+disconnected-owner bound. A Project is not deleted from under a live check
+run: the delete guard counts unfinished runs (`project_in_use`,
+`live_check_runs`), and a forced delete first cancels their consumers, settles
+queued runs and waits a bounded time for the worker to stop running ones
+(Project deletion, above). Should a run row disappear under its worker anyway,
+the worker finds no consumer at its next look, tells the owner to stop (best
+effort) and drops the run.
+
+**A pause while the step is suspended.** The check is machine work already
+asked for, so no pause stops it:
+
+| Pause | The pending check | Afterwards |
+|---|---|---|
+| Project pause | runs to its end; the result is delivered and applied, the review attempt settles | the reviewer run is held by the pause; resume dispatches it. The check is not run again |
+| Agent pause (coder, reviewer) | as above | the Task waits in `review` for its paused reviewer (`agent`); resume dispatches it |
+| Task `hold` | not offered while the Task waits for its entry check: the Task offers `cancel` only, which abandons the wait as described above | - |
+
+A Project pause or resume (like any Project edit) moves the Project version,
+which is the fence a hooks step was admitted under. A step that waited for a
+check therefore re-reads the Project when it continues: while the Project
+workflow and the entry's two merged state configurations are what the step
+froze, it continues under the current Project version; a changed workflow or
+state configuration still ends it with a version conflict. Without this the
+woken step failed, the attempt was cancelled, and recovery dispatched a
+reviewer that had no CI result to read.
 
 **Liveness of the wait.** Every way the answer can fail to arrive ends in a
 resume or a typed condition, never a silent wait:

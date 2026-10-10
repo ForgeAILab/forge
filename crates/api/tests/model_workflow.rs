@@ -2088,6 +2088,200 @@ async fn one_slot_carries_a_task_from_run_to_merge() {
         .await;
 }
 
+/// How a pause lands on a Task whose review-entry check is requested and not
+/// yet finished (its hooks step is suspended).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PauseKind {
+    Project,
+    /// Both of the Project's Agents: the reviewer is the check's follow-up.
+    Agents,
+    /// The Task itself: `hold` is the owner's Task-level pause.
+    TaskHold,
+}
+
+impl World {
+    /// The states of the check runs the Task asked for, oldest first.
+    async fn check_runs(&self, index: usize) -> Result<Vec<String>, String> {
+        sqlx::query_scalar(
+            "SELECT r.state FROM check_run r JOIN check_consumer c ON c.run_id = r.id
+             WHERE c.task_id = ? ORDER BY r.created_at, r.rowid",
+        )
+        .bind(&self.tasks[index])
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn pause_agents(&mut self, pause: bool) -> Result<(), String> {
+        let verb = if pause { "pause" } else { "resume" };
+        for agent in [self.coder_id.clone(), self.reviewer_id.clone()] {
+            let uri = format!("/api/v1/agents/{agent}/{verb}");
+            let (status, body) = self.request(Method::POST, &uri, None).await?;
+            if !status.is_success() {
+                return Err(format!("agent {verb} was refused: {status} {body}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A pause while the Task's hooks step is suspended on its review-entry
+/// check (here: queued behind a full machine). The check is machine work
+/// already asked for:
+/// - **Project pause, Agent pause**: the check runs to its end and its result
+///   is applied; the pause only holds what comes after it (the reviewer run).
+///   Resuming continues from the applied result: the check is not run again.
+/// - **Task hold**: not on offer in this state. A Task waiting for its entry
+///   check offers `cancel` only (which abandons the wait and stops the run);
+///   there is no Task-level pause to resume from, and the check finishes.
+async fn pause_while_the_entry_check_is_pending(kind: PauseKind) -> Result<Vec<String>, String> {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        // Two Tasks run. The machine then has one slot, which the second
+        // Task's run holds: the first Task's entry check is requested and
+        // waits for it, its hooks step suspended.
+        for action in [Action::Create, Action::Create] {
+            world.apply(&action).await?;
+            world.quiesce().await?;
+        }
+        let cap = &world.live().state.db.server_run_cap;
+        cap.set(Some(1), 1, &cap.embedded_machine_id());
+        world.apply(&Action::Finish(0, Outcome::Success)).await?;
+        world.quiesce().await?;
+        let task = world.task(0).await?;
+        if task["status"] != "review" || world.check_runs(0).await? != ["queued"] {
+            return Err(format!(
+                "expected a Task in review with one queued check, got {} {:?}",
+                task["status"],
+                world.check_runs(0).await?
+            ));
+        }
+        match kind {
+            PauseKind::Project => {
+                world.apply(&Action::PauseProject).await?;
+            }
+            PauseKind::Agents => world.pause_agents(true).await?,
+            PauseKind::TaskHold => {
+                let (_, offers) = world.offers(0).await?;
+                let verbs: Vec<&str> = offers
+                    .iter()
+                    .filter_map(|offer| offer["action"]["verb"].as_str())
+                    .collect();
+                if verbs != ["cancel"] {
+                    return Err(format!(
+                        "a Task waiting for its entry check offers {verbs:?}, expected only cancel"
+                    ));
+                }
+            }
+        }
+        world.quiesce().await?;
+        // The slot frees: the check that was asked for before the pause runs.
+        world.apply(&Action::Finish(1, Outcome::Success)).await?;
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                world.quiesce().await?;
+                let runs = world.check_runs(0).await?;
+                if runs
+                    .iter()
+                    .all(|state| ["succeeded", "failed", "cancelled"].contains(&state.as_str()))
+                {
+                    return Ok::<_, String>(runs);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the check did not finish under the pause".to_owned())??;
+        world.quiesce().await?;
+        let paused = world.task(0).await?;
+        world.trace.push(format!(
+            "{kind:?} paused: checks {settled:?}, task {} {}",
+            paused["status"], paused["condition"]
+        ));
+        let reviewer_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE role = 'reviewer' AND task_id = ?",
+        )
+        .bind(&world.tasks[0])
+        .fetch_one(&world.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        match kind {
+            PauseKind::Project | PauseKind::Agents => {
+                if settled != ["succeeded"] {
+                    return Err(format!("the check did not run to its end: {settled:?}"));
+                }
+                let applied: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+                )
+                .bind(&world.tasks[0])
+                .fetch_one(&world.live().pool)
+                .await
+                .map_err(|error| error.to_string())?;
+                if applied != 1 {
+                    return Err("the finished check's result was not applied".to_owned());
+                }
+                if paused["status"] != "review" || reviewer_runs != 0 {
+                    return Err(format!(
+                        "the pause did not hold the reviewer run: {} with {reviewer_runs} reviewer run(s)",
+                        paused["status"]
+                    ));
+                }
+            }
+            PauseKind::TaskHold => {
+                if settled != ["succeeded"] {
+                    return Err(format!("the check did not run to its end: {settled:?}"));
+                }
+            }
+        }
+        match kind {
+            PauseKind::Project => {
+                world.apply(&Action::ResumeProject).await?;
+            }
+            PauseKind::Agents => world.pause_agents(false).await?,
+            PauseKind::TaskHold => {}
+        }
+        world.quiesce().await?;
+        world.drive_to_settlement().await?;
+        for index in 0..2 {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!("task {index} ended in {}", task["status"]));
+            }
+        }
+        let runs = world.check_runs(0).await?;
+        if runs != ["succeeded"] {
+            return Err(format!("check runs after resume: {runs:?}, expected one"));
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => Ok(world.trace),
+        Err(violation) => Err(format!("{violation}\ntrace:\n{}", world.trace.join("\n"))),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_pause_lets_the_pending_entry_check_finish_and_resume_does_not_repeat_it() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::Project).await {
+        panic!("{violation}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_pause_lets_the_pending_entry_check_finish_and_resume_does_not_repeat_it() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::Agents).await {
+        panic!("{violation}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_waiting_for_its_pending_entry_check_offers_cancel_and_no_hold() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::TaskHold).await {
+        panic!("{violation}");
+    }
+}
+
 /// No pinned cap: the server resolves its own from the host's cores.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sequences_stay_live_without_a_pinned_run_cap() {

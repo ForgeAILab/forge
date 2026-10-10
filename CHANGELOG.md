@@ -2221,6 +2221,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Pausing or editing a Project while a Task's review CI runs no longer
+  costs the Task its result.** The Task's review-entry step was fenced on the
+  Project version, which a pause, a resume or any Project edit moves. When the
+  CI finished the step failed with `version conflict`, the review attempt was
+  cancelled, the Task parked as `cascade_failed`, and `retry` dispatched a
+  reviewer that failed with `pre-review result for required check ... is
+  unavailable`. The step now continues when the Project workflow and the
+  state configuration it was admitted under are unchanged: the finished check
+  is applied, a pause holds only the reviewer run, and resume does not run the
+  check again. A changed workflow or state configuration still ends the step.
+
 - **A machine limited to one run no longer parks its own running Task.**
   With `max_concurrent_runs: 1` (server setting, or a daemon's cap or admin
   run limit) the dispatcher's capacity precheck counted a Task's own running
