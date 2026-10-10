@@ -319,7 +319,33 @@ impl DaemonRuntime {
         });
         runtime.announce_protocol();
         runtime.replay_pending_journal();
+        runtime.spawn_workspace_gc();
         Ok(runtime)
+    }
+
+    /// Sweep the workspace root on a timer for as long as this runtime
+    /// lives. The first pass waits one interval: start-up already removed
+    /// what a previous process left, and nothing is quarantined on sight.
+    fn spawn_workspace_gc(self: &Arc<Self>) {
+        if self.workspace.is_none() {
+            return;
+        }
+        // Constructed outside a Tokio runtime (some tools do): no timer.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let runtime = Arc::downgrade(self);
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(crate::daemon_workspace::gc::GC_INTERVAL).await;
+                let Some(runtime) = runtime.upgrade() else {
+                    return;
+                };
+                if let Some(workspace) = &runtime.workspace {
+                    workspace.gc_sweep(&runtime.active_execution_ids()).await;
+                }
+            }
+        });
     }
 
     /// Keep the executor, handle registry and write locks alive across sockets.

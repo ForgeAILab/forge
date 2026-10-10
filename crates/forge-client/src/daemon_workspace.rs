@@ -141,6 +141,8 @@ pub struct DaemonWorkspaceBackend {
     owner_locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     provision_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     running_commands: Mutex<HashMap<String, RunningWorkspaceCommand>>,
+    /// Last handle directory the garbage-collection pass finished.
+    gc_cursor: Mutex<String>,
 }
 
 impl DaemonWorkspaceBackend {
@@ -189,6 +191,7 @@ impl DaemonWorkspaceBackend {
             owner_locks: Mutex::new(HashMap::new()),
             provision_locks: Mutex::new(HashMap::new()),
             running_commands: Mutex::new(HashMap::new()),
+            gc_cursor: Mutex::new(String::new()),
         })
     }
 
@@ -2361,6 +2364,7 @@ async fn merge_diffstat(
     Ok(stats)
 }
 
+pub mod gc;
 mod inspection;
 mod owner_operations;
 mod reconciliation;
