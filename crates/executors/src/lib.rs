@@ -2,6 +2,7 @@
 
 pub mod adapter;
 pub mod command;
+pub mod compiler_cache;
 pub mod config;
 pub mod effective_policy;
 pub mod environment;

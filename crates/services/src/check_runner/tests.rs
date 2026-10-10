@@ -804,6 +804,7 @@ async fn a_check_in_an_existing_worktree_is_admitted_under_the_disk_floor() {
                 total_inodes: None,
                 measured_at: db::now_rfc3339(),
                 gc_state: None,
+                compiler_cache_bytes: None,
             })
         }),
     );

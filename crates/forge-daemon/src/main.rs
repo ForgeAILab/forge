@@ -38,6 +38,17 @@ struct Cli {
     /// Unix niceness increment for run children (0: off).
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
     run_nice: Option<u32>,
+    /// Compiler-cache wrapper shared by this machine's Tasks (sccache, kache):
+    /// an absolute path or a name on PATH. Unset: off.
+    #[arg(long)]
+    compiler_cache_wrapper: Option<String>,
+    /// Size cap of the shared compiler cache in bytes (default: 20 GiB).
+    #[arg(long)]
+    compiler_cache_max_bytes: Option<u64>,
+    /// Directory of the shared compiler cache
+    /// (default: <workspace root>/.forge/build/cache).
+    #[arg(long)]
+    compiler_cache_dir: Option<PathBuf>,
     /// Forge server URL, for example https://forge.example.com.
     #[arg(long)]
     server: String,
@@ -97,6 +108,12 @@ async fn main() -> Result<()> {
     executors::run_process::install_machine_policy(Arc::new(
         executors::run_process::MachineRunPolicy::new(budget),
     ));
+    daemon_config.install_compiler_cache(
+        &workspace_root,
+        cli.compiler_cache_wrapper.clone(),
+        cli.compiler_cache_max_bytes,
+        cli.compiler_cache_dir.clone(),
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {

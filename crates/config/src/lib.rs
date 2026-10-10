@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod compiler_cache;
 mod defaults;
 mod error;
 mod file;
@@ -23,6 +24,7 @@ pub use defaults::{
     DEFAULT_MIN_FREE_INODE_PERCENT, DEFAULT_MIN_FREE_PERCENT, DEFAULT_SCAFFOLD_COMMAND,
     DEFAULT_SERVER_BIND, DEFAULT_USAGE_INDEX_BUDGET_MB, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
+pub use compiler_cache::{CompilerCacheConfig, DEFAULT_COMPILER_CACHE_MAX_BYTES};
 pub use error::ConfigError;
 pub use path::{data_dir_from_env, default_config_path, default_data_dir, default_workspace_root};
 pub use runtime::{

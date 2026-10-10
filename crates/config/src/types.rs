@@ -174,6 +174,9 @@ pub struct WorkspaceConfig {
     pub gc_free_bytes: Option<u64>,
     #[serde(default)]
     pub gc_free_percent: Option<u8>,
+    /// Opt-in shared compiler cache; off while `wrapper` is unset.
+    #[serde(default)]
+    pub compiler_cache: crate::CompilerCacheConfig,
 }
 
 /// Repository scaffolding run by Genesis provisioning when the approved
@@ -501,6 +504,7 @@ impl ForgeConfig {
                 min_free_inode_percent: DEFAULT_MIN_FREE_INODE_PERCENT,
                 gc_free_bytes: None,
                 gc_free_percent: None,
+                compiler_cache: crate::CompilerCacheConfig::default(),
             },
             agent: AgentDefaults {
                 max_concurrent_tasks: DEFAULT_AGENT_MAX_CONCURRENT_TASKS,

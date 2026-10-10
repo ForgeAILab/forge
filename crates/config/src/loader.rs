@@ -134,6 +134,14 @@ impl ForgeConfig {
             if workspace.gc_free_percent.is_some() {
                 self.workspace.gc_free_percent = workspace.gc_free_percent;
             }
+            if let Some(cache) = workspace.compiler_cache {
+                let current = std::mem::take(&mut self.workspace.compiler_cache);
+                self.workspace.compiler_cache = current.overridden(
+                    cache.wrapper,
+                    cache.max_bytes,
+                    cache.dir.as_deref().map(expand_path),
+                );
+            }
         }
 
         if let Some(agent) = file.agent {
@@ -331,6 +339,16 @@ impl ForgeConfig {
                 &value,
             )?)
             .unwrap_or(u8::MAX);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER") {
+            self.workspace.compiler_cache.wrapper = Some(value);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES") {
+            self.workspace.compiler_cache.max_bytes =
+                parse_env_u64("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_COMPILER_CACHE_DIR") {
+            self.workspace.compiler_cache.dir = Some(expand_path(&value));
         }
         if let Some(value) = env_value("FORGE_WORKSPACE_GC_FREE_BYTES") {
             self.workspace.gc_free_bytes =

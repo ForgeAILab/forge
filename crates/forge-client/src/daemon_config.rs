@@ -20,6 +20,9 @@ pub struct DaemonConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonWorkspaceConfig {
     pub run: DaemonWorkspaceRunConfig,
+    /// `workspace.compiler_cache`: this machine's opt-in shared compiler
+    /// cache. Never taken from the server: a daemon is another machine.
+    pub compiler_cache: config::CompilerCacheConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +65,29 @@ impl DaemonConfig {
             build_jobs_per_run: jobs.or(self.build_jobs_per_run),
             run_nice,
         })
+    }
+    /// Resolve this machine's compiler cache (flags over `daemon.yaml`) and
+    /// install it for `workspace_root`. Off unless a wrapper is configured.
+    pub fn install_compiler_cache(
+        &self,
+        workspace_root: &Path,
+        wrapper: Option<String>,
+        max_bytes: Option<u64>,
+        dir: Option<std::path::PathBuf>,
+    ) {
+        let config = self
+            .workspace
+            .compiler_cache
+            .clone()
+            .overridden(wrapper, max_bytes, dir);
+        executors::compiler_cache::install(
+            workspace_root,
+            executors::compiler_cache::CompilerCache::resolve(
+                &config,
+                workspace_root,
+                std::env::var_os("PATH"),
+            ),
+        );
     }
     pub fn load(credentials_path: &Path) -> Result<Self> {
         let path = credentials_path
@@ -153,6 +179,46 @@ mod budget_tests {
     use super::*;
     #[cfg(unix)]
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    #[test]
+    fn daemon_compiler_cache_is_its_own_file_key_and_flags_and_off_by_default() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let creds = dir.path().join("credentials.json");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let wrapper = dir.path().join("kache");
+        fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        DaemonConfig::load(&creds)
+            .unwrap()
+            .install_compiler_cache(&root, None, None, None);
+        assert!(executors::compiler_cache::installed(&root).is_none());
+
+        fs::write(
+            dir.path().join("daemon.yaml"),
+            format!(
+                "workspace:\n  compiler_cache:\n    wrapper: {}\n    max_bytes: 5000\n",
+                wrapper.display()
+            ),
+        )
+        .unwrap();
+        let config = DaemonConfig::load(&creds).unwrap();
+        config.install_compiler_cache(&root, None, None, None);
+        let cache = executors::compiler_cache::installed(&root).unwrap();
+        assert_eq!(cache.wrapper, wrapper);
+        assert_eq!(cache.max_bytes, 5000);
+        assert_eq!(cache.dir, root.join(".forge/build/cache"));
+
+        // Flags win over the file; an empty wrapper flag turns it off.
+        config.install_compiler_cache(&root, None, Some(9000), Some(dir.path().join("c")));
+        let cache = executors::compiler_cache::installed(&root).unwrap();
+        assert_eq!((cache.max_bytes, cache.dir.clone()), (9000, dir.path().join("c")));
+        config.install_compiler_cache(&root, Some(String::new()), None, None);
+        assert!(executors::compiler_cache::installed(&root).is_none());
+    }
+
     #[test]
     fn daemon_run_budget_file_flag_and_disabled() {
         let dir = tempfile::tempdir().unwrap();

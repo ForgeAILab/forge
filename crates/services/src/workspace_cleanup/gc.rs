@@ -220,7 +220,9 @@ impl WorkspaceCleanupScheduler {
                     .upgrade()
                     .and_then(|scheduler| scheduler.gc_state.read().ok().and_then(|state| *state))
                     .map(str::to_owned);
-                Some(space.facts(now_rfc3339(), gc_state))
+                let mut facts = space.facts(now_rfc3339(), gc_state);
+                facts.compiler_cache_bytes = executors::compiler_cache::measured_bytes(&root);
+                Some(facts)
             }),
         );
     }
@@ -486,6 +488,19 @@ impl WorkspaceCleanupScheduler {
             .await
             .unwrap_or_default();
             report.merge(&swept);
+        }
+        // The shared compiler cache goes first: an entry costs one crate
+        // one recompile, a Task's build output costs it a cold build.
+        if !out_of_time(&sweep) {
+            let (pass, floor) = (sweep.clone(), settings.free_floor);
+            let evicted = blocking(move || {
+                let mut report = GcReport::default();
+                pass.evict_compiler_cache(&floor, live_checks > 0, &mut report);
+                report
+            })
+            .await
+            .unwrap_or_default();
+            report.merge(&evicted);
         }
         if !out_of_time(&sweep) && live_checks == 0 {
             if let Err(error) = self
