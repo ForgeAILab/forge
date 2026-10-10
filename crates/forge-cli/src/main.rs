@@ -141,6 +141,27 @@ async fn run() {
         executors::run_process::MachineRunPolicy::new((&config.server).into()),
     ));
 
+    // 1. Create database pool and run migrations, then settle the workspace
+    // root against what this database recorded. A start that must be
+    // refused is refused here: before a port is bound, before the server
+    // state file is written, before anything is told where the root is.
+    let db_path = config.db_path();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).expect("Failed to create data directory");
+    }
+    let database_url = format!("sqlite:{}", db_path.display());
+    let forge_home = db_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("Failed to create database pool");
+    db::run_migrations(&pool)
+        .await
+        .expect("Failed to run migrations");
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let workspace_root = settle_workspace_root(&db, &config).await;
+
     let configured_addr: SocketAddr = config
         .server
         .bind
@@ -175,25 +196,6 @@ async fn run() {
             "web UI assets not found; API routes will still run, but browser navigation may return 404"
         );
     }
-    let db_path = config.db_path();
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).expect("Failed to create data directory");
-    }
-    let database_url = format!("sqlite:{}", db_path.display());
-    let forge_home = db_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    // 1. Create database pool and run migrations. The workspace root is
-    // settled against what this database recorded, so the database opens
-    // before anything is told where the root is.
-    let pool = db::create_sqlite_pool(&database_url)
-        .await
-        .expect("Failed to create database pool");
-    db::run_migrations(&pool)
-        .await
-        .expect("Failed to run migrations");
-    let db = Arc::new(db::SqliteDb::new(pool));
-    let workspace_root = settle_workspace_root(&db, &config).await;
     // Components that cannot be handed the resolved root explicitly (e.g.
     // Genesis repo provisioning inside the services crate) fall back to this
     // env var; export the configured value so every path agrees.
@@ -508,8 +510,8 @@ async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathB
             settled.root
         }
         Err(error) => {
-            error!(%error, "Forge cannot start on this workspace root");
-            eprintln!("{error}");
+            // Tracing writes to stderr and to the log file.
+            error!("Forge cannot start on this workspace root: {error}");
             std::process::exit(1);
         }
     }

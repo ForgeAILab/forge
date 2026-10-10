@@ -652,8 +652,8 @@ paths into it. From then on:
 
 Releases before this one kept the default root in the system temp directory
 (`<system temp>/forge/worktrees`), where the operating system deletes files:
-worktrees vanished and uncommitted work was lost. An install that still has
-its workspaces there keeps using that directory (nothing moves by itself),
+worktrees vanished and uncommitted work was lost. An install whose database
+recorded workspaces, clones or logs there keeps using that directory (nothing moves by itself),
 logs one warning at start and shows a `workspace_root` entry on the
 Operations page until you move it:
 
@@ -678,7 +678,8 @@ repositories, checks each with `git status`, and rewrites every stored path
 in one database transaction. Uncommitted changes and untracked files move
 with their worktree. The old root keeps a `MOVED` file and nothing in it is
 deleted that was not moved. Daemon-owned workspaces are not touched: a daemon
-keeps its own root under its own data directory.
+keeps its own root, and one that was configured to share the server's root
+keeps its `.forge/workspaces` in the old one.
 
 Each finished step is written to `<data dir>/workspace-root-migration.json`.
 If the command is interrupted, the server refuses to start while that file

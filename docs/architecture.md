@@ -3451,7 +3451,7 @@ Solo) calls after migrations and before anything is told where the root is:
 
 | Recorded | Configured | Result |
 |---|---|---|
-| none | default | `<data dir>/worktrees`, recorded. Exception: an install of a release that kept the default in the system temp directory (non-`cleaned` workspace rows under `<system temp>/forge/worktrees`, or `.repos` / `.forge` there) keeps that directory and records it. |
+| none | default | `<data dir>/worktrees`, recorded. Exception: an install of a release that kept the default in the system temp directory keeps that directory and records it. The evidence is in this database only (a workspace row that is not `cleaned`, a server `repo_location.path` or an `execution.logs_path` under `<system temp>/forge/worktrees`): every data directory on a machine used to share that directory, so what is on disk there says nothing about this one. |
 | none | chosen | the chosen root, recorded |
 | R | default | R, whatever today's default is |
 | R | chosen, same directory (any spelling, links resolved) | R |
@@ -3477,8 +3477,9 @@ server, and in this order:
    root (in every spelling a stored path may use), the new root, whether
    entries are renamed or copied, the entries, and what is finished. It is
    written whole (temp file, `fsync`, rename) before the next step.
-3. **Entries**: every top-level entry of the old root, with `.forge` opened
-   one level. On one filesystem each is renamed. Across filesystems each is
+3. **Entries**: every top-level entry of the old root, with `.forge` and
+   `.forge/gc` opened one level, except what a daemon sharing the root owns
+   (`.forge/workspaces`, `.forge/gc/daemon-owner`), which stays. On one filesystem each is renamed. Across filesystems each is
    copied (links as links, permissions and modification times kept),
    compared byte for byte with the original, journalled, and only then
    removed from the old root; a copy a crash left half-made is removed and

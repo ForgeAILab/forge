@@ -58,9 +58,31 @@ impl Host {
         self.forge(&self.path("home"), &all)
     }
 
-    /// What an older release left behind for this data directory.
+    /// What an older release left behind for this data directory: a
+    /// database that recorded the temp-directory root, and files in it.
     fn seed_legacy_root(&self) -> PathBuf {
         let root = self.legacy_root();
+        let database = self.path("data").join("forge.db");
+        let recorded = root.to_string_lossy().into_owned();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds")
+            .block_on(async move {
+                let pool = db::create_sqlite_pool(&format!("sqlite:{}", database.display()))
+                    .await
+                    .expect("database opens");
+                db::run_migrations(&pool).await.expect("migrations run");
+                sqlx::query(
+                    "INSERT INTO system_setting (key, value, updated_at) VALUES ('workspace_root', ?, ?)",
+                )
+                .bind(recorded)
+                .bind(db::now_rfc3339())
+                .execute(&pool)
+                .await
+                .expect("root is recorded");
+                pool.close().await;
+            });
         let task_root = root.join("3f0c2b0e-6d53-4b7e-9d0c-0d5a4f3f8a11");
         std::fs::create_dir_all(task_root.join("repo")).expect("task root creates");
         std::fs::write(task_root.join("repo/work.txt"), "uncommitted work\n").expect("file writes");
@@ -143,7 +165,6 @@ fn refuses_while_a_server_holds_the_data_directory() {
     );
     assert!(task_root.join("repo/work.txt").is_file());
     assert!(!host.path("data").join("worktrees").exists());
-    assert!(!host.path("data").join("forge.db").exists());
 }
 
 #[test]

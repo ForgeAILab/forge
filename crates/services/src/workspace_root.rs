@@ -95,7 +95,8 @@ pub async fn recorded_root(db: &SqliteDb) -> Result<Option<PathBuf>, WorkspaceRo
 ///
 /// - Nothing recorded, nothing chosen: `<data dir>/worktrees`, unless an
 ///   older release left this database's workspaces in
-///   `<system temp>/forge/worktrees`, which is then kept (and reported).
+///   `<system temp>/forge/worktrees` (rows of this database point there),
+///   which is then kept (and reported).
 /// - Recorded, nothing chosen: the recorded root, whatever today's default.
 /// - Chosen and different from the record: allowed only when no workspace
 ///   that is not `cleaned`, no repository clone and no running run is under
@@ -248,14 +249,21 @@ impl std::fmt::Display for LiveData {
 }
 
 /// Whether an older release left this database's workspaces in `legacy`.
+///
+/// Only the database can say: every data directory on a machine used to
+/// share `<system temp>/forge/worktrees`, so directories there prove nothing
+/// about this one (a fresh `./test` data directory beside a real install
+/// must get its own root). Evidence is a workspace that is not `cleaned`, a
+/// repository clone or an execution log this database recorded under it.
 async fn has_legacy_layout(db: &SqliteDb, legacy: &Path) -> Result<bool, sqlx::Error> {
-    if real_dir(&legacy.join(".repos")) || real_dir(&legacy.join(".forge")) {
-        return Ok(true);
-    }
     for spelling in spellings(legacy) {
         let rows = sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM workspace WHERE status != 'cleaned' AND {}",
-            under_sql("worktree_path")
+            "SELECT (SELECT COUNT(*) FROM workspace WHERE status != 'cleaned' AND {})
+                  + (SELECT COUNT(*) FROM repo_location WHERE owner_kind = 'server' AND {})
+                  + (SELECT COUNT(*) FROM execution WHERE {})",
+            under_sql("worktree_path"),
+            under_sql("path"),
+            under_sql("logs_path"),
         ))
         .bind(&spelling)
         .fetch_one(db.pool())

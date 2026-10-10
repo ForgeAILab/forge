@@ -285,7 +285,7 @@ impl std::fmt::Display for MigrateReport {
         )?;
         writeln!(
             formatter,
-            "Daemon-owned workspaces were not touched: a daemon keeps its own root under its own data directory."
+            "Daemon-owned workspaces were not touched: a daemon keeps its own root, and one that shares this root keeps .forge/workspaces in the old one."
         )?;
         writeln!(
             formatter,
@@ -737,36 +737,52 @@ fn same_filesystem(_left: &Path, _right: &Path) -> bool {
     false
 }
 
-/// What the old root holds, as paths relative to it: each top-level entry,
-/// with `.forge` opened one level (its logs, its garbage-collection state
-/// and its build directories move one by one).
+/// A daemon that shares the server's root keeps its own Task roots here and
+/// its own garbage-collection marker in `.forge/gc`: neither is the
+/// server's to move.
+const DAEMON_WORKSPACES: &str = "workspaces";
+
+/// What the old root holds that the server owns, as paths relative to it:
+/// each top-level entry, with `.forge` and `.forge/gc` opened one level
+/// (logs, build directories and each piece of garbage-collection state move
+/// one by one) so that what a daemon keeps there stays where it is.
 fn list_units(source: &Path) -> std::io::Result<Vec<String>> {
+    fn names(directory: &Path) -> std::io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let name = entry?.file_name();
+            names.push(name.into_string().map_err(|name| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name:?} in {} is not a UTF-8 name", directory.display()),
+                )
+            })?);
+        }
+        Ok(names)
+    }
     let mut units = Vec::new();
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let Ok(name) = entry.file_name().into_string() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{:?} is not a UTF-8 name", entry.file_name()),
-            ));
-        };
+    for name in names(source)? {
         if name == MOVED_MARKER {
             continue;
         }
-        if name == ".forge" && real_dir(&entry.path()) {
-            for inner in fs::read_dir(entry.path())? {
-                let inner = inner?;
-                let Ok(inner) = inner.file_name().into_string() else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "an entry of .forge is not a UTF-8 name",
-                    ));
-                };
-                units.push(format!(".forge/{inner}"));
-            }
+        if name != ".forge" || !real_dir(&source.join(&name)) {
+            units.push(name);
             continue;
         }
-        units.push(name);
+        for inner in names(&source.join(".forge"))? {
+            if inner == DAEMON_WORKSPACES {
+                continue;
+            }
+            if inner != "gc" || !real_dir(&source.join(gc::GC_DIR)) {
+                units.push(format!(".forge/{inner}"));
+                continue;
+            }
+            for state in names(&source.join(gc::GC_DIR))? {
+                if state != gc::DAEMON_OWNER_FILE {
+                    units.push(format!("{}/{state}", gc::GC_DIR));
+                }
+            }
+        }
     }
     units.sort();
     Ok(units)
@@ -785,9 +801,7 @@ fn move_units(run: &mut Run<'_>, source: &Path, target: &Path) -> Result<(), Wor
         }
         let from = source.join(&unit);
         let to = target.join(&unit);
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        mirror_parents(source, target, &unit)?;
         let from_exists = fs::symlink_metadata(&from).is_ok();
         let to_exists = fs::symlink_metadata(&to).is_ok();
         if run.journal.copy {
@@ -844,6 +858,26 @@ fn move_units(run: &mut Run<'_>, source: &Path, target: &Path) -> Result<(), Wor
         run.journal.moved.push(unit.clone());
         run.save()?;
         run.step(format!("moved:{unit}"))?;
+    }
+    Ok(())
+}
+
+/// Make the directories above `unit` in the new root (`.forge`, `.forge/gc`)
+/// with the permissions they have in the old one.
+fn mirror_parents(source: &Path, target: &Path, unit: &str) -> std::io::Result<()> {
+    let mut above = PathBuf::new();
+    let mut parts: Vec<&str> = unit.split('/').collect();
+    parts.pop();
+    for part in parts {
+        above.push(part);
+        let made = target.join(&above);
+        if fs::symlink_metadata(&made).is_ok() {
+            continue;
+        }
+        fs::create_dir(&made)?;
+        if let Ok(metadata) = fs::metadata(source.join(&above)) {
+            fs::set_permissions(&made, metadata.permissions())?;
+        }
     }
     Ok(())
 }

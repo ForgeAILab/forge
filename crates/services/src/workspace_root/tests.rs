@@ -144,20 +144,72 @@ async fn an_install_on_the_temp_default_keeps_it_records_it_and_reports_it() {
     );
 }
 
+/// Every data directory on a machine used to share the temp default, so
+/// directories there say nothing about this database: a fresh data
+/// directory beside a real install gets its own root.
 #[tokio::test]
-async fn directories_alone_mark_an_install_on_the_temp_default() {
-    for marker in [".repos", ".forge"] {
-        let db = sqlite_db().await;
-        let dirs = Dirs::new();
-        std::fs::create_dir_all(dirs.legacy_root().join(marker)).unwrap();
-        let settled = settle(&db, &dirs.default_choice()).await.unwrap();
-        assert_eq!(settled.root, dirs.legacy_root(), "{marker}");
-        assert!(settled.in_system_temp);
-    }
-    // An unrelated directory in the temp directory is not an install.
+async fn directories_in_the_temp_default_alone_are_not_this_install() {
     let db = sqlite_db().await;
     let dirs = Dirs::new();
-    std::fs::create_dir_all(dirs.legacy_root().join("stray")).unwrap();
+    for name in [".repos", ".forge", "3f0c2b0e-6d53-4b7e-9d0c-0d5a4f3f8a11"] {
+        std::fs::create_dir_all(dirs.legacy_root().join(name)).unwrap();
+    }
+    let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert_eq!(settled.root, dirs.default_root());
+    assert!(!settled.in_system_temp);
+}
+
+/// What this database recorded there is: a clone, or an execution log, even
+/// when every workspace is already cleaned.
+#[tokio::test]
+async fn a_recorded_clone_or_log_marks_an_install_on_the_temp_default() {
+    for evidence in ["log", "clone"] {
+        let db = sqlite_db().await;
+        let dirs = Dirs::new();
+        let legacy = dirs.legacy_root();
+        let workspace = seed_workspace_under(&db, &dirs, &legacy).await;
+        let execution = seed_running_execution(&db, &workspace).await;
+        sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+            .bind(&execution)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace SET status = 'cleaned'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        if evidence == "clone" {
+            sqlx::query("UPDATE execution SET logs_path = NULL")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE repo_location SET path = ?")
+                .bind(legacy.join(".repos/clone").to_string_lossy().as_ref())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE repo_location SET path = '/elsewhere/repo'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+        assert_eq!(settled.root, legacy, "{evidence}");
+        assert!(settled.in_system_temp, "{evidence}");
+    }
+    // Neither: only cleaned history, so this is a new install.
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    seed_workspace_under(&db, &dirs, &dirs.legacy_root()).await;
+    sqlx::query("UPDATE workspace SET status = 'cleaned'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repo_location SET path = '/elsewhere/repo'")
+        .execute(db.pool())
+        .await
+        .unwrap();
     let settled = settle(&db, &dirs.default_choice()).await.unwrap();
     assert_eq!(settled.root, dirs.default_root());
 }

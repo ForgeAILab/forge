@@ -1373,6 +1373,7 @@ dependencies = [
  "fs2",
  "review",
  "services",
+ "sqlx",
  "tempfile",
  "tokio",
  "tracing",

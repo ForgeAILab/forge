@@ -151,6 +151,16 @@ impl Install {
                 .unwrap(),
             gc::Ownership::Mine
         );
+        // A daemon sharing the root: its Task roots and its own marker.
+        let daemon_root = install.root.join(".forge/workspaces/workspace-7b0c9f6e");
+        std::fs::create_dir_all(daemon_root.join("repo")).unwrap();
+        std::fs::write(daemon_root.join("repo/daemon.txt"), "daemon work\n").unwrap();
+        std::fs::create_dir_all(install.root.join(gc::GC_DIR)).unwrap();
+        std::fs::write(
+            install.root.join(gc::GC_DIR).join(gc::DAEMON_OWNER_FILE),
+            "daemon-state-id",
+        )
+        .unwrap();
         Self {
             log_path,
             ..install
@@ -258,18 +268,31 @@ impl Install {
             .filter(|path| !before.files.contains_key(*path))
             .collect();
         assert!(extra.is_empty(), "appeared: {extra:?}");
-        // The old root keeps the marker and nothing else.
-        let mut left: Vec<String> = std::fs::read_dir(&self.root)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, vec![".forge".to_owned(), MOVED_MARKER.to_owned()]);
+        // The old root keeps the marker and what a daemon owns there, and
+        // nothing else.
+        let left: Vec<String> = tree_with(&self.root, true).into_keys().collect();
         assert_eq!(
-            std::fs::read_dir(self.root.join(".forge")).unwrap().count(),
-            0
+            left,
+            [
+                ".forge",
+                ".forge/gc",
+                ".forge/gc/daemon-owner",
+                ".forge/workspaces",
+                ".forge/workspaces/workspace-7b0c9f6e",
+                ".forge/workspaces/workspace-7b0c9f6e/repo",
+                ".forge/workspaces/workspace-7b0c9f6e/repo/daemon.txt",
+            ]
         );
+        assert_eq!(
+            std::fs::read_to_string(
+                self.root
+                    .join(".forge/workspaces/workspace-7b0c9f6e/repo/daemon.txt")
+            )
+            .unwrap(),
+            "daemon work\n"
+        );
+        assert!(!target.join(".forge/workspaces").exists());
+        assert!(!target.join(gc::GC_DIR).join(gc::DAEMON_OWNER_FILE).exists());
         assert!(std::fs::read_to_string(self.root.join(MOVED_MARKER))
             .unwrap()
             .contains(&target.display().to_string()));
@@ -435,7 +458,13 @@ enum Entry {
 /// worktree, `gitdir` in the repository) and the index, whose cached file
 /// times a copy changes.
 fn tree(root: &Path) -> BTreeMap<String, Entry> {
-    fn walk(root: &Path, path: &Path, all: &mut BTreeMap<String, Entry>) {
+    tree_with(root, false)
+}
+
+/// `daemon`: include what a daemon sharing the root owns (which a move
+/// leaves where it is) instead of leaving it out.
+fn tree_with(root: &Path, daemon: bool) -> BTreeMap<String, Entry> {
+    fn walk(root: &Path, path: &Path, daemon: bool, all: &mut BTreeMap<String, Entry>) {
         for entry in std::fs::read_dir(path).unwrap().flatten() {
             let path = entry.path();
             let metadata = std::fs::symlink_metadata(&path).unwrap();
@@ -445,6 +474,10 @@ fn tree(root: &Path) -> BTreeMap<String, Entry> {
                 .to_string_lossy()
                 .into_owned();
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !daemon && (relative == ".forge/workspaces" || relative == ".forge/gc/daemon-owner")
+            {
+                continue;
+            }
             #[cfg(unix)]
             let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777;
             #[cfg(not(unix))]
@@ -453,7 +486,7 @@ fn tree(root: &Path) -> BTreeMap<String, Entry> {
                 all.insert(relative, Entry::Link(std::fs::read_link(&path).unwrap()));
             } else if metadata.is_dir() {
                 all.insert(relative, Entry::Dir(mode));
-                walk(root, &path, all);
+                walk(root, &path, daemon, all);
             } else if !(name == "gitdir"
                 || name == "index"
                 || name == MOVED_MARKER
@@ -464,7 +497,7 @@ fn tree(root: &Path) -> BTreeMap<String, Entry> {
         }
     }
     let mut all = BTreeMap::new();
-    walk(root, root, &mut all);
+    walk(root, root, daemon, &mut all);
     all
 }
 
@@ -491,7 +524,11 @@ async fn a_move_on_one_filesystem_keeps_every_file_git_state_and_database_path()
     assert_eq!(report.gc_state, "owned");
     assert!(report.moved.contains(&".repos".to_owned()));
     assert!(report.moved.contains(&".forge/logs".to_owned()));
-    assert!(report.moved.contains(&".forge/gc".to_owned()));
+    assert!(report.moved.contains(&".forge/gc/owner".to_owned()));
+    assert!(!report
+        .moved
+        .iter()
+        .any(|unit| unit.contains("workspaces") || unit.contains("daemon-owner")));
     for task in &install.tasks {
         assert!(report.moved.contains(&task.id), "{:?}", report.moved);
     }
