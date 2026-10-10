@@ -2524,25 +2524,20 @@ async fn a_dead_lettered_check_delivery_is_read_by_the_step_at_its_deadline() {
     restart_while_the_entry_check_is_awaited(RestartPoint::DeliveryDeadLettered).await;
 }
 
-/// OPEN FINDING, pinned. Intermittent: it fails in about two of three runs of
-/// the whole target on a loaded machine and passes alone.
-///
 /// One slot. After the Project is resumed, the first Task's reviewer run
 /// takes the slot and the second Task (whose coder run ended under the pause)
 /// is refused a run slot. Its `machine_capacity` wait and its
 /// `task_schedule_wait` row (`daemon_id = '*'`) are written after the
-/// dispatcher's precheck read the machine as full. When the reviewer run ends
-/// between that read and those writes, the kick for "waiters on a run slot"
-/// finds no waiter yet: the Task then stays `in_progress`, parked on
-/// `capacity` (scope `machine`), with the machine idle, no step pending and
-/// nothing due. Observed state: `DBG` dump in
-/// `/Volumes/Data/tmp/refactor/33-e/gate-api-model_workflow-4.log`.
+/// dispatcher read the machine as full. When the reviewer run ended between
+/// that read and those writes, the mark for "waiters on a run slot" found no
+/// waiter: the Task stayed `in_progress`, parked on `capacity` (scope
+/// `machine`), with the machine idle, no step pending and nothing due.
 ///
-/// The wait is edge-triggered where it has to be level-triggered: a
-/// dispatcher pass must look at run-slot waiters again whenever a machine has
-/// room (or register the waiter before it reads the capacity).
+/// A Task that starts waiting for a run slot is now read once more after its
+/// wait row exists (`SqliteDb::schedule_wait`), and every such row carries a
+/// recheck deadline. This case failed in about two of three runs of the
+/// whole target on a loaded machine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open finding: a run-slot wait registered after the slot was released is never woken"]
 async fn a_run_slot_wait_registered_after_the_release_is_still_woken() {
     if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::Project, true).await {
         panic!("{violation}");

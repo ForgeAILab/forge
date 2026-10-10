@@ -8588,11 +8588,30 @@ the machine, which also covers a Task waiting for that machine's readiness or
 reconnect, so checks can be held to their share while no execution actually
 waits for a slot there.
 
-Known gap: a run-slot waiter is woken by the release of a slot (an edge). A
-Task whose wait is registered just after the release it should have seen is
-not looked at again until something else touches it; with one slot and no
-other activity that can be never. Pinned by the ignored model case
-`a_run_slot_wait_registered_after_the_release_is_still_woken`.
+**A run-slot waiter cannot miss its wake.** A Task that waits for a run slot
+has a `task_schedule_wait` row with `daemon_id = '*'`; every commit that frees
+a slot marks those rows' Tasks dirty (the end of an execution, a placement, a
+chat turn or an admission step, and since `V202610101906` a check run leaving
+`queued`/`running`/`cancelling`/`cleaning`/`uncertain`, a check run deleted in
+one of those states, and a check consumer being cancelled). Two things make
+that level-triggered:
+
+- *Registration.* Whoever decided the Task waits read the machines before the
+  row existed, so a release between that read and the row marked nobody.
+  `SqliteDb::schedule_wait` marks the Task dirty in the same commit that first
+  writes `'*'` for it. The pass this causes reads the machines with the row in
+  place: a release committed before that read is seen by it, one committed
+  after it finds the row. A row that already says `'*'` marks nothing, so a
+  Task that keeps waiting is not read in a loop, and an unchanged row costs no
+  write.
+- *Backstop.* Every wait for a machine carries a durable recheck deadline on
+  that row: 60 s for a run slot (`SLOT_WAIT_RECHECK`), 30 s while the Task
+  waits for disk or any machine is under its free-space floor
+  (`DISK_WAIT_RECHECK`; free disk comes back with no commit at all). The
+  deadline survives a restart and is due at once after one; a Task read again
+  before it fires keeps it. No ordering of a release and a wait, and no
+  release that marks nobody, parks a Task on an idle machine for longer than
+  one period.
 
 Neither side starves. A queued check at the head of its queue is admitted at
 the first slot release after `k < S` (rule 1 keeps the slot from executions);

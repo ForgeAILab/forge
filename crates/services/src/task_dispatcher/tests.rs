@@ -8095,6 +8095,85 @@ async fn machine_capacity_task_does_not_wait_for_its_own_slot() {
         .is_some());
 }
 
+/// The backstop under every run-slot wait. The slot is freed by something
+/// that marks nobody (here: the marks are thrown away, as a release that
+/// raced the wait or a future writer that forgets its trigger would leave
+/// it). Nothing is dirty, nothing is asked: the wait row's own deadline has
+/// the Task read again within one period, and it is dispatched.
+#[tokio::test]
+async fn machine_capacity_wait_is_read_again_at_its_deadline_without_any_mark() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let running = seed_task(&db, &project_id, "RUN", "in_progress", 0).await;
+    assign_role(&db, &running.id, "coder", &agent_id).await;
+    seed_running_execution(&db, &running.id, &agent_id, "coder").await;
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    db.server_run_cap.set(
+        Some(1),
+        config::resolved_run_cap(Some(1)),
+        &config::embedded_machine_id(),
+    );
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
+    // The new waiter is read once more with its wait row in place.
+    assert_eq!(dispatcher.tick(false).await.unwrap(), 0);
+    dispatcher.drain_steps().await.unwrap();
+    let row: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT daemon_id, deadline FROM task_schedule_wait WHERE task_id = ?")
+            .bind(&queued.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(row.0.as_deref(), Some("*"));
+    let armed = row.1.expect("a run-slot wait has a recheck deadline");
+    assert!(
+        dispatcher.schedule_sleep() <= super::reconciliation::SLOT_WAIT_RECHECK,
+        "the loop wakes for it"
+    );
+    // Read again before the deadline: the timer is kept, not pushed out.
+    dispatcher.check_once_and_drain().await.unwrap();
+    let kept: Option<String> =
+        sqlx::query_scalar("SELECT deadline FROM task_schedule_wait WHERE task_id = ?")
+            .bind(&queued.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(kept.as_deref(), Some(armed.as_str()));
+
+    // The slot is freed and every mark is lost.
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE task_id = ?")
+        .bind(&running.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET status = 'done' WHERE id = ?")
+        .bind(&running.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM task_schedule_dirty")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatcher.tick(false).await.unwrap(),
+        0,
+        "nothing marked it"
+    );
+    tokio::time::sleep(super::reconciliation::SLOT_WAIT_RECHECK + Duration::from_millis(300)).await;
+    dispatcher.tick(false).await.unwrap();
+    dispatcher.drain_steps().await.unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("dispatched by the timer alone")
+        .unwrap();
+    assert_eq!(started.task_id, queued.id);
+}
+
 /// Every machine under its free-space floor: the Task waits where it is with
 /// the machine-capacity wait naming the disk, raises nothing, and is
 /// dispatched by the next scan after the reading recovers. Nobody acts.
@@ -9236,6 +9315,9 @@ async fn machine_capacity_fifty_full_waiters_use_zero_write_transactions() {
     }
     let (dispatcher, _) = build_dispatcher(db.clone(), workspaces.path()).await;
     dispatcher.check_once_and_drain().await.unwrap(); // Establish visible waits and Project readiness caches.
+                                                      // A Task that starts waiting for a run slot is read once more after its
+                                                      // wait row exists; that look is part of establishing the wait.
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _trace = tracing::subscriber::set_default(MachineCapacityWriteCounter(writes.clone()));
     assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);

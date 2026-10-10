@@ -978,6 +978,86 @@ async fn with_one_slot_the_queued_check_runs_before_the_next_new_run() {
     assert!(one(stream.capacity().await).admits_execution());
 }
 
+/// A check that stops holding or reserving a slot is a release for the Tasks
+/// that wait for a run slot: its end, the cancellation of a queued one, and
+/// its last consumer giving up each mark those waiters. Before, only the end
+/// of an execution did, and a slot a check freed could stay unused.
+#[tokio::test]
+async fn a_check_that_frees_a_slot_marks_the_run_slot_waiters() {
+    let (_temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(1), 1, "server-machine");
+    let now = db::now_rfc3339();
+    for id in ["slot", "named", "agent"] {
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p','waiter','todo',?,?)").bind(id).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    }
+    store
+        .schedule_wait("slot", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    store
+        .schedule_wait("named", ("p", false), None, Some("another-machine"), None)
+        .await
+        .unwrap();
+    store
+        .schedule_wait("agent", ("p", false), Some("someone"), None, None)
+        .await
+        .unwrap();
+    let marked = || async {
+        let ids = store.dirty_schedule_tasks(100).await.unwrap();
+        sqlx::query("DELETE FROM task_schedule_dirty")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        ids.into_iter()
+            .filter(|id| ["slot", "named", "agent"].contains(&id.as_str()))
+            .collect::<Vec<_>>()
+    };
+    marked().await;
+
+    // Queued, then admitted: it takes a slot, which frees nothing.
+    let running = queue_check(&runner, "runs", CheckConsumerOrigin::Entry).await;
+    let running = admit(&store, &running).await;
+    assert!(marked().await.is_empty());
+    // It ends.
+    finish_check(&store, &running).await;
+    assert_eq!(marked().await, ["slot"]);
+
+    // A queued check keeps the slot from executions. Its consumer gives up.
+    let queued = queue_check(&runner, "queued", CheckConsumerOrigin::Entry).await;
+    assert!(marked().await.is_empty());
+    sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE run_id=?")
+        .bind(db::now_rfc3339())
+        .bind(&queued.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(marked().await, ["slot"]);
+    // The queued run itself is cancelled, and later deleted with its Project.
+    sqlx::query(
+        "UPDATE check_run SET state='cancelled',finished_at=?,version=version+1 WHERE id=?",
+    )
+    .bind(db::now_rfc3339())
+    .bind(&queued.id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(marked().await, ["slot"]);
+    sqlx::query("DELETE FROM check_run WHERE id=?")
+        .bind(&queued.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(marked().await.is_empty(), "a settled run frees nothing");
+    let last = queue_check(&runner, "deleted", CheckConsumerOrigin::Entry).await;
+    marked().await;
+    sqlx::query("DELETE FROM check_run WHERE id=?")
+        .bind(&last.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(marked().await, ["slot"]);
+}
+
 /// An owner whose `prepare` is the window in question: the consumer's Task
 /// is cancelled while the owner prepares, before any dispatch record exists.
 struct CancelledWhilePreparing {

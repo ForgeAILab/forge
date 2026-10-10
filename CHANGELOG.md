@@ -2307,6 +2307,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   is applied, a pause holds only the reviewer run, and resume does not run the
   check again. A changed workflow or state configuration still ends the step.
 
+- **A Task no longer stays `Waiting for a Slot` on an idle machine.** A Task
+  that waits for a run slot is looked at again when a slot is released. Three
+  ways to miss that are closed. (1) The wait was recorded just after the
+  release it should have seen (the dispatcher read the machine as full, the
+  run ended, then the wait was written): nothing looked at the Task again.
+  Seen with `max_concurrent_runs: 1` after a Project resume. A Task that
+  starts waiting for a slot is now read once more after its wait is recorded.
+  (2) A slot freed by a check run (review or integration CI) that ended, by a
+  queued check that was cancelled or expired, or by a check nobody waited for
+  any more woke no waiting Task; it does now. (3) Whatever else goes wrong,
+  every Task that waits for a run slot is read again at least every 60
+  seconds (30 while a machine is short of disk), also after a restart.
+
 - **A machine limited to one run no longer parks its own running Task.**
   With `max_concurrent_runs: 1` (server setting, or a daemon's cap or admin
   run limit) the dispatcher's capacity precheck counted a Task's own running
@@ -2649,14 +2662,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   administrator.
 
 ### Known issues
-
-- **A Task can stay `Waiting for a Slot` on an idle machine.** A run-slot
-  waiter is woken when a slot is released. When the wait is recorded just
-  after the release it should have seen (the dispatcher read the machine as
-  full, the run ended, then the wait was written), nothing looks at the Task
-  again until something else changes it. Seen with `max_concurrent_runs: 1`
-  after a Project resume. Pinned by an ignored case in
-  `crates/api/tests/model_workflow.rs`.
 
 - A damaged worktree on a daemon owner is not repaired; the Task needs
   `reset_to_initial`. A deleted worktree is recreated from the Task branch.
