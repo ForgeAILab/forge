@@ -89,8 +89,7 @@ impl DaemonWorkspaceBackend {
                 // The owner that performs the effect: this daemon holds the
                 // Task's checkout of a rebase even when the default checkout
                 // is on another machine.
-                if request.effect_owner()["daemon_id"].as_str()
-                    != Some(&params.workspace.daemon_id)
+                if request.effect_owner()["daemon_id"].as_str() != Some(&params.workspace.daemon_id)
                     || request.effect_owner()["runtime_id"].as_str()
                         != Some(&params.workspace.runtime_id)
                     || (!transferred

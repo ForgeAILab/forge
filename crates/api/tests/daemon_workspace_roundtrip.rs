@@ -783,6 +783,34 @@ impl Fixture {
     /// when nothing has moved for 5 s (the journal, the frames the server
     /// sent, the server's own rows), not after a fixed time: a loaded
     /// machine is slow, not stuck.
+    /// What the server runtime's heartbeat monitor does after an owner
+    /// reconnects: its placements go from `disconnected` back to `ready`.
+    /// The harness runs no monitor, so a test that needs it calls this.
+    async fn reconcile_reconnected_placement(&self, placement_id: &str) {
+        let monitor = services::HeartbeatMonitor::new(
+            self.harness.state.db.clone(),
+            self.harness.state.event_bus.clone(),
+        )
+        .with_daemon_connections(self.harness.state.daemon_connections.clone())
+        .with_task_service(self.harness.state.task_service.clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                monitor.check_once().await.unwrap();
+                let placement =
+                    WorkspacePlacementRepo::get_by_id(&*self.harness.state.db, placement_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if placement.state == PlacementState::Ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the reconnected owner's placement is reconciled");
+    }
+
     async fn wait_until_journal_empty(&self) {
         let mut stall = Stall::new(Duration::from_secs(5));
         loop {
@@ -792,7 +820,10 @@ impl Fixture {
             }
             let observed = format!(
                 "{:?}|{}|{}",
-                pending.iter().map(JournalEntry::entry_id).collect::<Vec<_>>(),
+                pending
+                    .iter()
+                    .map(JournalEntry::entry_id)
+                    .collect::<Vec<_>>(),
                 self.link
                     .as_ref()
                     .map_or(0, |link| link.requests.lock().unwrap().len()),
@@ -1170,7 +1201,10 @@ async fn assert_outage_order(socket_first: bool) {
             observed_task.version,
             observed_execution.status,
             observed_execution.execution_version,
-            pending.iter().map(JournalEntry::entry_id).collect::<Vec<_>>(),
+            pending
+                .iter()
+                .map(JournalEntry::entry_id)
+                .collect::<Vec<_>>(),
             fixture
                 .link
                 .as_ref()
@@ -5002,6 +5036,11 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
     assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
 
     fixture.reconnect().await;
+    // The head goes on once the Task's placement is `ready` again (the
+    // server runtime's owner reconciliation after a reconnect).
+    fixture
+        .reconcile_reconnected_placement(&fixture.resolved.placement.id)
+        .await;
     // The owner's receipt is read once and the head continues from it: the
     // rebased commit becomes the candidate without another rebase.
     let rebase_receipts = |attempt: &db::IntegrationAttempt| {
@@ -5266,8 +5305,7 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
 macro_rules! start_check_worker {
     ($fixture:expr, $stop:ident) => {
         let check_state = $fixture.harness.state.clone();
-        let check_periodic =
-            services::worker_runtime::PeriodicWorkers::new(check_state.db.clone());
+        let check_periodic = services::worker_runtime::PeriodicWorkers::new(check_state.db.clone());
         let ($stop, checks_stopped) = tokio::sync::watch::channel(false);
         let _checks = Arc::new(services::check_runner::worker::CheckRunWorker::new(
             check_state.db.clone(),
@@ -6297,30 +6335,9 @@ async fn cross_owner_task_daemon_disconnect_in_rebasing_is_settled_by_that_daemo
         .requests(METHOD_CHECK_RUN)
         .is_empty());
     // The owner reconciliation of the server runtime makes it ready again.
-    let monitor = services::HeartbeatMonitor::new(
-        fixture.harness.state.db.clone(),
-        fixture.harness.state.event_bus.clone(),
-    )
-    .with_daemon_connections(fixture.harness.state.daemon_connections.clone())
-    .with_task_service(fixture.harness.state.task_service.clone());
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            monitor.check_once().await.unwrap();
-            let placement = WorkspacePlacementRepo::get_by_id(
-                &*fixture.harness.state.db,
-                &fixture.resolved.placement.id,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            if placement.state == PlacementState::Ready {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the reconnected owner's placement is reconciled");
+    fixture
+        .reconcile_reconnected_placement(&fixture.resolved.placement.id)
+        .await;
     queue_eventually!(&fixture, &head, "the Task to merge after the reconnect", {
         task_status(&fixture, &head.task_id).await == "done"
             && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
@@ -6394,10 +6411,16 @@ async fn cross_owner_target_daemon_disconnect_in_ff_inflight_is_settled_by_that_
     assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
     let reflog = git_sync(&fixture.checkout, &["reflog", "--all"]);
     fixture.reconnect().await;
-    queue_eventually!(&fixture, &head, "the Task to be done after the reconnect", {
-        task_status(&fixture, &head.task_id).await == "done"
-            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
-    });
+    queue_eventually!(
+        &fixture,
+        &head,
+        "the Task to be done after the reconnect",
+        {
+            task_status(&fixture, &head.task_id).await == "done"
+                && queue_attempt(&fixture, &head).await.state
+                    == db::IntegrationAttemptState::Completed
+        }
+    );
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     let attempt = queue_attempt(&fixture, &head).await;
@@ -6464,7 +6487,10 @@ async fn cross_owner_target_moved_between_rebase_and_fast_forward_starts_a_new_r
         attempt.integrated_before_sha.as_deref(),
         Some(late_tip.as_str())
     );
-    assert_ne!(tip, first_candidate, "the first round's commit never landed");
+    assert_ne!(
+        tip, first_candidate,
+        "the first round's commit never landed"
+    );
     // Linear on top of the late commit: not a merge of a stale candidate.
     assert_eq!(
         git_sync(&default_checkout, &["rev-parse", &format!("{tip}^")]),
@@ -6514,8 +6540,8 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
     let state = fixture.harness.state.clone();
     let database = state.db.clone();
     let server = Arc::new(ServerIntegrationOwner::new(database.clone()));
-    let client =
-        DaemonWorkspaceClient::new(state.daemon_connections.clone()).with_receipts(database.clone());
+    let client = DaemonWorkspaceClient::new(state.daemon_connections.clone())
+        .with_receipts(database.clone());
     let fences = Arc::new(DaemonFences::new(database.clone(), client.clone()));
     let owner = RoutingIntegrationOwner::new(server.clone(), client.clone(), fences.clone());
     let transfer = OwnerObjectTransfer::new(
@@ -6525,8 +6551,9 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
         fences,
         &fixture.server_root.path().join("transfer-staging"),
     );
-    let facts_port = WorkspaceHeadFacts::new(database.clone(), state.workspace_backend_router.clone())
-        .with_daemons(client);
+    let facts_port =
+        WorkspaceHeadFacts::new(database.clone(), state.workspace_backend_router.clone())
+            .with_daemons(client);
     let attempt = database
         .integration_attempt(&attempt_id)
         .await
@@ -6689,8 +6716,14 @@ async fn two_tasks_in_one_queue_on_a_daemon_owned_target_merge_green_then_eject_
     let fixture = Fixture::file_backed("forge-queue-daemon-two-tasks").await;
     let runtime_id = fixture.resolved.placement.runtime_id.clone().unwrap();
     let first = admit_queue_head(&fixture, &["test -f feature.txt", "test -f outside.txt"]).await;
-    let (second_workspace, _, second_candidate) =
-        daemon_task(&fixture, &fixture.daemon_id, &runtime_id, None, "second.txt").await;
+    let (second_workspace, _, second_candidate) = daemon_task(
+        &fixture,
+        &fixture.daemon_id,
+        &runtime_id,
+        None,
+        "second.txt",
+    )
+    .await;
     // Red only once it sits on top of the first Task's merge.
     let second = admit_placed_head(
         &fixture,
@@ -6707,8 +6740,7 @@ async fn two_tasks_in_one_queue_on_a_daemon_owned_target_merge_green_then_eject_
     let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
     queue_eventually!(&fixture, &first, "the first Task to merge", {
         task_status(&fixture, &first.task_id).await == "done"
-            && queue_attempt(&fixture, &first).await.state
-                == db::IntegrationAttemptState::Completed
+            && queue_attempt(&fixture, &first).await.state == db::IntegrationAttemptState::Completed
     });
     queue_eventually!(&fixture, &second, "the second Task to be sent back", {
         queue_attempt(&fixture, &second).await.state == db::IntegrationAttemptState::Ejected
@@ -6925,9 +6957,7 @@ async fn the_server_refuses_to_fast_forward_a_candidate_it_was_not_sent() {
     );
     assert!(git_sync(&default_checkout, &["status", "--porcelain"]).is_empty());
     // The Task's daemon was not asked to merge anything.
-    assert!(
-        attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).is_empty()
-    );
+    assert!(attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).is_empty());
     let attempt = queue_attempt(&fixture, &head).await;
     assert_eq!(
         receipt_owners(&attempt, db::IntegrationOperationKind::FastForward),
