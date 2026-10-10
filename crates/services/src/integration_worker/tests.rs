@@ -2815,3 +2815,186 @@ async fn a_failed_release_step_is_asked_again_three_times_then_the_queue_says_so
     assert_eq!(world.attempt(&b.id).await.revision, attempt_revision);
     assert_eq!(world.attempt(&b.id).await.state, S::Ejected);
 }
+
+/// What the old merge path had written for a Task that was merging when the
+/// server was upgraded.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Legacy {
+    /// A merge sent to its owner whose reply never arrived (importer row P2).
+    RunningRemoteOperation,
+    /// A recorded `merge_intent` without an outcome (importer row P1).
+    IntentWithoutOutcome,
+}
+
+impl World {
+    /// A Task in `merging` the way a pre-queue server left it: a reviewed
+    /// commit in its worktree, the legacy evidence of `shape`, no attempt.
+    /// Returns the candidate commit.
+    async fn legacy_task(&self, task: &str, file: &str, shape: Legacy) -> String {
+        let (repo, tree) = (self.repo("r"), self.tree(task));
+        let branch = format!("task-{task}");
+        git_out(
+            &repo,
+            &["worktree", "add", "-b", &branch, tree.to_str().unwrap()],
+        )
+        .await
+        .expect("worktree");
+        std::fs::write(tree.join(file), "legacy\n").unwrap();
+        git::commit_all(&tree, task).await.unwrap();
+        let head = git::get_current_sha(&tree).await.unwrap();
+        let now = db::now_rfc3339();
+        let pool = self.db.pool();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'merging',?,?,?)").bind(task).bind(task).bind(&now).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES(?,?,'r',?,?,'ready',?,?)").bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&branch).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES(?,?,?,'server','l-r',?,1,'ready','scheduler','{}',?,?)").bind(format!("pl-{task}")).bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,workspace_id,created_at,updated_at) VALUES(?,?,'executor','completed',?,?,?)").bind(format!("e-{task}")).bind(task).bind(format!("w-{task}")).bind(&now).bind(&now).execute(pool).await.unwrap();
+        // The hooks step that was merging: settled by the old recovery, its
+        // effects retained.
+        sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,attempts,created_at,updated_at,expected_epoch,lane) VALUES(?,?,1,'hooks','{}','entry',?,1,'merging',1,'failed',?,1,?,?,0,'long')")
+            .bind(format!("s-{task}")).bind(task).bind(format!("c-{task}")).bind(&now).bind(&now).bind(&now).execute(pool).await.unwrap();
+        match shape {
+            Legacy::RunningRemoteOperation => {
+                sqlx::query("INSERT INTO task_remote_operation(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,state,created_at) VALUES(?,?,?,?,'old-daemon','old-runtime',1,0,'running',?)")
+                    .bind(format!("legacy-op-{task}")).bind(format!("s-{task}")).bind(format!("w-{task}")).bind(format!("pl-{task}")).bind(&now).execute(pool).await.unwrap();
+            }
+            Legacy::IntentWithoutOutcome => {
+                let intent = serde_json::json!({"target_branch":"main","candidate_sha":head}).to_string();
+                sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES(?,0,?,?)")
+                    .bind(format!("s-{task}")).bind(&now)
+                    .bind(serde_json::json!({"merge_intent":intent}).to_string())
+                    .execute(pool).await.unwrap();
+            }
+        }
+        head
+    }
+    /// The storage importer, as the start runs it before any worker.
+    async fn import(&self, task: &str) -> IntegrationAttempt {
+        while self
+            .db
+            .import_integration_pass(db::INTEGRATION_IMPORT_PAGE)
+            .await
+            .unwrap()
+            .remaining
+        {}
+        self.db
+            .current_integration_attempt(task)
+            .await
+            .unwrap()
+            .expect("imported as the Task's current attempt")
+    }
+}
+
+/// Importer rows P1 and P2 at the head of a queue: a merge whose result the
+/// old path never recorded. A candidate the target already contains is
+/// reported, never merged again and never reported failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_unknown_merge_that_landed_is_reported_and_never_repeated() {
+    for shape in [Legacy::RunningRemoteOperation, Legacy::IntentWithoutOutcome] {
+        let world = World::new().await;
+        let head = world.legacy_task("a", "a.txt", shape).await;
+        // The old merge landed; only its record is missing.
+        git_out(&world.repo("r"), &["merge", "--ff-only", &head])
+            .await
+            .unwrap();
+        let imported = world.import("a").await;
+        assert_eq!(imported.state, S::Reconciling, "{shape:?}");
+        assert_eq!(
+            world.queue_of(&imported).await.head_attempt_id.as_deref(),
+            Some(imported.id.as_str()),
+            "{shape:?}: an unknown result pins its queue"
+        );
+        let b = world.add_task("r", "b", "b.txt", "b\n").await;
+        // Run twice: a second start imports nothing more.
+        assert_eq!(world.db.import_integration_pass(100).await.unwrap().imported, 0);
+        let mut pump = Pump::new(world.worker());
+        world.settle(&mut pump).await;
+        let end = world.attempt(&imported.id).await;
+        assert_eq!(end.state, S::Completed, "{shape:?}: {:?}", end.failure_message);
+        assert_eq!(end.integrated_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(ff_successes(&world, &imported.id).await, 0, "{shape:?}");
+        assert_eq!(
+            world.steps.actions("a"),
+            vec![IntegrationStepAction::Result],
+            "{shape:?}: reported once, nothing else asked of the Task"
+        );
+        // The queue is open again and the next member merged behind it.
+        assert_eq!(
+            world.queue_of(&imported).await.state,
+            db::IntegrationQueueState::Open
+        );
+        assert_eq!(world.attempt(&b.id).await.state, S::Completed);
+    }
+}
+
+/// The same rows when the old merge did not land: the queue merges the
+/// candidate, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_unknown_merge_that_did_not_land_is_merged_once_by_the_queue() {
+    for shape in [Legacy::RunningRemoteOperation, Legacy::IntentWithoutOutcome] {
+        let world = World::new().await;
+        let head = world.legacy_task("a", "a.txt", shape).await;
+        let imported = world.import("a").await;
+        assert_eq!(imported.state, S::Reconciling, "{shape:?}");
+        let mut pump = Pump::new(world.worker());
+        world.settle(&mut pump).await;
+        let end = world.attempt(&imported.id).await;
+        assert_eq!(end.state, S::Completed, "{shape:?}: {:?}", end.failure_message);
+        assert_eq!(world.tip("r").await, head, "{shape:?}");
+        assert_eq!(ff_successes(&world, &imported.id).await, 1, "{shape:?}");
+        assert_eq!(
+            world.queue_of(&imported).await.state,
+            db::IntegrationQueueState::Open
+        );
+    }
+}
+
+/// Importer row P2 while the checkouts cannot be read: the head is
+/// quarantined with a typed reason and asked again on the reconcile timer.
+/// It never loops on a refused write, never leaves as `queued` or `parked`,
+/// and nothing behind it starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_unknown_merge_with_unreadable_checkouts_is_quarantined_not_looped() {
+    let world = World::new().await;
+    let head = world
+        .legacy_task("a", "a.txt", Legacy::RunningRemoteOperation)
+        .await;
+    let imported = world.import("a").await;
+    assert_eq!(
+        imported.current_operation_state,
+        Some(db::IntegrationOperationState::Uncertain)
+    );
+    let b = world.add_task("r", "b", "b.txt", "b\n").await;
+    world.facts.fail.store(true, Ordering::SeqCst);
+    let mut pump = Pump::new(world.worker());
+    for round in 0..3 {
+        // `settle` panics on a driver error: none in any round.
+        world.settle(&mut pump).await;
+        let unknown = world.attempt(&imported.id).await;
+        assert_eq!(unknown.state, S::Quarantined, "round {round}");
+        assert_eq!(
+            unknown.failure_kind,
+            Some(IntegrationFailureKind::NeedsFact)
+        );
+        assert_eq!(
+            world.queue_of(&imported).await.state,
+            db::IntegrationQueueState::Quarantined
+        );
+        assert_eq!(world.attempt(&b.id).await.state, S::Queued);
+        world.clock.advance(600);
+    }
+    assert!(world
+        .steps
+        .actions("a")
+        .contains(&IntegrationStepAction::Park));
+    // Readable again: Git shows it never landed, and the queue merges it.
+    world.facts.fail.store(false, Ordering::SeqCst);
+    world.clock.advance(600);
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&imported.id).await.state, S::Completed);
+    assert_eq!(ff_successes(&world, &imported.id).await, 1);
+    assert_eq!(world.attempt(&b.id).await.state, S::Completed);
+    let log = git_out(&world.repo("r"), &["log", "--format=%H", "main"])
+        .await
+        .unwrap();
+    assert_eq!(log.lines().filter(|line| *line == head).count(), 1);
+}

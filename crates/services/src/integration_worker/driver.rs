@@ -344,12 +344,20 @@ impl HeadDriver {
     /// `None`: ask now.
     fn unknown_result_wait(&mut self, a: &IntegrationAttempt) -> Option<Duration> {
         let at = self.reconcile_at?;
-        let intent = a.effect_intent_json.as_ref()?;
-        let link = self.w.owner.owner_connection(intent_owner(intent));
-        if link.is_some() && link != self.owner_link {
+        // An imported unknown result has no intent and so no owner link to
+        // watch: it is asked again on the timer alone.
+        if let Some(intent) = a.effect_intent_json.as_ref() {
+            let link = self.w.owner.owner_connection(intent_owner(intent));
+            if link.is_some() && link != self.owner_link {
+                return None;
+            }
+            self.owner_link = link;
+        } else if !matches!(
+            a.current_operation_state,
+            Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+        ) {
             return None;
         }
-        self.owner_link = link;
         let now = self.w.clock.now();
         (now < at).then(|| {
             (at - now)
@@ -1749,6 +1757,71 @@ impl HeadDriver {
             return Ok(Pass::Wait(
                 self.w.config.poll.min(self.w.config.reconcile_interval),
             ));
+        }
+        // An unknown result the importer took over: a merge that was in
+        // flight the old way when the server was upgraded. It has no fenced
+        // intent, so no owner receipt will ever settle it, and storage lets
+        // it leave only as `applied` or `quarantined` while the operation is
+        // unknown. Git decides once the checkouts can be read: every owner
+        // was restarted for the upgrade, so nothing started before it still
+        // runs. Until then the head is quarantined with a typed reason and
+        // asked again on the reconcile timer; it never loops on a refused
+        // write.
+        if matches!(
+            a.current_operation_state,
+            Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+        ) {
+            match &facts {
+                Ok(facts) => {
+                    let landed = facts.candidate_in_target
+                        && a.candidate_sha
+                            .as_deref()
+                            .is_none_or(|sha| sha == facts.candidate_head);
+                    let head = facts.candidate_head.clone();
+                    a = self
+                        .w
+                        .advance(&a.id, S::Reconciling, |a| {
+                            a.current_operation_state =
+                                landed.then_some(IntegrationOperationState::Succeeded);
+                            if landed {
+                                a.candidate_sha = Some(head);
+                            }
+                        })
+                        .await?;
+                }
+                Err(error) => {
+                    let message = format!(
+                        "the result of the merge that was in progress before the upgrade is unknown: {error}"
+                    );
+                    let queue = self.w.queue(&self.queue_id).await?;
+                    if queue.state == IntegrationQueueState::Open {
+                        self.w
+                            .db
+                            .quarantine_integration_queue(
+                                &queue.id,
+                                queue.revision,
+                                &self.w.instance,
+                                self.generation,
+                                IntegrationFailureKind::NeedsFact,
+                                &message,
+                            )
+                            .await?;
+                    }
+                    self.enqueue(&a, IntegrationStepAction::Park).await?;
+                    self.w
+                        .advance(&a.id, S::Quarantined, |a| {
+                            a.failure_kind = Some(IntegrationFailureKind::NeedsFact);
+                            a.failure_message = Some(bounded(&message));
+                        })
+                        .await?;
+                    self.w.defer_reconcile(&self.queue_id);
+                    self.reconcile_at =
+                        Some(later(self.w.clock.now(), self.w.config.reconcile_interval));
+                    return Ok(Pass::Wait(
+                        self.w.config.poll.min(self.w.config.reconcile_interval),
+                    ));
+                }
+            }
         }
         self.reconcile_at = None;
         // Settled. The newest receipt and a Git witness decide.

@@ -804,14 +804,26 @@ pub struct IntegrationImportPass {
     pub remaining: bool,
 }
 /// Progress is the unique `import:<Task>:<entry epoch>` admission identity.
-/// Selection excludes committed rows. A crash rolls back a whole bounded
+/// Selection excludes committed rows.
+///
+/// What is selected is bounded by the work in flight, not by history:
+///
+/// - a Task is imported at most once, and never once it has an attempt for
+///   its present status entry or one the queue admitted (`admit:`): from
+///   then on the queue's own rows are the record;
+/// - a `done` Task is never imported. Its merge landed and was reported the
+///   old way, nothing can run for it, and an install has one per merge it
+///   ever made: copying each one's evidence at the first start after the
+///   upgrade would hold every worker back for the length of the history.
+///   A `cancelled` Task is still read (a merge that was in flight when it
+///   was cancelled may have an unknown result). A crash rolls back a whole bounded
 /// slice, and the next pass starts at its first uncommitted entry. No third
 /// cursor table, Task mutation, step enqueue, condition statement or Git I/O.
 impl SqliteDb {
     pub async fn import_integration_pass(&self, limit: u32) -> Result<IntegrationImportPass> {
         let mut tx = begin_immediate(self.pool()).await?;
         let limit = limit.clamp(1, INTEGRATION_IMPORT_PAGE);
-        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN ('merging','merge_failed') OR (t.status IN ('done','cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN ('merging','merge_failed') OR l.to_state IN ('merging','merge_failed'))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND a.expected_epoch=t.status_epoch AND a.import_source_json IS NOT NULL) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?")
+        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN ('merging','merge_failed') OR (t.status IN ('cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN ('merging','merge_failed') OR l.to_state IN ('merging','merge_failed'))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%')) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?")
             .bind(limit+1).fetch_all(&mut *tx).await?;
         let mut pass = IntegrationImportPass {
             remaining: tasks.len() > limit as usize,

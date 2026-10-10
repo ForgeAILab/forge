@@ -576,9 +576,8 @@ async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
         .await
         .unwrap();
     assert_eq!(db.import_integration_pass(100).await.unwrap().imported, 2);
-    // Without the discard, an existing current attempt (the one admission
-    // wrote for the Task) is NOT replaced: the import row is retained
-    // non-current and asks for the fact.
+    // Without the discard, a Task the queue admitted is not imported at all:
+    // its attempt is the record, and no start writes a second row for it.
     sqlx::raw_sql("DELETE FROM integration_attempt; DELETE FROM integration_queue;")
         .execute(db.pool())
         .await
@@ -601,9 +600,31 @@ async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
             .id,
         admitted.id
     );
-    let (current, facts): (bool, String) = sqlx::query_as("SELECT current,json_extract(import_source_json,'$.needed_facts') FROM integration_attempt WHERE task_ref='a' AND import_source_json IS NOT NULL").fetch_one(db.pool()).await.unwrap();
-    assert!(!current);
-    assert!(facts.contains("existing_attempt_identity"));
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM integration_attempt WHERE task_ref='a'"
+        )
+        .await,
+        1
+    );
+    // Nor after the Task left that entry with the queue's attempt behind it.
+    sqlx::query("UPDATE task SET status='done',status_epoch=status_epoch+1 WHERE id='a'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('done','a','merging','done','workflow','merged',?)").bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+    assert_eq!(db.import_integration_pass(100).await.unwrap().examined, 0);
+    // A shadow row of the present entry stands for the Task as well.
+    sqlx::query("UPDATE task SET status='merging' WHERE id='a'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_attempt SET admission_key='shadow:a:1',expected_epoch=1 WHERE task_ref='a'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(db.import_integration_pass(100).await.unwrap().examined, 0);
 }
 
 #[tokio::test]
@@ -866,4 +887,71 @@ async fn the_cutover_migration_drops_only_the_removed_hook_from_stored_workflows
             "a definition without the hook is not rewritten"
         );
     }
+}
+
+/// A large install: `n` Tasks that merged the old way and are `done`, each
+/// with its transition history and a retained merge checkpoint, plus a few
+/// that are still in flight.
+async fn seed_merge_history(db: &SqliteDb, n: usize) {
+    let mut tx = db.pool().begin().await.unwrap();
+    for i in 0..n {
+        let id = format!("h{i:05}");
+        sqlx::query("INSERT INTO task(id,project_id,title,status,status_epoch,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'done',5,?,?,?)")
+            .bind(&id).bind(&id).bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(&mut *tx).await.unwrap();
+        for (n, (from, to)) in [("in_progress", "review"), ("review", "merging"), ("merging", "done")].iter().enumerate() {
+            sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES(?,?,?,?,'system','history',?)")
+                .bind(format!("{id}-{n}")).bind(&id).bind(from).bind(to).bind(FIXED_TIME).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,attempts,created_at,updated_at,expected_epoch,lane) VALUES(?,?,1,'hooks','{}','entry',?,1,'merging',3,'done',?,1,?,?,4,'long')")
+            .bind(format!("s-{id}")).bind(&id).bind(format!("c-{id}")).bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES(?,0,?,?)")
+            .bind(format!("s-{id}")).bind(FIXED_TIME)
+            .bind(serde_json::json!({"merge_intent":{"target_branch":"main","candidate_sha":"c"},"merge_outcome":{"Done":{"after_sha":"c","branch":"main","before_sha":"b"}}}).to_string())
+            .execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
+/// The start-time import on a large install. Run by name with
+/// `--ignored --nocapture`; prints the wall time of the import that precedes
+/// every worker.
+#[tokio::test]
+#[ignore = "measurement: 5000 terminal Tasks on a file-backed database"]
+async fn start_time_import_of_a_large_history_is_bounded() {
+    let dir = std::env::temp_dir().join(format!("forge-import-measure-{}", crate::new_uuid_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = crate::create_sqlite_pool(&format!("sqlite://{}", dir.join("forge.db").display()))
+        .await
+        .unwrap();
+    crate::run_migrations(&pool).await.unwrap();
+    let db = SqliteDb::new(pool);
+    seed(db.pool()).await;
+    seed_delivery(&db, "a").await;
+    seed_merge_history(&db, 5000).await;
+    let started = std::time::Instant::now();
+    let mut imported = 0;
+    let mut passes = 0;
+    loop {
+        let pass = db.import_integration_pass(INTEGRATION_IMPORT_PAGE).await.unwrap();
+        imported += pass.imported;
+        passes += 1;
+        if !pass.remaining || pass.examined == 0 {
+            break;
+        }
+    }
+    let first = started.elapsed();
+    let started = std::time::Instant::now();
+    let again = db.import_integration_pass(INTEGRATION_IMPORT_PAGE).await.unwrap();
+    let second = started.elapsed();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_attempt")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    println!("import of 5000 terminal + 2 live Tasks: {imported} imported in {passes} passes, {first:?}; second start {second:?}; {rows} attempt rows");
+    assert_eq!(again.imported, 0);
+    // Only the Tasks in flight are read; the merged history is left alone.
+    assert_eq!((imported, rows), (2, 2));
+    assert!(first < std::time::Duration::from_secs(2), "{first:?}");
+    assert!(second < std::time::Duration::from_secs(2), "{second:?}");
+    let _ = std::fs::remove_dir_all(dir);
 }
