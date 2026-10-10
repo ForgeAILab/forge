@@ -6965,3 +6965,83 @@ async fn the_server_refuses_to_fast_forward_a_candidate_it_was_not_sent() {
     );
     assert!(attempt.effect_intent_json.is_none(), "settled, not unknown");
 }
+
+/// The same race with the owners reversed: Task on the server, default
+/// checkout on a daemon, and the daemon's checkout moves while the head
+/// check runs on the server. The daemon refuses the transferred candidate
+/// (its target witness no longer holds) before any effect; the head goes
+/// through a new round and lands on top of the new tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cross_owner_daemon_target_moved_between_rebase_and_fast_forward_starts_a_new_round() {
+    use db::IntegrationOperationKind as Kind;
+    let fixture = Fixture::file_backed("forge-queue-cross-moved-daemon").await;
+    let (placement, _task_clone, candidate) = server_placed_task(&fixture).await;
+    let head = admit_placed_head(
+        &fixture,
+        &placement,
+        candidate,
+        &["test -f outside.txt && sleep 2"],
+    )
+    .await;
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    start_check_worker!(fixture, stop_checks);
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the first head check", {
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run")
+            .fetch_one(fixture.harness.state.db.pool())
+            .await
+            .unwrap();
+        queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Checking
+            && runs > 0
+    });
+    let first_candidate = queue_attempt(&fixture, &head).await.candidate_sha.unwrap();
+    std::fs::write(fixture.checkout.join("late.txt"), "late\n").unwrap();
+    git::commit_all(&fixture.checkout, "late").await.unwrap();
+    let late_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+
+    queue_eventually!(&fixture, &head, "the Task to merge", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = queue_attempt(&fixture, &head).await;
+    let tip = git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(attempt.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(
+        attempt.integrated_before_sha.as_deref(),
+        Some(late_tip.as_str())
+    );
+    assert_ne!(
+        tip, first_candidate,
+        "the first round's commit never landed"
+    );
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", &format!("{tip}^")]),
+        late_tip
+    );
+    for file in ["feature.txt", "outside.txt", "late.txt"] {
+        assert!(fixture.checkout.join(file).exists(), "{file}");
+    }
+    // Two rebases on the server; the daemon refused once and landed once.
+    assert_eq!(succeeded(&attempt, Kind::Rebase), vec![None, None]);
+    let fast_forwards = receipt_owners(&attempt, Kind::FastForward);
+    assert_eq!(
+        fast_forwards,
+        vec![
+            (
+                db::IntegrationOperationState::Failed,
+                Some(fixture.daemon_id.clone())
+            ),
+            (
+                db::IntegrationOperationState::Succeeded,
+                Some(fixture.daemon_id.clone())
+            )
+        ],
+        "{:?}",
+        attempt_receipts(&attempt)
+    );
+}
