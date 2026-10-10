@@ -429,6 +429,43 @@ Forge only after the command exits. Already-incremental databases are left in
 that mode without another full rebuild. Existing databases are never fully
 vacuumed automatically.
 
+Workspace garbage collection is configured under `workspace` in `forge.yaml`:
+
+```yaml
+workspace:
+  log_retention_days: 30        # logs of a terminal Task; 0 keeps them forever
+  min_free_bytes: 10737418240   # free-space floor: the larger of this
+  min_free_percent: 5           # and this share of the filesystem
+```
+
+Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
+`log_retention_days` after a terminal Task last changed. While the workspace
+root's filesystem has less free space than the floor, the periodic sweep
+deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
+least recently used first; those Tasks rebuild on their next run. Running work
+is never touched. `FORGE_WORKSPACE_LOG_RETENTION_DAYS`,
+`FORGE_WORKSPACE_MIN_FREE_BYTES` and `FORGE_WORKSPACE_MIN_FREE_PERCENT`
+override the file values; all three take effect on restart. A daemon uses the
+default floor. No key turns garbage collection off.
+
+Garbage collection runs only on a workspace root this server's database owns.
+The server adopts its root at start-up by writing `.forge/gc/owner` under it,
+and refuses a root that is the home directory or a parent of it, a git
+repository, a top-level directory or a symbolic link. Give every server its
+own workspace root: a second database on the same root leaves it unswept.
+After a database reset the root still names the old database, nothing is
+reclaimed and the disk can fill; the server log and operator status (the
+Operations page) say so. To take the root over, stop Forge and start it once
+with:
+
+```bash
+forge --reclaim-workspace-gc
+```
+
+Task directories the old database knew and the new one does not are then
+moved to `.forge/gc/` after a day and deleted a day later (see
+[Workspace garbage collection](architecture.md#workspace-garbage-collection)).
+
 `workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
 placement, or a server-owned workspace executed on a remote daemon, waits for
 that daemon to reconnect. Both freeze heartbeat leases to prevent a second
@@ -1320,12 +1357,12 @@ or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
 For containers sharing server workspaces, register a server-owned `shared_mount`
 location instead. Forge verifies a server-written probe through the daemon at
 the same path before using it as an execution provider. Matching absolute paths
-alone are insufficient. Daemon ownership requires revision 6 with `workspace.v1`.
+alone are insufficient. Daemon ownership requires revision 7 with `workspace.v1`.
 
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 6 or newer), restarting each with its existing
+release (protocol revision 7 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 6 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -1336,7 +1373,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 6, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

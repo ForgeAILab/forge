@@ -15,7 +15,7 @@ pub use driver::{HeadDriver, ParkReason, Pass};
 pub use ports::*;
 pub use table::{head_row, CancelRule, HeadAction, HeadStateRow, HeadTimeout, HEAD_TABLE};
 
-use crate::{integration_owner::ServerIntegrationOwner, Result, ServiceError};
+use crate::{Result, ServiceError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use db::{
@@ -59,6 +59,21 @@ pub struct IntegrationWorkerConfig {
     pub max_rounds: i64,
     pub transfer_cap_bytes: u64,
     pub page: u32,
+    /// While a head waits for a check verdict, ask for it again this often.
+    /// The ask joins the running check, or applies a verdict whose delivery
+    /// to the Task failed, so a lost delivery is not waited out.
+    pub check_reask: Duration,
+    /// Times one session asks again for a deciding step (`request_check`,
+    /// `settle`) that settled without answering, before it parks the head.
+    pub step_reasks: u32,
+    /// The Task-step side's timers (`IntegrationSteps::with_timers`): how
+    /// long the protected `result` step sleeps before it looks for itself,
+    pub result_wake: Duration,
+    /// its poll while a fast-forward is in flight or unknown,
+    pub result_poll: Duration,
+    /// and how long a `result` that could not be applied waits. The worker
+    /// re-arms it on every sweep while the attempt is `applied`.
+    pub result_park: Duration,
 }
 impl Default for IntegrationWorkerConfig {
     fn default() -> Self {
@@ -86,6 +101,11 @@ impl Default for IntegrationWorkerConfig {
             max_rounds: 9,
             transfer_cap_bytes: 256 * 1024 * 1024,
             page: 100,
+            check_reask: Duration::from_secs(60),
+            step_reasks: 2,
+            result_wake: Duration::from_secs(150),
+            result_poll: Duration::from_secs(15),
+            result_park: Duration::from_secs(600),
         }
     }
 }
@@ -109,16 +129,46 @@ struct Shared {
     /// are claimable than `max_heads`.
     cursor: Option<String>,
     reconcile_after: HashMap<String, DateTime<Utc>>,
-    /// Queued members of a suspended queue whose Task was told, by queue.
-    suspended_told: HashMap<String, HashSet<String>>,
+}
+
+/// Times a released attempt's Task step (`send_back`, `park`, `clear`) is
+/// asked again after it settled without applying.
+pub(crate) const RELEASE_REASKS: usize = 3;
+
+/// Bound of the worker's own journal on an attempt (`operation_receipts_json`).
+pub(crate) const JOURNAL_MAX: usize = 64;
+pub(crate) fn journal_push(attempt: &mut IntegrationAttempt, entry: serde_json::Value) {
+    let mut journal = attempt
+        .operation_receipts_json
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    journal.push(entry);
+    let excess = journal.len().saturating_sub(JOURNAL_MAX);
+    journal.drain(..excess);
+    attempt.operation_receipts_json = journal.into();
+}
+/// The Task of this waiting member was told its queue is suspended, at the
+/// member's present `effect_seq`. Stored on the attempt, so a restart neither
+/// tells it twice nor forgets to tell it the wait is over.
+fn told_suspended(attempt: &IntegrationAttempt) -> bool {
+    attempt
+        .operation_receipts_json
+        .as_array()
+        .and_then(|journal| journal.last())
+        .is_some_and(|entry| {
+            entry["kind"] == "worker_told"
+                && entry["effect_seq"].as_i64() == Some(attempt.effect_seq)
+        })
 }
 
 pub struct IntegrationQueueWorker {
     pub(crate) db: Arc<SqliteDb>,
-    pub(crate) owner: Arc<ServerIntegrationOwner>,
+    pub(crate) owner: Arc<dyn IntegrationOwnerPort>,
     pub(crate) steps: Arc<dyn IntegrationStepPort>,
     pub(crate) facts: Arc<dyn IntegrationFactsPort>,
     pub(crate) transfer: Arc<dyn ObjectTransferPort>,
+    pub(crate) locations: Option<Arc<dyn IntegrationLocationPort>>,
     pub(crate) clock: Arc<dyn WorkerClock>,
     pub(crate) config: IntegrationWorkerConfig,
     pub(crate) instance: String,
@@ -146,7 +196,7 @@ pub(crate) fn is_conflict(error: &ServiceError) -> bool {
 impl IntegrationQueueWorker {
     pub fn new(
         db: Arc<SqliteDb>,
-        owner: Arc<ServerIntegrationOwner>,
+        owner: Arc<dyn IntegrationOwnerPort>,
         steps: Arc<dyn IntegrationStepPort>,
         facts: Arc<dyn IntegrationFactsPort>,
         transfer: Arc<dyn ObjectTransferPort>,
@@ -159,6 +209,7 @@ impl IntegrationQueueWorker {
             steps,
             facts,
             transfer,
+            locations: None,
             clock,
             config,
             instance: format!("integration-worker:{}", db::new_uuid_v4()),
@@ -167,6 +218,13 @@ impl IntegrationQueueWorker {
             #[cfg(test)]
             fault: Mutex::new(None),
         }
+    }
+
+    /// The location verification the worker requests when an owner refuses a
+    /// claim's target. Without it such a head parks and retries with backoff.
+    pub fn with_locations(mut self, locations: Arc<dyn IntegrationLocationPort>) -> Self {
+        self.locations = Some(locations);
+        self
     }
 
     #[cfg(test)]
@@ -204,9 +262,19 @@ impl IntegrationQueueWorker {
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let stop = CancellationToken::new();
         let mut heads: JoinSet<()> = JoinSet::new();
+        // No transfer of this process is running yet: leftovers of a crashed
+        // one, and the refs of attempts that hold no slot, can go.
+        if let Err(error) = self.transfer.sweep_at_start().await {
+            tracing::warn!(target: "services::integration_worker", %error, "integration transfer sweep failed at start");
+        }
         loop {
             if *shutdown.borrow_and_update() {
                 break;
+            }
+            // Releases a daemon owner still owes from before this start; a
+            // no-op once they are done.
+            if let Err(error) = self.transfer.sweep_owners().await {
+                tracing::warn!(target: "services::integration_worker", %error, "integration transfer release on daemon owners failed; the next sweep retries");
             }
             match self.sweep_once().await {
                 Ok(drivers) => {
@@ -343,7 +411,163 @@ impl IntegrationQueueWorker {
     pub async fn sweep_once(self: &Arc<Self>) -> Result<Vec<HeadDriver>> {
         self.sweep_cancel_requests().await?;
         self.sweep_due_parked().await?;
+        if let Err(error) = self.sweep_dead_release_steps().await {
+            tracing::warn!(target: "services::integration_worker", %error, "integration release-step sweep failed; the next sweep retries");
+        }
         self.sweep_claims().await
+    }
+
+    /// A released attempt tells its Task what happened through one Task step:
+    /// `send_back` (ejected, needs review), `park` (parked), `clear`
+    /// (cancelled). A step that settled without applying (its handler failed
+    /// for good, or a preempting command dropped it) leaves the Task showing
+    /// a wait that is over. Such a step is asked again under a new
+    /// `effect_seq`, at most [`RELEASE_REASKS`] times; then the queue says so
+    /// in `last_error` and the attempt is left alone.
+    ///
+    /// Read: released attempts whose present `effect_seq` has no
+    /// acknowledgment (`send_back` and `park` acknowledge; `clear` does not,
+    /// so cancelled attempts are read for a day after they ended).
+    async fn sweep_dead_release_steps(&self) -> Result<()> {
+        let recent = stamp(self.clock.now() - chrono::Duration::days(1));
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .db
+                .untold_released_integration_attempts(&recent, after.as_deref(), self.config.page)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id.clone());
+            let full = page.len() as u32 >= self.config.page;
+            for attempt in page {
+                match self.reask_dead_release_step(&attempt).await {
+                    Ok(()) => {}
+                    Err(error) if is_conflict(&error) => {}
+                    Err(error) => {
+                        tracing::warn!(target: "services::integration_worker", attempt_id = %attempt.id, %error, "integration release step was not asked again");
+                    }
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn reask_dead_release_step(&self, attempt: &IntegrationAttempt) -> Result<()> {
+        use IntegrationAttemptState as S;
+        let action = match attempt.state {
+            S::Ejected | S::NeedsReview => IntegrationStepAction::SendBack,
+            S::Parked => IntegrationStepAction::Park,
+            S::Cancelled => IntegrationStepAction::Clear,
+            _ => return Ok(()),
+        };
+        let request = Self::step_request(attempt, action);
+        let state = self.steps.step_state(&request).await?;
+        if !matches!(
+            state,
+            IntegrationStepState::Dead | IntegrationStepState::TaskLeft
+        ) {
+            return Ok(());
+        }
+        // A Task that left the status entry the attempt was admitted in has
+        // moved on by another route: there is nothing left to tell it.
+        let live = state == IntegrationStepState::Dead;
+        if attempt.state == S::Cancelled {
+            // A terminal row is not written again. The `clear` handler does
+            // not bind `effect_seq`, so the re-asks are told apart by their
+            // keys alone.
+            for extra in 1..=RELEASE_REASKS as i64 {
+                let mut again = request.clone();
+                again.effect_seq = attempt.effect_seq + extra;
+                match self.steps.step_state(&again).await? {
+                    IntegrationStepState::Missing => return self.steps.enqueue_step(&again).await,
+                    IntegrationStepState::Live | IntegrationStepState::Done => return Ok(()),
+                    IntegrationStepState::Dead | IntegrationStepState::TaskLeft => {}
+                }
+            }
+            // A cancelled attempt's Task has left its entry by definition;
+            // the step still had a reason of this attempt to clear.
+            return self.tell_queue_owner(attempt, action).await;
+        }
+        let at = stamp(self.clock.now());
+        let asked = attempt
+            .operation_receipts_json
+            .as_array()
+            .map_or(0, |journal| {
+                journal
+                    .iter()
+                    .filter(|entry| {
+                        entry["kind"] == "worker_reask" && entry["action"] == action.as_str()
+                    })
+                    .count()
+            });
+        if !live || asked >= RELEASE_REASKS {
+            if live {
+                self.tell_queue_owner(attempt, action).await?;
+            }
+            let reason = if live { "asks_exhausted" } else { "task_left" };
+            self.advance_if(&attempt.id, attempt.state, move |attempt| {
+                journal_push(
+                    attempt,
+                    serde_json::json!({"kind":"worker_reask_exhausted","action":action.as_str(),"reason":reason,"at":at}),
+                );
+                true
+            })
+            .await?;
+            return Ok(());
+        }
+        // Enqueued first, like every step: one whose attempt is not at its
+        // `effect_seq` yet retries.
+        let seq = attempt.effect_seq + 1;
+        let mut again = request;
+        again.effect_seq = seq;
+        self.steps.enqueue_step(&again).await?;
+        self.advance_if(&attempt.id, attempt.state, move |attempt| {
+            if attempt.effect_seq + 1 != seq {
+                return false;
+            }
+            attempt.effect_seq = seq;
+            attempt.effect_ack_json = None;
+            attempt.acknowledged_at = None;
+            journal_push(
+                attempt,
+                serde_json::json!({"kind":"worker_reask","action":action.as_str(),"effect_seq":seq,"at":at}),
+            );
+            true
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The queue's `last_error` names a Task that could not be told what its
+    /// attempt came to. Written once per message.
+    async fn tell_queue_owner(
+        &self,
+        attempt: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<()> {
+        let Some(queue_id) = attempt.queue_id.as_deref() else {
+            return Ok(());
+        };
+        let message = format!(
+            "task_step_failed: the `{}` step of Task {} (attempt {}, {}) failed {} times; the Task was not told",
+            action.as_str(),
+            attempt.task_ref,
+            attempt.id,
+            attempt.state,
+            RELEASE_REASKS + 1
+        );
+        self.db
+            .note_integration_queue_error(
+                queue_id,
+                db::IntegrationFailureKind::Infrastructure,
+                &message,
+                &stamp(self.clock.now()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Cancel requests on attempts that hold no slot. A flagged head is its
@@ -411,14 +635,54 @@ impl IntegrationQueueWorker {
                 if attempt.cancel_requested_at.is_some() {
                     continue;
                 }
+                // A counted retry (infrastructure, timeout) is over: one
+                // `park` step restates `waiting` on the Task (the handler
+                // reads the attempt as it is then). It gets a fresh
+                // `effect_seq`; the park that began the wait used the present
+                // one. Enqueued first: a step whose attempt is not re-queued
+                // yet retries, and a repeat is the same key. A wait with no
+                // end of its own (a paused Project, a target that is not
+                // ready) restates nothing until it really ends: its Task was
+                // told once when the wait began.
+                let counted = attempt
+                    .operation_receipts_json
+                    .as_array()
+                    .and_then(|journal| {
+                        journal
+                            .iter()
+                            .rev()
+                            .find(|entry| entry["kind"] == "worker_park")
+                    })
+                    .is_none_or(|entry| entry["counted"] == true);
+                let seq = attempt.effect_seq + i64::from(counted);
+                if counted {
+                    let mut restate = Self::step_request(&attempt, IntegrationStepAction::Park);
+                    restate.effect_seq = seq;
+                    if let Err(error) = self.steps.enqueue_step(&restate).await {
+                        tracing::warn!(target: "services::integration_worker", attempt_id = %attempt.id, %error, "integration re-queue step was not enqueued; the next sweep retries");
+                        continue;
+                    }
+                }
                 match self
-                    .advance(&attempt.id, IntegrationAttemptState::Queued, |attempt| {
+                    .advance_if(&attempt.id, IntegrationAttemptState::Queued, |attempt| {
+                        if attempt.state != IntegrationAttemptState::Parked
+                            || attempt.effect_seq + i64::from(counted) != seq
+                        {
+                            return false;
+                        }
                         attempt.available_at = None;
                         attempt.resume_state = None;
+                        if counted {
+                            attempt.effect_seq = seq;
+                            attempt.effect_ack_json = None;
+                            attempt.acknowledged_at = None;
+                        }
+                        true
                     })
                     .await
                 {
-                    Ok(_) => requeued = true,
+                    Ok(Some(_)) => requeued = true,
+                    Ok(None) => {}
                     Err(error) if is_conflict(&error) => {}
                     Err(error) => {
                         tracing::warn!(target: "services::integration_worker", attempt_id = %attempt.id, %error, "integration parked retry failed for one attempt");
@@ -561,11 +825,11 @@ impl IntegrationQueueWorker {
             .await
         {
             Ok(claimed) => {
-                self.shared
-                    .lock()
-                    .expect("integration worker state")
-                    .suspended_told
-                    .remove(&claimed.id);
+                // The queue is open (the claim re-opens a suspended one):
+                // members that were told it is suspended wait in line again.
+                if let Err(error) = self.restate_waiting(&claimed).await {
+                    tracing::warn!(target: "services::integration_worker", queue_id = %claimed.id, %error, "integration members were not told their queue re-opened; the next claim retries");
+                }
                 Ok(Some(HeadDriver::new(Arc::clone(self), &claimed)))
             }
             Err(db::DbError::NotFound) => Ok(None),
@@ -594,26 +858,67 @@ impl IntegrationQueueWorker {
             if !waits || member.cancel_requested_at.is_some() {
                 continue;
             }
-            let told = self
-                .shared
-                .lock()
-                .expect("integration worker state")
-                .suspended_told
-                .get(queue_id)
-                .is_some_and(|told| told.contains(&member.id));
-            if told {
+            if told_suspended(&member) {
                 continue;
             }
             self.steps
                 .enqueue_step(&Self::step_request(&member, IntegrationStepAction::Park))
                 .await?;
-            self.shared
-                .lock()
-                .expect("integration worker state")
-                .suspended_told
-                .entry(queue_id.to_owned())
-                .or_default()
-                .insert(member.id);
+            let (seq, at) = (member.effect_seq, stamp(self.clock.now()));
+            match self
+                .advance_if(&member.id, member.state, move |member| {
+                    if member.effect_seq != seq {
+                        return false;
+                    }
+                    journal_push(
+                        member,
+                        serde_json::json!({"kind":"worker_told","reason":"queue_suspended","effect_seq":seq,"at":at}),
+                    );
+                    true
+                })
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Produce `park` for every waiting member whose Task was told the queue
+    /// is suspended: the step now finds an open queue and restates `waiting`.
+    /// Level-triggered on the stored mark, so it also runs for a queue that
+    /// re-opened under a process that died before telling anyone.
+    async fn restate_waiting(&self, claimed: &IntegrationQueue) -> Result<()> {
+        for member in self.db.integration_members(&claimed.id, 1000).await? {
+            if member.state != IntegrationAttemptState::Queued
+                || claimed.head_attempt_id.as_deref() == Some(&member.id)
+                || member.cancel_requested_at.is_some()
+                || !told_suspended(&member)
+            {
+                continue;
+            }
+            let seq = member.effect_seq + 1;
+            let mut restate = Self::step_request(&member, IntegrationStepAction::Park);
+            restate.effect_seq = seq;
+            self.steps.enqueue_step(&restate).await?;
+            match self
+                .advance_if(&member.id, IntegrationAttemptState::Queued, move |member| {
+                    if member.effect_seq + 1 != seq {
+                        return false;
+                    }
+                    member.effect_seq = seq;
+                    member.effect_ack_json = None;
+                    member.acknowledged_at = None;
+                    true
+                })
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

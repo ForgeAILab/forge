@@ -53,6 +53,12 @@ struct WorkspaceRegistry {
     /// pruned [`CANCEL_TOMBSTONE_RETENTION_SECS`] after it.
     #[serde(default)]
     cancel_tombstones: HashMap<String, u64>,
+    /// This handle table's identity as the owner of its workspace root, for
+    /// the garbage collector. It lives and dies with the table: a daemon
+    /// whose state was lost is a different owner and sweeps nothing on a
+    /// root the old state adopted.
+    #[serde(default)]
+    gc_owner_id: Option<String>,
 }
 
 /// A delayed request for a cancelled operation cannot arrive a week later:
@@ -141,6 +147,13 @@ pub struct DaemonWorkspaceBackend {
     owner_locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     provision_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     running_commands: Mutex<HashMap<String, RunningWorkspaceCommand>>,
+    /// Last handle directory the garbage-collection pass finished.
+    gc_cursor: Mutex<String>,
+    /// The exclusive lock on `<root>/.forge/gc/daemon.lock`, held for the
+    /// life of this backend. Only its holder sweeps the root: a second
+    /// daemon process (or a second backend) on the same root has its own
+    /// live runs this one cannot see, and gets `None`.
+    gc_lock: Option<std::fs::File>,
 }
 
 impl DaemonWorkspaceBackend {
@@ -167,17 +180,22 @@ impl DaemonWorkspaceBackend {
                 }
             }
         }
+        let mut state: WorkspaceRegistry = journal.load_workspace_state()?;
+        let gc_lock = gc::adopt_root(&workspace_root, &mut state, &journal);
         // No run survives a daemon restart, so every per-run temp directory
-        // left under an owned Task root belongs to a dead run.
-        let swept =
-            executors::sandbox::sweep_dead_runs(&workspace_root.join(WORKTREE_DIRECTORY), []);
-        if swept > 0 {
-            tracing::info!(
-                swept,
-                "removed temp directories of runs that did not settle"
-            );
+        // left under an owned Task root belongs to a dead run. That holds
+        // only for the one daemon on this root: another process that shares
+        // it has runs of its own, so only the holder of the root lock sweeps.
+        if gc_lock.is_some() {
+            let swept =
+                executors::sandbox::sweep_dead_runs(&workspace_root.join(WORKTREE_DIRECTORY), []);
+            if swept > 0 {
+                tracing::info!(
+                    swept,
+                    "removed temp directories of runs that did not settle"
+                );
+            }
         }
-        let state = journal.load_workspace_state()?;
         object_transfer::sweep_at_start(&workspace_root, &state);
         Ok(Self {
             manager: WorkspaceManager::new(workspace_root.join(WORKTREE_DIRECTORY)),
@@ -189,6 +207,8 @@ impl DaemonWorkspaceBackend {
             owner_locks: Mutex::new(HashMap::new()),
             provision_locks: Mutex::new(HashMap::new()),
             running_commands: Mutex::new(HashMap::new()),
+            gc_cursor: Mutex::new(String::new()),
+            gc_lock,
         })
     }
 
@@ -2361,6 +2381,7 @@ async fn merge_diffstat(
     Ok(stats)
 }
 
+pub mod gc;
 mod inspection;
 mod owner_operations;
 mod reconciliation;

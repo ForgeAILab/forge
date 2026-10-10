@@ -2121,14 +2121,14 @@ the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
 conflict. The minimum command protocol revision is 6. A revision-5 or older daemon
 receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
-from the server's release (protocol revision 6 or newer). Every command RPC is
+from the server's release (protocol revision 7 or newer). Every command RPC is
 refused, including execution, repository verification, `fs.list`, `fs.branches`,
 workspace operations, and PTY terminals. REST maps the upgrade refusal to HTTP
 `409 daemon_upgrade_required` with `needs_human: true`; placement rejection
 includes that filter code in `rejected_candidates`. An upgrade-only dispatch
 refusal records an actionable blocker and creates no Execution; reservation
 returns the typed error without modifying the Task. The heartbeat sweep clears
-upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 6.
+upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 7.
 Repository locations retain the upgrade reason in `last_error` after a verification
 attempt, without changing their verification status; pinned Agents expose
 `effective_status: "daemon_upgrade_required"`. Operator `daemon_issues[].issue`
@@ -3495,7 +3495,14 @@ an item in a project the caller cannot access.
 
 ## Operator status
 
-`GET /api/v1/operations/status` requires an administrator. The existing execution,
+`GET /api/v1/operations/status` requires an administrator. While workspace
+garbage collection is off for the server's workspace root (the root is owned
+by another database, as after a database reset, or cannot be a workspace
+root), `recent_errors` carries one entry with `entity_type` `workspace_gc`,
+`entity_id` the root path and severity `attention`; it goes away when the
+root is owned (`forge --reclaim-workspace-gc`). No response field changed.
+
+The existing execution,
 capacity, cleanup, retry, usage, and error summaries now also include:
 
 | Field | Meaning |
@@ -4412,7 +4419,7 @@ blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
 The dispatch-failure annotation and Task metadata record the refused daemon IDs.
 The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
-daemon reconnects at revision 6, even when a blocking annotation was preserved.
+daemon reconnects at revision 7, even when a blocking annotation was preserved.
 Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
 `recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
 `before_work_hook_failed`, and `before_work_hook_timeout` annotations.
@@ -4453,7 +4460,10 @@ sharing a root workspace expose that root's placement. The object includes
 `workspace_handle`, `generation`, `state`, `selected_by`, `selection_reason`,
 `reserved_until`, `disconnected_at`, `failure_cause`, `version`, and timestamps.
 The handle is opaque; `worktree_path` is populated only for server placements
-and is empty for daemon placements. Responses expose reserved/preparing and
+and is empty for daemon placements. Workspace responses also carry
+`disk_bytes` (disk bytes of the Task root as last measured by the server's
+garbage-collection sweep) and `disk_measured_at` (RFC 3339); both are `null`
+until the sweep has measured the root, and stay `null` for daemon placements. Responses expose reserved/preparing and
 disconnected placements even when the owner cannot be reached. Placement version
 conflicts use the ordinary HTTP `409 version_conflict` error.
 A claim on a `cleaning` or prepared `failed` placement returns
@@ -4514,7 +4524,7 @@ Server-owned and verified shared-mount plan files retain their layout and
 
 ### Workspace daemon protocol
 
-Protocol revision 6 negotiates `workspace.v1` and is required for every command
+Protocol revision 7 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
 Revision-5 and older daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch

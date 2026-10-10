@@ -16,3 +16,8 @@ pub const DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES: u64 = 104_857_600;
 /// Charter carries a scaffold. Pinned so a Project's first commit is
 /// reproducible; `bunx` resolves it, so `bun` is the only host dependency.
 pub const DEFAULT_SCAFFOLD_COMMAND: &str = "bunx @forgeailab/create-spark@0.4.5";
+/// Logs of a terminal Task are deleted after this many days.
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
+/// Free-space floor of the workspace root's filesystem: the larger of these.
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const DEFAULT_MIN_FREE_PERCENT: u8 = 5;

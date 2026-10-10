@@ -6,4 +6,14 @@ export type WorkspaceResponse = { id: string, task_id: string, repo_id: string,
 /**
  * A host path for server placements; empty for daemon placements.
  */
-worktree_path: string, placement: WorkspacePlacementResponse, pending_remote_cancel: Array<PendingRemoteCancel>, branch: string, status: string, before_sha: string | null, error: string | null, created_at: string, updated_at: string, };
+worktree_path: string, placement: WorkspacePlacementResponse, pending_remote_cancel: Array<PendingRemoteCancel>, branch: string, status: string, before_sha: string | null, error: string | null, 
+/**
+ * Disk bytes of the Task root as last measured by the server's
+ * garbage-collection sweep. `null` until it has been measured, and for
+ * daemon placements (a daemon does not report sizes).
+ */
+disk_bytes: number | null, 
+/**
+ * When `disk_bytes` was measured (RFC 3339).
+ */
+disk_measured_at: string | null, created_at: string, updated_at: string, };

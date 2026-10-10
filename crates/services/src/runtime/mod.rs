@@ -807,9 +807,20 @@ impl ForgeRuntimeBuilder {
             runner: check_runner,
             consumers: check_consumers,
             worker: check_worker,
+            owners: check_owners,
         } = task_service.compose_checks(
             daemon_connections.clone(),
             Duration::from_secs(effective_config.workspace.max_disconnect_seconds),
+        );
+        cleanup_scheduler.set_live_check_counter(check_owners.live_operation_counter());
+        cleanup_scheduler
+            .set_check_timeout(u64::from(effective_config.server.check_run_timeout_seconds));
+        cleanup_scheduler.set_gc_limits(
+            effective_config.workspace.log_retention_days,
+            executors::gc::FreeFloor {
+                min_free_bytes: effective_config.workspace.min_free_bytes,
+                min_free_percent: effective_config.workspace.min_free_percent,
+            },
         );
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(

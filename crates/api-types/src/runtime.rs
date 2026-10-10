@@ -89,6 +89,13 @@ pub struct WorkspaceResponse {
     pub status: String,
     pub before_sha: Option<String>,
     pub error: Option<String>,
+    /// Disk bytes of the Task root as last measured by the server's
+    /// garbage-collection sweep. `null` until it has been measured, and for
+    /// daemon placements (a daemon does not report sizes).
+    #[ts(type = "number | null")]
+    pub disk_bytes: Option<i64>,
+    /// When `disk_bytes` was measured (RFC 3339).
+    pub disk_measured_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

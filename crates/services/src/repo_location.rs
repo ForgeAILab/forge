@@ -136,7 +136,14 @@ impl DaemonLocationVerifier for RemoteDaemonLocationVerifier {
                     },
                     default_branch: repo.default_branch.clone(),
                     remote_url: repo.remote_url.clone().filter(|url| !url.is_empty()),
-                    expected_version: location.version,
+                    // The version this verification is stored as: the caller
+                    // writes the row next, compare-and-set on the present
+                    // version, which adds one. The owner keeps this number
+                    // and compares a queue claim's frozen location
+                    // generation with it; sending the present version left
+                    // the owner one behind after every stored verification,
+                    // so it refused every later claim `foreign_owner`.
+                    expected_version: location.version + 1,
                     probe: probe.as_ref().map(|probe| RepoLocationProbe {
                         path: probe.path.to_string_lossy().into_owned(),
                         content: probe.content.clone(),
@@ -481,6 +488,32 @@ impl RepoLocationService {
             return Err(DbError::VersionConflict.into());
         }
         self.verify_registered_location(&repo, location).await
+    }
+
+    /// Verify one location again on behalf of the system (the merge queue
+    /// asks when the owner of a default checkout refuses a claim because its
+    /// record of the location differs from the server's). `Ok(None)`: the
+    /// location is gone, or provisioning owns its verification right now.
+    pub async fn reverify(&self, location_id: &str) -> Result<Option<RepoLocation>> {
+        let provisioning: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE location_id = ?)",
+        )
+        .bind(location_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(DbError::from)?;
+        if provisioning {
+            return Ok(None);
+        }
+        let Some(location) = RepoLocationRepo::get_by_id(&*self.db, location_id).await? else {
+            return Ok(None);
+        };
+        let repo = RepoRepo::get_by_id(&*self.db, &location.repo_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("repo", &location.repo_id))?;
+        self.verify_registered_location(&repo, location)
+            .await
+            .map(Some)
     }
 
     /// Invoke after accepting the replacement daemon's command-stream handshake.
@@ -1034,7 +1067,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, api_types::METHOD_REPO_LOCATION_VERIFY);
         assert_eq!(requests[0].params["path"], "/remote/workspaces/repo");
-        assert_eq!(requests[0].params["expected_version"], location.version);
+        assert_eq!(requests[0].params["expected_version"], location.version + 1);
         assert!(!requests[0]
             .params
             .as_object()

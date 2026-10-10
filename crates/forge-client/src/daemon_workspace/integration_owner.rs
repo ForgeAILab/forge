@@ -323,12 +323,30 @@ impl DaemonWorkspaceBackend {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
-            if resolve_commit(&location.path, &format!("refs/heads/{branch}")).await? != expected
-                || (request.kind == WorkspaceIntegrationKind::Rebase
-                    && resolve_commit(&owned.path, &format!("refs/heads/{branch}")).await?
-                        != expected)
-            {
+            if resolve_commit(&location.path, &format!("refs/heads/{branch}")).await? != expected {
                 return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+            }
+            // The Task's checkout must hold the target tip the claim read:
+            // as its own target branch when it shares the default checkout's
+            // refs, or, in another clone on this owner, as the ref this claim
+            // generation's inbound object transfer bound.
+            if request.kind == WorkspaceIntegrationKind::Rebase
+                && !resolve_commit(&owned.path, &format!("refs/heads/{branch}"))
+                    .await
+                    .is_ok_and(|own| own == expected)
+            {
+                let transferred = git::integration::transfer_ref(&object_transfer_key(
+                    &request.fence.attempt_id,
+                    request.fence.generation,
+                    ObjectTransferDirection::Inbound,
+                ))
+                .map_err(|_| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
+                if !resolve_commit(&owned.path, &transferred)
+                    .await
+                    .is_ok_and(|bound| bound == expected)
+                {
+                    return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+                }
             }
         }
         Ok(())
@@ -478,6 +496,10 @@ pub(super) const MAX_INTEGRATION_FENCES: usize = 1024;
 /// An acknowledged attempt receipt whose queue never claims again is kept
 /// this long for a duplicate of its key, then replaced by a tombstone.
 pub(super) const ACKNOWLEDGED_ATTEMPT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Acknowledged attempt receipts hold no slot of the journal's record bound
+/// (only its byte bound), so their number is bounded here: past this the
+/// oldest go, each replaced by a tombstone like one that aged out.
+pub(super) const MAX_ACKNOWLEDGED_ATTEMPT_RECEIPTS: usize = 1024;
 
 impl WorkspaceRegistry {
     /// Record `fence` as the queue's high-water mark and return what was held
@@ -564,9 +586,11 @@ impl DaemonWorkspaceBackend {
     ///   protected fences are bounded by the journal's own entry bound.
     /// * An acknowledged attempt receipt goes once its queue's fence has moved
     ///   past its generation (a late duplicate is then refused `stale_fence`),
-    ///   once the queue's fence is gone, or
-    ///   [`ACKNOWLEDGED_ATTEMPT_RETENTION`] after the acknowledgement (in
-    ///   both cases a late duplicate then meets a cancellation tombstone).
+    ///   once the queue's fence is gone,
+    ///   [`ACKNOWLEDGED_ATTEMPT_RETENTION`] after the acknowledgement, or as
+    ///   the oldest past [`MAX_ACKNOWLEDGED_ATTEMPT_RECEIPTS`] (in these
+    ///   cases a late duplicate then meets a cancellation tombstone). A
+    ///   receipt the server has not acknowledged is never pruned.
     /// * A checkout's pending marker goes when its operation was just
     ///   acknowledged, was pruned, or has settled.
     pub(super) fn prune_integration_state(
@@ -628,6 +652,14 @@ impl DaemonWorkspaceBackend {
             .retain(|queue, _| fences.contains_key(queue));
         let pruned_fences = before - updated.integration_fences.len();
         let mut unfenced = Vec::new();
+        // Receipts acknowledged longer ago than this are past the number
+        // bound (ages are newest first).
+        let too_many = self
+            .journal
+            .acknowledged_attempt_ages()
+            .map_err(storage_error)?
+            .get(MAX_ACKNOWLEDGED_ATTEMPT_RECEIPTS)
+            .copied();
         let removed = self
             .journal
             .prune_acknowledged_attempts(|operation, acknowledged_for| {
@@ -635,9 +667,11 @@ impl DaemonWorkspaceBackend {
                 else {
                     return false;
                 };
+                let within_bounds = acknowledged_for < ACKNOWLEDGED_ATTEMPT_RETENTION
+                    && too_many.is_none_or(|limit| acknowledged_for < limit);
                 match fences.get(&request.fence.queue_id) {
                     Some(current) if request.fence.generation < current.generation => true,
-                    Some(_) if acknowledged_for < ACKNOWLEDGED_ATTEMPT_RETENTION => false,
+                    Some(_) if within_bounds => false,
                     _ => {
                         unfenced.push(operation.fence.operation_id.clone());
                         true

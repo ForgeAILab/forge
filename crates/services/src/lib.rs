@@ -38,6 +38,7 @@ pub mod external_api;
 pub mod external_sync;
 pub mod integration_effects;
 pub mod integration_owner;
+pub mod integration_ports;
 pub mod integration_service;
 pub mod integration_steps;
 pub mod integration_worker;
@@ -344,7 +345,7 @@ pub use usage_projection::{
 };
 pub use wake_turn_consumer::{wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun};
 pub use workflow::template_service::WorkflowTemplateService;
-pub use workspace_cleanup::WorkspaceCleanupScheduler;
+pub use workspace_cleanup::{GcSettings, WorkspaceCleanupScheduler};
 pub use workspace_execution_lock::WorkspaceExecutionLockManager;
 
 pub type Result<T> = std::result::Result<T, ServiceError>;

@@ -928,11 +928,14 @@ async fn race_once(world: &World, task: &'static str) -> bool {
     let service = world.service.clone();
     let port = world.port.clone();
     let request = IntegrationQueueWorker::step_request(&asked, IntegrationStepAction::Settle);
-    let (cancel, _) = tokio::join!(
-        tokio::spawn(async move { service.cancel_task(task).await }),
-        tokio::spawn(async move { port.enqueue_step(&request).await })
-    );
-    let _ = cancel;
+    // The Cancel is not awaited here. A Cancel that loses the race waits
+    // behind the protected `result` step for its caller-side bound (15 s for
+    // a preempting command, then `task_busy` with the command still queued).
+    // Joining it before the merge is finished below is what made a
+    // permit-wins round take 15 s (D2 checklist item 7): the wait was this
+    // test's, not the step queue's.
+    let cancel = tokio::spawn(async move { service.cancel_task(task).await });
+    let _ = tokio::spawn(async move { port.enqueue_step(&request).await }).await;
     eventually("the race settled", || async {
         let a = world.attempt(&a.id).await;
         a.permit_json.is_some() || world.task(task).await.status == "cancelled"
@@ -970,6 +973,13 @@ async fn race_once(world: &World, task: &'static str) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(world.attempt(&a.id).await.permit_json.is_none());
     }
+    // Either the Cancel won, or it ran after the merge was recorded and found
+    // a finished Task, or it gave up waiting: it has answered by now.
+    let answered = tokio::time::timeout(Duration::from_secs(30), cancel).await;
+    assert!(answered.is_ok(), "the Cancel command answered");
+    if permit {
+        assert_eq!(world.task(task).await.status, "done", "the merge stands");
+    }
     permit
 }
 
@@ -977,11 +987,18 @@ async fn race_once(world: &World, task: &'static str) -> bool {
 async fn cancel_racing_the_permit_has_exactly_one_winner_under_real_concurrency() {
     let world = World::new().await;
     let mut permits = 0;
-    for task in ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"] {
+    let started = std::time::Instant::now();
+    for task in [
+        "r00", "r01", "r02", "r03", "r04", "r05", "r06", "r07", "r08", "r09", "r10", "r11", "r12",
+        "r13", "r14", "r15", "r16", "r17", "r18", "r19",
+    ] {
         permits += usize::from(race_once(&world, task).await);
     }
     // Either order is legal; each round asserted exactly one winner.
-    println!("permit won {permits} of 8 rounds");
+    println!(
+        "permit won {permits} of 20 rounds in {:?}",
+        started.elapsed()
+    );
 }
 
 fn application(
@@ -1244,6 +1261,7 @@ impl crate::integration_worker::IntegrationFactsPort for GitFacts {
             target_dirty: !git::is_worktree_clean(&repo).await?,
             rebase_in_progress: git::detect_rebase_in_progress(&tree).await?,
             shared_object_store: true,
+            task_target_tip: String::new(),
             workspace: EffectWorkspace {
                 workspace_id,
                 placement_id,
@@ -1379,5 +1397,791 @@ async fn two_tasks_enter_the_queue_and_merge_in_order_through_the_real_worker() 
             .await
             .len(),
         1
+    );
+}
+
+// ----- production ports (plan 3.2 stage D2a) ------------------------------
+
+/// The worker over its production ports (`build_integration_worker`): the
+/// routing owner, the workspace facts, the owner object transfer, and the
+/// real Task-step port. Also composes the real check runner and its worker,
+/// as the server runtime does.
+struct Production {
+    worker: Arc<IntegrationQueueWorker>,
+    stop: tokio::sync::watch::Sender<bool>,
+    _checks: tokio::task::JoinHandle<()>,
+}
+impl Drop for Production {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
+}
+/// `build_integration_worker` over this World, with fast timers.
+fn production_ports(
+    world: &World,
+) -> (
+    Arc<IntegrationQueueWorker>,
+    Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    crate::integration_worker::IntegrationWorkerConfig,
+) {
+    use crate::daemon_transport::{DaemonConnectionRegistry, ServerExecutionEventSink};
+    let sink = Arc::new(ServerExecutionEventSink::new(
+        world.db.clone(),
+        world.bus.clone(),
+        world.temp.path().join("events"),
+    ));
+    let daemons = Arc::new(DaemonConnectionRegistry::new(
+        world.bus.clone(),
+        sink.clone(),
+    ));
+    sink.set_connection_registry(Arc::downgrade(&daemons));
+    let router = world
+        .service
+        .merge_service
+        .as_ref()
+        .unwrap()
+        .workspace_backend_router()
+        .unwrap();
+    let config = crate::integration_worker::IntegrationWorkerConfig {
+        poll: Duration::from_millis(20),
+        sweep_interval: Duration::from_millis(100),
+        conflict_backoff: Duration::from_millis(5),
+        ..Default::default()
+    };
+    (
+        crate::integration_ports::build_integration_worker(
+            world.db.clone(),
+            router,
+            daemons.clone(),
+            Arc::new(crate::repo_location::RepoLocationService::new(
+                world.db.clone(),
+                Arc::new(crate::repo_location::RemoteDaemonLocationVerifier::new(
+                    daemons.clone(),
+                    world.temp.path().join("probes"),
+                )),
+            )),
+            config.clone(),
+        ),
+        daemons,
+        config,
+    )
+}
+
+impl Production {
+    fn new(world: &World) -> Self {
+        let (worker, daemons, config) = production_ports(world);
+        // The check runner, its consumers and the merge-path family.
+        let runner = Arc::new(crate::check_runner::CheckRunner::new(world.db.clone()));
+        let consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
+            world.db.clone(),
+            runner,
+        ));
+        let _ = world.service.check_consumers.set(consumers.clone());
+        IntegrationCheckFamily::register(
+            &consumers,
+            Arc::new(
+                IntegrationSteps::new(world.service.clone())
+                    .with_timers(IntegrationStepTimers::from(&config)),
+            ),
+        );
+        let owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
+            world.db.clone(),
+            daemons,
+            Duration::from_secs(60),
+        ));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let periodic = crate::worker_runtime::PeriodicWorkers::new(world.db.clone());
+        let checks = Arc::new(crate::check_runner::worker::CheckRunWorker::new(
+            world.db.clone(),
+            owners,
+        ))
+        .start(&periodic, stopped);
+        Self {
+            worker,
+            stop,
+            _checks: checks,
+        }
+    }
+    fn run(&self) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(self.worker.clone().run(self.stop.subscribe()))
+    }
+}
+
+async fn review_ci(world: &World, task: &str, steps: &[&str]) {
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(json!({"review":{"ci_steps":steps}}).to_string())
+        .bind(task)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+}
+
+/// D2 checklist item 11. Three Tasks through the real worker, the production
+/// ports and the real check runner on a server-owned target, each with a real
+/// `ci_steps` command. The first merges as reviewed (no check: the target did
+/// not move). The second is rebased by the queue and its command passes only
+/// on the rebased commit: green, merged. The third is rebased and its command
+/// exits non-zero: red, ejected, sent back, never merged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn real_ci_steps_decide_the_head_through_the_production_ports() {
+    let world = World::new().await;
+    let first = world.add_task("one", "one.txt", "one\n").await;
+    let green = world.add_task("two", "two.txt", "two\n").await;
+    let red = world.add_task("three", "three.txt", "three\n").await;
+    review_ci(&world, "one", &["test -f one.txt"]).await;
+    // Passes only on top of the first Task's commit: the rebased commit.
+    review_ci(&world, "two", &["test -f one.txt", "test -f two.txt"]).await;
+    review_ci(&world, "three", &["test -f two.txt", "exit 3"]).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the first two merge and the third is sent back", || async {
+        world.task("one").await.status == "done"
+            && world.task("two").await.status == "done"
+            && world.attempt(&red.id).await.state == S::Ejected
+            && world.task("three").await.status != "merging"
+    })
+    .await;
+    eventually("the merged attempts complete", || async {
+        world.attempt(&first.id).await.state == S::Completed
+            && world.attempt(&green.id).await.state == S::Completed
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let (one, two, three) = (
+        world.attempt(&first.id).await,
+        world.attempt(&green.id).await,
+        world.attempt(&red.id).await,
+    );
+    // Git: main holds the first two, the second rebased; never the third.
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    assert_eq!(two.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(one.integrated_sha, one.original_candidate_sha);
+    assert_ne!(two.integrated_sha, two.original_candidate_sha);
+    for (file, present) in [("one.txt", true), ("two.txt", true), ("three.txt", false)] {
+        assert_eq!(
+            git_out(&world.repo(), &["cat-file", "-e", &format!("{tip}:{file}")])
+                .await
+                .is_some(),
+            present,
+            "{file}"
+        );
+    }
+    // The checks really ran: one run per rebased commit, with the commands'
+    // own exit codes, and none for the Task that merged as reviewed.
+    let runs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        runs,
+        vec![
+            (two.candidate_sha.clone().unwrap(), "pass".to_owned()),
+            (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
+        ],
+        "{runs:?}"
+    );
+    assert!(matches!(
+        two.phase_timings
+            .as_ref()
+            .and_then(|timings| timings.check.clone()),
+        Some(db::IntegrationCheckTiming::Ran { .. })
+    ));
+    assert_eq!(
+        three.failure_kind,
+        Some(IntegrationFailureKind::CandidateCheckFailed)
+    );
+    assert!(
+        three
+            .failure_message
+            .as_deref()
+            .unwrap()
+            .contains("exited 3"),
+        "{:?}",
+        three.failure_message
+    );
+    assert!(world
+        .step("one", IntegrationStepAction::RequestCheck)
+        .await
+        .is_empty());
+    // The red Task is told why, by its `send_back` step.
+    assert_eq!(
+        world
+            .step("three", IntegrationStepAction::SendBack)
+            .await
+            .len(),
+        1
+    );
+    assert!(world
+        .db
+        .integration_queue(three.queue_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .head_attempt_id
+        .is_none());
+}
+
+impl World {
+    fn clone_path(&self) -> PathBuf {
+        self.temp.path().join("clone-r")
+    }
+    /// A second server-owned checkout of the repo: its own clone, with its
+    /// own object store and refs, registered as a non-default location.
+    async fn add_clone(&self) {
+        let clone = self.clone_path();
+        git_out(
+            self.temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                self.repo().to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        )
+        .await
+        .expect("clone");
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l-c','r','server',?,'managed_clone',0,'ready',?,?)").bind(clone.to_str()).bind(&now).bind(&now).execute(self.db.pool()).await.unwrap();
+    }
+    /// Like `add_task`, but the Task's worktree belongs to the clone.
+    async fn add_task_in_clone(&self, task: &str, file: &str, content: &str) -> IntegrationAttempt {
+        let (clone, tree) = (self.clone_path(), self.tree(task));
+        let branch = format!("task-{task}");
+        git_out(
+            &clone,
+            &["worktree", "add", "-b", &branch, tree.to_str().unwrap()],
+        )
+        .await
+        .expect("worktree");
+        std::fs::write(tree.join(file), content).unwrap();
+        git::commit_all(&tree, task).await.unwrap();
+        let head = git::get_current_sha(&tree).await.unwrap();
+        let now = db::now_rfc3339();
+        let pool = self.db.pool();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'merging',?,?,?)").bind(task).bind(task).bind(&now).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES(?,?,'r',?,?,'ready',?,?)").bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&branch).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES(?,?,?,'server','l-c',?,1,'ready','scheduler','{}',?,?)").bind(format!("pl-{task}")).bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&now).bind(&now).execute(pool).await.unwrap();
+        let queue = self
+            .db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let mut attempt = IntegrationAttempt::new(
+            Some(queue.id),
+            task.into(),
+            "p".into(),
+            format!("admit-{task}"),
+            "merging".into(),
+            0,
+            1,
+        );
+        attempt.original_candidate_sha = Some(head);
+        self.db.admit_integration_attempt(attempt).await.unwrap()
+    }
+}
+
+/// Parity with today's merge path, which merges a Task placed in another
+/// clone than the default checkout (into that clone). Through the queue such
+/// a Task lands in the DEFAULT checkout: the target tip is brought to the
+/// Task's clone and bound to a ref, the rebase is onto that commit, the real
+/// check runs on the rebased commit, and the exact commit is sent to the
+/// default checkout and fast-forwarded there. Three Tasks in the clone: the
+/// first needs no rebase, the second is rebased and green, the third is
+/// rebased and red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queue() {
+    let world = World::new().await;
+    world.add_clone().await;
+    let clone_main = git_out(&world.clone_path(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    let first = world.add_task_in_clone("one", "one.txt", "one\n").await;
+    let green = world.add_task_in_clone("two", "two.txt", "two\n").await;
+    let red = world
+        .add_task_in_clone("three", "three.txt", "three\n")
+        .await;
+    review_ci(&world, "one", &["test -f one.txt"]).await;
+    review_ci(&world, "two", &["test -f one.txt", "test -f two.txt"]).await;
+    review_ci(&world, "three", &["test -f two.txt", "exit 3"]).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the first two merge and the third is sent back", || async {
+        world.task("one").await.status == "done"
+            && world.task("two").await.status == "done"
+            && world.attempt(&red.id).await.state == S::Ejected
+            && world.task("three").await.status != "merging"
+    })
+    .await;
+    eventually("the merged attempts complete", || async {
+        world.attempt(&first.id).await.state == S::Completed
+            && world.attempt(&green.id).await.state == S::Completed
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let (one, two, three) = (
+        world.attempt(&first.id).await,
+        world.attempt(&green.id).await,
+        world.attempt(&red.id).await,
+    );
+    assert!(one.failure_message.is_none(), "{:?}", one.failure_message);
+    assert!(two.failure_message.is_none(), "{:?}", two.failure_message);
+    // The DEFAULT checkout holds the first two, the second rebased.
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    assert_eq!(two.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(one.integrated_sha, one.original_candidate_sha);
+    assert_ne!(two.integrated_sha, two.original_candidate_sha);
+    for (file, present) in [("one.txt", true), ("two.txt", true), ("three.txt", false)] {
+        assert_eq!(
+            git_out(&world.repo(), &["cat-file", "-e", &format!("{tip}:{file}")])
+                .await
+                .is_some(),
+            present,
+            "{file}"
+        );
+    }
+    // The exact commit the Task's clone holds is what landed.
+    assert_eq!(git::get_current_sha(&world.tree("two")).await.unwrap(), tip);
+    // The clone's own target branch was never written.
+    assert_eq!(
+        git_out(&world.clone_path(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap(),
+        clone_main
+    );
+    // Commits moved through the owners, and each merged attempt's transfer
+    // refs are gone from both checkouts.
+    for attempt in [&one, &two] {
+        assert!(
+            attempt
+                .phase_timings
+                .as_ref()
+                .is_some_and(|timings| timings.transfer_ms.is_some()),
+            "{:?}",
+            attempt.phase_timings
+        );
+        for repo in [world.repo(), world.clone_path()] {
+            let refs = git_out(
+                &repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/forge/integration/{}-*", attempt.id),
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            assert!(refs.trim().is_empty(), "{refs}");
+        }
+    }
+    // The checks ran on the rebased commits in the clone.
+    let runs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        runs,
+        vec![
+            (two.candidate_sha.clone().unwrap(), "pass".to_owned()),
+            (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
+        ],
+        "{runs:?}"
+    );
+    assert_eq!(
+        three.failure_kind,
+        Some(IntegrationFailureKind::CandidateCheckFailed)
+    );
+}
+
+impl World {
+    /// An agent that holds the reviewer role of `task`.
+    async fn seed_reviewer(&self, task: &str) -> String {
+        let agent_id = format!("reviewer-{task}");
+        let now = db::now_rfc3339();
+        db::AgentRepo::create(
+            &*self.db,
+            db::CreateAgent {
+                id: agent_id.clone(),
+                name: agent_id.clone(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 2,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("agent creates");
+        db::TaskRoleAssignmentRepo::assign(
+            &*self.db,
+            db::CreateTaskRoleAssignment {
+                id: db::new_uuid_v4(),
+                task_id: task.to_owned(),
+                role_name: "reviewer".to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(agent_id.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("role assignment creates");
+        agent_id
+    }
+    async fn seed_execution(&self, task: &str, role: &str, agent: Option<&str>) -> String {
+        let id = db::new_uuid_v4();
+        let now = db::now_rfc3339();
+        db::ExecutionRepo::create(
+            &*self.db,
+            db::CreateExecution {
+                id: id.clone(),
+                task_id: task.to_owned(),
+                agent_id: agent.map(str::to_owned),
+                role: role.to_owned(),
+                // Stored settled; the reviewer's row is then marked running
+                // below, as it is while its contract is frozen. (Creating a
+                // running execution goes through dispatch admission, which
+                // this fixture has no machine for.)
+                status: db::ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: Some(format!("w-{task}")),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+        if agent.is_some() {
+            sqlx::query("UPDATE execution SET status='running' WHERE id=?")
+                .bind(&id)
+                .execute(self.db.pool())
+                .await
+                .unwrap();
+        }
+        id
+    }
+    /// A passed agent review of `task`'s present commit against the present
+    /// target tip, exactly as a reviewer run that passed leaves it (the
+    /// fixture `seed_passed_carry_review` of the workflow action tests): the
+    /// executor's and the reviewer's executions, the frozen contract, the
+    /// frozen passed assessment and the passed Review row. `reviewed_paths`
+    /// is the change set the contract froze. Returns the contract's
+    /// execution id.
+    async fn seed_passed_review(&self, task: &str, reviewed_paths: &[&str]) -> String {
+        use db::ReviewConformanceRepo;
+        let agent = self.seed_reviewer(task).await;
+        let executor = self.seed_execution(task, "executor", None).await;
+        let reviewer = self.seed_execution(task, "reviewer", Some(&agent)).await;
+        let commit_sha = git::get_current_sha(&self.tree(task)).await.unwrap();
+        let base_sha = git_out(&self.repo(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap();
+        let context = ::review::contract::load_context(&self.db, task, Some(&reviewer))
+            .await
+            .expect("governing context loads");
+        let mut contract = api_types::ReviewContract {
+            execution_id: reviewer.clone(),
+            policy: api_types::REVIEW_CONFORMANCE_POLICY.to_owned(),
+            commit_sha,
+            base_sha,
+            candidate_changed_paths: reviewed_paths
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect(),
+            context,
+            check_results: Vec::new(),
+            digest: String::new(),
+        };
+        contract.digest = api_types::canonical_digest(&contract).expect("contract digests");
+        self.db
+            .create_review_contract(&contract)
+            .await
+            .expect("contract freezes");
+        let conformance = api_types::ReviewConformance {
+            status: api_types::ConformanceStatus::Passed,
+            contract: Some(contract),
+            assessment: Some(api_types::ReviewAssessment {
+                fixable_by: api_types::FixableBy::Coder,
+                repeat: false,
+                result: api_types::ReviewResult::Pass,
+                reason: "looks right".to_owned(),
+                report: String::new(),
+            }),
+            checks: Vec::new(),
+            reason: None,
+        };
+        self.db
+            .record_review_conformance(&conformance)
+            .await
+            .expect("assessment freezes");
+        sqlx::query("UPDATE execution SET status='completed' WHERE id=?")
+            .bind(&reviewer)
+            .execute(self.db.pool())
+            .await
+            .unwrap();
+        let now = db::now_rfc3339();
+        db::ReviewRepo::create(
+            &*self.db,
+            db::CreateReview {
+                id: db::new_uuid_v4(),
+                task_id: task.to_owned(),
+                execution_id: executor,
+                attempt_number: 1,
+                status: db::ReviewStatus::Passed,
+                step_results_json: json!({
+                    "ci_steps": [],
+                    "conformance": conformance,
+                    "auditor": { "verdict": "pass", "reason": "looks right" },
+                })
+                .to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("passed review records");
+        reviewer
+    }
+}
+
+/// `carry_for` against a real review contract. Two Tasks were reviewed and
+/// passed by an agent reviewer; a third Task lands first and moves the
+/// target, so the queue rebases both. The first keeps its review: the
+/// rebased commit changes exactly what the reviewer saw, its check passes,
+/// the carry is recorded against the contract and charged, and it merges
+/// without a new review. The second loses it: its contract froze another
+/// change set than the candidate has, so the rebased commit is outside what
+/// was reviewed; it is sent back for review and never merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_real_review_contract_is_carried_over_the_queue_rebase_or_lost_with_its_change_set() {
+    let world = World::new().await;
+    let first = world.add_task("one", "one.txt", "one\n").await;
+    let kept = world.add_task("two", "two.txt", "two\n").await;
+    let lost = world.add_task("three", "three.txt", "three\n").await;
+    for task in ["one", "two", "three"] {
+        review_ci(&world, task, &["test -f base"]).await;
+    }
+    let kept_contract = world.seed_passed_review("two", &["two.txt"]).await;
+    world.seed_passed_review("three", &["elsewhere.txt"]).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually(
+        "one and two merge and three is sent back for review",
+        || async {
+            world.task("one").await.status == "done"
+                && world.task("two").await.status == "done"
+                && world.attempt(&lost.id).await.state == S::NeedsReview
+        },
+    )
+    .await;
+    eventually("the merged attempts complete", || async {
+        world.attempt(&first.id).await.state == S::Completed
+            && world.attempt(&kept.id).await.state == S::Completed
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let (two, three) = (world.attempt(&kept.id).await, world.attempt(&lost.id).await);
+    // Kept: one carry, of the rebased commit onto the tip it was rebased on,
+    // against the contract the reviewer froze; the allowance was charged.
+    assert_ne!(two.integrated_sha, two.original_candidate_sha);
+    let carries: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT task_id,contract_execution_id,commit_sha,base_sha FROM review_authority_carry ORDER BY created_at",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        carries,
+        vec![(
+            "two".to_owned(),
+            kept_contract,
+            two.integrated_sha.clone().unwrap(),
+            two.integrated_before_sha.clone().unwrap(),
+        )],
+        "{carries:?}"
+    );
+    let spent: i64 = world
+        .scalar(
+            "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_carry'),0)",
+            "two",
+        )
+        .await;
+    assert_eq!(spent, 1);
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    assert_eq!(two.integrated_sha.as_deref(), Some(tip.as_str()));
+    // Lost: no carry, the reason names the path, and nothing of it landed.
+    assert!(
+        three
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("outside the reviewed change set")),
+        "{:?}",
+        three.failure_message
+    );
+    assert!(git_out(
+        &world.repo(),
+        &["cat-file", "-e", &format!("{tip}:three.txt")]
+    )
+    .await
+    .is_none());
+    assert_ne!(world.task("three").await.status, "done");
+    assert_eq!(
+        world
+            .step("three", IntegrationStepAction::SendBack)
+            .await
+            .len(),
+        1
+    );
+}
+
+/// A digest of every row of every table except the three the worker may
+/// write: the queue, the attempt and the Task-step queue (with
+/// `task_schedule_dirty`, which the `task_step` triggers maintain on every
+/// step insert: the scheduler's "look at this Task" mark).
+async fn foreign_digest(db: &SqliteDb) -> std::collections::BTreeMap<String, String> {
+    use sha2::Digest;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('integration_queue','integration_attempt','task_step','task_schedule_dirty') ORDER BY name",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let mut digests = std::collections::BTreeMap::new();
+    for table in tables {
+        let columns: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT name FROM pragma_table_xinfo('{table}') WHERE hidden IN (0,2,3) ORDER BY cid"
+        ))
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let row = columns
+            .iter()
+            .map(|column| format!("quote(\"{column}\")"))
+            .collect::<Vec<_>>()
+            .join("||'|'||");
+        let rows: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT {row} FROM \"{table}\" ORDER BY 1"))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let mut hash = sha2::Sha256::new();
+        for row in &rows {
+            hash.update(row.as_bytes());
+            hash.update(b"\n");
+        }
+        digests.insert(
+            table,
+            format!("{}:{}", rows.len(), hex::encode(hash.finalize())),
+        );
+    }
+    digests
+}
+
+/// The worker over its production ports writes nothing outside the queue,
+/// the attempt and the Task-step queue. The Task-step worker is stopped, so
+/// every write in the window is the queue worker's own: a head whose real
+/// rebase conflicts, to its ejection; then a head that is rebased cleanly, to
+/// its request for a check; then idle sweeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_worker_over_production_ports_writes_only_queue_attempt_and_task_step() {
+    let world = World::new().await;
+    // No Task step runs in this test: only the queue worker writes.
+    let _ = world.stop.send(true);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let conflicted = world.add_task("conflict", "base", "theirs\n").await;
+    let clean = world.add_task("clean", "clean.txt", "clean\n").await;
+    // The target moves under both, on the file the first one changed.
+    std::fs::write(world.repo().join("base"), "ours\n").unwrap();
+    git::commit_all(&world.repo(), "outside").await.unwrap();
+    let (worker, _daemons, _config) = production_ports(&world);
+    let before = foreign_digest(&world.db).await;
+    let steps_before: i64 = world
+        .scalar("SELECT COUNT(*) FROM task_step WHERE task_id!=?", "")
+        .await;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(worker.clone().run(stopped));
+    eventually(
+        "the conflict is ejected and the clean head asks for its check",
+        || async {
+            world.attempt(&conflicted.id).await.state == S::Ejected
+                && world.attempt(&clean.id).await.state == S::Checking
+        },
+    )
+    .await;
+    // A few sweeps and polls on top.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let after = foreign_digest(&world.db).await;
+    for (table, digest) in &before {
+        assert_eq!(after.get(table), Some(digest), "table `{table}` changed");
+    }
+    assert_eq!(after.len(), before.len());
+    assert!(before.len() > 50, "the digest covers the schema");
+    let steps_after: i64 = world
+        .scalar("SELECT COUNT(*) FROM task_step WHERE task_id!=?", "")
+        .await;
+    assert!(
+        steps_after > steps_before,
+        "the worker did ask for Task steps"
+    );
+    let ejected = world.attempt(&conflicted.id).await;
+    assert_eq!(ejected.conflict_paths_json, Some(json!(["base"])));
+    let rebased = world.attempt(&clean.id).await;
+    assert_ne!(rebased.candidate_sha, rebased.original_candidate_sha);
+    assert!(
+        git_out(
+            &world.repo(),
+            &["cat-file", "-e", "refs/heads/main:clean.txt"]
+        )
+        .await
+        .is_none(),
+        "nothing merged without a Task step"
     );
 }

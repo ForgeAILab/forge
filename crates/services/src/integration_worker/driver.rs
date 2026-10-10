@@ -5,15 +5,13 @@
 use super::{
     is_conflict, later, parse_time, stamp, CrashPoint, HeadAction, HeadFacts, HeadTimeout,
     IntegrationQueueWorker, IntegrationStepAck, IntegrationStepAction, IntegrationStepOutcome,
-    ObjectTransferDirection, ObjectTransferEndpoint, ObjectTransferOutcome, ObjectTransferRelease,
-    ObjectTransferRequest, TaskGate,
+    IntegrationStepState, ObjectTransferDirection, ObjectTransferEndpoint, ObjectTransferOutcome,
+    ObjectTransferRelease, ObjectTransferRequest, OwnerFastForwardRequest, OwnerRebaseRequest,
+    TaskGate,
 };
 use crate::{
-    integration_effects::{merge::ReviewedMergeObject, EffectOwner},
-    integration_owner::{
-        OwnerEffectRefusal, OwnerMergeReceipt, OwnerRebaseReceipt, ServerMergeRequest,
-        ServerRebaseRequest,
-    },
+    integration_effects::EffectOwner,
+    integration_owner::{OwnerEffectRefusal, OwnerMergeReceipt, OwnerRebaseReceipt},
     MergeOutcome, Result, ServiceError,
 };
 use api_types::WorkspaceOwnerOperationOutcome;
@@ -54,7 +52,10 @@ pub enum ParkReason {
     TransferTooLarge,
     ExternalMovesExhausted,
     RoundsExhausted,
-    DaemonOwnerUnwired,
+    /// The Task's checkout and the default checkout have different owners.
+    CrossOwner,
+    /// A deciding Task step settled without answering, again after re-asks.
+    StepFailed,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retry {
@@ -78,12 +79,13 @@ impl ParkReason {
             Self::TransferTooLarge => "transfer_too_large",
             Self::ExternalMovesExhausted => "external_target_moves_exhausted",
             Self::RoundsExhausted => "rounds_exhausted",
-            Self::DaemonOwnerUnwired => "daemon_owner_unwired",
+            Self::CrossOwner => "cross_owner_unsupported",
+            Self::StepFailed => "task_step_failed",
         }
     }
     fn kind(self) -> IntegrationFailureKind {
         match self {
-            Self::Infrastructure => IntegrationFailureKind::Infrastructure,
+            Self::Infrastructure | Self::StepFailed => IntegrationFailureKind::Infrastructure,
             Self::Timeout => IntegrationFailureKind::Timeout,
             Self::TargetNotReady => IntegrationFailureKind::TargetUnavailable,
             _ => IntegrationFailureKind::OwnerRequired,
@@ -91,14 +93,13 @@ impl ParkReason {
     }
     fn retry(self) -> Retry {
         match self {
-            Self::Infrastructure | Self::Timeout => Retry::Counted,
+            Self::Infrastructure | Self::Timeout | Self::StepFailed => Retry::Counted,
             Self::ProjectPaused | Self::TargetNotReady => Retry::Soon,
             _ => Retry::Owner,
         }
     }
 }
 
-const JOURNAL_MAX: usize = 64;
 fn bounded(text: &str) -> String {
     let mut end = text.len().min(2048);
     while !text.is_char_boundary(end) {
@@ -111,6 +112,22 @@ fn millis(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
 }
 fn add(slot: &mut Option<i64>, value: i64) {
     *slot = Some(slot.unwrap_or(0).saturating_add(value));
+}
+/// The owner a queue's target (or a fence's `target_owner`) names.
+fn target_owner(owner: Option<&serde_json::Value>) -> Option<EffectOwner> {
+    let owner = owner?;
+    match (
+        owner["owner_kind"].as_str()?,
+        owner["daemon_id"].as_str(),
+        owner["runtime_id"].as_str(),
+    ) {
+        ("server", _, _) => Some(EffectOwner::Server),
+        ("daemon", Some(daemon_id), Some(runtime_id)) => Some(EffectOwner::Daemon {
+            daemon_id: daemon_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+        }),
+        _ => None,
+    }
 }
 fn receipts(attempt: &IntegrationAttempt) -> Vec<IntegrationEffectReceipt> {
     serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap_or_default()
@@ -128,8 +145,22 @@ pub struct HeadDriver {
     result_checked: Option<DateTime<Utc>>,
     /// The ends of an object transfer this session made for the head.
     transferred: Option<ObjectTransferRelease>,
+    /// The claim generation whose inbound transfer this session made.
+    inbound_generation: Option<i64>,
     /// Permits this session could not use (they did not bind the head).
     refused_permits: u32,
+    /// Deciding steps this session asked again because they settled without
+    /// answering.
+    reasked: u32,
+    /// When this session last asked for the head's check.
+    check_asked: Option<DateTime<Utc>>,
+    /// While the head's result is unknown: when the owner is asked next, and
+    /// the owner connection the last ask saw (`None`: not connected).
+    reconcile_at: Option<DateTime<Utc>>,
+    owner_link: Option<u64>,
+    /// Location verifications this session requested after the owner refused
+    /// the claim's target.
+    verifications: u32,
     stop: CancellationToken,
 }
 
@@ -143,7 +174,13 @@ impl HeadDriver {
             since: None,
             result_checked: None,
             transferred: None,
+            inbound_generation: None,
             refused_permits: 0,
+            reasked: 0,
+            check_asked: None,
+            reconcile_at: None,
+            owner_link: None,
+            verifications: 0,
             stop: CancellationToken::new(),
         }
     }
@@ -238,12 +275,41 @@ impl HeadDriver {
             HeadAction::Reconcile => self.reconcile(a, &queue).await,
             HeadAction::AwaitResult => self.await_result(a, &queue).await,
             HeadAction::Requeue => {
+                if let Some(wait) = self.unknown_result_wait(&a) {
+                    return Ok(Pass::Wait(wait));
+                }
                 w.advance(&a.id, S::Reconciling, |_| {}).await?;
                 Ok(Pass::Progress)
             }
             // A released or terminal attempt cannot hold the slot.
             HeadAction::Released | HeadAction::Terminal => Ok(Pass::Lost),
         }
+    }
+
+    /// A head whose result is unknown keeps its slot and its lease (this
+    /// session stays, so every pass renews). The owner is asked again every
+    /// `reconcile_interval`, and at once when its receipt has arrived (the
+    /// reconnect lookup recorded it) or the owner is on a new connection.
+    /// `None`: ask now.
+    fn unknown_result_wait(&mut self, a: &IntegrationAttempt) -> Option<Duration> {
+        let at = self.reconcile_at?;
+        let intent = a.effect_intent_json.as_ref()?;
+        let link = self
+            .w
+            .owner
+            .owner_connection(&intent["request"]["fence"]["target_owner"]);
+        if link.is_some() && link != self.owner_link {
+            return None;
+        }
+        self.owner_link = link;
+        let now = self.w.clock.now();
+        (now < at).then(|| {
+            (at - now)
+                .to_std()
+                .unwrap_or_default()
+                .min(self.w.config.poll)
+                .max(Duration::from_millis(1))
+        })
     }
 
     fn timed_out(&self, timeout: HeadTimeout) -> bool {
@@ -319,6 +385,16 @@ impl HeadDriver {
                 a.permit_json = None;
             })
             .await?;
+        // A permit of an earlier ask pre-enqueued its protected `result`
+        // step. It sleeps until its own deadline and holds back every later
+        // step of the Task, this one included. That round is over: wake it,
+        // so it reads the newer `effect_seq`, writes nothing and finishes.
+        // (The ask before this one, and the one a takeover moved past.)
+        for stale in [a.effect_seq - 1, a.effect_seq - 2] {
+            if stale > 0 {
+                self.w.steps.ready_result_step(&a.id, stale).await?;
+            }
+        }
         self.enqueue(&a, action).await?;
         Ok(a)
     }
@@ -334,6 +410,47 @@ impl HeadDriver {
         }
         self.fresh_step(a, action).await?;
         Ok(true)
+    }
+
+    /// The deciding step of this wait settled without answering (its handler
+    /// failed for good, or a preempting command dropped it): the wait would
+    /// only end at its timeout. Ask again under a new `effect_seq`, a bounded
+    /// number of times per session, then park with a typed cause.
+    /// `Ok(None)`: the step can still answer.
+    async fn reask_dead_step(
+        &mut self,
+        a: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<Option<Pass>> {
+        let state = self
+            .w
+            .steps
+            .step_state(&IntegrationQueueWorker::step_request(a, action))
+            .await?;
+        if state == IntegrationStepState::TaskLeft {
+            // The Task moved on by another route; nothing is left to decide.
+            return self.release_cancelled(a).await.map(Some);
+        }
+        if state != IntegrationStepState::Dead {
+            return Ok(None);
+        }
+        if self.reasked >= self.w.config.step_reasks {
+            return self
+                .park(
+                    a,
+                    ParkReason::StepFailed,
+                    &format!(
+                        "the `{}` Task step failed after {} asks",
+                        action.as_str(),
+                        self.reasked + 1
+                    ),
+                )
+                .await
+                .map(Some);
+        }
+        self.reasked += 1;
+        self.fresh_step(a, action).await?;
+        Ok(Some(Pass::Progress))
     }
 
     // ----- releases -----------------------------------------------------
@@ -379,17 +496,21 @@ impl HeadDriver {
             .count();
         // Parks for this same reason with nothing but the re-queue between
         // them (`start` adds one to `effect_seq`; any step adds more).
+        // The re-queue of a parked attempt adds one too (its `park` step
+        // restates `waiting`), and a head reconciled back to `queued` skips
+        // that one: a gap of one or two.
         let mut repeats = 0u32;
         let mut seq = a.effect_seq;
         for entry in journal.iter().rev().filter(parks) {
-            if entry["reason"] != reason.code() || entry["effect_seq"].as_i64() != Some(seq - 1) {
+            let Some(at) = entry["effect_seq"].as_i64() else {
+                break;
+            };
+            if entry["reason"] != reason.code() || !(1..=2).contains(&(seq - at)) {
                 break;
             }
             repeats += 1;
-            seq -= 1;
+            seq = at;
         }
-        let exhausted =
-            reason.retry() == Retry::Counted && self.w.config.infra_retry.get(counted).is_none();
         let (kind, available_at, message) = match reason.retry() {
             Retry::Counted => match self.w.config.infra_retry.get(counted) {
                 Some(delay) => (
@@ -419,24 +540,18 @@ impl HeadDriver {
             ),
             Retry::Owner => (reason.kind(), None, format!("{}: {detail}", reason.code())),
         };
-        // The Task was told when this wait began; a retry that ends in the
-        // same wait is not another Task step.
-        if repeats == 0 || exhausted {
+        // The Task was told when this wait began. A wait with no end of its
+        // own (`Soon`) is not told again on each retry, and its re-queue
+        // restates nothing either; a counted retry was re-queued with
+        // `waiting` restated, so its next park says so again.
+        if repeats == 0 || reason.retry() != Retry::Soon {
             self.enqueue(a, IntegrationStepAction::Park).await?;
         }
         self.close_timings(a).await?;
         let entry = json!({"kind":"worker_park","reason":reason.code(),"counted":reason.retry()==Retry::Counted,"effect_seq":a.effect_seq,"at":stamp(now)});
         self.w
             .advance(&a.id, S::Parked, move |a| {
-                let mut journal = a
-                    .operation_receipts_json
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                journal.push(entry);
-                let excess = journal.len().saturating_sub(JOURNAL_MAX);
-                journal.drain(..excess);
-                a.operation_receipts_json = journal.into();
+                super::journal_push(a, entry);
                 a.failure_kind = Some(kind);
                 a.failure_message = Some(bounded(&message));
                 a.available_at = available_at;
@@ -445,6 +560,38 @@ impl HeadDriver {
             })
             .await?;
         Ok(Pass::Released)
+    }
+
+    /// The owner does not recognise the claim's target: its record of the
+    /// default checkout differs from the one the claim froze (the server
+    /// changed the location since the owner last verified it: a default
+    /// toggle, a provisioning note). The refusal ran no Git. The worker asks
+    /// for the location to be verified again, which gives the owner the
+    /// server's present record, and the head goes on in a new round (a new
+    /// claim generation re-reads the target). `Ok(None)`: verification was
+    /// requested, retry. After two requests in one session, or when the
+    /// verification cannot be requested, the head leaves the slot and
+    /// retries with backoff.
+    async fn foreign_owner(&mut self, a: &IntegrationAttempt) -> Result<Option<Pass>> {
+        let location = self.w.queue(&self.queue_id).await?.target_location_id;
+        if let (Some(locations), Some(location), true) =
+            (self.w.locations.as_ref(), location, self.verifications < 2)
+        {
+            self.verifications += 1;
+            match locations.verify_location(&location).await {
+                Ok(()) => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(target: "services::integration_worker", queue_id = %self.queue_id, %location, %error, "location verification after an owner refusal failed");
+                }
+            }
+        }
+        self.park(
+            a,
+            ParkReason::TargetNotReady,
+            "the owner of the default checkout does not recognise this claim's target yet",
+        )
+        .await
+        .map(Some)
     }
 
     async fn send_back(
@@ -590,31 +737,36 @@ impl HeadDriver {
             return Ok(None);
         }
         let started = self.w.clock.now();
+        // `have` names commits the receiver holds, so the bundle carries only
+        // what is new. Inbound, the source is the default checkout: it does
+        // not know the candidate, but it knows the target commits the Task's
+        // clone already has (its own target branch, and the tip an earlier
+        // round of this attempt brought, whose ref is kept until release).
         let (have, want) = match direction {
-            ObjectTransferDirection::Inbound => {
-                (facts.candidate_head.clone(), facts.target_tip.clone())
-            }
+            ObjectTransferDirection::Inbound => (
+                vec![
+                    facts.candidate_head.clone(),
+                    facts.task_target_tip.clone(),
+                    a.target_tip_sha.clone().unwrap_or_default(),
+                ],
+                facts.target_tip.clone(),
+            ),
             ObjectTransferDirection::Outbound => {
-                (facts.target_tip.clone(), facts.candidate_head.clone())
+                (vec![facts.target_tip.clone()], facts.candidate_head.clone())
             }
         };
+        let mut seen = HashSet::new();
+        let have: Vec<String> = have
+            .into_iter()
+            .filter(|sha| !sha.is_empty() && *sha != want && seen.insert(sha.clone()))
+            .collect();
         let fence = self.fence(a).await?;
         let target = ObjectTransferEndpoint {
             repo_location_id: fence.target_owner["location_id"]
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            owner: match (
-                fence.target_owner["owner_kind"].as_str(),
-                fence.target_owner["daemon_id"].as_str(),
-                fence.target_owner["runtime_id"].as_str(),
-            ) {
-                (Some("daemon"), Some(daemon_id), Some(runtime_id)) => EffectOwner::Daemon {
-                    daemon_id: daemon_id.to_owned(),
-                    runtime_id: runtime_id.to_owned(),
-                },
-                _ => EffectOwner::Server,
-            },
+            owner: target_owner(Some(&fence.target_owner)).unwrap_or(EffectOwner::Server),
         };
         self.transferred = Some(ObjectTransferRelease {
             attempt_id: a.id.clone(),
@@ -630,13 +782,16 @@ impl HeadDriver {
                 task: facts.task_location.clone(),
                 target,
                 target_branch: queue.target_branch.clone(),
-                have: vec![have],
+                have,
                 want,
                 max_bytes: self.w.config.transfer_cap_bytes,
             })
             .await;
         match outcome {
             Ok(ObjectTransferOutcome::Transferred { .. }) => {
+                if direction == ObjectTransferDirection::Inbound {
+                    self.inbound_generation = Some(self.generation);
+                }
                 let elapsed = millis(started, self.w.clock.now());
                 self.timings(&a.id, |timings| add(&mut timings.transfer_ms, elapsed))
                     .await?;
@@ -713,19 +868,6 @@ impl HeadDriver {
         if a.cancel_requested_at.is_some() {
             return self.release_cancelled(&a).await;
         }
-        let server = queue
-            .target_owner_json
-            .as_ref()
-            .is_some_and(|owner| owner["owner_kind"] == "server");
-        if !server {
-            return self
-                .park(
-                    &a,
-                    ParkReason::DaemonOwnerUnwired,
-                    "this worker drives server-owned targets only",
-                )
-                .await;
-        }
         let started = self.w.clock.now();
         let facts = match self.facts(&a, queue).await {
             Ok(facts) => facts,
@@ -746,6 +888,18 @@ impl HeadDriver {
                     .park(&a, ParkReason::ProjectPaused, "the Project is paused")
                     .await
             }
+        }
+        // One fenced owner performs the rebase (in the Task's checkout) and
+        // the fast-forward (in the default checkout): the owner gate refuses
+        // an effect whose workspace it does not hold.
+        if Some(&facts.workspace.owner) != target_owner(queue.target_owner_json.as_ref()).as_ref() {
+            return self
+                .park(
+                    &a,
+                    ParkReason::CrossOwner,
+                    "the Task's checkout and the default checkout are on different machines; place the Task on the machine that holds the default checkout",
+                )
+                .await;
         }
         let admitted = a
             .candidate_sha
@@ -921,20 +1075,32 @@ impl HeadDriver {
                 .await?
                 .unwrap_or(Pass::Progress));
         }
+        // In another clone the rebase witness is the ref this generation's
+        // inbound transfer binds. Validation transferred under the generation
+        // it ran in; a later round of the same head transfers again here
+        // (a repeat of a key moves nothing).
+        if self.inbound_generation != Some(self.generation) {
+            if let Some(pass) = self
+                .transfer(&a, queue, &facts, ObjectTransferDirection::Inbound)
+                .await?
+            {
+                return Ok(pass);
+            }
+        }
         let fence = self.fence(&a).await?;
         self.w.fault(S::Rebasing, CrashPoint::BeforeEffect)?;
         let started = self.w.clock.now();
         let cancel = self.stop.child_token();
         let outcome = {
-            let effect = self.w.owner.rebase(ServerRebaseRequest {
-                fence: &fence,
-                workspace: &facts.workspace,
-                target_branch: &queue.target_branch,
-                expected_head_sha: &facts.candidate_head,
-                expected_target_sha: &facts.target_tip,
+            let effect = self.w.owner.rebase(OwnerRebaseRequest {
+                fence,
+                workspace: facts.workspace.clone(),
+                target_branch: queue.target_branch.clone(),
+                expected_head_sha: facts.candidate_head.clone(),
+                expected_target_sha: facts.target_tip.clone(),
                 handoff_conflicts: true,
                 deadline: self.w.config.rebase_deadline,
-                cancel: &cancel,
+                cancel: cancel.clone(),
             });
             tokio::pin!(effect);
             // The effect can outlive a lease period: keep the lease, and
@@ -1062,8 +1228,20 @@ impl HeadDriver {
                 }
             }
             OwnerRebaseReceipt::Refused {
-                reason: OwnerEffectRefusal::StaleFence | OwnerEffectRefusal::ForeignOwner,
+                reason: OwnerEffectRefusal::StaleFence,
             } => Ok(Pass::Lost),
+            OwnerRebaseReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner,
+            } => {
+                if let Some(pass) = self.foreign_owner(&a).await? {
+                    return Ok(pass);
+                }
+                let a = self.w.attempt(&a.id).await?;
+                Ok(self
+                    .new_round(&a, None, true)
+                    .await?
+                    .unwrap_or(Pass::Progress))
+            }
             OwnerRebaseReceipt::Refused { .. } | OwnerRebaseReceipt::NotPerformed {} => {
                 // The witness no longer holds (the target moved while this
                 // head held the slot) or this generation already has a rebase
@@ -1092,6 +1270,7 @@ impl HeadDriver {
             .ensure_step(&a, IntegrationStepAction::RequestCheck)
             .await?
         {
+            self.check_asked = Some(self.w.clock.now());
             return Ok(Pass::Progress);
         }
         let Some(ack) = IntegrationStepAck::current(&a, IntegrationStepAction::Settle) else {
@@ -1099,6 +1278,26 @@ impl HeadDriver {
                 return self
                     .park(&a, ParkReason::Timeout, "no check verdict arrived")
                     .await;
+            }
+            if let Some(pass) = self
+                .reask_dead_step(&a, IntegrationStepAction::RequestCheck)
+                .await?
+            {
+                self.check_asked = Some(self.w.clock.now());
+                return Ok(pass);
+            }
+            // The verdict reaches the Task by a delivery step of the check
+            // runner. One that failed is not delivered again, but the next
+            // ask applies the stored verdict (and an ask for a check still
+            // running only joins it): ask on a timer instead of waiting the
+            // check timeout out.
+            let now = self.w.clock.now();
+            let asked = *self.check_asked.get_or_insert(now);
+            if now >= later(asked, self.w.config.check_reask) {
+                self.fresh_step(&a, IntegrationStepAction::RequestCheck)
+                    .await?;
+                self.check_asked = Some(now);
+                return Ok(Pass::Progress);
             }
             return Ok(Pass::Wait(self.w.config.poll));
         };
@@ -1165,6 +1364,12 @@ impl HeadDriver {
                 return self
                     .park(&a, ParkReason::Timeout, "no Task-step decision arrived")
                     .await;
+            }
+            if let Some(pass) = self
+                .reask_dead_step(&a, IntegrationStepAction::Settle)
+                .await?
+            {
+                return Ok(pass);
             }
             return Ok(Pass::Wait(self.w.config.poll));
         };
@@ -1299,23 +1504,17 @@ impl HeadDriver {
         let started = self.w.clock.now();
         // Never cancelled by shutdown: a started fast-forward runs to its
         // receipt or to the owner's own bound.
-        let never = CancellationToken::new();
         let outcome = self
             .w
             .owner
-            .merge(ServerMergeRequest {
-                fence: &fence,
-                workspace: &facts.workspace,
-                target_branch: &queue.target_branch,
-                task_branch: &facts.task_branch,
-                expected_head_sha: &candidate,
-                expected_target_sha: &target,
-                reviewed: Some(ReviewedMergeObject {
-                    commit_sha: candidate.clone(),
-                    base_sha: target.clone(),
-                }),
-                cancel: &never,
-                deadline: Some(self.w.config.ff_owner_bound),
+            .fast_forward(OwnerFastForwardRequest {
+                fence,
+                workspace: facts.workspace.clone(),
+                target_branch: queue.target_branch.clone(),
+                task_branch: facts.task_branch.clone(),
+                candidate_sha: candidate.clone(),
+                target_sha: target.clone(),
+                deadline: self.w.config.ff_owner_bound,
             })
             .await;
         self.w
@@ -1342,8 +1541,21 @@ impl HeadDriver {
                 Ok(Pass::Progress)
             }
             Ok(OwnerMergeReceipt::Refused {
-                reason: OwnerEffectRefusal::StaleFence | OwnerEffectRefusal::ForeignOwner,
+                reason: OwnerEffectRefusal::StaleFence,
             }) => Ok(Pass::Lost),
+            Ok(OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner,
+            }) => {
+                let a = self.w.attempt(&a.id).await?;
+                if let Some(pass) = self.foreign_owner(&a).await? {
+                    return Ok(pass);
+                }
+                // The refusal is this generation's fast-forward receipt:
+                // reconciliation reads it as "not landed" and re-queues the
+                // head for a new round.
+                self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                Ok(Pass::Progress)
+            }
             Ok(OwnerMergeReceipt::Completed {
                 outcome: MergeOutcome::TargetMoved { .. },
             })
@@ -1404,7 +1616,7 @@ impl HeadDriver {
         }
         // Read after the settlement, so the facts are never older than it.
         let facts = self.facts(&a, queue).await;
-        if a.effect_intent_json.is_some() {
+        if let Some(intent) = a.effect_intent_json.clone() {
             // Unknown result. Nothing is guessed: the queue is quarantined
             // with a typed reason and the reconcile timer keeps asking.
             let message = "integration result unknown: the owner has no settled receipt";
@@ -1429,9 +1641,20 @@ impl HeadDriver {
                     a.failure_message = Some(message.into());
                 })
                 .await?;
+            // The slot and the lease stay with this session. Leaving here
+            // would make the lease expiry the retry clock.
             self.w.defer_reconcile(&self.queue_id);
-            return Ok(Pass::Lost);
+            let now = self.w.clock.now();
+            self.reconcile_at = Some(later(now, self.w.config.reconcile_interval));
+            self.owner_link = self
+                .w
+                .owner
+                .owner_connection(&intent["request"]["fence"]["target_owner"]);
+            return Ok(Pass::Wait(
+                self.w.config.poll.min(self.w.config.reconcile_interval),
+            ));
         }
+        self.reconcile_at = None;
         // Settled. The newest receipt and a Git witness decide.
         let last = receipts(&a).into_iter().next_back();
         let merged = last.as_ref().and_then(|receipt| {
@@ -1537,10 +1760,13 @@ impl HeadDriver {
             .result_checked
             .is_none_or(|at| now >= later(at, self.w.config.sweep_interval));
         if !done && due {
+            // Re-armed on every sweep interval while the attempt is `applied`
+            // without its acknowledgment: a `result` step that hit an error
+            // parked itself for `result_park`, and the merge has landed.
+            self.w.steps.ready_result_step(&a.id, a.effect_seq).await?;
             // The other exit: the Task has left `merging` (the result step
             // advanced it and died before its acknowledgment).
             if self.result_checked.is_some() {
-                self.w.steps.ready_result_step(&a.id, a.effect_seq).await?;
                 done = self
                     .facts(&a, queue)
                     .await

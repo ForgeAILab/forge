@@ -2,7 +2,8 @@ use crate::{
     default_data_dir, default_workspace_root, error::ConfigError,
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND,
+    DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
+    DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_PERCENT, DEFAULT_SCAFFOLD_COMMAND,
     DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,17 @@ pub struct WorkspaceConfig {
     pub cleanup_delay_seconds: u64,
     #[serde(default = "default_max_disconnect_seconds")]
     pub max_disconnect_seconds: u64,
+    /// Days the logs of a terminal Task are kept under
+    /// `<root>/.forge/logs/<project>/<task>`. `0` keeps them forever.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// Free-space floor of the workspace root's filesystem: below the larger
+    /// of `min_free_bytes` and `min_free_percent` the sweep evicts the build
+    /// output of idle Tasks, least recently used first.
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: u64,
+    #[serde(default = "default_min_free_percent")]
+    pub min_free_percent: u8,
 }
 
 /// Repository scaffolding run by Genesis provisioning when the approved
@@ -402,6 +414,11 @@ impl ForgeConfig {
                 message: "server.event_consumer_stall_seconds must be positive".to_owned(),
             });
         }
+        if self.workspace.min_free_percent > 100 {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.min_free_percent must be between 0 and 100".to_owned(),
+            });
+        }
         if self.workspace.max_disconnect_seconds == 0 {
             return Err(ConfigError::InvalidConfig {
                 message: "workspace.max_disconnect_seconds must be positive".to_owned(),
@@ -453,6 +470,9 @@ impl ForgeConfig {
                 root: default_workspace_root(),
                 cleanup_delay_seconds: DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
                 max_disconnect_seconds: DEFAULT_MAX_DISCONNECT_SECONDS,
+                log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
+                min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+                min_free_percent: DEFAULT_MIN_FREE_PERCENT,
             },
             agent: AgentDefaults {
                 max_concurrent_tasks: DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
@@ -638,6 +658,18 @@ fn default_media_upload_limit_bytes() -> u64 {
 
 fn default_max_disconnect_seconds() -> u64 {
     DEFAULT_MAX_DISCONNECT_SECONDS
+}
+
+fn default_log_retention_days() -> u32 {
+    DEFAULT_LOG_RETENTION_DAYS
+}
+
+fn default_min_free_bytes() -> u64 {
+    DEFAULT_MIN_FREE_BYTES
+}
+
+fn default_min_free_percent() -> u8 {
+    DEFAULT_MIN_FREE_PERCENT
 }
 
 fn parse_trusted_origin(value: &str) -> Option<String> {

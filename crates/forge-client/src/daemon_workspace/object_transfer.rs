@@ -353,9 +353,32 @@ impl DaemonWorkspaceBackend {
         ] {
             removed |= std::fs::remove_file(staging.join(name)).is_ok();
         }
+        let mut removed_refs = 0;
+        if let Some(attempt) = &params.attempt {
+            // The attempt left the queue slot: nothing of it is resumed, so
+            // every ref it imported here goes, and any staging of its keys.
+            git::integration::transfer_ref(&attempt.attempt_id).map_err(transfer_error)?;
+            let prefix = format!("{}-", attempt.attempt_id);
+            if let Ok(entries) = std::fs::read_dir(&staging) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let key = name
+                        .strip_prefix("export-")
+                        .or_else(|| name.strip_prefix("import-"));
+                    if key.is_some_and(|key| key.starts_with(&prefix)) {
+                        removed |= std::fs::remove_file(entry.path()).is_ok();
+                    }
+                }
+            }
+            let (_, repo) = self.location_path(&attempt.repo_location_id).await?;
+            removed_refs = git::integration::release_attempt_refs(&repo, &attempt.attempt_id)
+                .await
+                .map_err(transfer_error)? as u32;
+        }
         Ok(ReleaseObjectsResult {
             key: params.key,
             removed,
+            removed_refs,
         })
     }
 }

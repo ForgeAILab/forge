@@ -417,6 +417,9 @@ pub struct ComposedChecks {
     pub runner: Arc<crate::check_runner::CheckRunner>,
     pub consumers: Arc<crate::check_runner::consumer::TaskCheckConsumers>,
     pub worker: Arc<crate::check_runner::worker::CheckRunWorker>,
+    /// The workspace owners the worker dispatches to (one instance: its
+    /// live-operation counter is what the garbage-collection sweep reads).
+    pub owners: Arc<crate::check_runner::owners::WorkspaceCheckOwners>,
 }
 
 #[derive(Clone)]
@@ -437,6 +440,8 @@ pub struct TaskService {
     pub(crate) check_worker:
         Arc<std::sync::OnceLock<Arc<crate::check_runner::worker::CheckRunWorker>>>,
     pub(crate) check_runner: Arc<std::sync::OnceLock<Arc<crate::check_runner::CheckRunner>>>,
+    pub(crate) check_owners:
+        Arc<std::sync::OnceLock<Arc<crate::check_runner::owners::WorkspaceCheckOwners>>>,
     pub(crate) db: Arc<SqliteDb>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
@@ -570,16 +575,22 @@ impl TaskService {
                 consumers
             })
             .clone();
+        let owners = self
+            .check_owners
+            .get_or_init(|| {
+                Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
+                    self.db.clone(),
+                    daemon_connections,
+                    disconnect_bound,
+                ))
+            })
+            .clone();
         let worker = self
             .check_worker
             .get_or_init(|| {
                 Arc::new(crate::check_runner::worker::CheckRunWorker::new(
                     self.db.clone(),
-                    Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
-                        self.db.clone(),
-                        daemon_connections,
-                        disconnect_bound,
-                    )),
+                    owners.clone(),
                 ))
             })
             .clone();
@@ -587,6 +598,7 @@ impl TaskService {
             runner,
             consumers,
             worker,
+            owners,
         }
     }
     /// The check worker `drain` drives. The runtime composes it before any
@@ -630,6 +642,7 @@ impl TaskService {
             task_step_replies: Arc::default(),
             check_consumers: Arc::default(),
             check_runner: Arc::default(),
+            check_owners: Arc::default(),
             check_worker: Arc::default(),
             event_bus,
             merge_service: None,
