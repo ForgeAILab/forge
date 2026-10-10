@@ -2124,6 +2124,94 @@ async fn a_lost_transfer_reply_releases_both_ends_and_the_retry_moves_under_a_ne
     }
 }
 
+/// The server owner, behind an owner that cannot be asked for a rebase (the
+/// request fails before any intent: the owner could not be told the claim).
+struct UnreachableOwner {
+    inner: ServerIntegrationOwner,
+    down: AtomicBool,
+}
+#[async_trait]
+impl IntegrationOwnerPort for UnreachableOwner {
+    async fn rebase(
+        &self,
+        request: OwnerRebaseRequest,
+    ) -> Result<crate::integration_owner::OwnerRebaseReceipt> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(ServiceError::invalid_operation(
+                "daemon is not connected: integration.announce",
+            ));
+        }
+        IntegrationOwnerPort::rebase(&self.inner, request).await
+    }
+    async fn fast_forward(
+        &self,
+        request: OwnerFastForwardRequest,
+    ) -> Result<crate::integration_owner::OwnerMergeReceipt> {
+        IntegrationOwnerPort::fast_forward(&self.inner, request).await
+    }
+    async fn reconcile_effect(&self, request: &db::IntegrationEffectRequest) -> Result<()> {
+        IntegrationOwnerPort::reconcile_effect(&self.inner, request).await
+    }
+    async fn reconcile_outstanding(&self) -> Result<()> {
+        IntegrationOwnerPort::reconcile_outstanding(&self.inner).await
+    }
+}
+
+/// A rebase that cannot even be asked for (no intent was written, nothing
+/// ran) does not keep the head in `rebasing`: the head parks with a typed,
+/// counted retry, so the queue is not held by it, and it merges when the
+/// owner can be reached again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebase_that_cannot_be_asked_for_parks_the_head_instead_of_holding_the_queue() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    world.external_commit("r", "outside").await;
+    let owner = Arc::new(UnreachableOwner {
+        inner: ServerIntegrationOwner::new(world.db.clone()),
+        down: AtomicBool::new(true),
+    });
+    let mut pump = Pump::new(Arc::new(IntegrationQueueWorker::new(
+        world.db.clone(),
+        owner.clone(),
+        world.steps.clone(),
+        world.facts.clone(),
+        world.transfer.clone(),
+        world.clock.clone(),
+        config(),
+    )));
+    world.settle(&mut pump).await;
+    let parked = world.attempt(&a.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert_eq!(
+        parked.failure_kind,
+        Some(IntegrationFailureKind::Infrastructure)
+    );
+    assert!(
+        parked
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("daemon is not connected")),
+        "{:?}",
+        parked.failure_message
+    );
+    assert!(parked.available_at.is_some(), "retried by the sweep");
+    assert!(parked.effect_intent_json.is_none());
+    assert!(receipts_of(&world, &a.id).await.is_empty());
+    assert!(world.queue_of(&a).await.head_attempt_id.is_none());
+    assert!(world
+        .steps
+        .actions("a")
+        .contains(&IntegrationStepAction::Park));
+
+    owner.down.store(false, Ordering::SeqCst);
+    world.clock.advance(601);
+    world.settle(&mut pump).await;
+    let merged = world.attempt(&a.id).await;
+    assert_eq!(merged.state, S::Completed);
+    assert_eq!(ff_successes(&world, &a.id).await, 1);
+    assert_eq!(Some(world.tip("r").await), merged.candidate_sha);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queues_progress_independently_and_no_queue_starves_under_the_head_cap() {
     let world = World::new().await;

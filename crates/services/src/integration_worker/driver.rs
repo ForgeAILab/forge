@@ -1176,11 +1176,29 @@ impl HeadDriver {
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            // The receipt may or may not exist; the rows decide on the next
-            // pass. Returned as an error so that a rebase that keeps failing
-            // before its intent is counted and ends the session (the lease
-            // then paces the retries) instead of spinning at the backoff.
-            Err(error) => return Err(error),
+            Err(error) => {
+                let now = self.w.attempt(&a.id).await?;
+                let answered = now.effect_intent_json.is_some()
+                    || receipts(&now).iter().any(|receipt| {
+                        receipt.request.kind == IntegrationOperationKind::Rebase
+                            && receipt.request.fence.generation == self.generation
+                    });
+                if answered {
+                    // An intent or a receipt exists: the rows decide on the
+                    // next pass (reconcile the unknown result, or adopt the
+                    // receipt).
+                    return Err(error);
+                }
+                // The owner was never asked: the request failed before its
+                // intent (the owner could not be told the claim, or storage
+                // refused the effect). Nothing ran. The head leaves the slot
+                // with a typed, counted retry, so the members behind it go
+                // on; left in `rebasing` it would be re-claimed at every
+                // lease expiry for as long as the cause lasts.
+                return self
+                    .park(&now, ParkReason::Infrastructure, &error.to_string())
+                    .await;
+            }
         };
         self.w.fault(S::Rebasing, CrashPoint::AfterEffectReceipt)?;
         let elapsed = millis(started, self.w.clock.now());
