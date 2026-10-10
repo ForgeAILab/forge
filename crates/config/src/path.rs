@@ -30,8 +30,20 @@ pub fn data_dir_from_env() -> PathBuf {
         .unwrap_or_else(default_data_dir)
 }
 
+/// Where a server that never chose a workspace root keeps Task worktrees,
+/// repository clones and execution logs: beside its database, so the
+/// operating system's temp cleaner never removes them.
 #[must_use]
-pub fn default_workspace_root() -> PathBuf {
+pub fn default_workspace_root(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("worktrees")
+}
+
+/// The default workspace root of releases before the root moved into the
+/// data directory. Only ever read: a server that finds its data there keeps
+/// using it (and says so) until the operator runs
+/// `forge --migrate-workspace-root`.
+#[must_use]
+pub fn legacy_temp_workspace_root() -> PathBuf {
     env::temp_dir().join("forge").join("worktrees")
 }
 

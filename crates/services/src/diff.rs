@@ -88,7 +88,7 @@ impl DiffService {
 }
 
 pub(crate) fn embedded_read_router_for_test(db: Arc<SqliteDb>) -> Arc<WorkspaceBackendRouter> {
-    let root = config::default_workspace_root();
+    let root = config::legacy_temp_workspace_root();
     let merge_service = Arc::new(MergeService::new(
         Arc::clone(&db),
         Arc::new(events::EventBus::default()),

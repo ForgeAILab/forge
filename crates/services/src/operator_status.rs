@@ -409,6 +409,27 @@ impl OperatorStatusService {
                 });
             }
         }
+        // A root in the system temp directory loses worktrees to the
+        // operating system's cleaner: say so until the operator moves it.
+        let root_status = sqlx::query_as::<_, (String, String)>(
+            "SELECT value, updated_at FROM system_setting WHERE key = ?",
+        )
+        .bind(crate::workspace_root::STATUS_KEY)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((value, since)) = root_status {
+            let status: Value = serde_json::from_str(&value).unwrap_or_default();
+            if status["state"].as_str() == Some("system_temp") {
+                let root = status["root"].as_str().unwrap_or_default().to_owned();
+                recent_errors.push(RecentErrorSummary {
+                    severity: api_types::OperatorSeverity::Attention,
+                    entity_type: "workspace_root".into(),
+                    error: crate::workspace_root::system_temp_warning(std::path::Path::new(&root)),
+                    entity_id: root,
+                    occurred_at: since,
+                });
+            }
+        }
         for issue in &recent_errors {
             raise_severity(&mut overall_severity, issue.severity.clone());
         }

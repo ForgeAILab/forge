@@ -33,7 +33,18 @@ fn defaults_are_usable_without_a_config_file() {
     );
     assert_eq!(config.forge.data_dir, dir.path());
     assert_eq!(config.db_path(), dir.path().join("forge.db"));
-    assert_eq!(config.workspace.root, default_workspace_root());
+    // A server that never chose a root keeps its worktrees beside its
+    // database, never in the system temp directory.
+    assert_eq!(config.workspace.root, dir.path().join("worktrees"));
+    assert_eq!(
+        config.workspace.root,
+        default_workspace_root(&config.forge.data_dir)
+    );
+    assert!(!config.workspace.root_explicit);
+    assert!(!config
+        .workspace
+        .root
+        .starts_with(env::temp_dir().join("forge")));
     assert_eq!(
         config.workspace.cleanup_delay_seconds,
         DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS
@@ -378,6 +389,7 @@ project:
     assert_eq!(config.forge.data_dir, dir.path().join("cli-data"));
     assert_eq!(config.db_path(), dir.path().join("cli-data/forge.db"));
     assert_eq!(config.workspace.root, dir.path().join("cli-worktrees"));
+    assert!(config.workspace.root_explicit);
     assert_eq!(config.workspace.cleanup_delay_seconds, 30);
     assert_eq!(config.agent.max_concurrent_tasks, 4);
     assert_eq!(config.agent.heartbeat_interval_seconds, 35);
@@ -482,6 +494,7 @@ workspace:
         Some("https://env.example.com/app")
     );
     assert_eq!(config.workspace.root, dir.path().join("env-worktrees"));
+    assert!(config.workspace.root_explicit);
 
     clear_forge_env();
 }
@@ -526,6 +539,7 @@ workspace:
     assert_eq!(config.forge.data_dir, dir.path().join("file-data"));
     assert_eq!(config.db_path(), dir.path().join("file-data/forge.db"));
     assert_eq!(config.workspace.root, dir.path().join("file-worktrees"));
+    assert!(config.workspace.root_explicit);
 }
 
 #[test]

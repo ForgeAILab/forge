@@ -160,8 +160,17 @@ async fn run() {
     let forge_home = db_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let workspace_root = absolute_path(config.workspace.root.clone())
-        .expect("Failed to resolve workspace root path");
+    // 1. Create database pool and run migrations. The workspace root is
+    // settled against what this database recorded, so the database opens
+    // before anything is told where the root is.
+    let pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("Failed to create database pool");
+    db::run_migrations(&pool)
+        .await
+        .expect("Failed to run migrations");
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let workspace_root = settle_workspace_root(&db, &config).await;
     // Components that cannot be handed the resolved root explicitly (e.g.
     // Genesis repo provisioning inside the services crate) fall back to this
     // env var; export the configured value so every path agrees.
@@ -191,15 +200,6 @@ async fn run() {
         "initializing forge"
     );
 
-    // 1. Create database pool and run migrations
-    let pool = db::create_sqlite_pool(&database_url)
-        .await
-        .expect("Failed to create database pool");
-    db::run_migrations(&pool)
-        .await
-        .expect("Failed to run migrations");
-
-    let db = Arc::new(db::SqliteDb::new(pool));
     let event_bus = Arc::new(events::EventBus::with_default_capacity());
     let mut registry = cli_adapters::default_registry();
     if cli.demo {
@@ -459,6 +459,36 @@ fn init_tracing(log_dir: &std::path::Path) {
             .with_writer(writer)
             .compact()
             .init();
+    }
+}
+
+/// The workspace root this server runs on: the one its database recorded,
+/// or on a first start the configured one (see `services::workspace_root`).
+/// A configured root that would leave recorded workspaces behind, and a move
+/// that did not finish, stop the start here.
+async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathBuf {
+    let choice = services::workspace_root::RootChoice {
+        configured: absolute_path(config.workspace.root.clone())
+            .expect("Failed to resolve workspace root path"),
+        explicit: config.workspace.root_explicit,
+        data_dir: config.forge.data_dir.clone(),
+        system_temp: std::env::temp_dir(),
+    };
+    match services::workspace_root::settle(db, &choice).await {
+        Ok(settled) => {
+            if settled.in_system_temp {
+                warn!(
+                    "{}",
+                    services::workspace_root::system_temp_warning(&settled.root)
+                );
+            }
+            settled.root
+        }
+        Err(error) => {
+            error!(%error, "Forge cannot start on this workspace root");
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
     }
 }
 

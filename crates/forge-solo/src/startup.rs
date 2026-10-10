@@ -71,6 +71,9 @@ pub enum StartupError {
     #[error(transparent)]
     Tracing(#[from] TracingError),
 
+    #[error("{0}")]
+    WorkspaceRoot(String),
+
     #[error("Solo Agent {executor} is not authenticated or available on this machine")]
     AgentUnavailable { executor: String },
 
@@ -203,6 +206,28 @@ impl SoloStartup {
         let db = Arc::new(SqliteDb::new(pool));
         let event_bus = Arc::new(events::EventBus::new(EVENT_BUS_CAPACITY));
         let adapter_registry = Arc::new(cli_adapters::default_registry());
+
+        // Solo's root always follows its data root. It is recorded like the
+        // server's, and a database that recorded another root with live
+        // workspaces in it (a copied or relocated data root) is not started
+        // on: its stored paths would point at the other root.
+        let settled = services::workspace_root::settle(
+            &db,
+            &services::workspace_root::RootChoice {
+                configured: paths.worktrees.clone(),
+                explicit: true,
+                data_dir: paths.root.clone(),
+                system_temp: std::env::temp_dir(),
+            },
+        )
+        .await
+        .map_err(|error| StartupError::WorkspaceRoot(error.to_string()))?;
+        if settled.in_system_temp {
+            tracing::warn!(
+                "{}",
+                services::workspace_root::system_temp_warning(&settled.root)
+            );
+        }
 
         let runtime = Arc::new(
             ForgeRuntimeBuilder::from_config(
