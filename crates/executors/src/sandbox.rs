@@ -177,6 +177,15 @@ impl TaskRoot {
         create_private_dir(&build).is_ok() && is_real_dir(&build)
     }
 
+    /// The live-run registry name of run `run_id` when it has no temp
+    /// directory. Only a map key: nothing is created there.
+    fn live_key(&self, run_id: &str) -> PathBuf {
+        self.0
+            .join(TASK_DIR_NAME)
+            .join("live")
+            .join(run_key(run_id).unwrap_or_else(fresh_run_id))
+    }
+
     /// The temp directory of run `run_id`.
     ///
     /// Inside the Task root when that path is short enough for a socket,
@@ -201,6 +210,10 @@ pub struct SandboxEnv {
     root: Option<PathBuf>,
     tmp: Option<PathBuf>,
     build: Vec<(&'static str, PathBuf)>,
+    /// This run's entry in the live-run registry when it has no per-run
+    /// temp directory to be registered by: a name under the Task root that
+    /// is never created on disk.
+    live: Option<PathBuf>,
 }
 
 impl SandboxEnv {
@@ -219,6 +232,7 @@ impl SandboxEnv {
             } else {
                 Self::build_dirs(task_root)
             },
+            live: Some(task_root.live_key(run_id)),
         }
     }
 
@@ -244,6 +258,7 @@ impl SandboxEnv {
                 root: None,
                 tmp: None,
                 build: Self::build_dirs(&root),
+                live: None,
             })
             .unwrap_or_default()
     }
@@ -287,35 +302,60 @@ impl SandboxEnv {
         self
     }
 
-    /// Create the per-run temp directory. A run whose directory cannot be
-    /// created keeps today's temp directory instead of failing.
+    /// Start the run: enter it in the live-run registry by its Task root
+    /// and create its per-run temp directory. A run whose directory cannot
+    /// be created keeps today's temp directory instead of failing.
+    ///
+    /// Every run of a Task root is registered, with or without a temp
+    /// directory (a Task root whose path is too long for a socket has none,
+    /// which is the usual case on macOS): the registry is what keeps the
+    /// garbage collector from taking the build output of a run that
+    /// started after it looked ([`unless_live_run_in`]).
     #[must_use = "the returned environment is the one to apply"]
     pub fn prepared(mut self) -> Self {
-        if let Some(tmp) = &self.tmp {
-            LazyLock::force(&PROCESS_START);
-            // Live before it exists, so a concurrent sweep cannot take it.
-            live_run_dirs().insert(tmp.clone(), self.root.clone().unwrap_or_default());
-            if let Err(error) = prepare_run_tmp(tmp) {
-                live_run_dirs().remove(tmp);
+        let Some(root) = self.root.clone() else {
+            return self;
+        };
+        LazyLock::force(&PROCESS_START);
+        // Live before anything exists, so a concurrent sweep or eviction
+        // cannot take it. The no-temp name is entered first and replaced by
+        // the temp directory's once that exists, so the run is never out of
+        // the registry in between.
+        let live = self.live.clone();
+        if let Some(live) = &live {
+            live_run_dirs().insert(live.clone(), root.clone());
+        }
+        if let Some(tmp) = self.tmp.clone() {
+            live_run_dirs().insert(tmp.clone(), root.clone());
+            if let Err(error) = prepare_run_tmp(&tmp) {
+                live_run_dirs().remove(&tmp);
                 tracing::warn!(path = %tmp.display(), %error, "per-run temp directory could not be created; run keeps the inherited one");
                 self.tmp = None;
-            } else if let Some(root) = self.root.as_deref().and_then(TaskRoot::at) {
-                // The build output may have been evicted between the moment
-                // this environment was computed and the registration above.
-                // From here on the run is live and nothing takes it again.
-                if !self.build.is_empty() && !root.build_dir_is_usable() {
-                    self.build.clear();
-                }
+            } else if let Some(live) = &live {
+                live_run_dirs().remove(live);
+                self.live = None;
+            }
+        }
+        // The build output may have been evicted between the moment this
+        // environment was computed and the registration above. From here on
+        // the run is live and nothing takes it again.
+        if let Some(root) = TaskRoot::at(&root) {
+            if !self.build.is_empty() && !root.build_dir_is_usable() {
+                self.build.clear();
             }
         }
         self
     }
 
-    /// Remove the per-run temp directory. Idempotent.
+    /// End the run: remove the per-run temp directory and leave the
+    /// live-run registry. Idempotent.
     pub fn settle(&self) {
         if let Some(tmp) = &self.tmp {
             remove_run_tmp(tmp);
             live_run_dirs().remove(tmp);
+        }
+        if let Some(live) = &self.live {
+            live_run_dirs().remove(live);
         }
     }
 
@@ -418,6 +458,9 @@ pub fn settle_run(worktree: &Path, run_id: &str) {
             remove_run_tmp(&tmp);
         }
     }
+    // A run without a temp directory that its starter never settled (the
+    // execution was settled by someone else) leaves the registry here.
+    live_run_dirs().remove(&task_root.live_key(run_id));
 }
 
 /// Remove one per-run directory, but only out of a real directory: a

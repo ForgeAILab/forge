@@ -17,6 +17,14 @@ use std::{
 
 /// How long one reading of the server's root answers admissions.
 const READING_TTL: Duration = Duration::from_secs(5);
+/// How long a daemon's reported reading decides anything. A daemon reports
+/// every minute; one that has been silent for this long (disconnected,
+/// stopped, wedged) has a disk nobody knows: its old reading neither
+/// refuses work (the Task waits for the owner instead, or another machine
+/// takes it) nor counts as "under the floor" on any surface. The daemon's
+/// own check at `workspace.prepare` is what keeps a full disk from being
+/// filled on an old over-floor reading.
+pub const DAEMON_READING_TTL: Duration = Duration::from_secs(5 * 60);
 
 pub type DiskReader = Arc<dyn Fn() -> Option<MachineDiskFacts> + Send + Sync>;
 
@@ -101,9 +109,35 @@ impl DiskAdmission {
         self.pressure_of(self.server_facts().as_ref())
     }
 
-    /// Whether a daemon's stored reading is under the floor.
+    /// Whether a daemon's stored reading is under the floor. A reading
+    /// older than [`DAEMON_READING_TTL`] refuses nothing.
     pub fn daemon_pressure(&self, disk_json: Option<&str>) -> Option<DiskPressureKind> {
-        self.pressure_of(parse(disk_json).as_ref())
+        self.daemon_pressure_at(disk_json, chrono::Utc::now())
+    }
+
+    pub fn daemon_pressure_at(
+        &self,
+        disk_json: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<DiskPressureKind> {
+        self.pressure_of(
+            parse(disk_json)
+                .filter(|facts| is_fresh(facts, now))
+                .as_ref(),
+        )
+    }
+
+    /// A daemon's stored reading with the floor applied, for a read
+    /// surface. A stale reading is still shown (with the time it was
+    /// taken) but is never "under the floor".
+    pub fn applied_daemon(&self, disk_json: Option<&str>) -> Option<MachineDisk> {
+        let facts = parse(disk_json)?;
+        let fresh = is_fresh(&facts, chrono::Utc::now());
+        let mut disk = self.applied(Some(facts))?;
+        if !fresh {
+            disk.pressure = None;
+        }
+        Some(disk)
     }
 
     /// A reading with the floor applied, for a read surface.
@@ -116,14 +150,30 @@ fn parse(disk_json: Option<&str>) -> Option<MachineDiskFacts> {
     serde_json::from_str(disk_json?).ok()
 }
 
-/// Keep a daemon's reading from its report.
+/// `measured_at` of a stored daemon reading is the server's clock at the
+/// report (see [`record_daemon_disk`]). An unparseable time is not fresh.
+fn is_fresh(facts: &MachineDiskFacts, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&facts.measured_at).is_ok_and(|at| {
+        now.signed_duration_since(at.with_timezone(&chrono::Utc))
+            .to_std()
+            // A reading from the future (the clock was set back) is fresh.
+            .map_or(true, |age| age < DAEMON_READING_TTL)
+    })
+}
+
+/// Keep a daemon's reading from its report, stamped with the server's clock:
+/// how old a reading is must not depend on the daemon's clock.
 pub async fn record_daemon_disk(
     db: &crate::SqliteDb,
     daemon_id: &str,
     facts: &MachineDiskFacts,
 ) -> Result<()> {
+    let facts = MachineDiskFacts {
+        measured_at: crate::now_rfc3339(),
+        ..facts.clone()
+    };
     let json =
-        serde_json::to_string(facts).map_err(|error| crate::DbError::Check(error.to_string()))?;
+        serde_json::to_string(&facts).map_err(|error| crate::DbError::Check(error.to_string()))?;
     sqlx::query("UPDATE daemon SET disk_json = ? WHERE id = ? AND removed_at IS NULL")
         .bind(json)
         .bind(daemon_id)
@@ -132,17 +182,18 @@ pub async fn record_daemon_disk(
     Ok(())
 }
 
-/// A daemon's last reported reading.
-pub async fn daemon_disk(
+/// What a daemon is short of by its last reported reading, while that
+/// reading is fresh and the daemon is registered.
+pub async fn daemon_pressure(
     db: &crate::SqliteDb,
     daemon_id: &str,
-) -> Result<Option<MachineDiskFacts>> {
+) -> Result<Option<DiskPressureKind>> {
     let json: Option<Option<String>> =
-        sqlx::query_scalar("SELECT disk_json FROM daemon WHERE id = ?")
+        sqlx::query_scalar("SELECT disk_json FROM daemon WHERE id = ? AND removed_at IS NULL")
             .bind(daemon_id)
             .fetch_optional(db.pool())
             .await?;
-    Ok(parse(json.flatten().as_deref()))
+    Ok(db.disk_admission.daemon_pressure(json.flatten().as_deref()))
 }
 
 /// One machine and its reading with the floor applied.
@@ -178,7 +229,7 @@ pub async fn list_machine_disks(db: &crate::SqliteDb) -> Result<Vec<MachineDiskR
     .fetch_all(db.pool())
     .await?;
     for (id, hostname, disk_json) in daemons {
-        if let Some(disk) = admission.applied(parse(disk_json.as_deref())) {
+        if let Some(disk) = admission.applied_daemon(disk_json.as_deref()) {
             rows.push(MachineDiskRow {
                 daemon_id: Some(id),
                 hostname,
@@ -203,6 +254,15 @@ mod tests {
             measured_at: "2026-10-10T00:00:00Z".to_owned(),
             gc_state: None,
         }
+    }
+
+    /// A daemon's stored reading, taken just now.
+    fn reported(free: u64) -> String {
+        serde_json::to_string(&MachineDiskFacts {
+            measured_at: chrono::Utc::now().to_rfc3339(),
+            ..facts(free)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -242,8 +302,7 @@ mod tests {
     fn daemon_reading_is_held_to_the_same_floor_and_a_missing_one_refuses_nothing() {
         let admission = DiskAdmission::default();
         admission.configure(DiskFloor::of_bytes(100, 0), Arc::new(|| None));
-        let low = serde_json::to_string(&facts(99)).unwrap();
-        let fine = serde_json::to_string(&facts(100)).unwrap();
+        let (low, fine) = (reported(99), reported(100));
         assert_eq!(
             admission.daemon_pressure(Some(&low)),
             Some(DiskPressureKind::Bytes)
@@ -251,5 +310,49 @@ mod tests {
         assert_eq!(admission.daemon_pressure(Some(&fine)), None);
         assert_eq!(admission.daemon_pressure(None), None);
         assert_eq!(admission.daemon_pressure(Some("not json")), None);
+    }
+
+    /// A daemon that stopped reporting has a disk nobody knows. Its last
+    /// reading must not keep a Task waiting (another machine may take it,
+    /// or the Task waits for the owner, which is a different, visible
+    /// wait), and it must not be shown as under the floor for ever.
+    #[test]
+    fn a_stale_daemon_reading_refuses_nothing_and_is_not_shown_as_pressure() {
+        let admission = DiskAdmission::default();
+        admission.configure(DiskFloor::of_bytes(100, 0), Arc::new(|| None));
+        let now = chrono::Utc::now();
+        let at = |age: i64| {
+            serde_json::to_string(&MachineDiskFacts {
+                measured_at: (now - chrono::Duration::seconds(age)).to_rfc3339(),
+                ..facts(10)
+            })
+            .unwrap()
+        };
+        let ttl = DAEMON_READING_TTL.as_secs() as i64;
+        assert_eq!(
+            admission.daemon_pressure_at(Some(&at(ttl - 5)), now),
+            Some(DiskPressureKind::Bytes)
+        );
+        assert_eq!(admission.daemon_pressure_at(Some(&at(ttl + 5)), now), None);
+        // A clock set back does not make every reading stale.
+        assert_eq!(
+            admission.daemon_pressure_at(Some(&at(-3600)), now),
+            Some(DiskPressureKind::Bytes)
+        );
+        let shown = admission.applied_daemon(Some(&at(ttl + 5))).unwrap();
+        assert_eq!((shown.pressure, shown.facts.free_bytes), (None, 10));
+        assert_eq!(
+            admission.applied_daemon(Some(&at(0))).unwrap().pressure,
+            Some(DiskPressureKind::Bytes)
+        );
+        // A time nobody can read is not fresh.
+        assert_eq!(
+            admission.daemon_pressure(Some(
+                &serde_json::to_string(&facts(10))
+                    .unwrap()
+                    .replace("2026-10-10T00:00:00Z", "yesterday")
+            )),
+            None
+        );
     }
 }

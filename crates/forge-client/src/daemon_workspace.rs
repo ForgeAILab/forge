@@ -607,6 +607,19 @@ impl DaemonWorkspaceBackend {
                     self.workspace(&reference(&fence, handle), recreating)?;
                 }
             }
+            // The backstop of disk admission: the server placed this from a
+            // report that may be old. A worktree that exists is never
+            // refused; making one (new, or again) under the floor is. The
+            // refusal comes before the operation is journaled: an outcome
+            // kept under this operation id would answer every retry of the
+            // same request with the refusal, long after the disk has room.
+            if method == METHOD_WORKSPACE_PREPARE
+                && !existing
+                    .as_ref()
+                    .is_some_and(|(_, workspace)| workspace.path.exists())
+            {
+                self.refuse_new_disk_under_pressure()?;
+            }
             let operation = JournalOperation {
                 entry_id: operation_entry_id(&fence.operation_id),
                 fence: fence.clone(),

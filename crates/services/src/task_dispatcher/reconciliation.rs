@@ -19,6 +19,18 @@ use std::{
 
 /// Every Task that is not settled is re-examined once per period.
 pub(super) const SWEEP_PERIOD: Duration = Duration::from_secs(120);
+/// How often a Task that waits for a machine is read again while any
+/// machine is under its free-space floor. A run slot comes back with a
+/// commit (an execution ends) and that commit kicks the waiters; free disk
+/// comes back with no commit at all (an operator deletes something, the
+/// collector finishes, a daemon reports a better reading), so a disk wait
+/// is a timer or it is for ever. The timer is a durable deadline on the
+/// Task's wait row: it survives a restart and fires at once after one.
+pub(super) const DISK_WAIT_RECHECK: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
 /// What one tick spends on the sweep before it yields to dispatch.
 pub(super) const SWEEP_SLICE: Duration = Duration::from_millis(100);
 const SWEEP_PAGE: i64 = 100;
@@ -847,9 +859,24 @@ impl TaskDispatcher {
         let daemon = machine("environment_wait", &["machine", "daemon_id"])
             .or_else(|| machine("owner_wait", &["daemon_id"]))
             .or_else(|| machine_wait.then(|| "*".to_owned()));
+        // Level-triggered disk wait: see `DISK_WAIT_RECHECK`. Also for a
+        // Task that says it waits for a run slot while another machine is
+        // short of disk: that machine recovering is its exit too.
+        let disk_recheck = if machine_wait && self.waits_on_disk(&p.read.task).await {
+            Some((chrono::Utc::now() + DISK_WAIT_RECHECK).to_rfc3339())
+        } else {
+            None
+        };
+        let deadline = match (p.deadline.as_deref(), disk_recheck.as_deref()) {
+            (Some(own), Some(disk)) => {
+                let at = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
+                Some(if at(own) <= at(disk) { own } else { disk })
+            }
+            (own, disk) => own.or(disk),
+        };
         if agent.is_some()
             || daemon.is_some()
-            || p.deadline.is_some()
+            || deadline.is_some()
             || project_wait
             || p.read.has_wait
         {
@@ -859,11 +886,26 @@ impl TaskDispatcher {
                     (&project.id, project_wait),
                     agent,
                     daemon.as_deref(),
-                    p.deadline.as_deref(),
+                    deadline,
                 )
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether free disk coming back could end this machine wait: the Task
+    /// waits for disk, or some machine is under its floor right now. An
+    /// unreadable answer counts as yes: reading the Task again is cheap, a
+    /// wait nothing ends is not.
+    async fn waits_on_disk(&self, task: &db::Task) -> bool {
+        deferred_dispatch::current_dispatch_disposition(task).is_some_and(|wait| {
+            wait.capability == "machine_capacity"
+                && wait.capacity_scope.as_deref() == Some(api_types::CAPACITY_SCOPE_DISK)
+        }) || db::machine_disk::list_machine_disks(&self.db)
+            .await
+            .map_or(true, |machines| {
+                machines.iter().any(|row| row.disk.pressure.is_some())
+            })
     }
 
     /// Advance the sweep by at most `budget`. It runs outside the dispatch

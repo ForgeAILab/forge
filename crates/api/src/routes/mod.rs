@@ -1030,15 +1030,15 @@ pub fn daemon_response(db: &db::SqliteDb, mut daemon: Daemon) -> DaemonResponse 
     // the server's own.
     let disk = if services::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
         daemon.max_concurrent_runs = Some(db.server_run_cap.effective().unwrap_or(0));
-        db.disk_admission.server_facts()
+        db.disk_admission.applied(db.disk_admission.server_facts())
     } else {
-        daemon
-            .disk_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
+        // A reading the daemon stopped refreshing is shown, never as
+        // pressure.
+        db.disk_admission
+            .applied_daemon(daemon.disk_json.as_deref())
     };
     DaemonResponse {
-        disk: db.disk_admission.applied(disk),
+        disk,
         workspace_floor: db.disk_admission.floor(),
         max_concurrent_runs: daemon.max_concurrent_runs,
         run_limit: daemon.run_limit,

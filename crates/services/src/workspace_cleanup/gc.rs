@@ -232,6 +232,27 @@ impl WorkspaceCleanupScheduler {
     /// asked, it collects at most once per [`RECLAIM_INTERVAL`]. `true` when
     /// a pass ran.
     pub async fn reclaim_under_pressure(&self) -> bool {
+        self.reclaim(false).await
+    }
+
+    /// [`Self::reclaim_under_pressure`] for an admission: only when the
+    /// server's root is under the floor itself, so the admission would be
+    /// refused. Between the floor and the collector mark nothing is refused
+    /// and no claim (and no dispatcher scan) pays for a collection; the
+    /// cleanup tick runs that one.
+    ///
+    /// What an admission can wait for is bounded: one pass of at most
+    /// [`RECLAIM_BUDGET`], for the one caller that finds the collector free
+    /// and no pass in the last [`RECLAIM_INTERVAL`]. Every other caller
+    /// returns at once, whether a pass is running or just ran. The pass
+    /// holds the collector's own cursor and, briefly and one at a time, the
+    /// lifecycle lock of a Task it evicts from; it holds nothing a claim of
+    /// another Task or on another machine takes.
+    pub async fn reclaim_before_refusing(&self) -> bool {
+        self.reclaim(true).await
+    }
+
+    async fn reclaim(&self, only_under_floor: bool) -> bool {
         let admission = &self.db.disk_admission;
         let Some(floor) = admission.floor() else {
             return false;
@@ -239,7 +260,7 @@ impl WorkspaceCleanupScheduler {
         let Some(facts) = admission.server_facts() else {
             return false;
         };
-        if !floor.wants_gc(&facts) {
+        if !floor.wants_gc(&facts) || (only_under_floor && floor.pressure(&facts).is_none()) {
             return false;
         }
         // The periodic sweep holds the cursor for its whole pass and is the
@@ -450,9 +471,10 @@ impl WorkspaceCleanupScheduler {
                 _ => HashSet::new(),
             };
             let pass = sweep.clone();
+            let run_floor = settings.free_floor;
             let swept = blocking(move || {
                 let mut report = GcReport::default();
-                pass.run_dirs(running.iter().map(String::as_str), &mut report);
+                pass.run_dirs(running.iter().map(String::as_str), &run_floor, &mut report);
                 pass.check_checkouts(live_checks, &mut report);
                 // The legacy homes are shared by every run that still falls
                 // back to them, so they go only while nothing runs at all.
@@ -698,7 +720,9 @@ impl WorkspaceCleanupScheduler {
         let Some(task) = TaskRepo::get_by_id(&*self.db, name, true).await? else {
             return Ok(());
         };
-        let _guard = self.lock_task(&task).await;
+        let Some(_guard) = self.lock_task_for_gc(&task).await else {
+            return Ok(());
+        };
         let Some(task) = TaskRepo::get_by_id(&*self.db, name, true).await? else {
             return Ok(());
         };
@@ -821,7 +845,10 @@ impl WorkspaceCleanupScheduler {
             let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
                 continue;
             };
-            let guard = self.lock_task(&task).await;
+            // Never an unbounded wait: see `lock_task_for_gc`.
+            let Some(guard) = self.lock_task_for_gc(&task).await else {
+                continue;
+            };
             let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
                 continue;
             };

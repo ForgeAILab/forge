@@ -57,15 +57,20 @@ impl DiskFloor {
         }
     }
 
-    /// The byte floor on a filesystem of `total` bytes.
+    /// The byte floor on a filesystem of `total` bytes: the larger of the
+    /// byte floor and the percent floor. The byte floor counts for at most
+    /// half the filesystem, so a filesystem smaller than the configured
+    /// bytes (an 8 GiB volume under the 10 GiB default) is not under its
+    /// floor for ever; a percent floor is taken as configured.
     pub fn bytes(&self, total: u64) -> u64 {
         self.min_free_bytes
-            .max(total / 100 * u64::from(self.min_free_percent.min(100)))
+            .min(total / 2)
+            .max(percent_of(total, self.min_free_percent))
     }
 
     /// The inode floor on a filesystem of `total` inodes.
     pub fn inodes(&self, total: u64) -> u64 {
-        total / 100 * u64::from(self.min_free_inode_percent.min(100))
+        percent_of(total, self.min_free_inode_percent)
     }
 
     /// Bytes free under which the collector runs at once: the configured
@@ -76,14 +81,22 @@ impl DiskFloor {
             (None, None) => floor.saturating_mul(2),
             (bytes, percent) => bytes
                 .unwrap_or(0)
-                .max(total / 100 * u64::from(percent.unwrap_or(0).min(100)))
+                .min(total / 2)
+                .max(percent_of(total, percent.unwrap_or(0)))
                 .max(floor),
         }
     }
 
     /// What `facts` is short of, if anything. A filesystem that reports no
     /// inode counts has no inode floor.
+    ///
+    /// A filesystem that reports no size at all (some network and virtual
+    /// filesystems answer `statvfs` with zeros) is not a reading: nothing is
+    /// refused on it.
     pub fn pressure(&self, facts: &MachineDiskFacts) -> Option<DiskPressureKind> {
+        if !facts.is_readable() {
+            return None;
+        }
         if facts.free_bytes < self.bytes(facts.total_bytes) {
             return Some(DiskPressureKind::Bytes);
         }
@@ -97,8 +110,16 @@ impl DiskFloor {
 
     /// Whether the collector should run now rather than on its timer.
     pub fn wants_gc(&self, facts: &MachineDiskFacts) -> bool {
-        facts.free_bytes < self.gc_bytes(facts.total_bytes) || self.pressure(facts).is_some()
+        facts.is_readable()
+            && (facts.free_bytes < self.gc_bytes(facts.total_bytes)
+                || self.pressure(facts).is_some())
     }
+}
+
+/// `percent` of `total`, exact for every `total` (no overflow on a huge
+/// filesystem, no rounding to zero on a small one).
+fn percent_of(total: u64, percent: u8) -> u64 {
+    (u128::from(total) * u128::from(percent.min(100)) / 100) as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -138,6 +159,14 @@ pub struct MachineDiskFacts {
     /// `owned`, or why not (`unclaimed`, `claimed_by_other`, `refused`).
     #[serde(default)]
     pub gc_state: Option<String>,
+}
+
+impl MachineDiskFacts {
+    /// Whether the filesystem answered with a size. One that reports zero
+    /// bytes in total told Forge nothing it can hold to a floor.
+    pub fn is_readable(&self) -> bool {
+        self.total_bytes > 0
+    }
 }
 
 /// A machine's reading with the floor applied to it.
@@ -211,6 +240,41 @@ mod tests {
             ..floor
         };
         assert_eq!(off.pressure(&facts(9_000, 10_000, Some((0, 1_000)))), None);
+    }
+
+    #[test]
+    fn odd_filesystems_are_never_under_the_floor_for_ever() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let floor = DiskFloor::default();
+        // Zero-size (statvfs answered with zeros): not a reading, no refusal
+        // and no collection ahead of the timer.
+        assert_eq!(floor.pressure(&facts(0, 0, Some((0, 0)))), None);
+        assert!(!floor.wants_gc(&facts(0, 0, None)));
+        // Smaller than the byte floor: the byte floor counts for half of it,
+        // so an empty 8 GiB volume admits work and a nearly full one waits.
+        assert_eq!(floor.bytes(8 * GIB), 4 * GIB);
+        assert_eq!(floor.pressure(&facts(8 * GIB, 8 * GIB, None)), None);
+        assert_eq!(
+            floor.pressure(&facts(GIB, 8 * GIB, None)),
+            Some(DiskPressureKind::Bytes)
+        );
+        // Huge: 5 % of 16 EiB without overflow, and 5 % wins over 10 GiB.
+        assert_eq!(floor.bytes(u64::MAX), u64::MAX / 20);
+        assert_eq!(floor.pressure(&facts(u64::MAX / 10, u64::MAX, None)), None);
+        // Small counts are not rounded to a zero floor.
+        assert_eq!(floor.inodes(99), 4);
+        // A filesystem that counts no inodes (APFS and btrfs can report 0
+        // total) has no inode floor, whatever it says is free.
+        assert_eq!(
+            floor.pressure(&facts(100 * GIB, 200 * GIB, Some((0, 0)))),
+            None
+        );
+        // A percent floor of 100 is the way to say "always short".
+        let always = DiskFloor::of_bytes(0, 100);
+        assert_eq!(
+            always.pressure(&facts(999, 1_000, None)),
+            Some(DiskPressureKind::Bytes)
+        );
     }
 
     #[test]

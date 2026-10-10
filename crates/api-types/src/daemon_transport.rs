@@ -46,6 +46,11 @@ pub const STALE_GENERATION: &str = "stale_generation";
 pub const WRONG_OWNER: &str = "wrong_owner";
 pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
+/// `workspace.prepare` (a new or recreated worktree) and an exact-commit
+/// `check.run` refused because the daemon's own disk reading is under the
+/// free-space floor. Nothing was created; the same request is admitted once
+/// the machine has room.
+pub const DISK_PRESSURE: &str = "disk_pressure";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
 /// Revision 6 added the integration owner wire: the fence announcement on

@@ -241,6 +241,12 @@ impl DaemonWorkspaceBackend {
                 {
                     WorkspaceBackendError::OwnerUnreachable { daemon_id }
                 }
+                api_types::DISK_PRESSURE => WorkspaceBackendError::DiskPressure {
+                    task_id: placement.task_id.clone(),
+                    repo_location_id: placement.repo_location_id.clone(),
+                    daemon_id,
+                    runtime_id: placement.runtime_id.clone(),
+                },
                 "version_conflict" => db::DbError::VersionConflict.into(),
                 // The shared backend error contract represents path refusals as InvalidOperation.
                 _ => ServiceError::invalid_operation(format!("{}: {}", error.code, error.message))

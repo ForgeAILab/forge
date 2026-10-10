@@ -120,10 +120,6 @@ pub fn refuse_root(root: &Path) -> Option<&'static str> {
     }
     None
 }
-/// Default free-space floor: the larger of this many bytes and
-/// [`DEFAULT_MIN_FREE_PERCENT`] of the filesystem.
-pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-pub const DEFAULT_MIN_FREE_PERCENT: u8 = 5;
 /// Entries one Task-root measurement may visit before it is abandoned.
 pub const MEASURE_ENTRY_LIMIT: usize = 500_000;
 
@@ -540,10 +536,37 @@ impl Sweep {
     }
 
     /// Remove per-run temp directories no live run owns; see
-    /// [`sandbox::sweep_stale_runs`].
-    pub fn run_dirs<'a>(&self, live: impl IntoIterator<Item = &'a str>, report: &mut GcReport) {
+    /// [`sandbox::sweep_stale_runs`]. `floor` shortens how long a dead
+    /// run's directory is kept while the disk is short
+    /// ([`Self::run_dir_age`]).
+    pub fn run_dirs<'a>(
+        &self,
+        live: impl IntoIterator<Item = &'a str>,
+        floor: &FreeFloor,
+        report: &mut GcReport,
+    ) {
         report.run_dirs_removed +=
-            sandbox::sweep_stale_runs(&self.task_roots, live, self.now, MAX_RUN_AGE);
+            sandbox::sweep_stale_runs(&self.task_roots, live, self.now, self.run_dir_age(floor));
+    }
+
+    /// How long a per-run temp directory nobody claims is kept:
+    /// [`MAX_RUN_AGE`], and under the free-space floor only as long as the
+    /// longest configured limit of a run that is in no table allows.
+    ///
+    /// What age protects is a run no table knows (a hook, a check, a
+    /// detached push); executions are kept by the live set whatever their
+    /// age. The one configured limit on such a run is the check-run wall
+    /// limit, and [`Sweep::check_checkout_age`] is that limit doubled plus
+    /// an hour, the age at which a check's own checkout is already taken as
+    /// dead. So under the floor the directories crashed runs leave behind
+    /// stop accumulating for a day: with the default 30-minute limit they go
+    /// after two hours. Never longer than [`MAX_RUN_AGE`].
+    pub fn run_dir_age(&self, floor: &FreeFloor) -> Duration {
+        if self.under_floor(floor) {
+            self.check_checkout_age.min(MAX_RUN_AGE)
+        } else {
+            MAX_RUN_AGE
+        }
     }
 
     /// The given Task roots that have build output, least recently used
@@ -1366,10 +1389,11 @@ mod tests {
 
         let mut report = GcReport::default();
         // Now: the stale directory is younger than any allowed run.
-        sweep(&root).run_dirs([], &mut report);
+        let roomy = FreeFloor::of_bytes(0, 0);
+        sweep(&root).run_dirs([], &roomy, &mut report);
         assert!(stale.exists() && tmp.exists());
         // Much later it is older than any run; the live one still stands.
-        later(&root, 3 * DAY).run_dirs([], &mut report);
+        later(&root, 3 * DAY).run_dirs([], &roomy, &mut report);
         assert_eq!(report.run_dirs_removed, 1);
         assert!(!stale.exists());
         assert!(tmp.exists());
@@ -1407,17 +1431,95 @@ mod tests {
         assert_eq!(report.builds_evicted, 0);
         assert!(old.exists() && busy.exists());
 
-        // A floor no disk can meet: every idle build goes, the busy one stays
-        // whenever its run is visible to the registry.
-        let all = FreeFloor::of_bytes(u64::MAX, 0);
+        // A floor no disk can meet: every idle build goes, the busy one
+        // stays, whether or not its run has a temp directory (this test's
+        // own root may be too long for one).
+        let all = FreeFloor::of_bytes(u64::MAX, 100);
         sweep(&root).evict_builds(&names, &all, &mut report);
         assert!(!old.exists());
-        if run.tmp_dir().is_some() {
-            assert!(busy.exists());
-            assert_eq!(report.builds_evicted, 1);
-        }
+        assert!(busy.exists());
+        assert_eq!(report.builds_evicted, 1);
         assert_eq!(report.removed, 0);
         run.settle();
+    }
+
+    /// Under the free-space floor a crashed run's temp directory is kept
+    /// only as long as the longest configured run limit allows, not for the
+    /// 25 hours it gets on a roomy disk; a live run keeps its own whatever
+    /// the disk says.
+    #[test]
+    fn under_the_floor_a_dead_run_dir_goes_after_the_configured_run_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worktree = root.join("t").join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let tmp_root = root.join("t").join(TASK_DIR_NAME).join("tmp");
+        let (dead, live) = (tmp_root.join("deadrun000"), tmp_root.join("liverun000"));
+        fs::create_dir_all(&dead).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        let (roomy, short) = (
+            FreeFloor::of_bytes(0, 0),
+            FreeFloor::of_bytes(u64::MAX, 100),
+        );
+        let mut pass = later(&root, Duration::from_secs(3 * 60 * 60));
+        pass.check_checkout_age = check_checkout_age(30 * 60);
+        assert_eq!(pass.run_dir_age(&roomy), MAX_RUN_AGE);
+        assert_eq!(pass.run_dir_age(&short), Duration::from_secs(2 * 60 * 60));
+        // A limit longer than a day never lengthens the gate.
+        let mut long = pass.clone();
+        long.check_checkout_age = check_checkout_age(86_400);
+        assert_eq!(long.run_dir_age(&short), MAX_RUN_AGE);
+
+        let mut report = GcReport::default();
+        // Three hours old on a roomy disk: kept.
+        pass.run_dirs(["liverun000"], &roomy, &mut report);
+        assert_eq!(report.run_dirs_removed, 0);
+        // Under the floor: the dead one goes, the live one stays.
+        pass.run_dirs(["liverun000"], &short, &mut report);
+        assert_eq!(report.run_dirs_removed, 1);
+        assert!(!dead.exists() && live.exists());
+    }
+
+    /// A run with no per-run temp directory (its Task root is too long for
+    /// a socket path: the usual case on macOS) is in the live-run registry
+    /// all the same, so its build output is never evicted under it.
+    #[test]
+    fn a_run_without_a_temp_dir_still_keeps_its_build_output_from_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worktree = root.join("t").join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        let reserved = TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let build = root.join("t").join(TASK_DIR_NAME).join("build");
+        fs::create_dir_all(build.join("cargo")).unwrap();
+        fs::write(build.join("cargo/.rustc_info.json"), "{}").unwrap();
+
+        let run = SandboxEnv::for_run(&worktree, "no-tmp-run", RunPurpose::Execution)
+            .without_tmp()
+            .prepared();
+        assert!(run.tmp_dir().is_none());
+        assert!(sandbox::has_live_run_in(reserved.path()));
+        // A second run of the same Task, settled first, does not end the
+        // first one's registration.
+        let other = SandboxEnv::for_run(&worktree, "other-run", RunPurpose::Hook)
+            .without_tmp()
+            .prepared();
+        other.settle();
+        assert!(sandbox::has_live_run_in(reserved.path()));
+        let mut report = GcReport::default();
+        assert!(!sweep(&root).evict_build("t", &mut report));
+        assert!(build.join("cargo/.rustc_info.json").exists());
+        // Nothing was created for the registration.
+        assert!(!root.join("t").join(TASK_DIR_NAME).join("live").exists());
+
+        // Settled by its starter, or by whoever settles the execution.
+        sandbox::settle_run(&worktree, "no-tmp-run");
+        assert!(!sandbox::has_live_run_in(reserved.path()));
+        run.settle();
+        assert!(sweep(&root).evict_build("t", &mut report));
+        assert_eq!(report.builds_evicted, 1);
+        assert!(!build.exists());
     }
 
     #[test]

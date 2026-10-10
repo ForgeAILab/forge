@@ -529,7 +529,7 @@ async fn report_once(
         .await?;
     // The server holds every machine to one floor; the collector here
     // evicts to the same one.
-    crate::daemon_workspace::gc::accept_floor(daemon.workspace_floor);
+    crate::daemon_workspace::gc::accept_floor(workspace_root, daemon.workspace_floor);
     Ok(daemon)
 }
 

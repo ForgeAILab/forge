@@ -5476,3 +5476,70 @@ async fn integration_step_kind_rebuild_preserves_a_populated_file_database() {
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// `V202610101235` adds the nullable `daemon.disk_json` and nothing else: a
+/// daemon registered before it keeps every value and has no reading (which
+/// refuses nothing) until its next report.
+#[tokio::test]
+async fn daemon_disk_facts_migration_is_additive_and_keeps_existing_daemons() {
+    let migration_dir = unique_temp_path("daemon-disk-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir creates");
+    copy_migrations_up_to(202610100719, &migration_dir);
+    let db_path = unique_temp_path("daemon-disk-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("migrations before the disk facts apply");
+    let columns = |pool: db::SqlitePool| async move {
+        sqlx::query("PRAGMA table_info(daemon)")
+            .fetch_all(&pool)
+            .await
+            .expect("columns read")
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("notnull")))
+            .collect::<Vec<_>>()
+    };
+    let before = columns(pool.clone()).await;
+    assert!(before.iter().all(|(name, _)| name != "disk_json"));
+    let now = "2026-10-10T00:00:00Z";
+    sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at,max_concurrent_runs) VALUES ('disk-daemon','disk-machine','builder','linux','aarch64','online',?,?,3)")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("daemon inserts before the migration");
+    let row_before: String = sqlx::query_scalar(
+        "SELECT group_concat(quote(id)||quote(machine_id)||quote(hostname)||quote(status)||quote(max_concurrent_runs)||quote(updated_at)) FROM daemon",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row reads");
+
+    let all = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &all)
+        .await
+        .expect("the disk facts migration applies to a database with daemons");
+    let after = columns(pool.clone()).await;
+    // Every column that was there is unchanged and in place; the new one is
+    // nullable.
+    assert_eq!(&after[..before.len()], &before[..]);
+    assert!(after.contains(&("disk_json".to_owned(), 0)));
+    let row_after: String = sqlx::query_scalar(
+        "SELECT group_concat(quote(id)||quote(machine_id)||quote(hostname)||quote(status)||quote(max_concurrent_runs)||quote(updated_at)) FROM daemon",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row reads");
+    assert_eq!(row_before, row_after);
+    let reading: Option<String> =
+        sqlx::query_scalar("SELECT disk_json FROM daemon WHERE id = 'disk-daemon'")
+            .fetch_one(&pool)
+            .await
+            .expect("reading reads");
+    assert_eq!(reading, None, "no reading until the next report");
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}

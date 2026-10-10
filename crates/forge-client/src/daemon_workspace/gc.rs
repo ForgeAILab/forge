@@ -27,43 +27,93 @@ pub const GC_DISK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// While the disk is under the collector mark it sweeps this often instead.
 pub const GC_PRESSURE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The free-space floor this daemon was given by its server, in the reply
-/// to its report. A daemon has no floor of its own: the server holds every
-/// machine to one, so eviction here and refusal there agree.
-static SERVER_FLOOR: std::sync::RwLock<Option<FreeFloor>> = std::sync::RwLock::new(None);
+/// The free-space floor each workspace root of this process was given by its
+/// server, in the reply to its report. A daemon has no floor of its own: the
+/// server holds every machine to one, so eviction here and refusal there
+/// agree. Kept per root: two backends in one process (tests, a daemon beside
+/// a server) answer to their own servers and never see each other's floor.
+static SERVER_FLOORS: std::sync::Mutex<Option<HashMap<PathBuf, FreeFloor>>> =
+    std::sync::Mutex::new(None);
 /// What each root's ownership check found, for the disk report.
 static GC_STATES: std::sync::Mutex<Option<HashMap<PathBuf, &'static str>>> =
     std::sync::Mutex::new(None);
 
-/// Take the floor from the server's reply to a report.
-pub fn accept_floor(floor: Option<FreeFloor>) {
+/// One name for a root however it was spelled (`--workspace-root` through a
+/// link, a relative path): every per-root fact is kept under it.
+fn root_key(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf())
+}
+
+/// Take the floor for `workspace_root` from the server's reply to a report.
+pub fn accept_floor(workspace_root: &Path, floor: Option<FreeFloor>) {
     let Some(floor) = floor else {
         return;
     };
-    let mut current = SERVER_FLOOR.write().unwrap_or_else(|p| p.into_inner());
-    if *current != Some(floor) {
+    let key = root_key(workspace_root);
+    let mut floors = SERVER_FLOORS.lock().unwrap_or_else(|p| p.into_inner());
+    let floors = floors.get_or_insert_with(HashMap::new);
+    if floors.get(&key) != Some(&floor) {
         tracing::info!(
+            root = %key.display(),
             ?floor,
             "workspace free-space floor received from the server"
         );
-        *current = Some(floor);
+        floors.insert(key, floor);
     }
 }
 
-/// The floor the collector evicts to: the server's. Before the first reply
-/// (and with a server that sends none) it is the built-in default, and says
-/// so once.
-pub fn floor() -> FreeFloor {
+/// The floor the server sent for `workspace_root`, if it has sent one.
+pub fn server_floor(workspace_root: &Path) -> Option<FreeFloor> {
+    SERVER_FLOORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|floors| floors.get(&root_key(workspace_root)).copied())
+}
+
+/// The floor the collector of `workspace_root` evicts to: the server's.
+/// Before the first reply (and with a server that sends none) it is the
+/// built-in default, and says so once.
+pub fn floor(workspace_root: &Path) -> FreeFloor {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    match *SERVER_FLOOR.read().unwrap_or_else(|p| p.into_inner()) {
-        Some(floor) => floor,
-        None => {
-            WARNED.call_once(|| {
-                tracing::warn!("the server has sent no workspace free-space floor yet; using the built-in default (10 GiB or 5 % of the filesystem, 5 % of its inodes) until it does");
-            });
-            FreeFloor::default()
-        }
-    }
+    server_floor(workspace_root).unwrap_or_else(|| {
+        WARNED.call_once(|| {
+            tracing::warn!("the server has sent no workspace free-space floor yet; the collector uses the built-in default (10 GiB or 5 % of the filesystem, 5 % of its inodes) until it does");
+        });
+        FreeFloor::default()
+    })
+}
+
+/// The typed refusal of work that needs new disk (a new or recreated
+/// worktree, a check checkout) while this machine's own reading, taken now,
+/// is under the floor its server sent.
+///
+/// The server decides admission from this daemon's last report, which can be
+/// a minute old or, from a daemon that could not report, much older. This is
+/// what keeps a full disk from being filled on such a reading. No floor from
+/// the server yet, or a disk that cannot be read: nothing is refused.
+pub fn disk_pressure_refusal(
+    floor: Option<FreeFloor>,
+    reading: Option<executors::gc::DiskSpace>,
+) -> Option<api_types::DaemonErrorPayload> {
+    let facts = reading?.facts(String::new(), None);
+    let kind = floor?.pressure(&facts)?;
+    Some(api_types::DaemonErrorPayload {
+        code: api_types::DISK_PRESSURE.to_owned(),
+        message: format!(
+            "the workspace filesystem of this machine is under its free-space floor ({}): {} bytes free of {}",
+            kind.as_str(),
+            facts.free_bytes,
+            facts.total_bytes
+        ),
+        details: Some(serde_json::json!({
+            "kind": kind.as_str(),
+            "free_bytes": facts.free_bytes,
+            "total_bytes": facts.total_bytes,
+        })),
+    })
 }
 
 fn note_gc_state(workspace_root: &Path, state: &'static str) {
@@ -71,7 +121,7 @@ fn note_gc_state(workspace_root: &Path, state: &'static str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
-        .insert(workspace_root.to_path_buf(), state);
+        .insert(root_key(workspace_root), state);
 }
 
 /// The disk facts of `workspace_root` for a daemon report: free bytes and
@@ -79,13 +129,16 @@ fn note_gc_state(workspace_root: &Path, state: &'static str) {
 /// runs on it. `None` when the filesystem cannot be read; the server then
 /// refuses nothing for disk on this machine.
 pub fn disk_report(workspace_root: &Path) -> Option<api_types::MachineDiskFacts> {
+    // One warning while it stays unreadable, not one per report.
+    static UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let Some(space) = executors::gc::disk_space(workspace_root) else {
-        tracing::warn!(root = %workspace_root.display(), "free space of the workspace root cannot be read; no disk facts reported");
+        if !UNREADABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(root = %workspace_root.display(), "free space of the workspace root cannot be read; no disk facts are reported and nothing is refused for disk on this machine until it can");
+        }
         return None;
     };
-    let resolved = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    UNREADABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+    let resolved = root_key(workspace_root);
     let gc_state = GC_STATES
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -169,15 +222,30 @@ impl DaemonWorkspaceBackend {
     /// One budgeted pass. `active_ids` are the executions this daemon is
     /// running. Errors on single entries are counted, never returned.
     pub async fn gc_sweep(&self, active_ids: &[String]) -> GcReport {
-        self.gc_sweep_at(active_ids, SystemTime::now(), floor())
+        self.gc_sweep_at(active_ids, SystemTime::now(), floor(&self.workspace_root))
             .await
     }
 
     /// Whether the root's filesystem is under the mark at which the
     /// collector should not wait for its timer. `false` when unreadable.
     pub fn disk_is_short(&self) -> bool {
-        executors::gc::disk_space(&self.workspace_root)
-            .is_some_and(|space| floor().wants_gc(&space.facts(String::new(), None)))
+        executors::gc::disk_space(&self.workspace_root).is_some_and(|space| {
+            floor(&self.workspace_root).wants_gc(&space.facts(String::new(), None))
+        })
+    }
+
+    /// Refuse work that needs new disk while this machine's own reading is
+    /// under the floor its server sent: see [`disk_pressure_refusal`].
+    pub(super) fn refuse_new_disk_under_pressure(
+        &self,
+    ) -> Result<(), api_types::DaemonErrorPayload> {
+        match disk_pressure_refusal(
+            server_floor(&self.workspace_root),
+            executors::gc::disk_space(&self.workspace_root),
+        ) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
     }
 
     /// The handle table as every backend on this root knows it: this one's
@@ -328,7 +396,7 @@ impl DaemonWorkspaceBackend {
         let done = blocking(move || {
             let mut report = GcReport::default();
             pass.quarantine_settle(&known, &mut report);
-            pass.run_dirs(live.iter().map(String::as_str), &mut report);
+            pass.run_dirs(live.iter().map(String::as_str), &floor, &mut report);
             pass.check_checkouts(live_commands, &mut report);
             if idle {
                 pass.remove(&legacy, &mut report);

@@ -785,20 +785,20 @@ async fn full_owner_machine_queues_without_charging_wall_time_and_join_and_hit_t
     assert_eq!(count.active_runs(), 1);
 }
 
-/// A check always needs a new checkout. Under the disk floor it is the same
-/// typed capacity wait as a full machine: queued, told once, no wall time
-/// charged, and admitted by the next sweep that finds the reading recovered.
-/// It is never failed for it.
+/// Every run this worker dispatches executes in its Task's existing
+/// worktree, so the disk floor never holds one back: a wait here would keep
+/// a reviewed Task from finishing (which is how its worktree is given back)
+/// and would end, after the 30-minute queued-run expiry, as an
+/// infrastructure failure. Under the floor the check is admitted at once,
+/// never waits for capacity, and runs.
 #[tokio::test]
-async fn a_check_under_the_disk_floor_waits_then_runs_when_the_reading_recovers() {
+async fn a_check_in_an_existing_worktree_is_admitted_under_the_disk_floor() {
     let (_temp, store, runner) = fixture().await;
-    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
-    let reading = Arc::clone(&free);
     store.disk_admission.configure(
         api_types::DiskFloor::of_bytes(100, 0),
-        Arc::new(move || {
+        Arc::new(|| {
             Some(api_types::MachineDiskFacts {
-                free_bytes: reading.load(Ordering::SeqCst),
+                free_bytes: 10,
                 total_bytes: 1_000,
                 free_inodes: None,
                 total_inodes: None,
@@ -807,30 +807,14 @@ async fn a_check_under_the_disk_floor_waits_then_runs_when_the_reading_recovers(
             })
         }),
     );
-    let run = scheduled(runner.request(cacheable_request("disk-a")).await.unwrap());
-    let until = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
-    for _ in 0..2 {
-        let current = store.check_worker_record(&run.id).await.unwrap().run;
-        assert!(matches!(
-            store
-                .admit_check_run(&current, "waiting", &db::now_rfc3339(), &until)
-                .await
-                .unwrap(),
-            CheckAdmission::Waiting
-        ));
-    }
-    let waiting = store.check_worker_record(&run.id).await.unwrap();
-    assert!(waiting.admitted_at.is_none() && waiting.deadline_at.is_none());
-    assert_eq!(waiting.run.state, CheckRunState::Queued);
     assert_eq!(
-        store.check_run_counts().await.unwrap().waiting_for_capacity,
-        1
+        store.disk_admission.server_pressure(),
+        Some(api_types::DiskPressureKind::Bytes)
     );
-
-    // The reading recovers: the same run is admitted and runs.
-    free.store(500, Ordering::SeqCst);
-    store.disk_admission.refresh();
-    let admitted = admit(&store, &waiting.run).await;
+    let run = scheduled(runner.request(cacheable_request("disk-a")).await.unwrap());
+    let admitted = admit(&store, &run).await;
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    assert!(record.admitted_at.is_some(), "admitted, not expired");
     assert_eq!(
         store.check_run_counts().await.unwrap().waiting_for_capacity,
         0

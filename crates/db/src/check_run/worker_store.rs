@@ -206,28 +206,19 @@ impl CheckWorkerRepo for SqliteDb {
             let capacity =
                 crate::machine_capacity::count_machine_capacity(&mut tx, machine, cap, &embedded)
                     .await?;
-            // A check always needs a new checkout. On a machine whose
-            // workspace filesystem is under its floor it waits exactly as it
-            // waits for a run slot, and is admitted by the sweep that finds
-            // the reading recovered. It is never failed for it.
-            let disk_pressure = match machine {
-                Some(id) => {
-                    let disk_json: Option<String> =
-                        sqlx::query_scalar("SELECT disk_json FROM daemon WHERE id=?")
-                            .bind(id)
-                            .fetch_optional(&mut *tx)
-                            .await?
-                            .flatten();
-                    self.disk_admission.daemon_pressure(disk_json.as_deref())
-                }
-                None => self.disk_admission.server_pressure(),
-            };
-            if disk_pressure.is_some()
-                || (!capacity.has_capacity()
-                    && !crate::machine_capacity::check_borrows_machine_slot(
-                        &mut tx, &run.id, machine, &embedded,
-                    )
-                    .await?)
+            // Disk pressure is deliberately not asked here. Every run this
+            // worker dispatches executes in its Task's existing, ready
+            // worktree (`CheckDispatchTarget::{Server, Daemon}` both name a
+            // workspace; nothing here makes a checkout), and a run in an
+            // existing worktree is never refused for disk: finishing the
+            // review or the merge is how the worktree is given back. A wait
+            // here would also end in the queued-run expiry below, which
+            // settles the run as an infrastructure failure.
+            if !capacity.has_capacity()
+                && !crate::machine_capacity::check_borrows_machine_slot(
+                    &mut tx, &run.id, machine, &embedded,
+                )
+                .await?
             {
                 // The first refusal of this run starts its one slot wait: its
                 // consumers' Tasks are told once, not on every sweep.

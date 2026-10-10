@@ -1843,6 +1843,6 @@ pub(crate) fn metadata_changes_condition(mutations: &[crate::TaskMetadataMutatio
 
 pub(crate) mod readers;
 pub use readers::{
-    ConditionRead, ConditionRefusal, ConditionRetry, PRESENTATION_TEXT_LIMIT,
+    capacity_reason, ConditionRead, ConditionRefusal, ConditionRetry, PRESENTATION_TEXT_LIMIT,
     PRESENTATION_TRUNCATION_MARKER,
 };

@@ -419,7 +419,7 @@ impl TaskService {
     /// before it reports a reading under the mark.
     pub(crate) async fn reclaim_disk_before_refusing(&self) {
         if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
-            scheduler.reclaim_under_pressure().await;
+            scheduler.reclaim_before_refusing().await;
         }
     }
 
@@ -1088,11 +1088,9 @@ impl TaskService {
             };
             if needs_recreation {
                 let pressure = match admission.placement.daemon_id.as_deref() {
-                    Some(daemon_id) => self.db.disk_admission.pressure_of(
-                        db::machine_disk::daemon_disk(&self.db, daemon_id)
-                            .await?
-                            .as_ref(),
-                    ),
+                    Some(daemon_id) => {
+                        db::machine_disk::daemon_pressure(&self.db, daemon_id).await?
+                    }
                     None => self.db.disk_admission.server_pressure(),
                 };
                 self.refuse_recreation_under_disk_pressure(&admission, pressure)?;
@@ -1147,6 +1145,29 @@ impl TaskService {
         let prepared = match result {
             Ok(Ok(prepared)) => prepared,
             failure => {
+                // The owner's own disk reading is under the floor: it made
+                // nothing. The reservation is given back and the Task takes
+                // the disk wait, as when the server refuses from the
+                // owner's report. No retry budget is spent on it.
+                if let Ok(Err(crate::workspace_backend::WorkspaceBackendError::DiskPressure {
+                    ..
+                })) = &failure
+                {
+                    match crate::placement::admission::fail_preparation(
+                        &self.db,
+                        &admission.placement,
+                        db::PlacementFailureCause::PrepareFailed,
+                    )
+                    .await
+                    {
+                        Ok(()) | Err(ServiceError::Db(DbError::VersionConflict)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.refuse_recreation_under_disk_pressure(
+                        &admission,
+                        Some(api_types::DiskPressureKind::Bytes),
+                    )?;
+                }
                 let (message, cause, refusal) = match failure {
                     Ok(Err(
                         error @ crate::workspace_backend::WorkspaceBackendError::StaleGeneration {
