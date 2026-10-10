@@ -70,6 +70,18 @@ pub enum CheckVerdict {
     /// of the candidate.
     InfrastructureExhausted(db::StoredCheckResult),
 }
+/// A consumer as the step that asked sees it on a later look.
+#[derive(Debug, Clone)]
+pub enum CheckWaitState {
+    Result(db::StoredCheckResult),
+    /// No verdict after the automatic retries: the Task is parked on the
+    /// typed check condition and its owner's `retry` asks again.
+    Exhausted,
+    /// The run is queued, running or being retried.
+    Pending,
+    /// Nothing will answer this consumer any more.
+    Lost,
+}
 #[derive(Debug, Clone)]
 pub struct CheckApplication {
     pub task_id: String,
@@ -258,6 +270,59 @@ impl TaskCheckConsumers {
                 wall_timeout_seconds: request.wall_timeout_seconds,
             })
             .await
+    }
+
+    /// The verdict a consumer has been answered with, read by the step that
+    /// asked once it is woken. `None` while its run has produced no result,
+    /// or when the consumer was cancelled.
+    pub async fn verdict(&self, consumer_id: &str) -> Result<Option<CheckVerdict>> {
+        let Some(state) = self.store.check_consumer_delivery(consumer_id).await? else {
+            return Ok(None);
+        };
+        if state.cancelled_at.is_some() {
+            return Ok(None);
+        }
+        let Some(result_id) = state.consumer.result_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(result) = self.store.check_result(result_id).await? else {
+            return Ok(None);
+        };
+        if result.identity_key != state.consumer.identity_key {
+            return Err(ServiceError::invalid_operation(
+                "check consumer holds a result for another identity",
+            ));
+        }
+        Ok(Some(
+            if result.outcome == CheckResultOutcome::InfrastructureFailed {
+                CheckVerdict::InfrastructureExhausted(result)
+            } else {
+                CheckVerdict::Result(result)
+            },
+        ))
+    }
+
+    /// What the step that asked finds when it looks at its consumer again.
+    /// `Lost` is a wait nothing will ever answer: the consumer is unknown or
+    /// cancelled, or it names a run or result row that no longer exists.
+    pub async fn wait_state(&self, consumer_id: &str) -> Result<CheckWaitState> {
+        let Some(state) = self.store.check_consumer_delivery(consumer_id).await? else {
+            return Ok(CheckWaitState::Lost);
+        };
+        if state.cancelled_at.is_some() {
+            return Ok(CheckWaitState::Lost);
+        }
+        match self.verdict(consumer_id).await? {
+            Some(CheckVerdict::Result(result)) => Ok(CheckWaitState::Result(result)),
+            Some(CheckVerdict::InfrastructureExhausted(_)) => Ok(CheckWaitState::Exhausted),
+            None if state.consumer.result_id.is_some() => Ok(CheckWaitState::Lost),
+            None => match state.consumer.run_id.as_deref() {
+                Some(run_id) if self.store.check_run(run_id).await?.is_some() => {
+                    Ok(CheckWaitState::Pending)
+                }
+                _ => Ok(CheckWaitState::Lost),
+            },
+        }
     }
 
     /// The `apply_check_result` Task step. `step_id` is the claimed step:

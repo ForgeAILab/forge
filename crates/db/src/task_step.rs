@@ -44,6 +44,10 @@ pub struct TaskStep {
     /// False for a queued effect fenced by its own identity: it applies after
     /// a status change and survives a preempting Cancel/Hold.
     pub entry_fenced: bool,
+    /// Set while `suspended`: the latest time the step looks again.
+    pub suspended_until: Option<String>,
+    /// The check consumer a hooks step waits for, or last waited for.
+    pub awaited_consumer_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,9 +80,11 @@ pub trait TaskStepRepo: Send + Sync {
     ) -> Result<String>;
     async fn enqueue_step(&self, input: &EnqueueTaskStep) -> Result<String>;
     async fn task_steps(&self, task_id: &str) -> Result<Vec<TaskStep>>;
+    /// Steps that are queued or running. A `suspended` step is neither: it
+    /// waits for a check result and nothing can advance it meanwhile.
     async fn pending_steps(&self, task_id: &str) -> Result<i64>;
-    /// The current entry's post-commit hooks row is still pending or
-    /// claimed: its entry checks (CI, before-work scripts, dispatch) have not
+    /// The current entry's post-commit hooks row is still pending, claimed
+    /// or suspended on a check: its entry checks (CI, before-work scripts, dispatch) have not
     /// settled. Matched on status and epoch, as the step fence is.
     async fn entry_hooks_pending(&self, task_id: &str) -> Result<bool>;
     async fn chain_steps(&self, chain_id: &str) -> Result<Vec<TaskStep>>;
@@ -140,6 +146,8 @@ fn row_step(row: sqlx::sqlite::SqliteRow) -> TaskStep {
         completed_at: row.get("completed_at"),
         result_json: row.get("result_json"),
         entry_fenced: row.get::<i64, _>("entry_fenced") != 0,
+        suspended_until: row.get("suspended_until"),
+        awaited_consumer_id: row.get("awaited_consumer_id"),
     }
 }
 
@@ -164,7 +172,7 @@ impl TaskStepRepo for SqliteDb {
                 .bind(&i.id)
                 .execute(&mut **tx)
                 .await?;
-            superseded = sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation','integration')")
+            superseded = sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status IN ('pending','suspended') AND kind IN ('hooks','cascade','command','mutation','integration')")
                 .bind(&now).bind(&now).bind(&i.task_id).bind(&i.id).execute(&mut **tx).await?.rows_affected();
         }
         // An enqueued hooks step may become the entry's owner; a preempting
@@ -298,7 +306,7 @@ impl TaskStepRepo for SqliteDb {
             .filter(|step| step.task_id == task_id)
             .map(|step| step.id);
         Ok(sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id = s.task_id WHERE s.task_id = ? AND (s.kind='hooks' OR (s.kind='command' AND s.lane='long')) AND s.status IN ('pending','claimed') AND (? IS NULL OR s.id<>?) AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)",
+            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id = s.task_id WHERE s.task_id = ? AND (s.kind='hooks' OR (s.kind='command' AND s.lane='long')) AND s.status IN ('pending','claimed','suspended') AND (? IS NULL OR s.id<>?) AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)",
         )
         .bind(task_id)
         .bind(&own).bind(&own)
@@ -420,6 +428,129 @@ impl SqliteDb {
         if !owned {
             return Err(DbError::VersionConflict);
         }
+        Ok(())
+    }
+
+    /// Suspend a claimed hooks step that waits for a check result. The step
+    /// keeps its open checkpoint, gives up its lease and is not charged the
+    /// attempt. It is `suspended`, not `pending`: nothing claims it and it is
+    /// not an unfinished step, but it still owns its status entry. The
+    /// awaited consumer's delivery wakes it ([`Self::wake_suspended_hooks`]);
+    /// `until` is the latest time it looks again on its own.
+    pub async fn suspend_hook_step(
+        &self,
+        s: &TaskStep,
+        until: &str,
+        consumer_id: &str,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        let n = sqlx::query("UPDATE task_step SET status='suspended',claimed_by=NULL,lease_until=NULL,attempts=MAX(attempts-1,0),last_error=NULL,suspended_until=?,awaited_consumer_id=?,updated_at=? WHERE id=? AND kind='hooks' AND status='claimed' AND claimed_by=? AND (lease_until > ? OR ?)")
+            .bind(until).bind(consumer_id).bind(&now).bind(&s.id).bind(&s.claimed_by).bind(&now).bind(self.step_is_active(s))
+            .execute(self.pool()).await?.rows_affected();
+        if n != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        self.domain_event_notify().notify_waiters();
+        Ok(())
+    }
+
+    /// The awaited consumer was answered: its suspended hooks step is
+    /// `pending` again and claimable now. Returns how many steps were woken
+    /// (0 when none waits any more).
+    pub async fn wake_suspended_hooks(&self, task_id: &str, consumer_id: &str) -> Result<u64> {
+        let now = now_rfc3339();
+        let n = sqlx::query("UPDATE task_step SET status='pending',suspended_until=NULL,available_at=?,updated_at=? WHERE task_id=? AND status='suspended' AND awaited_consumer_id=?")
+            .bind(&now).bind(&now).bind(task_id).bind(consumer_id)
+            .execute(self.pool()).await?.rows_affected();
+        if n != 0 {
+            self.domain_event_notify().notify_waiters();
+        }
+        Ok(n)
+    }
+
+    /// Suspended steps whose deadline passed, or whose Task left the status
+    /// entry they wait in, become `pending`: the first looks at its check
+    /// again, the second is superseded by the ordinary entry fence when it
+    /// is claimed. Runs ahead of every claim; reads only the (small) partial
+    /// index of suspended rows unless one is due.
+    async fn wake_due_suspended(&self, now: &str) -> Result<()> {
+        const DUE: &str = "status='suspended' AND (suspended_until IS NULL OR suspended_until<=?1 OR NOT EXISTS(SELECT 1 FROM task t WHERE t.id=task_step.task_id AND t.status=task_step.expected_status AND t.status_epoch=task_step.expected_epoch AND t.deleted_at IS NULL))";
+        let due: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM task_step WHERE {DUE})"
+        ))
+        .bind(now)
+        .fetch_one(self.pool())
+        .await?;
+        if due {
+            sqlx::query(&format!("UPDATE task_step SET status='pending',suspended_until=NULL,available_at=?1,updated_at=?1 WHERE {DUE}"))
+                .bind(now)
+                .execute(self.pool())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// A suspended step of this Task, in its current status entry, awaits a
+    /// check consumer that is live and whose answer is not yet delivered
+    /// (no delivery step exists: its run is queued, running or retried).
+    pub async fn awaited_check_is_open(&self, task_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id=s.task_id JOIN check_consumer c ON c.id=s.awaited_consumer_id WHERE s.task_id=? AND s.status='suspended' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch AND c.cancelled_at IS NULL AND c.delivery_step_id IS NULL)")
+            .bind(task_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+
+    /// Every open check wait of this Task (see [`Self::awaited_check_is_open`])
+    /// is a run queued behind a full machine: no slot was free when the check
+    /// worker last tried to admit it. Only a run or check ending elsewhere
+    /// frees one. `false` when the Task has no open check wait.
+    pub async fn awaited_check_waits_for_slot(&self, task_id: &str) -> Result<bool> {
+        const OPEN: &str = "FROM task_step s JOIN task t ON t.id=s.task_id JOIN check_consumer c ON c.id=s.awaited_consumer_id LEFT JOIN check_run r ON r.id=c.run_id WHERE s.task_id=?1 AND s.status='suspended' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch AND c.cancelled_at IS NULL AND c.delivery_step_id IS NULL";
+        const SLOT: &str = "r.state='queued' AND r.capacity_wait_since IS NOT NULL";
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 {OPEN}) AND NOT EXISTS(SELECT 1 {OPEN} AND NOT COALESCE({SLOT},0))"
+        ))
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    /// What the open check waits of this Task wait on, for a report: each
+    /// suspended step's consumer and the state of the run it joined.
+    pub async fn awaited_check_summary(&self, task_id: &str) -> Result<String> {
+        let rows: Vec<String> = sqlx::query_scalar("SELECT json_object('step',s.id,'consumer',c.id,'request_key',c.request_key,'result',c.result_id,'run',c.run_id,'run_state',r.state,'run_lease_until',r.lease_until,'run_updated_at',r.updated_at,'slot_wait_since',r.capacity_wait_since,'machine',r.machine_id) FROM task_step s JOIN check_consumer c ON c.id=s.awaited_consumer_id LEFT JOIN check_run r ON r.id=c.run_id WHERE s.task_id=? AND s.status='suspended' ORDER BY s.seq")
+            .bind(task_id)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.join(", "))
+    }
+
+    /// Check consumers awaited by steps of this Task that will never read
+    /// their result: the step was superseded while suspended.
+    pub async fn abandoned_check_waits(&self, task_id: &str) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as("SELECT id,awaited_consumer_id FROM task_step WHERE task_id=? AND status='superseded' AND awaited_consumer_id IS NOT NULL")
+            .bind(task_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
+    /// The step that asked for this check will never read its result: the
+    /// consumer is cancelled, so its delivery is stale and its run, when it
+    /// has no other consumer, is stopped by the check worker's next look.
+    pub async fn cancel_abandoned_check_consumer(&self, consumer_id: &str) -> Result<bool> {
+        Ok(sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL AND applied_at IS NULL")
+            .bind(now_rfc3339())
+            .bind(consumer_id)
+            .execute(self.pool())
+            .await?
+            .rows_affected()
+            == 1)
+    }
+    /// The abandoned wait of `step_id` was cleaned up.
+    pub async fn forget_check_wait(&self, step_id: &str) -> Result<()> {
+        sqlx::query("UPDATE task_step SET awaited_consumer_id=NULL WHERE id=? AND status NOT IN ('suspended','pending','claimed')")
+            .bind(step_id)
+            .execute(self.pool())
+            .await?;
         Ok(())
     }
 
@@ -675,6 +806,7 @@ impl SqliteDb {
         let active = serde_json::to_string(&active)
             .map_err(|e| DbError::from(sqlx::Error::Decode(Box::new(e))))?;
         let now = now_rfc3339();
+        self.wake_due_suspended(&now).await?;
         if let Some(lane) = lane {
             let live:i64=sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE status='claimed' AND lane=? AND lease_until>?")
                 .bind(lane).bind(&now).fetch_one(self.pool()).await?;
