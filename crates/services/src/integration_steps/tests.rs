@@ -1261,6 +1261,7 @@ impl crate::integration_worker::IntegrationFactsPort for GitFacts {
             target_dirty: !git::is_worktree_clean(&repo).await?,
             rebase_in_progress: git::detect_rebase_in_progress(&tree).await?,
             shared_object_store: true,
+            placement_ready: true,
             task_target_tip: String::new(),
             workspace: EffectWorkspace {
                 workspace_id,

@@ -351,6 +351,7 @@ impl IntegrationFactsPort for GitFactsFake {
             worktree_dirty: !git::is_worktree_clean(&tree).await?,
             target_dirty: !git::is_worktree_clean(&repo).await?,
             rebase_in_progress: git::detect_rebase_in_progress(&tree).await?,
+            placement_ready: true,
             shared_object_store: !self
                 .transfer
                 .remote

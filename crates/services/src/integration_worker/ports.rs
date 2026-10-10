@@ -230,6 +230,11 @@ pub struct HeadFacts {
     pub rebase_in_progress: bool,
     /// The Task's checkout shares the default checkout's object store.
     pub shared_object_store: bool,
+    /// The Task's workspace placement is `ready`. After its owner
+    /// reconnects a placement stays `disconnected` until the owner
+    /// reconciliation has looked at it; a head check asked meanwhile is
+    /// refused for good, so the head waits before it asks.
+    pub placement_ready: bool,
     /// In another clone: the tip of that clone's own target branch (empty
     /// when it has none). The default checkout usually knows this commit, so
     /// an inbound transfer names it as one the receiver already holds.

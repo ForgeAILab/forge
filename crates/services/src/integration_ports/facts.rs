@@ -67,6 +67,7 @@ impl WorkspaceHeadFacts {
             target_dirty: false,
             rebase_in_progress: false,
             shared_object_store: true,
+            placement_ready: true,
             task_target_tip: String::new(),
             task_location: ObjectTransferEndpoint {
                 repo_location_id: queue.target_location_id.clone().unwrap_or_default(),
@@ -277,6 +278,7 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             target_dirty,
             rebase_in_progress,
             shared_object_store: shared,
+            placement_ready: placement.state == db::PlacementState::Ready,
             task_target_tip,
         })
     }

@@ -1153,6 +1153,24 @@ impl HeadDriver {
             } => {
                 // The receipt names no commit; read the rebased HEAD.
                 let facts = self.facts(&a, queue).await?;
+                if !facts.placement_ready {
+                    // The owner answered for its rebase (it is connected),
+                    // but the Task's placement is not `ready` again yet: the
+                    // owner reconciliation after a reconnect has not run.
+                    // The check owner refuses such a placement for good, so
+                    // the check is not asked for until it is ready. The
+                    // receipt stays to be adopted on the next pass.
+                    if self.timed_out(HeadTimeout::Step) {
+                        return self
+                            .park(
+                                &a,
+                                ParkReason::Infrastructure,
+                                "the Task's checkout is not ready on its machine",
+                            )
+                            .await;
+                    }
+                    return Ok(Pass::Wait(self.w.config.poll));
+                }
                 let head = facts.candidate_head;
                 let tip = target_tip.to_owned();
                 let a = self
