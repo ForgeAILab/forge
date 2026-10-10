@@ -5269,3 +5269,210 @@ async fn conflict_hotspot_migration_seeds_current_head_on_migrated_clone() {
     fs::remove_file(db_path).unwrap();
     fs::remove_dir_all(migration_dir).unwrap();
 }
+
+/// The `task_step` rebuild that adds the `integration` step kind
+/// (V202610100137), on a populated database file that is closed and opened
+/// again around the migration, the way an upgraded install meets it: every
+/// row, the self-reference, the dependent checkpoint, every index and trigger
+/// survive, and the new kind is accepted afterwards.
+#[tokio::test]
+async fn integration_step_kind_rebuild_preserves_a_populated_file_database() {
+    const NEW: &str = "V202610100137__integration_task_step.sql";
+    const NEW_VERSION: i64 = 202_610_100_137;
+    let dir = unique_temp_path("integration-step-kind-migrations");
+    fs::create_dir_all(&dir).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if migration_version(filename).is_some_and(|version| version < NEW_VERSION) {
+            fs::copy(&path, dir.join(filename)).unwrap();
+        }
+    }
+    let (pool, db_path) = migration_test_pool("integration-step-kind-db").await;
+    run_migrations_from(&pool, &dir).await.unwrap();
+    sqlx::raw_sql("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('step-project', 'keep', '{}', '{}', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z');
+        INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('step-a', 'step-project', 'a', 'task', 'merging', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z');
+        INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('step-b', 'step-project', 'b', 'task', 'review', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z');")
+        .execute(&pool).await.unwrap();
+    // One step of every kind and every status the old CHECK allowed, with
+    // every optional column filled on at least one row.
+    let kinds = ["cascade", "hooks", "command", "mutation"];
+    let statuses = [
+        "pending",
+        "claimed",
+        "done",
+        "superseded",
+        "parked",
+        "failed",
+    ];
+    let mut seq = 0;
+    let mut parent: Option<String> = None;
+    for task in ["step-a", "step-b"] {
+        for (index, status) in statuses.iter().enumerate() {
+            seq += 1;
+            let id = format!("{task}-{seq}");
+            let kind = kinds[index % kinds.len()];
+            let claimed = *status == "claimed";
+            let settled = matches!(*status, "done" | "superseded" | "failed");
+            sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,attempts,last_error,created_at,updated_at,completed_at,result_json,priority,preempt_requested_at,integration_started_at,expected_epoch,lane,entry_fenced) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(&id)
+                .bind(task)
+                .bind(seq)
+                .bind(kind)
+                .bind(if kind == "hooks" { r#"{"workflow_ref":{"kind":"snapshot","id":"wf-1"}}"# } else { r#"{"preempt":false}"# })
+                .bind(parent.as_deref())
+                .bind(format!("key-{seq}"))
+                .bind(format!("chain-{task}"))
+                .bind(index as i64 + 1)
+                .bind("merging")
+                .bind(seq + 10)
+                .bind(status)
+                .bind(claimed.then_some("worker-1"))
+                .bind(claimed.then_some("2099-01-01T00:00:00Z"))
+                .bind("2026-10-09T00:00:01Z")
+                .bind(index as i64)
+                .bind((*status == "failed").then_some("boom"))
+                .bind("2026-10-09T00:00:00Z")
+                .bind("2026-10-09T00:00:02Z")
+                .bind(settled.then_some("2026-10-09T00:00:03Z"))
+                .bind(settled.then_some(r#"{"ok":true}"#))
+                .bind(i64::from(kind == "command"))
+                .bind((kind == "command").then_some("2026-10-09T00:00:04Z"))
+                .bind(claimed.then_some("2026-10-09T00:00:05Z"))
+                .bind(seq % 3)
+                .bind(if index % 2 == 0 { "fast" } else { "long" })
+                .bind(i64::from(!claimed))
+                .execute(&pool)
+                .await
+                .unwrap();
+            parent = Some(id);
+        }
+    }
+    sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at) VALUES('step-a-2',0,'2026-10-09T00:00:06Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at) VALUES ('refused','step-a',99,'integration','{}','refused','refused',1,'merging',1,'pending','2026-10-09T00:00:00Z','2026-10-09T00:00:00Z','2026-10-09T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "the old CHECK refuses the kind"
+    );
+    async fn rows(pool: &sqlx::SqlitePool) -> String {
+        sqlx::query_scalar("SELECT json_group_array(json_array(id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,attempts,last_error,created_at,updated_at,completed_at,result_json,priority,preempt_requested_at,integration_started_at,expected_epoch,lane,entry_fenced,workflow_ref_id)) FROM (SELECT * FROM task_step ORDER BY task_id,seq)")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    async fn schema(pool: &sqlx::SqlitePool) -> Vec<(String, String, Option<String>)> {
+        sqlx::query_as("SELECT type,name,sql FROM sqlite_schema WHERE tbl_name='task_step' AND name NOT LIKE 'sqlite_autoindex%' ORDER BY type,name")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+    let before = rows(&pool).await;
+    let before_schema = schema(&pool).await;
+    let dirty_before: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(generation),0) FROM task_schedule_dirty")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        12
+    );
+    // The install stops, is upgraded, and starts on the same file.
+    pool.close().await;
+    fs::copy(source.join(NEW), dir.join(NEW)).unwrap();
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations_from(&pool, &dir).await.unwrap();
+
+    assert_eq!(rows(&pool).await, before, "every row and column value");
+    let after_schema = schema(&pool).await;
+    assert_eq!(before_schema.len(), after_schema.len());
+    for (old, new) in before_schema.iter().zip(&after_schema) {
+        assert_eq!((&old.0, &old.1), (&new.0, &new.1));
+        if old.0 != "table" {
+            assert_eq!(old.2, new.2, "{}", old.1);
+        }
+    }
+    // The rebuild copies rows without firing the scheduler triggers.
+    let dirty_after: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(generation),0) FROM task_schedule_dirty")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dirty_after, dirty_before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE step_id='step-a-2'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1,
+        "the rebuild leaves foreign keys on"
+    );
+    // The new kind is accepted, the self-reference still cascades to NULL,
+    // and the dependent checkpoint still follows its step.
+    sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at) VALUES ('accepted','step-a',99,'integration','{}','step-a-1','integration:a:1:settle','integration:a:1:settle',1,'merging',1,'pending','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM task_step WHERE id='step-a-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT causation_step_id FROM task_step WHERE id='accepted'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        None
+    );
+    sqlx::query("DELETE FROM task_step WHERE id='step-a-2'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_hook_checkpoint")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    // A second start is a no-op.
+    pool.close().await;
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations_from(&pool, &dir).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migration WHERE version=202610100137")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(dir);
+}
