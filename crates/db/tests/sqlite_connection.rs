@@ -141,7 +141,11 @@ async fn outbox_existing_database_conversion_is_explicit_and_preserves_data() {
     assert!(before.free_pages > 100);
     db::incremental_vacuum(&pool).await.unwrap();
     assert_eq!(db::sqlite_storage_status(&pool).await.unwrap(), before);
-    pool.close().await;
+    // The conversion opens the file exclusively and does not wait. A plain
+    // `pool.close()` can leave the connection the status read just released
+    // open (it is returned by a background task), which failed this test
+    // once with `database is locked`.
+    db::close_sqlite_pool(&pool).await;
     let size_before = std::fs::metadata(&path).unwrap().len();
     db::convert_sqlite_to_incremental(&url).await.unwrap();
     assert!(std::fs::metadata(&path).unwrap().len() < size_before);
@@ -168,7 +172,7 @@ async fn outbox_existing_database_conversion_is_explicit_and_preserves_data() {
         .await
         .unwrap();
     assert_eq!(journal, "wal");
-    pool.close().await;
+    db::close_sqlite_pool(&pool).await;
     // Re-running conversion is safe and does not rebuild incremental databases.
     db::convert_sqlite_to_incremental(&url).await.unwrap();
     std::fs::remove_file(path).unwrap();

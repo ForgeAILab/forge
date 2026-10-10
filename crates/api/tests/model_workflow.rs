@@ -2926,6 +2926,97 @@ async fn a_task_rebased_after_merge_contention_runs_its_review_entry_again() {
     .await;
 }
 
+/// The second review entry, directly. Two Tasks branch from the same target.
+/// The first merges; the second passed its review on the old target, fails
+/// its merge because the target moved, is rebased and enters `review` again.
+/// That second entry requests its own entry check for the rebased commit,
+/// the check runs, settles, and the Task merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_second_review_entry_after_a_rebase_requests_runs_and_settles_its_check() {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        for action in [
+            Action::Create,
+            Action::Create,
+            Action::Finish(0, Outcome::Success),
+            Action::Finish(1, Outcome::Success),
+        ] {
+            let applied = world.apply(&action).await?;
+            world.quiesce().await?;
+            let state = world.check_quiescent().await?;
+            world.trace.push(format!("{action:?} -> {applied}: {state}"));
+        }
+        world.drive_to_settlement().await?;
+        let pool = world.live().pool.clone();
+        let sql = |error: sqlx::Error| error.to_string();
+        for index in 0..2 {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!("task {index} ended in {}", task["status"]));
+            }
+        }
+        // Whichever Task merged second is the one that was rebased.
+        let rebased: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM transition_log WHERE from_state = 'merge_failed' AND to_state = 'review'",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(sql)?;
+        let [task_id] = rebased.as_slice() else {
+            return Err(format!(
+                "expected exactly one Task to re-enter review from merge_failed, got {rebased:?}"
+            ));
+        };
+        let entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM transition_log WHERE task_id = ? AND to_state = 'review'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(sql)?;
+        // One consumer per entry, each with its own run on its own commit,
+        // each run finished and its result applied to that entry.
+        let checks: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT c.origin, r.commit_sha, r.state, c.applied_at, c.status_epoch
+             FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+             WHERE c.task_id = ? ORDER BY c.created_at, c.rowid",
+        )
+        .bind(task_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(sql)?;
+        if entries != 2 || checks.len() != 2 {
+            return Err(format!("{entries} review entries with checks {checks:?}; expected two of each"));
+        }
+        let (first, second) = (&checks[0], &checks[1]);
+        if checks.iter().any(|(origin, _, state, applied, _)| {
+            origin != "entry" || state != "succeeded" || applied.is_none()
+        }) {
+            return Err(format!("an entry check did not run and settle: {checks:?}"));
+        }
+        if first.1 == second.1 || first.4 == second.4 {
+            return Err(format!(
+                "the second entry did not ask for the rebased commit under its own entry: {checks:?}"
+            ));
+        }
+        let reviews: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number")
+                .bind(task_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(sql)?;
+        if reviews.len() != 2 || reviews.iter().any(|status| status != "passed") {
+            return Err(format!("review attempts {reviews:?}; expected two that passed"));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(violation) = outcome {
+        world.record_history().await;
+        panic!("{violation}\ntrace:\n{}", world.trace.join("\n"));
+    }
+}
+
 /// Found by this model, fixed. A subtask used to be accepted under a parent
 /// that was already done, cancelled, in review or integrating; it then sat in
 /// `todo` with a `clear` condition, was never scheduled and offered only
