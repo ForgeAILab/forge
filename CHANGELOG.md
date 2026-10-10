@@ -8,13 +8,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- **Daemon protocol revision 7: upgrade every daemon with the server (3.4
-  stage E).** A daemon now sends the free bytes and inodes of its workspace
-  root with every report and takes the server's free-space floor from the
-  reply. The minimum protocol revision is 7: a revision-6 daemon is refused
-  every command RPC with `daemon_upgrade_required` until it is replaced by
-  `forge-ctl` from the server's release and restarted with the same
-  `--workspace-root`. Upgrade the server first, then every daemon.
 - **A machine under its free-space floor starts no new work (3.4 stage E).**
   With the default floor (10 GiB or 5 % of the workspace filesystem,
   whichever is larger, or 5 % of its inodes) a server or daemon that is that
@@ -98,6 +91,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   directory (a Codex execution that is not a managed Task, Gemini with
   `--sandbox`) are unchanged.
 
+- **Daemon protocol revision 7 (3.2 stage D2a, 3.4 stage E): upgrade every
+  daemon with the server.** The minimum revision is 7.
+  `integration.release_objects` takes an optional `attempt`
+  (`{attempt_id, repo_location_id}`) and then also deletes every ref that
+  attempt imported in that checkout (`refs/forge/integration/<attempt>-*`)
+  and the attempt's remaining transfer staging; the result adds
+  `removed_refs`. A revision-6 daemon is refused with
+  `daemon_upgrade_required`. Upgrade the server first, then each daemon.
+  Nothing calls the new form yet: the merge queue is still not started.
+  Also in revision 7: `repo_location.verify` now carries in
+  `expected_version` the version the server stores the verification as (the
+  present version plus one), and `workspace.read` has a new Git query,
+  `target_status_porcelain` (the status of the checkout the workspace's repo
+  location names).
+  Also in revision 7 (3.4 stage E): a daemon sends the free bytes and inodes
+  of its workspace root with every report and takes the server's free-space
+  floor from the reply; it refuses `workspace.prepare` and a check checkout
+  with `disk_pressure` when its own reading is under that floor. One
+  unreleased revision carries both changes: there is no revision that has
+  only one of them.
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -891,6 +904,43 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Merge queue: production ports, still not started (3.2 stage D2a).**
+  Everything the queue worker needs to run against real machines now exists;
+  nothing starts it and merging works as before.
+  - A queue head on a daemon-owned default checkout is rebased, checked and
+    fast-forwarded through that daemon instead of parking. A lost reply is
+    settled from the daemon's receipt after it reconnects; the effect is
+    never sent twice.
+  - Commits move between a Task's checkout and the default checkout through
+    the owners when they do not share an object store, and the refs a
+    transfer leaves are deleted when the attempt leaves the queue slot and
+    swept at start.
+  - The daemon journal's record bound (1024) now counts only entries the
+    server has not acknowledged. Acknowledged merge-queue receipts are kept
+    for duplicates and pruned by age (7 days), by a newer claim, or as the
+    oldest past 1024.
+  - Queue waits that used to end only at a timeout now end by themselves: a
+    retried or re-opened queue member shows "waiting" again, a failed queue
+    step is asked again, and a merge that landed but could not be recorded
+    is retried every 30 s instead of every 10 min.
+  - A daemon no longer refuses every merge-queue claim after it reconnects.
+    The daemon kept a location version one behind the server's after each
+    stored verification; it now keeps the stored one. When an owner still
+    does not recognise a claim's default checkout (the server changed the
+    location since), the queue asks for a verification and goes on instead
+    of only parking.
+  - A Task whose checkout is another clone than the default checkout, on
+    the same owner, now merges through the queue into the default checkout.
+    A Task on another machine than the default checkout still parks
+    (`cross_owner_unsupported`).
+  - A queue head whose result is unknown keeps its place and is asked about
+    every 60 s, and at once when its machine is back, instead of when a 60 s
+    lease ran out.
+  - A dirty default checkout on a daemon parks the head `target_dirty` at
+    once. Queue steps that tell a Task it was sent back, parked or cleared
+    are asked again when they fail (three times, then the queue's
+    `last_error` says so). Refs an interrupted transfer left on a daemon
+    are released at the next start.
 - **Budgeted garbage collection of the workspace root on the server and on
   each daemon (3.4 stage D).** Every 10 minutes, inside the existing 60 second
   sweep budget and resuming from a cursor, Forge now reclaims what no record

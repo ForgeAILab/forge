@@ -1,7 +1,9 @@
 //! The worker's Task-step port over the real step queue.
 use super::INTEGRATION_STEP_KIND;
 use crate::{
-    integration_worker::{IntegrationStepAction, IntegrationStepPort, IntegrationStepRequest},
+    integration_worker::{
+        IntegrationStepAction, IntegrationStepPort, IntegrationStepRequest, IntegrationStepState,
+    },
     Result, ServiceError,
 };
 use async_trait::async_trait;
@@ -121,5 +123,32 @@ impl IntegrationStepPort for TaskStepIntegrationPort {
             .ready_integration_step(&attempt.task_ref, &key)
             .await?;
         Ok(())
+    }
+
+    async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM task_step WHERE task_id=? AND causation_key=?")
+                .bind(&request.task_id)
+                .bind(request.causation_key())
+                .fetch_optional(self.db.pool())
+                .await?;
+        Ok(match status.as_deref() {
+            None => IntegrationStepState::Missing,
+            Some("pending" | "claimed" | "parked") => IntegrationStepState::Live,
+            Some("done") => IntegrationStepState::Done,
+            Some(_) => {
+                let left: bool = sqlx::query_scalar(
+                    "SELECT NOT EXISTS(SELECT 1 FROM integration_attempt a JOIN task t ON t.id=a.task_ref WHERE a.id=? AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch AND t.deleted_at IS NULL)",
+                )
+                .bind(&request.attempt_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                if left {
+                    IntegrationStepState::TaskLeft
+                } else {
+                    IntegrationStepState::Dead
+                }
+            }
+        })
     }
 }

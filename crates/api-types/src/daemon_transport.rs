@@ -49,10 +49,12 @@ pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
 /// Revision 6 added the integration owner wire: the fence announcement on
-/// lookup, `integration.announce`, and Git object export / import.
-/// Revision 7 adds the disk facts of the workspace root to every daemon
-/// report and the free-space floor to its reply: a daemon that does not send
-/// them could fill its disk with work the server keeps placing there.
+/// lookup, `integration.announce`, and Git object export / import. Revision 7
+/// (one unreleased revision, two changes) lets `integration.release_objects`
+/// delete the refs an attempt imported, and adds the disk facts of the
+/// workspace root to every daemon report and the free-space floor to its
+/// reply: a daemon that does not send them could fill its disk with work the
+/// server keeps placing there.
 pub const DAEMON_PROTOCOL_REVISION: u32 = 7;
 /// Every command RPC requires revision 7.
 pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 7;
@@ -153,6 +155,9 @@ pub struct RepoLocationVerifyParams {
     pub kind: DaemonRepoLocationKind,
     pub default_branch: String,
     pub remote_url: Option<String>,
+    /// The location version this verification is stored as on the server.
+    /// The owner keeps it: a verification older than the one it holds is
+    /// refused, and a merge-queue claim must name exactly this version.
     pub expected_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<RepoLocationProbe>,
@@ -545,6 +550,10 @@ pub enum WorkspaceGitQuery {
     TargetHead {
         branch: String,
     },
+    /// `git status --porcelain` of the checkout the workspace's repo location
+    /// names (the default checkout when the Task is placed in it), not of the
+    /// Task's own worktree.
+    TargetStatusPorcelain,
 }
 
 /// Additional structured workspace.read inputs used by owner-local services.
@@ -2061,7 +2070,9 @@ pub enum ImportObjectsResult {
     },
 }
 
-/// Drop a key's owner-local staging (export bundle, partial import).
+/// Drop a key's owner-local staging (export bundle, partial import). With
+/// `attempt`, also delete every ref the attempt imported in one checkout
+/// (`refs/forge/integration/<attempt>-*`) and the attempt's other staging.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
@@ -2069,6 +2080,17 @@ pub struct ReleaseObjectsParams {
     pub daemon_id: String,
     pub runtime_id: String,
     pub key: String,
+    #[serde(default)]
+    pub attempt: Option<ReleaseAttemptRefs>,
+}
+
+/// The attempt whose imported refs a release deletes, and where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReleaseAttemptRefs {
+    pub attempt_id: String,
+    pub repo_location_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2076,6 +2098,9 @@ pub struct ReleaseObjectsParams {
 pub struct ReleaseObjectsResult {
     pub key: String,
     pub removed: bool,
+    /// Imported refs deleted for `attempt`.
+    #[serde(default)]
+    pub removed_refs: u32,
 }
 
 /// `inbound` brings the target tip to the Task's checkout before a rebase;

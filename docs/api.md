@@ -4467,7 +4467,7 @@ blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
 The dispatch-failure annotation and Task metadata record the refused daemon IDs.
 The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
-daemon reconnects at revision 6, even when a blocking annotation was preserved.
+daemon reconnects at revision 7, even when a blocking annotation was preserved.
 Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
 `recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
 `before_work_hook_failed`, and `before_work_hook_timeout` annotations.

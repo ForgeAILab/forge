@@ -79,7 +79,16 @@ pub async fn drain(state: &AppState, app: &Router, task_id: &str) -> TaskRespons
 }
 
 pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
-    let pool = db::create_sqlite_pool("sqlite::memory:")
+    test_app_on(workspace_root, prefix, "sqlite::memory:").await
+}
+
+/// `test_app` over the database at `database_url`. An in-memory database is
+/// one connection: a connection the pool discards (a query future dropped
+/// mid-flight by a `select!` or a timeout is enough) is replaced by a new,
+/// EMPTY database, and the next statement fails `no such table`. Tests that
+/// run workers on several threads against the harness use a file.
+pub async fn test_app_on(workspace_root: &Path, prefix: &str, database_url: &str) -> Harness {
+    let pool = db::create_sqlite_pool(database_url)
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");

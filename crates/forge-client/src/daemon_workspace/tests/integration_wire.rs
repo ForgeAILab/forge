@@ -644,6 +644,7 @@ async fn objects_round_trip_between_two_checkouts_in_chunks_and_replay_by_key() 
             daemon_id: "daemon-1".into(),
             runtime_id: "runtime-1".into(),
             key: "attempt-1-1-out".into(),
+            attempt: None,
         },
     )
     .await
@@ -664,6 +665,60 @@ async fn objects_round_trip_between_two_checkouts_in_chunks_and_replay_by_key() 
     );
     assert_eq!(transfer.target().await, before);
     assert!(transfer.staging().is_empty());
+    // The attempt left its queue slot: one release deletes every ref it
+    // imported in this checkout (protocol revision 7), and nothing else.
+    local_git(
+        &clone,
+        &[
+            "update-ref",
+            "refs/forge/integration/attempt-10-1-out",
+            &transfer.tip,
+        ],
+    )
+    .await
+    .unwrap();
+    let release = |attempt_id: &str| ReleaseObjectsParams {
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        key: format!("{attempt_id}-0-in"),
+        attempt: Some(ReleaseAttemptRefs {
+            attempt_id: attempt_id.into(),
+            repo_location_id: transfer.import("k", None).repo_location_id,
+        }),
+    };
+    let released: ReleaseObjectsResult = call(
+        backend,
+        METHOD_INTEGRATION_RELEASE_OBJECTS,
+        release("attempt-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(released.removed_refs, 1);
+    assert!(local_git(
+        &clone,
+        &["rev-parse", "refs/forge/integration/attempt-1-1-out"]
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        local_git(
+            &clone,
+            &["rev-parse", "refs/forge/integration/attempt-10-1-out"]
+        )
+        .await
+        .unwrap(),
+        transfer.tip,
+        "another attempt's ref is not touched"
+    );
+    assert_eq!(git::get_current_sha(&clone).await.unwrap(), head);
+    let again: ReleaseObjectsResult = call(
+        backend,
+        METHOD_INTEGRATION_RELEASE_OBJECTS,
+        release("attempt-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.removed_refs, 0, "idempotent");
 }
 
 #[tokio::test]
@@ -812,6 +867,7 @@ async fn object_transfer_refusals_leave_the_target_and_staging_untouched() {
             daemon_id: "daemon-1".into(),
             runtime_id: "runtime-1".into(),
             key: "k".into(),
+            attempt: None,
         },
     )
     .await

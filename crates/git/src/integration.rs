@@ -407,6 +407,51 @@ pub fn sweep_transfer_leftovers(repo: &Path) -> usize {
     removed
 }
 
+/// Every transfer key imported in the repository (`refs/forge/integration/*`).
+pub async fn imported_keys(repo: &Path) -> Result<Vec<String>> {
+    let output = crate::command_output(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            INTEGRATION_REF_PREFIX,
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|name| name.strip_prefix(INTEGRATION_REF_PREFIX))
+        .filter(|key| !key.is_empty() && !key.contains('/'))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Delete every imported ref of one attempt (`refs/forge/integration/<attempt>-*`).
+/// The objects stay until Git collects them; no branch, tag or work tree is
+/// touched. Idempotent. Returns how many refs were deleted.
+pub async fn release_attempt_refs(repo: &Path, attempt_id: &str) -> TransferResult<usize> {
+    // The attempt id is the leading part of a key, so it obeys the key rules.
+    transfer_ref(attempt_id)?;
+    let prefix = format!("{attempt_id}-");
+    let mut removed = 0;
+    for key in imported_keys(repo).await? {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let name = transfer_ref(&key)?;
+        let output =
+            crate::command_output(repo, &[NO_HOOKS[0], NO_HOOKS[1], "update-ref", "-d", &name])
+                .await?;
+        if output.status.success() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// The receipt of an import that already happened for this key, if any.
 pub async fn imported_objects(
     repo: &Path,

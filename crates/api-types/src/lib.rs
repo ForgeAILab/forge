@@ -722,6 +722,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     ObjectImportReceipt::export().expect("export ObjectImportReceipt");
     ImportObjectsResult::export().expect("export ImportObjectsResult");
     ReleaseObjectsParams::export().expect("export ReleaseObjectsParams");
+    ReleaseAttemptRefs::export().expect("export ReleaseAttemptRefs");
     ReleaseObjectsResult::export().expect("export ReleaseObjectsResult");
     ObjectTransferDirection::export().expect("export ObjectTransferDirection");
 }

@@ -1283,6 +1283,59 @@ async fn former_revision_three_handshake_requires_daemon_upgrade() {
         .protocol_allows_dispatch());
 }
 
+/// The merge-queue wire (object release per attempt, the target status
+/// query) is revision 7. A daemon one revision behind is told to upgrade with
+/// the same message as any older daemon, and no integration request is sent
+/// to it.
+#[tokio::test]
+async fn revision_six_daemon_is_refused_with_the_upgrade_message() {
+    assert_eq!(api_types::DAEMON_MIN_PROTOCOL_REVISION, 7);
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("revision-six".into());
+    let id = connection.id();
+    registry.register("revision-six".into(), connection);
+    assert!(registry.dispatch_incoming_for_connection(
+        "revision-six",
+        id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION - 1,"capabilities":api_types::DAEMON_REQUIRED_CAPABILITIES}),
+        }
+    ));
+    let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+        panic!("a revision 6 daemon was accepted");
+    };
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+    assert!(
+        error.message.contains("upgrade the daemon"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(&format!(
+            "revision {}",
+            api_types::DAEMON_MIN_PROTOCOL_REVISION
+        )),
+        "{}",
+        error.message
+    );
+    assert!(registry.get("revision-six").unwrap().needs_upgrade());
+    for method in [
+        api_types::METHOD_INTEGRATION_ANNOUNCE,
+        api_types::METHOD_INTEGRATION_RELEASE_OBJECTS,
+        api_types::METHOD_WORKSPACE_MERGE,
+    ] {
+        let result: Result<serde_json::Value, _> = registry
+            .send_request("revision-six", method, json!({}), 1)
+            .await;
+        assert!(
+            matches!(result, Err(ServiceError::DaemonUpgradeRequired { .. })),
+            "{method}"
+        );
+    }
+    assert!(outbound.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn revision_four_check_owner_is_refused_before_any_check_rpc() {
     let registry = make_registry();

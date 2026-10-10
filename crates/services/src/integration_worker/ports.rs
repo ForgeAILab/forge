@@ -2,17 +2,77 @@
 //! object transfer) and provides two (enqueue notification, snapshot).
 use crate::{
     integration_effects::{EffectOwner, EffectWorkspace},
+    integration_owner::{OwnerMergeReceipt, OwnerRebaseReceipt},
     Result,
 };
 pub use api_types::ObjectTransferDirection;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use db::{
-    IntegrationAttempt, IntegrationAttemptState, IntegrationCheckTiming, IntegrationFailureKind,
-    IntegrationOwnerFence, IntegrationPhaseTimings, IntegrationQueue, IntegrationQueueState,
+    IntegrationAttempt, IntegrationAttemptState, IntegrationCheckTiming, IntegrationEffectRequest,
+    IntegrationFailureKind, IntegrationOwnerFence, IntegrationPhaseTimings, IntegrationQueue,
+    IntegrationQueueState,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// A rebase of the Task's checkout onto the target tip the head read.
+#[derive(Debug, Clone)]
+pub struct OwnerRebaseRequest {
+    pub fence: IntegrationOwnerFence,
+    pub workspace: EffectWorkspace,
+    pub target_branch: String,
+    pub expected_head_sha: String,
+    pub expected_target_sha: String,
+    pub handoff_conflicts: bool,
+    pub deadline: Duration,
+    /// Stops the effect; the owner still answers with a receipt.
+    pub cancel: CancellationToken,
+}
+/// The fast-forward of the default checkout to the exact permitted commit.
+/// It has no cancel: a started fast-forward runs to its receipt or to
+/// `deadline`, the owner's own bound.
+#[derive(Debug, Clone)]
+pub struct OwnerFastForwardRequest {
+    pub fence: IntegrationOwnerFence,
+    pub workspace: EffectWorkspace,
+    pub target_branch: String,
+    pub task_branch: String,
+    pub candidate_sha: String,
+    pub target_sha: String,
+    pub deadline: Duration,
+}
+
+/// The fenced Git owner of a head's effects: the server for a server-owned
+/// target, the daemon that holds the default checkout for a daemon-owned one.
+/// Every effect is admitted by intent and answered by one receipt per
+/// `(fence, kind)`; a repeated call returns that receipt and runs no Git. An
+/// `Err` means the reply is missing, never that nothing ran: the driver then
+/// reconciles by receipt (`reconcile_effect`) and does not ask again.
+#[async_trait]
+pub trait IntegrationOwnerPort: Send + Sync {
+    async fn rebase(&self, request: OwnerRebaseRequest) -> Result<OwnerRebaseReceipt>;
+    async fn fast_forward(&self, request: OwnerFastForwardRequest) -> Result<OwnerMergeReceipt>;
+    /// Ask the owner for the receipt of an admitted effect (and of the
+    /// effects that share its checkout lock). Runs no Git effect.
+    async fn reconcile_effect(&self, request: &IntegrationEffectRequest) -> Result<()>;
+    async fn reconcile_outstanding(&self) -> Result<()>;
+    /// The live connection to the owner `target_owner` names: `None` while
+    /// it is not connected, another number after it reconnected. The server
+    /// is always connected. A head with an unknown result reads this to ask
+    /// for the receipt as soon as its owner is back.
+    fn owner_connection(&self, _target_owner: &serde_json::Value) -> Option<u64> {
+        Some(0)
+    }
+}
+
+/// Asks for a repo location to be verified again. The service behind it
+/// writes `repo_location`; the worker never does.
+#[async_trait]
+pub trait IntegrationLocationPort: Send + Sync {
+    async fn verify_location(&self, repo_location_id: &str) -> Result<()>;
+}
 
 /// The actions of the `integration` Task-step kind the worker asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -119,6 +179,25 @@ pub trait IntegrationStepPort: Send + Sync {
     /// pre-enqueued by `settle` with the permit deadline). Idempotent; a
     /// missing step is not an error.
     async fn ready_result_step(&self, attempt_id: &str, effect_seq: i64) -> Result<()>;
+    /// Where the step of `request` stands in the Task's step queue. The
+    /// worker reads it while it waits for an acknowledgment, so a step that
+    /// can never answer is asked again instead of waited out.
+    async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationStepState {
+    /// Not enqueued (or its Task is gone).
+    Missing,
+    /// Pending or claimed: it can still answer.
+    Live,
+    Done,
+    /// Settled without applying: its handler failed for good, or a
+    /// preempting command dropped it. It will not answer.
+    Dead,
+    /// Settled without applying because the Task is no longer in the status
+    /// entry the attempt was admitted in. Asking again cannot change that.
+    TaskLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +228,10 @@ pub struct HeadFacts {
     pub rebase_in_progress: bool,
     /// The Task's checkout shares the default checkout's object store.
     pub shared_object_store: bool,
+    /// In another clone: the tip of that clone's own target branch (empty
+    /// when it has none). The default checkout usually knows this commit, so
+    /// an inbound transfer names it as one the receiver already holds.
+    pub task_target_tip: String,
     /// The repo location the Task's checkout belongs to (the other end of an
     /// object transfer; the default checkout is the queue's target).
     pub task_location: ObjectTransferEndpoint,
@@ -209,6 +292,17 @@ pub struct ObjectTransferRelease {
 pub trait ObjectTransferPort: Send + Sync {
     async fn transfer(&self, request: ObjectTransferRequest) -> Result<ObjectTransferOutcome>;
     async fn release(&self, release: ObjectTransferRelease) -> Result<()>;
+    /// Run once before the first sweep, while no transfer of this process is
+    /// in flight: remove what a crashed transfer left in the server-owned
+    /// checkouts and the imported refs of attempts that hold no slot.
+    async fn sweep_at_start(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Called on every sweep: releases `sweep_at_start` found for owners that
+    /// were not connected then. Cheap when nothing is owed.
+    async fn sweep_owners(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Provided by the worker. The step that admits an attempt calls it after

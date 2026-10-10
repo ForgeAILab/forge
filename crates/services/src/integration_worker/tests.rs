@@ -2,6 +2,7 @@
 //! steps, fake check verdicts, fake object transfer, a clock the test moves.
 use super::*;
 use crate::integration_effects::{EffectOwner, EffectWorkspace};
+use crate::integration_owner::ServerIntegrationOwner;
 use db::{
     IntegrationAttemptState as S, IntegrationCheckTiming, IntegrationCiSkipReason,
     IntegrationEffectAdmission, IntegrationEffectRequest, IntegrationFailureKind,
@@ -67,6 +68,10 @@ struct FakeSteps {
     /// Permits name another candidate (a consumer bug the worker must bound).
     bad_permit: AtomicBool,
     readied: AtomicUsize,
+    /// Steps the step worker settled without applying (`task|causation key`).
+    dead: Mutex<HashSet<String>>,
+    /// Every deciding step of these Tasks dies instead of answering.
+    dying: Mutex<HashSet<String>>,
 }
 impl FakeSteps {
     fn hold(&self, task: &str, action: IntegrationStepAction) {
@@ -123,6 +128,12 @@ impl FakeSteps {
                         continue;
                     }
                     if a.state != waiting {
+                        continue;
+                    }
+                    if self.dying.lock().unwrap().contains(&request.task_id) {
+                        // The step worker settled it `failed`: no answer.
+                        self.dead.lock().unwrap().insert(key.clone());
+                        done(&mut progressed);
                         continue;
                     }
                     if IntegrationStepAck::current(&a, IntegrationStepAction::Settle).is_some() {
@@ -220,6 +231,21 @@ impl IntegrationStepPort for FakeSteps {
         self.readied.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+    async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState> {
+        let key = format!("{}|{}", request.task_id, request.causation_key());
+        Ok(if self.dead.lock().unwrap().contains(&key) {
+            IntegrationStepState::Dead
+        } else if self.answered.lock().unwrap().contains(&key) {
+            IntegrationStepState::Done
+        } else if self.requests.lock().unwrap().iter().any(|existing| {
+            existing.task_id == request.task_id
+                && existing.causation_key() == request.causation_key()
+        }) {
+            IntegrationStepState::Live
+        } else {
+            IntegrationStepState::Missing
+        })
+    }
 }
 
 #[derive(Default)]
@@ -244,7 +270,7 @@ impl ObjectTransferPort for FakeTransfer {
             ));
         assert_eq!(request.target.repo_location_id, "l-r");
         assert_eq!(request.task.owner, EffectOwner::Server);
-        assert_eq!(request.have.len(), 1);
+        assert!(!request.have.is_empty() && !request.have.contains(&request.want));
         Ok(if self.too_large.load(Ordering::SeqCst) {
             ObjectTransferOutcome::TooLarge {
                 bytes: request.max_bytes + 1,
@@ -319,6 +345,7 @@ impl IntegrationFactsPort for GitFactsFake {
                 repo_location_id: format!("l-{}", queue.repo_id),
                 owner: EffectOwner::Server,
             },
+            task_target_tip: String::new(),
             target_in_candidate: ancestor(target_tip.clone(), candidate_head.clone()).await,
             candidate_in_target: ancestor(candidate_head.clone(), target_tip.clone()).await,
             worktree_dirty: !git::is_worktree_clean(&tree).await?,
@@ -1391,6 +1418,7 @@ async fn a_paused_project_parks_with_backoff_and_one_task_step() {
         gaps.windows(2).all(|pair| pair[1] > pair[0]),
         "the retry backs off: {gaps:?}"
     );
+    // A wait with no end of its own tells the Task once, not on each retry.
     assert_eq!(world.steps.actions("a"), vec![IntegrationStepAction::Park]);
     world.facts.paused.store(false, Ordering::SeqCst);
     world.settle(&mut pump).await;
@@ -1873,10 +1901,31 @@ async fn twenty_members_drain_in_order_under_the_supervised_loop() {
     let worker = world.worker();
     let (stop, shutdown) = watch::channel(false);
     let running = tokio::spawn(worker.clone().run(shutdown));
-    wait_for!("the queue to drain", {
+    // Bounded by progress, not by a total: under a loaded machine twenty
+    // heads take as long as they take, and only a queue that stops moving is
+    // a failure. One head never needs a minute.
+    let mut completed = 0;
+    let mut stalled = tokio::time::Instant::now();
+    loop {
         world.steps.answer(&world.db).await;
-        world.attempt(&attempts[19].id).await.state == S::Completed
-    });
+        let mut now = 0;
+        for attempt in &attempts {
+            now += usize::from(world.attempt(&attempt.id).await.state == S::Completed);
+        }
+        if now == attempts.len() {
+            break;
+        }
+        if now > completed {
+            completed = now;
+            stalled = tokio::time::Instant::now();
+        }
+        assert!(
+            stalled.elapsed() < Duration::from_secs(60),
+            "the queue stopped draining at {completed} of {}",
+            attempts.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     stop.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), running)
         .await
@@ -1935,4 +1984,272 @@ async fn shutdown_mid_head_is_clean_and_the_next_worker_finishes() {
     let mut pump = Pump::new(world.worker());
     world.settle(&mut pump).await;
     assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+}
+
+fn park_seqs(world: &World, task: &str) -> Vec<i64> {
+    world
+        .steps
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.task_id == task && request.action == IntegrationStepAction::Park)
+        .map(|request| request.effect_seq)
+        .collect()
+}
+
+/// D2 checklist item 1. A counted retry that is re-queued, and a waiting
+/// member of a queue that re-opens, each get one `park` step under a fresh
+/// `effect_seq`: the level-triggered handler then restates `waiting`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requeued_retry_and_a_reopened_queue_tell_the_task_it_waits_again() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    let mut pump = Pump::new(world.worker());
+    world.facts.fail.store(true, Ordering::SeqCst);
+    world.settle(&mut pump).await;
+    let parked = world.attempt(&a.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert_eq!(park_seqs(&world, "a"), vec![parked.effect_seq]);
+    // Due: re-queued with `waiting` restated, claimed, and parked again.
+    world.clock.advance(31);
+    world.settle(&mut pump).await;
+    let again = world.attempt(&a.id).await;
+    assert_eq!(again.state, S::Parked);
+    assert_eq!(
+        park_seqs(&world, "a"),
+        vec![parked.effect_seq, parked.effect_seq + 1, again.effect_seq],
+        "deferred, waiting again, deferred again"
+    );
+    assert_eq!(again.effect_seq, parked.effect_seq + 2);
+    world.facts.fail.store(false, Ordering::SeqCst);
+    world.clock.advance(121);
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    assert_eq!(park_seqs(&world, "a").len(), 4, "waiting once more");
+
+    // A suspended queue: both members are told once. A new process re-opens
+    // it: the member that is not claimed is told it waits in line again.
+    world.add_repo("s").await;
+    let b = world.add_task("s", "b", "b.txt", "b\n").await;
+    let c = world.add_task("s", "c", "c.txt", "c\n").await;
+    sqlx::query("UPDATE repo_location SET status='unavailable' WHERE id='l-s'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        world.settle(&mut pump).await;
+        world.clock.advance(30);
+    }
+    assert_eq!(
+        world.queue_of(&b).await.state,
+        db::IntegrationQueueState::Suspended
+    );
+    let told = world.attempt(&c.id).await;
+    assert_eq!(park_seqs(&world, "b").len(), 1);
+    assert_eq!(park_seqs(&world, "c"), vec![told.effect_seq]);
+    sqlx::query("UPDATE repo_location SET status='ready' WHERE id='l-s'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.steps.hold("b", IntegrationStepAction::Settle);
+    let mut restarted = Pump::new(world.worker());
+    world.settle(&mut restarted).await;
+    assert_eq!(world.attempt(&c.id).await.state, S::Queued);
+    assert_eq!(
+        park_seqs(&world, "c"),
+        vec![told.effect_seq, told.effect_seq + 1]
+    );
+    assert_eq!(
+        park_seqs(&world, "b").len(),
+        1,
+        "the head is told by its steps"
+    );
+    // Not told a third time by later claims.
+    world.steps.unhold("b", IntegrationStepAction::Settle);
+    world.settle(&mut restarted).await;
+    for attempt in [&b, &c] {
+        assert_eq!(world.attempt(&attempt.id).await.state, S::Completed);
+    }
+    assert_eq!(park_seqs(&world, "c").len(), 2);
+}
+
+/// D2 checklist item 8. A deciding step that settled without answering is
+/// asked again under a new `effect_seq`, a bounded number of times; then the
+/// head parks with a typed cause and a counted retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_deciding_step_is_asked_again_then_the_head_parks_typed() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    world.steps.dying.lock().unwrap().insert("a".into());
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    let parked = world.attempt(&a.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert_eq!(
+        parked.failure_kind,
+        Some(IntegrationFailureKind::Infrastructure)
+    );
+    assert!(parked
+        .failure_message
+        .as_deref()
+        .unwrap()
+        .starts_with("task_step_failed"));
+    assert!(parked.available_at.is_some(), "a counted retry");
+    let settles: Vec<i64> = world
+        .steps
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.action == IntegrationStepAction::Settle)
+        .map(|request| request.effect_seq)
+        .collect();
+    assert_eq!(
+        settles.len(),
+        3,
+        "the first ask and two re-asks: {settles:?}"
+    );
+    assert!(settles.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    assert!(world.queue_of(&a).await.head_attempt_id.is_none());
+    // The step side recovers: the retry merges.
+    world.steps.dying.lock().unwrap().clear();
+    world.clock.advance(31);
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    assert_eq!(ff_successes(&world, &a.id).await, 1);
+}
+
+/// D2 checklist items 9 and 6. A head waiting for its check asks again on a
+/// timer (the ask applies a verdict whose delivery failed) instead of waiting
+/// the check timeout out; an applied head re-arms its `result` step on every
+/// sweep interval, not once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_check_is_asked_again_and_an_applied_head_re_arms_its_result() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    // The target moves after the Task forked: the head is rebased and checked.
+    world.external_commit("r", "outside").await;
+    world.steps.hold("a", IntegrationStepAction::RequestCheck);
+    let mut pump = Pump::new(world.worker_with(IntegrationWorkerConfig {
+        check_reask: Duration::from_secs(20),
+        ..config()
+    }));
+    world.settle(&mut pump).await;
+    let checking = world.attempt(&a.id).await;
+    assert_eq!(checking.state, S::Checking);
+    let asks = |world: &World| {
+        world
+            .steps
+            .actions("a")
+            .into_iter()
+            .filter(|action| *action == IntegrationStepAction::RequestCheck)
+            .count()
+    };
+    assert_eq!(asks(&world), 1);
+    world.clock.advance(10);
+    world.settle(&mut pump).await;
+    assert_eq!(asks(&world), 1, "not due yet");
+    world.clock.advance(11);
+    world.settle(&mut pump).await;
+    let asked = world.attempt(&a.id).await;
+    assert_eq!(asked.state, S::Checking);
+    assert_eq!(asks(&world), 2);
+    assert_eq!(asked.effect_seq, checking.effect_seq + 1);
+    assert_eq!(
+        asked.slot_generation, checking.slot_generation,
+        "same claim"
+    );
+
+    world.steps.hold("a", IntegrationStepAction::Result);
+    world.steps.unhold("a", IntegrationStepAction::RequestCheck);
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Applied);
+    let mut readied = world.steps.readied.load(Ordering::SeqCst);
+    assert!(readied >= 1);
+    for sweep in 0..3 {
+        world.clock.advance(31);
+        world.settle(&mut pump).await;
+        let now = world.steps.readied.load(Ordering::SeqCst);
+        assert!(now > readied, "re-armed on sweep {sweep}");
+        readied = now;
+        assert_eq!(world.attempt(&a.id).await.state, S::Applied);
+    }
+    world.steps.unhold("a", IntegrationStepAction::Result);
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+}
+
+/// Blocker 6 of the D2a review. A released attempt's `send_back` step that
+/// settled without applying is asked again by the sweep under a new
+/// `effect_seq`, three times; then the queue says so in `last_error` and the
+/// attempt is left alone. A step that answers ends the asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_release_step_is_asked_again_three_times_then_the_queue_says_so() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "base", "from a\n").await;
+    let b = world.add_task("r", "b", "base", "from b\n").await;
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    let ejected = world.attempt(&b.id).await;
+    assert_eq!(ejected.state, S::Ejected);
+    let send_backs = || -> Vec<i64> {
+        world
+            .steps
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.task_id == "b" && request.action == IntegrationStepAction::SendBack
+            })
+            .map(|request| request.effect_seq)
+            .collect()
+    };
+    let kill = |seq: i64| {
+        world
+            .steps
+            .dead
+            .lock()
+            .unwrap()
+            .insert(format!("b|integration:{}:{seq}:send_back", b.id));
+    };
+    // A healthy step is never asked again.
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    assert_eq!(send_backs(), vec![ejected.effect_seq]);
+    // The step died: three re-asks, each under the next `effect_seq`.
+    for round in 0..3 {
+        kill(ejected.effect_seq + round);
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+        let now = world.attempt(&b.id).await;
+        assert_eq!(now.state, S::Ejected);
+        assert_eq!(now.effect_seq, ejected.effect_seq + round + 1);
+        assert_eq!(send_backs().len() as i64, round + 2);
+        // Asked once per death, not once per sweep.
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+        assert_eq!(send_backs().len() as i64, round + 2);
+        assert!(world.queue_of(&b).await.last_error.is_none());
+    }
+    // The third re-ask died too: the queue's owner is told, once.
+    kill(ejected.effect_seq + 3);
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    let queue = world.queue_of(&b).await;
+    let message = queue.last_error.clone().unwrap();
+    assert!(
+        message.starts_with("task_step_failed: the `send_back` step of Task b"),
+        "{message}"
+    );
+    assert_eq!(
+        queue.last_error_kind,
+        Some(IntegrationFailureKind::Infrastructure)
+    );
+    let (revision, attempt_revision) = (queue.revision, world.attempt(&b.id).await.revision);
+    for _ in 0..3 {
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    }
+    assert_eq!(send_backs().len(), 4, "the first ask and three re-asks");
+    assert_eq!(world.queue_of(&b).await.revision, revision);
+    assert_eq!(world.attempt(&b.id).await.revision, attempt_revision);
+    assert_eq!(world.attempt(&b.id).await.state, S::Ejected);
 }

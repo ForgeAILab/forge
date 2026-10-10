@@ -5481,7 +5481,7 @@ An uncertain receipt is replaced on reconciliation, not appended as a second
 receipt for the same key. An original owner can retain its receipt after lease
 takeover; the frozen intent remains its identity.
 
-**Integration owner wire (3.2 stage D1c, daemon protocol revision 6).** This
+**Integration owner wire (3.2 stage D1c, daemon protocol revision 6; `integration.release_objects` with `attempt` since revision 7).** This
 sub-stage is passive: the queue worker is still off and today's merge path does
 not call any of it. It adds what the worker needs from an owner.
 
@@ -5881,13 +5881,156 @@ members in order with position, state, timings; the read surface is built on
 it). Steps answer by writing `effect_ack_json` / `acknowledged_at` (and
 `permit_json`) on the attempt; the worker only reads them.
 
-Not in this part: daemon-owned targets (the head parks with
-`daemon_owner_unwired`, no automatic retry), the production
-`ObjectTransferPort`, Task conditions, and the Task-step consumer itself.
-Known limits: the first rebase of a head is always counted as a
+Known limit: the first rebase of a head is always counted as a
 `queue_member` lost race (the queue does not store the commit it last
-integrated, so a push from outside before the claim cannot be told apart);
-an `applied` head waits for its `result` step without a timer.
+integrated, so a push from outside before the claim cannot be told apart).
+
+### Integration queue production ports (3.2 stage D, part 2a; still passive)
+
+`services::integration_ports` holds the real things behind the worker's seams.
+`build_integration_worker(db, router, daemons, locations, config)` assembles
+them and returns the worker **not started** (`locations` is the
+`RepoLocationService`, behind the worker's `IntegrationLocationPort`): nothing in the runtime calls it yet, and
+`merging` still runs today's merge hooks. The next stage (D2b) starts it.
+
+| Worker port | Production | What it does |
+|---|---|---|
+| `IntegrationOwnerPort` (`rebase`, `fast_forward`, `reconcile_effect`, `reconcile_outstanding`) | `RoutingIntegrationOwner` | Dispatches on the fence's `target_owner`. Server: `ServerIntegrationOwner`. Daemon: `DaemonWorkspaceClient::integration_effect` with `workspace.reset` / `rebase_target` and `workspace.merge` (reviewed fast-forward). |
+| `ObjectTransferPort` (`transfer`, `release`, `sweep_at_start`, `sweep_owners`) | `OwnerObjectTransfer` | Moves commits between the Task's checkout and the default checkout when they do not share an object store. |
+| `IntegrationLocationPort` (`verify_location`) | `RepoLocationService::reverify` | Asks for a repo location to be verified again. The service writes `repo_location`; the worker never does. |
+| `IntegrationFactsPort` | `WorkspaceHeadFacts` | Task gate from storage; Git state through the Task's workspace placement. |
+| `IntegrationStepPort` (`enqueue_step`, `ready_result_step`, `step_state`) | `integration_steps::TaskStepIntegrationPort` | The Task-step queue. |
+
+**Daemon-owned targets.** A head whose default checkout is held by a daemon
+is driven through that daemon: it no longer parks. The rebase runs in the
+Task's worktree and the fast-forward in the default checkout, both as attempt
+effects (one intent, one receipt per `(fence, kind)`). The check hand-off is
+unchanged: the `request_check` step asks the check runner, which runs the
+commands on the daemon that holds the workspace. Before the first effect of a
+claim generation on a daemon the worker sends `integration.announce` with
+`live_queue_ids` = every queue that is not closed and targets that daemon,
+plus every queue with an outstanding intent on it (`DaemonFences`).
+
+**Where the Task's checkout may be.** Today's merge path merges every Task
+into the checkout of the Task's *own* repo location (embedded: that
+location's repo source; daemon: `workspace.merge` with the placement's
+`repo_location_id`), wherever the default checkout is. The queue always
+lands in the default checkout:
+
+| Task's checkout | Through the queue |
+|---|---|
+| A worktree of the default checkout (server or daemon) | Rebased and fast-forwarded in place; no transfer. |
+| Another clone, same owner as the default checkout | The target tip is brought to the Task's clone and bound to `refs/forge/integration/<attempt>-<generation>-in`. That ref is the rebase witness on both owner gates (the clone's own target branch is not written and need not match), and the rebase is onto that commit. The exact rebased commit is then sent to the default checkout and fast-forwarded there. Proven end to end on a server-owned pair; the daemon gate has the same rule but a pair of clones on one daemon has no end-to-end test yet. |
+| Another owner than the default checkout (daemon-placed Task and server-owned default checkout, or the reverse) | **Not supported.** One fenced owner performs both effects of a head, so the head parks `cross_owner_unsupported` (owner action: place the Task on the machine that holds the default checkout). Today's path does merge such a Task (into its own location), so this is open before the cutover. |
+
+**Location version.** A claim freezes `repo_location.version` as the
+target's `generation`, and a daemon owner refuses a claim whose generation is
+not the one it holds `foreign_owner`. The owner holds the version its last
+verification was *stored as*: `repo_location.verify` carries
+`expected_version` = the present version plus one, because the server writes
+the row right after the owner answers. (It used to carry the present
+version, which left the owner one behind after every stored verification,
+so every claim after a reconnect was refused.) The server also bumps the
+version for reasons the owner is not told (a default toggle). On a
+`foreign_owner` refusal the worker therefore asks for the location to be
+verified again (`IntegrationLocationPort`) and goes on in a new round, at
+most twice per claim session; after that, or when the verification cannot
+be requested, the head parks `target_not_ready` and retries with backoff.
+
+**Lost reply.** A transport failure during an effect is never read as "it did
+not run". The intent stays on the attempt, the head goes `reconciling`, and
+the worker asks the owner for the receipt (`reconcile_effect`; for a daemon
+this is the journal lookup, which runs no Git). The same lookup runs when the
+daemon reconnects. The receipt decides: an applied fast-forward goes to
+`applied`; a completed rebase is adopted as the new candidate; "not
+performed" re-queues the head. The effect is never sent a second time. While
+the result is unknown the queue is `quarantined` and the Task shows
+`deferred / unresolved_result`. The head keeps its slot and its lease while
+the result is unknown: the claim session stays, renews the lease, and asks
+the owner again every `reconcile_interval` (60 s). It also re-reads the
+attempt every `poll` (1 s) and goes on at once when the receipt has arrived
+(the reconnect lookup recorded it) or the owner is on a new connection. The
+lease expiry is only the retry clock of a worker that died.
+
+A queue-claim lookup also carries what the owner's own records said
+(`owner_fence.intent`). `unknown` (the owner had never been told of the claim
+generation, so its empty journal proves nothing) is never a settlement,
+whatever the receipt says. `not_performed` settles the intent even when the
+receipt is unusable.
+
+**Object transfer.** One transfer runs `imported_objects` on the receiver (a
+repeat of the key finds its import and moves nothing), `export_objects` on the
+source into a server staging file, `import_objects` on the receiver, then
+`release_objects` for the source's staging. `have` names commits the receiver holds so the bundle
+carries only what is new: inbound, the Task's HEAD, its clone's own target
+branch tip, and the target tip an earlier round of the attempt brought;
+outbound, the target tip. A transfer over the worker's cap
+(256 MiB) moves nothing and parks the head `transfer_too_large`. When the
+attempt leaves the slot the worker calls `release`, which deletes
+`refs/forge/integration/<attempt>-*` on both ends (local Git for a
+server-owned checkout; `integration.release_objects` with `attempt` for a
+daemon-owned one, protocol revision 7). At start the worker calls
+`sweep_at_start`: for every ready server-owned location it removes the export
+pins and import quarantines of a crashed transfer
+(`git::integration::sweep_transfer_leftovers`) and the imported refs of every
+attempt that is not the head of a queue. Daemon-owned checkouts are swept by
+the daemon at its own start (staging and crash leftovers). Their imported
+refs cannot be listed from the server, so at start the worker releases, by
+the same `integration.release_objects` call, every attempt of the last 30
+days that once held a slot, holds none now, and whose Task was placed in
+another checkout than its queue's target (at most 4096). A daemon that is
+not connected then is asked on a later sweep (`sweep_owners`), three tries
+per attempt.
+
+**Facts.** The gate is `live` while the Task is in the status entry the
+attempt was admitted in, `project_paused` when its Project is paused, `left`
+otherwise (nothing else is read for a Task that left: its checkout may be
+gone). HEAD, target tip, ancestry, dirtiness and a stopped rebase are read
+through the workspace placement, so a daemon-placed Task is read on its
+daemon. A daemon-owned default checkout's dirtiness is read on the daemon
+(`workspace.read` Git query `target_status_porcelain`: `git status
+--porcelain` of the checkout the Task's repo location names) when the Task is
+placed in that checkout, and a dirty one parks the head `target_dirty` before
+any effect. From another clone on the same daemon it is not read; the owner
+then refuses the fast-forward itself.
+
+**Waits that end by themselves.** These close gaps found in the D1 reviews:
+
+| Wait | Before | Now |
+|---|---|---|
+| A parked attempt is re-queued after a counted retry (infrastructure, timeout) | The Task kept showing `deferred` | One `park` step under a new `effect_seq` restates `waiting` |
+| A suspended queue re-opens | Members kept showing `deferred` | Each waiting member that was told gets one `park` step. The mark is stored on the attempt, so a restart neither repeats nor forgets it |
+| A deciding step (`request_check`, `settle`) settled `failed` or was superseded | The head waited its full timeout | Asked again under a new `effect_seq`, twice per claim, then parked `task_step_failed` (counted retry) |
+| The check verdict's delivery to the Task failed | The head waited the check timeout (35 min) | `request_check` is asked again every 60 s (`check_reask`); the ask applies the stored verdict, or joins a check still running |
+| A `result` step hit an error | Parked itself for 10 min | Re-armed on every sweep interval while the attempt is `applied` |
+| A deciding step is asked again after a permit was issued | Waited up to 150 s behind that permit's sleeping protected `result` step | The stale protected step is woken; it sees the newer `effect_seq` and finishes without a write |
+| The owner refuses a claim `foreign_owner` | The head held its lease and claimed again at once | The location is verified again and the head goes on in a new round; parked `target_not_ready` with backoff after two requests |
+| A released attempt's `send_back`, `park` or `clear` step settled `failed` or was superseded | The Task was never told | The sweep asks again under a new `effect_seq`, three times, then writes the queue's `last_error` (`task_step_failed: ...`). A Task that already left its status entry is not asked |
+| A head with an unknown result | Taken up again when its lease ran out (60 s) | Keeps its slot; asked every `reconcile_interval` and at once when the owner is back |
+
+A wait with no end of its own (a paused Project, a target that is not ready)
+still tells the Task once and restates nothing on each retry.
+
+The Task-step timers (`result_wake` 150 s, `result_poll` 15 s, `result_park`
+600 s) are fields of `IntegrationWorkerConfig`;
+`IntegrationSteps::with_timers(IntegrationStepTimers::from(&config))` gives
+the step side the same values.
+
+**Daemon journal.** Acknowledged queue-attempt receipts no longer count
+against the journal's record bound (1024): that bound now means "entries the
+server has not acknowledged", so a journal full of history cannot refuse a new
+intent, and nothing unacknowledged is ever removed to make room. Acknowledged
+receipts still count against the byte bound and are pruned by the owner: when
+the queue's fence moves past their generation, when the queue's fence is
+gone, seven days after the acknowledgement, or as the oldest past 1024 (the
+last three leave a tombstone that refuses a late duplicate).
+
+Known limits of this part: a head whose Task checkout and default checkout
+are different clones is rebased only if the Task's clone already has the
+target branch at the target tip (the owner's rebase gate compares the Task
+checkout's own `refs/heads/<target>`); after a daemon reconnect the owner
+refuses the next claim's fast-forward `foreign_owner` (see the D2b
+checklist); a failed `send_back`, `park` or `clear` step is not asked again.
 
 ### Integration Task steps (3.2 stage D, part 1b; not produced until D2)
 
