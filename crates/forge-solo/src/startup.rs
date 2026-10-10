@@ -227,7 +227,9 @@ impl SoloStartup {
                 state = ownership.as_str(),
                 "workspace garbage collection is off: the workspace root is owned by another Forge database or cannot be a workspace root"
             ),
-            Err(error) => tracing::warn!(%error, "workspace root ownership could not be settled; garbage collection is off"),
+            Err(error) => {
+                tracing::warn!(%error, "workspace root ownership could not be settled; garbage collection is off")
+            }
         }
         runtime
             .cleanup_scheduler

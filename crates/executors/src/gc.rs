@@ -1174,7 +1174,10 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let cleaned = task_root(&root, "cleaned");
         let later_root = task_root(&root, "later");
-        let both = states(&[("cleaned", RootState::Cleaned), ("later", RootState::Cleaned)]);
+        let both = states(&[
+            ("cleaned", RootState::Cleaned),
+            ("later", RootState::Cleaned),
+        ]);
         let mut pass = sweep(&root);
         pass.deadline = Instant::now();
         let mut report = GcReport::default();
@@ -1307,7 +1310,10 @@ mod tests {
         assert_eq!(pass.adopt("second"), Ownership::Other);
         assert_eq!(pass.ownership("second"), Ownership::Other);
         assert_eq!(pass.ownership(""), Ownership::Other);
-        assert_eq!(fs::read_to_string(root.join(GC_DIR).join(OWNER_FILE)).unwrap(), "first");
+        assert_eq!(
+            fs::read_to_string(root.join(GC_DIR).join(OWNER_FILE)).unwrap(),
+            "first"
+        );
         // Nothing staged is left behind, and the claim is not a quarantine entry.
         assert_eq!(fs::read_dir(root.join(GC_DIR)).unwrap().count(), 1);
         assert!(pass.quarantined_names().is_empty());
@@ -1353,7 +1359,12 @@ mod tests {
     fn a_root_that_is_a_home_a_repository_a_link_or_the_top_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
-        for path in [Path::new("/"), Path::new("/Volumes"), Path::new("/tmp"), Path::new("/usr")] {
+        for path in [
+            Path::new("/"),
+            Path::new("/Volumes"),
+            Path::new("/tmp"),
+            Path::new("/usr"),
+        ] {
             assert!(refuse_root(path).is_some(), "{}", path.display());
         }
         // The home directory of this test process, and every parent of it.
@@ -1364,7 +1375,10 @@ mod tests {
         }
         let repo = base.join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
-        assert_eq!(sweep(&repo).adopt("owner"), Ownership::Refused("it is a git repository"));
+        assert_eq!(
+            sweep(&repo).adopt("owner"),
+            Ownership::Refused("it is a git repository")
+        );
         assert!(!repo.join(".forge").exists());
         // A root reached through a link is not the directory that was adopted.
         let real = base.join("real");
@@ -1372,7 +1386,10 @@ mod tests {
         assert_eq!(sweep(&real).adopt("owner"), Ownership::Mine);
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(matches!(sweep(&link).ownership("owner"), Ownership::Refused(_)));
+        assert!(matches!(
+            sweep(&link).ownership("owner"),
+            Ownership::Refused(_)
+        ));
         // A marker that is a link, or a `.forge/gc` that is one, is no claim.
         let planted = base.join("planted");
         fs::create_dir_all(planted.join(".forge")).unwrap();
@@ -1398,14 +1415,27 @@ mod tests {
         task_root(&root, "creating");
         let mut pass = later(&root, 30 * DAY);
         pass.creating = |path| path.ends_with("creating");
-        let names = ["mine", "line\nbreak", "reserved", "worktree", "outbox", "creating", "/etc", "..", "a/b"];
+        let names = [
+            "mine",
+            "line\nbreak",
+            "reserved",
+            "worktree",
+            "outbox",
+            "creating",
+            "/etc",
+            "..",
+            "a/b",
+        ];
         let unknown: HashMap<String, RootState> = names
             .iter()
             .map(|name| ((*name).to_owned(), RootState::Unknown))
             .collect();
         let mut report = GcReport::default();
         pass.task_roots(&unknown, &mut report);
-        assert_eq!((report.quarantined, report.removed, report.errors), (3, 0, 0));
+        assert_eq!(
+            (report.quarantined, report.removed, report.errors),
+            (3, 0, 0)
+        );
         assert!(root.join("mine/photos").exists() && root.join("mine/clone/.git").exists());
         assert!(root.join("line\nbreak/repo").exists() && root.join("creating/repo/file").exists());
         let mut held = pass.quarantined_names();
@@ -1428,7 +1458,10 @@ mod tests {
         let mut report = GcReport::default();
         pass.task_roots(&states(&[("orphan", RootState::Unknown)]), &mut report);
         assert!(!pass.trash(&orphan, &mut report));
-        assert_eq!((report.quarantined, report.removed, report.errors), (0, 0, 2));
+        assert_eq!(
+            (report.quarantined, report.removed, report.errors),
+            (0, 0, 2)
+        );
         assert!(orphan.join("repo/file").exists());
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
@@ -1482,15 +1515,42 @@ mod tests {
         pass.disk_space = |_| None;
         pass.evict_builds(&names, &floor, &mut report);
         // Plenty of room.
-        pass.disk_space = |_| Some(DiskSpace { free: 900, total: 1000 });
-        pass.evict_builds(&names, &FreeFloor { min_free_bytes: 0, min_free_percent: 5 }, &mut report);
+        pass.disk_space = |_| {
+            Some(DiskSpace {
+                free: 900,
+                total: 1000,
+            })
+        };
+        pass.evict_builds(
+            &names,
+            &FreeFloor {
+                min_free_bytes: 0,
+                min_free_percent: 5,
+            },
+            &mut report,
+        );
         assert!(build.exists());
         assert_eq!(report, GcReport::default());
         // Under the floor.
-        pass.disk_space = |_| Some(DiskSpace { free: 10, total: 1000 });
-        pass.evict_builds(&names, &FreeFloor { min_free_bytes: 0, min_free_percent: 5 }, &mut report);
+        pass.disk_space = |_| {
+            Some(DiskSpace {
+                free: 10,
+                total: 1000,
+            })
+        };
+        pass.evict_builds(
+            &names,
+            &FreeFloor {
+                min_free_bytes: 0,
+                min_free_percent: 5,
+            },
+            &mut report,
+        );
         assert!(!build.exists());
-        assert_eq!((report.builds_evicted, report.removed, report.errors), (1, 0, 0));
+        assert_eq!(
+            (report.builds_evicted, report.removed, report.errors),
+            (1, 0, 0)
+        );
     }
 
     #[test]
@@ -1502,7 +1562,11 @@ mod tests {
         assert!(!untouched_for(&home, now, LEGACY_UNTOUCHED));
         assert!(!untouched_for(&home, now + 6 * DAY, LEGACY_UNTOUCHED));
         assert!(untouched_for(&home, now + 8 * DAY, LEGACY_UNTOUCHED));
-        assert!(!untouched_for(&dir.path().join("missing"), now + 8 * DAY, LEGACY_UNTOUCHED));
+        assert!(!untouched_for(
+            &dir.path().join("missing"),
+            now + 8 * DAY,
+            LEGACY_UNTOUCHED
+        ));
     }
 
     #[cfg(unix)]

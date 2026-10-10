@@ -17,9 +17,7 @@
 //! was lost, and a second daemon process on the same root, sweep nothing.
 
 use super::*;
-use executors::gc::{
-    FreeFloor, GcReport, Ownership, RootState, Sweep, DAEMON_OWNER_FILE, GC_DIR,
-};
+use executors::gc::{FreeFloor, GcReport, Ownership, RootState, Sweep, DAEMON_OWNER_FILE, GC_DIR};
 use std::time::SystemTime;
 
 /// How often a running daemon sweeps its root.

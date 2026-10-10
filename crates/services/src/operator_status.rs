@@ -2380,7 +2380,9 @@ mod condition_check_tests {
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 )
                 .bind(crate::workspace_cleanup::GC_STATUS_KEY)
-                .bind(format!(r#"{{"state":"{state}","root":"/srv/forge","reason":null}}"#))
+                .bind(format!(
+                    r#"{{"state":"{state}","root":"/srv/forge","reason":null}}"#
+                ))
                 .bind(db::now_rfc3339())
                 .execute(db.pool())
                 .await

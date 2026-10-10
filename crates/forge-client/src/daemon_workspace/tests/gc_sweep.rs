@@ -135,7 +135,14 @@ async fn build_output_is_evicted_under_the_floor_but_never_for_a_busy_handle() {
     // Plenty of room: nothing goes even when idle.
     let report = fixture
         .backend
-        .gc_sweep_at(&[], SystemTime::now(), FreeFloor { min_free_bytes: 0, min_free_percent: 0 })
+        .gc_sweep_at(
+            &[],
+            SystemTime::now(),
+            FreeFloor {
+                min_free_bytes: 0,
+                min_free_percent: 0,
+            },
+        )
         .await;
     assert_eq!(report.builds_evicted, 0);
     // Idle and under the floor.

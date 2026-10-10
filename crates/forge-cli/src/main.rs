@@ -251,7 +251,9 @@ async fn run() {
             state = ownership.as_str(),
             "workspace garbage collection is OFF: the workspace root is owned by another Forge database or cannot be a workspace root, so nothing is reclaimed and the disk can fill. If the root belongs to this server, restart once with --reclaim-workspace-gc"
         ),
-        Err(error) => tracing::warn!(%error, "workspace root ownership could not be settled; garbage collection is off"),
+        Err(error) => {
+            tracing::warn!(%error, "workspace root ownership could not be settled; garbage collection is off")
+        }
     }
     runtime
         .cleanup_scheduler

@@ -3038,9 +3038,17 @@ mod tests {
     fn backdate(path: &Path, days: u64) {
         let then = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
         let mut paths = vec![path.to_path_buf()];
-        paths.extend(std::fs::read_dir(path).unwrap().flatten().map(|entry| entry.path()));
+        paths.extend(
+            std::fs::read_dir(path)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path()),
+        );
         for path in paths.iter().rev() {
-            std::fs::File::open(path).unwrap().set_modified(then).unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(then)
+                .unwrap();
         }
     }
 
@@ -3124,10 +3132,14 @@ mod tests {
         let mut cursor = SweepCursor::default();
         let later = std::time::SystemTime::now() + 25 * HOUR;
 
-        let first = scheduler.gc_pass_at(&mut cursor, GC_TEST_BUDGET, later).await;
+        let first = scheduler
+            .gc_pass_at(&mut cursor, GC_TEST_BUDGET, later)
+            .await;
         assert_eq!(first.quarantined, SWEEP_LIMIT as usize);
         assert!(!cursor.root_name.is_empty());
-        let second = scheduler.gc_pass_at(&mut cursor, GC_TEST_BUDGET, later).await;
+        let second = scheduler
+            .gc_pass_at(&mut cursor, GC_TEST_BUDGET, later)
+            .await;
         assert_eq!(second.quarantined, 6);
         assert!(cursor.root_name.is_empty());
         assert!(orphans.iter().all(|orphan| !orphan.exists()));
@@ -3140,10 +3152,14 @@ mod tests {
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        let starved = scheduler.gc_pass_at(&mut cursor, Duration::ZERO, later).await;
+        let starved = scheduler
+            .gc_pass_at(&mut cursor, Duration::ZERO, later)
+            .await;
         assert_eq!(starved.quarantined, 1);
         assert_eq!(cursor.root_name, names[0]);
-        let next = scheduler.gc_pass_at(&mut cursor, Duration::ZERO, later).await;
+        let next = scheduler
+            .gc_pass_at(&mut cursor, Duration::ZERO, later)
+            .await;
         assert_eq!(next.quarantined, 1);
         assert_eq!(cursor.root_name, names[1]);
     }
@@ -3202,7 +3218,9 @@ mod tests {
         scheduler.set_gc_limits(30, under);
         scheduler.set_live_check_counter(Arc::new(|| 1));
         assert_eq!(gc_at(&scheduler, Duration::ZERO).await.builds_evicted, 0);
-        assert!(builds.iter().all(|build| build.join("cargo/marker").exists()));
+        assert!(builds
+            .iter()
+            .all(|build| build.join("cargo/marker").exists()));
 
         // Under the floor: only the idle, non-terminal Task loses its build.
         scheduler.set_live_check_counter(Arc::new(|| 0));
@@ -3541,7 +3559,8 @@ mod tests {
         let mine = fixture_task(&db, &workspace_id).await;
         let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
         let linked = fixture_task(&db, &workspace_id).await;
-        let (old_task, other_task, linked_task) = (mine.id.clone(), new_uuid_v4(), linked.id.clone());
+        let (old_task, other_task, linked_task) =
+            (mine.id.clone(), new_uuid_v4(), linked.id.clone());
         let logs = legacy.join("forge/logs");
         for path in [
             legacy.join("forge-gemini-api-key-home/.gemini"),
@@ -3567,7 +3586,9 @@ mod tests {
         // it, so everything stays.
         scheduler.set_legacy_temp_dir(legacy.clone());
         gc_at(&scheduler, 6 * 24 * HOUR).await;
-        assert!(legacy.join("forge-gemini-api-key-home/.gemini/file").exists());
+        assert!(legacy
+            .join("forge-gemini-api-key-home/.gemini/file")
+            .exists());
         assert!(logs.join(&old_task).join("hooks/file").exists());
 
         gc_at(&scheduler, 8 * 24 * HOUR).await;
