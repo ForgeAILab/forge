@@ -128,6 +128,8 @@ pub struct HeadDriver {
     result_checked: Option<DateTime<Utc>>,
     /// The ends of an object transfer this session made for the head.
     transferred: Option<ObjectTransferRelease>,
+    /// Permits this session could not use (they did not bind the head).
+    refused_permits: u32,
     stop: CancellationToken,
 }
 
@@ -141,6 +143,7 @@ impl HeadDriver {
             since: None,
             result_checked: None,
             transferred: None,
+            refused_permits: 0,
             stop: CancellationToken::new(),
         }
     }
@@ -1182,8 +1185,13 @@ impl HeadDriver {
                 {
                     Ok(_) => Ok(Pass::Progress),
                     // The permit does not bind this candidate, target, Task
-                    // entry and slot: ask again.
-                    Err(ServiceError::Db(db::DbError::Check(_))) => {
+                    // entry and slot: ask again, a bounded number of times
+                    // (each ask is a Task step).
+                    Err(ServiceError::Db(db::DbError::Check(detail))) => {
+                        self.refused_permits += 1;
+                        if self.refused_permits > 2 {
+                            return self.park(&a, ParkReason::Infrastructure, &detail).await;
+                        }
                         self.enqueued.clear();
                         Ok(Pass::Wait(self.w.config.poll))
                     }
@@ -1383,12 +1391,12 @@ impl HeadDriver {
             // Only the owner settles an admitted effect, under its own
             // checkout lock: a receipt, an exact proof, or "the ref never
             // moved". The worker records nothing itself.
-            let outcome = match serde_json::from_value::<IntegrationEffectRequest>(
-                intent["request"].clone(),
-            ) {
-                Ok(request) => self.w.owner.reconcile_effect(&request).await,
-                Err(_) => self.w.owner.reconcile_outstanding().await,
-            };
+            let outcome =
+                match serde_json::from_value::<IntegrationEffectRequest>(intent["request"].clone())
+                {
+                    Ok(request) => self.w.owner.reconcile_effect(&request).await,
+                    Err(_) => self.w.owner.reconcile_outstanding().await,
+                };
             if let Err(error) = outcome {
                 tracing::warn!(target: "services::integration_worker", attempt_id = %a.id, %error, "integration owner reconciliation failed");
             }

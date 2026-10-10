@@ -64,6 +64,8 @@ struct FakeSteps {
     answered: Mutex<HashSet<String>>,
     held: Mutex<HashSet<(String, IntegrationStepAction)>>,
     red: Mutex<HashSet<String>>,
+    /// Permits name another candidate (a consumer bug the worker must bound).
+    bad_permit: AtomicBool,
     readied: AtomicUsize,
 }
 impl FakeSteps {
@@ -129,8 +131,13 @@ impl FakeSteps {
                     }
                     let red = checked && self.red.lock().unwrap().contains(&request.task_id);
                     if !red {
+                        let candidate = if self.bad_permit.load(Ordering::SeqCst) {
+                            Some("0".repeat(40))
+                        } else {
+                            a.candidate_sha.clone()
+                        };
                         a.permit_json = Some(
-                            json!({"candidate_sha":a.candidate_sha,"target_tip_sha":a.target_tip_sha,"task_ref":a.task_ref,"expected_epoch":a.expected_epoch,"slot_generation":a.slot_generation}),
+                            json!({"candidate_sha":candidate,"target_tip_sha":a.target_tip_sha,"task_ref":a.task_ref,"expected_epoch":a.expected_epoch,"slot_generation":a.slot_generation}),
                         );
                     }
                     IntegrationStepAck {
@@ -227,11 +234,14 @@ struct FakeTransfer {
 impl ObjectTransferPort for FakeTransfer {
     async fn transfer(&self, request: ObjectTransferRequest) -> Result<ObjectTransferOutcome> {
         self.calls.lock().unwrap().push(request.direction);
-        self.keys.lock().unwrap().push(api_types::object_transfer_key(
-            &request.fence.attempt_id,
-            request.fence.generation,
-            request.direction,
-        ));
+        self.keys
+            .lock()
+            .unwrap()
+            .push(api_types::object_transfer_key(
+                &request.fence.attempt_id,
+                request.fence.generation,
+                request.direction,
+            ));
         assert_eq!(request.target.repo_location_id, "l-r");
         assert_eq!(request.task.owner, EffectOwner::Server);
         assert_eq!(request.have.len(), 1);
@@ -1107,11 +1117,7 @@ async fn cancel_during_a_running_rebase_stops_git_and_releases_after_the_receipt
     assert!(!pass.is_finished());
     world
         .db
-        .request_integration_cancel(
-            &held.id,
-            running_attempt.revision,
-            &db::now_rfc3339(),
-        )
+        .request_integration_cancel(&held.id, running_attempt.revision, &db::now_rfc3339())
         .await
         .unwrap();
     let (driver, pass) = tokio::time::timeout(Duration::from_secs(20), pass)
@@ -1210,6 +1216,34 @@ async fn takeover_of_a_started_rebase_is_settled_by_the_owner_from_git() {
             db::IntegrationQueueState::Open
         );
     }
+}
+
+/// A permit that does not bind the head is asked for again, but not for
+/// ever: each ask is a Task step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permit_that_never_binds_parks_after_a_bounded_number_of_asks() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    world.steps.bad_permit.store(true, Ordering::SeqCst);
+    let mut pump = Pump::new(world.worker());
+    // A refused permit ends a pump round (the driver waits one poll).
+    for _ in 0..6 {
+        world.settle(&mut pump).await;
+    }
+    let parked = world.attempt(&a.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert_eq!(
+        parked.failure_kind,
+        Some(IntegrationFailureKind::Infrastructure)
+    );
+    let asks = world
+        .steps
+        .actions("a")
+        .iter()
+        .filter(|action| **action == IntegrationStepAction::Settle)
+        .count();
+    assert_eq!(asks, 3);
+    assert!(world.queue_of(&a).await.head_attempt_id.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

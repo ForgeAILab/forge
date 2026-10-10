@@ -177,7 +177,8 @@ impl ServerIntegrationOwner {
     ///   reads it as already merged.)
     /// - rebase: HEAD still names the expected commit and no rebase is
     ///   stopped: not performed. HEAD moved onto the expected target: done.
-    ///   A rebase still stopped after the effect's own deadline: timed out.
+    ///   A rebase still stopped after the effect's own deadline is aborted
+    ///   and settled as timed out.
     async fn queue_effect_settlement(
         &self,
         request: &IntegrationEffectRequest,
@@ -212,13 +213,22 @@ impl ServerIntegrationOwner {
                                     .ok()
                             })
                             .is_some_and(|age| age > bound);
-                        return stopped.then(|| {
-                            let outcome = OwnerRebaseReceipt::TimedOut {
-                                head_sha: Some(now),
-                                rebase_in_progress: true,
-                            };
-                            (json!(outcome), IntegrationOperationState::Failed)
-                        });
+                        if !stopped {
+                            return None;
+                        }
+                        // Nothing of this owner runs under the lock and the
+                        // effect's own deadline has passed: put the branch
+                        // back, so the next round starts from the candidate.
+                        let aborted = git::abort_rebase(path).await.is_ok();
+                        let outcome = OwnerRebaseReceipt::TimedOut {
+                            head_sha: if aborted {
+                                git::get_current_sha(path).await.ok()
+                            } else {
+                                Some(now)
+                            },
+                            rebase_in_progress: !aborted,
+                        };
+                        return Some((json!(outcome), IntegrationOperationState::Failed));
                     }
                     if now == head {
                         return not_performed();

@@ -5466,7 +5466,12 @@ Parts:
   when its head is `reconciling` / `ff_inflight`; a `quarantined` head is put
   back to `reconciling` once per reconcile interval (60 s); a head that
   resolved before the queue was re-opened is re-opened with its stored
-  witness first.
+  witness first. A quarantined queue with no head (an imported quarantine)
+  is re-opened with a `NoEffect` witness as soon as the storage agrees that
+  no member holds an unknown result; the pinned attempt stays `quarantined`
+  for its owner's Retry. A suspended queue is tried again on every sweep
+  (the claim re-resolves the target, one small write per try); its head and
+  each queued member get one `park` step so the Task shows why it waits.
 - **Head driver** (`HeadDriver`): a table-driven state machine (`HEAD_TABLE`:
   per state the action, success edges, failure edges, timeout, cancel rule and
   what a restart finds). Every attempt transition goes through one function
@@ -5484,7 +5489,7 @@ Parts:
 | `awaiting_task_step` | wait for the `settle` step's permit (300 s) | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
 | `ready_ff` | move commits out if needed; cancel-or-commit compare-and-set (permit lifetime 120 s) | `ff_inflight`, `awaiting_task_step`, `cancelled` |
 | `ff_inflight` | fenced owner fast-forward of the exact candidate | `applied`; `rebasing` in a new round when the target moved; `reconciling` otherwise |
-| `reconciling` | owner reconciliation, then a Git witness | `applied`, `queued` (proven not landed), `rebasing`, `quarantined` (unknown) |
+| `reconciling` | ask the owner to settle the head's own effect, then read the newest receipt and a Git witness | `applied`, `queued` (proven not landed), `rebasing` (a finished rebase to adopt), `quarantined` (unknown) |
 | `applied` | ready the `result` step; wait for its acknowledgment or for the Task to leave `merging` | `completed` |
 
 Rules the driver enforces:
@@ -5497,9 +5502,22 @@ Rules the driver enforces:
   only have been moved from outside Forge: it is recorded as `external`, starts
   a new round (`start_integration_round`), and the sixth one parks the attempt
   with `external_target_moves_exhausted`.
-- An unknown result is never guessed. The queue is quarantined with
-  `needs_fact`, the head becomes `quarantined`, and the queue re-opens only
-  with a settled receipt (or `NoEffect`) that the storage re-verifies.
+- An unknown result is never guessed, and only the owner settles an admitted
+  effect. `ServerIntegrationOwner::reconcile_effect` runs under the effect's
+  own checkout lock and, for a started queue-claim effect with no receipt,
+  records: the exact reviewed merge when the target names the candidate;
+  `not_performed` when the target ref (fast-forward) or the Task's HEAD
+  (rebase, none stopped) never moved; `completed` when HEAD already sits on
+  the expected target (a rebase that finished without its receipt, conflict
+  hand-off paths included); `timed_out` after aborting a rebase that is still
+  stopped once its own deadline has passed since the first lookup. Anything
+  else stays uncertain: the queue is quarantined with `needs_fact`, the head
+  becomes `quarantined`, the lookup repeats every 60 s, and the queue
+  re-opens only with a settled receipt (or `NoEffect`) that the storage
+  re-verifies. The lock covers effects of this process; a Git child that
+  outlives a killed server is covered by the lease (takeover is at least one
+  lease later) and by content: a late fast-forward lands the exact candidate,
+  which the next validation reads as already merged.
 - Cancel against the permit: both are compare-and-set writes on the attempt
   row and a cancel request is refused once `ff_inflight` is stored, so exactly
   one wins. Before that point a cancel request wins even over a written permit.
@@ -5507,22 +5525,38 @@ Rules the driver enforces:
   `effect_seq`, and a step is enqueued before the attempt transition it
   belongs to, so a crash between the two leaves a step, not a silent attempt.
 - Infrastructure parks retry after 30 s, 2 min and 10 min, then wait for the
-  owner. The park history is kept in `operation_receipts_json`.
+  owner. A wait with no end of its own (paused Project, target not ready) is
+  retried with a doubling gap up to 10 min, and only its first park is a Task
+  step. A permit that does not bind the head is asked for three times, then
+  the attempt parks. The park history is kept in `operation_receipts_json`
+  (entries `{"kind":"worker_park",...}`, newest 64): nothing else writes that
+  column, and the evidence pruner empties it only on terminal attempts that
+  are no longer current, which the worker never reads.
+- A rebase or fast-forward is bounded by the owner (120 s / 30 s), not by a
+  worker timer. A cancel request that arrives while `git rebase` runs stops
+  the process group; the head is released after the cancelled receipt.
 
 Ports (`integration_worker::ports`). Consumed, and to be implemented by D2:
 `IntegrationStepPort` (enqueue an `integration` Task step by causation key
 `integration:<attempt>:<effect_seq>:<action>`; make the protected `result`
 step runnable), `IntegrationFactsPort` (read-only Task gate and Git facts of
-the head), `ObjectTransferPort` (commits between a non-default checkout and
-the default checkout, 256 MiB cap). Provided: `IntegrationEnqueuePort`
+the head, and the repo location of its checkout), `ObjectTransferPort`
+(`transfer`: commits between a non-default checkout and the default checkout,
+256 MiB cap, keyed by attempt, claim generation and direction; `release`: drop
+the attempt's transfer refs on both checkouts when it leaves the slot). The
+real transfer over the owner operations is not written yet. Provided: `IntegrationEnqueuePort`
 (wake the sweep after an admission) and `IntegrationSnapshotPort` (queue,
 members in order with position, state, timings; the read surface is built on
 it). Steps answer by writing `effect_ack_json` / `acknowledged_at` (and
 `permit_json`) on the attempt; the worker only reads them.
 
 Not in this part: daemon-owned targets (the head parks with
-`daemon_owner_unwired`), Task conditions and `park` steps for members of a
-suspended queue, and the Task-step consumer itself.
+`daemon_owner_unwired`, no automatic retry), the production
+`ObjectTransferPort`, Task conditions, and the Task-step consumer itself.
+Known limits: the first rebase of a head is always counted as a
+`queue_member` lost race (the queue does not store the commit it last
+integrated, so a push from outside before the claim cannot be told apart);
+an `applied` head waits for its `result` step without a timer.
 
 ### Task condition actions
 
