@@ -141,8 +141,9 @@ impl TaskMutationReply {
                         project_id,
                         running_executions,
                         active_leases,
+                        live_check_runs,
                     } => {
-                        serde_json::json!({"code":"project_in_use","project_id":project_id,"running_executions":running_executions,"active_leases":active_leases})
+                        serde_json::json!({"code":"project_in_use","project_id":project_id,"running_executions":running_executions,"active_leases":active_leases,"live_check_runs":live_check_runs})
                     }
                     DbError::TurnNotRetryable => serde_json::json!({"code":"turn_not_retryable"}),
                     DbError::ChatTurnLive => serde_json::json!({"code":"chat_turn_live"}),
@@ -230,6 +231,7 @@ impl TaskMutationReply {
                     project_id: value("project_id"),
                     running_executions: error["running_executions"].as_i64().unwrap_or_default(),
                     active_leases: error["active_leases"].as_i64().unwrap_or_default(),
+                    live_check_runs: error["live_check_runs"].as_i64().unwrap_or_default(),
                 },
                 Some("task_condition_quarantined") => DbError::TaskConditionQuarantined {
                     task_id: value("task_id"),

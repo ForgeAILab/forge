@@ -2331,14 +2331,22 @@ failure leaves no Project or handoff and keeps Genesis ready for retry.
 `DELETE /api/v1/projects/{id}` requires an authenticated Project owner/admin;
 unauthorized members cannot observe in-use counts or filesystem state. It
 refuses with `409 project_in_use` while the
-Project still holds a running Execution or an active Workspace lease, and its
-`details` report `running_executions` and `active_leases`. With
+Project still holds a running Execution, an active Workspace lease or an
+unfinished check run (a review-entry or integration check that is queued,
+running, being cancelled or cleaned up, or whose result is not known yet), and
+its `details` report `running_executions`, `active_leases` and
+`live_check_runs`. With
 `?force=true`, Forge requests provider-acknowledged cancellation for every
 running Execution, terminalizes those rows, revokes active Workspace leases,
-and retries the same guarded deletion. A provider or database failure stops
-the request before authoritative deletion; if any execution or lease is still
-live, the request remains a `409` and the Project is left intact. Force does
-not mean "delete anyway".
+stops the Project's check runs (a queued run is cancelled at once; a running
+one is cancelled on the machine that runs it and Forge waits a few seconds for
+it to settle), and retries the same guarded deletion. A provider or database
+failure stops the request before authoritative deletion; if any execution,
+lease or check run is still live, the request remains a `409` (`details.
+force_cancellation_incomplete: true`) and the Project is left intact. That is
+the answer while a check runs on a daemon that cannot be reached: its stop is
+not confirmed, so the record that fences it is kept; retry once the daemon is
+back or the run has timed out. Force does not mean "delete anyway".
 
 Once admitted, it performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project, including

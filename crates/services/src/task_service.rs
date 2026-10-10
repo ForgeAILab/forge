@@ -932,7 +932,68 @@ impl TaskService {
                 }
             }
         }
-        Ok(())
+        self.stop_project_check_runs(project_id).await
+    }
+
+    /// Force deletion stops the Project's unfinished check runs first and
+    /// waits, bounded, for each to settle. Their consumers are cancelled, so
+    /// nobody waits for a result: a queued run is cancelled here, a running
+    /// one is cancelled on its owner by the check worker (which notices a run
+    /// without consumers within about a second). A run that does not settle
+    /// in the bound (its daemon is unreachable, so the worker cannot confirm
+    /// the stop) stays live, and the deletion guard then refuses: the row
+    /// that fences the remote process is never deleted from under it.
+    async fn stop_project_check_runs(&self, project_id: &str) -> Result<()> {
+        const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+        if self
+            .db
+            .live_project_check_runs(project_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.db.cancel_project_check_consumers(project_id).await?;
+        let deadline = tokio::time::Instant::now() + SETTLE_BOUND;
+        loop {
+            let live = self.db.live_project_check_runs(project_id).await?;
+            if live.is_empty() {
+                return Ok(());
+            }
+            if let Some(worker) = self.check_worker() {
+                for (id, version, state) in &live {
+                    if state != "queued" {
+                        continue;
+                    }
+                    // A queued run has spawned nothing: it is settled as
+                    // cancelled at once instead of at the worker's next sweep
+                    // (or, on a full machine, when a slot frees).
+                    let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                    match db::CheckRunRepo::claim_check_run(
+                        &*self.db,
+                        id,
+                        *version,
+                        "project-deletion",
+                        &now_rfc3339(),
+                        &until,
+                    )
+                    .await
+                    {
+                        Ok(run) => {
+                            if let Err(error) = worker.drive(run).await {
+                                tracing::warn!(run_id = %id, %error, "queued check run was not cancelled for Project deletion");
+                            }
+                        }
+                        Err(DbError::VersionConflict | DbError::NotFound) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Prepare the scheduler-owned lease installed with a newly-created

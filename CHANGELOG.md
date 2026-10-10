@@ -8,6 +8,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Project deletion counts unfinished check runs.** `DELETE
+  /api/v1/projects/{id}` now refuses with `409 project_in_use` while a check
+  run of the Project (review-entry or integration CI on the durable check
+  runner) is queued, running, stopping or of unknown result; `details` gain
+  `live_check_runs`. Before, the delete went through and could leave the
+  check's processes running on a machine with nothing left to stop them.
+  `?force=true` cancels queued runs, stops running ones on their machine and
+  waits a few seconds for them to settle; if one has not (its daemon is
+  unreachable), the answer stays `409` with `force_cancellation_incomplete`
+  and nothing is deleted.
+
 - **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
   The `ci_steps` a Task runs when it enters `review` are no longer executed
   inside the Task's hooks step: the step asks the check runner and waits

@@ -400,8 +400,9 @@ pub async fn update_project_workflow(
 }
 
 /// `?force=true` is the caller's explicit decision to destroy in-flight agent
-/// work. Without it, a Project holding a running Execution or an active
-/// Workspace lease is refused with `409 project_in_use`.
+/// work. Without it, a Project holding a running Execution, an active
+/// Workspace lease or an unfinished check run is refused with
+/// `409 project_in_use`.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct DeleteProjectQuery {
     #[serde(default)]
@@ -458,6 +459,7 @@ pub async fn delete_project(
                 project_id,
                 running_executions,
                 active_leases,
+                live_check_runs,
             }) if query.force => {
                 return Err(ApiError::conflict_with_code_and_details(
                     "project_in_use",
@@ -468,6 +470,7 @@ pub async fn delete_project(
                         "project_id": project_id,
                         "running_executions": running_executions,
                         "active_leases": active_leases,
+                        "live_check_runs": live_check_runs,
                         "force_cancellation_incomplete": true,
                     }),
                 ));

@@ -61,7 +61,7 @@ fn map_project_slot_read(row: SqliteRow) -> Result<crate::ProjectSlotRead> {
 async fn project_in_use_counts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     project_id: &str,
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64, i64)> {
     sqlx::query_as(
         "SELECT
             ((SELECT COUNT(*) FROM execution e
@@ -74,8 +74,12 @@ async fn project_in_use_counts(
                 AND (json_type(t.metadata_json, '$.plan_publication_claim') IS NOT NULL
                   OR json_type(t.metadata_json, '$.plan_publication_cleanup') IS NOT NULL))),
             (SELECT COUNT(*) FROM workspace_lease wl
-              WHERE wl.project_id = ? AND wl.status = 'active')",
+              WHERE wl.project_id = ? AND wl.status = 'active'),
+            (SELECT COUNT(*) FROM check_run r
+              WHERE r.project_id = ?
+                AND r.state IN ('queued','running','cancelling','cleaning','uncertain'))",
     )
+    .bind(project_id)
     .bind(project_id)
     .bind(project_id)
     .bind(project_id)
@@ -852,12 +856,14 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
-        let (running_executions, active_leases) = project_in_use_counts(&mut tx, id).await?;
-        if running_executions > 0 || active_leases > 0 {
+        let (running_executions, active_leases, live_check_runs) =
+            project_in_use_counts(&mut tx, id).await?;
+        if running_executions > 0 || active_leases > 0 || live_check_runs > 0 {
             return Err(DbError::ProjectInUse {
                 project_id: id.to_owned(),
                 running_executions,
                 active_leases,
+                live_check_runs,
             });
         }
         tx.commit().await?;
@@ -880,17 +886,21 @@ impl ProjectRepo for SqliteDb {
         }
 
         // Deleting a Project destroys in-flight agent work. Force callers
-        // must obtain provider acknowledgement, terminalize executions, and
-        // revoke leases before reaching this transaction, but the database
+        // must obtain provider acknowledgement, terminalize executions,
+        // revoke leases and have every check run settled before reaching
+        // this transaction (a check run still live may be executing on a
+        // machine: deleting its row would leave that process unfenced), but the database
         // boundary remains guarded as the final admission check. Keeping the
         // guard here prevents any lower-level caller from bypassing the
         // stop protocol accidentally.
-        let (running_executions, active_leases) = project_in_use_counts(&mut tx, id).await?;
-        if running_executions > 0 || active_leases > 0 {
+        let (running_executions, active_leases, live_check_runs) =
+            project_in_use_counts(&mut tx, id).await?;
+        if running_executions > 0 || active_leases > 0 || live_check_runs > 0 {
             return Err(DbError::ProjectInUse {
                 project_id: id.to_owned(),
                 running_executions,
                 active_leases,
+                live_check_runs,
             });
         }
 

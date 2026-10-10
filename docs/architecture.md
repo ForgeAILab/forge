@@ -2011,7 +2011,14 @@ Project-Chat LCM timelines, entries, operations, and nodes — and then the
 Project itself; the database permits those deletes only while the exact Project
 deletion guard is active. Before authoritative deletion, the API requires
 Project owner/admin authorization and, for `?force=true`, provider-acknowledged
-execution cancellation plus Workspace lease revocation. The final
+execution cancellation plus Workspace lease revocation. An unfinished check run
+(`queued`, `running`, `cancelling`, `cleaning`, `uncertain`) is in-flight work
+like a running execution: the guard counts it (`live_check_runs`) and refuses.
+Force cancels the runs' consumers, settles queued runs as cancelled at once, and
+waits up to three seconds for the check worker to stop running ones on their
+owner; a run that has not settled (an unreachable daemon cannot confirm the
+stop) keeps the refusal, so the `check_run` row that fences the remote
+operation is never deleted from under it. The final
 `BEGIN IMMEDIATE` transaction captures the exact Task IDs, Workspace paths, and
 Project repository paths present at its boundary; it does not rename live paths
 before commit. After commit, the API reacquires `BEGIN IMMEDIATE` immediately
