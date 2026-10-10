@@ -8,6 +8,34 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Logs of terminal Tasks are deleted after 30 days (3.4 stage D).** The
+  directory `<workspace root>/.forge/logs/<project>/<task>` (execution JSONL
+  logs and hook logs) is removed `workspace.log_retention_days` days after a
+  terminal Task last changed. The default is `30`; set it to `0` in
+  `forge.yaml` to keep logs forever, as before. Log endpoints for such a Task
+  then report no log. On the first sweep after the upgrade, logs of every Task
+  that has been terminal for longer than the retention are removed.
+- **Unknown Task-root directories are quarantined, then deleted (3.4 stage
+  D).** A directory under the workspace root whose name is a Task id (daemon:
+  `workspace-<uuid>` under `.forge/workspaces`) and that has no workspace row,
+  Task or Project (daemon: no handle) is moved to
+  `<root>/.forge/gc/<name>-<unix seconds>` and deleted 24 hours later. Move it
+  out of `.forge/gc` within that day to keep it. Directories with any other
+  name are never touched. `<name>.broken-<ms>` copies are deleted after 7
+  days; leftovers of the pre-stage-C layout (`<system temp>/forge/logs/<task
+  id>/hooks`, `<system temp>/forge-gemini-api-key-home`, the daemon's shared
+  `.codex-managed-home`) are deleted when nothing is running.
+- **One workspace root per database (3.4 stage D).** The first server to
+  sweep a workspace root records its identity in `<root>/.forge/gc/owner`. A
+  server with another database that points at the same root logs a warning
+  and garbage-collects nothing there. Delete that file to hand the root to a
+  new database.
+- **Idle Tasks lose their build output under disk pressure (3.4 stage D).**
+  While the workspace root's filesystem is under its free-space floor
+  (default: the larger of 10 GiB and 5 %), the sweep deletes
+  `.forge-task/build` of non-terminal Tasks that have nothing running, least
+  recently used first. Those Tasks rebuild on their next run.
+
 - **The managed Codex home and Task hook logs moved (3.4 stage C part 1).**
   The Forge-owned Codex home of a Task is now
   `<task root>/.forge-task/home/codex` instead of
@@ -829,6 +857,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Budgeted garbage collection of the workspace root on the server and on
+  each daemon (3.4 stage D).** Every 10 minutes, inside the existing 60 second
+  sweep budget and resuming from a cursor, Forge now reclaims what no record
+  points at: unknown Task roots (quarantine first), leftovers of cleaned
+  workspaces, temp directories of runs that never settled, dead exact-commit
+  check checkouts, old broken-worktree copies and the legacy locations. It
+  never follows a link, never removes anything outside the root, never takes a
+  directory a live run or a create in progress owns, and one failing entry
+  does not stop the pass. New `forge.yaml` keys: `workspace.log_retention_days`,
+  `workspace.min_free_bytes`, `workspace.min_free_percent`. Workspace
+  responses gain `disk_bytes` and `disk_measured_at` (nullable; new columns on
+  `workspace`), written by the sweep for server-owned Task roots. No daemon
+  protocol change. See `docs/architecture.md#workspace-garbage-collection`.
 - **Every run gets its temp directory and build output from its Task root
   (3.4 stage C part 1).** Forge reserves `.forge-task/` beside each Task
   worktree (`tmp/<run>/`, `home/<family>/`, `build/`). Agent executions of

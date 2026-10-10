@@ -3367,6 +3367,78 @@ field.
 - Lifecycle hooks that run outside an execution log to
   `<workspace root>/.forge/logs/<project_id>/<task_id>/hooks/`.
 
+### Workspace garbage collection
+
+Cleanup of a terminal Task (below) reclaims what Forge recorded. The
+garbage-collection pass reclaims what it did not: directories left by a crash
+between two steps, by a deleted Task, by a run that never settled. The server
+runs it at the end of every terminal-Task sweep (every 10 minutes, inside the
+same 60 second budget: the Task and repository backfill may use 40 seconds,
+the rest is kept for this pass) and each daemon runs it on the same interval
+over its own root. Both use one implementation (`executors::gc`) and differ
+only in the table that says what a directory is: workspace rows and Tasks on
+the server, the persisted handle table on a daemon. A pass resumes from a
+cursor (64 Task roots per pass), stops at its deadline, and counts an error on
+one entry without stopping.
+
+On the server the pass is on only in the running server (`forge-cli` enables
+it); a scheduler built any other way sweeps and claims nothing.
+
+A Task root is a real directory whose name is a Task id (a 36-character UUID)
+directly under the server workspace root, or `workspace-<uuid>` under
+`<root>/.forge/workspaces` on a daemon.
+
+| What | When it is removed |
+|---|---|
+| Task root with no workspace row, no Task and no Project of that name (daemon: no handle) | Renamed to `<root>/.forge/gc/<name>-<unix seconds>` once the directory is older than 10 minutes; deleted 24 hours after that. Never deleted where it stands. |
+| Quarantined directory whose record appears later | Moved back when its place is still empty, otherwise left in quarantine. Never deleted. |
+| Task root whose workspace rows are all `cleaned` (daemon: handle marked cleaned) | Removed, under the Task's lifecycle lock (daemon: the handle's owner lock), only while the Task is terminal and has no running execution or active lease. |
+| `<name>.broken-<ms>` in a live Task root | 7 days after the time in its name; earlier with its Task root. |
+| Per-run temp directory `.forge-task/tmp/<key>` or `<task roots dir>/.forge-tmp/<key>` | When this process does not hold it, its key belongs to no running execution, and it either predates this process or was last modified more than 25 hours ago (longer than any run). |
+| `.forge/build/checks/check-*` | Last modified more than 2 hours ago (check wall time is at most 1800 s), and either the owner's check table (the server check runner's live operations, the daemon's running commands) is empty or the checkout predates this process. |
+| `.forge-task/build` of a live, non-terminal Task | Only while the root's filesystem is under the free-space floor (`workspace.min_free_bytes` or `workspace.min_free_percent`, whichever is larger; default 10 GiB or 5 %), least recently used first, until it is back above the floor. Never for a Task with a running execution, an active lease, or a hook, check or tool command of this process in its root; never while any check operation is live. A terminal Task's build output goes with its Task root. |
+| `.forge/logs/<project>/<task>` (server only) | `workspace.log_retention_days` (default 30, `0` keeps logs forever) after a terminal Task last changed, by the terminal-Task sweep. |
+| Legacy: `<root>/.forge/logs/<project>/<task>/.codex-managed-home` | With its terminal Task (unchanged). |
+| Legacy: the daemon's shared `<root>/.forge-daemon/execution-logs/.codex-managed-home` | When the daemon runs no execution and no command. |
+| Legacy: `<system temp>/forge/logs/<task id>/hooks` and `<system temp>/forge-gemini-api-key-home` | By the running server only, when no execution is running. These are exact paths; nothing else in the temp directory is read. |
+
+What the pass never touches:
+
+- `.forge` (except its own `gc/`, `build/checks/check-*` and, under log
+  retention, `logs/<project>/<task>`), `.forge-tmp`
+  itself, `.repos`, `main-agents`, a directory named like an existing
+  Project, and every name that is not Task-root shaped. Such names are not
+  even listed.
+- Anything outside the workspace root, apart from the exact legacy paths
+  above. Every removal checks that the entry's parent resolves inside the
+  root.
+- Anything through a link. A link or a file found where a directory is
+  expected is removed as the entry it is, or skipped; a Task root that is a
+  link is not a Task root.
+- A user's `local_path` repository: only exact worktree paths, as before.
+- A directory that is being created. On the server a create has its Task
+  before its directory; on a daemon a handle is recorded before its
+  directory; and no directory younger than 10 minutes is quarantined.
+- A live run. Hooks, checks, tool commands, probes and executions of this
+  process are in the sandbox's registry, which also records the Task root of
+  each run.
+- A workspace root claimed by another database. The first server to sweep a
+  root writes its identity (the `workspace_gc_owner_id` system setting) to
+  `<root>/.forge/gc/owner`; a server with a different identity logs a warning
+  and sweeps nothing there, because its table would call the other server's
+  live Task roots unknown. Two servers must not share a workspace root. To
+  hand a root to a new database, delete that file. A daemon keeps its handle
+  table inside its root, so every runtime on that root reads the same one: a
+  second runtime joins its memory with the persisted table before it judges
+  any directory.
+
+Each pass also measures live server-owned Task roots (32 per pass, least
+recently measured first; disk blocks, links not followed) and writes
+`workspace.disk_bytes` and `workspace.disk_measured_at`. A walk that passes
+the deadline writes nothing; one that passes 500 000 entries writes only the
+time, so `disk_bytes` stays `NULL` rather than hold a partial number. A daemon
+does not report sizes.
+
 ### Workspace placement
 
 A repository's logical identity is separate from its machine-local checkouts.

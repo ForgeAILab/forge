@@ -4453,7 +4453,10 @@ sharing a root workspace expose that root's placement. The object includes
 `workspace_handle`, `generation`, `state`, `selected_by`, `selection_reason`,
 `reserved_until`, `disconnected_at`, `failure_cause`, `version`, and timestamps.
 The handle is opaque; `worktree_path` is populated only for server placements
-and is empty for daemon placements. Responses expose reserved/preparing and
+and is empty for daemon placements. Workspace responses also carry
+`disk_bytes` (disk bytes of the Task root as last measured by the server's
+garbage-collection sweep) and `disk_measured_at` (RFC 3339); both are `null`
+until the sweep has measured the root, and stay `null` for daemon placements. Responses expose reserved/preparing and
 disconnected placements even when the owner cannot be reached. Placement version
 conflicts use the ordinary HTTP `409 version_conflict` error.
 A claim on a `cleaning` or prepared `failed` placement returns

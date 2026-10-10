@@ -429,6 +429,26 @@ Forge only after the command exits. Already-incremental databases are left in
 that mode without another full rebuild. Existing databases are never fully
 vacuumed automatically.
 
+Workspace garbage collection is configured under `workspace` in `forge.yaml`:
+
+```yaml
+workspace:
+  log_retention_days: 30        # logs of a terminal Task; 0 keeps them forever
+  min_free_bytes: 10737418240   # free-space floor: the larger of this
+  min_free_percent: 5           # and this share of the filesystem
+```
+
+Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
+`log_retention_days` after a terminal Task last changed. While the workspace
+root's filesystem has less free space than the floor, the periodic sweep
+deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
+least recently used first; those Tasks rebuild on their next run. Running work
+is never touched. The three keys are read from the file only and take effect
+on restart. Give every server its own workspace root: the first database to
+sweep a root claims it, and any other server leaves that root unswept (see
+[Workspace garbage collection](architecture.md#workspace-garbage-collection)).
+A daemon uses the default floor.
+
 `workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
 placement, or a server-owned workspace executed on a remote daemon, waits for
 that daemon to reconnect. Both freeze heartbeat leases to prevent a second
