@@ -2666,6 +2666,14 @@ async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
         ),
     )
     .unwrap();
+    // The repository names the worktree back, as Git does; without it the
+    // worktree's own `.git` file claims nothing.
+    std::fs::create_dir_all(root.join(".repos/r/worktrees/task")).unwrap();
+    std::fs::write(
+        root.join(".repos/r/worktrees/task/gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )
+    .unwrap();
     let wrapper = f.temp.path().join("kache");
     std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();

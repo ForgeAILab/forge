@@ -3365,20 +3365,39 @@ field.
   worktree itself: a linked worktree's `.git` file names
   `<repository>/worktrees/<name>`, and `<repository>` is
   `<root>/.repos/<repo id>` on the server and `<root>/repos/<repo id>` on a
-  daemon. A directory that is not a linked worktree gets no cache. Each
-  store carries a marker file (`.forge-compiler-cache`, the wrapper kind).
+  daemon. A directory that is not a linked worktree gets no cache, and
+  neither does one whose repository does not name it back
+  (`<repository>/worktrees/<name>/gitdir` must resolve to the worktree's
+  `.git`): the `.git` file is the Task's to rewrite, the repository's
+  directory is not, so a Task cannot claim another repository's store. Each
+  store carries a marker file (`.forge-compiler-cache`, the wrapper kind),
+  written by rename and never through a link a run left in its place.
+  - Trust boundary: one store per repository directory per machine, shared
+    by that repository's Tasks and checks. It is a write channel between
+    them (an entry one Task stores is linked by the next), which is the
+    trust Tasks of one repository already have through the commits they
+    send to the same checks. Nothing crosses repositories or machines.
   - Precedence is the build directory's: Project environment (an empty
     `RUSTC_WRAPPER` turns it off for the Project), a value on the command,
-    the operator's process environment, then Forge. `RUSTC_WRAPPER` decides
-    for the whole set: when anyone else names a wrapper, Forge sets nothing.
-  - A cache that cannot be used never fails a run. Wrapper not executable,
-    store not creatable or writable, `sccache` socket path over 100 bytes or
-    its server not starting: the run gets no wrapper, and one warning per
-    cause is logged per process.
+    the operator's process environment, then Forge. All or nothing: when
+    anyone else carries `RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER` or one
+    of the wrapper's own variables, Forge sets none of the set and the store
+    is not a writable root. A process whose own environment names a wrapper
+    would hand out nothing, so `install_configured` installs nothing for it
+    and warns once.
+  - A cache that cannot be used never fails a run. A known wrapper that
+    does not answer `--version` in five seconds when it is resolved: the
+    feature is off for the process. Per run: wrapper not executable, store
+    not creatable or writable, `sccache` socket path over 100 bytes or its
+    server not starting: the run gets no wrapper, and one warning per cause
+    is logged per process. After three failed server starts in a row for a
+    store, runs skip the start for ten minutes (a start may block a run's
+    start for up to ten seconds). Compilers are never given a timeout.
   - `sccache` keeps one server per socket, and the server keeps the cache
     directory and the environment it started with. Forge therefore starts
     it itself, once per store (`--start-server` with the store's socket, a
-    temp directory inside the store and no idle exit, under a file lock
+    temp directory inside the store, no idle exit and none of the Forge
+    process's own environment beyond `PATH` and `HOME`, under a file lock
     shared by every Forge process on that store). A server started by a
     run's first compile would inherit that run's per-run `TMPDIR` and fail
     every compile after the run settled. Runs are handed
@@ -3461,7 +3480,7 @@ directly under the server workspace root, or `workspace-<uuid>` under
 | Per-run temp directory `.forge-task/tmp/<key>` or `<task roots dir>/.forge-tmp/<key>` | When this process does not hold it, its key belongs to no running execution, and it was last modified more than 25 hours ago. While the root's filesystem is under the free-space floor that age drops to the age at which a check checkout is taken as dead (twice `server.check_run_timeout_seconds` plus an hour, 2 hours by default and on a daemon; never more than 25 hours): the check-run limit is the one configured limit on a run that is in no table, so what crashed runs leave behind stops accumulating for a day exactly when the disk is short. Neither is a bound on a run: an execution deadline is set per agent and has no ceiling, and a longer run is kept by the first two conditions. The sweep at start-up uses the same rule: a run a previous process left detached (a protected push, a check still settling) can still be alive after the restart and is in nobody's table, so being older than this process condemns nothing. |
 | `.forge/build/checks/check-*` | Last modified longer ago than twice `server.check_run_timeout_seconds` plus an hour (never under 2 hours; a daemon uses 2 hours), and either the owner's check table (the server check runner's live operations, the daemon's running commands) is empty or the checkout predates this process. |
 | `.forge-task/build` of a live, non-terminal Task | Only while the root's filesystem is under the free-space floor (`workspace.min_free_bytes` or `workspace.min_free_percent`, whichever is larger, default 10 GiB or 5 %; or `workspace.min_free_inode_percent` of its inodes, default 5 %), least recently used first, until it is back above the floor. Never for a Task with a running execution, an active lease, or a hook, check or tool command of this process in its root; never while any check operation is live. The server decides each Task under its lifecycle lock after reading its state again (it waits at most one second for that lock and otherwise skips the Task until the next pass: a pass can run inside a claim, and must never wait for the claim that asked for it), and the eviction is one rename into `<root>/.forge/gc/trash/` made under the lock every run start takes (the sandbox's live-run registry): a run that starts meanwhile is either seen, and keeps its build output, or starts after the rename and gets the directory made again. Every run of a Task root is in that registry, with or without a per-run temp directory of its own (a Task root whose path is too long for a socket has none, which is the usual case on macOS); a daemon's eviction uses the same registry. The delete happens after both locks are released. A terminal Task's build output goes with its Task root. |
-| Entries of the shared compiler cache (`<cache dir>/<repository id>/**`, default `<root>/.forge/build/cache`) | Only while the root's filesystem is under the free-space floor, and before any Task's build output: least recently used first (the later of a file's access and modification time), until the disk is back above the floor or the cache is down to half of `workspace.compiler_cache.max_bytes` (down to nothing when no cache is configured any more). A cache directory on another filesystem than the root is not trimmed. Only regular files inside a store that carries Forge's marker file are deleted: never a directory, a link, a socket, a `*.lock` file, a file directly in the store (marker, launcher, a wrapper's index) or anything under its `tmp`. A `sccache` store is trimmed whatever runs (an entry deleted under its live server is a miss and is stored again; removing the store directory would make every write fail, so it is never removed). A store of any other wrapper is left alone while a run of this process was handed it (the live-run registry records each run's store) and while the owner has a live check or command. A cache store or cache directory is never a Task root: it is never quarantined and never removed as a cleaned Task's leftover, wherever the operator put it. The pass also measures the cache for the machine's disk facts (`compiler_cache_bytes`). |
+| Entries of the shared compiler cache (`<cache dir>/<repository id>/**`, default `<root>/.forge/build/cache`) | Nothing at all on a root with no cache installed and no default cache directory (no stat of a Task root, no measurement). Otherwise two rules. On every pass, wherever the cache directory is: all stores together are held to `workspace.compiler_cache.max_bytes`, least recently used first (the later of a file's access and modification time). While the root's filesystem is under the free-space floor, and before any Task's build output: least recently used first until the disk is back above the floor or the cache is down to half of `max_bytes` (down to nothing for a cache left in the default directory after the setting was removed, which is collected under the floor only). A cache directory on another filesystem than the root is not trimmed for the floor. Only regular files inside a store that carries Forge's marker file are deleted: never a directory, a link, a socket, a `*.lock` file, a file directly in the store (marker, launcher, a wrapper's index) or anything under its `tmp`. A `sccache` store is trimmed whatever runs (an entry deleted under its live server is a miss and is stored again; removing the store directory would make every write fail, so it is never removed). A store of any other wrapper is left alone while a run of this process was handed it (the live-run registry records each run's store) and while the owner has a live check or command. A cache store or cache directory is never a Task root: it is never quarantined and never removed as a cleaned Task's leftover, wherever the operator put it. The pass also measures the cache for the machine's disk facts (`compiler_cache_bytes`). |
 | `.forge/logs/<project>/<task>` (server only) | `workspace.log_retention_days` (default 30, `0` keeps logs forever) after a terminal Task last changed and after the last write to the directory, whichever is later, by the terminal-Task sweep, on a root this database owns. A reopened Task is not terminal and keeps its logs; a Task whose record carries an old or future timestamp keeps logs written inside the retention; a Task with an open review (running or waiting for a person) or an unresolved attention item about it keeps its logs until that is decided or resolved. |
 | Legacy: `<root>/.forge/logs/<project>/<task>/.codex-managed-home` | With its terminal Task (unchanged). |
 | Legacy: the daemon's shared `<root>/.forge-daemon/execution-logs/.codex-managed-home` | When the daemon runs no execution and no command. |

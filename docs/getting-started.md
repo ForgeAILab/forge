@@ -504,10 +504,23 @@ native command tool and a daemon's `workspace.run`. Precedence is the same as
 for the build directory: a `RUSTC_WRAPPER` in the Project environment wins
 (set it to an empty value to turn the wrapper off for one Project), then a
 value already on the command, then `RUSTC_WRAPPER` in the environment Forge
-itself was started with, then this setting. When any of those names a
-wrapper, Forge sets none of the variables above. Hooks, checks and
-`workspace.run` commands run in a login shell, so a `RUSTC_WRAPPER` exported
-by the operator's shell profile also replaces Forge's there.
+itself was started with, then this setting. The set is all or nothing: when
+any of those carries `RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER` (which
+`RUSTC_WRAPPER` would shadow) or one of the wrapper's own variables in the
+table (`KACHE_CACHE_DIR`, `SCCACHE_DIR`, ...), Forge sets none of the
+variables above and grants no extra writable directory, so a Project can
+never aim Forge's wrapper at a directory of its own choosing. Hooks, checks
+and `workspace.run` commands run in a login shell, so a `RUSTC_WRAPPER`
+exported by the operator's shell profile also replaces Forge's there.
+
+Two consequences worth knowing. If the environment Forge itself is started
+with already names a wrapper (a global `export RUSTC_WRAPPER=kache`, say),
+every run inherits that, so this setting is off for that process; Forge says
+so in one warning at start. Unset the variable for the Forge process to get
+one store per repository. And a `build.rustc-wrapper` in a repository's
+`.cargo/config.toml` is not something Forge sees: `RUSTC_WRAPPER` shadows
+it, so a Project that wants its own wrapper sets `RUSTC_WRAPPER` (or an
+empty value) in its Project environment.
 
 Things to know:
 
@@ -526,10 +539,34 @@ Things to know:
   `SCCACHE_SERVER_UDS=<store>/s sccache --stop-server`. A cache directory
   whose socket path would exceed 100 bytes is not used: set `dir` to a
   shorter path.
-- **A cache never fails a run.** If the wrapper is gone, the directory cannot
-  be created or written, or the `sccache` server does not start, the run
-  builds as it would without the setting and the log carries one warning per
-  cause for the life of the process.
+- **A cache never fails a run.** At start `kache` and `sccache` must answer
+  `--version` within five seconds, or the setting is off for the life of the
+  process (one warning). After that, if the wrapper is gone, the directory
+  cannot be created or written (read-only or full disk included), or the
+  `sccache` server does not start, the run builds as it would without the
+  setting and the log carries one warning per cause for the life of the
+  process. Starting an `sccache` server may hold a run's start for up to ten
+  seconds; after three failed starts in a row for one store, runs stop
+  trying for ten minutes. What Forge cannot see is a wrapper that still
+  exists and starts but fails or hangs while compiling: that is a build
+  failure of the run like any other broken tool, and Forge puts no timeout
+  around a compiler.
+- **Who shares a store (trust boundary).** One store is shared by every Task
+  of one repository on one machine, and by nothing else: the store is named
+  after the repository's id (for a repository that is a local checkout,
+  after that checkout's path), and it is taken from the Task worktree only
+  when the repository's own Git directory names that worktree back, so a
+  Task cannot claim another repository's store by editing its `.git` file.
+  Two Projects share a store only if they are bound to the same repository
+  directory on disk. Within a repository the cache is a channel between
+  Tasks: a Task that can write the store can plant an artifact a later Task
+  or check links. That is the same trust you already give Tasks of one
+  repository (their commits reach the same checks); do not turn this on for
+  a repository whose Tasks must not be able to affect each other's builds.
+- **Background processes.** `sccache` servers (above) and the `kache` daemon
+  (which `kache` starts itself on first use, one per store) outlive the run
+  and Forge. Stop a `kache` daemon with
+  `KACHE_CACHE_DIR=<store> kache daemon stop`.
 - **Sandboxed CLIs.** A Codex Task under Forge's managed workspace-write
   sandbox gets the wrapper only when it is `kache` (which builds uncached
   when it cannot reach its store), and its store is then added to the
@@ -537,17 +574,23 @@ Things to know:
   into that sandbox: `sccache` fails a compile when it cannot reach its
   server. Codex under `yolo` gets whatever you configured. Codex with your
   own sandbox configuration, and Gemini with `--sandbox`, get no wrapper.
-- **Disk.** The wrapper enforces `max_bytes` per repository store. While the
-  workspace filesystem is under its free-space floor, the garbage collector
-  deletes least recently used cache entries (by access and modification
-  time) until the disk is back above the floor or the cache is down to half
-  of `max_bytes`, and only then takes any Task's build output. It deletes
-  entry files only, never a store directory. For a `kache` store it does so
-  only while no run of that repository is live. A cache left behind after
-  you remove the setting is trimmed to nothing under the same pressure. A
-  `dir` on another filesystem than the workspace root is never trimmed by
-  Forge (it would free nothing where space is short); the wrapper's own cap
-  bounds it.
+- **Disk.** `max_bytes` is enforced twice. The wrapper holds each repository
+  store to it (`KACHE_MAX_SIZE`, `SCCACHE_CACHE_SIZE`), and on every pass
+  the garbage collector holds all stores of the machine together to it,
+  deleting least recently used entries (by access and modification time)
+  whatever the disk has free and wherever `dir` is. While the workspace
+  filesystem is under its free-space floor, the collector also deletes
+  least recently used entries until the disk is back above the floor or the
+  cache is down to half of `max_bytes`, and only then takes any Task's build
+  output. It deletes entry files only, never a store directory. For a
+  `kache` store it does so only while no run of that repository is live. A
+  cache left behind in the default directory after you remove the setting
+  is trimmed to nothing under floor pressure only; one left in a `dir` of
+  your own is yours to delete. A `dir` on another filesystem than the
+  workspace root is not trimmed for the floor (it would free nothing where
+  space is short), only held to `max_bytes`. A wrapper Forge does not know
+  (`RUSTC_WRAPPER` only) keeps its cache wherever it likes; Forge neither
+  measures nor trims it.
   Free space admission counts the cache like any other used disk.
 - Check results are not affected: the wrapper is added per run and is not
   part of the environment a check's identity is computed from.

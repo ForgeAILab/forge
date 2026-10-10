@@ -452,10 +452,12 @@ impl SandboxEnv {
     ///   inherited. A key the Project environment declares is left to it.
     /// - Build directories: Project > command > operator process > Forge. A
     ///   Project value that is empty disables the redirect for that key.
-    /// - The shared compiler cache: the same order. `RUSTC_WRAPPER` decides
-    ///   for all of it: when the Project (an empty value included, which
-    ///   turns the wrapper off for that Project), the command or the
-    ///   operator's environment already names a wrapper, Forge sets nothing.
+    /// - The shared compiler cache: the same order, for the whole set at
+    ///   once. When the Project (an empty value included, which turns the
+    ///   wrapper off for that Project), the command or the operator's
+    ///   environment already carries `RUSTC_WRAPPER`,
+    ///   `CARGO_BUILD_RUSTC_WRAPPER` (which `RUSTC_WRAPPER` would shadow) or
+    ///   any of the wrapper's own variables, Forge sets none of them.
     pub fn variables(
         &self,
         project: &BTreeMap<String, String>,
@@ -487,15 +489,15 @@ impl SandboxEnv {
                     || preset(key)
                     || operator(key).is_some_and(|value| !value.is_empty())
             };
-            if !taken(crate::compiler_cache::WRAPPER_KEY) {
-                vars.extend(
-                    cache
-                        .variables()
-                        .filter(|(key, _)| {
-                            *key == crate::compiler_cache::WRAPPER_KEY || !taken(key)
-                        })
-                        .map(|(key, value)| (key, Some(value))),
-                );
+            // All or nothing. A wrapper of Forge's writing into a directory
+            // someone else named would let a Project point the operator's
+            // program at another repository's store.
+            let chosen_elsewhere = crate::compiler_cache::WRAPPER_CONFIG_KEYS
+                .iter()
+                .any(|key| taken(key))
+                || cache.variables().any(|(key, _)| taken(key));
+            if !chosen_elsewhere {
+                vars.extend(cache.variables().map(|(key, value)| (key, Some(value))));
             }
         }
         vars
@@ -1341,14 +1343,36 @@ mod tests {
             cache_vars(env.variables(&BTreeMap::new(), unset, empty)),
             all
         );
-        // One of the wrapper's own variables set by the operator stays theirs,
-        // and the store is then not the one in use.
+        // One of the wrapper's own variables set by anyone else: Forge sets
+        // nothing at all, so its wrapper is never pointed at a directory a
+        // Project chose (another repository's store, say).
         let own_dir =
             |key: &str| (key == "KACHE_CACHE_DIR").then(|| OsString::from("/operator/cache"));
-        assert_eq!(
-            cache_vars(env.variables(&BTreeMap::new(), unset, own_dir)),
-            vec![WRAPPER_KEY, "KACHE_MAX_SIZE"]
-        );
+        assert!(cache_vars(env.variables(&BTreeMap::new(), unset, own_dir)).is_empty());
+        for key in [
+            "KACHE_CACHE_DIR",
+            "KACHE_MAX_SIZE",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ] {
+            let project = BTreeMap::from([(key.to_owned(), "/other/store".to_owned())]);
+            assert!(
+                cache_vars(env.variables(&project, unset, none)).is_empty(),
+                "{key}"
+            );
+            let mut command = Command::new("sh");
+            command.envs(&project);
+            env.apply_with(&mut command, &project, none);
+            assert_eq!(env.compiler_cache_dir_in_use(command.as_std()), None);
+            assert!(
+                cache_vars(env.variables(&BTreeMap::new(), |name| name == key, none)).is_empty(),
+                "{key} on the command"
+            );
+        }
+        // A config-file wrapper of the operator's own is theirs too.
+        let cargo_config = |key: &str| {
+            (key == "CARGO_BUILD_RUSTC_WRAPPER").then(|| OsString::from("/usr/bin/sccache"))
+        };
+        assert!(cache_vars(env.variables(&BTreeMap::new(), unset, cargo_config)).is_empty());
 
         let mut command = Command::new("sh");
         command

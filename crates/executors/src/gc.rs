@@ -390,10 +390,14 @@ impl Sweep {
     /// it is never quarantined and never removed as a cleaned Task's
     /// leftover. (The default cache directory is under `.forge`, which no
     /// owner's Task-root shape matches; this is for a cache directory an
-    /// operator put somewhere a Task-root name could reach.)
+    /// operator put somewhere a Task-root name could reach.) Asked only
+    /// while a cache is installed for this root: with the feature off a
+    /// pass does nothing it did not do before.
     fn holds_compiler_cache(&self, path: &Path) -> bool {
-        fs::symlink_metadata(path.join(compiler_cache::MARKER_FILE)).is_ok()
-            || compiler_cache::store_of(&self.root).0.starts_with(path)
+        compiler_cache::installed(&self.root).is_some_and(|cache| {
+            cache.dir.starts_with(path)
+                || fs::symlink_metadata(path.join(compiler_cache::MARKER_FILE)).is_ok()
+        })
     }
 
     fn quarantine(&self, name: &str, path: &Path, report: &mut GcReport) {
@@ -613,18 +617,24 @@ impl Sweep {
             .is_some_and(|space| floor.pressure(&space.facts(String::new(), None)).is_some())
     }
 
-    /// Trim the shared compiler cache of this root while its filesystem is
-    /// under `floor`: least recently used entries first, until the disk is
-    /// back above the floor or the cache is down to half its configured
-    /// size ([`compiler_cache::store_of`]). Runs before any per-Task build
-    /// output is evicted: a cache entry costs one recompile of one crate,
-    /// a Task's build output costs that Task a cold build.
+    /// Collect the shared compiler cache of this root.
     ///
-    /// The cache directory may be anywhere the operator put it on the
-    /// root's filesystem (a cache on another disk is left to its wrapper's
-    /// own size cap); only entry files of stores Forge marked are deleted
+    /// - Under `floor`: least recently used entries go first, until the
+    ///   disk is back above the floor or the cache is down to half its
+    ///   configured size. This runs before any per-Task build output is
+    ///   evicted: a cache entry costs one recompile of one crate, a Task's
+    ///   build output costs that Task a cold build. Only for a cache on the
+    ///   root's own filesystem: entries deleted from another disk give the
+    ///   short one nothing back.
+    /// - On every pass, whatever the disk has free and wherever the cache
+    ///   is: all stores together are held to the configured size. Each
+    ///   wrapper caps its own store, so without this a machine with many
+    ///   repositories holds that many times the size the operator set.
+    ///
+    /// Only entry files of stores Forge marked are deleted
     /// ([`compiler_cache::evict`]). Also records the cache's size for the
-    /// machine's disk facts.
+    /// machine's disk facts. With no cache installed and none left behind
+    /// this does nothing at all.
     ///
     /// `live_elsewhere`: the owner runs something its table knows and the
     /// live-run registry names no repository for (a check, a command). A
@@ -636,21 +646,39 @@ impl Sweep {
         live_elsewhere: bool,
         report: &mut GcReport,
     ) {
-        let (dir, keep_bytes) = compiler_cache::store_of(&self.root);
-        // A cache the operator put on another filesystem cannot give this
-        // one anything back.
-        if self.under_floor(floor) && compiler_cache::shares_filesystem(&dir, &self.root) {
-            let done =
-                compiler_cache::evict(&dir, keep_bytes, live_elsewhere, self.deadline, || {
-                    !self.under_floor(floor)
-                });
+        let Some(cache) = compiler_cache::collected(&self.root) else {
+            return;
+        };
+        let dir = &cache.dir;
+        let mut note = |done: compiler_cache::Eviction, why: &str| {
             report.cache_entries_evicted += done.files_removed;
             report.out_of_time |= done.out_of_time;
             if done.files_removed > 0 {
-                tracing::warn!(path = %dir.display(), entries = done.files_removed, bytes = done.bytes_freed, "disk is under its free-space floor: evicted least recently used compiler-cache entries");
+                tracing::warn!(path = %dir.display(), entries = done.files_removed, bytes = done.bytes_freed, "{why}: evicted least recently used compiler-cache entries");
+            }
+        };
+        if self.under_floor(floor) && compiler_cache::shares_filesystem(dir, &self.root) {
+            let done = compiler_cache::evict(
+                dir,
+                cache.keep_under_floor,
+                live_elsewhere,
+                self.deadline,
+                || !self.under_floor(floor),
+            );
+            note(done, "disk is under its free-space floor");
+        }
+        let mut measured = compiler_cache::measure(dir, self.deadline);
+        if let (Some(cap), Some(bytes)) = (cache.cap, measured) {
+            if bytes > cap {
+                let done = compiler_cache::evict(dir, cap, live_elsewhere, self.deadline, || false);
+                measured = Some(bytes.saturating_sub(done.bytes_freed));
+                note(
+                    done,
+                    "the shared compiler cache is over its configured size",
+                );
             }
         }
-        if let Some(bytes) = compiler_cache::measure(&dir, self.deadline) {
+        if let Some(bytes) = measured {
             compiler_cache::note_measured(&self.root, bytes);
         }
     }
@@ -1638,6 +1666,115 @@ mod tests {
         let report = pass(false);
         assert_eq!(report.cache_entries_evicted, 1);
         assert!(!oldest.exists() && kept_a.exists() && kept_b.exists());
+        compiler_cache::install(&root, None);
+    }
+
+    /// With the feature off a pass does nothing about a compiler cache: it
+    /// creates nothing, measures nothing and stats no Task root for a
+    /// marker. Turned on, all stores together are held to the configured
+    /// size on a disk with plenty of room; a store of a wrapper not known
+    /// to tolerate it is left alone while a run uses it.
+    #[test]
+    fn compiler_cache_is_untouched_when_off_and_held_to_its_size_when_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let roomy = |_: &Path| {
+            Some(DiskSpace {
+                free: 1000,
+                total: 1000,
+                free_inodes: None,
+                total_inodes: None,
+            })
+        };
+        let floor = FreeFloor::of_bytes(100, 0);
+        let pass = || {
+            let mut report = GcReport::default();
+            let mut sweep = sweep(&root);
+            sweep.disk_space = roomy;
+            sweep.evict_compiler_cache(&floor, false, &mut report);
+            report
+        };
+
+        // Off, never used: nothing.
+        task_root(&root, "t1");
+        let before: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(!pass().did_something());
+        assert_eq!(compiler_cache::collected(&root), None);
+        assert_eq!(compiler_cache::measured_bytes(&root), None);
+        assert!(!root.join(".forge").exists());
+        let after: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(before, after);
+        assert!(!sweep(&root).holds_compiler_cache(&root.join("t1")));
+
+        let cache_dir = root.join(compiler_cache::CACHE_DIR);
+        let entry = |repository: &str, name: &str, age: u64| {
+            let store = cache_dir.join(repository);
+            fs::create_dir_all(store.join("0")).unwrap();
+            fs::write(store.join(compiler_cache::MARKER_FILE), "kache").unwrap();
+            let path = store.join("0").join(name);
+            fs::write(&path, vec![0_u8; 1000]).unwrap();
+            let then = SystemTime::now() - Duration::from_secs(age);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_accessed(then).set_modified(then))
+                .unwrap();
+            path
+        };
+        // Off with a cache left behind, roomy disk: measured, not trimmed.
+        let (oldest, old, new) = (
+            entry("repo-a", "oldest", 900),
+            entry("repo-b", "old", 500),
+            entry("repo-a", "new", 10),
+        );
+        assert!(!pass().did_something());
+        assert!(compiler_cache::measured_bytes(&root).is_some_and(|bytes| bytes >= 3000));
+
+        // On, 2000 bytes for all stores together: the least recently used
+        // entry goes, whichever repository it belongs to.
+        let wrapper = root.join("kache");
+        fs::write(&wrapper, "").unwrap();
+        compiler_cache::install(
+            &root,
+            Some(compiler_cache::CompilerCache {
+                wrapper,
+                kind: compiler_cache::WrapperKind::Kache,
+                dir: cache_dir.clone(),
+                max_bytes: 2000,
+            }),
+        );
+        let report = pass();
+        assert_eq!(report.cache_entries_evicted, 1, "{report:?}");
+        assert!(!oldest.exists() && old.exists() && new.exists());
+        assert_eq!(pass().cache_entries_evicted, 0);
+
+        // Over the size again while a run uses the store that holds the
+        // oldest entry: that store waits, the pass does not fail.
+        let again = entry("repo-b", "again", 700);
+        let holder = root.join("holder").join("repo");
+        fs::create_dir_all(&holder).unwrap();
+        TaskRoot::reserve(holder.parent().unwrap()).unwrap();
+        let live = SandboxEnv::for_run(&holder, "holder", RunPurpose::Check)
+            .with_compiler_cache(Some(compiler_cache::CacheEnv {
+                wrapper: PathBuf::from("/opt/kache"),
+                kind: compiler_cache::WrapperKind::Kache,
+                dir: Some(cache_dir.join("repo-b")),
+                vars: Vec::new(),
+            }))
+            .prepared();
+        let report = pass();
+        assert_eq!((report.cache_entries_evicted, report.errors), (1, 0));
+        assert!(again.exists() && old.exists() && !new.exists());
+        live.settle();
         compiler_cache::install(&root, None);
     }
 

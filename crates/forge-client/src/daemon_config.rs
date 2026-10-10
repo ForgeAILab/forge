@@ -80,14 +80,7 @@ impl DaemonConfig {
             .compiler_cache
             .clone()
             .overridden(wrapper, max_bytes, dir);
-        executors::compiler_cache::install(
-            workspace_root,
-            executors::compiler_cache::CompilerCache::resolve(
-                &config,
-                workspace_root,
-                std::env::var_os("PATH"),
-            ),
-        );
+        executors::compiler_cache::install_configured(workspace_root, &config);
     }
     pub fn load(credentials_path: &Path) -> Result<Self> {
         let path = credentials_path
@@ -183,12 +176,27 @@ mod budget_tests {
     #[test]
     fn daemon_compiler_cache_is_its_own_file_key_and_flags_and_off_by_default() {
         use std::os::unix::fs::PermissionsExt;
+        // The shared cache is off for a process whose own environment names
+        // a wrapper (it wins for every run), which this test cannot undo.
+        if executors::compiler_cache::WRAPPER_CONFIG_KEYS
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        {
+            eprintln!("skipped: this environment names a compiler wrapper (RUSTC_WRAPPER)");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let creds = dir.path().join("credentials.json");
-        let root = dir.path().join("root");
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("root");
         fs::create_dir_all(&root).unwrap();
-        let wrapper = dir.path().join("kache");
-        fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        let wrapper = base.join("kache");
+        // Answers `--version`, as the real one does when it is resolved.
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nexec \"$@\"\n",
+        )
+        .unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
 
         DaemonConfig::load(&creds)
@@ -212,12 +220,9 @@ mod budget_tests {
         assert_eq!(cache.dir, root.join(".forge/build/cache"));
 
         // Flags win over the file; an empty wrapper flag turns it off.
-        config.install_compiler_cache(&root, None, Some(9000), Some(dir.path().join("c")));
+        config.install_compiler_cache(&root, None, Some(9000), Some(base.join("c")));
         let cache = executors::compiler_cache::installed(&root).unwrap();
-        assert_eq!(
-            (cache.max_bytes, cache.dir.clone()),
-            (9000, dir.path().join("c"))
-        );
+        assert_eq!((cache.max_bytes, cache.dir.clone()), (9000, base.join("c")));
         config.install_compiler_cache(&root, Some(String::new()), None, None);
         assert!(executors::compiler_cache::installed(&root).is_none());
     }

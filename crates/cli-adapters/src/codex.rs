@@ -2808,6 +2808,14 @@ mod tests {
             ),
         )
         .expect("worktree link writes");
+        // The repository names the worktree back, as Git does; without it the
+        // worktree's own `.git` file claims nothing.
+        fs::create_dir_all(root.join(".repos/repo-a/worktrees/t")).unwrap();
+        fs::write(
+            root.join(".repos/repo-a/worktrees/t/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
         let wrapper = |name: &str| {
             let path = dir.path().join("bin").join(name);
             fs::create_dir_all(path.parent().unwrap()).expect("bin creates");

@@ -39,6 +39,12 @@ pub const CACHE_DIR: &str = ".forge/build/cache";
 pub const MARKER_FILE: &str = ".forge-compiler-cache";
 /// The variable every supported wrapper is passed through.
 pub const WRAPPER_KEY: &str = "RUSTC_WRAPPER";
+/// Every variable that names a compiler wrapper to Cargo. `RUSTC_WRAPPER`
+/// shadows `CARGO_BUILD_RUSTC_WRAPPER`, so Forge sets its own only when
+/// neither is already chosen by the Project, the command or the operator.
+/// (A `build.rustc-wrapper` in a repository's `.cargo/config.toml` is not
+/// seen and is shadowed; a Project that wants its own sets one of these.)
+pub const WRAPPER_CONFIG_KEYS: [&str; 2] = [WRAPPER_KEY, "CARGO_BUILD_RUSTC_WRAPPER"];
 /// Where a daemon keeps its Task roots, under its workspace root.
 pub const DAEMON_TASK_ROOTS: &str = ".forge/workspaces";
 const SCCACHE_SOCKET: &str = "s";
@@ -49,6 +55,13 @@ const SCCACHE_LAUNCHER: &str = "rustc-wrapper";
 const MAX_SOCKET_BYTES: usize = 100;
 #[cfg_attr(not(unix), allow(dead_code))]
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the wrapper may take to answer `--version` when it is resolved.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Failed starts of one store's sccache server in a row after which runs
+/// stop trying (each try may block a run start for the start timeout), and
+/// for how long.
+const SERVER_START_ATTEMPTS: u32 = 3;
+const SERVER_RETRY_AFTER: Duration = Duration::from_secs(600);
 /// Files one eviction may look at before it stops collecting.
 const EVICTION_ENTRY_LIMIT: usize = 500_000;
 
@@ -157,6 +170,29 @@ impl CompilerCache {
             );
             return None;
         };
+        let kind = WrapperKind::of(&wrapper);
+        // A wrapper Forge knows must answer `--version` (both do) before any
+        // run is handed it: a program that exits non-zero or hangs here
+        // would fail or hang every build. Checked once, at start.
+        if kind != WrapperKind::Unknown {
+            let mut probe = std::process::Command::new(&wrapper);
+            probe
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let answered = run_bounded(&mut probe, PROBE_TIMEOUT).and_then(|status| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!("--version exited with {status}")))
+                }
+            });
+            if let Err(error) = answered {
+                tracing::warn!(wrapper = %wrapper.display(), %error, "workspace.compiler_cache.wrapper does not run: the shared compiler cache is off and runs build as before");
+                return None;
+            }
+        }
         let dir = match &config.dir {
             Some(dir) if dir.is_absolute() => dir.clone(),
             Some(dir) => {
@@ -166,9 +202,11 @@ impl CompilerCache {
             None => workspace_root.join(CACHE_DIR),
         };
         Some(Self {
-            kind: WrapperKind::of(&wrapper),
+            kind,
             wrapper,
-            dir,
+            // The real path: the collector never walks a cache directory
+            // that is a link, so a linked one would never be trimmed.
+            dir: real_path(dir),
             max_bytes: config.max_bytes,
         })
     }
@@ -214,8 +252,12 @@ impl CompilerCache {
                     return None;
                 }
                 let size = sccache_size(self.max_bytes);
+                if server_start_given_up(&dir) {
+                    return None;
+                }
                 let started = ensure_sccache_server(&self.wrapper, &dir, &socket, &size)
                     .and_then(|()| write_sccache_launcher(&self.wrapper, &dir));
+                note_server_start(&dir, started.is_ok());
                 let launcher = match started {
                     Ok(launcher) => launcher,
                     Err(error) => {
@@ -300,6 +342,125 @@ pub fn warnings_logged() -> usize {
     WARNINGS.load(Ordering::Relaxed)
 }
 
+/// Stores whose sccache server failed to start: how often in a row, and when
+/// last.
+static SERVER_FAILURES: LazyLock<Mutex<HashMap<PathBuf, (u32, Instant)>>> =
+    LazyLock::new(Mutex::default);
+
+/// Whether runs have stopped trying to start the sccache server of `store`
+/// for now: it failed [`SERVER_START_ATTEMPTS`] times in a row, the last
+/// time less than [`SERVER_RETRY_AFTER`] ago. Runs build without the
+/// wrapper meanwhile, and without waiting for another start to fail.
+fn server_start_given_up(store: &Path) -> bool {
+    SERVER_FAILURES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(store)
+        .is_some_and(|(failures, last)| {
+            *failures >= SERVER_START_ATTEMPTS && last.elapsed() < SERVER_RETRY_AFTER
+        })
+}
+
+fn note_server_start(store: &Path, started: bool) {
+    let mut failures = SERVER_FAILURES.lock().unwrap_or_else(|p| p.into_inner());
+    if started {
+        failures.remove(store);
+    } else {
+        let entry = failures
+            .entry(store.to_path_buf())
+            .or_insert((0, Instant::now()));
+        *entry = (entry.0.saturating_add(1), Instant::now());
+    }
+}
+
+/// Run `command` to its end, or kill it at `timeout`.
+fn run_bounded(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the program did not return in time",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `path` with every link in its existing part resolved; the part that does
+/// not exist yet is kept as written.
+fn real_path(path: PathBuf) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path.as_path();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(real, |real, name| real.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path,
+        }
+    }
+}
+
+/// Write `contents` to `path` without ever writing through a link: a new
+/// file beside it (created exclusively), renamed over whatever is there. A
+/// store is writable by the runs that use it, so a run can leave a link
+/// where Forge is about to write.
+fn write_replacing(path: &Path, contents: &str, executable: bool) -> io::Result<()> {
+    use std::io::Write;
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let staged = path.with_file_name(format!(
+        ".{}.{}.{}",
+        name.trim_start_matches('.'),
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    match fs::remove_file(&staged) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let written = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(contents.as_bytes())?;
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o755))?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        drop(file);
+        fs::rename(&staged, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    written
+}
+
 type Installed = HashMap<PathBuf, Arc<CompilerCache>>;
 static INSTALLED: LazyLock<RwLock<Installed>> = LazyLock::new(RwLock::default);
 /// Bytes of each workspace root's cache as its collector last measured them.
@@ -332,6 +493,42 @@ pub fn install(workspace_root: &Path, cache: Option<CompilerCache>) {
     }
 }
 
+/// Resolve `config` against this process's environment and install the
+/// result for `workspace_root`: what a server or daemon entrypoint calls
+/// once at start.
+pub fn install_configured(workspace_root: &Path, config: &config::CompilerCacheConfig) {
+    install(
+        workspace_root,
+        configured(config, workspace_root, |key| std::env::var_os(key)),
+    );
+}
+
+/// [`CompilerCache::resolve`] for a process whose environment is `operator`.
+///
+/// The operator's own environment wins over Forge's for every run. A process
+/// that itself carries a wrapper variable would therefore hand its runs
+/// nothing while still making stores and starting servers for them: the
+/// cache is off for it instead, and that is said once here rather than
+/// discovered by a cold build.
+fn configured(
+    config: &config::CompilerCacheConfig,
+    workspace_root: &Path,
+    operator: impl Fn(&str) -> Option<OsString>,
+) -> Option<CompilerCache> {
+    let cache = CompilerCache::resolve(config, workspace_root, operator("PATH"))?;
+    if let Some(key) = WRAPPER_CONFIG_KEYS
+        .iter()
+        .find(|key| operator(key).is_some_and(|value| !value.is_empty()))
+    {
+        tracing::warn!(
+            variable = key,
+            "this process's environment already names a compiler wrapper, which every run inherits: workspace.compiler_cache is off. Unset the variable for this process to give each repository its own store"
+        );
+        return None;
+    }
+    Some(cache)
+}
+
 /// The compiler cache installed for `workspace_root`.
 pub fn installed(workspace_root: &Path) -> Option<Arc<CompilerCache>> {
     INSTALLED
@@ -359,15 +556,38 @@ pub fn for_task_roots(task_roots: &Path) -> Option<Arc<CompilerCache>> {
     })
 }
 
-/// Where the collector of `workspace_root` finds the cache, and the size it
-/// trims it to under the floor's pressure. A root with no cache installed
-/// (the feature was turned off) still has its default directory collected,
-/// down to nothing.
-pub fn store_of(workspace_root: &Path) -> (PathBuf, u64) {
-    installed(workspace_root).map_or_else(
-        || (workspace_root.join(CACHE_DIR), 0),
-        |cache| (cache.dir.clone(), cache.max_bytes / 2),
-    )
+/// What the collector of one workspace root does with its cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collected {
+    pub dir: PathBuf,
+    /// The size the cache is trimmed to while the disk is under its floor.
+    pub keep_under_floor: u64,
+    /// The size all stores together are held to on every pass, whatever the
+    /// disk has free. `None` for a cache that is no longer configured: it
+    /// only gives way to the floor.
+    pub cap: Option<u64>,
+}
+
+/// Where the collector of `workspace_root` finds the cache and what it
+/// trims it to. `None` when there is nothing to collect: no cache is
+/// installed and the default directory does not exist, which is every
+/// machine that never turned the feature on (the collector then does no
+/// work at all). A root whose cache was turned off still has its default
+/// directory collected, down to nothing, under the floor only.
+pub fn collected(workspace_root: &Path) -> Option<Collected> {
+    if let Some(cache) = installed(workspace_root) {
+        return Some(Collected {
+            dir: cache.dir.clone(),
+            keep_under_floor: cache.max_bytes / 2,
+            cap: Some(cache.max_bytes),
+        });
+    }
+    let dir = workspace_root.join(CACHE_DIR);
+    sandbox::is_real_dir(&dir).then_some(Collected {
+        dir,
+        keep_under_floor: 0,
+        cap: None,
+    })
 }
 
 /// Whether `cache_dir` is on the filesystem that holds `workspace_root`.
@@ -429,6 +649,20 @@ pub fn repository_id(worktree: &Path) -> Option<String> {
     };
     let worktrees = git_dir.parent()?;
     if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    // The repository must name this worktree back (`<git dir>/gitdir`, which
+    // Git writes and a sandboxed run of another repository cannot). The
+    // `.git` file alone is the Task's to rewrite, and would let it claim
+    // any repository's store.
+    let back = fs::read_to_string(git_dir.join("gitdir")).ok()?;
+    let back = Path::new(back.lines().next()?.trim());
+    let back = if back.is_absolute() {
+        back.to_path_buf()
+    } else {
+        git_dir.join(back)
+    };
+    if back.canonicalize().ok()? != dot_git.canonicalize().ok()? {
         return None;
     }
     let common = worktrees.parent()?;
@@ -498,7 +732,7 @@ fn prepare_store(cache_dir: &Path, dir: &Path, kind: WrapperKind) -> io::Result<
     }
     // Rewritten on every run start: the proof of write access, and the
     // record of which wrapper's layout the collector will find here.
-    fs::write(dir.join(MARKER_FILE), kind.as_str())
+    write_replacing(&dir.join(MARKER_FILE), kind.as_str(), false)
 }
 
 /// Make sure the sccache server of one repository store runs, started by
@@ -533,40 +767,34 @@ fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) 
         }
         let tmp = dir.join(SERVER_TMP_DIR);
         sandbox::create_private_dir(&tmp)?;
-        let mut child = std::process::Command::new(wrapper)
+        // The server outlives this process and compiles for every later run
+        // with the environment each compile sends it; it gets none of this
+        // process's own (which holds the server's credentials).
+        let mut start = std::process::Command::new(wrapper);
+        start
             .arg("--start-server")
+            .env_clear()
+            .envs(
+                ["PATH", "HOME"]
+                    .into_iter()
+                    .filter_map(|key| Some((key, std::env::var_os(key)?))),
+            )
             .env("SCCACHE_DIR", dir)
             .env("SCCACHE_CACHE_SIZE", size)
             .env("SCCACHE_SERVER_UDS", socket)
             .env("SCCACHE_IDLE_TIMEOUT", "0")
             .env("TMPDIR", &tmp)
-            .env_remove("TMP")
-            .env_remove("TEMP")
             .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        let deadline = Instant::now() + SERVER_START_TIMEOUT;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!(
-                        "--start-server exited with {status}"
-                    )))
-                };
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "--start-server did not return",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+            .stderr(std::process::Stdio::null());
+        let status = run_bounded(&mut start, SERVER_START_TIMEOUT)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "--start-server exited with {status}"
+            )))
         }
     }
     #[cfg(not(unix))]
@@ -606,19 +834,13 @@ fn write_sccache_launcher(wrapper: &Path, dir: &Path) -> io::Result<PathBuf> {
         "#!/bin/sh\n# Written by Forge. Runs the configured compiler-cache wrapper without the\n# per-Task target directory, which would otherwise be part of every cache key.\nunset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR\nexec '{program}' \"$@\"\n"
     );
     let launcher = dir.join(SCCACHE_LAUNCHER);
-    if fs::read_to_string(&launcher).is_ok_and(|current| current == script)
+    let current = fs::symlink_metadata(&launcher)
+        .is_ok_and(|metadata| metadata.file_type().is_file())
         && is_executable(&launcher)
-    {
-        return Ok(launcher);
+        && fs::read_to_string(&launcher).is_ok_and(|current| current == script);
+    if !current {
+        write_replacing(&launcher, &script, true)?;
     }
-    let staged = dir.join(format!(".{SCCACHE_LAUNCHER}.{}", std::process::id()));
-    fs::write(&staged, script)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
-    }
-    fs::rename(&staged, &launcher)?;
     Ok(launcher)
 }
 
@@ -793,7 +1015,7 @@ pub(crate) mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
+                "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
                 dir.join("calls").display()
             ),
         )
@@ -808,19 +1030,29 @@ pub(crate) mod tests {
         let worktree = root.join(task).join("repo");
         fs::create_dir_all(&worktree).unwrap();
         sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let admin = root
+            .join(".repos")
+            .join(repository)
+            .join("worktrees")
+            .join(task);
+        link_worktree(&worktree, &admin);
+        worktree
+    }
+
+    /// Make `worktree` a linked worktree of the repository `admin` belongs
+    /// to, as Git does: each names the other.
+    pub(crate) fn link_worktree(worktree: &Path, admin: &Path) {
+        fs::create_dir_all(admin).unwrap();
         fs::write(
             worktree.join(".git"),
-            format!(
-                "gitdir: {}\n",
-                root.join(".repos")
-                    .join(repository)
-                    .join("worktrees")
-                    .join(task)
-                    .display()
-            ),
+            format!("gitdir: {}\n", admin.display()),
         )
         .unwrap();
-        worktree
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
     }
 
     pub(crate) fn cache(root: &Path, wrapper: &Path) -> CompilerCache {
@@ -839,9 +1071,10 @@ pub(crate) mod tests {
     #[test]
     fn wrapper_resolves_from_an_absolute_path_or_path_and_is_off_otherwise() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
+        let base = dir.path().canonicalize().unwrap();
+        let bin = base.join("bin");
         let wrapper = fake_wrapper(&bin, "sccache");
-        let root = dir.path().join("root");
+        let root = base.join("root");
         let path_var = Some(bin.clone().into_os_string());
 
         assert_eq!(
@@ -879,6 +1112,36 @@ pub(crate) mod tests {
             CompilerCache::resolve(&config(bin.join("plain").to_str().unwrap()), &root, None),
             None
         );
+        // A known wrapper that does not run, or never returns, is off before
+        // any run is handed it. A program Forge does not know is not probed.
+        use std::os::unix::fs::PermissionsExt;
+        for (name, body) in [
+            ("broken/kache", "#!/bin/sh\nexit 1\n"),
+            ("hung/sccache", "#!/bin/sh\nexec sleep 600\n"),
+            ("other/cachepot", "#!/bin/sh\nexit 1\n"),
+        ] {
+            let program = base.join(name);
+            fs::create_dir_all(program.parent().unwrap()).unwrap();
+            fs::write(&program, body).unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            let started = Instant::now();
+            let resolved = CompilerCache::resolve(&config(program.to_str().unwrap()), &root, None);
+            assert_eq!(resolved.is_some(), name == "other/cachepot", "{name}");
+            assert!(started.elapsed() < PROBE_TIMEOUT + Duration::from_secs(5));
+        }
+        // A cache directory given through a link is collected at its real
+        // path (the collector never walks a link).
+        fs::create_dir_all(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let linked = config::CompilerCacheConfig::default().overridden(
+            Some(wrapper.to_str().unwrap().to_owned()),
+            None,
+            Some(base.join("link").join("cache")),
+        );
+        assert_eq!(
+            CompilerCache::resolve(&linked, &root, None).unwrap().dir,
+            base.join("real").join("cache")
+        );
 
         let custom = config::CompilerCacheConfig::default().overridden(
             Some(wrapper.to_str().unwrap().to_owned()),
@@ -886,10 +1149,35 @@ pub(crate) mod tests {
             Some(dir.path().join("elsewhere")),
         );
         let custom = CompilerCache::resolve(&custom, &root, None).unwrap();
-        assert_eq!(
-            (custom.dir, custom.max_bytes),
-            (dir.path().join("elsewhere"), 99)
-        );
+        assert_eq!((custom.dir, custom.max_bytes), (base.join("elsewhere"), 99));
+    }
+
+    /// A server whose own environment names a wrapper (this is common: a
+    /// global `export RUSTC_WRAPPER=...`) hands that to every run already.
+    /// The setting is then off, not half on; an empty value names nothing.
+    #[test]
+    fn a_process_that_already_names_a_wrapper_gets_no_shared_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let wrapper = fake_wrapper(&base.join("bin"), "kache");
+        let root = base.join("root");
+        let config = config(wrapper.to_str().unwrap());
+        let with = |key: &'static str, value: &'static str| {
+            configured(&config, &root, move |name| {
+                (name == key).then(|| OsString::from(value))
+            })
+        };
+        assert!(with("UNRELATED", "x").is_some());
+        assert!(with("RUSTC_WRAPPER", "").is_some());
+        assert_eq!(with("RUSTC_WRAPPER", "kache"), None);
+        assert_eq!(with("CARGO_BUILD_RUSTC_WRAPPER", "/usr/bin/sccache"), None);
+        // A bare name is found on the PATH of that same environment.
+        let by_name = self::config("kache");
+        let path = base.join("bin").into_os_string();
+        let found = configured(&by_name, &root, |name| {
+            (name == "PATH").then(|| path.clone())
+        });
+        assert_eq!(found.unwrap().wrapper, wrapper);
     }
 
     #[test]
@@ -991,15 +1279,31 @@ pub(crate) mod tests {
         let worktree = linked_worktree(root, "t1", "3f2b0c1e-repo");
         assert_eq!(repository_id(&worktree).as_deref(), Some("3f2b0c1e-repo"));
 
-        // A repository that is a checkout: named after it, with its path.
+        // The `.git` file is the Task's to rewrite: naming another
+        // repository that does not name this worktree back claims nothing.
+        let other = linked_worktree(root, "t2", "other-repo");
+        assert_eq!(repository_id(&other).as_deref(), Some("other-repo"));
         fs::write(
             worktree.join(".git"),
             format!(
                 "gitdir: {}\n",
-                root.join("my app/.git/worktrees/t1").display()
+                root.join(".repos/other-repo/worktrees/t2").display()
             ),
         )
         .unwrap();
+        assert_eq!(repository_id(&worktree), None);
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".repos/other-repo/worktrees/none").display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(repository_id(&worktree), None);
+
+        // A repository that is a checkout: named after it, with its path.
+        link_worktree(&worktree, &root.join("my app/.git/worktrees/t1"));
         let id = repository_id(&worktree).unwrap();
         assert!(
             id.starts_with("my_app-") && id.len() == "my_app-".len() + 8,
@@ -1044,6 +1348,17 @@ pub(crate) mod tests {
         assert!(!dir.path().join(MARKER_FILE).exists());
         fs::remove_file(kache.dir.join("repo-a")).unwrap();
         assert!(kache.for_worktree(&worktree).is_some());
+        // A run left a link where the marker goes: replaced, never written
+        // through.
+        let marker = kache.dir.join("repo-a").join(MARKER_FILE);
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        assert!(kache.for_worktree(&worktree).is_some());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(fs::symlink_metadata(&marker).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "kache");
 
         // The wrapper went away after start.
         fs::remove_file(&wrapper).unwrap();
@@ -1072,6 +1387,14 @@ pub(crate) mod tests {
             assert_eq!(cache(&root, &failing).for_worktree(&worktree), None);
         }
         assert_eq!(warnings_logged(), logged);
+        // After a few failed starts in a row runs stop trying for a while:
+        // a server that hangs at start costs a bounded number of waits.
+        let store = root.join(CACHE_DIR).join("repo-a");
+        assert!(server_start_given_up(&store));
+        fs::write(&failing, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(cache(&root, &failing).for_worktree(&worktree), None);
+        note_server_start(&store, true);
+        assert!(!server_start_given_up(&store));
     }
 
     #[test]
@@ -1087,15 +1410,34 @@ pub(crate) mod tests {
         assert_eq!(for_task_roots(&server).unwrap().dir, server.join(CACHE_DIR));
         assert_eq!(for_task_roots(&daemon), None);
         assert_eq!(for_task_roots(&daemon.join(DAEMON_TASK_ROOTS)), None);
-        assert_eq!(store_of(&daemon), (daemon.join(CACHE_DIR), 0));
+        // Nothing installed and nothing left behind: nothing to collect.
+        assert_eq!(collected(&daemon), None);
 
         install(&daemon, Some(cache(&daemon, &wrapper)));
         assert_eq!(
             for_task_roots(&daemon.join(DAEMON_TASK_ROOTS)).unwrap().dir,
             daemon.join(CACHE_DIR)
         );
-        assert_eq!(store_of(&daemon), (daemon.join(CACHE_DIR), (3 << 20) / 2));
+        assert_eq!(
+            collected(&daemon),
+            Some(Collected {
+                dir: daemon.join(CACHE_DIR),
+                keep_under_floor: (3 << 20) / 2,
+                cap: Some(3 << 20),
+            })
+        );
         install(&daemon, None);
+        // Turned off with a cache left behind: collected under the floor
+        // only, down to nothing.
+        fs::create_dir_all(daemon.join(CACHE_DIR)).unwrap();
+        assert_eq!(
+            collected(&daemon),
+            Some(Collected {
+                dir: daemon.join(CACHE_DIR),
+                keep_under_floor: 0,
+                cap: None,
+            })
+        );
         assert_eq!(for_task_roots(&daemon.join(DAEMON_TASK_ROOTS)), None);
         install(&server, None);
     }

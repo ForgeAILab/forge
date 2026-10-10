@@ -2084,11 +2084,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Off unless a wrapper is configured; Forge installs nothing. A Project
   environment `RUSTC_WRAPPER` wins (an empty value turns the wrapper off for
   that Project), then a value on the command, then the operator's own
-  environment. A wrapper or cache directory that cannot be used never fails
+  environment; when any of them carries `RUSTC_WRAPPER`,
+  `CARGO_BUILD_RUSTC_WRAPPER` or one of the wrapper's own variables, Forge
+  sets none of its own. A store is shared by the Tasks of one repository on
+  one machine and by nothing else. A wrapper or cache directory that cannot be used never fails
   a run: the run builds without it and the server logs one warning. While a
   disk is under its free-space floor the garbage collector deletes least
   recently used cache entries, down to half of `max_bytes`, before it takes
-  any Task's build output. Machine disk facts gain `compiler_cache_bytes`.
+  any Task's build output; on every pass it also holds all stores of the
+  machine together to `max_bytes`. Machine disk facts gain `compiler_cache_bytes`.
   See `docs/getting-started.md` for what each wrapper is given, and for the
   two things Forge does for `sccache` (it starts one server per repository
   store, and hands runs a launcher that drops `CARGO_TARGET_DIR` from the

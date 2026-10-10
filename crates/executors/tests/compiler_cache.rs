@@ -409,5 +409,16 @@ fn kache_shares_a_build_between_two_task_worktrees() {
         local_hits() >= 1,
         "the second Task hit the first Task's entries"
     );
+    // What the collector does to a store no run is using: entry files
+    // deleted behind kache's index. The next build must still succeed.
+    let done = compiler_cache::evict(
+        &cache_dir,
+        0,
+        false,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        || false,
+    );
+    assert!(done.files_removed > 0, "{done:?}");
+    cargo_build(&root, &repo, "task-c", &store);
     compiler_cache::install(&root, None);
 }

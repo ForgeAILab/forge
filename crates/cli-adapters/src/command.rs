@@ -470,6 +470,14 @@ mod run_budget_tests {
             format!("gitdir: {}\n", root.join(".repos/r1/worktrees/t").display()),
         )
         .unwrap();
+        // The repository names the worktree back, as Git does; without it the
+        // worktree's own `.git` file claims nothing.
+        std::fs::create_dir_all(root.join(".repos/r1/worktrees/t")).unwrap();
+        std::fs::write(
+            root.join(".repos/r1/worktrees/t/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
         let wrapper = temp.path().join("kache");
         std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();

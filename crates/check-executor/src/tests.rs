@@ -718,6 +718,46 @@ async fn the_environment_probe_survives_a_noisy_profile_and_a_clobbered_exit_cod
     std::fs::write(home.path().join(".bash_profile"), "exit 0\n").unwrap();
     assert!(probe_environment(Some(home.path())).await.is_none());
 }
+/// Plan 3.4 F: a compiler wrapper the operator's own login environment
+/// names is inherited environment and stays in the identity, by value.
+/// (Forge's own `RUSTC_WRAPPER` is set on a run's command and is never in
+/// the login shell this probe reads.) Whatever this test process itself
+/// inherits, the profile decides.
+#[tokio::test]
+async fn an_operator_set_compiler_wrapper_is_part_of_the_environment_identity() {
+    for key in [
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "SCCACHE_DIR",
+        "KACHE_CACHE_DIR",
+    ] {
+        assert!(!ENVIRONMENT_IDENTITY_DENYLIST.contains(&key), "{key}");
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut seen = Vec::new();
+    for profile in [
+        "export RUSTC_WRAPPER=/operator/sccache\n",
+        "export RUSTC_WRAPPER=/operator/kache\n",
+        "unset RUSTC_WRAPPER\n",
+    ] {
+        std::fs::write(home.path().join(".bash_profile"), profile).unwrap();
+        let inherited = probe_environment(Some(home.path())).await.unwrap();
+        seen.push(
+            inherited
+                .identity_values()
+                .get("RUSTC_WRAPPER")
+                .map(|value| (*value).to_owned()),
+        );
+    }
+    assert_eq!(
+        seen,
+        [
+            Some("/operator/sccache".to_owned()),
+            Some("/operator/kache".to_owned()),
+            None
+        ]
+    );
+}
 #[tokio::test]
 async fn a_canonical_witness_reports_a_dirty_start_a_tracked_change_and_a_moved_head() {
     // Untracked work the commit does not contain: not a clean checkout.
@@ -901,6 +941,14 @@ async fn check_in_a_task_worktree_gets_the_shared_compiler_cache() {
     std::fs::write(
         worktree.join(".git"),
         format!("gitdir: {}\n", root.join(".repos/r1/worktrees/t").display()),
+    )
+    .unwrap();
+    // The repository names the worktree back, as Git does; without it the
+    // worktree's own `.git` file claims nothing.
+    std::fs::create_dir_all(root.join(".repos/r1/worktrees/t")).unwrap();
+    std::fs::write(
+        root.join(".repos/r1/worktrees/t/gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
     )
     .unwrap();
     let wrapper = temp.path().join("kache");
