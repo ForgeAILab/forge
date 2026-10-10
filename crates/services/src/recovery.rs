@@ -4712,7 +4712,6 @@ pub(crate) mod tests {
         }
         let task_root = worktrees[0].parent().unwrap();
         executors::sandbox::TaskRoot::reserve(task_root).expect("Task root reserves");
-        let tmp = task_root.join(".forge-task/tmp");
         // A hook running right now, in this process, however old its directory looks.
         let hook = executors::sandbox::SandboxEnv::for_command(
             &worktrees[0],
@@ -4723,7 +4722,10 @@ pub(crate) mod tests {
             .tmp_dir()
             .expect("hook has a temp dir")
             .to_path_buf();
-        assert_eq!(hook_tmp.parent(), Some(tmp.as_path()));
+        // In the Task root, or in the short directory beside it when the
+        // test's temp path is long: the sweep covers both.
+        let tmp = hook_tmp.parent().expect("temp parent").to_path_buf();
+        assert!(tmp.starts_with(root.path()));
         backdate(&hook_tmp);
         // What the previous process left, and what something made since.
         let (dead, recent) = (tmp.join("deadrun"), tmp.join("recentrun"));

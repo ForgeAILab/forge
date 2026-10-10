@@ -24,7 +24,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `<task root>/.forge-task/home/gemini`.
 - **A repository named `.forge-task` cannot have a Task workspace.** Creating
   its worktree fails with `repository name ".forge-task" is reserved by
-  Forge; rename the repository`.
+  Forge; rename the repository`. A Task root that already holds `.forge-task`
+  as a link or a file is refused as well.
+- **Rust build output of a Task moved out of the worktree (3.4 stage C part
+  1).** Runs in a Task worktree get
+  `CARGO_TARGET_DIR=<task root>/.forge-task/build/cargo`, so `target/` no
+  longer appears in the worktree and scripts that read `./target/...` must
+  use `$CARGO_TARGET_DIR`. A value from the Project environment, the Agent
+  profile or the server's own environment still wins; an empty Project value
+  keeps building in the worktree. Runs whose own sandbox cannot write the
+  directory (a Codex execution that is not a managed Task, Gemini with
+  `--sandbox`) are unchanged.
 
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
@@ -833,8 +843,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the Project environment to choose another directory, or to an empty value
   to keep building in the worktree. `HOME` and shared toolchain caches are
   unchanged. Workspaces whose recorded path is not
-  `<workspace root>/<task_id>/<name>` keep the previous behaviour.
-
+  `<workspace root>/<task_id>/<name>` keep the previous behaviour. Leftovers
+  of a crashed process are removed at the next start, never the directory of
+  a run that is still going. A run is never given a directory it cannot
+  write or one that is a link: it keeps the inherited one instead.
 - **Integration queue worker, not started yet (3.2 stage D, part 1d).** The
   server has the worker that will drive the per-branch merge queue (rebase,
   check, fast-forward, takeover after a crash), but nothing starts it:

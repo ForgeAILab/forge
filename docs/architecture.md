@@ -3315,10 +3315,39 @@ field.
   is the usual place.
 - A run that died with its process leaves its directory behind. Crash
   recovery removes the directory of every execution it settles; at startup
-  the server (in crash recovery, for every ready server placement) and the
-  daemon remove every per-run directory that does not belong to an execution
-  still recorded as running. Nothing Forge reads after a run (outbox, plan,
-  evidence, logs) lives in the per-run directory.
+  the server (in crash recovery, for every ready server placement of the
+  managed shape) and the daemon sweep the rest
+  (`executors::sandbox::sweep_dead_runs`). Hooks, checks, tool commands and
+  probes are in no table, so the sweep is safe by construction, not by
+  ordering: it removes a directory only when this process did not create it
+  (an in-process registry of unsettled runs), it was last modified before
+  this process started, and its key belongs to no execution still recorded
+  as running. A sweep failure is logged and never stops recovery. Nothing
+  Forge reads after a run (outbox, plan, evidence, logs) lives in the
+  per-run directory.
+- Links are never followed. `.forge-task` that exists as a link or a file
+  makes worktree creation fail and is never a reserved root; a linked or
+  non-directory `.forge-task/tmp`, `.forge-tmp`, `.forge-task/home` or
+  `.forge-task/build` is not created through, removed through or handed to a
+  run (the run keeps the inherited temp directory, the previous home
+  location, and builds in the worktree); a linked Task-root entry is skipped
+  by the sweep.
+- A CLI that confines its own writes is handed only what it can write
+  (`cli_adapters::command::run_in_task_worktree_with`). A managed Codex Task
+  (workspace-write) gets the per-run directory and `.forge-task/build` as
+  writable roots, each only when it resolves where the Task root says, and
+  the build root only when the child really uses that `CARGO_TARGET_DIR`;
+  a Codex execution under `yolo` has no sandbox and gets everything; a Codex
+  execution that is not a managed Task uses the operator's own sandbox
+  configuration and gets nothing. Gemini launched with `--sandbox` (or
+  `GEMINI_SANDBOX`) gets nothing. Claude, Cursor, OpenCode, Smith, the shell
+  executor, the native command tool, hooks and checks run unsandboxed.
+- One build directory per Task root is shared by the coder, hooks and
+  in-worktree checks. Cargo serialises concurrent users with its own
+  build-directory lock, and its fingerprints (source content and mtime,
+  profile, flags, package path) decide what is rebuilt, so output left by
+  another commit can make a check slower or faster but cannot change its
+  result.
 - `CARGO_TARGET_DIR` is set to `<task root>/.forge-task/build/cargo` from
   `executors::sandbox::BUILD_DIR_TABLE` (Rust only). Precedence: Project
   environment, then a value the command already carries, then the operator's
@@ -3332,7 +3361,9 @@ field.
   On first use after an upgrade the server-side per-Task home is moved from
   `<root>/.forge/logs/<project>/<task>/.codex-managed-home` into the Task
   root, so a resumed Task keeps its Codex sessions; the old shared daemon
-  home is left where it is and a fresh home is created.
+  home is left where it is and a fresh home is created. The move is one
+  rename and deletes nothing: a stray Codex process still holding the old
+  home keeps writing the files it has open, which are now in the new home.
 - Lifecycle hooks that run outside an execution log to
   `<workspace root>/.forge/logs/<project_id>/<task_id>/hooks/`.
 
