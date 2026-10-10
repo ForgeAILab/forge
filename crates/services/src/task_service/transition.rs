@@ -895,6 +895,20 @@ impl TaskService {
             },
         )
         .await?;
+        // A deleted Task never runs again: its directories are reclaimed on
+        // the next cleanup tick, after anything still running has stopped.
+        if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+            if let Some(workspace) =
+                db::WorkspaceRepo::get_by_task_id(&*self.db, &deleted.id).await?
+            {
+                if let Err(error) = scheduler
+                    .schedule(&workspace.id, std::time::Duration::ZERO)
+                    .await
+                {
+                    tracing::warn!(task_id = %deleted.id, %error, "cleanup of a deleted Task not scheduled");
+                }
+            }
+        }
 
         self.publish(ForgeEvent {
             event_type: "task.deleted".to_owned(),

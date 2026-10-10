@@ -182,13 +182,17 @@ impl DaemonWorkspaceBackend {
         }
         let mut state: WorkspaceRegistry = journal.load_workspace_state()?;
         let gc_lock = gc::adopt_root(&workspace_root, &mut state, &journal);
-        // No run survives a daemon restart, so every per-run temp directory
-        // left under an owned Task root belongs to a dead run. That holds
-        // only for the one daemon on this root: another process that shares
-        // it has runs of its own, so only the holder of the root lock sweeps.
+        // A run this daemon left detached can outlive its restart, so a
+        // per-run temp directory goes only once it is older than the longest
+        // run. Another process that shares the root has runs of its own, so
+        // only the holder of the root lock sweeps.
         if gc_lock.is_some() {
-            let swept =
-                executors::sandbox::sweep_dead_runs(&workspace_root.join(WORKTREE_DIRECTORY), []);
+            let swept = executors::sandbox::sweep_stale_runs(
+                &workspace_root.join(WORKTREE_DIRECTORY),
+                [],
+                std::time::SystemTime::now(),
+                executors::gc::MAX_RUN_AGE,
+            );
             if swept > 0 {
                 tracing::info!(
                     swept,

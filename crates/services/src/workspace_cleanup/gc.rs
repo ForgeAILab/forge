@@ -32,6 +32,9 @@ const EVICTION_CANDIDATES: i64 = 256;
 
 /// Legacy hook-log directories looked at per pass.
 const LEGACY_LOG_DIRS: usize = 256;
+/// Time one Task's expired logs may take to remove; what is left goes on
+/// the next sweep.
+const LOG_REMOVAL_BUDGET: Duration = Duration::from_secs(10);
 const OWNER_KEY: &str = "workspace_gc_owner_id";
 /// What the last ownership check found, for operator status.
 pub const STATUS_KEY: &str = "workspace_gc_status";
@@ -232,6 +235,12 @@ impl WorkspaceCleanupScheduler {
         if terminal_since + chrono::Duration::days(i64::from(days)) > chrono::Utc::now() {
             return;
         }
+        // Somebody is still looking at this Task: an open review reads its
+        // logs, and an open attention item points a person at them. An
+        // unreadable answer keeps the logs too.
+        if !matches!(self.task_logs_unreferenced(&task.id).await, Ok(true)) {
+            return;
+        }
         let Ok(root) = std::fs::canonicalize(&self.workspace_root) else {
             return;
         };
@@ -245,7 +254,7 @@ impl WorkspaceCleanupScheduler {
             .join("logs")
             .join(&task.project_id)
             .join(&task.id);
-        let sweep = Sweep::new(&root, &root, is_task_id, Duration::ZERO);
+        let sweep = Sweep::new(&root, &root, is_task_id, LOG_REMOVAL_BUDGET);
         let quiet = Duration::from_secs(u64::from(days) * 24 * 60 * 60);
         let report = blocking(move || {
             let mut report = GcReport::default();
@@ -261,6 +270,27 @@ impl WorkspaceCleanupScheduler {
         if report.removed > 0 {
             tracing::info!(task_id = %task.id, days, "logs of a terminal Task removed after their retention");
         }
+    }
+
+    /// No review of the Task is open (running or waiting for a person) and
+    /// no attention item about it is unresolved.
+    async fn task_logs_unreferenced(&self, task_id: &str) -> Result<bool> {
+        let referenced = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM review
+                WHERE task_id = ?1 AND status IN ('running', 'awaiting_human')
+             ) OR EXISTS (
+                SELECT 1 FROM attention_projection
+                WHERE status <> 'resolved'
+                  AND ((scope_type = 'task' AND scope_id = ?1)
+                       OR json_extract(details_json, '$.task_id') = ?1
+                       OR json_extract(details_json, '$.task.id') = ?1)
+             )",
+        )
+        .bind(task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        Ok(referenced == 0)
     }
 
     pub(super) async fn gc_pass(&self, cursor: &mut SweepCursor, budget: Duration) -> GcReport {
@@ -537,7 +567,12 @@ impl WorkspaceCleanupScheduler {
         })
     }
 
+    /// Terminal by its workflow state, or deleted: a deleted Task never runs
+    /// again, whatever state it was deleted in.
     async fn task_is_terminal(&self, task: &db::Task) -> Result<bool> {
+        if task.deleted_at.is_some() {
+            return Ok(true);
+        }
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(false);
         };
@@ -660,19 +695,24 @@ impl WorkspaceCleanupScheduler {
         (ours && is_task_id(name)).then(|| name.to_owned())
     }
 
+    /// Evict build output, least recently used first, while the root is
+    /// under its floor. Each Task is decided and evicted under its lifecycle
+    /// lock, after reading its state again: what the candidate list said is
+    /// stale by the time its turn comes. The eviction itself is one rename
+    /// made under the lock every run start takes
+    /// ([`Sweep::evict_build`]); the delete happens after both are released.
     async fn gc_evict_builds(
         &self,
         sweep: &Sweep,
         floor: &FreeFloor,
         report: &mut GcReport,
     ) -> Result<()> {
-        let (root, floor, disk_space) = (sweep.root.clone(), *floor, sweep.disk_space);
-        let under_floor = blocking(move || {
-            disk_space(&root).is_some_and(|space| space.free < floor.bytes(space.total))
-        })
-        .await
-        .unwrap_or(false);
-        if !under_floor {
+        let (pass, floor) = (sweep.clone(), *floor);
+        let under_floor = {
+            let pass = pass.clone();
+            move || pass.under_floor(&floor)
+        };
+        if !blocking(under_floor.clone()).await.unwrap_or(false) {
             return Ok(());
         }
         let rows = sqlx::query_as::<_, (String, String)>(
@@ -682,30 +722,72 @@ impl WorkspaceCleanupScheduler {
         .bind(EVICTION_CANDIDATES)
         .fetch_all(self.db.pool())
         .await?;
-        let mut candidates = Vec::new();
+        let mut tasks = HashMap::new();
         for (task_id, worktree_path) in rows {
-            let Some(name) = self.task_root_name(&worktree_path) else {
+            if let Some(name) = self.task_root_name(&worktree_path) {
+                tasks.insert(name, task_id);
+            }
+        }
+        let names: Vec<String> = tasks.keys().cloned().collect();
+        let ordered = {
+            let pass = pass.clone();
+            blocking(move || pass.builds_by_last_use(&names))
+                .await
+                .unwrap_or_default()
+        };
+        for name in ordered {
+            if std::time::Instant::now() >= sweep.deadline {
+                report.out_of_time = true;
+                break;
+            }
+            let Some(task_id) = tasks.get(&name) else {
                 continue;
             };
-            let Some(task) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? else {
+            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
+                continue;
+            };
+            let guard = self.lock_task(&task).await;
+            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
                 continue;
             };
             // A terminal Task's build output goes with its Task root; a busy
             // Task keeps what it is building with.
-            if self.task_is_terminal(&task).await? || self.task_is_active(&task_id).await? {
+            if self.task_is_terminal(&task).await? || self.task_is_active(task_id).await? {
                 continue;
             }
-            candidates.push(name);
+            let evicted = {
+                let (pass, name) = (pass.clone(), name.clone());
+                blocking(move || {
+                    let mut report = GcReport::default();
+                    pass.evict_build(&name, &mut report);
+                    report
+                })
+                .await
+                .unwrap_or_default()
+            };
+            drop(guard);
+            report.merge(&evicted);
+            if evicted.builds_evicted == 0 {
+                continue;
+            }
+            // Space comes back only when the trash is emptied.
+            let emptied = {
+                let pass = pass.clone();
+                blocking(move || {
+                    let mut report = GcReport::default();
+                    pass.empty_trash(&mut report);
+                    // The build output itself is counted as an eviction.
+                    report.removed = report.removed.saturating_sub(1);
+                    report
+                })
+                .await
+                .unwrap_or_default()
+            };
+            report.merge(&emptied);
+            if !blocking(under_floor.clone()).await.unwrap_or(false) {
+                break;
+            }
         }
-        let pass = sweep.clone();
-        let done = blocking(move || {
-            let mut report = GcReport::default();
-            pass.evict_builds(&candidates, &floor, &mut report);
-            report
-        })
-        .await
-        .unwrap_or_default();
-        report.merge(&done);
         Ok(())
     }
 

@@ -573,7 +573,12 @@ impl WorkspaceCleanupScheduler {
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
+        // A deleted Task never runs again, whatever state it was deleted in:
+        // its directories are reclaimed like a terminal Task's. Deletion
+        // itself stops nothing, so a run still in flight is waited for below
+        // exactly as for a terminal Task.
         if terminal_only
+            && task.deleted_at.is_none()
             && workflow.state_kind(&task.status) != Some(api_types::StateKind::Terminal)
         {
             return self.clear_cleanup_after(task_id).await;
@@ -648,10 +653,10 @@ impl WorkspaceCleanupScheduler {
         }
         let cleanup_result = if let Some(workspace) = workspace {
             let children = TaskRepo::list_subtasks_ordered(&*self.db, task_id).await?;
-            if children
-                .iter()
-                .any(|child| !crate::task_hierarchy::subtask_is_terminal(child, &workflow))
-            {
+            if children.iter().any(|child| {
+                child.deleted_at.is_none()
+                    && !crate::task_hierarchy::subtask_is_terminal(child, &workflow)
+            }) {
                 return Ok(());
             }
             let router = self.workspace_backend_router()?;
@@ -3542,6 +3547,241 @@ mod tests {
         assert!(logs_dir(&root, &tasks[2]).join("execution.jsonl").exists());
         assert!(logs_dir(&root, &recent).join("execution.jsonl").exists());
         assert!(logs_dir(&root, &skewed).join("execution.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn gc_eviction_takes_the_task_lifecycle_lock_and_reads_the_task_again() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let task = set_fixture_status(&db, &task, "todo").await;
+        let task_root = worktree_path.parent().unwrap().to_path_buf();
+        executors::sandbox::TaskRoot::reserve(&task_root).unwrap();
+        let marker = task_root.join(".forge-task/build/cargo/marker");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "x").unwrap();
+        let scheduler = Arc::new(gc_scheduler(&db, &root).await);
+        scheduler.set_gc_limits(
+            30,
+            executors::gc::FreeFloor {
+                min_free_bytes: u64::MAX,
+                min_free_percent: 0,
+            },
+        );
+
+        // The pass saw an idle Task. Something holds the Task's lifecycle
+        // lock; a run starts before the pass gets its turn.
+        let guard = scheduler.lock_task(&task).await;
+        let pass = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            async move { gc_at(&scheduler, Duration::ZERO).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!pass.is_finished(), "eviction waits for the lifecycle lock");
+        assert!(marker.exists());
+        let run =
+            fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
+        drop(guard);
+        let report = pass.await.unwrap();
+        assert_eq!((report.builds_evicted, report.errors), (0, 0));
+        assert!(marker.exists(), "the run that started keeps its build output");
+
+        // Once the run is over the same Task is evicted.
+        sqlx::query("UPDATE execution SET status = 'failed' WHERE id = ?")
+            .bind(&run.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let report = gc_at(&scheduler, Duration::ZERO).await;
+        assert_eq!((report.builds_evicted, report.errors), (1, 0));
+        assert!(!marker.exists());
+        assert!(worktree_path.exists(), "only the build output goes");
+    }
+
+    #[tokio::test]
+    async fn deleted_task_is_reclaimed_like_a_terminal_one_once_its_run_has_stopped() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let task = set_fixture_status(&db, &task, "todo").await;
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        let status = || async {
+            WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        };
+
+        // Not terminal and not deleted: untouched.
+        scheduler.cleanup_terminal_task(&task.id).await.unwrap();
+        assert!(worktree_path.exists());
+        assert_eq!(status().await, WorkspaceStatus::Ready);
+
+        // Deleting stops nothing by itself: a run still in flight keeps the
+        // directory until it has stopped.
+        let run =
+            fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
+        let now = now_rfc3339();
+        TaskRepo::soft_delete(
+            &*db,
+            db::SoftDeleteTask {
+                id: task.id.clone(),
+                expected_version: task.version,
+                deleted_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Task is deleted");
+        scheduler.cleanup_terminal_task(&task.id).await.unwrap();
+        assert!(worktree_path.exists(), "a running execution defers cleanup");
+        assert_eq!(status().await, WorkspaceStatus::Ready);
+
+        // The run stops; the deferred cleanup comes due.
+        sqlx::query("UPDATE execution SET status = 'cancelled' WHERE id = ?")
+            .bind(&run.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace SET cleanup_after = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(&workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        scheduler.tick().await.unwrap();
+        assert!(!worktree_path.exists());
+        assert_eq!(status().await, WorkspaceStatus::Cleaned);
+    }
+
+    #[tokio::test]
+    async fn log_retention_skips_a_task_with_an_open_review_or_attention_item() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
+        let base = fixture_task(&db, &workspace_id).await;
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let task = seed_log_only_task(&db, &root, &base, new_uuid_v4(), None, "done").await;
+            sqlx::query("UPDATE task SET updated_at = ? WHERE id = ?")
+                .bind((chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339())
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            tasks.push(task);
+        }
+        let (reviewed, flagged, plain) = (&tasks[0], &tasks[1], &tasks[2]);
+        // A review a person has not decided yet.
+        let execution =
+            fixture_execution(&db, reviewed, &workspace_id, db::ExecutionStatus::Completed).await;
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO review (id, task_id, execution_id, attempt_number, status, step_results_json, started_at, created_at, updated_at) VALUES (?, ?, ?, 1, 'awaiting_human', '[]', ?, ?, ?)")
+            .bind(new_uuid_v4())
+            .bind(&reviewed.id)
+            .bind(&execution.id)
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // An attention item that points a person at the Task.
+        let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+        let event = db::DomainEventRepo::append_event_in_tx(
+            &*db,
+            &mut transaction,
+            &db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.needs_attention".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: flagged.id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "project".to_owned(),
+                scope_id: flagged.project_id.clone(),
+                correlation_id: flagged.id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        db.insert_attention_in_tx(
+            &mut transaction,
+            db::CreateAttentionProjection {
+                id: new_uuid_v4(),
+                attention_type: "progress_warning".to_owned(),
+                scope_type: "project".to_owned(),
+                scope_id: flagged.project_id.clone(),
+                identity_id: None,
+                source_event_id: event.id,
+                priority: 60,
+                status: "open".to_owned(),
+                summary: "look at this Task".to_owned(),
+                details_json: serde_json::json!({"task": {"id": flagged.id}}).to_string(),
+                dedupe_key: format!("test:{}", flagged.id),
+                occurred_at: now.clone(),
+                updated_at: now.clone(),
+                acknowledged_at: None,
+                snoozed_until: None,
+                resolved_at: None,
+                updated_by_user_id: None,
+                recommended_action: "inspect".to_owned(),
+                source_sequence: Some(event.sequence),
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let scheduler = gc_scheduler(&db, &root).await;
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::default());
+        let age = |tasks: &[db::Task]| {
+            for task in tasks {
+                if logs_dir(&root, task).exists() {
+                    backdate(&logs_dir(&root, task), 60);
+                }
+            }
+        };
+        // The first sweep removes the legacy agent home from each log
+        // directory, which is a write to it: age them, then sweep again.
+        scheduler.sweep().await.unwrap();
+        age(&tasks);
+        scheduler.sweep().await.unwrap();
+        assert!(!logs_dir(&root, plain).exists());
+        assert!(logs_dir(&root, reviewed).join("execution.jsonl").exists());
+        assert!(logs_dir(&root, flagged).join("execution.jsonl").exists());
+
+        // Decided and resolved: both are ordinary old logs now.
+        sqlx::query("UPDATE review SET status = 'passed' WHERE task_id = ?")
+            .bind(&reviewed.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE attention_projection SET status = 'resolved' WHERE dedupe_key = ?")
+            .bind(format!("test:{}", flagged.id))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        age(&tasks);
+        scheduler.sweep().await.unwrap();
+        assert!(!logs_dir(&root, reviewed).exists());
+        assert!(!logs_dir(&root, flagged).exists());
     }
 
     #[cfg(unix)]
