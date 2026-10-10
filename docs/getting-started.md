@@ -443,11 +443,28 @@ Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
 root's filesystem has less free space than the floor, the periodic sweep
 deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
 least recently used first; those Tasks rebuild on their next run. Running work
-is never touched. The three keys are read from the file only and take effect
-on restart. Give every server its own workspace root: the first database to
-sweep a root claims it, and any other server leaves that root unswept (see
+is never touched. `FORGE_WORKSPACE_LOG_RETENTION_DAYS`,
+`FORGE_WORKSPACE_MIN_FREE_BYTES` and `FORGE_WORKSPACE_MIN_FREE_PERCENT`
+override the file values; all three take effect on restart. A daemon uses the
+default floor. No key turns garbage collection off.
+
+Garbage collection runs only on a workspace root this server's database owns.
+The server adopts its root at start-up by writing `.forge/gc/owner` under it,
+and refuses a root that is the home directory or a parent of it, a git
+repository, a top-level directory or a symbolic link. Give every server its
+own workspace root: a second database on the same root leaves it unswept.
+After a database reset the root still names the old database, nothing is
+reclaimed and the disk can fill; the server log and operator status (the
+Operations page) say so. To take the root over, stop Forge and start it once
+with:
+
+```bash
+forge --reclaim-workspace-gc
+```
+
+Task directories the old database knew and the new one does not are then
+moved to `.forge/gc/` after a day and deleted a day later (see
 [Workspace garbage collection](architecture.md#workspace-garbage-collection)).
-A daemon uses the default floor.
 
 `workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
 placement, or a server-owned workspace executed on a remote daemon, waits for

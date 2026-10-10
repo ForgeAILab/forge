@@ -3495,7 +3495,14 @@ an item in a project the caller cannot access.
 
 ## Operator status
 
-`GET /api/v1/operations/status` requires an administrator. The existing execution,
+`GET /api/v1/operations/status` requires an administrator. While workspace
+garbage collection is off for the server's workspace root (the root is owned
+by another database, as after a database reset, or cannot be a workspace
+root), `recent_errors` carries one entry with `entity_type` `workspace_gc`,
+`entity_id` the root path and severity `attention`; it goes away when the
+root is owned (`forge --reclaim-workspace-gc`). No response field changed.
+
+The existing execution,
 capacity, cleanup, retry, usage, and error summaries now also include:
 
 | Field | Meaning |

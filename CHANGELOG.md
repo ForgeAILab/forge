@@ -11,25 +11,40 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **Logs of terminal Tasks are deleted after 30 days (3.4 stage D).** The
   directory `<workspace root>/.forge/logs/<project>/<task>` (execution JSONL
   logs and hook logs) is removed `workspace.log_retention_days` days after a
-  terminal Task last changed. The default is `30`; set it to `0` in
-  `forge.yaml` to keep logs forever, as before. Log endpoints for such a Task
-  then report no log. On the first sweep after the upgrade, logs of every Task
-  that has been terminal for longer than the retention are removed.
+  terminal Task last changed and after the last write to the directory,
+  whichever is later. The default is `30`; set it to `0` in `forge.yaml` (or
+  `FORGE_WORKSPACE_LOG_RETENTION_DAYS=0`) to keep logs forever, as before.
+  Log endpoints for such a Task then report no log. On the first sweep after
+  the upgrade, logs of every Task that has been terminal and unwritten for
+  longer than the retention are removed. Only on a workspace root the
+  server's database owns.
 - **Unknown Task-root directories are quarantined, then deleted (3.4 stage
   D).** A directory under the workspace root whose name is a Task id (daemon:
-  `workspace-<uuid>` under `.forge/workspaces`) and that has no workspace row,
-  Task or Project (daemon: no handle) is moved to
-  `<root>/.forge/gc/<name>-<unix seconds>` and deleted 24 hours later. Move it
-  out of `.forge/gc` within that day to keep it. Directories with any other
-  name are never touched. `<name>.broken-<ms>` copies are deleted after 7
-  days; leftovers of the pre-stage-C layout (`<system temp>/forge/logs/<task
-  id>/hooks`, `<system temp>/forge-gemini-api-key-home`, the daemon's shared
-  `.codex-managed-home`) are deleted when nothing is running.
-- **One workspace root per database (3.4 stage D).** The first server to
-  sweep a workspace root records its identity in `<root>/.forge/gc/owner`. A
-  server with another database that points at the same root logs a warning
-  and garbage-collects nothing there. Delete that file to hand the root to a
-  new database.
+  `workspace-<uuid>` under `.forge/workspaces`), that has no workspace row,
+  Task or Project (daemon: no handle), that Forge made (it holds
+  `.forge-task`, `.forge-outbox` or a linked git worktree) and that is older
+  than 24 hours is moved to `<root>/.forge/gc/<name>-<unix seconds>` and
+  deleted 24 hours later. Move it out of `.forge/gc` within that day to keep
+  it. Directories with any other name, and Task-shaped directories without
+  those marks, are never touched. `<name>.broken-<ms>` copies are deleted
+  after 7 days. Leftovers of the pre-stage-C layout are deleted too: the
+  daemon's shared `.codex-managed-home` when the daemon is idle, and
+  `<system temp>/forge-gemini-api-key-home` and
+  `<system temp>/forge/logs/<task id>/hooks` (for Tasks of this database
+  only) once nothing touched them for 7 days and the server runs no
+  execution.
+- **One workspace root per database, and the root must be adopted (3.4 stage
+  D).** A running server writes its database's identity to
+  `<root>/.forge/gc/owner` at start-up when the root has no owner. A server
+  with another database on the same root, and a server whose database was
+  reset, garbage-collects nothing there; the log and operator status
+  (`workspace_gc` under `recent_errors`) say so. It is never taken over
+  automatically: stop Forge and start it once with
+  `forge --reclaim-workspace-gc`. A workspace root that is the home
+  directory or a parent of it, a git repository, a top-level directory or a
+  symbolic link is refused and never collected. A daemon does the same with
+  `<root>/.forge/gc/daemon-owner`, tied to its persisted workspace state,
+  and only one daemon process per root collects.
 - **Idle Tasks lose their build output under disk pressure (3.4 stage D).**
   While the workspace root's filesystem is under its free-space floor
   (default: the larger of 10 GiB and 5 %), the sweep deletes
@@ -860,16 +875,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **Budgeted garbage collection of the workspace root on the server and on
   each daemon (3.4 stage D).** Every 10 minutes, inside the existing 60 second
   sweep budget and resuming from a cursor, Forge now reclaims what no record
-  points at: unknown Task roots (quarantine first), leftovers of cleaned
-  workspaces, temp directories of runs that never settled, dead exact-commit
-  check checkouts, old broken-worktree copies and the legacy locations. It
-  never follows a link, never removes anything outside the root, never takes a
-  directory a live run or a create in progress owns, and one failing entry
-  does not stop the pass. New `forge.yaml` keys: `workspace.log_retention_days`,
-  `workspace.min_free_bytes`, `workspace.min_free_percent`. Workspace
-  responses gain `disk_bytes` and `disk_measured_at` (nullable; new columns on
-  `workspace`), written by the sweep for server-owned Task roots. No daemon
-  protocol change. See `docs/architecture.md#workspace-garbage-collection`.
+  points at: unknown Task roots that Forge made (quarantined after 24 hours,
+  deleted 24 hours later), leftovers of cleaned workspaces, temp directories
+  of runs that never settled, dead exact-commit check checkouts, old
+  broken-worktree copies and the legacy locations. It runs only on a root the
+  running server (or daemon) adopted at start-up by writing
+  `.forge/gc/owner` (`daemon-owner` for a daemon), and refuses a home
+  directory, a git repository, a top-level directory and a linked path. It
+  never follows a link, never removes anything outside the root, never takes
+  a directory a live run or a create in progress owns, never moves a
+  Task-shaped directory a user made, and one failing entry does not stop the
+  pass. A root owned by another database (also the case after a database
+  reset) is not swept: the log and operator status say so, and
+  `forge --reclaim-workspace-gc` takes it over. New `forge.yaml` keys:
+  `workspace.log_retention_days`, `workspace.min_free_bytes`,
+  `workspace.min_free_percent`, with `FORGE_WORKSPACE_LOG_RETENTION_DAYS`,
+  `FORGE_WORKSPACE_MIN_FREE_BYTES` and `FORGE_WORKSPACE_MIN_FREE_PERCENT`.
+  Workspace responses gain `disk_bytes` and `disk_measured_at` (nullable; new
+  columns on `workspace`), written by the sweep for server-owned Task roots.
+  No daemon protocol change. See
+  `docs/architecture.md#workspace-garbage-collection`.
 
 - **Check results can now be reused, for the canonical CI policy (plan 3.3
   stage D part 2, scope 1). Nothing runs under it yet.** A new execution
