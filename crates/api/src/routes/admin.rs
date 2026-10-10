@@ -175,5 +175,10 @@ fn admin_user_response(user: User) -> AdminUserResponse {
 }
 
 fn is_protected_setting_key(key: &str) -> bool {
-    matches!(key, "bootstrap_completed" | db::MAPPING_REVISION_KEY)
+    matches!(
+        key,
+        "bootstrap_completed"
+            | db::MAPPING_REVISION_KEY
+            | services::check_runner::policy::VALUE_REVISION_SALT_KEY
+    )
 }

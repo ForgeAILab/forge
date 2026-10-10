@@ -857,6 +857,34 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     step is asked again, and a merge that landed but could not be recorded
     is retried every 30 s instead of every 10 min.
 
+- **Check results can now be reused, for the canonical CI policy (plan 3.3
+  stage D part 2, scope 1). Nothing runs under it yet.** A new execution
+  policy, `canonical-ci/1`, defines when the stored result of a CI bundle may
+  answer a later request without running anything. A step under it runs
+  exactly as a CI step runs today: login shell, the server's own environment,
+  the Project environment values, the build budget, in the Task worktree, and
+  a service one step starts is still there for the next. Nothing is cleared.
+  What the policy adds is a record of what the steps saw: a digest of the
+  whole inherited environment and of the Project values (keyed with a salt
+  that never leaves the server's database, so no value or public hash of one
+  is stored), the shell and Forge versions, the worktree, a clean checkout at
+  the commit before the first step, the same HEAD with no tracked change
+  after the last, and a process tree that was stopped and verified stopped
+  when the run ended. A pass with all of that is reused for the same
+  worktree, commit, steps and environment. Anything less (a step that
+  rewrote a tracked file, a leftover untracked file, an environment that
+  changed while the check was queued, a login profile that did not answer in
+  ten seconds) is still the verdict for the Task that asked and is never
+  reused. Failed, timed-out, cancelled and infrastructure results are never
+  reused, so a re-review of a red commit runs again. Not seen, and therefore
+  limits of reuse: a tool upgraded in place behind an unchanged `PATH`,
+  ignored files that changed inside the same worktree, and steps whose result
+  depends on the time or the network. Daemon-placed checks stay on the frozen
+  policy and always run. Review-entry CI still runs inline exactly as before:
+  moving it onto the durable runner (which is what makes a re-review of an
+  unchanged commit run no CI) is the next step and is not in this change. No
+  stored check result is migrated or reinterpreted.
+
 - **Merge queue Task steps, not produced yet (3.2 stage D, part 1b).** The
   server can now apply what the merge queue decides to a Task (ask for the
   check of a rebased commit, authorize the fast-forward, mark the Task done,

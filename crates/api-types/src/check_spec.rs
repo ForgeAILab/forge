@@ -5,6 +5,15 @@ use ts_rs::TS;
 
 pub const CHECK_SPEC_REVISION: u32 = 2;
 pub const CHECK_DIGEST_SCHEMA: &str = "forge.check-execution/2";
+/// The canonical CI policy, the only one whose result may be reused. A step
+/// runs as it always did (login shell, the owner's inherited environment, the
+/// Project values, the machine build budget, in the Task worktree; a service
+/// one step starts is there for the next). What the policy adds is evidence:
+/// the owner attests the environment the steps inherit, the executor
+/// witnesses a clean checkout at the commit before and the same HEAD with no
+/// tracked change after, and the whole run's process tree is stopped and
+/// verified when the run ends. A change to any of that is a new revision.
+pub const CANONICAL_CI_POLICY: &str = "canonical-ci/1";
 
 /// Why a consumer asked for a check. It selects the bundle the builder
 /// assembles and is recorded on the consumer row; it is NOT part of the spec

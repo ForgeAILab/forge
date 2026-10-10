@@ -470,6 +470,7 @@ impl CheckRunWorker {
                     commands: vec![],
                     output_truncated: false,
                     redaction_values: vec![],
+                    reusable: false,
                 },
                 &db::now_rfc3339(),
             )

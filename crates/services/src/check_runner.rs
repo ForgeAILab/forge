@@ -1,6 +1,7 @@
 //! Durable mechanical-evidence requests. This port has no Task/Review writers.
 pub mod consumer;
 pub mod owners;
+pub mod policy;
 mod receipt;
 pub mod worker;
 
@@ -71,19 +72,30 @@ impl CheckRunner {
         if run.identity_key != consumer.identity_key {
             return Err(ServiceError::invalid_operation("foreign check run"));
         }
-        let outcome = if matches!(requested.disposition, CheckRequestDisposition::Reused)
-            || matches!(requested.disposition, CheckRequestDisposition::Idempotent)
-                && run.state == db::CheckRunState::Succeeded
-                && run.cacheable
-                && consumer.result_id.is_some()
-        {
-            let result = self
-                .store
-                .check_result(consumer.result_id.as_deref().ok_or_else(|| {
-                    ServiceError::invalid_operation("check hit has no result identity")
-                })?)
-                .await?
-                .ok_or_else(|| ServiceError::invalid_operation("check result disappeared"))?;
+        let reused = matches!(requested.disposition, CheckRequestDisposition::Reused);
+        let stored =
+            match consumer.result_id.as_deref() {
+                Some(id)
+                    if reused
+                        || matches!(requested.disposition, CheckRequestDisposition::Idempotent)
+                            && run.state == db::CheckRunState::Succeeded
+                            && run.cacheable =>
+                {
+                    Some(self.store.check_result(id).await?.ok_or_else(|| {
+                        ServiceError::invalid_operation("check result disappeared")
+                    })?)
+                }
+                None if reused => {
+                    return Err(ServiceError::invalid_operation(
+                        "check hit has no result identity",
+                    ))
+                }
+                _ => None,
+            };
+        // A repeated request whose own run passed without reusable evidence
+        // (a step left a tracked change, say) is not a cache hit: it joins
+        // its original run and is answered by that run's result.
+        let outcome = if let Some(result) = stored.filter(|result| reused || result.cacheable) {
             if result.identity_key != consumer.identity_key
                 || result.run_id != run.id
                 || !result.certified

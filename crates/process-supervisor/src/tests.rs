@@ -87,6 +87,17 @@ async fn completion_policy_decides_what_outlives_a_normal_exit() {
         assert!(output.status.success());
         let pid = std::fs::read_to_string(dir.path().join("child.pid")).unwrap();
         let survived = alive(&pid);
+        if survived {
+            // What a caller does at the end of its run: the group is stopped
+            // and verified gone, including the member that ignores SIGTERM.
+            let group = output.group.expect("a started command has a group");
+            assert!(tokio::task::spawn_blocking(move || stop_group(group))
+                .await
+                .unwrap());
+            assert!(!alive(&pid));
+            // Stopping a group that is already gone is still "stopped".
+            assert!(stop_group(group));
+        }
         let _ = std::process::Command::new("kill")
             .args(["-KILL", pid.trim()])
             .status();

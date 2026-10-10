@@ -134,6 +134,7 @@ async fn settle(db: &db::SqliteDb, run: &StoredCheckRun, outcome: CheckResultOut
             },
             output_truncated: false,
             redaction_values: vec![],
+            reusable: true,
         },
         &now,
     )
