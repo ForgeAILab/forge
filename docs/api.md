@@ -33,7 +33,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
-| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution or Workspace lease is live, while `?force=true` requests cancellation before retrying the guard |
+| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution, a Workspace lease or a check run is live; `?force=true` refuses without cancelling anything when a check run is on an unreachable machine, and otherwise requests cancellation before retrying the guard |
 | GET    | `/api/v1/projects/{id}/analytics` | Read authorized Project analytics for a half-open window (CI steps, review summary, typed usage/cost breakdown, and released-milestone outcome economics) |
 | POST   | `/api/v1/projects/{id}/cost-estimation-previews` | Preview exact retrospective estimates for eligible legacy Project usage against one immutable catalog snapshot |
 | POST   | `/api/v1/projects/{id}/cost-estimation-runs` | Commit one preview's retrospective estimates idempotently |

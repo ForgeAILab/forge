@@ -8597,7 +8597,12 @@ flight, nothing more is dispatched for it until the run ends, and a capacity
 wait left on it is retired. Any other running execution of the Task (an
 interactive session, a run of another role) is not that: a dispatch then needs
 a second slot, the reserve and start transactions count the first one against
-it, and the Task waits like any other. A review-entry check never needs a
+it, and the Task waits for a run slot. Fairness is per slot, not per Task:
+such a Task already fills one slot, so under rule 1 it is admitted only at a
+release where no queued check is kept a slot (with the machine otherwise full
+of checks, `active = C - 1` and one kept slot refuse it). While checks keep
+queuing it keeps waiting, visibly, until its other run ends; it is not one of
+the waiters the bound below speaks of. A review-entry check never needs a
 second slot while its Task's run or reservation holds one: it borrows that
 slot and takes it over when the run ends, so the machine's count does not
 change.
