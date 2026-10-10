@@ -1350,6 +1350,90 @@ mod tests {
         }
     }
 
+    /// A rebase performed off the target's owner (the Task's checkout is on
+    /// a daemon, the default checkout on the server) belongs to that daemon:
+    /// it is listed as that daemon's outstanding effect, not the server's,
+    /// and removing the daemon settles it. The queue's target is not the
+    /// removed machine, so the queue is not suspended.
+    #[tokio::test]
+    async fn an_effect_is_listed_and_settled_by_the_owner_that_performs_it() {
+        let db = fixture().await;
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('d','remote-machine','host','linux','aarch64','offline',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO runtime(id,daemon_id,kind,workspace_root,status,labels_json,created_at,updated_at) VALUES ('rt','d','codex','root','offline','{}',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let a = db
+            .admit_integration_attempt(admission(&q, "a", "task-owner"))
+            .await
+            .unwrap();
+        let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+        db.claim_integration_queue(&q.id, q.revision, "worker", &now, "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        let fence = db.integration_owner_fence(&a.id).await.unwrap().unwrap();
+        assert_eq!(fence.target_owner["owner_kind"], "server");
+        let request = IntegrationEffectRequest {
+            fence,
+            kind: IntegrationOperationKind::Rebase,
+            witness: serde_json::json!({"workspace":{"handle":"task-tree"},"effect_owner":{"location_id":"task-location","owner_kind":"daemon","daemon_id":"d","runtime_id":"rt"}}),
+        };
+        assert_eq!(request.effect_owner()["daemon_id"], "d");
+        let IntegrationEffectAdmission::Started(mut guard) =
+            db.begin_integration_effect(request.clone()).await.unwrap()
+        else {
+            panic!("not admitted");
+        };
+        assert!(guard.start().await.unwrap().is_none());
+        // Asked of the daemon that performs it, never of the target's owner.
+        assert_eq!(
+            db.outstanding_integration_effects("daemon", Some("d"))
+                .await
+                .unwrap(),
+            vec![request.clone()]
+        );
+        assert!(db
+            .outstanding_integration_effects("daemon", Some("other"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .outstanding_integration_effects("server", None)
+            .await
+            .unwrap()
+            .is_empty());
+        // An effect without `effect_owner` belongs to the target's owner.
+        let plain = IntegrationEffectRequest {
+            witness: serde_json::json!({"workspace":{"handle":"task-tree"}}),
+            ..request.clone()
+        };
+        assert_eq!(plain.effect_owner(), &plain.fence.target_owner);
+
+        db.remove_daemon("d", "admin", true, "local-host", false)
+            .await
+            .unwrap();
+        let settled = db.integration_attempt(&a.id).await.unwrap().unwrap();
+        assert!(settled.effect_intent_json.is_none());
+        assert_eq!(settled.state, IntegrationAttemptState::Parked);
+        assert_eq!(
+            settled.failure_kind,
+            Some(IntegrationFailureKind::Infrastructure)
+        );
+        let receipt = db
+            .integration_effect_receipt(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.result["kind"], "infrastructure");
+        assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
+        // The default checkout is still there: the queue stays open.
+        let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+        assert_eq!(q.state, IntegrationQueueState::Open);
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn machine_removal_settles_attempt_and_preserves_quarantine() {
         for quarantined in [false, true] {
