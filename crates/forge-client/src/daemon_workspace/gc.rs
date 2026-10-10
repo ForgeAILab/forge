@@ -22,6 +22,75 @@ use std::time::SystemTime;
 
 /// How often a running daemon sweeps its root.
 pub const GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// How often it looks at its disk between sweeps.
+pub const GC_DISK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// While the disk is under the collector mark it sweeps this often instead.
+pub const GC_PRESSURE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The free-space floor this daemon was given by its server, in the reply
+/// to its report. A daemon has no floor of its own: the server holds every
+/// machine to one, so eviction here and refusal there agree.
+static SERVER_FLOOR: std::sync::RwLock<Option<FreeFloor>> = std::sync::RwLock::new(None);
+/// What each root's ownership check found, for the disk report.
+static GC_STATES: std::sync::Mutex<Option<HashMap<PathBuf, &'static str>>> =
+    std::sync::Mutex::new(None);
+
+/// Take the floor from the server's reply to a report.
+pub fn accept_floor(floor: Option<FreeFloor>) {
+    let Some(floor) = floor else {
+        return;
+    };
+    let mut current = SERVER_FLOOR.write().unwrap_or_else(|p| p.into_inner());
+    if *current != Some(floor) {
+        tracing::info!(?floor, "workspace free-space floor received from the server");
+        *current = Some(floor);
+    }
+}
+
+/// The floor the collector evicts to: the server's. Before the first reply
+/// (and with a server that sends none) it is the built-in default, and says
+/// so once.
+pub fn floor() -> FreeFloor {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    match *SERVER_FLOOR.read().unwrap_or_else(|p| p.into_inner()) {
+        Some(floor) => floor,
+        None => {
+            WARNED.call_once(|| {
+                tracing::warn!("the server has sent no workspace free-space floor yet; using the built-in default (10 GiB or 5 % of the filesystem, 5 % of its inodes) until it does");
+            });
+            FreeFloor::default()
+        }
+    }
+}
+
+fn note_gc_state(workspace_root: &Path, state: &'static str) {
+    GC_STATES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(workspace_root.to_path_buf(), state);
+}
+
+/// The disk facts of `workspace_root` for a daemon report: free bytes and
+/// inodes of its filesystem, read now, and whether this daemon's collector
+/// runs on it. `None` when the filesystem cannot be read; the server then
+/// refuses nothing for disk on this machine.
+pub fn disk_report(workspace_root: &Path) -> Option<api_types::MachineDiskFacts> {
+    let Some(space) = executors::gc::disk_space(workspace_root) else {
+        tracing::warn!(root = %workspace_root.display(), "free space of the workspace root cannot be read; no disk facts reported");
+        return None;
+    };
+    let resolved = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let gc_state = GC_STATES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|states| states.get(&resolved).copied())
+        .unwrap_or("unclaimed");
+    Some(space.facts(chrono::Utc::now().to_rfc3339(), Some(gc_state.to_owned())))
+}
 const GC_BUDGET: Duration = Duration::from_secs(60);
 const GC_PAGE: usize = 64;
 /// One directory for every Codex execution of a daemon, used before each
@@ -57,7 +126,9 @@ pub(super) fn adopt_root(
         Duration::ZERO,
     );
     sweep.owner_file = DAEMON_OWNER_FILE;
-    match sweep.adopt(&owner_id) {
+    let ownership = sweep.adopt(&owner_id);
+    note_gc_state(workspace_root, ownership.as_str());
+    match ownership {
         Ownership::Mine => {}
         ownership => {
             tracing::warn!(
@@ -81,6 +152,7 @@ pub(super) fn adopt_root(
                 root = %workspace_root.display(),
                 "another daemon is running on this workspace root; this one leaves garbage collection to it"
             );
+            note_gc_state(workspace_root, Ownership::Other.as_str());
             None
         }
     }
@@ -94,8 +166,15 @@ impl DaemonWorkspaceBackend {
     /// One budgeted pass. `active_ids` are the executions this daemon is
     /// running. Errors on single entries are counted, never returned.
     pub async fn gc_sweep(&self, active_ids: &[String]) -> GcReport {
-        self.gc_sweep_at(active_ids, SystemTime::now(), FreeFloor::default())
+        self.gc_sweep_at(active_ids, SystemTime::now(), floor())
             .await
+    }
+
+    /// Whether the root's filesystem is under the mark at which the
+    /// collector should not wait for its timer. `false` when unreadable.
+    pub fn disk_is_short(&self) -> bool {
+        executors::gc::disk_space(&self.workspace_root)
+            .is_some_and(|space| floor().wants_gc(&space.facts(String::new(), None)))
     }
 
     /// The handle table as every backend on this root knows it: this one's

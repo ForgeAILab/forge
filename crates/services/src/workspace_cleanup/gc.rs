@@ -35,6 +35,10 @@ const LEGACY_LOG_DIRS: usize = 256;
 /// Time one Task's expired logs may take to remove; what is left goes on
 /// the next sweep.
 const LOG_REMOVAL_BUDGET: Duration = Duration::from_secs(10);
+/// Garbage is collected ahead of its timer at most this often.
+const RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+/// Time one such pass may take: an admission waits for it.
+const RECLAIM_BUDGET: Duration = Duration::from_secs(20);
 const OWNER_KEY: &str = "workspace_gc_owner_id";
 /// What the last ownership check found, for operator status.
 pub const STATUS_KEY: &str = "workspace_gc_status";
@@ -173,6 +177,9 @@ impl WorkspaceCleanupScheduler {
     /// Keep what the last check found where operator status reads it.
     /// Written only when it changes.
     async fn record_gc_status(&self, root: &Path, ownership: Ownership) {
+        if let Ok(mut state) = self.gc_state.write() {
+            *state = Some(ownership.as_str());
+        }
         let reason = match ownership {
             Ownership::Refused(reason) => Some(reason),
             _ => None,
@@ -196,6 +203,70 @@ impl WorkspaceCleanupScheduler {
         if let Err(error) = written {
             tracing::warn!(%error, "workspace gc status not recorded");
         }
+    }
+
+    /// Turn disk-pressure admission on for this server: the floor every
+    /// machine is held to, and the reading of this server's own workspace
+    /// root. Called once by the running server, never by a test builder, so
+    /// a scheduler nobody enabled it for refuses nothing.
+    pub fn enable_disk_admission(self: &Arc<Self>, floor: FreeFloor) {
+        let scheduler = Arc::downgrade(self);
+        let root = self.workspace_root.clone();
+        self.db.disk_admission.configure(
+            floor,
+            Arc::new(move || {
+                let space = gc::disk_space(&root)?;
+                let gc_state = scheduler
+                    .upgrade()
+                    .and_then(|scheduler| scheduler.gc_state.read().ok().and_then(|state| *state))
+                    .map(str::to_owned);
+                Some(space.facts(now_rfc3339(), gc_state))
+            }),
+        );
+    }
+
+    /// Collect garbage now when the server's root is under the mark at which
+    /// the collector should not wait for its timer, then read the disk
+    /// again. Admission calls this before it counts the server as short of
+    /// disk, and the cleanup tick calls it every minute; however often it is
+    /// asked, it collects at most once per [`RECLAIM_INTERVAL`]. `true` when
+    /// a pass ran.
+    pub async fn reclaim_under_pressure(&self) -> bool {
+        let admission = &self.db.disk_admission;
+        let Some(floor) = admission.floor() else {
+            return false;
+        };
+        let Some(facts) = admission.server_facts() else {
+            return false;
+        };
+        if !floor.wants_gc(&facts) {
+            return false;
+        }
+        {
+            let mut last = self
+                .last_reclaim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|at| at.elapsed() < RECLAIM_INTERVAL) {
+                return false;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let report = {
+            let mut cursor = self.sweep_cursor.lock().await;
+            self.gc_pass(&mut cursor, RECLAIM_BUDGET).await
+        };
+        let after = admission.refresh();
+        tracing::info!(
+            ?report,
+            free_bytes_before = facts.free_bytes,
+            free_bytes_after = after.as_ref().map(|facts| facts.free_bytes),
+            still_under_floor = after
+                .as_ref()
+                .is_some_and(|facts| floor.pressure(facts).is_some()),
+            "workspace disk is short: garbage collected ahead of the timer"
+        );
+        true
     }
 
     /// Let the pass remove the legacy locations under the system temp

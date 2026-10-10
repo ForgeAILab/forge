@@ -455,7 +455,10 @@ pub async fn report_with_retry(
 
     loop {
         match client.report(request.clone()).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                crate::daemon_workspace::gc::accept_floor(response.workspace_floor);
+                return Ok(response);
+            }
             Err(error) if should_retry(&error, attempt) => {
                 tracing::warn!(
                     attempt,

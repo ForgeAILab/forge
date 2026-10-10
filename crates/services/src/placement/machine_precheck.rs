@@ -20,7 +20,7 @@ pub(crate) async fn snapshot(
     .await?)
 }
 
-/// False includes unknown verification/probe facts and non-capacity refusals.
+/// `None` includes unknown verification/probe facts and non-capacity refusals.
 /// Current environment failures exclude a machine from the usable set.
 pub(crate) async fn task_blocked(
     db: &db::SqliteDb,
@@ -30,22 +30,26 @@ pub(crate) async fn task_blocked(
     adapters: Option<&executors::AdapterRegistry>,
     workspace_root: &Path,
     role: Option<&str>,
-) -> Result<bool> {
+) -> Result<Option<super::CapacityWait>> {
     if agent.paused || agent.status == db::AgentStatus::Error {
-        return Ok(false);
+        return Ok(None);
     }
     if snapshot(db)
         .await?
         .iter()
         .all(|row| row.capacity.has_capacity())
+        && db::machine_disk::list_machine_disks(db)
+            .await?
+            .iter()
+            .all(|row| row.disk.pressure.is_none())
     {
-        return Ok(false);
+        return Ok(None);
     }
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
     if project.primary_repo_id.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let workflow = WorkflowEngine::resolve_workflow_for_task(
         task,
@@ -67,7 +71,7 @@ pub(crate) async fn task_blocked(
         .as_ref()
         .is_some_and(|p| !matches!(p.state, PlacementState::Ready | PlacementState::Cleaned))
     {
-        return Ok(false);
+        return Ok(None);
     }
     let locations: Vec<(String, String)> =
         sqlx::query_as("SELECT id, status FROM repo_location WHERE repo_id = ?")
@@ -82,7 +86,7 @@ pub(crate) async fn task_blocked(
             continue;
         }
         if status != "ready" {
-            return Ok(false);
+            return Ok(None);
         } // Reserve may verify it first.
     }
     let empty = DaemonConnectionRegistry::without_handlers();
@@ -105,12 +109,14 @@ pub(crate) async fn task_blocked(
         )
         .await?
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(
-        matches!(select_placement(&context), SelectionOutcome::Unavailable(refusal)
-        if capacity_only_wait(&refusal)),
-    )
+    Ok(match select_placement(&context) {
+        SelectionOutcome::Unavailable(refusal) if capacity_only_wait(&refusal) => {
+            Some(super::CapacityWait::of(&refusal))
+        }
+        _ => None,
+    })
 }
 
 /// A known environment-failed machine is not an alternative to a full,
@@ -121,13 +127,13 @@ pub(crate) fn capacity_only_wait(refusal: &super::PlacementUnavailable) -> bool 
     refusal
         .rejected_candidates
         .iter()
-        .any(|r| r.filter_codes == [MachineCapacity])
+        .any(|r| super::capacity_codes_only(&r.filter_codes))
         && refusal.rejected_candidates.iter().all(|r| {
-            r.filter_codes == [MachineCapacity]
+            super::capacity_codes_only(&r.filter_codes)
                 || (r.filter_codes.contains(&EnvironmentNotReady)
-                    && r.filter_codes
-                        .iter()
-                        .all(|c| matches!(c, MachineCapacity | EnvironmentNotReady)))
+                    && r.filter_codes.iter().all(|c| {
+                        matches!(c, MachineCapacity | DiskPressure | EnvironmentNotReady)
+                    }))
         })
 }
 
@@ -140,14 +146,8 @@ pub(crate) async fn wait_before_dispatch(
     agent: &Agent,
     role: Option<&str>,
 ) -> Result<bool> {
-    if service.machine_capacity_blocked(task, agent, role).await? {
-        crate::deferred_dispatch::record_dispatch_disposition(
-            db,
-            task,
-            "machine_capacity",
-            "machine_capacity: waiting for a machine run slot",
-        )
-        .await?;
+    if let Some(wait) = service.capacity_wait_for(task, agent, role).await? {
+        crate::deferred_dispatch::record_capacity_wait(db, task, wait).await?;
         return Ok(true);
     }
     retire_wait(db, task).await

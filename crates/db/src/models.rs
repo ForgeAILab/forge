@@ -1199,6 +1199,9 @@ pub struct WorkspaceLease {
 pub struct Daemon {
     pub run_limit: Option<u32>,
     pub max_concurrent_runs: Option<i64>,
+    /// The disk facts of its workspace root from its last report, as JSON
+    /// ([`api_types::MachineDiskFacts`]). `None` until it reports one.
+    pub disk_json: Option<String>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,

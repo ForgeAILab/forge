@@ -134,6 +134,7 @@ pub enum HumanBoundary {
 pub enum ConditionCapacityScope {
     Agent,
     Machine,
+    Disk,
     Project,
     OwnerBackpressure,
 }
@@ -1028,10 +1029,18 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     if let Some(disposition) = object(m, "dispatch_disposition") {
         let capability = text(&disposition, "capability");
         found.push(match capability.as_deref() {
+            // A disk wait is a machine-capacity wait in every respect but
+            // what it names: the same disposition, re-evaluated the same way.
             Some("machine_capacity") => (
                 160,
                 ParkReason::Capacity {
-                    scope: ConditionCapacityScope::Machine,
+                    scope: if text(&disposition, "capacity_scope").as_deref()
+                        == Some(api_types::CAPACITY_SCOPE_DISK)
+                    {
+                        ConditionCapacityScope::Disk
+                    } else {
+                        ConditionCapacityScope::Machine
+                    },
                 },
             ),
             Some("project_capacity") => (

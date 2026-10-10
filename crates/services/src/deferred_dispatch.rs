@@ -352,6 +352,10 @@ pub(crate) struct DispatchDisposition {
     pub blocker_digest: String,
     pub recorded_at: String,
     pub safe_message: String,
+    /// What a `machine_capacity` wait is for when it is not a run slot:
+    /// `disk`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_scope: Option<String>,
 }
 
 pub(crate) fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
@@ -400,6 +404,77 @@ pub(crate) async fn record_dispatch_disposition(
     record_dispatch_disposition_naming(db, task, capability, safe_message, &[]).await
 }
 
+/// The wait message of a Task no machine can take for lack of a run slot.
+pub(crate) const MACHINE_CAPACITY_WAIT: &str = "machine_capacity: waiting for a machine run slot";
+
+/// Record that the Task waits for a machine: a run slot, or free space on a
+/// workspace filesystem. Either way it is the one machine-capacity wait the
+/// dispatcher re-evaluates on every scan, so it clears by itself.
+pub(crate) async fn record_capacity_wait(
+    db: &db::SqliteDb,
+    task: &Task,
+    wait: crate::placement::CapacityWait,
+) -> Result<bool> {
+    match wait {
+        crate::placement::CapacityWait::Machine => {
+            record_dispatch_disposition(db, task, "machine_capacity", MACHINE_CAPACITY_WAIT).await
+        }
+        crate::placement::CapacityWait::Disk => {
+            let message = disk_wait_message(db).await;
+            record_disposition(
+                db,
+                task,
+                "machine_capacity",
+                &message,
+                &[],
+                Some(api_types::CAPACITY_SCOPE_DISK),
+            )
+            .await
+        }
+    }
+}
+
+/// Which machines are under their free-space floor, and whether anything
+/// reclaims space on them. Stable while the facts are: a changing message
+/// would rewrite the wait on every scan.
+pub(crate) async fn disk_wait_message(db: &db::SqliteDb) -> String {
+    let rows = db::machine_disk::list_machine_disks(db)
+        .await
+        .unwrap_or_default();
+    let under: Vec<&db::machine_disk::MachineDiskRow> = rows
+        .iter()
+        .filter(|row| row.disk.pressure.is_some())
+        .collect();
+    let names = |rows: &[&db::machine_disk::MachineDiskRow]| {
+        rows.iter()
+            .map(|row| row.hostname.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut message = if under.is_empty() {
+        "disk_pressure: waiting for free space on a workspace filesystem".to_owned()
+    } else {
+        format!(
+            "disk_pressure: waiting for free space on the workspace filesystem of {}",
+            names(&under)
+        )
+    };
+    let unowned: Vec<&db::machine_disk::MachineDiskRow> = under
+        .iter()
+        .copied()
+        .filter(|row| {
+            row.disk.facts.gc_state.as_deref() != Some(api_types::WORKSPACE_GC_OWNED)
+        })
+        .collect();
+    if !unowned.is_empty() {
+        message.push_str(&format!(
+            "; workspace garbage collection is not running on {} (its workspace root is not owned by that Forge), so nothing is reclaimed there until an operator frees space or fixes the ownership",
+            names(&unowned)
+        ));
+    }
+    message
+}
+
 /// [`record_dispatch_disposition`], naming the dependencies the Task waits
 /// for (`dependency_ids`), which the typed condition presents.
 pub(crate) async fn record_dispatch_disposition_naming(
@@ -408,6 +483,17 @@ pub(crate) async fn record_dispatch_disposition_naming(
     capability: &str,
     safe_message: &str,
     dependency_ids: &[String],
+) -> Result<bool> {
+    record_disposition(db, task, capability, safe_message, dependency_ids, None).await
+}
+
+async fn record_disposition(
+    db: &db::SqliteDb,
+    task: &Task,
+    capability: &str,
+    safe_message: &str,
+    dependency_ids: &[String],
+    capacity_scope: Option<&str>,
 ) -> Result<bool> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
@@ -433,6 +519,9 @@ pub(crate) async fn record_dispatch_disposition_naming(
     });
     if !dependency_ids.is_empty() {
         value["dependency_ids"] = json!(dependency_ids);
+    }
+    if let Some(scope) = capacity_scope {
+        value["capacity_scope"] = json!(scope);
     }
     let mutation = match metadata.extra.get(DISPOSITION_METADATA_KEY) {
         Some(expected) => TaskMetadataMutation::SetIf {
@@ -599,7 +688,15 @@ pub(crate) async fn finish_machine_wait(
         if d.task_version <= previous_version {
             crate::placement::machine_precheck::retire_wait(db, task).await?;
         } else if d.task_version != task.version {
-            record_dispatch_disposition(db, task, &d.capability, &d.safe_message).await?;
+            record_disposition(
+                db,
+                task,
+                &d.capability,
+                &d.safe_message,
+                &[],
+                d.capacity_scope.as_deref(),
+            )
+            .await?;
         }
         refresh_machine_wait(db, task).await?;
     }

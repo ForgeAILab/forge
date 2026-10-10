@@ -514,18 +514,23 @@ async fn report_once(
 ) -> Result<DaemonResponse> {
     let request = DaemonReportRequest {
         max_concurrent_runs: Some(max_concurrent_runs),
+        disk: crate::daemon_workspace::gc::disk_report(workspace_root),
         detected_clis: detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),
         active_execution_ids: active_executions.map(|tracker| tracker.active_ids()),
     };
-    client
+    let daemon: DaemonResponse = client
         .post_bearer(
             &format!("/api/v1/daemons/{}/report", credentials.daemon_id),
             &credentials.token,
             &request,
         )
-        .await
+        .await?;
+    // The server holds every machine to one floor; the collector here
+    // evicts to the same one.
+    crate::daemon_workspace::gc::accept_floor(daemon.workspace_floor);
+    Ok(daemon)
 }
 
 async fn detect_clis() -> Vec<DetectedCli> {

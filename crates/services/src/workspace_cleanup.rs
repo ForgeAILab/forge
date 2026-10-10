@@ -94,6 +94,10 @@ pub struct WorkspaceCleanupScheduler {
     lifecycle_locks: WorkspaceExecutionLockManager,
     sweep_cursor: Mutex<SweepCursor>,
     gc_settings: RwLock<GcSettings>,
+    /// What the last ownership check of the root found, for the disk reading.
+    gc_state: RwLock<Option<&'static str>>,
+    /// When garbage was last collected because the disk was short.
+    last_reclaim: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[async_trait]
@@ -130,6 +134,8 @@ impl WorkspaceCleanupScheduler {
             lifecycle_locks: WorkspaceExecutionLockManager::new(),
             sweep_cursor: Mutex::new(SweepCursor::default()),
             gc_settings: RwLock::new(GcSettings::default()),
+            gc_state: RwLock::new(None),
+            last_reclaim: std::sync::Mutex::new(None),
         }
     }
 
@@ -462,6 +468,8 @@ impl WorkspaceCleanupScheduler {
     }
 
     pub(crate) async fn tick(&self) -> Result<()> {
+        // Short of disk: collect now instead of waiting for the sweep timer.
+        self.reclaim_under_pressure().await;
         let task_ids = sqlx::query_scalar::<_, String>(
             "SELECT task_id FROM workspace
              WHERE status != 'cleaned' AND (cleanup_after <= ? OR (status = 'cleaning' AND cleanup_after IS NULL))
@@ -3204,18 +3212,12 @@ mod tests {
         }
         let hook = hook.unwrap();
         let scheduler = gc_scheduler(&db, &root).await;
-        let under = executors::gc::FreeFloor {
-            min_free_bytes: u64::MAX,
-            min_free_percent: 0,
-        };
+        let under = executors::gc::FreeFloor::of_bytes(u64::MAX, 0);
 
         // Plenty of room: nothing is evicted.
         scheduler.set_gc_limits(
             30,
-            executors::gc::FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 0,
-            },
+            executors::gc::FreeFloor::of_bytes(0, 0),
         );
         assert_eq!(gc_at(&scheduler, Duration::ZERO).await.builds_evicted, 0);
 
@@ -3566,10 +3568,7 @@ mod tests {
         let scheduler = Arc::new(gc_scheduler(&db, &root).await);
         scheduler.set_gc_limits(
             30,
-            executors::gc::FreeFloor {
-                min_free_bytes: u64::MAX,
-                min_free_percent: 0,
-            },
+            executors::gc::FreeFloor::of_bytes(u64::MAX, 0),
         );
 
         // The pass saw an idle Task. Something holds the Task's lifecycle
@@ -3599,6 +3598,55 @@ mod tests {
         assert_eq!((report.builds_evicted, report.errors), (1, 0));
         assert!(!marker.exists());
         assert!(worktree_path.exists(), "only the build output goes");
+    }
+
+    /// Before the server is counted as short of disk its garbage is
+    /// collected once and its disk read again: reclaimable trash present
+    /// means the machine is admitted after the pass.
+    #[tokio::test]
+    async fn disk_pressure_collects_garbage_once_then_reads_the_disk_again() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let scheduler = gc_scheduler(&db, &root).await;
+        let trash = root.join(executors::gc::TRASH_DIR);
+        std::fs::create_dir_all(trash.join("condemned-1-0/target")).unwrap();
+        std::fs::write(trash.join("condemned-1-0/target/big"), "x").unwrap();
+        // The injected disk: short exactly while the trash holds something.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, watched) = (Arc::clone(&reads), trash.clone());
+        db.disk_admission.configure(
+            api_types::DiskFloor::of_bytes(100, 0),
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let full = std::fs::read_dir(&watched).is_ok_and(|mut entries| entries.next().is_some());
+                Some(api_types::MachineDiskFacts {
+                    free_bytes: if full { 10 } else { 900 },
+                    total_bytes: 1_000,
+                    free_inodes: None,
+                    total_inodes: None,
+                    measured_at: now_rfc3339(),
+                    gc_state: Some("owned".to_owned()),
+                })
+            }),
+        );
+        assert_eq!(
+            db.disk_admission.server_pressure(),
+            Some(api_types::DiskPressureKind::Bytes)
+        );
+        assert!(scheduler.reclaim_under_pressure().await, "a pass ran");
+        assert!(!trash.join("condemned-1-0").exists());
+        assert_eq!(db.disk_admission.server_pressure(), None, "read again after the pass");
+        // Asked again at once: no second pass, whatever the disk says.
+        std::fs::create_dir_all(trash.join("condemned-2-0")).unwrap();
+        db.disk_admission.refresh();
+        assert!(!scheduler.reclaim_under_pressure().await);
+        assert!(trash.join("condemned-2-0").exists());
+        // With room to spare nothing is collected ahead of the timer.
+        let unconfigured = sqlite_db().await;
+        let idle = gc_scheduler(&unconfigured, &root).await;
+        assert!(!idle.reclaim_under_pressure().await);
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
     }
 
     #[tokio::test]

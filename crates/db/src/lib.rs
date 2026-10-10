@@ -11,6 +11,7 @@ mod ids;
 pub mod integration_queue;
 pub use integration_queue::*;
 pub mod machine_capacity;
+pub mod machine_disk;
 mod migration;
 mod models;
 mod orchestration;

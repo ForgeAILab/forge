@@ -213,6 +213,29 @@ impl Drop for RuntimeTaskHandle {
     }
 }
 
+/// The free-space floor of the configured workspace: one value for the
+/// garbage collector's eviction and for admission's refusal, so the two can
+/// never disagree.
+pub fn workspace_disk_floor(workspace: &config::WorkspaceConfig) -> api_types::DiskFloor {
+    api_types::DiskFloor {
+        min_free_bytes: workspace.min_free_bytes,
+        min_free_percent: workspace.min_free_percent,
+        min_free_inode_percent: workspace.min_free_inode_percent,
+        gc_free_bytes: workspace.gc_free_bytes,
+        gc_free_percent: workspace.gc_free_percent,
+    }
+}
+
+impl ForgeRuntime {
+    /// Turn disk-pressure admission on. Only a running server does this,
+    /// beside adopting its workspace root: nothing built for a test reads
+    /// the real disk to decide whether work may start.
+    pub fn enable_disk_admission(&self) {
+        self.cleanup_scheduler
+            .enable_disk_admission(workspace_disk_floor(&self.effective_config.workspace));
+    }
+}
+
 /// Typed service and worker component graph shared by server and Solo.
 #[derive(Clone)]
 pub struct ForgeRuntime {
@@ -824,10 +847,7 @@ impl ForgeRuntimeBuilder {
             .set_check_timeout(u64::from(effective_config.server.check_run_timeout_seconds));
         cleanup_scheduler.set_gc_limits(
             effective_config.workspace.log_retention_days,
-            executors::gc::FreeFloor {
-                min_free_bytes: effective_config.workspace.min_free_bytes,
-                min_free_percent: effective_config.workspace.min_free_percent,
-            },
+            workspace_disk_floor(&effective_config.workspace),
         );
         let check_worker = Arc::new(crate::check_runner::worker::CheckRunWorker::new(
             self.db.clone(),

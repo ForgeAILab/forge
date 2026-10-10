@@ -110,10 +110,7 @@ async fn build_output_is_evicted_under_the_floor_but_never_for_a_busy_handle() {
         .unwrap()
         .execution_ids
         .push(execution.clone());
-    let under = FreeFloor {
-        min_free_bytes: u64::MAX,
-        min_free_percent: 0,
-    };
+    let under = FreeFloor::of_bytes(u64::MAX, 0);
     let sweep = |active: Vec<String>| {
         let backend = &fixture.backend;
         async move { backend.gc_sweep_at(&active, SystemTime::now(), under).await }
@@ -138,10 +135,7 @@ async fn build_output_is_evicted_under_the_floor_but_never_for_a_busy_handle() {
         .gc_sweep_at(
             &[],
             SystemTime::now(),
-            FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 0,
-            },
+            FreeFloor::of_bytes(0, 0),
         )
         .await;
     assert_eq!(report.builds_evicted, 0);

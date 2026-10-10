@@ -74,6 +74,7 @@ pub async fn report_request(
 ) -> DaemonReportRequest {
     DaemonReportRequest {
         max_concurrent_runs: Some(max_concurrent_runs),
+        disk: forge_client::daemon_workspace::gc::disk_report(workspace_root),
         detected_clis: detect::detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),

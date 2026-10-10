@@ -705,6 +705,8 @@ fn canonical_phase_for_status(status: &str) -> CanonicalPhase {
 
 fn daemon_response() -> DaemonResponse {
     DaemonResponse {
+        disk: None,
+        workspace_floor: None,
         max_concurrent_runs: None,
         run_limit: None,
         effective_max_concurrent_runs: None,

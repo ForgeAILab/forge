@@ -234,6 +234,7 @@ impl SoloStartup {
         runtime
             .cleanup_scheduler
             .set_legacy_temp_dir(std::env::temp_dir());
+        runtime.enable_disk_admission();
 
         let daemon = Arc::new(
             EmbeddedDaemon::new(

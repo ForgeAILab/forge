@@ -23,6 +23,7 @@ pub(crate) fn retryable_filter_codes(codes: &[PlacementFilterCode]) -> bool {
                 code,
                 PlacementFilterCode::AgentCapacity
                     | PlacementFilterCode::MachineCapacity
+                    | PlacementFilterCode::DiskPressure
                     | PlacementFilterCode::OwnerUnreachable
                     | PlacementFilterCode::EnvironmentProbePending
                     | PlacementFilterCode::EnvironmentNotReady
@@ -104,12 +105,72 @@ pub(crate) async fn admission_refusal_is_retryable(
     })
 }
 
-/// At least one otherwise eligible candidate was rejected solely for machine capacity.
+/// What a Task that no machine can take right now waits for. Both are the
+/// same wait to the dispatcher (one recorded disposition, re-evaluated on
+/// every scan); they differ in what the Task says it waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityWait {
+    /// A run slot on a machine.
+    Machine,
+    /// Free space on a machine's workspace filesystem.
+    Disk,
+}
+
+/// Rejected for nothing but a run slot or free disk: the machine is usable
+/// as soon as either comes back.
+pub(crate) fn capacity_codes_only(codes: &[PlacementFilterCode]) -> bool {
+    !codes.is_empty()
+        && codes.iter().all(|code| {
+            matches!(
+                code,
+                PlacementFilterCode::MachineCapacity | PlacementFilterCode::DiskPressure
+            )
+        })
+}
+
+impl CapacityWait {
+    /// A machine whose disk has room but whose slots are full is the nearer
+    /// exit, so the wait is for disk only when every machine that could take
+    /// the Task is short of disk.
+    pub(crate) fn of(refusal: &PlacementUnavailable) -> Self {
+        let mut waiting = refusal
+            .rejected_candidates
+            .iter()
+            .filter(|candidate| capacity_codes_only(&candidate.filter_codes))
+            .peekable();
+        if waiting.peek().is_some()
+            && waiting.all(|candidate| {
+                candidate
+                    .filter_codes
+                    .contains(&PlacementFilterCode::DiskPressure)
+            })
+        {
+            Self::Disk
+        } else {
+            Self::Machine
+        }
+    }
+}
+
+/// At least one otherwise eligible candidate was rejected solely for machine
+/// capacity: a run slot, or free disk for a new worktree.
 pub(crate) fn is_machine_capacity_refusal(error: &crate::ServiceError) -> bool {
-    matches!(
-        error,
-        crate::ServiceError::Db(db::DbError::MachineAtCapacity)
-    ) || matches!(error, crate::ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate| candidate.filter_codes == [PlacementFilterCode::MachineCapacity]))
+    capacity_wait_of(error).is_some()
+}
+
+pub(crate) fn capacity_wait_of(error: &crate::ServiceError) -> Option<CapacityWait> {
+    match error {
+        crate::ServiceError::Db(db::DbError::MachineAtCapacity) => Some(CapacityWait::Machine),
+        crate::ServiceError::PlacementUnavailable(refusal)
+            if refusal
+                .rejected_candidates
+                .iter()
+                .any(|candidate| capacity_codes_only(&candidate.filter_codes)) =>
+        {
+            Some(CapacityWait::of(refusal))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

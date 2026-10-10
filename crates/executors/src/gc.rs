@@ -565,7 +565,8 @@ impl Sweep {
     /// Whether the filesystem of the root is under `floor`. `false` when it
     /// cannot be read: an unreadable disk evicts nothing.
     pub fn under_floor(&self, floor: &FreeFloor) -> bool {
-        (self.disk_space)(&self.root).is_some_and(|space| space.free < floor.bytes(space.total))
+        (self.disk_space)(&self.root)
+            .is_some_and(|space| floor.pressure(&space.facts(String::new(), None)).is_some())
     }
 
     /// Take the build output of one Task root the caller proved idle: moved
@@ -596,7 +597,7 @@ impl Sweep {
 
     /// Free space by evicting the build output of the given Task roots,
     /// least recently used first, until the filesystem of the root is back
-    /// above `floor` bytes free. `candidates` are Task-root names the caller
+    /// above `floor` (bytes and inodes). `candidates` are Task-root names the caller
     /// proved idle; a root with a run of this process is skipped regardless.
     /// For an owner whose table is its own lock (a daemon); the server evicts
     /// one root at a time under the Task's lifecycle lock.
@@ -795,39 +796,39 @@ fn unix_secs(time: SystemTime) -> u64 {
         .as_secs()
 }
 
-/// The free-space floor of one managed root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FreeFloor {
-    pub min_free_bytes: u64,
-    pub min_free_percent: u8,
+/// The free-space floor of one managed root: one type for the eviction here
+/// and for the admission refusal, so the two can never disagree.
+pub use api_types::DiskFloor as FreeFloor;
+
+/// One `statvfs` reading of the filesystem holding a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiskSpace {
+    /// Bytes free to an unprivileged process.
+    pub free: u64,
+    pub total: u64,
+    /// Inodes free to an unprivileged process; `None` on a filesystem that
+    /// does not count them.
+    pub free_inodes: Option<u64>,
+    pub total_inodes: Option<u64>,
 }
 
-impl Default for FreeFloor {
-    fn default() -> Self {
-        Self {
-            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
-            min_free_percent: DEFAULT_MIN_FREE_PERCENT,
+impl DiskSpace {
+    /// This reading as the fact a machine reports.
+    pub fn facts(&self, measured_at: String, gc_state: Option<String>) -> api_types::MachineDiskFacts {
+        api_types::MachineDiskFacts {
+            free_bytes: self.free,
+            total_bytes: self.total,
+            free_inodes: self.free_inodes,
+            total_inodes: self.total_inodes,
+            measured_at,
+            gc_state,
         }
     }
 }
 
-impl FreeFloor {
-    /// The larger of the byte floor and the percentage of `total`.
-    pub fn bytes(&self, total: u64) -> u64 {
-        let percent = u64::from(self.min_free_percent.min(100));
-        self.min_free_bytes.max(total / 100 * percent)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DiskSpace {
-    pub free: u64,
-    pub total: u64,
-}
-
-/// Free (to an unprivileged process) and total bytes of the filesystem
-/// holding `path`, from `statvfs`. `None` when it cannot be read; callers
-/// then leave everything alone.
+/// Free (to an unprivileged process) and total bytes and inodes of the
+/// filesystem holding `path`, from `statvfs`. `None` when it cannot be read;
+/// callers then leave everything alone.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub fn disk_space(path: &Path) -> Option<DiskSpace> {
@@ -843,15 +844,20 @@ pub fn disk_space(path: &Path) -> Option<DiskSpace> {
         stat.assume_init()
     };
     #[allow(clippy::unnecessary_cast)]
-    let (block, free, total) = (
+    let (block, free, total, inodes_free, inodes) = (
         stat.f_frsize as u64,
         stat.f_bavail as u64,
         stat.f_blocks as u64,
+        stat.f_favail as u64,
+        stat.f_files as u64,
     );
-    // A filesystem that reports no size reports nothing usable.
+    // A filesystem that reports no size reports nothing usable; one that
+    // reports no inodes simply does not count them.
     (block > 0 && total > 0).then(|| DiskSpace {
         free: free.saturating_mul(block),
         total: total.saturating_mul(block),
+        free_inodes: (inodes > 0).then_some(inodes_free),
+        total_inodes: (inodes > 0).then_some(inodes),
     })
 }
 
@@ -1392,20 +1398,14 @@ mod tests {
 
         // Plenty of room: nothing is evicted.
         let mut report = GcReport::default();
-        let none = FreeFloor {
-            min_free_bytes: 0,
-            min_free_percent: 0,
-        };
+        let none = FreeFloor::of_bytes(0, 0);
         sweep(&root).evict_builds(&names, &none, &mut report);
         assert_eq!(report.builds_evicted, 0);
         assert!(old.exists() && busy.exists());
 
         // A floor no disk can meet: every idle build goes, the busy one stays
         // whenever its run is visible to the registry.
-        let all = FreeFloor {
-            min_free_bytes: u64::MAX,
-            min_free_percent: 0,
-        };
+        let all = FreeFloor::of_bytes(u64::MAX, 0);
         sweep(&root).evict_builds(&names, &all, &mut report);
         assert!(!old.exists());
         if run.tmp_dir().is_some() {
@@ -1615,6 +1615,15 @@ mod tests {
         assert_eq!(floor.bytes(1000 * gib), 50 * gib);
         let space = disk_space(Path::new("/")).unwrap();
         assert!(space.total >= space.free && space.total > 0);
+        // Inodes are read with the bytes, where the filesystem counts them.
+        if let (Some(free), Some(total)) = (space.free_inodes, space.total_inodes) {
+            assert!(total >= free && total > 0);
+        }
+        let facts = space.facts("now".to_owned(), Some("owned".to_owned()));
+        assert_eq!(
+            (facts.free_bytes, facts.total_inodes, facts.gc_state.as_deref()),
+            (space.free, space.total_inodes, Some("owned"))
+        );
         assert!(disk_space(Path::new("/no/such/place")).is_none());
         assert_eq!(check_checkout_age(60), CHECK_CHECKOUT_AGE);
         assert_eq!(check_checkout_age(7200), Duration::from_secs(5 * 3600));
@@ -1639,14 +1648,12 @@ mod tests {
             Some(DiskSpace {
                 free: 900,
                 total: 1000,
+                ..DiskSpace::default()
             })
         };
         pass.evict_builds(
             &names,
-            &FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 5,
-            },
+            &FreeFloor::of_bytes(0, 5),
             &mut report,
         );
         assert!(build.exists());
@@ -1656,14 +1663,12 @@ mod tests {
             Some(DiskSpace {
                 free: 10,
                 total: 1000,
+                ..DiskSpace::default()
             })
         };
         pass.evict_builds(
             &names,
-            &FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 5,
-            },
+            &FreeFloor::of_bytes(0, 5),
             &mut report,
         );
         assert!(!build.exists());

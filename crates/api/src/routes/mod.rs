@@ -1026,10 +1026,20 @@ fn projected_agent_status(
 }
 
 pub fn daemon_response(db: &db::SqliteDb, mut daemon: Daemon) -> DaemonResponse {
-    if services::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
+    // The embedded daemon is the server host: its run cap and its disk are
+    // the server's own.
+    let disk = if services::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
         daemon.max_concurrent_runs = Some(db.server_run_cap.effective().unwrap_or(0));
-    }
+        db.disk_admission.server_facts()
+    } else {
+        daemon
+            .disk_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+    };
     DaemonResponse {
+        disk: db.disk_admission.applied(disk),
+        workspace_floor: db.disk_admission.floor(),
         max_concurrent_runs: daemon.max_concurrent_runs,
         run_limit: daemon.run_limit,
         effective_max_concurrent_runs: services::placement::capacity::effective_machine_cap(

@@ -48,12 +48,15 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 6 adds the integration owner wire: the fence announcement on
+/// Revision 6 added the integration owner wire: the fence announcement on
 /// lookup, `integration.announce`, and Git object export / import.
-pub const DAEMON_PROTOCOL_REVISION: u32 = 6;
-/// Every command RPC requires revision 6.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 6;
-pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 6 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
+/// Revision 7 adds the disk facts of the workspace root to every daemon
+/// report and the free-space floor to its reply: a daemon that does not send
+/// them could fill its disk with work the server keeps placing there.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 7;
+/// Every command RPC requires revision 7.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 7;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 7 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
@@ -1191,7 +1194,7 @@ mod tests {
             super::DAEMON_PROTOCOL_REVISION,
             &old
         ));
-        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 6);
+        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 7);
         let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
         assert_eq!(probe.commands[0].name, "cargo");
         let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
@@ -1459,8 +1462,8 @@ mod tests {
             DAEMON_PROTOCOL_REVISION,
             &revision_2_capabilities
         ));
-        assert_eq!(DAEMON_PROTOCOL_REVISION, 6);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 6);
+        assert_eq!(DAEMON_PROTOCOL_REVISION, 7);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 7);
     }
 
     #[test]

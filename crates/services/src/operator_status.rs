@@ -717,10 +717,17 @@ impl OperatorStatusService {
 
     async fn daemon_pressure(&self) -> Result<Vec<DaemonPressureSummary>, ServiceError> {
         let budget = self.run_process_policy.get();
+        let mut disks: std::collections::HashMap<Option<String>, api_types::MachineDisk> =
+            db::machine_disk::list_machine_disks(&self.db)
+                .await?
+                .into_iter()
+                .map(|row| (row.daemon_id, row.disk))
+                .collect();
         Ok(crate::placement::machine_precheck::snapshot(&self.db)
             .await?
             .into_iter()
             .map(|row| DaemonPressureSummary {
+                disk: disks.remove(&row.daemon_id),
                 daemon_id: row
                     .daemon_id
                     .clone()

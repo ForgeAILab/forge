@@ -14,6 +14,9 @@ pub enum PlacementFilterCode {
     PinMismatch,
     AgentCapacity,
     MachineCapacity,
+    /// The machine's workspace filesystem is under its free-space floor and
+    /// this Task has no worktree there yet.
+    DiskPressure,
     NativeBackendUnsupported,
     RunPurposeDenied,
     NotVisible,
