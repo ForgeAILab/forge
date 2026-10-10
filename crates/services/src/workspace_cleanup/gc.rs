@@ -242,6 +242,12 @@ impl WorkspaceCleanupScheduler {
         if !floor.wants_gc(&facts) {
             return false;
         }
+        // The periodic sweep holds the cursor for its whole pass and is the
+        // same collection: an admission never waits behind it for a second
+        // one.
+        let Ok(mut cursor) = self.sweep_cursor.try_lock() else {
+            return false;
+        };
         {
             let mut last = self
                 .last_reclaim
@@ -252,10 +258,8 @@ impl WorkspaceCleanupScheduler {
             }
             *last = Some(std::time::Instant::now());
         }
-        let report = {
-            let mut cursor = self.sweep_cursor.lock().await;
-            self.gc_pass(&mut cursor, RECLAIM_BUDGET).await
-        };
+        let report = self.gc_pass(&mut cursor, RECLAIM_BUDGET).await;
+        drop(cursor);
         let after = admission.refresh();
         tracing::info!(
             ?report,
