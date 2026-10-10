@@ -4030,6 +4030,7 @@ pub(crate) mod tests {
                     total_inodes: None,
                     measured_at: now_rfc3339(),
                     gc_state: Some("unclaimed".to_owned()),
+                    compiler_cache_bytes: None,
                 })
             }),
         );

@@ -166,6 +166,12 @@ async fn run() {
     // Genesis repo provisioning inside the services crate) fall back to this
     // env var; export the configured value so every path agrees.
     std::env::set_var("FORGE_WORKSPACE_ROOT", &workspace_root);
+    // Opt-in: nothing is installed while `workspace.compiler_cache.wrapper`
+    // is unset.
+    executors::compiler_cache::install_configured(
+        &workspace_root,
+        &config.workspace.compiler_cache,
+    );
     // Same reason: Genesis provisioning runs the scaffold command from the
     // services crate and reads it from the environment.
     std::env::set_var("FORGE_SCAFFOLD_COMMAND", &config.scaffold.command);

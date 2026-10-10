@@ -311,6 +311,7 @@ async fn machine_disk_facts_arrive_with_the_report_and_show_on_every_machine_rea
                 total_inodes: None,
                 measured_at: "2026-10-10T00:00:00Z".to_owned(),
                 gc_state: Some("owned".to_owned()),
+                compiler_cache_bytes: None,
             })
         }),
     );

@@ -3291,6 +3291,40 @@ mod tests {
         assert!(builds[3].join("cargo/marker").exists());
     }
 
+    /// Plan 3.4 F: under the floor the server's collector trims the shared
+    /// compiler cache, also while a check runs (an sccache store tolerates
+    /// it), and every pass measures the cache for the server's disk facts.
+    #[tokio::test]
+    async fn gc_trims_the_shared_compiler_cache_under_the_floor_and_measures_it() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let store = root
+            .join(executors::compiler_cache::CACHE_DIR)
+            .join("repo-a");
+        std::fs::create_dir_all(store.join("0")).unwrap();
+        std::fs::write(
+            store.join(executors::compiler_cache::MARKER_FILE),
+            "sccache",
+        )
+        .unwrap();
+        let entry = store.join("0").join("entry");
+        std::fs::write(&entry, vec![0_u8; 4096]).unwrap();
+        let scheduler = gc_scheduler(&db, &root).await;
+
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(0, 0));
+        let report = gc_at(&scheduler, Duration::ZERO).await;
+        assert_eq!(report.cache_entries_evicted, 0);
+        assert!(entry.exists());
+        assert!(executors::compiler_cache::measured_bytes(&root).is_some_and(|bytes| bytes >= 4096));
+
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(u64::MAX, 100));
+        scheduler.set_live_check_counter(Arc::new(|| 1));
+        let report = gc_at(&scheduler, Duration::ZERO).await;
+        assert_eq!((report.cache_entries_evicted, report.errors), (1, 0));
+        assert!(!entry.exists() && store.join("0").is_dir());
+    }
+
     async fn gc_at(
         scheduler: &WorkspaceCleanupScheduler,
         after: Duration,
@@ -3683,6 +3717,7 @@ mod tests {
                     total_inodes: None,
                     measured_at: now_rfc3339(),
                     gc_state: Some("owned".to_owned()),
+                    compiler_cache_bytes: None,
                 })
             }),
         );
@@ -3737,6 +3772,7 @@ mod tests {
                     total_inodes: None,
                     measured_at: now_rfc3339(),
                     gc_state: Some("owned".to_owned()),
+                    compiler_cache_bytes: None,
                 })
             }),
         );

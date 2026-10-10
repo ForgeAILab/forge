@@ -8252,6 +8252,7 @@ async fn disk_pressure_waits_in_initial_state_then_starts_when_the_reading_recov
                 total_inodes: None,
                 measured_at: db::now_rfc3339(),
                 gc_state: Some("owned".to_owned()),
+                compiler_cache_bytes: None,
             })
         }),
     );
@@ -8388,6 +8389,7 @@ async fn disk_wait_is_reread_by_the_loop_tick_on_a_timer_and_survives_a_restart(
                 total_inodes: None,
                 measured_at: db::now_rfc3339(),
                 gc_state: Some("owned".to_owned()),
+                compiler_cache_bytes: None,
             })
         }),
     );

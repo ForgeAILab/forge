@@ -159,6 +159,14 @@ pub struct MachineDiskFacts {
     /// `owned`, or why not (`unclaimed`, `claimed_by_other`, `refused`).
     #[serde(default)]
     pub gc_state: Option<String>,
+    /// Bytes of the machine's shared compiler cache
+    /// (`workspace.compiler_cache`) as its collector last measured them.
+    /// Unset when the machine has none or has not measured it yet. Already
+    /// part of `total_bytes - free_bytes`; the collector trims it before it
+    /// evicts any Task's build output.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub compiler_cache_bytes: Option<u64>,
 }
 
 impl MachineDiskFacts {
@@ -205,6 +213,7 @@ mod tests {
             total_inodes: inodes.map(|(_, total)| total),
             measured_at: "2026-10-10T00:00:00Z".to_owned(),
             gc_state: None,
+            compiler_cache_bytes: None,
         }
     }
 

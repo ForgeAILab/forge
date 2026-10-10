@@ -685,6 +685,9 @@ fn clear_forge_env() {
         "FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT",
         "FORGE_WORKSPACE_GC_FREE_BYTES",
         "FORGE_WORKSPACE_GC_FREE_PERCENT",
+        "FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER",
+        "FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES",
+        "FORGE_WORKSPACE_COMPILER_CACHE_DIR",
         "FORGE_AGENT_MAX_CONCURRENT_TASKS",
         "FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
         "FORGE_AGENT_MAX_MISSED_HEARTBEATS",
@@ -726,6 +729,58 @@ fn max_disconnect_defaults_and_obeys_file_env_override_precedence() {
     .expect("override loads");
     assert_eq!(loaded.workspace.max_disconnect_seconds, 1200);
     clear_forge_env();
+}
+
+#[test]
+fn compiler_cache_is_off_by_default_and_obeys_file_then_env() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("forge.yaml");
+    let defaults = ForgeConfig::with_data_dir(dir.path().to_path_buf())
+        .workspace
+        .compiler_cache;
+    assert_eq!(
+        (defaults.wrapper, defaults.max_bytes, defaults.dir),
+        (None, 20 * 1024 * 1024 * 1024, None)
+    );
+    fs::write(
+        &path,
+        "workspace:\n  compiler_cache:\n    wrapper: sccache\n    max_bytes: 5000\n    dir: /var/forge-cache\n",
+    )
+    .expect("config writes");
+    let cache = ForgeConfig::load(Some(&path), test_overrides(dir.path()))
+        .expect("file loads")
+        .workspace
+        .compiler_cache;
+    assert_eq!(cache.wrapper.as_deref(), Some("sccache"));
+    assert_eq!(cache.max_bytes, 5000);
+    assert_eq!(
+        cache.dir,
+        Some(std::path::PathBuf::from("/var/forge-cache"))
+    );
+
+    env::set_var("FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER", "/opt/bin/kache");
+    env::set_var("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES", "7000");
+    env::set_var("FORGE_WORKSPACE_COMPILER_CACHE_DIR", "/srv/cache");
+    let cache = ForgeConfig::load(Some(&path), test_overrides(dir.path()))
+        .expect("env loads")
+        .workspace
+        .compiler_cache;
+    assert_eq!(cache.wrapper.as_deref(), Some("/opt/bin/kache"));
+    assert_eq!(cache.max_bytes, 7000);
+    assert_eq!(cache.dir, Some(std::path::PathBuf::from("/srv/cache")));
+    env::set_var("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES", "many");
+    assert!(ForgeConfig::load(Some(&path), test_overrides(dir.path())).is_err());
+    clear_forge_env();
+
+    // An empty wrapper in the file is the feature left off.
+    fs::write(&path, "workspace:\n  compiler_cache:\n    wrapper: \"\"\n").expect("config writes");
+    let cache = ForgeConfig::load(Some(&path), test_overrides(dir.path()))
+        .expect("file loads")
+        .workspace
+        .compiler_cache;
+    assert_eq!(cache.wrapper, None);
 }
 
 #[test]

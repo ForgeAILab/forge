@@ -174,6 +174,7 @@ impl DaemonArgs {
                 executors::run_process::install_machine_policy(Arc::new(
                     executors::run_process::MachineRunPolicy::new(budget),
                 ));
+                daemon_config.install_compiler_cache(&workspace_root, None, None, None);
                 let max_concurrent_runs = daemon_config.run_cap(*max_concurrent_runs);
                 let hostname = hostname
                     .clone()
@@ -256,6 +257,7 @@ impl DaemonArgs {
                 executors::run_process::install_machine_policy(Arc::new(
                     executors::run_process::MachineRunPolicy::new(budget),
                 ));
+                daemon_config.install_compiler_cache(&workspace_root, None, None, None);
                 let max_concurrent_runs = daemon_config.run_cap(*max_concurrent_runs);
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(

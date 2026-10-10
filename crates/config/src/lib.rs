@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod compiler_cache;
 mod defaults;
 mod error;
 mod file;
@@ -15,6 +16,7 @@ mod runtime;
 mod tests;
 mod types;
 
+pub use compiler_cache::{CompilerCacheConfig, DEFAULT_COMPILER_CACHE_MAX_BYTES};
 pub use defaults::{
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CHECK_RUN_TIMEOUT_SECONDS,

@@ -145,7 +145,9 @@ pub fn disk_report(workspace_root: &Path) -> Option<api_types::MachineDiskFacts>
         .as_ref()
         .and_then(|states| states.get(&resolved).copied())
         .unwrap_or("unclaimed");
-    Some(space.facts(chrono::Utc::now().to_rfc3339(), Some(gc_state.to_owned())))
+    let mut facts = space.facts(chrono::Utc::now().to_rfc3339(), Some(gc_state.to_owned()));
+    facts.compiler_cache_bytes = executors::compiler_cache::measured_bytes(workspace_root);
+    Some(facts)
 }
 const GC_BUDGET: Duration = Duration::from_secs(60);
 const GC_PAGE: usize = 64;
@@ -401,6 +403,9 @@ impl DaemonWorkspaceBackend {
             if idle {
                 pass.remove(&legacy, &mut report);
             }
+            // Before any Task's build output: a cache entry is cheaper to
+            // lose than a Task's whole build.
+            pass.evict_compiler_cache(&floor, live_commands > 0, &mut report);
             pass.evict_builds(&candidates, &floor, &mut report);
             report
         })

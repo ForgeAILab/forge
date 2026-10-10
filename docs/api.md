@@ -3681,8 +3681,15 @@ report:
 ```json
 { "free_bytes": 52428800000, "total_bytes": 500000000000,
   "free_inodes": 4000000, "total_inodes": 32000000,
-  "measured_at": "2026-10-10T12:00:00Z", "gc_state": "owned" }
+  "measured_at": "2026-10-10T12:00:00Z", "gc_state": "owned",
+  "compiler_cache_bytes": 3221225472 }
 ```
+
+`compiler_cache_bytes` is the size of the machine's opt-in shared compiler
+cache (`workspace.compiler_cache`) as its garbage collector last measured it;
+`null` or absent when the machine has none or has not measured it yet. It is
+already part of the used space, and it is what the collector trims first
+while the machine is under its floor.
 
 `free_inodes` and `total_inodes` are `null` (or absent) on a filesystem that
 does not count them. The server stores the reading with `measured_at` set to

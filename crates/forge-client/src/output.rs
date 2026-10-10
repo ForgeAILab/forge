@@ -205,6 +205,7 @@ mod disk_cell_tests {
                 total_inodes: None,
                 measured_at: "2026-10-10T00:00:00Z".to_owned(),
                 gc_state: None,
+                compiler_cache_bytes: None,
             },
             &DiskFloor::of_bytes(10 * GIB, 0),
         )

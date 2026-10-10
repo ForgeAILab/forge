@@ -458,3 +458,41 @@ async fn prepare_of_a_new_worktree_is_refused_under_the_floor_and_an_existing_on
         .expect("an existing worktree is not refused");
     gc::accept_floor(&root, Some(FreeFloor::of_bytes(0, 0)));
 }
+
+/// Plan 3.4 F: under the floor a daemon's collector trims its shared
+/// compiler cache before any handle's build output, and its disk report
+/// carries the size its collector measured.
+#[tokio::test]
+async fn compiler_cache_is_trimmed_under_the_floor_and_reported() {
+    let fixture = Fixture::new().await;
+    let root = fixture.dir.path();
+    let store = root
+        .join(executors::compiler_cache::CACHE_DIR)
+        .join("repo-a");
+    std::fs::create_dir_all(store.join("0")).unwrap();
+    std::fs::write(
+        store.join(executors::compiler_cache::MARKER_FILE),
+        "sccache",
+    )
+    .unwrap();
+    let entry = store.join("0").join("entry");
+    std::fs::write(&entry, vec![0_u8; 4096]).unwrap();
+
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now(), FreeFloor::of_bytes(0, 0))
+        .await;
+    assert_eq!(report.cache_entries_evicted, 0);
+    assert!(entry.exists());
+    let facts = gc::disk_report(root).expect("the test filesystem is readable");
+    assert!(facts
+        .compiler_cache_bytes
+        .is_some_and(|bytes| bytes >= 4096));
+
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now(), FreeFloor::of_bytes(u64::MAX, 100))
+        .await;
+    assert_eq!((report.cache_entries_evicted, report.errors), (1, 0));
+    assert!(!entry.exists() && store.join("0").is_dir());
+}

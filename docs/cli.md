@@ -749,6 +749,13 @@ their credentials. `forge-daemon`, `forge-ctl daemon link` and
 override the file. This is daemon-local policy, with no transport override and
 no daemon protocol change. Remote policy facts are not reported.
 
+A daemon's opt-in shared compiler cache is `workspace.compiler_cache`
+(`wrapper`, `max_bytes`, `dir`) in the same `daemon.yaml`; `forge-daemon`
+accepts `--compiler-cache-wrapper`, `--compiler-cache-max-bytes` and
+`--compiler-cache-dir` to override it (`forge-ctl daemon link` and
+`forge-ctl daemon start` read the file only). See "Shared compiler cache" in
+`docs/getting-started.md`.
+
 ## Task action commands
 
 `forge-ctl task actions <id>` prints current offers and version. `forge-ctl task action <id> <verb> [--version N] [flags]` applies one; without `--version` it reads the current version first. Verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`.

@@ -9,4 +9,12 @@ export type MachineDiskFacts = { free_bytes: number, total_bytes: number, free_i
  * Whether the machine's workspace garbage collector runs on this root:
  * `owned`, or why not (`unclaimed`, `claimed_by_other`, `refused`).
  */
-gc_state: string | null, };
+gc_state: string | null, 
+/**
+ * Bytes of the machine's shared compiler cache
+ * (`workspace.compiler_cache`) as its collector last measured them.
+ * Unset when the machine has none or has not measured it yet. Already
+ * part of `total_bytes - free_bytes`; the collector trims it before it
+ * evicts any Task's build output.
+ */
+compiler_cache_bytes: number | null, };
