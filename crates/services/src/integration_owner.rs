@@ -980,6 +980,58 @@ impl ServerIntegrationOwner {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::integration_worker::IntegrationOwnerPort for ServerIntegrationOwner {
+    async fn rebase(
+        &self,
+        request: crate::integration_worker::OwnerRebaseRequest,
+    ) -> Result<OwnerRebaseReceipt> {
+        ServerIntegrationOwner::rebase(
+            self,
+            ServerRebaseRequest {
+                fence: &request.fence,
+                workspace: &request.workspace,
+                target_branch: &request.target_branch,
+                expected_head_sha: &request.expected_head_sha,
+                expected_target_sha: &request.expected_target_sha,
+                handoff_conflicts: request.handoff_conflicts,
+                deadline: request.deadline,
+                cancel: &request.cancel,
+            },
+        )
+        .await
+    }
+    async fn fast_forward(
+        &self,
+        request: crate::integration_worker::OwnerFastForwardRequest,
+    ) -> Result<OwnerMergeReceipt> {
+        // Never cancelled: a started fast-forward runs to its receipt or to
+        // the owner's own bound.
+        let never = CancellationToken::new();
+        self.merge(ServerMergeRequest {
+            fence: &request.fence,
+            workspace: &request.workspace,
+            target_branch: &request.target_branch,
+            task_branch: &request.task_branch,
+            expected_head_sha: &request.candidate_sha,
+            expected_target_sha: &request.target_sha,
+            reviewed: Some(integration_effects::merge::ReviewedMergeObject {
+                commit_sha: request.candidate_sha.clone(),
+                base_sha: request.target_sha.clone(),
+            }),
+            cancel: &never,
+            deadline: Some(request.deadline),
+        })
+        .await
+    }
+    async fn reconcile_effect(&self, request: &IntegrationEffectRequest) -> Result<()> {
+        ServerIntegrationOwner::reconcile_effect(self, request).await
+    }
+    async fn reconcile_outstanding(&self) -> Result<()> {
+        ServerIntegrationOwner::reconcile_outstanding(self).await
+    }
+}
+
 /// Validate owner facts before persistence or journal acknowledgement.
 pub(crate) fn validate_attempt_receipt(receipt: &db::IntegrationEffectReceipt) -> Result<()> {
     let invalid = || {

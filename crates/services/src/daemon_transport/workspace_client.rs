@@ -1564,32 +1564,39 @@ impl DaemonWorkspaceClient {
             // The owner answered. Whatever it said about this one attempt is
             // settled here; only a transport failure above stops the pass.
             let task_step = db::is_task_step(&request);
-            let lookup = serde_json::from_value::<WorkspaceReconcileResult>(value)
-                .map_err(|error| error.to_string())
-                .and_then(|lookup| {
-                    if lookup.operation_id != params.operation_id {
-                        return Err("owner lookup returned another attempt".to_owned());
+            let parsed = serde_json::from_value::<WorkspaceReconcileResult>(value)
+                .map_err(|error| error.to_string());
+            // What the owner's own records said about this intent before it
+            // answered. Only a queue claim's lookup carries it.
+            let owner_intent = parsed
+                .as_ref()
+                .ok()
+                .and_then(|lookup| lookup.owner_fence.as_ref())
+                .map(|fence| fence.intent);
+            let lookup = parsed.and_then(|lookup| {
+                if lookup.operation_id != params.operation_id {
+                    return Err("owner lookup returned another attempt".to_owned());
+                }
+                let receipt = match &lookup.outcome {
+                    WorkspaceReconcileOutcome::Result { result } => {
+                        result.get("integration_receipt")
                     }
-                    let receipt = match &lookup.outcome {
-                        WorkspaceReconcileOutcome::Result { result } => {
-                            result.get("integration_receipt")
-                        }
-                        WorkspaceReconcileOutcome::Error { error } => error
-                            .details
-                            .as_ref()
-                            .and_then(|details| details.get("integration_receipt")),
-                    }
-                    .cloned()
-                    .ok_or("owner lookup did not return an attempt receipt")?;
-                    let receipt: db::IntegrationEffectReceipt =
-                        serde_json::from_value(receipt).map_err(|error| error.to_string())?;
-                    crate::integration_owner::validate_attempt_receipt(&receipt)
-                        .map_err(|error| error.to_string())?;
-                    if receipt.request != request {
-                        return Err("owner receipt belongs to another request".to_owned());
-                    }
-                    Ok((lookup.entry_id, receipt))
-                });
+                    WorkspaceReconcileOutcome::Error { error } => error
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("integration_receipt")),
+                }
+                .cloned()
+                .ok_or("owner lookup did not return an attempt receipt")?;
+                let receipt: db::IntegrationEffectReceipt =
+                    serde_json::from_value(receipt).map_err(|error| error.to_string())?;
+                crate::integration_owner::validate_attempt_receipt(&receipt)
+                    .map_err(|error| error.to_string())?;
+                if receipt.request != request {
+                    return Err("owner receipt belongs to another request".to_owned());
+                }
+                Ok((lookup.entry_id, receipt))
+            });
             let (entry_id, receipt) = match lookup {
                 Ok(found) => found,
                 Err(reason) => {
@@ -1605,10 +1612,34 @@ impl DaemonWorkspaceClient {
                             )
                             .await
                             .map_err(ServiceError::from)?;
+                    } else if owner_intent == Some(IntegrationIntentRecord::NotPerformed) {
+                        // The owner already knew this claim generation and
+                        // holds no intent for the operation: it never ran
+                        // there, and the owner has fenced it off. That is a
+                        // settlement even without a usable receipt.
+                        guard
+                            .record(
+                                serde_json::json!({"kind":"not_performed"}),
+                                db::IntegrationOperationState::Failed,
+                            )
+                            .await
+                            .map_err(ServiceError::from)?;
                     }
                     continue;
                 }
             };
+            // The owner had never been told of this claim generation, so its
+            // empty journal proves nothing (lost or replaced owner state).
+            // Whatever the receipt says, that is never a settlement and never
+            // permission to repeat the effect: the intent stays uncertain for
+            // its owner and the worker's reconcile timer keeps asking.
+            if !task_step
+                && owner_intent == Some(IntegrationIntentRecord::Unknown)
+                && receipt.operation_state != db::IntegrationOperationState::Uncertain
+            {
+                tracing::warn!(target: "services::daemon_transport", %daemon_id, attempt_id = %request.fence.attempt_id, "owner has no record of the claim generation; its answer does not settle the attempt");
+                continue;
+            }
             // The owner could not prove a Task-step effect either way. Keeping
             // it uncertain would refuse every later effect on this checkout.
             if task_step && receipt.operation_state == db::IntegrationOperationState::Uncertain {
@@ -2054,12 +2085,45 @@ impl DaemonWorkspaceClient {
                     daemon_id: daemon_id.into(),
                     runtime_id: runtime_id.into(),
                     key: key.into(),
+                    attempt: None,
                 },
             )
             .await;
         if let Err(error) = released {
             tracing::warn!(target: "services::daemon_transport", %daemon_id, %key, %error, "object transfer staging was not released");
         }
+    }
+
+    /// Delete every ref an attempt imported in one checkout of an owner
+    /// (`refs/forge/integration/<attempt>-*`) and the attempt's staging.
+    /// Idempotent. Returns how many refs were deleted.
+    pub async fn release_attempt_objects(
+        &self,
+        target: DaemonObjectEndpoint<'_>,
+        attempt_id: &str,
+    ) -> Result<u32> {
+        let released: ReleaseObjectsResult = self
+            .integration_request(
+                target.daemon_id,
+                METHOD_INTEGRATION_RELEASE_OBJECTS,
+                &ReleaseObjectsParams {
+                    daemon_id: target.daemon_id.into(),
+                    runtime_id: target.runtime_id.into(),
+                    // The handler takes one key; the attempt's keys all start
+                    // with its id.
+                    key: api_types::object_transfer_key(
+                        attempt_id,
+                        0,
+                        api_types::ObjectTransferDirection::Inbound,
+                    ),
+                    attempt: Some(api_types::ReleaseAttemptRefs {
+                        attempt_id: attempt_id.into(),
+                        repo_location_id: target.repo_location_id.into(),
+                    }),
+                },
+            )
+            .await?;
+        Ok(released.removed_refs)
     }
 }
 

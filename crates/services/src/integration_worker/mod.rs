@@ -15,7 +15,7 @@ pub use driver::{HeadDriver, ParkReason, Pass};
 pub use ports::*;
 pub use table::{head_row, CancelRule, HeadAction, HeadStateRow, HeadTimeout, HEAD_TABLE};
 
-use crate::{integration_owner::ServerIntegrationOwner, Result, ServiceError};
+use crate::{Result, ServiceError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use db::{
@@ -59,6 +59,21 @@ pub struct IntegrationWorkerConfig {
     pub max_rounds: i64,
     pub transfer_cap_bytes: u64,
     pub page: u32,
+    /// While a head waits for a check verdict, ask for it again this often.
+    /// The ask joins the running check, or applies a verdict whose delivery
+    /// to the Task failed, so a lost delivery is not waited out.
+    pub check_reask: Duration,
+    /// Times one session asks again for a deciding step (`request_check`,
+    /// `settle`) that settled without answering, before it parks the head.
+    pub step_reasks: u32,
+    /// The Task-step side's timers (`IntegrationSteps::with_timers`): how
+    /// long the protected `result` step sleeps before it looks for itself,
+    pub result_wake: Duration,
+    /// its poll while a fast-forward is in flight or unknown,
+    pub result_poll: Duration,
+    /// and how long a `result` that could not be applied waits. The worker
+    /// re-arms it on every sweep while the attempt is `applied`.
+    pub result_park: Duration,
 }
 impl Default for IntegrationWorkerConfig {
     fn default() -> Self {
@@ -86,6 +101,11 @@ impl Default for IntegrationWorkerConfig {
             max_rounds: 9,
             transfer_cap_bytes: 256 * 1024 * 1024,
             page: 100,
+            check_reask: Duration::from_secs(60),
+            step_reasks: 2,
+            result_wake: Duration::from_secs(150),
+            result_poll: Duration::from_secs(15),
+            result_park: Duration::from_secs(600),
         }
     }
 }
@@ -109,13 +129,38 @@ struct Shared {
     /// are claimable than `max_heads`.
     cursor: Option<String>,
     reconcile_after: HashMap<String, DateTime<Utc>>,
-    /// Queued members of a suspended queue whose Task was told, by queue.
-    suspended_told: HashMap<String, HashSet<String>>,
+}
+
+/// Bound of the worker's own journal on an attempt (`operation_receipts_json`).
+pub(crate) const JOURNAL_MAX: usize = 64;
+pub(crate) fn journal_push(attempt: &mut IntegrationAttempt, entry: serde_json::Value) {
+    let mut journal = attempt
+        .operation_receipts_json
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    journal.push(entry);
+    let excess = journal.len().saturating_sub(JOURNAL_MAX);
+    journal.drain(..excess);
+    attempt.operation_receipts_json = journal.into();
+}
+/// The Task of this waiting member was told its queue is suspended, at the
+/// member's present `effect_seq`. Stored on the attempt, so a restart neither
+/// tells it twice nor forgets to tell it the wait is over.
+fn told_suspended(attempt: &IntegrationAttempt) -> bool {
+    attempt
+        .operation_receipts_json
+        .as_array()
+        .and_then(|journal| journal.last())
+        .is_some_and(|entry| {
+            entry["kind"] == "worker_told"
+                && entry["effect_seq"].as_i64() == Some(attempt.effect_seq)
+        })
 }
 
 pub struct IntegrationQueueWorker {
     pub(crate) db: Arc<SqliteDb>,
-    pub(crate) owner: Arc<ServerIntegrationOwner>,
+    pub(crate) owner: Arc<dyn IntegrationOwnerPort>,
     pub(crate) steps: Arc<dyn IntegrationStepPort>,
     pub(crate) facts: Arc<dyn IntegrationFactsPort>,
     pub(crate) transfer: Arc<dyn ObjectTransferPort>,
@@ -146,7 +191,7 @@ pub(crate) fn is_conflict(error: &ServiceError) -> bool {
 impl IntegrationQueueWorker {
     pub fn new(
         db: Arc<SqliteDb>,
-        owner: Arc<ServerIntegrationOwner>,
+        owner: Arc<dyn IntegrationOwnerPort>,
         steps: Arc<dyn IntegrationStepPort>,
         facts: Arc<dyn IntegrationFactsPort>,
         transfer: Arc<dyn ObjectTransferPort>,
@@ -204,6 +249,11 @@ impl IntegrationQueueWorker {
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let stop = CancellationToken::new();
         let mut heads: JoinSet<()> = JoinSet::new();
+        // No transfer of this process is running yet: leftovers of a crashed
+        // one, and the refs of attempts that hold no slot, can go.
+        if let Err(error) = self.transfer.sweep_at_start().await {
+            tracing::warn!(target: "services::integration_worker", %error, "integration transfer sweep failed at start");
+        }
         loop {
             if *shutdown.borrow_and_update() {
                 break;
@@ -411,14 +461,54 @@ impl IntegrationQueueWorker {
                 if attempt.cancel_requested_at.is_some() {
                     continue;
                 }
+                // A counted retry (infrastructure, timeout) is over: one
+                // `park` step restates `waiting` on the Task (the handler
+                // reads the attempt as it is then). It gets a fresh
+                // `effect_seq`; the park that began the wait used the present
+                // one. Enqueued first: a step whose attempt is not re-queued
+                // yet retries, and a repeat is the same key. A wait with no
+                // end of its own (a paused Project, a target that is not
+                // ready) restates nothing until it really ends: its Task was
+                // told once when the wait began.
+                let counted = attempt
+                    .operation_receipts_json
+                    .as_array()
+                    .and_then(|journal| {
+                        journal
+                            .iter()
+                            .rev()
+                            .find(|entry| entry["kind"] == "worker_park")
+                    })
+                    .is_none_or(|entry| entry["counted"] == true);
+                let seq = attempt.effect_seq + i64::from(counted);
+                if counted {
+                    let mut restate = Self::step_request(&attempt, IntegrationStepAction::Park);
+                    restate.effect_seq = seq;
+                    if let Err(error) = self.steps.enqueue_step(&restate).await {
+                        tracing::warn!(target: "services::integration_worker", attempt_id = %attempt.id, %error, "integration re-queue step was not enqueued; the next sweep retries");
+                        continue;
+                    }
+                }
                 match self
-                    .advance(&attempt.id, IntegrationAttemptState::Queued, |attempt| {
+                    .advance_if(&attempt.id, IntegrationAttemptState::Queued, |attempt| {
+                        if attempt.state != IntegrationAttemptState::Parked
+                            || attempt.effect_seq + i64::from(counted) != seq
+                        {
+                            return false;
+                        }
                         attempt.available_at = None;
                         attempt.resume_state = None;
+                        if counted {
+                            attempt.effect_seq = seq;
+                            attempt.effect_ack_json = None;
+                            attempt.acknowledged_at = None;
+                        }
+                        true
                     })
                     .await
                 {
-                    Ok(_) => requeued = true,
+                    Ok(Some(_)) => requeued = true,
+                    Ok(None) => {}
                     Err(error) if is_conflict(&error) => {}
                     Err(error) => {
                         tracing::warn!(target: "services::integration_worker", attempt_id = %attempt.id, %error, "integration parked retry failed for one attempt");
@@ -561,11 +651,11 @@ impl IntegrationQueueWorker {
             .await
         {
             Ok(claimed) => {
-                self.shared
-                    .lock()
-                    .expect("integration worker state")
-                    .suspended_told
-                    .remove(&claimed.id);
+                // The queue is open (the claim re-opens a suspended one):
+                // members that were told it is suspended wait in line again.
+                if let Err(error) = self.restate_waiting(&claimed).await {
+                    tracing::warn!(target: "services::integration_worker", queue_id = %claimed.id, %error, "integration members were not told their queue re-opened; the next claim retries");
+                }
                 Ok(Some(HeadDriver::new(Arc::clone(self), &claimed)))
             }
             Err(db::DbError::NotFound) => Ok(None),
@@ -594,26 +684,67 @@ impl IntegrationQueueWorker {
             if !waits || member.cancel_requested_at.is_some() {
                 continue;
             }
-            let told = self
-                .shared
-                .lock()
-                .expect("integration worker state")
-                .suspended_told
-                .get(queue_id)
-                .is_some_and(|told| told.contains(&member.id));
-            if told {
+            if told_suspended(&member) {
                 continue;
             }
             self.steps
                 .enqueue_step(&Self::step_request(&member, IntegrationStepAction::Park))
                 .await?;
-            self.shared
-                .lock()
-                .expect("integration worker state")
-                .suspended_told
-                .entry(queue_id.to_owned())
-                .or_default()
-                .insert(member.id);
+            let (seq, at) = (member.effect_seq, stamp(self.clock.now()));
+            match self
+                .advance_if(&member.id, member.state, move |member| {
+                    if member.effect_seq != seq {
+                        return false;
+                    }
+                    journal_push(
+                        member,
+                        serde_json::json!({"kind":"worker_told","reason":"queue_suspended","effect_seq":seq,"at":at}),
+                    );
+                    true
+                })
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Produce `park` for every waiting member whose Task was told the queue
+    /// is suspended: the step now finds an open queue and restates `waiting`.
+    /// Level-triggered on the stored mark, so it also runs for a queue that
+    /// re-opened under a process that died before telling anyone.
+    async fn restate_waiting(&self, claimed: &IntegrationQueue) -> Result<()> {
+        for member in self.db.integration_members(&claimed.id, 1000).await? {
+            if member.state != IntegrationAttemptState::Queued
+                || claimed.head_attempt_id.as_deref() == Some(&member.id)
+                || member.cancel_requested_at.is_some()
+                || !told_suspended(&member)
+            {
+                continue;
+            }
+            let seq = member.effect_seq + 1;
+            let mut restate = Self::step_request(&member, IntegrationStepAction::Park);
+            restate.effect_seq = seq;
+            self.steps.enqueue_step(&restate).await?;
+            match self
+                .advance_if(&member.id, IntegrationAttemptState::Queued, move |member| {
+                    if member.effect_seq + 1 != seq {
+                        return false;
+                    }
+                    member.effect_seq = seq;
+                    member.effect_ack_json = None;
+                    member.acknowledged_at = None;
+                    true
+                })
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

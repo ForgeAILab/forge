@@ -6,9 +6,7 @@
 //! - the `settle` step, when the target did not move (no check is asked);
 //! - the check's delivery (`apply_check_result`, through
 //!   [`IntegrationCheckFamily`]), after a `request_check` for a rebased head.
-use super::{
-    ack_value, bounded, IntegrationSteps, StepOutcome, TaskStepIntegrationPort, RESULT_WAKE_SECONDS,
-};
+use super::{ack_value, bounded, IntegrationSteps, StepOutcome, TaskStepIntegrationPort};
 use crate::{
     check_runner::consumer::{
         CheckApplication, CheckConsumerFamily, CheckVerdict, TaskCheckRequest,
@@ -720,7 +718,7 @@ impl IntegrationSteps {
                     action: IntegrationStepAction::Result,
                     ..request.clone()
                 };
-                let wake = chrono::Utc::now() + chrono::Duration::seconds(RESULT_WAKE_SECONDS);
+                let wake = chrono::Utc::now() + self.timers.result_wake;
                 let input = TaskStepIntegrationPort::step_input(
                     &result,
                     &attempt.expected_status,

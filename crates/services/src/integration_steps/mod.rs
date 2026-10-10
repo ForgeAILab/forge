@@ -49,16 +49,43 @@ pub use settle::{HeadCheck, HeadCheckSource, IntegrationCheckFamily, ReviewCiHea
 /// The Task-step kind this module consumes.
 pub const INTEGRATION_STEP_KIND: &str = "integration";
 
-/// How long the protected `result` step sleeps before it looks for itself.
-/// The worker readies it the moment the fast-forward is recorded; this only
-/// bounds how long an unused permit keeps a waiting owner command queued.
-pub(crate) const RESULT_WAKE_SECONDS: i64 = 150;
-/// The protected step's poll while a fast-forward is in flight or unknown.
-const RESULT_POLL_SECONDS: i64 = 15;
-/// A `result` that cannot be applied waits this long; `ready_result_step`
-/// re-arms it sooner.
-const RESULT_PARK_SECONDS: i64 = 600;
+/// The timers of the Task-step side of the handshake. They come from the
+/// queue worker's configuration (`IntegrationWorkerConfig`), so both sides
+/// are tuned in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrationStepTimers {
+    /// How long the protected `result` step sleeps before it looks for
+    /// itself. The worker readies it the moment the fast-forward is
+    /// recorded; this only bounds how long an unused permit keeps a waiting
+    /// owner command queued.
+    pub result_wake: chrono::Duration,
+    /// The protected step's poll while a fast-forward is in flight or unknown.
+    pub result_poll: chrono::Duration,
+    /// A `result` that cannot be applied waits this long; the worker re-arms
+    /// it on every sweep (`ready_result_step`).
+    pub result_park: chrono::Duration,
+}
+impl From<&crate::integration_worker::IntegrationWorkerConfig> for IntegrationStepTimers {
+    fn from(config: &crate::integration_worker::IntegrationWorkerConfig) -> Self {
+        let chrono = |duration: std::time::Duration| {
+            chrono::Duration::from_std(duration).unwrap_or_else(|_| chrono::Duration::days(1))
+        };
+        Self {
+            result_wake: chrono(config.result_wake),
+            result_poll: chrono(config.result_poll),
+            result_park: chrono(config.result_park),
+        }
+    }
+}
+impl Default for IntegrationStepTimers {
+    fn default() -> Self {
+        Self::from(&crate::integration_worker::IntegrationWorkerConfig::default())
+    }
+}
 const TEXT_LIMIT: usize = 1000;
+/// Leads the retry reason of a `result` step that found its fast-forward
+/// still in flight.
+const FF_POLL: &str = "fast-forward ";
 
 /// What a handler did with its step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +136,7 @@ pub struct IntegrationSteps {
     pub(crate) task_service: crate::TaskService,
     pub(crate) engine: Arc<WorkflowEngine>,
     pub(crate) head_check: Arc<dyn HeadCheckSource>,
+    pub(crate) timers: IntegrationStepTimers,
 }
 
 impl IntegrationSteps {
@@ -119,7 +147,14 @@ impl IntegrationSteps {
             head_check: Arc::new(ReviewCiHeadCheck::new(Arc::clone(&engine.db))),
             engine,
             task_service,
+            timers: IntegrationStepTimers::default(),
         }
+    }
+    /// Use the timers of the queue worker's configuration (the same
+    /// `IntegrationWorkerConfig` the worker is built with).
+    pub fn with_timers(mut self, timers: IntegrationStepTimers) -> Self {
+        self.timers = timers;
+        self
     }
     /// Replace how the head's check identity is built (tests, and a later
     /// stage that shares the review-entry builder).
@@ -443,13 +478,41 @@ impl IntegrationSteps {
                 self.park_result(step, request, &error.to_string()).await;
                 StepOutcome::RetryAt(
                     bounded(&error.to_string()),
-                    chrono::Utc::now() + chrono::Duration::seconds(RESULT_PARK_SECONDS),
+                    chrono::Utc::now() + self.timers.result_park,
                 )
             }
         };
+        // A poll: the step ran while the fast-forward was still in flight.
+        let polled =
+            matches!(&outcome, StepOutcome::RetryAt(reason, _) if reason.starts_with(FF_POLL));
         if let Err(error) = self.conclude(step, outcome).await {
             // The lease recovers a step whose settlement was lost.
             tracing::warn!(target: "services::integration_steps", task_id = %step.task_id, attempt_id = %request.attempt_id, %error, "integration result step was not settled; its lease recovers it");
+        }
+        if polled {
+            // The worker records `applied` and readies this step in one go.
+            // If that happened while this run held the step, the wake found
+            // nothing pending and the retry above then pushed the step a
+            // whole poll into the future: look once more, now that the step
+            // is pending again.
+            let applied = self
+                .db
+                .integration_attempt(&request.attempt_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|attempt| {
+                    attempt.state == S::Applied && attempt.effect_seq == request.effect_seq
+                });
+            if applied {
+                if let Err(error) = self
+                    .db
+                    .ready_integration_step(&step.task_id, &request.causation_key())
+                    .await
+                {
+                    tracing::warn!(target: "services::integration_steps", task_id = %step.task_id, %error, "integration result step was not re-armed; the worker's sweep re-arms it");
+                }
+            }
         }
         Ok(())
     }
@@ -505,8 +568,8 @@ impl IntegrationSteps {
             S::Applied => {}
             S::FfInflight | S::Reconciling | S::Quarantined => {
                 return Ok(StepOutcome::RetryAt(
-                    format!("fast-forward {}", attempt.state),
-                    chrono::Utc::now() + chrono::Duration::seconds(RESULT_POLL_SECONDS),
+                    format!("{FF_POLL}{}", attempt.state),
+                    chrono::Utc::now() + self.timers.result_poll,
                 ));
             }
             S::AwaitingTaskStep | S::ReadyFf => {
