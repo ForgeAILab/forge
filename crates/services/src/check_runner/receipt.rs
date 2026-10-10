@@ -85,7 +85,7 @@ pub(super) fn validate_receipt(
             command: command.command.clone(),
             exit_code: command.exit_code.unwrap_or(-1),
             stderr_tail: command.stderr_tail.clone(),
-            output_tail: command.stdout_tail.clone(),
+            output_tail: combined_tail(&command.stdout_tail, &command.stderr_tail),
             started_at: command.started_at.clone(),
             finished_at: command.finished_at.clone(),
         });
@@ -159,4 +159,19 @@ pub(super) fn validate_receipt(
         redaction_values: vec![],
         reusable,
     })
+}
+
+/// `output_tail` as command evidence has always carried it: stdout, then
+/// stderr on a new line, cut to the last 4096 bytes. Both inputs are already
+/// redacted tails of at most that size, so the cut equals the one over the
+/// full streams.
+fn combined_tail(stdout: &str, stderr: &str) -> String {
+    let combined = if stdout.is_empty() {
+        stderr.to_owned()
+    } else if stderr.is_empty() {
+        stdout.to_owned()
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    crate::integration_effects::check::tail_bytes(&combined, 4096)
 }

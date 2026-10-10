@@ -3,6 +3,11 @@ use crate::worker_runtime::queue::TaskStepWorker;
 use db::TaskStepRepo;
 use std::time::Duration;
 
+/// A long-lane hooks step that runs for as long as the test holds its gate.
+/// Review-entry CI no longer runs inside the step (the durable check runner
+/// executes it while the step is suspended), so the lane is held by the
+/// test-only `test_hold_step` hook placed before `run_ci_steps`; the entry
+/// has no CI steps and `run_ci_steps` keeps the transition on the long lane.
 async fn queued_ci_for_task(
     fixture: &FailedCiFixture,
     selected: &db::Task,
@@ -10,15 +15,32 @@ async fn queued_ci_for_task(
 ) -> (String, PathBuf, PathBuf) {
     let started = gate.join("started");
     let release = gate.join("release");
-    let quote = |p: &std::path::Path| format!("\"{}\"", p.to_str().unwrap());
-    let script = format!(
-        "touch {}; while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done",
-        quote(&started),
-        quote(&release),
-        quote(gate)
-    );
+    let mut workflow = fixture.workflow.clone();
+    let hooks = &mut workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .hooks
+        .before_enter;
+    let at = hooks
+        .iter()
+        .position(|hook| hook.action == "run_ci_steps")
+        .unwrap();
+    let mut hold = hooks[at].clone();
+    hold.action = "test_hold_step".to_owned();
+    hooks.insert(at, hold);
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&selected.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
     sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
-        .bind(json!({"retry_budgets":{"review":3},"review":{"ci_steps":[script]}}).to_string())
+        .bind(
+            json!({"retry_budgets":{"review":3},"review":{"ci_steps":[],"test_hold_gate":gate.to_str().unwrap()}})
+                .to_string(),
+        )
         .bind(&selected.id)
         .execute(fixture.db.pool())
         .await
@@ -32,7 +54,7 @@ async fn queued_ci_for_task(
         .workflow_execution()
         .cascade_step_input(
             &task,
-            &fixture.workflow,
+            &workflow,
             "review".into(),
             "queued CI".into(),
             Default::default(),

@@ -395,7 +395,26 @@ impl CodingExecutorAdapter for ScriptedAdapter {
 // The real stack
 // ---------------------------------------------------------------------------
 
+/// The durable check worker of one boot. Review-entry CI is a check it
+/// executes; it dies with its server.
+struct Checks {
+    stop: tokio::sync::watch::Sender<bool>,
+    job: tokio::task::JoinHandle<()>,
+}
+impl Checks {
+    fn stop(&self) {
+        let _ = self.stop.send(true);
+        self.job.abort();
+    }
+}
+impl Drop for Checks {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 struct Live {
+    checks: Checks,
     pool: sqlx::SqlitePool,
     runtime: Arc<services::ForgeRuntime>,
     state: AppState,
@@ -490,7 +509,17 @@ impl World {
         );
         let state = AppState::from_runtime_arc(Arc::clone(&runtime), true);
         let app = build_router(state.clone(), dir.join("web"));
+        let (stop, signal) = tokio::sync::watch::channel(false);
+        let checks = Checks {
+            stop,
+            job: state
+                .task_service
+                .check_worker()
+                .expect("the runtime composes the check worker")
+                .start(&state.operator_status_service.periodic_workers(), signal),
+        };
         Live {
+            checks,
             pool,
             runtime,
             state,
@@ -610,6 +639,7 @@ impl World {
         old.script.alive.store(false, Ordering::SeqCst);
         old.script.waiting.lock().unwrap().clear();
         old.runtime.task_dispatcher.stop();
+        old.checks.stop();
         // Whatever the dead process still had in flight can no longer write.
         let _ = tokio::time::timeout(Duration::from_secs(5), old.pool.close()).await;
         drop(old);
@@ -1080,7 +1110,19 @@ impl World {
                 .pending_steps(id)
                 .await
                 .map_err(|error| error.to_string())?;
-            print.push_str(&format!("{index}:{status}@{version}+{pending}["));
+            // A hooks step suspended on review-entry CI is not a pending
+            // step, but the check worker still owes this Task a result.
+            let awaiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status = 'suspended'",
+            )
+            .bind(id)
+            .fetch_one(&self.live().pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            if awaiting > 0 {
+                unowned.push(format!("task {index} waits for a check result"));
+            }
+            print.push_str(&format!("{index}:{status}@{version}+{pending}~{awaiting}["));
             for (execution, role, status) in self.executions(index).await? {
                 print.push_str(&format!("{role}={status},"));
                 let gated = self
@@ -1713,6 +1755,7 @@ async fn run(sequence: &[Step], avoid_open_findings: bool) -> Result<Vec<String>
         live.script.alive.store(false, Ordering::SeqCst);
         live.script.waiting.lock().unwrap().clear();
         live.runtime.task_dispatcher.stop();
+        live.checks.stop();
         let _ = tokio::time::timeout(Duration::from_secs(5), live.pool.close()).await;
     }
     match outcome {

@@ -48,9 +48,24 @@ pub(crate) struct HookPhaseResult {
     /// `run_merge` hit a transient error. Its checkpoint stays open and no
     /// later hook ran; the step queue retries the step with back-off.
     pub retry: Option<String>,
+    /// A hook asked for a check and waits for its result. Its checkpoint
+    /// stays open and no later hook ran; the step is suspended until the
+    /// awaited consumer's delivery wakes it, or until the deadline at the
+    /// latest.
+    pub suspend: Option<HookSuspension>,
 }
 
 impl HookPhaseResult {
+    fn suspended(suspension: HookSuspension) -> Self {
+        Self {
+            follow_up: None,
+            failure: None,
+            blocking_failure: None,
+            merge_failure: None,
+            retry: None,
+            suspend: Some(suspension),
+        }
+    }
     fn retry(reason: String) -> Self {
         Self {
             follow_up: None,
@@ -58,6 +73,7 @@ impl HookPhaseResult {
             blocking_failure: None,
             merge_failure: Some(reason.clone()),
             retry: Some(reason),
+            suspend: None,
         }
     }
 }
@@ -66,6 +82,16 @@ impl HookPhaseResult {
 pub(crate) enum DurableHook {
     Done(HookResult),
     Retry(String),
+    /// The hook waits for a check result.
+    Suspend(HookSuspension),
+}
+
+/// A hook's wait for a check result: the consumer whose delivery wakes the
+/// step, and the latest time the step looks again on its own.
+#[derive(Debug, Clone)]
+pub(crate) struct HookSuspension {
+    pub consumer_id: String,
+    pub until: String,
 }
 
 #[derive(Clone)]
@@ -73,9 +99,10 @@ pub(crate) struct HookAttempt {
     pub db: Arc<db::SqliteDb>,
     pub step: db::TaskStep,
     pub index: i64,
-    pub interrupted: bool,
     /// Set when the hook's failure came from a transient error.
     pub transient: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by a hook that asked for a check and must wait for its result.
+    pub suspend: Arc<std::sync::Mutex<Option<HookSuspension>>>,
 }
 tokio::task_local! { static HOOK_ATTEMPT: HookAttempt; }
 pub(crate) fn current_hook(task_id: &str) -> Option<HookAttempt> {
@@ -94,6 +121,43 @@ pub(crate) fn note_hook_failure(task_id: &str, error: &ServiceError) {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Suspend the running hooks step once this hook returns: the hook asked for
+/// a check and its result arrives later. `false` outside a hooks step.
+pub(crate) fn suspend_hook(task_id: &str, consumer_id: &str, until: String) -> bool {
+    match current_hook(task_id) {
+        Some(attempt) => {
+            *attempt.suspend.lock().unwrap_or_else(|p| p.into_inner()) = Some(HookSuspension {
+                consumer_id: consumer_id.to_owned(),
+                until,
+            });
+            true
+        }
+        None => false,
+    }
+}
+
+/// Run `future` as hook `index` of the claimed `step`, outside the engine:
+/// its effects are recorded on that step's checkpoint. Returns the wait the
+/// hook asked for, if any. For tests that drive one hook action directly.
+pub(crate) async fn in_hook<T>(
+    db: Arc<db::SqliteDb>,
+    step: db::TaskStep,
+    index: i64,
+    future: impl std::future::Future<Output = T>,
+) -> (T, Option<HookSuspension>) {
+    let suspend = Arc::new(std::sync::Mutex::new(None));
+    let attempt = HookAttempt {
+        db,
+        step,
+        index,
+        transient: Arc::default(),
+        suspend: suspend.clone(),
+    };
+    let out = HOOK_ATTEMPT.scope(attempt, future).await;
+    let wait = suspend.lock().unwrap_or_else(|p| p.into_inner()).take();
+    (out, wait)
 }
 
 pub(crate) async fn hook_effect(task_id: &str, key: &str) -> crate::Result<Option<String>> {
@@ -151,7 +215,7 @@ impl WorkflowExecution<'_> {
         hook: &api_types::HookSpec,
         ctx: &HookContext,
     ) -> crate::Result<DurableHook> {
-        let (recorded, interrupted) = self.db.start_hook(step, index).await?;
+        let (recorded, _) = self.db.start_hook(step, index).await?;
         if let Some(recorded) = recorded {
             return serde_json::from_str(&recorded)
                 .map(DurableHook::Done)
@@ -159,14 +223,20 @@ impl WorkflowExecution<'_> {
         }
         let action = registry::resolve_action(&hook.action)?;
         let transient = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let suspend = Arc::new(std::sync::Mutex::new(None));
         let attempt = HookAttempt {
             db: self.db.clone(),
             step: step.clone(),
             index,
-            interrupted,
             transient: transient.clone(),
+            suspend: suspend.clone(),
         };
         let result = HOOK_ATTEMPT.scope(attempt, action.execute(ctx)).await;
+        if let Some(suspension) = suspend.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            // Leave the checkpoint open: the woken step runs this hook
+            // again and it settles from the delivered result.
+            return Ok(DurableHook::Suspend(suspension));
+        }
         if let HookResult::Failed { reason } = &result {
             if hook.action == "run_merge" && transient.load(std::sync::atomic::Ordering::Relaxed) {
                 // Leave the checkpoint open: the retried step resumes this
@@ -342,6 +412,7 @@ impl WorkflowExecution<'_> {
             {
                 DurableHook::Done(result) => result,
                 DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                DurableHook::Suspend(wait) => return Ok(HookPhaseResult::suspended(wait)),
             };
             self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                 .await?;
@@ -439,6 +510,7 @@ impl WorkflowExecution<'_> {
                 {
                     DurableHook::Done(result) => result,
                     DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                    DurableHook::Suspend(wait) => return Ok(HookPhaseResult::suspended(wait)),
                 };
                 self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                     .await?;
@@ -739,6 +811,7 @@ impl WorkflowExecution<'_> {
                 {
                     DurableHook::Done(result) => result,
                     DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                    DurableHook::Suspend(wait) => return Ok(HookPhaseResult::suspended(wait)),
                 };
                 self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                     .await?;
@@ -917,6 +990,7 @@ impl WorkflowExecution<'_> {
                 {
                     DurableHook::Done(result) => result,
                     DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                    DurableHook::Suspend(wait) => return Ok(HookPhaseResult::suspended(wait)),
                 };
                 self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                     .await?;
@@ -1067,6 +1141,7 @@ impl WorkflowExecution<'_> {
                     blocking_failure,
                     merge_failure,
                     retry: None,
+                    suspend: None,
                 });
             }
 
@@ -1114,6 +1189,7 @@ impl WorkflowExecution<'_> {
             blocking_failure,
             merge_failure,
             retry: None,
+            suspend: None,
         })
     }
 

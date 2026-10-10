@@ -20,7 +20,7 @@ use crate::{workflow::engine::WorkflowEngine, Result};
 const STRANDED_ENTRIES: &str = "SELECT t.id, t.status_epoch FROM task t
     WHERE t.project_id = ? AND t.status IN (SELECT value FROM json_each(?))
       AND t.parent_task_id IS NULL AND t.deleted_at IS NULL AND t.archived_at IS NULL
-      AND NOT EXISTS (SELECT 1 FROM task_step s WHERE s.task_id = t.id AND s.status IN ('pending','claimed'))
+      AND NOT EXISTS (SELECT 1 FROM task_step s WHERE s.task_id = t.id AND s.status IN ('pending','claimed','suspended'))
       AND NOT EXISTS (SELECT 1 FROM task_step s WHERE s.task_id = t.id AND s.kind = 'hooks'
                       AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)
     ORDER BY t.created_at, t.id";

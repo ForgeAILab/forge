@@ -404,7 +404,7 @@ impl Families {
                     }
                     if bits & 2 != 0 {
                         // Exact status/epoch prevents old entries from fabricating hook ownership.
-                        columns.push_str(",(SELECT id FROM task_step WHERE task_id=t.id AND expected_status=t.status AND expected_epoch=t.status_epoch AND kind='hooks' AND status IN ('pending','claimed') ORDER BY seq LIMIT 1) AS hooks");
+                        columns.push_str(",(SELECT id FROM task_step WHERE task_id=t.id AND expected_status=t.status AND expected_epoch=t.status_epoch AND kind='hooks' AND status IN ('pending','claimed','suspended') ORDER BY seq LIMIT 1) AS hooks");
                     }
                     if bits & 4 != 0 {
                         // The partial index holds only running executions, so

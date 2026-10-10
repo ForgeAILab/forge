@@ -22,7 +22,7 @@ use super::merge::RequireConflictMarkersResolved;
 use super::merge::{merge_failure_result, target_moved_result, RunMerge};
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
-    RequireUpstreamRolesCompleted, RunCiSteps,
+    RequireUpstreamRolesCompleted,
 };
 use crate::workflow::{
     default_roles, default_states, default_workflow, HookAction, HookContext, HookResult,
@@ -637,6 +637,14 @@ async fn assign_agent_role(db: &SqliteDb, task_id: &str, role: &str, agent_id: &
     .await;
 }
 
+/// `run_ci_steps` as the step queue runs it: review-entry CI is a check the
+/// durable runner executes, asked for from the Task's hooks step, and the
+/// hook settles the Review when it runs again with the result.
+async fn run_ci(ctx: &HookContext) -> HookResult {
+    let worker = ctx.task_service.check_worker_or_embedded();
+    crate::workflow::actions::run_ci_steps_in_step(ctx, &worker).await
+}
+
 async fn build_test_ctx(
     task_id: &str,
     from_state: &str,
@@ -914,7 +922,7 @@ async fn run_ci_steps_empty_reason_contains_ci_steps() {
     .await;
     ctx.state_config = json!({ "ci_steps": [] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("ci steps")),
@@ -933,7 +941,7 @@ async fn run_ci_steps_skips_when_ci_steps_empty() {
     .await;
     ctx.state_config = json!({ "ci_steps": [] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("ci steps")),
@@ -957,7 +965,7 @@ async fn run_ci_steps_skips_project_implementation_checks_for_discovery_tasks() 
         .expect("Task kind updates");
     ctx.state_config = json!({ "ci_steps": ["false"] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("read-only Task")),
@@ -983,7 +991,7 @@ async fn run_ci_steps_skips_when_workspace_missing() {
     .await;
     ctx.state_config = json!({ "ci_steps": ["cargo test"] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("no workspace")),
@@ -1003,7 +1011,7 @@ async fn run_ci_steps_skips_when_executor_execution_missing() {
     ctx.state_config = json!({ "ci_steps": ["cargo test"] });
     ctx.workspace_id = Some("workspace-1".to_owned());
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("no executor execution")),
@@ -1026,7 +1034,7 @@ async fn run_ci_steps_creates_passed_review_record() {
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     enter_target_state(&ctx).await;
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     assert!(matches!(result, HookResult::Ok));
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1053,7 +1061,7 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1343,7 +1351,7 @@ async fn merge_fix_re_review_still_requires_an_assigned_reviewer() {
         .await
         .expect("review_passed_at seeds");
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1390,7 +1398,7 @@ async fn run_ci_steps_failure_prevents_reviewer_dispatch() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["false"] });
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Failed { .. }),
         "{ci_result:?}"
@@ -1465,7 +1473,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
         .await;
     crate::test_support::set_test_agent_capacity(&ctx.db, agent_id, 1).await;
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
@@ -1610,7 +1618,7 @@ async fn run_ci_steps_without_reviewer_cascades_to_merging() {
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     enter_target_state(&ctx).await;
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     match AutoCascadeOnReviewPass.execute(&ctx).await {
@@ -1636,7 +1644,7 @@ async fn cached_passed_review_cannot_cascade_after_its_authority_is_cleared() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
     enter_target_state(&ctx).await;
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
     TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now_rfc3339())
         .await
@@ -1682,7 +1690,7 @@ async fn passed_review_defers_integration_while_project_is_paused() {
     let execution_id = seed_completed_executor_execution(&ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
     ProjectRepo::set_paused_at(&*ctx.db, &ctx.project_id, Some(now_rfc3339()))
         .await
@@ -1725,7 +1733,7 @@ async fn run_ci_steps_with_user_approval_gate_waits_for_human() {
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     enter_target_state(&ctx).await;
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -3154,7 +3162,7 @@ async fn ci_passes_then_reviewer_dispatched_via_dispatch_role_agent() {
         build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, vec!["test -d ."]).await;
     let ctx = harness.ctx.clone();
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Ok),
         "CI should pass: {ci_result:?}"
@@ -3417,7 +3425,7 @@ async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
     .await
     .expect("subtask execution creates");
     ctx.execution_id = Some(child_execution_id);
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
@@ -3471,7 +3479,7 @@ async fn reviewer_dispatch_ignores_waiting_review_tasks_without_running_executio
     .expect("other task creates");
     assign_agent_role(&ctx.db, other_task_id, default_roles::REVIEWER, reviewer_id).await;
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
@@ -3494,7 +3502,7 @@ async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
     let harness = build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, vec!["exit 1"]).await;
     let ctx = harness.ctx.clone();
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Failed { .. }),
         "CI hook returns Failed on CI failure: {ci_result:?}"
@@ -3698,7 +3706,7 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
     .await;
     crate::test_support::set_test_agent_capacity(&ctx.db, reviewer_id, 1).await;
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Ok),
         "CI should pass even when reviewer at capacity: {ci_result:?}"
@@ -3737,7 +3745,7 @@ async fn no_reviewer_assigned_auto_cascade_to_merging() {
     .await;
     ctx.state_config = json!({});
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     match ci_result {
         HookResult::Skipped { reason } => assert!(reason.contains("ci steps")),
         other => panic!("expected skipped for empty ci, got {other:?}"),
@@ -4258,7 +4266,7 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4337,7 +4345,7 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4390,7 +4398,7 @@ async fn repair_touching_a_new_path_gets_a_full_review() {
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4460,7 +4468,7 @@ async fn changed_governing_context_means_a_full_review() {
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4521,7 +4529,7 @@ async fn carry_for_an_old_review_is_ignored_after_a_newer_real_review() {
         json!(["test -d ."]),
     )
     .await;
-    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+    assert!(matches!(run_ci(&ctx).await, HookResult::Ok));
     assert!(matches!(
         super::CarryReviewAuthority.execute(&ctx).await,
         HookResult::Cascade { .. }
@@ -4614,7 +4622,7 @@ async fn carries_are_bounded_per_review() {
         json!(["test -d ."]),
     )
     .await;
-    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+    assert!(matches!(run_ci(&ctx).await, HookResult::Ok));
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
     let HookResult::Skipped { reason } = carried else {

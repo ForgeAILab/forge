@@ -134,7 +134,8 @@ impl IntegrationStepPort for TaskStepIntegrationPort {
                 .await?;
         Ok(match status.as_deref() {
             None => IntegrationStepState::Missing,
-            Some("pending" | "claimed" | "parked") => IntegrationStepState::Live,
+            // `suspended` waits for a check and is as live as a queued step.
+            Some("pending" | "claimed" | "suspended" | "parked") => IntegrationStepState::Live,
             Some("done") => IntegrationStepState::Done,
             Some(_) => {
                 let left: bool = sqlx::query_scalar(
