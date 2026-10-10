@@ -479,7 +479,7 @@ wrapper:
 workspace:
   compiler_cache:
     wrapper: kache              # absolute path, or a name found on PATH at start
-    # max_bytes: 21474836480    # size cap, default 20 GiB
+    # max_bytes: 21474836480    # size cap, default 20 GiB; 0 turns the cache off
     # dir: /var/cache/forge     # default <workspace root>/.forge/build/cache
 ```
 
@@ -574,6 +574,11 @@ Things to know:
   into that sandbox: `sccache` fails a compile when it cannot reach its
   server. Codex under `yolo` gets whatever you configured. Codex with your
   own sandbox configuration, and Gemini with `--sandbox`, get no wrapper.
+  Forge cannot see a sandbox you switch on inside Claude Code, Cursor,
+  OpenCode or Smith themselves: those runs get the wrapper like any other.
+  If such a sandbox blocks the store or the `sccache` socket, use `kache`
+  (it builds uncached) or set an empty `RUSTC_WRAPPER` in that Project's
+  environment.
 - **Disk.** `max_bytes` is enforced twice. The wrapper holds each repository
   store to it (`KACHE_MAX_SIZE`, `SCCACHE_CACHE_SIZE`), and on every pass
   the garbage collector holds all stores of the machine together to it,

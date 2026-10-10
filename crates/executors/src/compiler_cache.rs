@@ -150,6 +150,12 @@ impl CompilerCache {
         if name.is_empty() {
             return None;
         }
+        if config.max_bytes == 0 {
+            // Not a size: the collector would empty the cache on every pass
+            // and each wrapper reads a zero cap its own way.
+            tracing::warn!("workspace.compiler_cache.max_bytes is 0: the shared compiler cache is off and runs build as before");
+            return None;
+        }
         let configured = Path::new(name);
         let wrapper = if configured.is_absolute() {
             is_executable(configured).then(|| configured.to_path_buf())
@@ -1150,6 +1156,12 @@ pub(crate) mod tests {
         );
         let custom = CompilerCache::resolve(&custom, &root, None).unwrap();
         assert_eq!((custom.dir, custom.max_bytes), (base.join("elsewhere"), 99));
+        let zero = config::CompilerCacheConfig::default().overridden(
+            Some(wrapper.to_str().unwrap().to_owned()),
+            Some(0),
+            None,
+        );
+        assert_eq!(CompilerCache::resolve(&zero, &root, None), None);
     }
 
     /// A server whose own environment names a wrapper (this is common: a
