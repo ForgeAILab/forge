@@ -48,12 +48,13 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 6 adds the integration owner wire: the fence announcement on
-/// lookup, `integration.announce`, and Git object export / import.
-pub const DAEMON_PROTOCOL_REVISION: u32 = 6;
-/// Every command RPC requires revision 6.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 6;
-pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 6 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
+/// Revision 6 added the integration owner wire: the fence announcement on
+/// lookup, `integration.announce`, and Git object export / import. Revision 7
+/// lets `integration.release_objects` delete the refs an attempt imported.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 7;
+/// Every command RPC requires revision 7.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 7;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 7 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
@@ -1191,7 +1192,7 @@ mod tests {
             super::DAEMON_PROTOCOL_REVISION,
             &old
         ));
-        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 6);
+        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 7);
         let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
         assert_eq!(probe.commands[0].name, "cargo");
         let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
@@ -1459,8 +1460,8 @@ mod tests {
             DAEMON_PROTOCOL_REVISION,
             &revision_2_capabilities
         ));
-        assert_eq!(DAEMON_PROTOCOL_REVISION, 6);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 6);
+        assert_eq!(DAEMON_PROTOCOL_REVISION, 7);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 7);
     }
 
     #[test]
@@ -2058,7 +2059,9 @@ pub enum ImportObjectsResult {
     },
 }
 
-/// Drop a key's owner-local staging (export bundle, partial import).
+/// Drop a key's owner-local staging (export bundle, partial import). With
+/// `attempt`, also delete every ref the attempt imported in one checkout
+/// (`refs/forge/integration/<attempt>-*`) and the attempt's other staging.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
@@ -2066,6 +2069,17 @@ pub struct ReleaseObjectsParams {
     pub daemon_id: String,
     pub runtime_id: String,
     pub key: String,
+    #[serde(default)]
+    pub attempt: Option<ReleaseAttemptRefs>,
+}
+
+/// The attempt whose imported refs a release deletes, and where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReleaseAttemptRefs {
+    pub attempt_id: String,
+    pub repo_location_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2073,6 +2087,9 @@ pub struct ReleaseObjectsParams {
 pub struct ReleaseObjectsResult {
     pub key: String,
     pub removed: bool,
+    /// Imported refs deleted for `attempt`.
+    #[serde(default)]
+    pub removed_refs: u32,
 }
 
 /// `inbound` brings the target tip to the Task's checkout before a rebase;

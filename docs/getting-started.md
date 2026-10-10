@@ -1320,12 +1320,12 @@ or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
 For containers sharing server workspaces, register a server-owned `shared_mount`
 location instead. Forge verifies a server-written probe through the daemon at
 the same path before using it as an execution provider. Matching absolute paths
-alone are insufficient. Daemon ownership requires revision 6 with `workspace.v1`.
+alone are insufficient. Daemon ownership requires revision 7 with `workspace.v1`.
 
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 6 or newer), restarting each with its existing
+release (protocol revision 7 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 6 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -1336,7 +1336,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 6, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

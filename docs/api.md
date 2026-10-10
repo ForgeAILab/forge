@@ -2121,14 +2121,14 @@ the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
 conflict. The minimum command protocol revision is 6. A revision-5 or older daemon
 receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
-from the server's release (protocol revision 6 or newer). Every command RPC is
+from the server's release (protocol revision 7 or newer). Every command RPC is
 refused, including execution, repository verification, `fs.list`, `fs.branches`,
 workspace operations, and PTY terminals. REST maps the upgrade refusal to HTTP
 `409 daemon_upgrade_required` with `needs_human: true`; placement rejection
 includes that filter code in `rejected_candidates`. An upgrade-only dispatch
 refusal records an actionable blocker and creates no Execution; reservation
 returns the typed error without modifying the Task. The heartbeat sweep clears
-upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 6.
+upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 7.
 Repository locations retain the upgrade reason in `last_error` after a verification
 attempt, without changing their verification status; pinned Agents expose
 `effective_status: "daemon_upgrade_required"`. Operator `daemon_issues[].issue`
@@ -4412,7 +4412,7 @@ blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
 The dispatch-failure annotation and Task metadata record the refused daemon IDs.
 The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
-daemon reconnects at revision 6, even when a blocking annotation was preserved.
+daemon reconnects at revision 7, even when a blocking annotation was preserved.
 Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
 `recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
 `before_work_hook_failed`, and `before_work_hook_timeout` annotations.
@@ -4514,7 +4514,7 @@ Server-owned and verified shared-mount plan files retain their layout and
 
 ### Workspace daemon protocol
 
-Protocol revision 6 negotiates `workspace.v1` and is required for every command
+Protocol revision 7 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
 Revision-5 and older daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch
