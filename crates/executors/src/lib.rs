@@ -5,6 +5,7 @@ pub mod command;
 pub mod config;
 pub mod effective_policy;
 pub mod environment;
+pub mod gc;
 pub mod log_reader;
 pub mod log_schema;
 pub mod log_writer;

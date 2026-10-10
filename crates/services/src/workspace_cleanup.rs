@@ -24,7 +24,14 @@ use tokio::{
 use tracing::info;
 use workspace::{RepoCacheLockManager, WorkspaceManager};
 
+mod gc;
+pub use gc::{GcSettings, LiveCheckCounter, STATUS_KEY as GC_STATUS_KEY};
+
 const SWEEP_BUDGET: Duration = Duration::from_secs(60);
+/// The part of [`SWEEP_BUDGET`] the Task and repository backfill may use. The
+/// rest is kept for the garbage-collection pass, so a long backfill cannot
+/// starve it.
+const BACKFILL_BUDGET: Duration = Duration::from_secs(40);
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_CLEANUP_BACKOFF: Duration = Duration::from_secs(60 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -73,6 +80,8 @@ fn cleanup_backoff(previous_attempts: i64) -> Duration {
 struct SweepCursor {
     task_id: String,
     repo_id: String,
+    /// Last Task-root directory name the garbage-collection pass finished.
+    root_name: String,
 }
 
 pub struct WorkspaceCleanupScheduler {
@@ -84,6 +93,7 @@ pub struct WorkspaceCleanupScheduler {
     repo_cache_locks: RwLock<Arc<RepoCacheLockManager>>,
     lifecycle_locks: WorkspaceExecutionLockManager,
     sweep_cursor: Mutex<SweepCursor>,
+    gc_settings: RwLock<GcSettings>,
 }
 
 #[async_trait]
@@ -119,6 +129,7 @@ impl WorkspaceCleanupScheduler {
             repo_cache_locks: RwLock::new(Arc::new(RepoCacheLockManager::new())),
             lifecycle_locks: WorkspaceExecutionLockManager::new(),
             sweep_cursor: Mutex::new(SweepCursor::default()),
+            gc_settings: RwLock::new(GcSettings::default()),
         }
     }
 
@@ -472,21 +483,31 @@ impl WorkspaceCleanupScheduler {
         Ok(())
     }
 
+    /// One periodic pass: the terminal-Task and repository backfill, then
+    /// the garbage collection of the workspace root, all inside
+    /// [`SWEEP_BUDGET`]. Both resume from the shared cursor.
     pub(crate) async fn sweep(&self) -> Result<()> {
         let mut cursor = self.sweep_cursor.lock().await;
+        let started = Instant::now();
+        let backfill = self.sweep_backfill(&mut cursor, started).await;
+        let left = SWEEP_BUDGET.saturating_sub(started.elapsed());
+        self.gc_pass(&mut cursor, left).await;
+        backfill
+    }
+
+    async fn sweep_backfill(&self, cursor: &mut SweepCursor, started: Instant) -> Result<()> {
         let task_ids =
             sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE id > ? ORDER BY id LIMIT ?")
                 .bind(&cursor.task_id)
                 .bind(SWEEP_LIMIT)
                 .fetch_all(self.db.pool())
                 .await?;
-        let started = Instant::now();
         for task_id in &task_ids {
             cursor.task_id = task_id.clone();
             if let Err(error) = self.cleanup_terminal_task(task_id).await {
                 tracing::warn!(%task_id, %error, "terminal Task workspace backfill failed");
             }
-            if started.elapsed() >= SWEEP_BUDGET {
+            if started.elapsed() >= BACKFILL_BUDGET {
                 return Ok(());
             }
         }
@@ -510,7 +531,7 @@ impl WorkspaceCleanupScheduler {
             // User local_path repositories are cleaned by exact worktree path.
             if let Some(source) = self.cached_repo_source(repo_id) {
                 let locks = self.repo_cache_locks()?;
-                match timeout(SWEEP_BUDGET, async {
+                match timeout(BACKFILL_BUDGET.saturating_sub(started.elapsed()), async {
                     let _guard = locks.acquire(&source.to_string_lossy()).await;
                     WorkspaceManager::prune_worktrees(&source).await
                 })
@@ -521,7 +542,7 @@ impl WorkspaceCleanupScheduler {
                     Err(_) => tracing::warn!(%repo_id, "worktree prune timed out"),
                 }
             }
-            if started.elapsed() >= SWEEP_BUDGET {
+            if started.elapsed() >= BACKFILL_BUDGET {
                 return Ok(());
             }
         }
@@ -684,6 +705,9 @@ impl WorkspaceCleanupScheduler {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ServiceError::Git(git::GitError::Io(error))),
             }
+            // The Task is terminal and nothing runs for it: its logs are
+            // history, kept for the configured retention.
+            self.expire_task_logs(&task).await;
         }
         cleanup_result
     }
@@ -2984,5 +3008,598 @@ mod tests {
             .unwrap();
         assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
         assert_eq!(workspace.cleanup_attempts, 0);
+    }
+
+    const GC_TEST_BUDGET: Duration = Duration::from_secs(30);
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+
+    /// A scheduler on `root` after the start-up step a running server does:
+    /// the root is adopted for this database.
+    async fn gc_scheduler(db: &Arc<SqliteDb>, root: &Path) -> WorkspaceCleanupScheduler {
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(db),
+            Arc::new(EventBus::new(16)),
+            root.to_path_buf(),
+        );
+        scheduler.adopt_workspace_root().await.unwrap();
+        scheduler
+    }
+
+    /// An unrecorded Task root that Forge made (it carries `.forge-task`).
+    fn forge_made_root(root: &Path) -> PathBuf {
+        let task_root = root.join(new_uuid_v4());
+        std::fs::create_dir_all(task_root.join(".forge-task")).unwrap();
+        std::fs::create_dir_all(task_root.join("repo")).unwrap();
+        std::fs::write(task_root.join("repo/file"), "content").unwrap();
+        task_root
+    }
+
+    /// Make `path` and what is directly inside it look `days` old.
+    fn backdate(path: &Path, days: u64) {
+        let then = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+        let mut paths = vec![path.to_path_buf()];
+        paths.extend(
+            std::fs::read_dir(path)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path()),
+        );
+        for path in paths.iter().rev() {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(then)
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_does_nothing_on_a_root_no_running_server_adopted() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let orphan = forge_made_root(&root);
+        // Built the way every test and tool builds one: nothing adopts.
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            root.clone(),
+        );
+        let report = gc_at(&scheduler, 30 * 24 * HOUR).await;
+        assert_eq!(report, executors::gc::GcReport::default());
+        scheduler.sweep().await.unwrap();
+        assert!(orphan.exists());
+        // Not even the marker is written.
+        assert!(!root.join(".forge").exists());
+    }
+
+    #[tokio::test]
+    async fn gc_refuses_a_root_that_is_a_repository_and_reports_it() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let orphan = forge_made_root(&root);
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            root.clone(),
+        );
+        assert!(matches!(
+            scheduler.adopt_workspace_root().await.unwrap(),
+            executors::gc::Ownership::Refused(_)
+        ));
+        assert_eq!(
+            gc_at(&scheduler, 30 * 24 * HOUR).await,
+            executors::gc::GcReport::default()
+        );
+        assert!(orphan.exists() && !root.join(".forge").exists());
+        // The operator can see why nothing is reclaimed.
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM system_setting WHERE key = 'workspace_gc_status'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(status.contains("\"state\":\"refused\"") && status.contains("git repository"));
+    }
+
+    #[tokio::test]
+    async fn gc_leaves_a_task_root_whose_create_is_in_flight_however_old() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let slow = forge_made_root(&root);
+        let scheduler = gc_scheduler(&db, &root).await;
+        // A worktree create that has been running for a month.
+        let creating = workspace::creating(&slow);
+        assert_eq!(
+            gc_at(&scheduler, 30 * 24 * HOUR).await,
+            executors::gc::GcReport::default()
+        );
+        assert!(slow.join("repo/file").exists());
+        drop(creating);
+        assert_eq!(gc_at(&scheduler, 30 * 24 * HOUR).await.quarantined, 1);
+    }
+
+    #[tokio::test]
+    async fn gc_pages_through_more_roots_than_one_pass_takes() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let total = SWEEP_LIMIT as usize + 6;
+        let orphans: Vec<PathBuf> = (0..total).map(|_| forge_made_root(&root)).collect();
+        let scheduler = gc_scheduler(&db, &root).await;
+        let mut cursor = SweepCursor::default();
+        let later = std::time::SystemTime::now() + 25 * HOUR;
+
+        let first = scheduler
+            .gc_pass_at(&mut cursor, GC_TEST_BUDGET, later)
+            .await;
+        assert_eq!(first.quarantined, SWEEP_LIMIT as usize);
+        assert!(!cursor.root_name.is_empty());
+        let second = scheduler
+            .gc_pass_at(&mut cursor, GC_TEST_BUDGET, later)
+            .await;
+        assert_eq!(second.quarantined, 6);
+        assert!(cursor.root_name.is_empty());
+        assert!(orphans.iter().all(|orphan| !orphan.exists()));
+
+        // Out of time from the start: a pass still finishes one entry and
+        // the cursor moves past it, so no entry can starve the ones after it.
+        let more: Vec<PathBuf> = (0..3).map(|_| forge_made_root(&root)).collect();
+        let mut names: Vec<String> = more
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let starved = scheduler
+            .gc_pass_at(&mut cursor, Duration::ZERO, later)
+            .await;
+        assert_eq!(starved.quarantined, 1);
+        assert_eq!(cursor.root_name, names[0]);
+        let next = scheduler
+            .gc_pass_at(&mut cursor, Duration::ZERO, later)
+            .await;
+        assert_eq!(next.quarantined, 1);
+        assert_eq!(cursor.root_name, names[1]);
+    }
+
+    #[tokio::test]
+    async fn gc_evicts_build_output_under_the_floor_but_never_of_a_busy_task() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut builds = Vec::new();
+        let mut hook = None;
+        for kind in ["idle", "running", "hook", "done"] {
+            let (workspace_id, worktree_path) =
+                seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+            let task = fixture_task(&db, &workspace_id).await;
+            let task =
+                set_fixture_status(&db, &task, if kind == "done" { "done" } else { "todo" }).await;
+            let task_root = worktree_path.parent().unwrap().to_path_buf();
+            executors::sandbox::TaskRoot::reserve(&task_root).unwrap();
+            let build = task_root.join(".forge-task/build");
+            std::fs::create_dir_all(build.join("cargo")).unwrap();
+            std::fs::write(build.join("cargo/marker"), "x").unwrap();
+            match kind {
+                "running" => {
+                    fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running)
+                        .await;
+                }
+                "hook" => {
+                    hook = Some(executors::sandbox::SandboxEnv::for_command(
+                        &worktree_path,
+                        executors::sandbox::RunPurpose::Hook,
+                    ));
+                }
+                _ => {}
+            }
+            builds.push(build);
+        }
+        let hook = hook.unwrap();
+        let scheduler = gc_scheduler(&db, &root).await;
+        let under = executors::gc::FreeFloor {
+            min_free_bytes: u64::MAX,
+            min_free_percent: 0,
+        };
+
+        // Plenty of room: nothing is evicted.
+        scheduler.set_gc_limits(
+            30,
+            executors::gc::FreeFloor {
+                min_free_bytes: 0,
+                min_free_percent: 0,
+            },
+        );
+        assert_eq!(gc_at(&scheduler, Duration::ZERO).await.builds_evicted, 0);
+
+        // Under the floor while a check runs somewhere: nothing is evicted.
+        scheduler.set_gc_limits(30, under);
+        scheduler.set_live_check_counter(Arc::new(|| 1));
+        assert_eq!(gc_at(&scheduler, Duration::ZERO).await.builds_evicted, 0);
+        assert!(builds
+            .iter()
+            .all(|build| build.join("cargo/marker").exists()));
+
+        // Under the floor: only the idle, non-terminal Task loses its build.
+        scheduler.set_live_check_counter(Arc::new(|| 0));
+        let report = gc_at(&scheduler, Duration::ZERO).await;
+        assert_eq!((report.builds_evicted, report.errors), (1, 0));
+        assert!(!builds[0].exists());
+        assert!(builds[1].join("cargo/marker").exists());
+        if hook.env().tmp_dir().is_some() {
+            assert!(builds[2].join("cargo/marker").exists());
+        }
+        assert!(builds[3].join("cargo/marker").exists());
+    }
+
+    async fn gc_at(
+        scheduler: &WorkspaceCleanupScheduler,
+        after: Duration,
+    ) -> executors::gc::GcReport {
+        scheduler
+            .gc_pass_at(
+                &mut SweepCursor::default(),
+                GC_TEST_BUDGET,
+                std::time::SystemTime::now() + after,
+            )
+            .await
+    }
+
+    fn quarantined(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root.join(executors::gc::GC_DIR)) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| uuid::Uuid::parse_str(name.get(..36).unwrap_or_default()).is_ok())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn gc_quarantines_unknown_task_roots_then_deletes_them_a_day_later() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let task = set_fixture_status(&db, &task, "todo").await;
+        // A create in progress: the Task exists, its workspace row does not yet.
+        let creating =
+            seed_log_only_task(&db, &root, &task, new_uuid_v4(), None, "in_progress").await;
+        let orphan = forge_made_root(&root);
+        // A directory with a Task-shaped name that a user made.
+        let users = root.join(new_uuid_v4());
+        let kept = [
+            root.join(&creating.id).join("repo"),
+            root.join(&task.project_id).join("checkout"),
+            root.join("main-agents").join("agent"),
+            root.join(".forge").join("probes"),
+            root.join("notes").join("mine"),
+            users.join("photos"),
+            orphan.join("repo"),
+        ];
+        for path in &kept {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("file"), "content").unwrap();
+        }
+        let scheduler = gc_scheduler(&db, &root).await;
+
+        // First sight of a directory made a moment ago: nothing moves.
+        assert_eq!(gc_at(&scheduler, Duration::ZERO).await.quarantined, 0);
+        assert!(orphan.exists());
+
+        // Eleven hours old: a slow clone may still be filling it.
+        assert_eq!(gc_at(&scheduler, 11 * HOUR).await.quarantined, 0);
+        assert!(orphan.exists());
+
+        // Older than the creation grace: only the unknown Task root is moved
+        // aside, and it is not deleted.
+        let report = gc_at(&scheduler, 25 * HOUR).await;
+        assert_eq!(
+            (report.quarantined, report.removed, report.errors),
+            (1, 0, 0)
+        );
+        assert!(!orphan.exists());
+        let held = quarantined(&root);
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(
+                root.join(executors::gc::GC_DIR)
+                    .join(&held[0])
+                    .join("repo/file")
+            )
+            .unwrap(),
+            "content"
+        );
+        for path in &kept[..6] {
+            assert!(path.join("file").exists(), "{} was touched", path.display());
+        }
+        assert!(worktree_path.exists());
+        assert!(root.join(".repos").exists());
+
+        // Still held 23 hours after it was quarantined; gone after 24.
+        assert_eq!(gc_at(&scheduler, 48 * HOUR).await.removed, 0);
+        assert_eq!(quarantined(&root).len(), 1);
+        assert_eq!(gc_at(&scheduler, 50 * HOUR).await.removed, 1);
+        assert!(quarantined(&root).is_empty());
+        for path in &kept[..6] {
+            assert!(path.join("file").exists(), "{} was touched", path.display());
+        }
+        assert!(worktree_path.exists());
+    }
+
+    #[tokio::test]
+    async fn gc_restores_a_quarantined_root_whose_task_appears() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let late = forge_made_root(&root);
+        let late_id = late.file_name().unwrap().to_string_lossy().into_owned();
+        let scheduler = gc_scheduler(&db, &root).await;
+        assert_eq!(gc_at(&scheduler, 25 * HOUR).await.quarantined, 1);
+        assert!(!late.exists());
+
+        // Its record shows up while it sits in quarantine.
+        seed_log_only_task(&db, &root, &task, late_id, None, "in_progress").await;
+        let report = gc_at(&scheduler, 30 * 24 * HOUR).await;
+        assert_eq!((report.restored, report.removed), (1, 0));
+        assert_eq!(
+            std::fs::read_to_string(late.join("repo/file")).unwrap(),
+            "content"
+        );
+        assert!(quarantined(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_never_sweeps_a_root_another_database_claimed() {
+        let first = sqlite_db().await;
+        let second = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // A live Task root of the first server, unknown to the second.
+        let (_, worktree_path) = seed_workspace(&first, &root, WorkspaceStatus::Ready).await;
+        let owner = gc_scheduler(&first, &root).await;
+        assert_eq!(
+            gc_at(&owner, HOUR).await,
+            executors::gc::GcReport::default()
+        );
+
+        // A second server on the same root with another database: adopting
+        // changes nothing, and it never sweeps.
+        let stranger = WorkspaceCleanupScheduler::new(
+            Arc::clone(&second),
+            Arc::new(EventBus::new(16)),
+            root.clone(),
+        );
+        assert_eq!(
+            stranger.adopt_workspace_root().await.unwrap(),
+            executors::gc::Ownership::Other
+        );
+        let report = gc_at(&stranger, 30 * 24 * HOUR).await;
+        assert_eq!(report, executors::gc::GcReport::default());
+        stranger.sweep().await.unwrap();
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM system_setting WHERE key = 'workspace_gc_status'",
+        )
+        .fetch_one(second.pool())
+        .await
+        .unwrap();
+        assert!(status.contains("claimed_by_other"), "{status}");
+        // The owner is still the owner.
+        assert_eq!(
+            owner.adopt_workspace_root().await.unwrap(),
+            executors::gc::Ownership::Mine
+        );
+        assert!(worktree_path.join("node_modules/build-output").exists());
+        assert!(quarantined(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_removes_leftovers_of_a_cleaned_terminal_task_only() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let scheduler = gc_scheduler(&db, &root).await;
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            let (workspace_id, worktree_path) =
+                seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+            clean_due(&scheduler, &workspace_id).await;
+            let task_root = worktree_path.parent().unwrap().to_path_buf();
+            assert!(!task_root.exists());
+            // Something wrote into the Task root after it was reclaimed.
+            std::fs::create_dir_all(task_root.join(".forge-outbox/late")).unwrap();
+            std::fs::write(task_root.join(".forge-outbox/late/result.json"), "{}").unwrap();
+            roots.push((workspace_id, task_root));
+        }
+        // The second Task was reopened: its root is about to be used again.
+        let reopened = fixture_task(&db, &roots[1].0).await;
+        set_fixture_status(&db, &reopened, "todo").await;
+
+        let report = gc_at(&scheduler, Duration::ZERO).await;
+        assert_eq!((report.removed, report.errors), (1, 0));
+        assert!(!roots[0].1.exists());
+        assert!(roots[1].1.join(".forge-outbox/late/result.json").exists());
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_broken_copies_seven_days_and_live_run_directories_always() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        set_fixture_status(&db, &task, "todo").await;
+        let task_root = worktree_path.parent().unwrap().to_path_buf();
+        executors::sandbox::TaskRoot::reserve(&task_root).unwrap();
+        let millis = chrono::Utc::now().timestamp_millis();
+        let broken = task_root.join(format!("repo.broken-{millis}"));
+        std::fs::create_dir_all(broken.join("src")).unwrap();
+        let hook = executors::sandbox::SandboxEnv::for_command(
+            &worktree_path,
+            executors::sandbox::RunPurpose::Hook,
+        );
+        let scheduler = gc_scheduler(&db, &root).await;
+
+        gc_at(&scheduler, 6 * 24 * HOUR).await;
+        assert!(broken.exists());
+        let report = gc_at(&scheduler, 8 * 24 * HOUR).await;
+        assert_eq!((report.removed, report.run_dirs_removed), (1, 0));
+        assert!(!broken.exists());
+        assert!(worktree_path.join("node_modules/build-output").exists());
+        if let Some(tmp) = hook.env().tmp_dir() {
+            assert!(tmp.exists(), "a live hook lost its temp directory");
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_measures_live_task_roots() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        std::fs::write(worktree_path.join("blob"), vec![7_u8; 256 * 1024]).unwrap();
+        let before = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((before.disk_bytes, before.disk_measured_at), (None, None));
+
+        gc_at(&gc_scheduler(&db, &root).await, Duration::ZERO).await;
+
+        let measured = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(measured.disk_bytes.is_some_and(|bytes| bytes >= 256 * 1024));
+        assert!(measured.disk_measured_at.is_some());
+        assert_eq!(measured.updated_at, before.updated_at);
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_logs_of_terminal_tasks_after_the_retention() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
+        let base = fixture_task(&db, &workspace_id).await;
+        let mut tasks = Vec::new();
+        for (status, days) in [("done", 31), ("done", 29), ("in_progress", 400)] {
+            let task = seed_log_only_task(&db, &root, &base, new_uuid_v4(), None, status).await;
+            sqlx::query("UPDATE task SET updated_at = ? WHERE id = ?")
+                .bind((chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339())
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            backdate(&logs_dir(&root, &task), 60);
+            tasks.push(task);
+        }
+        // Terminal for 31 days by its record, but its logs were written
+        // inside the retention (a Task imported or restored): kept.
+        let recent = seed_log_only_task(&db, &root, &base, new_uuid_v4(), None, "done").await;
+        sqlx::query("UPDATE task SET updated_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339())
+            .bind(&recent.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // The record says the future (a skewed clock): kept.
+        let skewed = seed_log_only_task(&db, &root, &base, new_uuid_v4(), None, "done").await;
+        sqlx::query("UPDATE task SET updated_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() + chrono::Duration::days(400)).to_rfc3339())
+            .bind(&skewed.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        backdate(&logs_dir(&root, &skewed), 60);
+        let scheduler = gc_scheduler(&db, &root).await;
+
+        // `0` keeps every log.
+        scheduler.set_gc_limits(0, executors::gc::FreeFloor::default());
+        scheduler.sweep().await.unwrap();
+        assert!(logs_dir(&root, &tasks[0]).join("execution.jsonl").exists());
+
+        // That sweep removed the legacy agent home from each log directory,
+        // which is a write to it: age them again.
+        for task in tasks.iter().chain([&skewed]) {
+            backdate(&logs_dir(&root, task), 60);
+        }
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::default());
+        scheduler.sweep().await.unwrap();
+        assert!(!logs_dir(&root, &tasks[0]).exists());
+        assert!(logs_dir(&root, &tasks[1]).join("execution.jsonl").exists());
+        assert!(logs_dir(&root, &tasks[2]).join("execution.jsonl").exists());
+        assert!(logs_dir(&root, &recent).join("execution.jsonl").exists());
+        assert!(logs_dir(&root, &skewed).join("execution.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_removes_only_legacy_temp_locations_that_are_provably_its_own_and_long_untouched() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (root, legacy, outside) = (base.join("root"), base.join("tmp"), base.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("user")).unwrap();
+        // Two Tasks of this database; the third id belongs to another Forge
+        // on the same machine.
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
+        let mine = fixture_task(&db, &workspace_id).await;
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
+        let linked = fixture_task(&db, &workspace_id).await;
+        let (old_task, other_task, linked_task) =
+            (mine.id.clone(), new_uuid_v4(), linked.id.clone());
+        let logs = legacy.join("forge/logs");
+        for path in [
+            legacy.join("forge-gemini-api-key-home/.gemini"),
+            logs.join(&old_task).join("hooks"),
+            logs.join(&other_task).join("hooks"),
+            logs.join("not-a-task").join("hooks"),
+            legacy.join("forge/worktrees/someone"),
+            legacy.join("unrelated"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("file"), "content").unwrap();
+        }
+        // A planted link where a hook-log directory used to be.
+        std::fs::create_dir_all(logs.join(&linked_task)).unwrap();
+        std::os::unix::fs::symlink(&outside, logs.join(&linked_task).join("hooks")).unwrap();
+        let scheduler = gc_scheduler(&db, &root).await;
+
+        // Not told about a temp directory: nothing outside the root is read.
+        gc_at(&scheduler, 30 * 24 * HOUR).await;
+        assert!(legacy.join("forge-gemini-api-key-home").exists());
+
+        // Touched within a week: another Forge on the machine may be using
+        // it, so everything stays.
+        scheduler.set_legacy_temp_dir(legacy.clone());
+        gc_at(&scheduler, 6 * 24 * HOUR).await;
+        assert!(legacy
+            .join("forge-gemini-api-key-home/.gemini/file")
+            .exists());
+        assert!(logs.join(&old_task).join("hooks/file").exists());
+
+        gc_at(&scheduler, 8 * 24 * HOUR).await;
+        assert!(!legacy.join("forge-gemini-api-key-home").exists());
+        assert!(!logs.join(&old_task).exists());
+        // Not a Task of this database: not ours.
+        assert!(logs.join(&other_task).join("hooks/file").exists());
+        assert!(logs.join("not-a-task/hooks/file").exists());
+        assert!(legacy.join("forge/worktrees/someone/file").exists());
+        assert!(legacy.join("unrelated/file").exists());
+        assert!(!logs.join(&linked_task).exists());
+        assert!(outside.join("user").exists());
     }
 }

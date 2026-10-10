@@ -62,6 +62,21 @@ impl WorkspaceCheckOwners {
             disconnect_bound,
         }
     }
+
+    /// A counter of check operations this server is running right now (in
+    /// the table and without a result yet), for the workspace garbage
+    /// collector: it reclaims nothing a live check could be using.
+    pub fn live_operation_counter(&self) -> Arc<dyn Fn() -> usize + Send + Sync> {
+        let operations = self.operations.clone();
+        Arc::new(move || {
+            operations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .filter(|operation| operation.result.is_none())
+                .count()
+        })
+    }
     fn intent<'a>(&self, record: &'a CheckWorkerRecord) -> Result<&'a CheckDispatchIntent> {
         record
             .dispatch

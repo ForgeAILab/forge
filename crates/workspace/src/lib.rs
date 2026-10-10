@@ -11,6 +11,62 @@ pub mod repo_cache;
 
 pub use repo_cache::RepoCacheLockManager;
 
+/// Task roots this process is creating a worktree in right now.
+///
+/// A create has its directory before anything records it, and a checkout of a
+/// large repository can take a long time. The garbage collector asks
+/// [`is_creating`] and never moves such a directory, whatever its age.
+static CREATING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+/// A directory path with its parent resolved, so the same directory reached
+/// through a link on the way compares equal.
+fn create_key(task_root: &Path) -> PathBuf {
+    match (task_root.parent(), task_root.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name),
+        _ => task_root.to_path_buf(),
+    }
+}
+
+/// Held while a worktree is created in a Task root.
+#[derive(Debug)]
+pub struct CreateGuard(PathBuf);
+
+/// Mark `task_root` as being created until the guard is dropped.
+pub fn creating(task_root: &Path) -> CreateGuard {
+    let key = create_key(task_root);
+    *CREATING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.clone())
+        .or_default() += 1;
+    CreateGuard(key)
+}
+
+impl Drop for CreateGuard {
+    fn drop(&mut self) {
+        let mut creating = CREATING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = creating.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                creating.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Whether a create of this process is in flight for `task_root`.
+pub fn is_creating(task_root: &Path) -> bool {
+    CREATING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&create_key(task_root))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("workspace already exists")]
@@ -128,6 +184,9 @@ impl WorkspaceManager {
             return Err(WorkspaceError::AlreadyExists);
         }
 
+        // Registered before the directory exists: a sweep never sees it
+        // unrecorded and unguarded.
+        let _creating = creating(&task_root);
         fs::create_dir_all(&task_root).await?;
         reserve_task_dir(&task_root).await?;
 
@@ -187,6 +246,7 @@ impl WorkspaceManager {
         if fs::try_exists(&worktree_path).await? {
             return Err(WorkspaceError::AlreadyExists);
         }
+        let _creating = creating(&owner_root);
         fs::create_dir_all(&owner_root).await?;
 
         let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
@@ -288,6 +348,9 @@ impl WorkspaceManager {
             return Err(WorkspaceError::AlreadyExists);
         }
 
+        // Registered before the directory exists: a sweep never sees it
+        // unrecorded and unguarded.
+        let _creating = creating(&task_root);
         fs::create_dir_all(&task_root).await?;
         reserve_task_dir(&task_root).await?;
 
@@ -789,6 +852,23 @@ fn repo_name(repo_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_registry_holds_a_task_root_until_every_create_in_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let task_root = root.join("task");
+        assert!(!is_creating(&task_root));
+        let first = creating(&task_root);
+        // The same directory named through `.` on the way.
+        let second = creating(&root.join(".").join("task"));
+        assert!(is_creating(&task_root));
+        drop(first);
+        assert!(is_creating(&task_root));
+        assert!(!is_creating(&root.join("other")));
+        drop(second);
+        assert!(!is_creating(&task_root));
+    }
     use tempfile::TempDir;
     use tokio::fs;
 

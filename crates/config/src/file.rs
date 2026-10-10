@@ -76,6 +76,9 @@ pub(crate) struct FileWorkspaceConfig {
     pub root: Option<String>,
     pub cleanup_delay_seconds: Option<u64>,
     pub max_disconnect_seconds: Option<u64>,
+    pub log_retention_days: Option<u32>,
+    pub min_free_bytes: Option<u64>,
+    pub min_free_percent: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]

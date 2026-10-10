@@ -1842,3 +1842,4 @@ fn cancel_tombstones_are_pruned_seven_days_after_acknowledgment() {
 }
 
 mod check_owner;
+mod gc_sweep;
