@@ -20,13 +20,14 @@
 //! server and a daemon derive the same directories without a protocol change,
 //! and a run can be settled by a caller that never saw its [`SandboxEnv`].
 
+use crate::compiler_cache::CacheEnv;
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 use tokio::process::Command;
 
@@ -65,18 +66,27 @@ pub enum RunPurpose {
 pub const BUILD_DIR_TABLE: [(&str, &str); 1] = [("CARGO_TARGET_DIR", "cargo")];
 
 /// Per-run temp directories this process created and has not yet removed.
-/// [`sweep_dead_runs`] never touches one: a hook, check, tool command or
+/// [`sweep_stale_runs`] never touches one: a hook, check, tool command or
 /// execution running in this process is live whatever any table says.
 ///
 /// Each maps to the Task root it belongs to (the per-run directory itself may
 /// live in the short directory beside the Task roots), so the garbage
 /// collector can tell which Task roots have a run in this process.
-static LIVE_RUN_DIRS: LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> = LazyLock::new(Mutex::default);
+static LIVE_RUN_DIRS: LazyLock<Mutex<HashMap<PathBuf, LiveRun>>> = LazyLock::new(Mutex::default);
+
+/// One live run: its Task root, and the repository store of the shared
+/// compiler cache it was handed (the repository it builds, for the
+/// collector of that cache).
+#[derive(Debug, Clone)]
+struct LiveRun {
+    root: PathBuf,
+    cache: Option<PathBuf>,
+}
 /// First use of this module by the process. A directory modified after it was
 /// not left by a previous process, so the sweep leaves it alone.
 static PROCESS_START: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
 
-fn live_run_dirs() -> std::sync::MutexGuard<'static, HashMap<PathBuf, PathBuf>> {
+fn live_run_dirs() -> std::sync::MutexGuard<'static, HashMap<PathBuf, LiveRun>> {
     LIVE_RUN_DIRS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -87,7 +97,88 @@ fn live_run_dirs() -> std::sync::MutexGuard<'static, HashMap<PathBuf, PathBuf>> 
 /// per-run temp directory; a run without one is not visible here, so callers
 /// that reclaim something a run uses add their own table as well.
 pub fn has_live_run_in(task_root: &Path) -> bool {
-    live_run_dirs().values().any(|root| root == task_root)
+    live_run_dirs().values().any(|run| run.root == task_root)
+}
+
+/// Run `reclaim` unless a run of this process is live in `task_root`, holding
+/// the lock every run start takes ([`SandboxEnv::prepared`]) for the length
+/// of the call. A run therefore starts either before the check (and nothing
+/// is reclaimed) or after `reclaim` returned (and it gets its directories
+/// made again): never in between. `reclaim` must be short, a rename and not
+/// a delete, and must not start or settle a run.
+pub fn unless_live_run_in<T>(task_root: &Path, reclaim: impl FnOnce() -> T) -> Option<T> {
+    let live = live_run_dirs();
+    if live.values().any(|run| run.root == task_root) {
+        return None;
+    }
+    Some(reclaim())
+}
+
+/// [`unless_live_run_in`] for one repository store of the shared compiler
+/// cache: run `reclaim` unless a run of this process was handed `store`, or
+/// a command without a run scope holds it ([`hold_compiler_cache`]).
+pub fn unless_live_cache_run_in<T>(store: &Path, reclaim: impl FnOnce() -> T) -> Option<T> {
+    let live = live_run_dirs();
+    if live.values().any(|run| run.cache.as_deref() == Some(store)) {
+        return None;
+    }
+    let held = held_cache_stores();
+    if held.contains_key(store) {
+        return None;
+    }
+    Some(reclaim())
+}
+
+/// Repository stores of the shared compiler cache in use by commands that
+/// have no run scope, and how many of them.
+static HELD_CACHE_STORES: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Mutex::default);
+
+fn held_cache_stores() -> std::sync::MutexGuard<'static, HashMap<PathBuf, usize>> {
+    HELD_CACHE_STORES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keeps the collector away from one repository store until dropped.
+#[derive(Debug)]
+#[must_use = "the store is held only while this value lives"]
+pub struct CacheHold(Option<PathBuf>);
+
+impl Drop for CacheHold {
+    fn drop(&mut self) {
+        let Some(store) = self.0.take() else { return };
+        let mut held = held_cache_stores();
+        if let Some(count) = held.get_mut(&store) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&store);
+            }
+        }
+    }
+}
+
+/// Hold the shared compiler cache store of the repository of `worktree`
+/// while a command built with [`SandboxEnv::for_task`] runs there.
+///
+/// Such a command (an owner-local hook or CI step) has no run scope, so the
+/// live-run registry does not know it, yet it may be compiling through the
+/// wrapper. The collector deletes entries of a store whose wrapper is not
+/// known to tolerate that only while nothing uses the store; this is how an
+/// unscoped command says it does. Nothing is created and, with no cache
+/// installed, nothing is looked at.
+pub fn hold_compiler_cache(worktree: &Path) -> CacheHold {
+    if crate::compiler_cache::none_installed() {
+        return CacheHold(None);
+    }
+    let store = TaskRoot::of_worktree(worktree).and_then(|root| {
+        let cache = crate::compiler_cache::for_task_roots(root.0.parent()?)?;
+        (cache.kind != crate::compiler_cache::WrapperKind::Unknown).then_some(())?;
+        Some(cache.repository_dir(&crate::compiler_cache::repository_id(worktree)?))
+    });
+    if let Some(store) = &store {
+        *held_cache_stores().entry(store.clone()).or_default() += 1;
+    }
+    CacheHold(store)
 }
 
 /// When this process first used the sandbox. Nothing it runs is older.
@@ -163,6 +254,15 @@ impl TaskRoot {
         create_private_dir(&build).is_ok() && is_real_dir(&build)
     }
 
+    /// The live-run registry name of run `run_id` when it has no temp
+    /// directory. Only a map key: nothing is created there.
+    fn live_key(&self, run_id: &str) -> PathBuf {
+        self.0
+            .join(TASK_DIR_NAME)
+            .join("live")
+            .join(run_key(run_id).unwrap_or_else(fresh_run_id))
+    }
+
     /// The temp directory of run `run_id`.
     ///
     /// Inside the Task root when that path is short enough for a socket,
@@ -187,6 +287,13 @@ pub struct SandboxEnv {
     root: Option<PathBuf>,
     tmp: Option<PathBuf>,
     build: Vec<(&'static str, PathBuf)>,
+    /// This run's entry in the live-run registry when it has no per-run
+    /// temp directory to be registered by: a name under the Task root that
+    /// is never created on disk.
+    live: Option<PathBuf>,
+    /// The shared compiler cache, when the operator configured one and it
+    /// is usable for this worktree's repository right now.
+    cache: Option<CacheEnv>,
 }
 
 impl SandboxEnv {
@@ -205,6 +312,8 @@ impl SandboxEnv {
             } else {
                 Self::build_dirs(task_root)
             },
+            live: Some(task_root.live_key(run_id)),
+            cache: None,
         }
     }
 
@@ -218,8 +327,56 @@ impl SandboxEnv {
     /// [`Self::none`] when that root is not Forge-shaped.
     pub fn for_run(worktree: &Path, run_id: &str, purpose: RunPurpose) -> Self {
         TaskRoot::of_worktree(worktree)
-            .map(|root| Self::for_task_root(&root, run_id, purpose))
+            .map(|root| {
+                let env = Self::for_task_root(&root, run_id, purpose);
+                if purpose == RunPurpose::Probe {
+                    env
+                } else {
+                    env.with_compiler_cache(Self::cache_of(&root, worktree))
+                }
+            })
             .unwrap_or_default()
+    }
+
+    /// What the compiler cache installed for the workspace root of
+    /// `task_root` offers a run in `worktree`.
+    fn cache_of(task_root: &TaskRoot, worktree: &Path) -> Option<CacheEnv> {
+        crate::compiler_cache::for_task_roots(task_root.0.parent()?)?.for_worktree(worktree)
+    }
+
+    /// This environment with `cache` as its shared compiler cache.
+    #[must_use]
+    pub fn with_compiler_cache(mut self, cache: Option<CacheEnv>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// This environment without the shared compiler cache: for a run whose
+    /// own sandbox could not use it. The run builds without a wrapper.
+    #[must_use]
+    pub fn without_compiler_cache(self) -> Self {
+        self.with_compiler_cache(None)
+    }
+
+    /// The shared compiler cache this run is offered.
+    pub fn compiler_cache(&self) -> Option<&CacheEnv> {
+        self.cache.as_ref()
+    }
+
+    /// The repository store of the shared compiler cache, when `command`
+    /// really carries Forge's wrapper and every one of its variables (the
+    /// Project, the command or the operator may have chosen otherwise).
+    pub fn compiler_cache_dir_in_use(&self, command: &std::process::Command) -> Option<&Path> {
+        let cache = self.cache.as_ref()?;
+        cache
+            .variables()
+            .all(|(key, value)| {
+                command
+                    .get_envs()
+                    .any(|(name, set)| name == OsStr::new(key) && set == Some(value.as_os_str()))
+            })
+            .then_some(())?;
+        cache.dir()
     }
 
     /// The Task-level part only (build directories, no per-run temp
@@ -230,6 +387,8 @@ impl SandboxEnv {
                 root: None,
                 tmp: None,
                 build: Self::build_dirs(&root),
+                live: None,
+                cache: Self::cache_of(&root, worktree),
             })
             .unwrap_or_default()
     }
@@ -273,28 +432,67 @@ impl SandboxEnv {
         self
     }
 
-    /// Create the per-run temp directory. A run whose directory cannot be
-    /// created keeps today's temp directory instead of failing.
+    /// Start the run: enter it in the live-run registry by its Task root
+    /// and create its per-run temp directory. A run whose directory cannot
+    /// be created keeps today's temp directory instead of failing.
+    ///
+    /// Every run of a Task root is registered, with or without a temp
+    /// directory (a Task root whose path is too long for a socket has none,
+    /// which is the usual case on macOS): the registry is what keeps the
+    /// garbage collector from taking the build output of a run that
+    /// started after it looked ([`unless_live_run_in`]).
     #[must_use = "the returned environment is the one to apply"]
     pub fn prepared(mut self) -> Self {
-        if let Some(tmp) = &self.tmp {
-            LazyLock::force(&PROCESS_START);
-            // Live before it exists, so a concurrent sweep cannot take it.
-            live_run_dirs().insert(tmp.clone(), self.root.clone().unwrap_or_default());
-            if let Err(error) = prepare_run_tmp(tmp) {
-                live_run_dirs().remove(tmp);
+        let Some(root) = self.root.clone() else {
+            return self;
+        };
+        LazyLock::force(&PROCESS_START);
+        // Live before anything exists, so a concurrent sweep or eviction
+        // cannot take it. The no-temp name is entered first and replaced by
+        // the temp directory's once that exists, so the run is never out of
+        // the registry in between.
+        let live = self.live.clone();
+        let run = LiveRun {
+            root: root.clone(),
+            cache: self
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.dir().map(Path::to_path_buf)),
+        };
+        if let Some(live) = &live {
+            live_run_dirs().insert(live.clone(), run.clone());
+        }
+        if let Some(tmp) = self.tmp.clone() {
+            live_run_dirs().insert(tmp.clone(), run);
+            if let Err(error) = prepare_run_tmp(&tmp) {
+                live_run_dirs().remove(&tmp);
                 tracing::warn!(path = %tmp.display(), %error, "per-run temp directory could not be created; run keeps the inherited one");
                 self.tmp = None;
+            } else if let Some(live) = &live {
+                live_run_dirs().remove(live);
+                self.live = None;
+            }
+        }
+        // The build output may have been evicted between the moment this
+        // environment was computed and the registration above. From here on
+        // the run is live and nothing takes it again.
+        if let Some(root) = TaskRoot::at(&root) {
+            if !self.build.is_empty() && !root.build_dir_is_usable() {
+                self.build.clear();
             }
         }
         self
     }
 
-    /// Remove the per-run temp directory. Idempotent.
+    /// End the run: remove the per-run temp directory and leave the
+    /// live-run registry. Idempotent.
     pub fn settle(&self) {
         if let Some(tmp) = &self.tmp {
             remove_run_tmp(tmp);
             live_run_dirs().remove(tmp);
+        }
+        if let Some(live) = &self.live {
+            live_run_dirs().remove(live);
         }
     }
 
@@ -311,6 +509,12 @@ impl SandboxEnv {
     ///   inherited. A key the Project environment declares is left to it.
     /// - Build directories: Project > command > operator process > Forge. A
     ///   Project value that is empty disables the redirect for that key.
+    /// - The shared compiler cache: the same order, for the whole set at
+    ///   once. When the Project (an empty value included, which turns the
+    ///   wrapper off for that Project), the command or the operator's
+    ///   environment already carries `RUSTC_WRAPPER`,
+    ///   `CARGO_BUILD_RUSTC_WRAPPER` (which `RUSTC_WRAPPER` would shadow) or
+    ///   any of the wrapper's own variables, Forge sets none of them.
     pub fn variables(
         &self,
         project: &BTreeMap<String, String>,
@@ -334,6 +538,23 @@ impl SandboxEnv {
                 Some(_) => {}
                 None if preset(key) || operator(key).is_some_and(|value| !value.is_empty()) => {}
                 None => vars.push((key, Some(path.clone().into_os_string()))),
+            }
+        }
+        if let Some(cache) = &self.cache {
+            let taken = |key: &str| {
+                project.contains_key(key)
+                    || preset(key)
+                    || operator(key).is_some_and(|value| !value.is_empty())
+            };
+            // All or nothing. A wrapper of Forge's writing into a directory
+            // someone else named would let a Project point the operator's
+            // program at another repository's store.
+            let chosen_elsewhere = crate::compiler_cache::WRAPPER_CONFIG_KEYS
+                .iter()
+                .any(|key| taken(key))
+                || cache.variables().any(|(key, _)| taken(key));
+            if !chosen_elsewhere {
+                vars.extend(cache.variables().map(|(key, value)| (key, Some(value))));
             }
         }
         vars
@@ -397,6 +618,9 @@ pub fn settle_run(worktree: &Path, run_id: &str) {
             remove_run_tmp(&tmp);
         }
     }
+    // A run without a temp directory that its starter never settled (the
+    // execution was settled by someone else) leaves the registry here.
+    live_run_dirs().remove(&task_root.live_key(run_id));
 }
 
 /// Remove one per-run directory, but only out of a real directory: a
@@ -408,7 +632,7 @@ fn remove_run_tmp(tmp: &Path) {
     }
 }
 
-/// Remove the temp directories runs of a previous process left behind.
+/// Remove the temp directories of runs that are dead.
 ///
 /// `task_roots` is the directory whose children are Task roots (the server
 /// workspace root; `<root>/.forge/workspaces` on a daemon). A per-run
@@ -418,29 +642,18 @@ fn remove_run_tmp(tmp: &Path) {
 /// - this process did not create it (a hook, check, tool command, probe or
 ///   execution running here is never touched, whenever the sweep runs and
 ///   however often);
-/// - it was last modified before this process first used this module (so a
-///   directory another live owner made since is left alone);
-/// - its key belongs to no run id in `live`.
+/// - its key belongs to no run id in `live`;
+/// - it was last modified more than `max_run_age` before `now`.
+///
+/// The same rule holds at start-up and on the timer. "Older than this
+/// process" is not proof of death: a run a previous process started and left
+/// detached (a protected push, a check still settling) outlives a restart
+/// and is in nobody's table, so only its age can condemn its directory. Age
+/// never removes a directory younger than `max_run_age`, and a run longer
+/// than that is kept by `live` and by this process's registry.
 ///
 /// Links are never followed: not a linked Task root, not a linked
 /// `.forge-task`, `tmp` or `.forge-tmp`. Returns the number removed.
-pub fn sweep_dead_runs<'a>(task_roots: &Path, live: impl IntoIterator<Item = &'a str>) -> usize {
-    sweep_dead_runs_older_than(task_roots, live, *PROCESS_START)
-}
-
-/// The periodic form of [`sweep_dead_runs`], for a process that has been
-/// running for a while.
-///
-/// A per-run directory is removed when this process does not hold it, its key
-/// belongs to no run id in `live`, and it was last modified more than
-/// `max_run_age` before `now`.
-///
-/// Unlike the start-up sweep it does not take "older than this process" as
-/// proof of death: a run a previous process started and left detached (a
-/// protected push, a check still settling) can outlive a restart, and only
-/// the start-up sweep's caller knows which of those it re-adopted. Age alone
-/// never removes a directory younger than `max_run_age`, and a run longer
-/// than that is kept by `live` and by this process's registry.
 pub fn sweep_stale_runs<'a>(
     task_roots: &Path,
     live: impl IntoIterator<Item = &'a str>,
@@ -569,24 +782,99 @@ fn prepare_run_tmp(tmp: &Path) -> io::Result<()> {
 /// Remove a directory tree, including directories a run left read-only.
 /// Symbolic links are removed, never followed.
 pub(crate) fn remove_tree(path: &Path) {
+    remove_tree_until(path, None);
+}
+
+/// Entries removed between two looks at the deadline. A tree smaller than
+/// this always goes in one call, so every pass makes progress.
+const REMOVE_STRIDE: usize = 256;
+
+/// [`remove_tree`] that stops between entries once `deadline` has passed.
+/// `false` when it stopped early: what is left is still a tree under `path`
+/// and the next call carries on. `true` otherwise, whether or not every
+/// entry could be removed.
+pub(crate) fn remove_tree_until(path: &Path, deadline: Option<Instant>) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
+        return true;
     };
     if !metadata.file_type().is_dir() {
         let _ = fs::remove_file(path);
-        return;
+        return true;
     }
-    if fs::remove_dir_all(path).is_ok() {
-        return;
+    let Some(deadline) = deadline else {
+        if fs::remove_dir_all(path).is_ok() {
+            return true;
+        }
+        #[cfg(unix)]
+        make_dirs_owner_writable(path);
+        if let Err(error) = fs::remove_dir_all(path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "directory tree could not be removed");
+            }
+        }
+        return true;
+    };
+    // Depth first, children before their directory. An entry that cannot be
+    // removed is remembered so the walk goes past it and ends.
+    let mut stuck: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut stack = vec![path.to_path_buf()];
+    let mut removed = 0_usize;
+    while let Some(dir) = stack.last().cloned() {
+        make_owner_writable(&dir);
+        let mut descended = false;
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if stuck.contains(&child) {
+                    continue;
+                }
+                // `file_type` does not follow a link: a link is a file here.
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    stack.push(child);
+                    descended = true;
+                    break;
+                }
+                if fs::remove_file(&child).is_err() {
+                    stuck.insert(child);
+                }
+                removed += 1;
+                if removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline {
+                    return false;
+                }
+            }
+        }
+        if descended {
+            continue;
+        }
+        stack.pop();
+        if fs::remove_dir(&dir).is_err() && fs::symlink_metadata(&dir).is_ok() {
+            stuck.insert(dir);
+        }
+        removed += 1;
+        if !stack.is_empty() && removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline
+        {
+            return false;
+        }
     }
-    #[cfg(unix)]
-    make_dirs_owner_writable(path);
-    if let Err(error) = fs::remove_dir_all(path) {
-        if error.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(path = %path.display(), %error, "per-run temp directory could not be removed");
+    if fs::symlink_metadata(path).is_ok() {
+        tracing::warn!(path = %path.display(), "directory tree could not be removed");
+    }
+    true
+}
+
+#[cfg(unix)]
+fn make_owner_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::symlink_metadata(dir) {
+        let mode = metadata.permissions().mode();
+        if metadata.file_type().is_dir() && mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700));
         }
     }
 }
+
+#[cfg(not(unix))]
+fn make_owner_writable(_dir: &Path) {}
 
 #[cfg(unix)]
 fn make_dirs_owner_writable(root: &Path) {
@@ -862,9 +1150,12 @@ mod tests {
         }
         assert!(dirs[2].starts_with(dir.path().join(SHORT_TMP_DIR_NAME)));
         fs::create_dir_all(unreserved.join("tmp/kept")).unwrap();
-        // Nothing is old enough for the real cutoff: all four were made
-        // after this process started.
-        assert_eq!(sweep_dead_runs(dir.path(), []), 0);
+        // A restart proves nothing about a run the previous process left
+        // detached: at start-up, as on the timer, only a directory older
+        // than the longest run goes.
+        let day = std::time::Duration::from_secs(25 * 60 * 60);
+        assert_eq!(sweep_stale_runs(dir.path(), [], SystemTime::now(), day), 0);
+        assert!(dirs.iter().all(|tmp| tmp.is_dir()));
         assert_eq!(
             sweep_dead_runs_older_than(dir.path(), ["live-run", "live-long"], later()),
             2
@@ -968,5 +1259,203 @@ mod tests {
             );
         }
         assert!(real_root.join(".forge-task/tmp/runabc").exists());
+    }
+
+    use crate::compiler_cache::{self, tests as cache_tests, CACHE_DIR, WRAPPER_KEY};
+
+    fn value(vars: &[(&'static str, Option<OsString>)], key: &str) -> Option<Option<OsString>> {
+        vars.iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn compiler_cache_is_off_until_installed_and_then_every_run_of_a_repository_shares_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let first = cache_tests::linked_worktree(&root, "t1", "repo-a");
+        let second = cache_tests::linked_worktree(&root, "t2", "repo-a");
+        let other = cache_tests::linked_worktree(&root, "t3", "repo-b");
+        let none = |_: &str| None;
+        let unset = |_: &str| false;
+        let project = BTreeMap::new();
+
+        // Off by default: nothing about a wrapper reaches a run.
+        let off = SandboxEnv::for_run(&first, "run-1", RunPurpose::Execution);
+        drop(hold_compiler_cache(&first));
+        assert!(off.compiler_cache().is_none());
+        assert!(value(&off.variables(&project, unset, none), WRAPPER_KEY).is_none());
+        assert!(!root.join(CACHE_DIR).exists());
+
+        let wrapper = cache_tests::fake_wrapper(&dir.path().join("bin"), "kache");
+        compiler_cache::install(&root, Some(cache_tests::cache(&root, &wrapper)));
+        let store = root.join(CACHE_DIR).join("repo-a");
+        // Every run family that gets a build directory gets the cache:
+        // executions, tool commands, hooks, checks, and the Task-level
+        // environment of a check or review command.
+        let families = [
+            SandboxEnv::for_run(&first, "run-1", RunPurpose::Execution),
+            SandboxEnv::for_run(&first, "run-2", RunPurpose::Command),
+            SandboxEnv::for_run(&second, "run-3", RunPurpose::Hook),
+            SandboxEnv::for_run(&second, "run-4", RunPurpose::Check),
+            SandboxEnv::for_task(&second),
+        ];
+        for env in &families {
+            let vars = env.variables(&project, unset, none);
+            assert_eq!(
+                value(&vars, WRAPPER_KEY),
+                Some(Some(wrapper.clone().into_os_string()))
+            );
+            assert_eq!(
+                value(&vars, "KACHE_CACHE_DIR"),
+                Some(Some(store.clone().into_os_string()))
+            );
+            assert!(value(&vars, "CARGO_TARGET_DIR").is_some());
+        }
+        let scoped = SandboxEnv::for_command(&first, RunPurpose::Command);
+        assert_eq!(
+            scoped.env().compiler_cache().unwrap().dir(),
+            Some(store.as_path())
+        );
+        drop(scoped);
+        // A probe builds nothing; another repository has its own store.
+        assert!(SandboxEnv::for_run(&first, "p", RunPurpose::Probe)
+            .compiler_cache()
+            .is_none());
+        assert_eq!(
+            SandboxEnv::for_run(&other, "run-5", RunPurpose::Check)
+                .compiler_cache()
+                .unwrap()
+                .dir(),
+            Some(root.join(CACHE_DIR).join("repo-b").as_path())
+        );
+
+        // While a run that was handed the store is live, the collector of
+        // a store whose wrapper is not known to tolerate it stays away.
+        let live = SandboxEnv::for_run(&first, "live", RunPurpose::Execution).prepared();
+        assert_eq!(unless_live_cache_run_in(&store, || ()), None);
+        assert_eq!(
+            unless_live_cache_run_in(&root.join(CACHE_DIR).join("repo-b"), || ()),
+            Some(())
+        );
+        live.settle();
+        assert_eq!(unless_live_cache_run_in(&store, || ()), Some(()));
+        // A command with no run scope (an owner-local hook or CI step) holds
+        // its repository's store for as long as it runs.
+        let (hook, ci_step) = (hold_compiler_cache(&first), hold_compiler_cache(&second));
+        let elsewhere = hold_compiler_cache(dir.path());
+        assert_eq!(unless_live_cache_run_in(&store, || ()), None);
+        drop(hook);
+        assert_eq!(unless_live_cache_run_in(&store, || ()), None);
+        drop(ci_step);
+        assert_eq!(unless_live_cache_run_in(&store, || ()), Some(()));
+        drop(elsewhere);
+
+        compiler_cache::install(&root, None);
+        assert!(SandboxEnv::for_run(&first, "run-6", RunPurpose::Check)
+            .compiler_cache()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn compiler_cache_yields_to_the_project_the_command_and_the_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let worktree = cache_tests::linked_worktree(&root, "t1", "repo-a");
+        let wrapper = cache_tests::fake_wrapper(&dir.path().join("bin"), "kache");
+        let env = SandboxEnv::for_run(&worktree, "run-1", RunPurpose::Execution)
+            .with_compiler_cache(cache_tests::cache(&root, &wrapper).for_worktree(&worktree));
+        let store = root.join(CACHE_DIR).join("repo-a");
+        let none = |_: &str| None;
+        let unset = |_: &str| false;
+        let cache_vars = |vars: Vec<(&'static str, Option<OsString>)>| {
+            vars.into_iter()
+                .filter(|(key, _)| *key == WRAPPER_KEY || key.starts_with("KACHE_"))
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>()
+        };
+        let all = vec![WRAPPER_KEY, "KACHE_CACHE_DIR", "KACHE_MAX_SIZE"];
+        assert_eq!(
+            cache_vars(env.variables(&BTreeMap::new(), unset, none)),
+            all
+        );
+
+        // The Project names its own wrapper, or turns the wrapper off with
+        // an empty value: Forge sets nothing at all.
+        for project_value in ["/project/wrapper", ""] {
+            let project = BTreeMap::from([(WRAPPER_KEY.to_owned(), project_value.to_owned())]);
+            assert!(cache_vars(env.variables(&project, unset, none)).is_empty());
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("printf '%s|%s' \"${RUSTC_WRAPPER-unset}\" \"${KACHE_CACHE_DIR-unset}\"")
+                .env_remove("KACHE_CACHE_DIR")
+                .envs(&project);
+            env.apply_with(&mut command, &project, none);
+            let output = command.output().await.unwrap();
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{project_value}|unset")
+            );
+            assert_eq!(env.compiler_cache_dir_in_use(command.as_std()), None);
+        }
+        // A value already on the command, then the operator's environment.
+        assert!(
+            cache_vars(env.variables(&BTreeMap::new(), |key| key == WRAPPER_KEY, none)).is_empty()
+        );
+        let operator = |key: &str| (key == WRAPPER_KEY).then(|| OsString::from("/usr/bin/sccache"));
+        assert!(cache_vars(env.variables(&BTreeMap::new(), unset, operator)).is_empty());
+        // An empty operator value is no wrapper of the operator's.
+        let empty = |key: &str| (key == WRAPPER_KEY).then(OsString::new);
+        assert_eq!(
+            cache_vars(env.variables(&BTreeMap::new(), unset, empty)),
+            all
+        );
+        // One of the wrapper's own variables set by anyone else: Forge sets
+        // nothing at all, so its wrapper is never pointed at a directory a
+        // Project chose (another repository's store, say).
+        let own_dir =
+            |key: &str| (key == "KACHE_CACHE_DIR").then(|| OsString::from("/operator/cache"));
+        assert!(cache_vars(env.variables(&BTreeMap::new(), unset, own_dir)).is_empty());
+        for key in [
+            "KACHE_CACHE_DIR",
+            "KACHE_MAX_SIZE",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ] {
+            let project = BTreeMap::from([(key.to_owned(), "/other/store".to_owned())]);
+            assert!(
+                cache_vars(env.variables(&project, unset, none)).is_empty(),
+                "{key}"
+            );
+            let mut command = Command::new("sh");
+            command.envs(&project);
+            env.apply_with(&mut command, &project, none);
+            assert_eq!(env.compiler_cache_dir_in_use(command.as_std()), None);
+            assert!(
+                cache_vars(env.variables(&BTreeMap::new(), |name| name == key, none)).is_empty(),
+                "{key} on the command"
+            );
+        }
+        // A config-file wrapper of the operator's own is theirs too.
+        let cargo_config = |key: &str| {
+            (key == "CARGO_BUILD_RUSTC_WRAPPER").then(|| OsString::from("/usr/bin/sccache"))
+        };
+        assert!(cache_vars(env.variables(&BTreeMap::new(), unset, cargo_config)).is_empty());
+
+        let mut command = Command::new("sh");
+        command
+            .env_remove(WRAPPER_KEY)
+            .env_remove("KACHE_CACHE_DIR");
+        env.apply_with(&mut command, &BTreeMap::new(), none);
+        assert_eq!(
+            env.compiler_cache_dir_in_use(command.as_std()),
+            Some(store.as_path())
+        );
+        assert_eq!(
+            env.clone()
+                .without_compiler_cache()
+                .compiler_cache_dir_in_use(command.as_std()),
+            None
+        );
     }
 }

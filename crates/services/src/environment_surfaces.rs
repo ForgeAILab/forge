@@ -666,13 +666,15 @@ pub async fn task_placement_diagnostics(
             failing_checks: vec![],
         });
     }
-    if condition
+    if let Some(disposition) = condition
         .current_refusal(task.version)
-        .is_some_and(|disposition| disposition.capability == "machine_capacity")
+        .filter(|disposition| disposition.capability == "machine_capacity")
     {
+        // `machine_capacity` for a run slot, `disk_pressure` for free disk:
+        // by the typed scope of the wait.
         diagnostics.push(api_types::TaskPlacementDiagnostic {
             machine: None,
-            filter_codes: vec!["machine_capacity".into()],
+            filter_codes: vec![disposition.capacity_reason().0.to_owned()],
             failing_checks: vec![],
         });
     }

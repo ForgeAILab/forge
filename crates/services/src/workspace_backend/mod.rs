@@ -143,6 +143,16 @@ pub enum WorkspaceBackendError {
     RpcTimeoutBeforeStart { daemon_id: String, method: String },
     #[error("owner_unsupported: workspace owner {owner_kind}")]
     OwnerUnsupported { owner_kind: PlacementOwnerKind },
+    /// The owner refused to make a worktree because its own disk reading
+    /// is under the free-space floor. Nothing was created; the Task waits
+    /// for disk exactly as when the server refuses from the owner's report.
+    #[error("disk_pressure: the workspace filesystem of daemon {daemon_id} is under its free-space floor")]
+    DiskPressure {
+        task_id: String,
+        repo_location_id: String,
+        daemon_id: String,
+        runtime_id: Option<String>,
+    },
     #[error(transparent)]
     Other(Box<ServiceError>),
 }
@@ -202,6 +212,25 @@ impl From<WorkspaceBackendError> for ServiceError {
             error @ WorkspaceBackendError::OwnerUnsupported { .. } => {
                 Self::invalid_operation(error.to_string())
             }
+            // The same typed placement refusal the server makes from the
+            // owner's report: one disk wait, whoever noticed.
+            WorkspaceBackendError::DiskPressure {
+                task_id,
+                repo_location_id,
+                daemon_id,
+                runtime_id,
+            } => Self::PlacementUnavailable(crate::placement::PlacementUnavailable {
+                task_id,
+                repo_id: String::new(),
+                rejected_candidates: vec![crate::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
+                    repo_location_id,
+                    owner_kind: PlacementOwnerKind::Daemon.to_string(),
+                    daemon_id: Some(daemon_id),
+                    runtime_id,
+                    filter_codes: vec![crate::placement::PlacementFilterCode::DiskPressure],
+                }],
+            }),
         }
     }
 }

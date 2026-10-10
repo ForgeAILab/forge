@@ -336,12 +336,25 @@ impl DaemonRuntime {
         };
         let runtime = Arc::downgrade(self);
         handle.spawn(async move {
+            use crate::daemon_workspace::gc::{
+                GC_DISK_CHECK_INTERVAL, GC_INTERVAL, GC_PRESSURE_INTERVAL,
+            };
+            let mut since_sweep = Duration::ZERO;
             loop {
-                tokio::time::sleep(crate::daemon_workspace::gc::GC_INTERVAL).await;
+                tokio::time::sleep(GC_DISK_CHECK_INTERVAL).await;
+                since_sweep += GC_DISK_CHECK_INTERVAL;
                 let Some(runtime) = runtime.upgrade() else {
                     return;
                 };
-                if let Some(workspace) = &runtime.workspace {
+                let Some(workspace) = &runtime.workspace else {
+                    return;
+                };
+                // Short of disk: the sweep does not wait for its timer, so
+                // the next report already carries what it reclaimed.
+                let due = since_sweep >= GC_INTERVAL
+                    || (since_sweep >= GC_PRESSURE_INTERVAL && workspace.disk_is_short());
+                if due {
+                    since_sweep = Duration::ZERO;
                     workspace.gc_sweep(&runtime.active_execution_ids()).await;
                 }
             }

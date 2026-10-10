@@ -436,6 +436,9 @@ workspace:
   log_retention_days: 30        # logs of a terminal Task; 0 keeps them forever
   min_free_bytes: 10737418240   # free-space floor: the larger of this
   min_free_percent: 5           # and this share of the filesystem
+  min_free_inode_percent: 5     # and this share of its inodes; 0 turns it off
+  # gc_free_bytes: 21474836480  # collect at once under the larger of this
+  # gc_free_percent: 10         # and this; unset: twice the floor
 ```
 
 Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
@@ -443,10 +446,171 @@ Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
 root's filesystem has less free space than the floor, the periodic sweep
 deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
 least recently used first; those Tasks rebuild on their next run. Running work
-is never touched. `FORGE_WORKSPACE_LOG_RETENTION_DAYS`,
-`FORGE_WORKSPACE_MIN_FREE_BYTES` and `FORGE_WORKSPACE_MIN_FREE_PERCENT`
-override the file values; all three take effect on restart. A daemon uses the
-default floor. No key turns garbage collection off.
+is never touched. A Task with an open review or an unresolved attention item
+keeps its logs until that is decided or resolved.
+
+The same floor decides admission. While a machine's workspace filesystem is
+under it (bytes or inodes), Forge starts no new worktree on that machine.
+Checks run in a Task's existing worktree and are not held back. On a
+filesystem smaller than twice `min_free_bytes` the byte floor is half the
+filesystem. Other machines stay eligible. A Task that already has its
+worktree there keeps running, and nothing running is stopped: finishing work
+is how space comes back. When every machine that could take a Task is short,
+the Task waits and says so ("Waiting for Disk Space"); it is dispatched by
+itself within about half a minute of a reading recovering. Nothing fails, no retry budget is spent
+and the Project is not paused. Before the server refuses, it collects its
+garbage once and reads the disk again, and under the collector mark
+(`gc_free_*`, default twice the floor) the collector runs at once instead of
+on its 10 minute timer. If the wait says garbage collection is not running on
+a machine, free space there by hand or fix the root's ownership (below):
+nothing will reclaim it automatically. A disk that cannot be read refuses
+nothing.
+
+#### Shared compiler cache (opt-in)
+
+Every Task builds into its own directory (`CARGO_TARGET_DIR` under its Task
+root), so every Task starts with a cold build. If you have a compiler-cache
+wrapper installed, Forge can hand it to runs so that separate Tasks of one
+repository reuse each other's compiled crates, without sharing a build
+directory or a lock. Forge installs nothing and this is off until you name a
+wrapper:
+
+```yaml
+workspace:
+  compiler_cache:
+    wrapper: kache              # absolute path, or a name found on PATH at start
+    # max_bytes: 21474836480    # size cap, default 20 GiB; 0 turns the cache off
+    # dir: /var/cache/forge     # default <workspace root>/.forge/build/cache
+```
+
+`FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER`, `..._MAX_BYTES` and `..._DIR`
+override the file. This is per machine: a daemon reads the same
+`workspace.compiler_cache` block from its own `daemon.yaml`
+(`forge-daemon --compiler-cache-wrapper`, `--compiler-cache-max-bytes` and
+`--compiler-cache-dir` override it) and never receives the server's.
+
+What a run gets, when the wrapper is still executable and the cache
+directory can be written:
+
+| Wrapper (by program name) | Variables set on the run |
+|---|---|
+| `kache` | `RUSTC_WRAPPER`, `KACHE_CACHE_DIR=<dir>/<repository id>`, `KACHE_MAX_SIZE=<max_bytes>` |
+| `sccache` | `RUSTC_WRAPPER=<dir>/<repository id>/rustc-wrapper`, `SCCACHE_DIR=<dir>/<repository id>`, `SCCACHE_CACHE_SIZE`, `SCCACHE_SERVER_UDS=<dir>/<repository id>/s` |
+| anything else | `RUSTC_WRAPPER` only |
+
+It applies to every run that gets the per-Task build directory: agent
+executions, lifecycle hooks, checks and CI commands in a Task worktree, the
+native command tool and a daemon's `workspace.run`. Precedence is the same as
+for the build directory: a `RUSTC_WRAPPER` in the Project environment wins
+(set it to an empty value to turn the wrapper off for one Project), then a
+value already on the command, then `RUSTC_WRAPPER` in the environment Forge
+itself was started with, then this setting. The set is all or nothing: when
+any of those carries `RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER` (which
+`RUSTC_WRAPPER` would shadow) or one of the wrapper's own variables in the
+table (`KACHE_CACHE_DIR`, `SCCACHE_DIR`, ...), Forge sets none of the
+variables above and grants no extra writable directory, so a Project can
+never aim Forge's wrapper at a directory of its own choosing. Hooks, checks
+and `workspace.run` commands run in a login shell, so a `RUSTC_WRAPPER`
+exported by the operator's shell profile also replaces Forge's there.
+
+Two consequences worth knowing. If the environment Forge itself is started
+with already names a wrapper (a global `export RUSTC_WRAPPER=kache`, say),
+every run inherits that, so this setting is off for that process; Forge says
+so in one warning at start. Unset the variable for the Forge process to get
+one store per repository. And a `build.rustc-wrapper` in a repository's
+`.cargo/config.toml` is not something Forge sees: `RUSTC_WRAPPER` shadows
+it, so a Project that wants its own wrapper sets `RUSTC_WRAPPER` (or an
+empty value) in its Project environment.
+
+Things to know:
+
+- **`kache` shares the most.** It reuses a crate across worktrees. `sccache`
+  makes the directory the compiler runs in part of its key, so it shares
+  dependencies (registry and git crates) between Tasks but not the
+  repository's own crates.
+- **`sccache` needs two things from Forge**, both automatic. One server per
+  repository store, started by Forge (`sccache --start-server`, socket and
+  temp directory inside the store, no idle exit): a server started by a
+  run's first compile would keep that run's temporary directory and fail
+  every compile after the run ended. And a two-line launcher,
+  `<store>/rustc-wrapper`, that runs your `sccache` without
+  `CARGO_TARGET_DIR`: `sccache` makes every `CARGO_*` variable part of its
+  key, and each Task has its own. The servers outlive Forge; stop one with
+  `SCCACHE_SERVER_UDS=<store>/s sccache --stop-server`. A cache directory
+  whose socket path would exceed 100 bytes is not used: set `dir` to a
+  shorter path.
+- **A cache never fails a run.** At start `kache` and `sccache` must answer
+  `--version` within five seconds, or the setting is off for the life of the
+  process (one warning). After that, if the wrapper is gone, the directory
+  cannot be created or written (read-only or full disk included), or the
+  `sccache` server does not start, the run builds as it would without the
+  setting and the log carries one warning per cause for the life of the
+  process. Starting an `sccache` server may hold a run's start for up to ten
+  seconds; after three failed starts in a row for one store, runs stop
+  trying for ten minutes. What Forge cannot see is a wrapper that still
+  exists and starts but fails or hangs while compiling: that is a build
+  failure of the run like any other broken tool, and Forge puts no timeout
+  around a compiler.
+- **Who shares a store (trust boundary).** One store is shared by every Task
+  of one repository on one machine, and by nothing else: the store is named
+  after the repository's id (for a repository that is a local checkout,
+  after that checkout's path), and it is taken from the Task worktree only
+  when the repository's own Git directory names that worktree back, so a
+  Task cannot claim another repository's store by editing its `.git` file.
+  Two Projects share a store only if they are bound to the same repository
+  directory on disk. Within a repository the cache is a channel between
+  Tasks: a Task that can write the store can plant an artifact a later Task
+  or check links. That is the same trust you already give Tasks of one
+  repository (their commits reach the same checks); do not turn this on for
+  a repository whose Tasks must not be able to affect each other's builds.
+- **Background processes.** `sccache` servers (above) and the `kache` daemon
+  (which `kache` starts itself on first use, one per store) outlive the run
+  and Forge. Stop a `kache` daemon with
+  `KACHE_CACHE_DIR=<store> kache daemon stop`.
+- **Sandboxed CLIs.** A Codex Task under Forge's managed workspace-write
+  sandbox gets the wrapper only when it is `kache` (which builds uncached
+  when it cannot reach its store), and its store is then added to the
+  sandbox's writable roots. `sccache` and unknown wrappers are not passed
+  into that sandbox: `sccache` fails a compile when it cannot reach its
+  server. Codex under `yolo` gets whatever you configured. Codex with your
+  own sandbox configuration, and Gemini with `--sandbox`, get no wrapper.
+  Forge cannot see a sandbox you switch on inside Claude Code, Cursor,
+  OpenCode or Smith themselves: those runs get the wrapper like any other.
+  If such a sandbox blocks the store or the `sccache` socket, use `kache`
+  (it builds uncached) or set an empty `RUSTC_WRAPPER` in that Project's
+  environment.
+- **Disk.** `max_bytes` is enforced twice. The wrapper holds each repository
+  store to it (`KACHE_MAX_SIZE`, `SCCACHE_CACHE_SIZE`), and on every pass
+  the garbage collector holds all stores of the machine together to it,
+  deleting least recently used entries (by access and modification time)
+  whatever the disk has free and wherever `dir` is. While the workspace
+  filesystem is under its free-space floor, the collector also deletes
+  least recently used entries until the disk is back above the floor or the
+  cache is down to half of `max_bytes`, and only then takes any Task's build
+  output. It deletes entry files only, never a store directory. For a
+  `kache` store it does so only while no run of that repository is live. A
+  cache left behind in the default directory after you remove the setting
+  is trimmed to nothing under floor pressure only; one left in a `dir` of
+  your own is yours to delete. A `dir` on another filesystem than the
+  workspace root is not trimmed for the floor (it would free nothing where
+  space is short), only held to `max_bytes`. A wrapper Forge does not know
+  (`RUSTC_WRAPPER` only) keeps its cache wherever it likes; Forge neither
+  measures nor trims it.
+  Free space admission counts the cache like any other used disk.
+- Check results are not affected: the wrapper is added per run and is not
+  part of the environment a check's identity is computed from.
+
+`FORGE_WORKSPACE_LOG_RETENTION_DAYS`, `FORGE_WORKSPACE_MIN_FREE_BYTES`,
+`FORGE_WORKSPACE_MIN_FREE_PERCENT`, `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`,
+`FORGE_WORKSPACE_GC_FREE_BYTES` and `FORGE_WORKSPACE_GC_FREE_PERCENT` override
+the file values; all take effect on restart. A daemon has no floor of its own:
+it reports the free bytes and inodes of its workspace root with every report
+and takes the server's floor from the reply, for its own collector and for
+refusing to make a worktree while its own disk is under it. Until the first
+reply its collector uses the built-in default and logs that it does, and it
+refuses nothing. A daemon that stops reporting for five minutes is no longer
+counted as short of disk. No key turns
+garbage collection off.
 
 Garbage collection runs only on a workspace root this server's database owns.
 The server adopts its root at start-up by writing `.forge/gc/owner` under it,

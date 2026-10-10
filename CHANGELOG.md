@@ -68,6 +68,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     `forge-ctl` (position, phase and timings are on the Task's `condition`
     only), and deleting a repository, a location or a Project is not yet
     refused while a merge into it has an unknown result.
+- **A machine under its free-space floor starts no new work (3.4 stage E).**
+  With the default floor (10 GiB or 5 % of the workspace filesystem,
+  whichever is larger, or 5 % of its inodes; on a filesystem under 20 GiB
+  the byte floor is half the filesystem) a server or daemon that is that
+  short of disk no longer gets new worktrees; Tasks wait ("Waiting for Disk
+  Space") and are dispatched by themselves within about 30 seconds of space
+  coming back. Work in an existing worktree, check runs included, is never
+  held back. A daemon also refuses to make a worktree
+  (`workspace.prepare`, error code `disk_pressure`) while its own reading is
+  under the floor. Lower `workspace.min_free_bytes` / `min_free_percent` /
+  `min_free_inode_percent` in `forge.yaml` to admit work on a fuller disk.
+- **A deleted Task's worktree and build output are removed (3.4 stage E).**
+  Deleting a Task now schedules the cleanup a terminal Task gets, once
+  nothing runs for it (no execution, lease, dispatched check run, or hook or
+  command of the server in its directory). Before, the directories of a Task deleted in a
+  non-terminal state stayed on disk indefinitely.
 
 - **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
   The `ci_steps` a Task runs when it enters `review` are no longer executed
@@ -162,6 +178,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   symbolic link is refused and never collected. A daemon does the same with
   `<root>/.forge/gc/daemon-owner`, tied to its persisted workspace state,
   and only one daemon process per root collects.
+- **Temp directories of crashed runs go sooner on a short disk (3.4 stage
+  E).** While the workspace filesystem is under its free-space floor, a
+  per-run temp directory that no live run owns is deleted once it is older
+  than twice `server.check_run_timeout_seconds` plus an hour (2 hours by
+  default) instead of 25 hours.
 - **Idle Tasks lose their build output under disk pressure (3.4 stage D).**
   While the workspace root's filesystem is under its free-space floor
   (default: the larger of 10 GiB and 5 %), the sweep deletes
@@ -196,7 +217,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   directory (a Codex execution that is not a managed Task, Gemini with
   `--sandbox`) are unchanged.
 
-- **Daemon protocol revision 7 (3.2 stage D2a).** The minimum revision is 7.
+- **Daemon protocol revision 7 (3.2 stage D2a, 3.4 stage E): upgrade every
+  daemon with the server.** The minimum revision is 7.
   `integration.release_objects` takes an optional `attempt`
   (`{attempt_id, repo_location_id}`) and then also deletes every ref that
   attempt imported in that checkout (`refs/forge/integration/<attempt>-*`)
@@ -220,6 +242,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `target_owner` names another owner). A daemon built before these
   additions refuses such a head's effects (`foreign_owner` /
   `unknown method`); upgrade daemons with the server.
+  Also in revision 7 (3.4 stage E): a daemon sends the free bytes and inodes
+  of its workspace root with every report and takes the server's free-space
+  floor from the reply; it refuses `workspace.prepare` of a worktree it
+  would have to make, and an exact-commit `check.run`, with the new error
+  code `disk_pressure` when its own reading is under that floor. One
+  unreleased revision carries both changes: there is no revision that has
+  only one of them.
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -2134,6 +2163,66 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Opt-in shared compiler cache (3.4 stage F).** Each Task builds into its
+  own `CARGO_TARGET_DIR`, so each Task builds cold. If a compiler-cache
+  wrapper is installed on a machine (`kache`, `sccache`), name it in
+  `workspace.compiler_cache.wrapper` (`forge.yaml`, or
+  `FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER`; a daemon: the same key in its
+  `daemon.yaml`, or `forge-daemon --compiler-cache-wrapper`) and separate
+  Tasks of one repository share compiled artifacts without sharing a build
+  directory or a lock. Runs that get the per-Task build directory
+  (executions, hooks, checks in a Task worktree, the native command tool,
+  daemon `workspace.run`) then also get `RUSTC_WRAPPER` and the wrapper's
+  cache directory, one store per repository under
+  `<workspace root>/.forge/build/cache/<repository id>`
+  (`workspace.compiler_cache.dir`), capped by `max_bytes` (default 20 GiB).
+  Off unless a wrapper is configured; Forge installs nothing. A Project
+  environment `RUSTC_WRAPPER` wins (an empty value turns the wrapper off for
+  that Project), then a value on the command, then the operator's own
+  environment; when any of them carries `RUSTC_WRAPPER`,
+  `CARGO_BUILD_RUSTC_WRAPPER` or one of the wrapper's own variables, Forge
+  sets none of its own. A store is shared by the Tasks of one repository on
+  one machine and by nothing else. A wrapper or cache directory that cannot be used never fails
+  a run: the run builds without it and the server logs one warning. While a
+  disk is under its free-space floor the garbage collector deletes least
+  recently used cache entries, down to half of `max_bytes`, before it takes
+  any Task's build output; on every pass it also holds all stores of the
+  machine together to `max_bytes`. Machine disk facts gain `compiler_cache_bytes`.
+  See `docs/getting-started.md` for what each wrapper is given, and for the
+  two things Forge does for `sccache` (it starts one server per repository
+  store, and hands runs a launcher that drops `CARGO_TARGET_DIR` from the
+  compile's environment, which `sccache` would otherwise make part of every
+  cache key).
+- **Disk-pressure admission (3.4 stage E).** A full disk no longer silently
+  kills work. Each machine's workspace filesystem is read for free bytes and
+  inodes (the server reads its own root; a daemon reports its root). Under
+  the floor a machine is rejected for new worktrees with the placement filter
+  code `disk_pressure` while other machines stay eligible, a Task with a
+  ready worktree there keeps running, and nothing running is stopped. When
+  every usable machine is short the Task waits on the machine-capacity path
+  with capacity scope `disk` (`ConditionCapacityScope` gains `disk`;
+  `workflow_health.stale_reason` is `disk_pressure`, derived from the typed
+  scope) and clears by itself: no failure, no retry-budget charge, no
+  Project pause. The dispatcher reads disk waiters again every 30 seconds
+  while a machine is short, also after a restart. Check runs execute in an
+  existing worktree and are never held for disk. Before refusing, the server
+  collects its garbage once and reads the disk again (one pass a minute at
+  most, never one per claim), and the wait says when nothing collects
+  garbage on a machine. A disk that cannot be read, a filesystem that
+  reports no size, and a daemon reading older than five minutes refuse
+  nothing. A daemon checks its own disk before it makes a worktree and
+  refuses with `disk_pressure`; the Task takes the same wait.
+- **Inode floor and collector mark.** `workspace.min_free_inode_percent`
+  (default 5, `0` off; `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`) joins the
+  byte floor for eviction and admission. `workspace.gc_free_bytes` /
+  `workspace.gc_free_percent` (`FORGE_WORKSPACE_GC_FREE_*`; default twice the
+  floor) is the free space under which the garbage collector runs at once
+  instead of on its 10 minute timer, on the server and on daemons.
+- **Machine disk facts on the API and CLI.** Daemon reads add `disk` (the
+  last reading, `floor_bytes` and `pressure`) and `workspace_floor`;
+  Operations `daemon_pressure` entries add `disk`; `forge-ctl daemon` tables
+  add a `Disk` column.
+
 - **Remove a machine that will never return.** `DELETE /api/v1/daemons/{id}`,
   `forge-ctl daemon remove <id>` and a Remove button with a confirmation on the
   machines settings page. Only a disconnected machine can be removed
@@ -2300,6 +2389,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   re-running review for every lost race (3.2 stage D2b).
 - A long merge or its checks no longer occupy the long Task-step slots of
   unrelated Projects.
+- **Garbage collection could take a build directory from a run that had just
+  started, and other collector safety gaps (3.4 stage E).** Build eviction is
+  now decided per Task under its lifecycle lock after reading its state
+  again, and the eviction is one rename made under the lock every run start
+  takes; a run starting meanwhile keeps its build output or gets the
+  directory made again. Every run is in that registry, also one without a
+  per-run temp directory (the usual case on macOS). A collection never
+  waits more than a second for a Task's lifecycle lock. Log retention skips a Task with an open review or an
+  unresolved attention item. Removing a very large tree stops when the pass
+  is out of time and resumes on the next pass instead of overrunning it. The
+  sweep of run directories at start-up no longer removes the directory of a
+  run a previous process left detached and still alive (server and daemon):
+  it is age-gated like the periodic sweep.
 
 - **Three waits that showed nothing, or lost what they waited for, are now
   typed and visible.** (1) A Task whose Agent is paused or unreachable kept a

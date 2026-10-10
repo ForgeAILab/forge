@@ -617,6 +617,10 @@ impl CodingExecutorAdapter for CodexAdapter {
                 .and(build_in_use)
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
+            compiler_cache: managed_codex_home
+                .as_ref()
+                .and(run_scope.env().compiler_cache_dir_in_use(command.as_std()))
+                .map(Path::to_path_buf),
             home: managed_codex_home,
         };
         let mut child = command.group_spawn()?;
@@ -983,7 +987,11 @@ impl CodexAdapter {
                             None
                         }
                     })
-                    .chain(cache_roots).collect::<Vec<_>>()
+                    .chain(cache_roots)
+                    // The shared compiler cache's store for this repository:
+                    // a root only while the child really carries its wrapper.
+                    .chain(managed.compiler_cache.as_deref().map(resolve_path_for_overlap))
+                    .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -1349,6 +1357,9 @@ struct ManagedRoots {
     scratch: Option<PathBuf>,
     /// `<task root>/.forge-task/build`, when the Task root is Forge's.
     build: Option<PathBuf>,
+    /// The repository store of the shared compiler cache, when this
+    /// execution was really handed the wrapper that writes it.
+    compiler_cache: Option<PathBuf>,
 }
 
 /// The part of the Task root's environment a Codex execution can write.
@@ -1361,7 +1372,8 @@ struct ManagedRoots {
 ///   the run keeps the scratch directory of its managed home and builds in
 ///   the worktree.
 /// - Any other execution uses the sandbox of the operator's own Codex
-///   configuration, which Forge does not control: nothing is redirected.
+///   configuration, which Forge does not control: nothing is redirected,
+///   and no compiler-cache wrapper is passed.
 fn codex_admitted_sandbox(
     sandbox: executors::sandbox::SandboxEnv,
     worktree: &Path,
@@ -1392,6 +1404,25 @@ fn codex_admitted_sandbox(
         .is_some_and(|build| !in_place(build))
     {
         sandbox = sandbox.without_build();
+    }
+    // The shared compiler cache reaches a sandboxed Codex only through a
+    // wrapper known to compile uncached when it cannot reach its store
+    // (the sandbox may deny it the daemon or server it talks to), and only
+    // into a store that is the directory its path names, not a link.
+    let usable = |cache: &executors::compiler_cache::CacheEnv| {
+        cache.kind().fails_open()
+            && cache.dir().is_some_and(|store| {
+                store
+                    .parent()
+                    .zip(store.file_name())
+                    .is_some_and(|(parent, name)| {
+                        resolve_path_for_overlap(store)
+                            == resolve_path_for_overlap(parent).join(name)
+                    })
+            })
+    };
+    if sandbox.compiler_cache().is_some_and(|cache| !usable(cache)) {
+        sandbox = sandbox.without_compiler_cache();
     }
     sandbox
 }
@@ -2753,6 +2784,116 @@ mod tests {
         assert_eq!(
             admitted.build_dir("CARGO_TARGET_DIR"),
             Some(reserved.join("build/cargo").as_path())
+        );
+    }
+
+    /// The shared compiler cache reaches a Codex execution only where the
+    /// run cannot be broken by it.
+    #[cfg(unix)]
+    #[test]
+    fn codex_sandbox_gets_the_compiler_cache_only_when_it_cannot_break_the_run() {
+        use executors::compiler_cache::{CACHE_DIR, CompilerCache, WrapperKind};
+        use executors::sandbox::{RunPurpose, SandboxEnv, TaskRoot};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let root = dir.path().join("root");
+        let worktree = root.join("t/repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+        TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".repos/repo-a/worktrees/t").display()
+            ),
+        )
+        .expect("worktree link writes");
+        // The repository names the worktree back, as Git does; without it the
+        // worktree's own `.git` file claims nothing.
+        fs::create_dir_all(root.join(".repos/repo-a/worktrees/t")).unwrap();
+        fs::write(
+            root.join(".repos/repo-a/worktrees/t/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        let wrapper = |name: &str| {
+            let path = dir.path().join("bin").join(name);
+            fs::create_dir_all(path.parent().unwrap()).expect("bin creates");
+            fs::write(
+                &path,
+                "#!/bin/sh\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
+            )
+            .expect("wrapper writes");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+        let offered = |name: &str| {
+            let wrapper = wrapper(name);
+            let cache = CompilerCache {
+                kind: WrapperKind::of(&wrapper),
+                wrapper,
+                dir: root.join(CACHE_DIR),
+                max_bytes: 1 << 30,
+            };
+            SandboxEnv::for_run(&worktree, "run-1", RunPurpose::Execution)
+                .with_compiler_cache(cache.for_worktree(&worktree))
+        };
+        let store = root.join(CACHE_DIR).join("repo-a");
+        for name in ["kache", "sccache", "cachepot"] {
+            assert!(offered(name).compiler_cache().is_some(), "{name}");
+            // Yolo has no sandbox: whatever the operator configured.
+            assert_eq!(
+                codex_admitted_sandbox(offered(name), &worktree, false, true),
+                offered(name)
+            );
+            // The operator's own sandbox: nothing, so no wrapper either.
+            assert_eq!(
+                codex_admitted_sandbox(offered(name), &worktree, false, false),
+                SandboxEnv::none()
+            );
+        }
+        // Managed: only the wrapper that builds uncached when the sandbox
+        // keeps it from its store. sccache fails the compile instead, and
+        // an unknown wrapper is not known to do either.
+        let managed = |name: &str| codex_admitted_sandbox(offered(name), &worktree, true, false);
+        assert_eq!(
+            managed("kache")
+                .compiler_cache()
+                .and_then(|cache| cache.dir()),
+            Some(store.as_path())
+        );
+        for name in ["sccache", "cachepot"] {
+            let admitted = managed(name);
+            assert!(admitted.compiler_cache().is_none(), "{name}");
+            // The rest of the Task root's environment is untouched.
+            assert!(admitted.build_dir("CARGO_TARGET_DIR").is_some());
+        }
+
+        // The store is a writable root only when the child really carries
+        // Forge's wrapper and variables.
+        let admitted = managed("kache");
+        let mut command = std::process::Command::new("codex");
+        assert_eq!(admitted.compiler_cache_dir_in_use(&command), None);
+        for (key, value) in admitted.compiler_cache().unwrap().variables() {
+            command.env(key, value);
+        }
+        assert_eq!(
+            admitted.compiler_cache_dir_in_use(&command),
+            Some(store.as_path())
+        );
+        command.env("RUSTC_WRAPPER", "/operator/sccache");
+        assert_eq!(admitted.compiler_cache_dir_in_use(&command), None);
+
+        // A store that resolves somewhere else is never handed to a sandbox.
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside creates");
+        let env = offered("kache");
+        fs::remove_dir_all(&store).expect("store removes");
+        std::os::unix::fs::symlink(&outside, &store).expect("link plants");
+        assert!(
+            codex_admitted_sandbox(env, &worktree, true, false)
+                .compiler_cache()
+                .is_none()
         );
     }
 

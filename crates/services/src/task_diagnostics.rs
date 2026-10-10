@@ -249,14 +249,19 @@ pub fn derive_workflow_health(
             disposition.capability.as_str(),
             "project_capacity" | "machine_capacity"
         ) {
-            let (reason, message) = disposition
-                .safe_message
-                .split_once(": ")
-                .unwrap_or(("project_at_capacity", &disposition.safe_message));
+            // The typed scope decides what the Task waits for; the message
+            // is only shown.
+            let (reason, message) = db::capacity_reason(
+                &disposition.capability,
+                disposition.capacity_scope.as_deref(),
+                &disposition.safe_message,
+            );
             let label = if reason == "project_waiting_on_owner" {
                 "Waiting on Owner"
             } else if reason == "machine_capacity" {
                 "Waiting for a Machine Slot"
+            } else if reason == "disk_pressure" {
+                "Waiting for Disk Space"
             } else {
                 "Waiting for a Slot"
             };

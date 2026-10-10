@@ -93,6 +93,9 @@ impl<T: AsRef<Path> + Send + Sync + ?Sized> ReviewWorkspace for T {
         env: &BTreeMap<String, String>,
         limits: Option<CommandLimits>,
     ) -> Result<CommandOutput, ReviewError> {
+        // A bounded step has no run scope; while it runs in a Task worktree
+        // the collector leaves that repository's compiler-cache store alone.
+        let _cache_hold = executors::sandbox::hold_compiler_cache(self.as_ref());
         let output = match limits {
             Some(limits) => crate::run_workspace_command(
                 self.as_ref(),

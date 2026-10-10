@@ -242,6 +242,9 @@ pub enum HumanBoundary {
 pub enum ConditionCapacityScope {
     Agent,
     Machine,
+    /// Every usable machine's workspace filesystem is under its free-space
+    /// floor. Clears by itself when a reading recovers.
+    Disk,
     Project,
     OwnerBackpressure,
 }

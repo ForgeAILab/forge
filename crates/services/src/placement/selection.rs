@@ -73,6 +73,9 @@ pub struct PlacementCandidate {
     pub executors: BTreeMap<String, ExecutorFacts>,
     pub allowed_run_purposes: Vec<WorkspaceRunPurpose>,
     pub machine_capacity: Option<MachineCapacity>,
+    /// What the filesystem holding this owner's workspace root is short of,
+    /// by its last reading. `None` also when there is no reading.
+    pub disk_pressure: Option<api_types::DiskPressureKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +208,7 @@ impl PlacementUnavailable {
                             PlacementFilterCode::OwnerUnreachable
                                 | PlacementFilterCode::AgentCapacity
                                 | PlacementFilterCode::MachineCapacity
+                                | PlacementFilterCode::DiskPressure
                                 | PlacementFilterCode::EnvironmentProbePending
                                 | PlacementFilterCode::EnvironmentNotReady
                         )
@@ -229,6 +233,7 @@ impl PlacementUnavailable {
                             | LocationNotReady
                             | AgentCapacity
                             | MachineCapacity
+                            | DiskPressure
                             | EnvironmentProbePending
                             | EnvironmentNotReady
                     ) || (handshake_missing
@@ -595,6 +600,7 @@ pub(crate) fn environment_pause_candidates(context: &SelectionContext) -> Vec<&P
                         | PlacementFilterCode::EnvironmentProbePending
                         | PlacementFilterCode::AgentCapacity
                         | PlacementFilterCode::MachineCapacity
+                        | PlacementFilterCode::DiskPressure
                         | PlacementFilterCode::OwnerUnreachable
                 )
             }) && codes != [PlacementFilterCode::EnvironmentNotReady]
@@ -676,6 +682,7 @@ pub(crate) fn ready_location_can_run(context: &SelectionContext) -> bool {
                     code,
                     PlacementFilterCode::AgentCapacity
                         | PlacementFilterCode::MachineCapacity
+                        | PlacementFilterCode::DiskPressure
                         | PlacementFilterCode::EnvironmentProbePending
                 )
             })
@@ -794,6 +801,17 @@ pub(crate) fn filter_candidate(
     {
         filters.insert(MachineCapacity);
     }
+    // Under its floor a machine starts no new worktree. A Task that already
+    // has a ready worktree there (its own, or the root's it shares) is never
+    // refused: finishing work is how space comes back.
+    if !candidate.provisioning
+        && candidate.disk_pressure.is_some()
+        && !context.binding().is_some_and(|binding| {
+            binding.state == PlacementState::Ready && matches_placement(candidate, binding)
+        })
+    {
+        filters.insert(DiskPressure);
+    }
     if (!daemon_owned || owner_facts_known)
         && context
             .needed_run_purposes
@@ -834,10 +852,12 @@ pub(crate) fn filter_candidate(
                 | CapabilityMissing
                 | RunPurposeDenied
         ) && filters.contains(&OwnerUnreachable)
-    }) || filters
-        .iter()
-        .all(|code| matches!(code, LocationNotReady | AgentCapacity | MachineCapacity))
-    {
+    }) || filters.iter().all(|code| {
+        matches!(
+            code,
+            LocationNotReady | AgentCapacity | MachineCapacity | DiskPressure
+        )
+    }) {
         if let Some(code) = environment_filter(context, candidate) {
             filters.insert(code);
         }
@@ -1093,7 +1113,7 @@ pub async fn load_selection_context(
             input.server.execution_daemon_id.clone()
         };
         let daemon = match execution_daemon_id.as_deref() {
-            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json FROM daemon WHERE id = ? AND removed_at IS NULL")
+            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json, disk_json FROM daemon WHERE id = ? AND removed_at IS NULL")
                 .bind(id)
                 .fetch_optional(&mut **transaction)
                 .await?,
@@ -1245,6 +1265,19 @@ pub async fn load_selection_context(
             )
             .await?,
         );
+        // The worktree lives on its owner's disk: the server's root for a
+        // server-owned location (wherever it executes), the daemon's
+        // reported root otherwise.
+        let disk_pressure = if daemon_owned {
+            let disk_json = daemon
+                .as_ref()
+                .map(|row| row.try_get::<Option<String>, _>("disk_json"))
+                .transpose()?
+                .flatten();
+            db.disk_admission.daemon_pressure(disk_json.as_deref())
+        } else {
+            db.disk_admission.server_pressure()
+        };
         let machine = EnvironmentMachine::from_location(&location);
         let environment_readiness = readiness.iter().find(|row| row.machine == machine).cloned();
         candidates.push(PlacementCandidate {
@@ -1310,6 +1343,7 @@ pub async fn load_selection_context(
                 ]
             },
             machine_capacity,
+            disk_pressure,
         });
     }
     Ok(SelectionContext {
@@ -1675,6 +1709,7 @@ mod tests {
                 max_concurrent_runs: Some(2),
                 ..MachineCapacity::default()
             }),
+            disk_pressure: None,
         }
     }
 
@@ -1722,6 +1757,80 @@ mod tests {
                 .running_executions -= 1;
             selected(&context);
         }
+    }
+
+    #[test]
+    fn disk_pressure_refuses_a_new_worktree_and_another_machine_takes_the_task() {
+        use api_types::DiskPressureKind::{Bytes, Inodes};
+        let mut context = context();
+        let mut server = candidate(&context, "server", None);
+        server.disk_pressure = Some(Bytes);
+        context.candidates.insert(0, server);
+        // One machine under its floor: the other one is chosen.
+        let result = selected(&context);
+        assert_eq!(result.candidate.execution_daemon_id.as_deref(), Some("mac"));
+        assert_eq!(
+            result.selection_reason.rejected_candidates[0].filter_codes,
+            vec![PlacementFilterCode::DiskPressure]
+        );
+        // Every machine under its floor (bytes on one, inodes on the other):
+        // a wait for disk that the next scan decides again, never a failure.
+        context.candidates[1].disk_pressure = Some(Inodes);
+        let refusal = rejected(&context, PlacementFilterCode::DiskPressure);
+        assert!(refusal
+            .rejected_candidates
+            .iter()
+            .all(|candidate| candidate.filter_codes == [PlacementFilterCode::DiskPressure]));
+        assert!(!refusal.is_deterministic());
+        assert!(super::super::machine_precheck::capacity_only_wait(&refusal));
+        assert_eq!(
+            super::super::CapacityWait::of(&refusal),
+            super::super::CapacityWait::Disk
+        );
+        let error = crate::ServiceError::PlacementUnavailable(refusal);
+        assert!(super::super::is_retryable_admission_refusal(&error));
+        assert!(super::super::is_machine_capacity_refusal(&error));
+        assert!(
+            environment_pause_candidates(&context).is_empty(),
+            "no Project pause for disk"
+        );
+        // A machine with room on its disk but no run slot is the nearer
+        // exit: the Task says it waits for a slot.
+        context.candidates[1].disk_pressure = None;
+        let capacity = context.candidates[1].machine_capacity.as_mut().unwrap();
+        capacity.max_concurrent_runs = Some(1);
+        capacity.running_executions = 1;
+        let refusal = rejected(&context, PlacementFilterCode::MachineCapacity);
+        assert_eq!(
+            super::super::CapacityWait::of(&refusal),
+            super::super::CapacityWait::Machine
+        );
+        // The reading recovers: nothing else has to happen.
+        context.candidates[0].disk_pressure = None;
+        assert_eq!(selected(&context).candidate.location.id, "server");
+    }
+
+    #[test]
+    fn disk_pressure_never_refuses_a_run_in_an_existing_ready_worktree() {
+        let mut context = context();
+        context.candidates[0].disk_pressure = Some(api_types::DiskPressureKind::Bytes);
+        rejected(&context, PlacementFilterCode::DiskPressure);
+        // The Task's own ready worktree: finishing work is how space comes
+        // back, so it runs.
+        context.existing_placement = Some(placement(&context.candidates[0]));
+        assert_eq!(
+            context.existing_placement.as_ref().unwrap().state,
+            PlacementState::Ready
+        );
+        selected(&context);
+        // A subtask in its root's ready worktree runs too.
+        context.inherited_root_placement = context.existing_placement.take();
+        selected(&context);
+        // A reservation is not a worktree yet: creating one is new work.
+        let mut reserved = context.inherited_root_placement.take().unwrap();
+        reserved.state = PlacementState::Reserved;
+        context.existing_placement = Some(reserved);
+        rejected(&context, PlacementFilterCode::DiskPressure);
     }
 
     #[test]

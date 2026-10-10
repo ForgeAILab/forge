@@ -2558,12 +2558,8 @@ impl TaskService {
         }
 
         if let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? {
-            if self
-                .machine_capacity_blocked(task, &agent, Some("coder"))
-                .await?
-            {
-                self.defer_placement_refusal(task, &ServiceError::Db(DbError::MachineAtCapacity))
-                    .await?;
+            if let Some(wait) = self.capacity_wait_for(task, &agent, Some("coder")).await? {
+                crate::deferred_dispatch::record_capacity_wait(&self.db, task, wait).await?;
                 let waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("task", &task.id))?;

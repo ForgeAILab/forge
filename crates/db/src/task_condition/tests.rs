@@ -116,6 +116,41 @@ fn reasons(condition: &TaskCondition) -> Vec<&ParkReason> {
     }
 }
 
+/// A machine-capacity wait names what it waits for: a run slot unless the
+/// disposition says `disk`. Both are the same wait to everything else.
+#[test]
+fn machine_capacity_wait_names_disk_when_its_scope_says_so() {
+    let scope = |disposition: serde_json::Value| {
+        let condition = map_legacy_condition(&input(
+            None,
+            None,
+            None,
+            None,
+            Some(json!({ "dispatch_disposition": disposition })),
+        ));
+        match reasons(&condition).first() {
+            Some(ParkReason::Capacity { scope }) => scope.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        scope(json!({"capability":"machine_capacity"})),
+        ConditionCapacityScope::Machine
+    );
+    assert_eq!(
+        scope(json!({"capability":"machine_capacity","capacity_scope":"disk"})),
+        ConditionCapacityScope::Disk
+    );
+    assert_eq!(
+        scope(json!({"capability":"machine_capacity","capacity_scope":"something newer"})),
+        ConditionCapacityScope::Machine
+    );
+    assert_eq!(
+        serde_json::to_value(ConditionCapacityScope::Disk).unwrap(),
+        json!("disk")
+    );
+}
+
 #[tokio::test]
 async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
     let cases = [
@@ -268,6 +303,20 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
                 None,
                 None,
                 Some(json!({"dispatch_disposition":{"capability":"machine_capacity"}})),
+            ),
+            "parked",
+            Some("capacity"),
+        ),
+        (
+            "capacity_disk",
+            input(
+                None,
+                None,
+                None,
+                None,
+                Some(
+                    json!({"dispatch_disposition":{"capability":"machine_capacity","capacity_scope":"disk"}}),
+                ),
             ),
             "parked",
             Some("capacity"),

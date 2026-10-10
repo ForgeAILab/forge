@@ -785,6 +785,57 @@ async fn full_owner_machine_queues_without_charging_wall_time_and_join_and_hit_t
     assert_eq!(count.active_runs(), 1);
 }
 
+/// Every run this worker dispatches executes in its Task's existing
+/// worktree, so the disk floor never holds one back: a wait here would keep
+/// a reviewed Task from finishing (which is how its worktree is given back)
+/// and would end, after the 30-minute queued-run expiry, as an
+/// infrastructure failure. Under the floor the check is admitted at once,
+/// never waits for capacity, and runs.
+#[tokio::test]
+async fn a_check_in_an_existing_worktree_is_admitted_under_the_disk_floor() {
+    let (_temp, store, runner) = fixture().await;
+    store.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(|| {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: 10,
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: None,
+                compiler_cache_bytes: None,
+            })
+        }),
+    );
+    assert_eq!(
+        store.disk_admission.server_pressure(),
+        Some(api_types::DiskPressureKind::Bytes)
+    );
+    let run = scheduled(runner.request(cacheable_request("disk-a")).await.unwrap());
+    let admitted = admit(&store, &run).await;
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    assert!(record.admitted_at.is_some(), "admitted, not expired");
+    assert_eq!(
+        store.check_run_counts().await.unwrap().waiting_for_capacity,
+        0
+    );
+    let owner = Arc::new(TestOwner::default());
+    CheckRunWorker::new(store.clone(), owner.clone())
+        .drive(admitted)
+        .await
+        .unwrap();
+    assert_eq!(owner.runs.load(Ordering::SeqCst), 1);
+    let finished = store.check_run(&run.id).await.unwrap().unwrap().state;
+    assert!(
+        !matches!(
+            finished,
+            CheckRunState::Failed | CheckRunState::Cancelled | CheckRunState::Queued
+        ),
+        "{finished:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_check_borrows_the_same_tasks_reservation_and_keeps_its_slot_when_it_expires() {
     let (temp, store, runner) = fixture().await;
@@ -2585,4 +2636,65 @@ async fn the_salt_is_created_once_survives_a_restart_and_no_identity_holds_a_val
             .unwrap();
     assert!(again.identity.inputs.reusable_inputs());
     assert_ne!(again.identity.key().unwrap(), before);
+}
+
+/// Plan 3.4 F: the shared compiler cache is something Forge adds to a run
+/// (`RUSTC_WRAPPER` and the wrapper's cache directory), per run and per
+/// repository. It is not part of the environment the owner inherits or of
+/// the Project environment, which are all the identity names, so turning
+/// it on or off leaves a check's identity (and every stored result) alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = canonical_fixture().await;
+    let step = f.counting_step();
+    let off = f.request("k", &step).await;
+    assert!(off.identity.inputs.reusable_inputs());
+
+    // A workspace root with the cache on, and a Task worktree in it that
+    // really is handed the wrapper.
+    let root = f.temp.path().join("ws");
+    let worktree = root.join("task").join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            root.join(".repos/r/worktrees/task").display()
+        ),
+    )
+    .unwrap();
+    // The repository names the worktree back, as Git does; without it the
+    // worktree's own `.git` file claims nothing.
+    std::fs::create_dir_all(root.join(".repos/r/worktrees/task")).unwrap();
+    std::fs::write(
+        root.join(".repos/r/worktrees/task/gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )
+    .unwrap();
+    let wrapper = f.temp.path().join("kache");
+    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    executors::compiler_cache::install(
+        &root,
+        Some(executors::compiler_cache::CompilerCache {
+            kind: executors::compiler_cache::WrapperKind::of(&wrapper),
+            wrapper: wrapper.clone(),
+            dir: root.join(executors::compiler_cache::CACHE_DIR),
+            max_bytes: 1 << 30,
+        }),
+    );
+    let handed = executors::sandbox::SandboxEnv::for_task(&worktree);
+    assert_eq!(
+        handed.compiler_cache().map(|cache| cache.wrapper()),
+        Some(wrapper.as_path())
+    );
+
+    let on = f.request("k", &step).await;
+    executors::compiler_cache::install(&root, None);
+    assert!(on.identity.inputs.reusable_inputs());
+    assert_eq!(on.identity.inputs, off.identity.inputs);
+    assert_eq!(on.identity.key().unwrap(), off.identity.key().unwrap());
 }

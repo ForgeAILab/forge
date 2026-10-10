@@ -213,6 +213,10 @@ pub struct DaemonPressureSummary {
     pub build_jobs_per_run: Option<u32>,
     pub run_nice: Option<u32>,
     pub at_capacity: bool,
+    /// The machine's last disk reading with the floor applied. While
+    /// `disk.pressure` is set the machine starts no new worktree or check.
+    #[serde(default)]
+    pub disk: Option<crate::MachineDisk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

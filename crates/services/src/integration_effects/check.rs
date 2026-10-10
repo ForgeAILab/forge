@@ -13,6 +13,9 @@ pub async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
         )
         .into());
     }
+    // These commands have no run scope; while one runs in a Task worktree
+    // the collector leaves that repository's compiler-cache store alone.
+    let _cache_hold = executors::sandbox::hold_compiler_cache(path);
     if spec.purpose == api_types::WorkspaceRunPurpose::EnvironmentSetup
         && spec.max_output_bytes < isize::MAX as usize
     {

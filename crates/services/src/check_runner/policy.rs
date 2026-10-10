@@ -140,3 +140,36 @@ pub async fn digest_input(
         },
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan 3.4 F: the wrapper an operator's login environment names is in
+    /// the environment revision, by value; so is one the Project sets.
+    /// Forge's own per-run wrapper is in neither map (it is set on the
+    /// run's command), so turning the shared cache on or off changes nothing
+    /// here: `the_compiler_cache_wrapper_does_not_change_a_check_identity`.
+    #[test]
+    fn an_operator_or_project_compiler_wrapper_changes_the_environment_revision() {
+        let inherited = |wrapper: Option<&str>| check_executor::InheritedEnvironment {
+            values: wrapper
+                .map(|value| ("RUSTC_WRAPPER".to_owned(), value.to_owned()))
+                .into_iter()
+                .chain([("PATH".to_owned(), "/usr/bin".to_owned())])
+                .collect(),
+            shell_revision: "bash".to_owned(),
+        };
+        let none = BTreeMap::new();
+        let revision = |wrapper, project: &BTreeMap<String, String>| {
+            environment_revision("salt", &inherited(wrapper), project).unwrap()
+        };
+        let off = revision(None, &none);
+        assert_eq!(off, revision(None, &none));
+        let sccache = revision(Some("/operator/sccache"), &none);
+        assert_ne!(sccache, off);
+        assert_ne!(sccache, revision(Some("/operator/kache"), &none));
+        let project = BTreeMap::from([("RUSTC_WRAPPER".to_owned(), String::new())]);
+        assert_ne!(revision(None, &project), off);
+    }
+}

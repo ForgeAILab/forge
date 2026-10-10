@@ -1220,10 +1220,10 @@ impl TaskService {
             let agent = db::AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id))?;
-            self.machine_capacity_blocked(task, &agent, queued.request.role_name.as_deref())
+            self.capacity_wait_for(task, &agent, queued.request.role_name.as_deref())
                 .await?
         } else {
-            false
+            None
         };
         let now = now_rfc3339();
         let repository_roles = Self::workflow_execution_roles(snapshot);
@@ -1231,14 +1231,8 @@ impl TaskService {
             db::TaskMetadataMutation::Set { key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(), value: serde_json::to_value(&queued).map_err(|error| ServiceError::invalid_operation(error.to_string()))? },
             db::TaskMetadataMutation::Set { key: "deferred_dispatch".to_owned(), value: json!({ "not_before": now, "reason": "task action queued", "target_state": task.status }) },
         ], None).await?;
-        let updated = if machine_wait {
-            crate::deferred_dispatch::record_dispatch_disposition(
-                &self.db,
-                &updated,
-                "machine_capacity",
-                "machine_capacity: waiting for a machine run slot",
-            )
-            .await?;
+        let updated = if let Some(wait) = machine_wait {
+            crate::deferred_dispatch::record_capacity_wait(&self.db, &updated, wait).await?;
             TaskRepo::get_by_id(&*self.db, &updated.id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", &updated.id))?

@@ -79,6 +79,17 @@ pub(crate) struct FileWorkspaceConfig {
     pub log_retention_days: Option<u32>,
     pub min_free_bytes: Option<u64>,
     pub min_free_percent: Option<u8>,
+    pub min_free_inode_percent: Option<u8>,
+    pub gc_free_bytes: Option<u64>,
+    pub gc_free_percent: Option<u8>,
+    pub compiler_cache: Option<FileCompilerCacheConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileCompilerCacheConfig {
+    pub wrapper: Option<String>,
+    pub max_bytes: Option<u64>,
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
