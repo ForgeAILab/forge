@@ -448,7 +448,15 @@ async fn the_step_kind_migration_preserves_rows_indexes_triggers_and_dependents(
     let source = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
     for file in std::fs::read_dir(source).unwrap() {
         let file = file.unwrap();
-        if file.file_name().to_str().unwrap() != NEW {
+        // Everything before the migration under test: a later migration
+        // rebuilds `task_step` again and would already accept the kind.
+        let version = |name: &str| {
+            name.strip_prefix('V')
+                .and_then(|rest| rest.split_once("__"))
+                .and_then(|(version, _)| version.parse::<i64>().ok())
+        };
+        let name = file.file_name();
+        if version(name.to_str().unwrap()) < version(NEW) {
             std::fs::copy(file.path(), dir.path().join(file.file_name())).unwrap();
         }
     }
