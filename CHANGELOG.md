@@ -8,6 +8,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **The managed Codex home and Task hook logs moved (3.4 stage C part 1).**
+  The Forge-owned Codex home of a Task is now
+  `<task root>/.forge-task/home/codex` instead of
+  `<workspace root>/.forge/logs/<project>/<task>/.codex-managed-home` (server)
+  or `<root>/.forge-daemon/execution-logs/.codex-managed-home` (daemon, one
+  home shared by every execution). The server-side home is moved into the
+  Task root on the Task's next Codex execution, so resumed Tasks keep their
+  sessions; the old daemon home is no longer used and can be deleted. Hook
+  logs written outside an execution moved from
+  `<system temp>/forge/logs/<task_id>/hooks/` to
+  `<workspace root>/.forge/logs/<project_id>/<task_id>/hooks/`; old files are
+  not migrated. The Gemini API-key home moved from
+  `<system temp>/forge-gemini-api-key-home` to
+  `<task root>/.forge-task/home/gemini`.
+- **A repository named `.forge-task` cannot have a Task workspace.** Creating
+  its worktree fails with `repository name ".forge-task" is reserved by
+  Forge; rename the repository`.
+
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -797,6 +815,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Every run gets its temp directory and build output from its Task root
+  (3.4 stage C part 1).** Forge reserves `.forge-task/` beside each Task
+  worktree (`tmp/<run>/`, `home/<family>/`, `build/`). Agent executions of
+  every executor family, native tool commands, lifecycle script hooks and
+  check commands now run with `TMPDIR`, `TMP` and `TEMP` pointing at a
+  per-run directory that is removed when the run ends, after a crash, and
+  with the Task; before, temp files went to the system temp directory and
+  were never reclaimed. When the in-root path would be too long for a Unix
+  socket the run uses `<workspace root>/.forge-tmp/<run>/` instead. Rust
+  builds get `CARGO_TARGET_DIR=<task root>/.forge-task/build/cargo`, so
+  build output no longer sits inside the worktree; set `CARGO_TARGET_DIR` in
+  the Project environment to choose another directory, or to an empty value
+  to keep building in the worktree. `HOME` and shared toolchain caches are
+  unchanged. Workspaces whose recorded path is not
+  `<workspace root>/<task_id>/<name>` keep the previous behaviour.
 
 - **Task conditions can say a Task is waiting on its checks (3.3 stage D
   part 1).** The public Task condition gains the reason
