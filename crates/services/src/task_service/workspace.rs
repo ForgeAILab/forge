@@ -3006,6 +3006,7 @@ pub(crate) mod tests {
                         | 202610060838
                         | 202610070507
                         | 202610100137
+                        | 202610100820
                 ))
                 .then_some((version, path))
             })
@@ -3142,6 +3143,13 @@ pub(crate) mod tests {
         // so it follows them here as it does in version order.
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610100137__integration_task_step.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // Rebuilds `task_step` again (step status `suspended`).
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610100820__task_step_suspended.sql"
         ))
         .execute(db.pool())
         .await

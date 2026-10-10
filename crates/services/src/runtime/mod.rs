@@ -823,25 +823,18 @@ impl ForgeRuntimeBuilder {
         ));
         operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
-        let check_runner = Arc::new(crate::check_runner::CheckRunner::new(self.db.clone()));
-        let check_consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
-            self.db.clone(),
-            check_runner.clone(),
-        ));
-        let _ = task_service.check_consumers.set(check_consumers.clone());
-        // The merge-path consumer family. Passive until the integration
-        // queue is activated: nothing asks for an `integration` check yet.
-        crate::integration_steps::IntegrationCheckFamily::register(
-            &check_consumers,
-            Arc::new(crate::integration_steps::IntegrationSteps::new(
-                (*task_service).clone(),
-            )),
-        );
-        let check_owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
-            self.db.clone(),
+        // One constructor composes the runner, both consumer families
+        // (review entry and the merge path) and the worker; tests build the
+        // same set through it.
+        let crate::task_service::ComposedChecks {
+            runner: check_runner,
+            consumers: check_consumers,
+            worker: check_worker,
+            owners: check_owners,
+        } = task_service.compose_checks(
             daemon_connections.clone(),
             Duration::from_secs(effective_config.workspace.max_disconnect_seconds),
-        ));
+        );
         cleanup_scheduler.set_live_check_counter(check_owners.live_operation_counter());
         cleanup_scheduler
             .set_check_timeout(u64::from(effective_config.server.check_run_timeout_seconds));
@@ -849,10 +842,6 @@ impl ForgeRuntimeBuilder {
             effective_config.workspace.log_retention_days,
             workspace_disk_floor(&effective_config.workspace),
         );
-        let check_worker = Arc::new(crate::check_runner::worker::CheckRunWorker::new(
-            self.db.clone(),
-            check_owners,
-        ));
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
             Arc::clone(&self.db),

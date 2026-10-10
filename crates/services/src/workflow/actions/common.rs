@@ -881,39 +881,6 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
     Ok(())
 }
 
-pub(super) async fn run_ci_steps_in_worktree(
-    workspace: &crate::workspace_backend::ResolvedWorkspace,
-    ci_steps: &[String],
-    env: &std::collections::BTreeMap<String, String>,
-) -> Result<
-    crate::integration_effects::check::CheckRunOutcome,
-    crate::integration_effects::check::CheckRunFailure,
-> {
-    let binding = crate::workspace_backend::effect_workspace(&workspace.placement);
-    let mut checks = crate::integration_effects::check::CheckRun::new(
-        crate::integration_effects::check::CheckRunInput {
-            workspace: &binding,
-            commands: ci_steps,
-            purpose: api_types::WorkspaceRunPurpose::CiStep,
-            environment: env,
-            deadline: None,
-            max_output_bytes: usize::MAX,
-        },
-    );
-    while let Some(command) = checks.next_command() {
-        let output = match workspace
-            .backend
-            .run(&workspace.placement, &command.spec)
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => return Err(checks.infrastructure_failed(error)),
-        };
-        checks.completed(command, output);
-    }
-    Ok(checks.outcome())
-}
-
 pub(super) fn publish_review_passed(ctx: &HookContext, review: &db::Review) {
     ctx.event_bus.publish(ForgeEvent {
         event_type: "review.passed".to_string(),

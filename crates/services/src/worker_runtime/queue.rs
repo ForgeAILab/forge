@@ -180,7 +180,7 @@ impl TaskStepWorker {
             }
         }
         if command.preempt {
-            let hooks: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','rerun_review','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
+            let hooks: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed','suspended') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','rerun_review','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
                 .bind(task_id).fetch_one(self.db.pool()).await?;
             payload["preempting_hooks"] = serde_json::json!(hooks);
         }
@@ -406,8 +406,18 @@ impl TaskStepWorker {
     }
     /// Deterministic test/service utility. Does not spawn background work and
     /// waits for existing owners/backoff exactly as the production worker does.
+    ///
+    /// A hooks step suspended on a check is not pending, and nothing in the
+    /// step queue advances it: drain runs the check worker's sweep itself
+    /// until that check has an answer, then applies its delivery and the
+    /// woken step like any other. A wait with no verdict to come (the
+    /// consumer was cancelled, or infrastructure is exhausted and the Task
+    /// is parked) ends the drain. So does a check queued behind a full
+    /// machine, once the Task states that it waits for a slot: only a run
+    /// ending elsewhere frees one, and the check worker admits it then.
     pub async fn drain(&self, task_id: &str) -> Result<db::Task> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        let checks = self.task_service.check_worker_or_embedded();
         loop {
             if self.db.pending_steps(task_id).await? == 0
                 && !self.db.task_step_is_running(task_id)
@@ -417,6 +427,34 @@ impl TaskStepWorker {
                         .is_some_and(|until| until > db::now_rfc3339().as_str())
                 })
             {
+                if self.db.awaited_check_is_open(task_id).await? {
+                    let mut jobs = JoinSet::new();
+                    checks.sweep(&mut jobs).await?;
+                    while let Some(job) = jobs.join_next().await {
+                        job.map_err(|_| {
+                            ServiceError::invalid_operation("check job stopped during drain")
+                        })??;
+                    }
+                    // The sweep just tried to admit the run. One still queued
+                    // behind a full machine is answered only when a run ends
+                    // elsewhere: once the Task's step has stated that wait,
+                    // nothing here can advance it.
+                    if self.db.pending_steps(task_id).await? == 0
+                        && self.db.awaited_check_waits_for_slot(task_id).await?
+                    {
+                        return TaskRepo::get_by_id(&*self.db, task_id, false)
+                            .await?
+                            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ServiceError::invalid_operation(format!(
+                            "task step drain timed out waiting for a check: {}",
+                            self.db.awaited_check_summary(task_id).await?
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
                 return TaskRepo::get_by_id(&*self.db, task_id, false)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()));
@@ -683,6 +721,16 @@ impl TaskStepWorker {
                 return Ok(());
             }
             if command.preempt {
+                // A hooks step superseded while it waited for review-entry
+                // CI: its remote run is cancelled or fenced, its consumer
+                // cancelled and its review attempt closed, here in the
+                // preempting command's own step, before the command acts.
+                crate::check_runner::review_entry::abandon_superseded_waits(
+                    &self.db,
+                    self.task_service.daemon_connections.clone(),
+                    &step.task_id,
+                )
+                .await?;
                 // A disconnect may have failed the server-side hook before
                 // Cancel arrived, although its owner command is still alive.
                 let marked = self.db.pending_remote_cancels(None, None).await?;
@@ -802,14 +850,21 @@ impl TaskStepWorker {
         }
         let task = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
         if !self.db.step_entry_matches(step).await? {
-            return self
-                .settle(
-                    step,
-                    "superseded",
-                    Some("Task left the producing status entry"),
-                    false,
-                )
-                .await;
+            self.settle(
+                step,
+                "superseded",
+                Some("Task left the producing status entry"),
+                false,
+            )
+            .await?;
+            // A step that left its entry while it waited for a check never
+            // reads the result: close the review attempt it opened.
+            return crate::check_runner::review_entry::abandon_superseded_waits(
+                &self.db,
+                self.task_service.daemon_connections.clone(),
+                &step.task_id,
+            )
+            .await;
         }
         if step.kind == "hooks" {
             let payload: crate::workflow::engine::durable::HookPayload =
@@ -820,6 +875,14 @@ impl TaskStepWorker {
                 .bind(&self.task_service)
                 .execute_hook_step(step, &payload)
                 .await?;
+            if let Some(wait) = &result.suspend {
+                // A hook asked for a check: the step waits, suspended and
+                // uncharged, for the result's delivery to wake it.
+                self.db
+                    .suspend_hook_step(step, &wait.until, &wait.consumer_id)
+                    .await?;
+                return Ok(());
+            }
             if let Some(reason) = result.retry.as_deref() {
                 // A transient `run_merge` failure takes the cascade retry
                 // budget and back-off; once spent it settles as a merge failure.

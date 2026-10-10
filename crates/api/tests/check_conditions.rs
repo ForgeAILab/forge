@@ -198,6 +198,8 @@ async fn a_check_wait_is_read_through_rest_applied_by_the_step_worker_and_retrie
     )
     .await;
     let db = harness.state.db.clone();
+    // This test is the check owner: it settles every run by hand.
+    harness.step_worker.stop_checks().await;
     let consumers = harness
         .state
         .task_service

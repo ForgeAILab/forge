@@ -6752,8 +6752,11 @@ checkpoint indexes. These scripts already run on
 entries to planning, in_progress, review and merge_failed: retrying or sending a
 Task back runs them again, so they already must be repeatable and crash resumption
 adds no new requirement. A resumed script's hook log includes
-rerun_after_interruption: true and its step_id; resumed CI command entries carry
-the same evidence. CI may restart the entire check sequence after a crash.
+rerun_after_interruption: true and its step_id. Review-entry CI is not run by
+the hook itself (see "Review-entry CI on the check runner"): after a crash the
+check run is reconciled by the check worker and the woken hook reads its
+result, so CI command entries carry their `step_id` but never
+`rerun_after_interruption`.
 
 All runtime writes to an existing Task's workflow state execute through a claimed
 Task step. Owner commands, claims, execution settlement, dispatcher effects,
@@ -7514,7 +7517,8 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
 - **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
-  runs configured checks before ordinary reviewer dispatch. `ReviewRunner`
+  asks the durable check runner for the configured checks before ordinary
+  reviewer dispatch; its hooks step waits `suspended` for the result. `ReviewRunner`
   owns explicit reviewer/auditor reruns. Task configuration
   overrides the Project's `default_review_config`; otherwise the Project
   defaults are inherited. A ready Project Agent can replace both
@@ -8487,11 +8491,10 @@ plus the RPC timeout; the caller then asks `check.lookup`.
 Upgrade the server first, then every daemon from that release and restart using
 the same workspace root. Revision-4 and older daemons are refused before dispatch.
 
-The legacy `integration_effects::check::CheckRun` is a thin phased adapter to the
-shared sequence/projection policy; each owner command uses the primitive before
-its existing recorder continues. Review-entry CI and manual `ReviewRunner` CI
-retain command order, cwd, inherited env, verdicts, comments/events and per-command
-receipt acknowledgment. No extra setup or managed checkout is enabled. Required
+The inline `integration_effects::check::CheckRun` adapter is deleted with the
+review-entry cutover. Review-entry CI (now one check run per entry) and manual
+`ReviewRunner` CI retain command order, cwd, inherited env, verdicts and
+comments/events. No extra setup or managed checkout is enabled. Required
 conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
 and agent-selected families retain their existing orchestration and check policy.
 
@@ -8688,13 +8691,14 @@ Rules:
   `task_check_exhausted`, severity `attention`) until it is retried, cancelled
   or leaves the status entry.
 
-**No production family is registered yet, and no execution family requests
-the runner.** Merge-path and review-entry CI, manual `ReviewRunner`,
-conformance, before-work and other checks retain their current inline
-orchestration, limits and verdicts; the conditions above are therefore
-produced only by tests until a family moves. The 3.2 integration queue stays
-inactive. Still pending: the review-entry cutover (3.3 stage D part 2, scope
-2), the merge-path cutover (3.2 D1b) and managed-checkout activation. The
+**Two families are registered, composed by one constructor
+(`TaskService::compose_checks`, used by the production runtime and by every
+test): review entry (`entry`, requested in production, see "Review-entry CI on
+the check runner") and the merge path (`integration`, passive until the
+integration queue is activated).** Manual `ReviewRunner`, conformance,
+before-work and other checks retain their current inline orchestration,
+limits and verdicts. The 3.2 integration queue stays inactive. Still pending:
+the merge-queue cutover and managed-checkout activation. The
 owners execute the frozen legacy policies and the canonical CI policy below;
 only the canonical one attests its inputs and may be reused. A reusable result
 has no expiry: reuse ends only when the commit, spec digest, owner environment
@@ -8704,10 +8708,9 @@ CI row is promoted to cache.
 #### Reusable results: the canonical CI policy (3.3 stage D part 2, scope 1)
 
 `canonical-ci/1` (`api_types::CANONICAL_CI_POLICY`) is the execution policy
-under which a CI bundle's result may stand for a later request. **No
-production family requests it yet**: review-entry CI still runs inline under
-`legacy-server/1` / `legacy-daemon/1` until the review-entry cutover, so no
-Project's behaviour changes with this stage.
+under which a CI bundle's result may stand for a later request. Review-entry
+CI of a server-placed Task requests it (a daemon-placed Task keeps
+`legacy-daemon/1`: it always runs and is never reused).
 
 **A canonical step runs exactly as an inline CI step runs today.** `bash -lc`
 in the Task worktree; the owner process's environment, inherited, after the
@@ -8834,6 +8837,131 @@ Neither the spec revision nor the digest schema changes: the policy string is
 already a digest input, so no stored result of a legacy policy can satisfy a
 canonical request. No result was ever stored under `canonical-ci/1` before
 this definition, so the policy revision stays `1`.
+
+#### Review-entry CI on the check runner (3.3 stage D part 2)
+
+`run_ci_steps` no longer runs commands. In its hooks step it
+
+1. opens the review attempt and records the authority it asks under (hook
+   effect `ci_review`: the attempt id, the Task version and the Review row's
+   status and `updated_at` at that moment; a woken or redelivered step
+   continues that attempt and never opens a second),
+2. builds the `EntryCi` check spec with `canonical_policy: true` and the
+   worktree identity (a daemon placement gets its legacy policy from the
+   builder and is never reused; blank `ci_steps` entries are dropped, and a
+   spec with no command passes with no request), and asks
+   `TaskCheckConsumers::request` once (hook effect `ci_consumer`) with
+   origin `entry`, authority = the review attempt id and a 3600 s wall limit.
+   A worktree that is dirty when the entry asks (uncommitted or untracked
+   files) is not what the commit names: its identity is stated unattested,
+   so the entry runs and its result is never reused,
+3. reads `TaskCheckConsumers::wait_state`. A `Hit` already carries its result
+   and is settled in the same invocation. A pending run (or exhausted
+   infrastructure, see below) makes the hook ask the engine to suspend the
+   step (`durable::suspend_hook`). A consumer nothing will answer any more
+   (cancelled under a step nobody superseded, or its run or result row is
+   gone) cancels the review attempt and fails the hook with `review check was
+   lost before it produced a result` instead of suspending again.
+
+**A suspended hooks step is its own durable state.** `task_step.status =
+'suspended'` (V202610100820) with `suspended_until` (the latest time it looks
+again: wall limit + 120 s) and `awaited_consumer_id`. The step gives up its
+lease, keeps its open hook checkpoint and is not charged the attempt. Readers:
+
+| Reader | Suspended step |
+|---|---|
+| claim (`claim_step_lane`), predecessor ordering, `queued_admissions` | never a candidate, never blocks a later step: the delivery step, owner commands and queued effects run while CI runs |
+| `pending_steps`, `TaskStepWorker::drain`, `TaskBusy` counts, operator queue depth | not counted: nothing in the step queue can advance it |
+| `entry_hooks_pending`, the condition producer's hooks owner, `schedule_reads.queue_owned`, `schedule_has_owner`, stranded-hooks sweep, a preempting command's `preempting_hooks` | counted: the entry is still owned and its checks have not settled |
+| `due_schedule_tasks` | due at `suspended_until` |
+| preempting Cancel/Hold (`enqueue_step_in_tx`) | superseded like a pending entry-fenced step |
+| retention (`prune_steps`) | never pruned |
+
+Wakes move it back to `pending`: the awaited consumer's delivery
+(`ReviewEntryChecks::apply` → `wake_suspended_hooks`, by consumer id), or,
+ahead of every claim, `wake_due_suspended` for a passed deadline or a Task
+that left the step's status entry (the ordinary entry fence then supersedes
+it). The woken step runs `run_ci_steps` again; it reads the verdict itself,
+because a delivery step cannot write into a step it has not claimed. The
+delivery step no longer needs a priority to pass the waiting step, so check
+deliveries are ordinary priority-0 steps again.
+
+**Authority across the suspension.** The woken step settles under the
+authority recorded when it asked, not under what it re-reads: the Review
+write is fenced on the asking-time Task version and Review status /
+`updated_at`. A Task version bump or a Review row change while the check ran
+refuses the write exactly where the inline run refused it, and the attempt
+is cancelled (`cancel_review_after_authority_loss`).
+
+Settlement is otherwise unchanged: the result's commands become the Review's
+`ci_steps` (same fields, 4096-byte tails; a result row that would exceed its
+262144-byte cap gets shorter tails), then the same Review/Task projection,
+comment and events as before. `TimedOut` and `Cancelled` cancel the review
+attempt and fail the hook. Exhausted infrastructure is no verdict: the Task
+is parked on the typed check condition and the step re-suspends at each
+deadline until the owner's `retry` produces a result.
+
+A step superseded while suspended never reads its result.
+`review_entry::abandon_superseded_waits` cleans the wait up, in the preempting
+Cancel/Hold command's own step (before the command acts) and when a woken step
+finds its Task has left the entry:
+
+- **Remote run.** When the run still executes on a daemon and this consumer is
+  the only one waiting, its operation is registered as the step's running
+  remote operation and put under the ordinary remote-cancellation fence
+  (`remote_cancel::cancel_operations`): `workspace.cancel` is sent when the
+  daemon is reachable, and otherwise a `pending_remote_cancel` marker keeps
+  the workspace excluded (the Task's follow-up action parks on
+  `pending_remote_cancel`, naming the machine) until the daemon reconnects and
+  confirms. A still-running remote command can therefore not write into a
+  workspace the Task has moved on from.
+- **Consumer.** It is cancelled, so a late delivery is `Stale` and is applied
+  to nothing, whether or not the Task's status epoch moved (a Hold keeps it).
+- **Task condition.** The check wait is cleared (in the Task's own step).
+- **Review attempt.** It is cancelled (`execution_retry.status =
+  cancelled_authority_lost`).
+
+The check worker looks every second whether a running dispatch still has a
+live consumer (`CONSUMER_LIVENESS_INTERVAL`; the lease is renewed every 15 s)
+and cancels a run nobody waits for, so its machine slot is freed promptly.
+An unreachable daemon keeps the run `uncertain` (slot and single-flight
+identity retained) until it confirms the stop, is removed, or passes the
+disconnected-owner bound. Deleting the Project removes the Task, its
+steps (the suspended one included) and its check rows by cascade; the worker
+driving the run finds no consumer at its next look, tells the owner to stop
+(best effort when the run row is already gone) and drops the run.
+
+**Liveness of the wait.** Every way the answer can fail to arrive ends in a
+resume or a typed condition, never a silent wait:
+
+| What happens | Outcome |
+|---|---|
+| check worker not running | the Task shows the typed check wait (`check`, phase `result` or `slot`) stated when it asked; the step looks again at `suspended_until` and re-suspends while the run is still pending |
+| run or result row lost, consumer cancelled under a live step | the woken step fails the hook (`review check was lost...`) and cancels the attempt |
+| delivery step dead-lettered or never enqueued | the step wakes at `suspended_until` and reads the verdict itself |
+| daemon unreachable | the run stays `uncertain`; on reconnect the daemon's journaled result is looked up (the command is not run again) and the step resumes. Past the disconnected-owner bound the run is an infrastructure failure: retried, then the Task parks on `check` / `infrastructure_exhausted` (offers `retry`, `cancel`) |
+| restart after the request, before the suspend | the redelivered step asks again with the same request key and gets the same consumer |
+| restart while suspended, or after delivery before the wake | the run's lease expires and any worker takes it over; delivery or the deadline wakes the step |
+| restart after the wake, before the settle | the step's lease expires, it is redelivered and settles from the stored result (or returns the result it already wrote) |
+
+`wake_due_suspended` runs ahead of every claim as one `EXISTS` over the
+suspended rows (an index search on `status = 'suspended'`, never a table
+scan; asserted by `task_step_suspended_migration_preserves_...`) and updates
+only when a row is due, so it cannot starve claims.
+
+Review entry and the integration queue share the one check-witness slot of a
+Task. They never collide: a consumer row carries its origin and is delivered
+only to that origin's family, each family's `current_authority` names a
+different object (the running review attempt with no CI evidence; the
+`checking` integration attempt of that epoch), and the two occur in
+different Task statuses, so a late delivery of one is `Stale` (epoch or
+authority) before either family's `apply` runs.
+
+`TaskStepWorker::drain` (tests and service utilities) drives the check
+worker's sweep itself while the drained Task awaits an undelivered check, so
+a drain still ends with the entry settled. A `TaskService` built without the
+runtime composes the same check runtime (both families) through
+`compose_checks` on first drain.
 
 The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death

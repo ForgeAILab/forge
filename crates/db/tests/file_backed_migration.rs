@@ -5543,3 +5543,140 @@ async fn daemon_disk_facts_migration_is_additive_and_keeps_existing_daemons() {
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(migration_dir);
 }
+
+/// V202610100820 rebuilds `task_step` for the `suspended` status on a
+/// populated database: every row survives as it was (pending, leased,
+/// superseded, done, with its causation link), the new columns start empty,
+/// and every index and trigger of the table exists afterwards.
+#[tokio::test]
+async fn task_step_suspended_migration_preserves_populated_steps_indexes_and_triggers() {
+    const BEFORE: i64 = 202_610_100_719;
+    const SUSPENDED: i64 = 202_610_100_820;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut versions: Vec<i64> = fs::read_dir(&source)
+        .unwrap()
+        .filter_map(|entry| migration_version(entry.unwrap().file_name().to_str().unwrap()))
+        .collect();
+    versions.sort_unstable();
+    let at = versions.iter().position(|v| *v == SUSPENDED).unwrap();
+    assert_eq!(
+        versions[at - 1],
+        BEFORE,
+        "the rebuild follows the workspace disk-usage migration directly"
+    );
+    assert!(
+        include_str!("../src/migration.rs").contains(&format!(
+            "Embedded migration bundle revision: V{}",
+            versions.last().unwrap()
+        )),
+        "the bundle comment names the newest migration"
+    );
+
+    let dir = unique_temp_path("task-step-suspended-migrations");
+    fs::create_dir_all(&dir).unwrap();
+    copy_migrations_up_to(BEFORE, &dir);
+    let (pool, db_path) = migration_test_pool("task-step-suspended-db").await;
+    run_migrations_from(&pool, &dir).await.unwrap();
+    sqlx::raw_sql("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('susp-project', 'keep', '{}', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('susp-task', 'susp-project', 'keep task', 'task', 'review', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,completed_at,result_json) VALUES ('step-done','susp-task',1,'cascade','{\"workflow_ref\":{\"id\":\"wf-1\"}}','k-done','chain',1,'in_progress',1,'done','2026-10-01T00:00:00Z','2026-10-01T00:00:00Z','2026-10-01T00:00:01Z','2026-10-01T00:00:01Z','{\"ok\":true}');
+        INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,completed_at,last_error) VALUES ('step-superseded','susp-task',2,'hooks','{}','step-done','k-superseded','chain',2,'review',2,'superseded','2026-10-01T00:00:02Z','2026-10-01T00:00:02Z','2026-10-01T00:00:03Z','2026-10-01T00:00:03Z','preempted by owner command');
+        INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,attempts,created_at,updated_at,lane,expected_epoch,priority) VALUES ('step-leased','susp-task',3,'hooks','{}','k-leased','chain-2',1,'review',3,'claimed','worker-1','2099-01-01T00:00:00Z','2026-10-01T00:00:04Z',2,'2026-10-01T00:00:04Z','2026-10-01T00:00:05Z','long',7,0);
+        INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,priority,entry_fenced) VALUES ('step-pending','susp-task',4,'command','{\"operation\":\"noop\"}','k-pending','chain-3',1,'review',3,'pending','2026-10-01T00:00:06Z','2026-10-01T00:00:06Z','2026-10-01T00:00:06Z',1,0);")
+        .execute(&pool).await.unwrap();
+    const ROWS: &str = "SELECT group_concat(id||'|'||seq||'|'||kind||'|'||payload_json||'|'||COALESCE(causation_step_id,'-')||'|'||causation_key||'|'||chain_id||'|'||chain_position||'|'||expected_status||'|'||expected_version||'|'||status||'|'||COALESCE(claimed_by,'-')||'|'||COALESCE(lease_until,'-')||'|'||available_at||'|'||attempts||'|'||COALESCE(last_error,'-')||'|'||created_at||'|'||updated_at||'|'||COALESCE(completed_at,'-')||'|'||COALESCE(result_json,'-')||'|'||priority||'|'||expected_epoch||'|'||lane||'|'||entry_fenced||'|'||COALESCE(workflow_ref_id,'-'), char(10)) FROM (SELECT * FROM task_step ORDER BY seq)";
+    let before: String = sqlx::query_scalar(ROWS).fetch_one(&pool).await.unwrap();
+    let objects = "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE tbl_name='task_step' AND type IN ('index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name)";
+    let objects_before: String = sqlx::query_scalar(objects).fetch_one(&pool).await.unwrap();
+
+    fs::copy(
+        source.join("V202610100820__task_step_suspended.sql"),
+        dir.join("V202610100820__task_step_suspended.sql"),
+    )
+    .unwrap();
+    run_migrations_from(&pool, &dir).await.unwrap();
+
+    let after: String = sqlx::query_scalar(ROWS).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        after, before,
+        "every step row survives the rebuild unchanged"
+    );
+    assert_eq!(after.lines().count(), 4);
+    let empty: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_step WHERE suspended_until IS NULL AND awaited_consumer_id IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(empty, 4, "the new columns start empty");
+    let objects_after: String = sqlx::query_scalar(objects).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        objects_after,
+        format!("{objects_before},task_step_suspended")
+            .split(',')
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(","),
+        "every earlier index and trigger is re-created, plus the suspended index"
+    );
+    for name in [
+        "task_step_next",
+        "task_step_lane_ready",
+        "task_step_suspended",
+        "task_schedule_step_insert",
+        "task_schedule_step_update",
+        "task_schedule_step_delete",
+        "task_schedule_admission_release",
+    ] {
+        assert!(
+            objects_after.split(',').any(|object| object == name),
+            "{name} exists after the rebuild: {objects_after}"
+        );
+    }
+    // The status is accepted, the scheduler trigger still fires on it, and
+    // the wake query reads the partial index.
+    let dirty = "SELECT COALESCE((SELECT generation FROM task_schedule_dirty WHERE task_id='susp-task'),-1)";
+    let generation: i64 = sqlx::query_scalar(dirty).fetch_one(&pool).await.unwrap();
+    sqlx::query("UPDATE task_step SET status='suspended',claimed_by=NULL,lease_until=NULL,suspended_until='2099-01-01T00:00:00Z',awaited_consumer_id='consumer-1' WHERE id='step-leased'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let bumped: i64 = sqlx::query_scalar(dirty).fetch_one(&pool).await.unwrap();
+    assert!(bumped > generation, "the step-update trigger survived");
+    assert!(
+        sqlx::query("UPDATE task_step SET status='waiting' WHERE id='step-pending'")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "the status CHECK still refuses unknown values"
+    );
+    let plan: Vec<String> = sqlx::query("EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM task_step WHERE status='suspended' AND (suspended_until IS NULL OR suspended_until<='2026-10-10T00:00:00Z' OR NOT EXISTS(SELECT 1 FROM task t WHERE t.id=task_step.task_id AND t.status=task_step.expected_status AND t.status_epoch=task_step.expected_epoch AND t.deleted_at IS NULL)))")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("SEARCH task_step USING") && detail.contains("INDEX"))
+            && !plan.iter().any(|detail| detail.contains("SCAN task_step")),
+        "the wake query before every claim is an index search on the suspended rows, never a table scan: {plan:?}"
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    let kept: (String, String) = sqlx::query_as(
+        "SELECT causation_step_id, status FROM task_step WHERE id='step-superseded'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, ("step-done".into(), "superseded".into()));
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(dir);
+}
