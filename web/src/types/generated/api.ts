@@ -1324,6 +1324,7 @@ export type TransitionBridgeKind =
   | 'review_refresh' | 'target_moved_rebase' | 'conflict_handoff'
   | 'retry_window_reset' | 'recovery' | 'gate_skipped' | 'gate_approved'
   | 'gate_rejected' | 'ci_only_review_passed' | 'review_carry'
+  | 'integration_import'
 
 export interface TransitionLogEntry {
   bridge_kind: TransitionBridgeKind | null

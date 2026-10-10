@@ -4,4 +4,4 @@
  * Durable classification of a mechanical transition or accepted gate action.
  * Human reason text is never an input to this classification.
  */
-export type TransitionBridgeKind = "review_refresh" | "target_moved_rebase" | "conflict_handoff" | "retry_window_reset" | "recovery" | "gate_skipped" | "gate_approved" | "gate_rejected" | "ci_only_review_passed" | "review_carry";
+export type TransitionBridgeKind = "review_refresh" | "target_moved_rebase" | "conflict_handoff" | "retry_window_reset" | "recovery" | "gate_skipped" | "gate_approved" | "gate_rejected" | "ci_only_review_passed" | "review_carry" | "integration_import";

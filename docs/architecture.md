@@ -4298,6 +4298,91 @@ Task can return to `review` after repair or retry from `in_progress`; typed
 blocking annotations park a Task in its current state and are not states
 themselves.
 
+### `merging` is the integration queue (3.2 stage D2b)
+
+There is exactly one merge path. A Task entering `merging` is admitted to the
+integration queue of its repository's target branch and **stays in `merging`**
+while the queue worker brings it to the head, rebases it only if the target
+moved, has the head check run through the durable check runner, carries or
+re-requires review, and fast-forwards the default checkout. No flag selects
+this and no other code merges.
+
+| What happens to the Task | Written by | Task status | Condition (`parked`, reason `integration`) |
+|---|---|---|---|
+| Entry: the `run_merge` hook admits the Task (`integration_steps::admission`): one attempt, bound to the placement it merges from, or a successor of the attempt of an earlier entry (same place in line) | the entry's hooks step | `merging` | `waiting` |
+| Head: validate, bring the target tip to the Task's checkout if it lives in another clone, rebase onto the tip if the target moved | queue worker (attempt and queue rows only) | `merging` | `waiting` |
+| Head check on a rebased commit | `integration/request_check` step, then the check's delivery | `merging` | `owned` / `checking` |
+| Review authority for the exact commit: unchanged commit, or carry by attempt lineage; the permit and the protected `result` step | `integration/settle` step (or the check's delivery) | `merging` | `owned` / `fast_forwarding` |
+| Fast-forward of the exact commit in the default checkout | queue worker, through the owner of that checkout | `merging` | `owned` / `fast_forwarding` |
+| Result: execution evidence, "Changes merged" comment | protected `integration/result` step | `merging` → `done` | `applied`, then settled |
+| Rebase conflict (committed with markers), or a red head check | `integration/send_back` step | `merging` → `merge_failed` (coder), typed `conflict_handoff` bridge for a conflict | `repair` / `candidate_check_failed`, handed off |
+| The rebased commit is not covered by the passed review | `integration/send_back` step | `merging` → `merge_failed` → `review` (`review_refresh` bridge) | `review_required`, handed off |
+| Infrastructure, an offline owner, a dirty default checkout, a paused Project, a suspended queue | `integration/park` step | `merging` | `deferred` with its cause (retried by the worker's sweep, or the owner's) |
+| The Task leaves `merging` by an owner command (Cancel, Hold, a board move) | that command; then `integration/clear` | the command's target | cleared |
+
+`merge_failed` therefore only means "a coder is repairing a conflict, a red
+check or a dirty worktree", or the one-step hop to `review` after a
+`review_required` send-back. A clean rebase never leaves `merging`: the
+`merging → merge_failed → review` bounce (bridge `target_moved_rebase`
+followed by `review_refresh`) is no longer produced. Rows of that shape written
+before the upgrade are still read (history, budgets, the review-entry carry).
+
+What the entry hook still decides itself, before the queue: a subtask, a Task
+without a worktree or a server without a merge service is skipped as before; a
+handed-off conflict file that still adds conflict markers blocks the Task for
+manual repair; a candidate that cannot be named (no implementation run, lost
+workspace or repository) fails as a `workspace_error` merge failure under the
+merge-fix budget; a transient error retries the hooks step with back-off.
+
+Start order (server and Solo, `RuntimeSupervisor::start`): crash recovery,
+which reconciles the server owner's outstanding effects first; the importer
+(`integration_steps::import::import_at_start`); the dispatcher's start
+reconciliation; the Task-step worker and the check worker; then the queue
+worker, whose first sweep claims every queue with work and every head whose
+lease ran out. The heartbeat monitor runs in both modes; it turns a
+reconnected daemon's placements back to `ready`, which a head whose rebase is
+done waits for.
+
+`TaskService::compose_integration` is the one place the worker is built
+(over `integration_ports`), and `TaskService::compose_checks` takes the same
+`IntegrationWorkerConfig`, so the merge-path check family and the worker share
+one set of timers. A Task step that writes an answer on an attempt wakes that
+head's driver (`IntegrationQueueWorker::notify_answered`); a driver that
+misses the wake reads the answer at its poll.
+
+**Importer continuation.** At every start the storage importer runs until
+nothing is left, then each *current* imported attempt (and each attempt the
+passive shadow recording left) without a continuation gets one
+identity-fenced `integration/import_continue` step, keyed
+`integration-import:<attempt id>`. The step applies the continuation of the
+imported state under the Task's lease; running the start twice enqueues
+nothing new.
+
+| Imported state | Continuation |
+|---|---|
+| `applied` (the merge landed and was recorded), Task still in `merging` | the step reports it as `result` does (evidence, comment, `done`) and completes the attempt |
+| `reconciling` (unknown result) | the worker's reconciliation of the head (owner receipt, or ancestry of the candidate): landed → `applied`, proven not landed → `queued`; the step states `owned` / `reconciling` |
+| `parked` waiting only for the candidate's HEAD (missing-hooks entry, resumed or obsolete pause marker, stored carry, rebased candidate awaiting checks) | the step admits the Task again: the imported row is superseded by one bound to the Task's placement and present candidate; the legacy `paused_integration` marker of a merging Task is cleared |
+| `parked` under a Project pause | the same; the worker then holds the Task while the Project is paused and re-queues it on resume |
+| a clean-rebase bridge with the Task in `merge_failed` / `review` | the step returns the Task to the merge state once, with the typed bridge `integration_import` (no coder, no reviewer, no budget), and the entry admits it |
+| `parked` with a stored deadline | the worker's sweep re-queues it at the deadline; the step states `deferred` / `infrastructure` |
+| `parked` otherwise (blocked, failed, human wait, owner wait, sticky disposition, lost workspace), `quarantined` | nothing automatic; the step states `deferred` with its cause and raises the interruption for an intervention; the owner's existing action re-enters `merging`, which admits a successor |
+| `ejected`, `needs_review` | the repair or review already in progress continues; on its return to `merging` admission supersedes the row |
+| Task no longer in the imported entry | nothing is written; the row is history |
+
+A hooks step of a `merging` entry that was pending or running at the upgrade
+executes the admitting `run_merge`. It first reads the effects that step
+recorded: a recorded `merge_outcome` of `Done`, or a `merge_intent` whose
+candidate the target already contains, is reported once (comment, `done`); a
+recorded `rebase_target` without an outcome is finished by the
+interrupted-rebase rule it was started under (a conflict is handed to the
+Worker); anything else is admitted.
+
+Not built in this stage (stage D3): public queue reads (REST, MCP,
+`forge-ctl`), web labels, the `integration.updated` event, operator timing
+percentiles, the retention job, and the `409 integration_unresolved` deletion
+guards.
+
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same
 preflight before their provider RPC. Environment pauses retain the failed
@@ -4792,9 +4877,9 @@ cut at 4,096 bytes; 24 KiB is its tested ceiling for the same reason.
 
 ### Integration-owned conditions (3.2 stage A)
 
-Stage A extends the statement seam only. No production caller emits these reasons;
-merge/rebase/CI/fast-forward, legacy writers, budgets and completion semantics are
-unchanged. Stage B below adds passive queue/attempt storage; there is still no queue worker or path guard enforcement.
+Stage A added the statement seam. Since stage D2b the integration Task steps and the
+`merging` entry hook emit these reasons (see "`merging` is the integration queue").
+There is still no path guard enforcement (stage E).
 `IntegrationAttemptId` is an opaque typed string, never queue rank or worker token.
 
 `ConditionStatement::Integration { reason }` replaces only integration's reason,
@@ -4911,10 +4996,9 @@ when applying a real owner failure. Pushing remains explicit repository sync.
 ### Passive integration queues, import and observations (3.2 stage B)
 
 Stage B adds `integration_queue` and `integration_attempt`. Their repository
-methods are storage operations; no production queue worker calls them to run
-Git, rebase, CI, authorize a fast-forward, send a Task back or mark it done.
-`merging` still runs today's merge hooks. No condition statement is emitted,
-no Task column or budget is migrated, and no legacy producer is retired.
+methods are storage operations. Since stage D2b the queue worker and the
+`merging` entry hook are their production callers (see "`merging` is the
+integration queue"); the shadow observation of the old merge path is removed.
 
 A queue is unique by `(repo_id, target_branch)`. Branch validation strips one
 `refs/heads/` prefix and preserves exact spelling. Location is never a queue
@@ -5404,9 +5488,8 @@ An uncertain receipt is replaced on reconciliation, not appended as a second
 receipt for the same key. An original owner can retain its receipt after lease
 takeover; the frozen intent remains its identity.
 
-**Integration owner wire (3.2 stage D1c, daemon protocol revision 6; `integration.release_objects` with `attempt` since revision 7).** This
-sub-stage is passive: the queue worker is still off and today's merge path does
-not call any of it. It adds what the worker needs from an owner.
+**Integration owner wire (3.2 stage D1c, daemon protocol revision 6; `integration.release_objects` with `attempt` since revision 7).** It is
+what the queue worker needs from an owner; the worker is active since stage D2b.
 
 - *Fence announcement.* `integration.announce { daemon_id, runtime_id, fence,
   live_queue_ids? }` is the first message of a claim generation. The daemon
@@ -5565,10 +5648,10 @@ effect and never its result or a precondition of the next one:
 | daemon journal intent without outcome | server lookup, else the next Task-step request on that checkout | reconnect, or next request | journal outcome `interrupted` plus receipt |
 | daemon never reconnects | today's owner-disconnected timeout fails the placement; machine removal settles the attempt | existing timeout / operator removal | receipt `failed` / `infrastructure`, Task handled by placement recovery |
 | machine or location removed mid-effect | the remover's transaction | at removal | receipt `failed`, attempt `parked` (or still `quarantined`), queue `suspended` |
-| queue `suspended` / attempt `quarantined` | nothing automatic: no worker runs before activation, and today's Task-step path does not read queue state | n/a | passive rows; stage D owns their exits |
+| queue `suspended` / attempt `quarantined` | the queue worker's sweep: a claim re-opens a suspended queue whose target is ready; the head's reconciliation settles a quarantine | every sweep / the reconcile interval | active since stage D2b |
 
 Queue-claim (`attempt`) intents keep the strict rule (uncertain until the owner's
-receipt). No production caller creates one before activation.
+receipt). The queue worker creates them.
 
 Machine removal and permitted location deletion settle in-flight attempts with
 an infrastructure receipt/failure in the remover's transaction, suspend their
@@ -5599,12 +5682,12 @@ Known limits before activation:
 - The existing local Review/Project authority guard remains separate from queue
   owner serialization.
 
-### Integration activation storage (3.2 stage D, part 1a; not called until D2)
+### Integration activation storage (3.2 stage D, part 1a; in use since D2b)
 
 Migration `V202610091612__integration_activation.sql` and
 `db::integration_queue::activation` add the storage the queue worker will use.
-Nothing in production calls it until D2: `merging` still runs today's merge
-hooks, and existing rows read both new columns as `NULL`.
+The queue worker is its caller since D2b; rows written before it read both
+new columns as `NULL`.
 
 New `integration_attempt` columns:
 
@@ -5697,11 +5780,11 @@ move to `queued` from `reconciling` or `quarantined` is refused while the
 attempt has an effect intent or a running / uncertain operation, so `queued`
 is never a way around an unknown result.
 
-### Integration queue worker (3.2 stage D, part 1d; not started until D2)
+### Integration queue worker (3.2 stage D, part 1d; started by the runtime since D2b)
 
-`services::integration_worker` is the queue worker. Nothing constructs or
-starts it yet: `merging` still runs today's merge hooks, and the runtime gains
-no worker until D2 wires it. The module writes `integration_queue` and
+`services::integration_worker` is the queue worker. The runtime builds it
+(`TaskService::compose_integration`) and starts it after owner reconciliation
+and the importer. The module writes `integration_queue` and
 `integration_attempt` rows only. It calls no Git and writes no Task, Review,
 budget or event row; a source test (`worker_sources_stay_inside_the_boundary`)
 holds that line.
@@ -5808,13 +5891,13 @@ Known limit: the first rebase of a head is always counted as a
 `queue_member` lost race (the queue does not store the commit it last
 integrated, so a push from outside before the claim cannot be told apart).
 
-### Integration queue production ports (3.2 stage D, part 2a; still passive)
+### Integration queue production ports (3.2 stage D, part 2a)
 
 `services::integration_ports` holds the real things behind the worker's seams.
 `build_integration_worker(db, router, daemons, locations, config)` assembles
 them and returns the worker **not started** (`locations` is the
-`RepoLocationService`, behind the worker's `IntegrationLocationPort`): nothing in the runtime calls it yet, and
-`merging` still runs today's merge hooks. The next stage (D2b) starts it.
+`RepoLocationService`, behind the worker's `IntegrationLocationPort`): `TaskService::compose_integration` calls it,
+and the runtime starts the worker (stage D2b).
 
 | Worker port | Production | What it does |
 |---|---|---|
@@ -6063,13 +6146,12 @@ checkout's own `refs/heads/<target>`); after a daemon reconnect the owner
 refuses the next claim's fast-forward `foreign_owner` (see the D2b
 checklist); a failed `send_back`, `park` or `clear` step is not asked again.
 
-### Integration Task steps (3.2 stage D, part 1b; not produced until D2)
+### Integration Task steps (3.2 stage D, part 1b; produced since D2b)
 
 `services::integration_steps` is the Task-step side of the integration queue.
-Nothing enqueues one of its steps yet: `merging` still runs today's merge
-hooks, and the queue worker that would ask is not started until D2. The only
-live additions are a registered check consumer family that nobody requests
-from, and one write in the cancel transition (below).
+The queue worker enqueues its steps since D2b, the `merging` entry hook
+admits through `integration_steps::admission`, and the start-time importer
+enqueues `import_continue` (`integration_steps::import`).
 
 The worker never writes Task state. Each request is one Task step of kind
 `integration` with the payload `{task_id, queue_id, attempt_id,
@@ -6559,8 +6641,10 @@ integration. A passed review that reaches the pause boundary retains a durable
 `paused_integration` marker instead of advancing or writing the default branch;
 the review-integration authority lock rechecks `project.paused_at` inside its own
 serialized write transaction immediately before Git integration. After resume,
-the dispatcher consumes the marker and retries the exact `review` or `merging`
-capability without creating another reviewer execution.
+the dispatcher consumes the marker and retries the exact `review`
+capability without creating another reviewer execution. A Task in `merging`
+carries no marker: the queue worker parks it while the Project is paused and
+re-queues it on resume.
 
 The per-Project `check_once` order is repository pause synchronization,
 environment pause synchronization (if the repository pause did not change),
@@ -6762,18 +6846,12 @@ because those steps hold the worktree and Workspace they captured. Paused
 integration resume does nothing while the Task has a pending or claimed step;
 the queued attempt's success consumes the marker.
 
-On every start, before the step worker and dispatcher, a recovery sweep enqueues
-the hooks of a Task's current entry when the Task is in a state whose on_enter
-runs `run_merge`, has no pending or claimed step, and its current entry has no
-hooks row. That is the shape of a `merging` Task whose inline merge a pre-upgrade
-binary lost. The row is keyed `<entry transition_log id>:recovered`, skips the
-prior state's exit hooks, and the merge resumes safely because it first checks
-whether the target already contains the candidate; repeated sweeps never
-duplicate it. Tasks that are paused (manual stop), held for a human, blocked by an
-annotation or entry barrier, or carrying a paused-integration marker are skipped.
-Other states are not swept: they have no durable completion witness, and a
-missing hooks row there is the normal shape of an upgraded Task whose inline
-hooks finished, or of a settled row that storage maintenance pruned.
+A `merging` Task whose entry has no hooks row (the wedge a pre-upgrade binary
+left when it lost an inline merge) is not replayed: the start-time importer
+takes it into the integration queue and its continuation step admits it (see
+"`merging` is the integration queue"). Other states were never swept: they
+have no durable completion witness, and a missing hooks row there is the
+normal shape of an upgraded Task whose inline hooks finished.
 
 Only cascades consume automatic chain positions and edges. Repeated unchanged-
 evidence edges or more than 64 hops park with workflow_loop; fresh Review/rebase

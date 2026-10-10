@@ -8,6 +8,67 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **`merging` now means "in the merge queue" (3.2 stage D2b).** A Task
+  entering `merging` is queued for its repository's target branch and stays
+  in `merging` while Forge rebases it (only if the target moved), checks the
+  rebased commit and fast-forwards it. Tasks that merge into one branch merge
+  one at a time, in the order they first entered `merging`; a Task sent back
+  for a conflict repair or a re-review keeps its place. There is no other
+  merge path and no switch.
+  - **A clean rebase no longer moves the Task.** The `merging → merge_failed
+    → review` bounce is gone: the `task.transitioned` /
+    `task.auto_transitioned` events and transition-log rows for it
+    (`bridge_kind` `target_moved_rebase` followed by `review_refresh`) are no
+    longer produced. `merge_failed` now only means "a coder is repairing a
+    conflict, a red check or a dirty worktree", plus the one hop to `review`
+    when the rebased commit needs a fresh review.
+  - **`pending_steps` no longer shows a merge in progress.** The merge is not
+    a Task step any more: `pending_steps` counts only the short integration
+    steps while one is queued and is `0` for a Task that is simply waiting.
+    Read the Task's `condition` (reason `integration`) instead. Affects
+    `POST /api/v1/tasks/{id}/transition`, the review responses, MCP
+    `forge_transition_task` and `forge-ctl`.
+  - **Task conditions for merging change.** A Task in the queue reports
+    `parked` with reason `integration` (`waiting`, `owned` with a phase,
+    `repair`, `review_required`, `candidate_check_failed`, `deferred` with a
+    cause, `applied`). `paused_integration` is no longer written for a Task
+    in `merging`: while its Project is paused the queue holds it and
+    continues on resume.
+  - **A rebased commit is checked before it merges.** When the queue had to
+    rebase a Task, the review state's `ci_steps` run on the rebased commit
+    (one run, 1800 s limit) before the fast-forward. A red run sends the Task
+    to its coder; a pass lets the passed review carry when the rebase changed
+    nothing outside the reviewed paths, otherwise the Task is re-reviewed. A
+    Project with no `ci_steps` gets a fresh review of every rebased commit,
+    as before. A Task whose target did not move merges its reviewed commit as
+    it is, with no new run.
+  - **A Task placed on a non-default checkout now merges into the
+    repository's default checkout.** Before, it merged into its own
+    location's branch. Its commits are moved between the two checkouts at
+    merge time (256 MiB limit; a larger change waits for its owner).
+  - **A merge-fix budget of 0 still stops a conflict at the merge gate**,
+    but the branch is now already rebased with the conflict committed with
+    markers when it stops.
+  - **Workflow hook `auto_cascade_on_merge_result` is removed; `run_merge`
+    only admits to the queue.** Stored Project workflows and retained step
+    workflow snapshots are rewritten by migration `V202610101725`, which
+    drops the removed hook name and keeps everything else. A workflow YAML
+    template on disk that names the hook must be edited by hand: it is
+    refused as an unknown action.
+  - **Transition bridge kinds add `integration_import`** (an exhaustive enum
+    for typed clients): the one transition that returns a Task to `merging`
+    when the upgrade finds it between a clean rebase and its re-review.
+  - **Upgrade.** Merges that are in flight when the server is upgraded are
+    taken into the queue at the first start: a merge that already landed is
+    reported, an unknown result is looked up before anything is repeated, a
+    Task waiting on its owner keeps waiting with the reason shown. Upgrade
+    the server, then each daemon (daemon protocol revision 7 is required for
+    Tasks or default checkouts on a daemon).
+  - Not in this release yet: the queue is not readable through REST, MCP or
+    `forge-ctl` (position, phase and timings are on the Task's `condition`
+    only), and deleting a repository, a location or a Project is not yet
+    refused while a merge into it has an unknown result.
+
 - **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
   The `ci_steps` a Task runs when it enters `review` are no longer executed
   inside the Task's hooks step: the step asks the check runner and waits
@@ -2233,6 +2294,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- Tasks that merge into one branch no longer race: one merges at a time and
+  the others wait in order, instead of failing with "target moved" and
+  re-running review for every lost race (3.2 stage D2b).
+- A long merge or its checks no longer occupy the long Task-step slots of
+  unrelated Projects.
 
 - **Three waits that showed nothing, or lost what they waited for, are now
   typed and visible.** (1) A Task whose Agent is paused or unreachable kept a

@@ -2750,9 +2750,20 @@ settled state. `pending_steps = 0` is a snapshot, not a promise
 that future agent or execution actions will never enqueue more work. Failed,
 parked, superseded and done rows do not count as pending.
 
+**`pending_steps` does not show a merge in progress.** A Task in `merging` is in
+the integration queue of its repository's target branch; the merge is the queue
+worker's, not a Task step. After the entry's short hooks step (admission)
+settles, `pending_steps` is `0` while the Task simply waits, and counts only the
+short integration steps (check request, settle, result, send-back, park) while
+one is queued. Read the Task's `condition` instead: reason `integration` with
+`waiting`, `owned` (and a phase), `repair`, `review_required`,
+`candidate_check_failed`, `deferred` (and a cause) or `applied`. The Task leaves
+`merging` once: to `done`, or to `merge_failed` when a conflict, a red check or
+a required re-review sends it back.
+
 `forge_transition_task` retains its Task-with-offers result and adds the same
 `pending_steps` integer. The returned Task belongs to the requested transition;
-post-commit hooks (including CI, merge and dispatch) and follow-up cascades are asynchronous on both REST and MCP. The returned `review` is therefore the pre-hook Review: a Review created by the entry's CI appears on a later `GET`. Hook outcomes are checkpointed; interrupted CI and user scripts may run again after restart. A hook whose failure policy is `log` and that fails settles its step `failed` without annotating or blocking the Task, except `run_merge`: it retries transient errors with back-off, then (or on any other error) annotates the Task with a blocking `workspace_error` merge failure that the owner's Retry re-runs.
+post-commit hooks (including CI, admission to the merge queue and dispatch) and follow-up cascades are asynchronous on both REST and MCP. The returned `review` is therefore the pre-hook Review: a Review created by the entry's CI appears on a later `GET`. Hook outcomes are checkpointed; interrupted CI and user scripts may run again after restart. A hook whose failure policy is `log` and that fails settles its step `failed` without annotating or blocking the Task, except `run_merge` (which only admits the Task to the merge queue): it retries transient errors with back-off, then (or on any other error) annotates the Task with a blocking `workspace_error` merge failure that the owner's Retry re-runs.
 
 ## Task hierarchy, workspaces, and prerequisite dependencies
 
@@ -2946,7 +2957,11 @@ agent default.
 `bridge_kind` and `bridge_payload` alongside the original human `trigger_reason`.
 Kinds are `review_refresh`, `target_moved_rebase`, `conflict_handoff`,
 `retry_window_reset`, `recovery`, `gate_skipped`, `gate_approved`, `gate_rejected`,
-`ci_only_review_passed` and `review_carry`. Conflict payloads contain a `paths`
+`ci_only_review_passed`, `review_carry` and `integration_import`.
+`target_moved_rebase` is history only: a clean rebase happens inside `merging`
+since the merge queue is active and writes no transition. `integration_import`
+marks the one transition that returned a Task to `merging` when an upgrade
+found it between a clean rebase and its re-review. Conflict payloads contain a `paths`
 array; recovery/reset payloads contain the recorded `verb`. Ordinary history
 has null fields. Malformed legacy conflict paths retain the handoff kind with
 null payload. New reasons contain plain prose; historical reasons are preserved.
