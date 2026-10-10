@@ -614,7 +614,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             }),
             build: managed_codex_home
                 .as_ref()
-                .and_then(|_| build_in_use)
+                .and(build_in_use)
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
             home: managed_codex_home,
