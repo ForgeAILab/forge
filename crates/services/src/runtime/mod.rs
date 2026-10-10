@@ -811,6 +811,14 @@ impl ForgeRuntimeBuilder {
             daemon_connections.clone(),
             Duration::from_secs(effective_config.workspace.max_disconnect_seconds),
         ));
+        cleanup_scheduler.set_live_check_counter(check_owners.live_operation_counter());
+        cleanup_scheduler.set_gc_limits(
+            effective_config.workspace.log_retention_days,
+            executors::gc::FreeFloor {
+                min_free_bytes: effective_config.workspace.min_free_bytes,
+                min_free_percent: effective_config.workspace.min_free_percent,
+            },
+        );
         let check_worker = Arc::new(crate::check_runner::worker::CheckRunWorker::new(
             self.db.clone(),
             check_owners,

@@ -227,6 +227,13 @@ async fn run() {
             .with_bcrypt_cost(effective_config.server.bcrypt_cost)
             .build(),
     );
+    // Only the running server garbage-collects its workspace root and the
+    // locations older versions left in the system temp directory; nothing
+    // built for a test ever does.
+    runtime.cleanup_scheduler.enable_gc();
+    runtime
+        .cleanup_scheduler
+        .set_legacy_temp_dir(std::env::temp_dir());
 
     let embedded_daemon = if cli.no_embedded_daemon {
         None

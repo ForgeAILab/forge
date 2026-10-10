@@ -343,7 +343,7 @@ pub use usage_projection::{
 };
 pub use wake_turn_consumer::{wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun};
 pub use workflow::template_service::WorkflowTemplateService;
-pub use workspace_cleanup::WorkspaceCleanupScheduler;
+pub use workspace_cleanup::{GcSettings, WorkspaceCleanupScheduler};
 pub use workspace_execution_lock::WorkspaceExecutionLockManager;
 
 pub type Result<T> = std::result::Result<T, ServiceError>;

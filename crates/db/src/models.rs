@@ -1076,6 +1076,10 @@ pub struct Workspace {
     pub cleanup_attempts: i64,
     pub last_cleanup_error: Option<String>,
     pub error: Option<String>,
+    /// Disk bytes of the Task root as last measured by the garbage-collection
+    /// sweep; `None` until a walk of it has finished.
+    pub disk_bytes: Option<i64>,
+    pub disk_measured_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

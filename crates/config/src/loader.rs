@@ -116,6 +116,15 @@ impl ForgeConfig {
             if let Some(max_disconnect_seconds) = workspace.max_disconnect_seconds {
                 self.workspace.max_disconnect_seconds = max_disconnect_seconds;
             }
+            if let Some(log_retention_days) = workspace.log_retention_days {
+                self.workspace.log_retention_days = log_retention_days;
+            }
+            if let Some(min_free_bytes) = workspace.min_free_bytes {
+                self.workspace.min_free_bytes = min_free_bytes;
+            }
+            if let Some(min_free_percent) = workspace.min_free_percent {
+                self.workspace.min_free_percent = min_free_percent;
+            }
         }
 
         if let Some(agent) = file.agent {

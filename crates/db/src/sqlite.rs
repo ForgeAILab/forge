@@ -445,6 +445,8 @@ fn map_workspace(row: SqliteRow) -> Result<Workspace> {
         cleanup_attempts: row.try_get("cleanup_attempts")?,
         last_cleanup_error: row.try_get("last_cleanup_error")?,
         error: row.try_get("error")?,
+        disk_bytes: row.try_get("disk_bytes")?,
+        disk_measured_at: row.try_get("disk_measured_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

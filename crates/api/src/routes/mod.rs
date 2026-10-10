@@ -1101,6 +1101,8 @@ pub async fn workspace_response(
         status: workspace.status.to_string(),
         before_sha: workspace.before_sha,
         error: workspace.error,
+        disk_bytes: workspace.disk_bytes,
+        disk_measured_at: workspace.disk_measured_at,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
     })
