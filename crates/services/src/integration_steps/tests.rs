@@ -207,7 +207,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // Generous: the focused suite runs hundreds of tests beside this one.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if check().await {
             return;
@@ -422,29 +423,31 @@ async fn result_applies_a_landed_merge_exactly_as_the_merge_hook_does() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_result_that_cannot_apply_never_dead_letters_and_is_rearmed() {
+    // The fault is keyed by Task id in a process-wide set: an id no other
+    // test uses (it made the plain `result` test time out under `"t"`).
     let world = World::new().await;
-    let a = world.add_task("t", "f", "one\n").await;
-    test_faults::set("t", true);
-    land(&world, "t", &a.id).await;
+    let a = world.add_task("unapplied", "f", "one\n").await;
+    test_faults::set("unapplied", true);
+    land(&world, "unapplied", &a.id).await;
     world.port.ready_result_step(&a.id, 1).await.unwrap();
     // More deliveries than any step's retry allowance.
     for round in 1..=10 {
         eventually("the result step ran again", || async {
-            world.step("t", IntegrationStepAction::Result).await[0].attempts >= round
+            world.step("unapplied", IntegrationStepAction::Result).await[0].attempts >= round
         })
         .await;
-        let step = &world.step("t", IntegrationStepAction::Result).await[0];
+        let step = &world.step("unapplied", IntegrationStepAction::Result).await[0];
         assert_ne!(step.status, "failed");
         assert_ne!(step.status, "parked");
         // Parked far out; `ready_result_step` is what re-arms it.
         eventually("the result step is parked for later", || async {
-            let step = &world.step("t", IntegrationStepAction::Result).await[0];
+            let step = &world.step("unapplied", IntegrationStepAction::Result).await[0];
             step.status == "pending" && step.available_at > db::now_rfc3339()
         })
         .await;
         world.port.ready_result_step(&a.id, 1).await.unwrap();
     }
-    let task = world.task("t").await;
+    let task = world.task("unapplied").await;
     assert_eq!(task.status, "merging");
     assert_eq!(integration(&task)["kind"], "deferred");
     assert_eq!(integration(&task)["cause"], "unresolved_result");
@@ -455,10 +458,10 @@ async fn a_result_that_cannot_apply_never_dead_letters_and_is_rearmed() {
     );
     assert!(ack(&world.attempt(&a.id).await, IntegrationStepAction::Result).is_none());
 
-    test_faults::set("t", false);
+    test_faults::set("unapplied", false);
     world.port.ready_result_step(&a.id, 1).await.unwrap();
     eventually("the Task is done", || async {
-        world.task("t").await.status == "done"
+        world.task("unapplied").await.status == "done"
     })
     .await;
     assert!(ack(&world.attempt(&a.id).await, IntegrationStepAction::Result).is_some());
@@ -557,6 +560,67 @@ async fn send_back_hands_a_conflict_to_the_worker_as_the_merge_hook_does() {
         world.step("t", IntegrationStepAction::SendBack).await[0].status,
         "done"
     );
+}
+
+/// A `send_back` that stops after its comment, annotation and event but
+/// before its transaction (a crash, a lost lease) is delivered again: the
+/// Task ends with exactly what one delivery leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redelivered_send_back_repeats_no_comment_charge_or_transition() {
+    let world = World::new().await;
+    for (task, budget, set, comment) in [
+        (
+            "redelivered-conflict",
+            vec![("conflict_handoff".to_owned(), 1)],
+            "state='ejected',conflict_paths_json='[\"f\"]',failure_message='conflict in f'",
+            "Merge conflict handed back to the Worker: rebased onto main; conflicts were committed with markers in: f",
+        ),
+        (
+            "redelivered-red",
+            // One rejection out of the `merging` gate and one merge fix.
+            vec![("gate:merging".to_owned(), 1), ("merge_fix".to_owned(), 1)],
+            "state='ejected',failure_kind='candidate_check_failed',failure_message='make test exited 2'",
+            "Merge checks failed: checks failed after the rebase onto main: make test exited 2",
+        ),
+    ] {
+        let a = world.add_task(task, task, "one\n").await;
+        let asked = world.place(&a.id, "rebasing", 2).await;
+        world.set(&a.id, set).await;
+        test_faults::interrupt_once(task);
+        world.ask(&asked, IntegrationStepAction::SendBack).await;
+        eventually("the Task was handed back", || async {
+            world.task(task).await.status == "merge_failed"
+        })
+        .await;
+        let step = &world.step(task, IntegrationStepAction::SendBack).await[0];
+        assert_eq!(step.status, "done");
+        assert!(step.attempts >= 2, "the step was delivered twice");
+        assert_eq!(world.comments(task).await, vec![comment.to_owned()], "{task}");
+        let transitions = world.transitions(task).await;
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|row| row.0 == "merging" && row.1 == "merge_failed")
+                .count(),
+            1,
+            "{task}: {transitions:?}"
+        );
+        let charged: Vec<(String, i64)> =
+            sqlx::query_as("SELECT kind,spent FROM task_budget WHERE task_id=? AND spent>0 ORDER BY kind")
+                .bind(task)
+                .fetch_all(world.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(charged, budget, "{task}");
+        let cascades: i64 = world
+            .scalar(
+                "SELECT COUNT(*) FROM task_step WHERE task_id=? AND kind='cascade' AND causation_key LIKE 'integration:%'",
+                task,
+            )
+            .await;
+        assert_eq!(cascades, 1, "{task}");
+        assert!(ack(&world.attempt(&a.id).await, IntegrationStepAction::SendBack).is_some());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

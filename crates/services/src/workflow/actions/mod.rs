@@ -1,6 +1,6 @@
 pub(crate) mod carry;
 mod common;
-pub(crate) use common::{review_ci_steps, system_comment};
+pub(crate) use common::{review_ci_steps, system_comment, with_comment_key};
 mod dispatch;
 mod gates;
 mod lifecycle;

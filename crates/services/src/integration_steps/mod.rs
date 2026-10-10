@@ -726,6 +726,23 @@ pub(crate) mod test_faults {
             tasks.remove(task_id);
         }
     }
+    static INTERRUPTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    /// The next `send_back` of this Task stops before its transaction, as a
+    /// crash or a lost lease there would, and is delivered again.
+    pub(crate) fn interrupt_once(task_id: &str) {
+        INTERRUPTED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(task_id.to_owned());
+    }
+    pub(super) fn interrupts_once(task_id: &str) -> bool {
+        INTERRUPTED
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|tasks| tasks.remove(task_id))
+    }
     pub(super) fn fails(task_id: &str) -> bool {
         FAILING
             .lock()

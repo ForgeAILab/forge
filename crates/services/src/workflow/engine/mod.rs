@@ -1450,6 +1450,9 @@ impl WorkflowExecution<'_> {
                             after_id: move_request.after_id,
                             entry_barrier_json: entry_barrier_json.clone(),
                             post_commit_step: initial_hook_step.clone(),
+                            integration_cancel: current_status != target_state
+                                && workflow.cancellation_state.as_deref()
+                                    == Some(target_state.as_str()),
                             transition_log_id: transition_log_id.clone(),
                             workflow_snapshot: workflow_snapshot.clone(),
                             trigger_name: trigger_name.clone(),

@@ -807,7 +807,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   hand a conflict or a failed check back, say why a Task is waiting), but
   nothing asks it to: merging works exactly as before. Upgrading rebuilds the
   internal `task_step` table once to add the new step kind; no row is
-  changed.
+  changed. One thing is live today: cancelling a Task, by action or by
+  dragging it to the cancelled column, also marks its merge-queue record as
+  cancel-requested in the same write.
 - **Integration queue worker, not started yet (3.2 stage D, part 1d).** The
   server has the worker that will drive the per-branch merge queue (rebase,
   check, fast-forward, takeover after a crash), but nothing starts it:

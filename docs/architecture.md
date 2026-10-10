@@ -5643,7 +5643,26 @@ is. The Task's cancel transition calls
 cancellable attempt gets `cancel_requested_at` with the Task write; in
 `ff_inflight`, `reconciling`, `applied` or `quarantined` the Cancel is
 refused as busy while the protected step is alive (it then runs after the
-result) and is not held back by an attempt nothing drives.
+result) and is not held back by an attempt nothing drives. A board move into
+the cancellation state does the same through the same function
+(`CompareAndMoveTask.integration_cancel`, inside the move's transaction), so
+the flag has one writer. The call never fails a Cancel for a reason of its
+own: an attempt row or request time storage refuses counts as an attempt
+nothing drives. Storage refuses a permit for an attempt that carries the
+flag, and `settle` answers `task_left` instead of asking for one.
+
+**Redelivery.** Every action is safe to deliver twice. `settle`, `result`,
+`park` and `clear` write only in their final transaction. `send_back` writes
+its comment, annotation, block and `merge.failed` event before that
+transaction, as today's merge hook does; the comments are keyed by the step
+(`with_comment_key`), the annotation, block and cleared approval are the same
+values again, and the budget is charged by the cascade enqueued in the
+transaction, so a step that stops before its commit and runs again leaves one
+comment, one charge and one transition. The `merge.failed` and `task.blocked`
+bus events are not durable and can repeat. `request_check` asked again for a
+commit whose verdict already exists (applied for an earlier `effect_seq`, or a
+delivery whose application failed part-way and is not run again) applies the
+stored verdict itself.
 
 **`result` cannot dead-letter.** It never settles `failed` or `parked`. If it
 cannot apply, the Task states `integration/deferred/unresolved_result`, the
@@ -5666,8 +5685,7 @@ Storage: migration `V202610100137__integration_task_step.sql` adds the step
 kind (a data-preserving `task_step` rebuild; SQLite cannot alter a CHECK).
 
 Not here yet: the head's check result is not copied onto a Review row; after
-a queue reopens nothing asks for the `park` step that restores `waiting`;
-the cancel flag is not set for a board move into the cancellation state.
+a queue reopens nothing asks for the `park` step that restores `waiting`.
 
 
 ### Task condition actions

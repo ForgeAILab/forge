@@ -305,6 +305,62 @@ async fn task_cancel_flags_a_cancellable_attempt_and_waits_only_behind_a_protect
         );
         assert_eq!(reread(&db, &a.id).await, before, "{state}");
     }
+    // (An ended attempt is never the Task's current row: the table's own
+    // CHECK refuses `current=1` in a terminal state.)
+    sqlx::query("DELETE FROM task_step WHERE id=?")
+        .bind(&protected)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // A request time storage would refuse is not a reason to fail a Cancel.
+    sqlx::query(
+        "UPDATE integration_attempt SET state='queued',cancel_requested_at=NULL WHERE id=?",
+    )
+    .bind(&a.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    assert_eq!(
+        request_task_integration_cancel_in_tx(&mut tx, "a", "not a time")
+            .await
+            .unwrap(),
+        TaskIntegrationCancel::Undriven
+    );
+    drop(tx);
+}
+
+#[tokio::test]
+async fn a_permit_is_refused_once_the_task_asked_to_cancel() {
+    let db = fixture().await;
+    let a = attempt(&db, "a").await;
+    place(&db, &a.id, "awaiting_task_step", 3, 7).await;
+    assert_eq!(
+        {
+            let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+            let outcome = request_task_integration_cancel_in_tx(&mut tx, "a", NOW)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            outcome
+        },
+        TaskIntegrationCancel::Requested
+    );
+    let flagged = reread(&db, &a.id).await;
+    assert!(matches!(
+        write(&db, &settle_write(&flagged, 3, 7)).await,
+        Err(DbError::Check(_))
+    ));
+    let after = reread(&db, &a.id).await;
+    assert_eq!(after, flagged, "nothing was written");
+    // An answer without a permit (the Task left) is still accepted.
+    let mut left = settle_write(&flagged, 3, 7);
+    left.permit = None;
+    left.ack = ack(3, 7, "settle", "task_left");
+    assert!(matches!(
+        write(&db, &left).await.unwrap(),
+        IntegrationStepAckOutcome::Written(_)
+    ));
 }
 
 #[tokio::test]
@@ -531,4 +587,81 @@ async fn an_attempt_carry_is_recorded_once_and_spends_the_review_carry_allowance
         Err(DbError::Check(_))
     ));
     assert_eq!(rows().await, (limit, limit));
+}
+
+/// A board move into the cancellation state is the same single writer as the
+/// cancel transition: flag in the move's own transaction, or wait behind the
+/// protected result step with nothing moved.
+#[tokio::test]
+async fn a_board_move_into_the_cancellation_state_flags_the_attempt_or_waits() {
+    use crate::{CompareAndMoveTask, TaskBoardRepo, TaskRepo};
+    let db = fixture().await;
+    let a = attempt(&db, "a").await;
+    let b = attempt(&db, "b").await;
+    let revision = TaskBoardRepo::board_revision(&db, "p").await.unwrap();
+    let input = |task: &str, cancel: bool| CompareAndMoveTask {
+        post_commit_step: None,
+        integration_cancel: cancel,
+        operation_id: crate::new_uuid_v4(),
+        project_id: "p".into(),
+        task_id: task.into(),
+        task_version: 1,
+        board_revision: revision,
+        target_status: "cancelled".into(),
+        target_column_statuses: vec!["cancelled".into()],
+        before_id: None,
+        after_id: None,
+        entry_barrier_json: None,
+        transition_log_id: crate::new_uuid_v4(),
+        workflow_snapshot: Value::Null,
+        trigger_name: None,
+        triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+        bridge: Default::default(),
+        trigger_reason: "board move".into(),
+        rejection: false,
+        expected_project_version: None,
+        expected_workflow_definition: None,
+        updated_at: NOW.into(),
+    };
+    // Protected: the move is refused as busy and nothing changes.
+    place(&db, &b.id, "ff_inflight", 1, 1).await;
+    let mut protected = step("b", "integration:b:1:result", "integration", json!({}));
+    protected.expected_status = "merging".into();
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    db.enqueue_protected_integration_step_in_tx(&mut tx, &protected)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut busy = input("b", true);
+    busy.task_version = TaskRepo::get_by_id(&db, "b", false)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let before = reread(&db, &b.id).await;
+    assert!(matches!(
+        TaskBoardRepo::compare_and_move_task(&db, busy).await,
+        Err(DbError::TaskBusy { .. })
+    ));
+    assert_eq!(reread(&db, &b.id).await, before);
+    let task = TaskRepo::get_by_id(&db, "b", false).await.unwrap().unwrap();
+    assert_eq!(task.status, "merging");
+
+    // Cancellable: the flag commits with the move.
+    let mut moved = input("a", true);
+    moved.task_version = TaskRepo::get_by_id(&db, "a", false)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    moved.board_revision = TaskBoardRepo::board_revision(&db, "p").await.unwrap();
+    TaskBoardRepo::compare_and_move_task(&db, moved)
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&db, "a", false).await.unwrap().unwrap();
+    assert_eq!(task.status, "cancelled");
+    assert_eq!(
+        reread(&db, &a.id).await.cancel_requested_at.as_deref(),
+        Some(NOW)
+    );
 }

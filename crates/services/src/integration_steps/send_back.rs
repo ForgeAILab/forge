@@ -82,7 +82,24 @@ impl IntegrationSteps {
         })
     }
 
+    /// Everything this step writes before its final transaction is safe to
+    /// repeat when the step is delivered again (a crash or a lost lease
+    /// before the commit): comments are keyed by the step, the annotation,
+    /// the block and the cleared approval are the same values again, and the
+    /// budget is charged by the cascade, which is enqueued in the transaction.
     pub(crate) async fn send_back(
+        &self,
+        step: &TaskStep,
+        request: &IntegrationStepRequest,
+    ) -> Result<StepOutcome> {
+        crate::workflow::actions::with_comment_key(
+            step.causation_key.clone(),
+            self.send_back_keyed(step, request),
+        )
+        .await
+    }
+
+    async fn send_back_keyed(
         &self,
         step: &TaskStep,
         request: &IntegrationStepRequest,
@@ -277,6 +294,10 @@ impl IntegrationSteps {
             None => None,
         };
 
+        #[cfg(test)]
+        if super::test_faults::interrupts_once(&task.id) {
+            return Ok(StepOutcome::Retry("injected redelivery".into()));
+        }
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         if !Self::entry_live_in_tx(&mut tx, &attempt).await? {
             return Ok(StepOutcome::TaskLeft);

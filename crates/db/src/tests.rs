@@ -7594,6 +7594,7 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         .expect("revision loads");
     let input = CompareAndMoveTask {
         post_commit_step: None,
+        integration_cancel: false,
         operation_id: operation_id.clone(),
         project_id: project_id.clone(),
         task_id: moved_id.clone(),
@@ -7652,6 +7653,7 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
 
     let stale_task = CompareAndMoveTask {
         post_commit_step: None,
+        integration_cancel: false,
         operation_id: new_uuid_v4(),
         task_version: moved.version,
         board_revision: result.board_revision,
@@ -7666,6 +7668,7 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
 
     let stale_board = CompareAndMoveTask {
         post_commit_step: None,
+        integration_cancel: false,
         operation_id: new_uuid_v4(),
         task_version: loaded.version,
         board_revision,
@@ -7704,6 +7707,7 @@ async fn compare_and_move_rejects_stale_project_workflow_authority_without_mutat
         .expect("board revision loads");
     let input = CompareAndMoveTask {
         post_commit_step: None,
+        integration_cancel: false,
         operation_id: new_uuid_v4(),
         project_id: project_id.clone(),
         task_id: task_id.clone(),
@@ -7793,6 +7797,7 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
         &db,
         CompareAndMoveTask {
             post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: project_id.clone(),
             task_id: task_id.clone(),
@@ -7885,6 +7890,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
         &db,
         CompareAndMoveTask {
             post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: project_id.clone(),
             task_id: moved_id.clone(),
@@ -7928,6 +7934,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
         &db,
         CompareAndMoveTask {
             post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: project_id.clone(),
             task_id: source_id,
@@ -7966,6 +7973,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
         &db,
         CompareAndMoveTask {
             post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id,
             task_id: another_id,

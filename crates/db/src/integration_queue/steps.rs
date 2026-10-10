@@ -111,7 +111,8 @@ pub async fn current_integration_attempt_in_tx(
 /// `effect_seq` and, unless `bind_generation` is false, its slot generation.
 ///
 /// `DbError::Check`: the acknowledgment is malformed, or the permit does not
-/// bind this candidate, target tip, Task entry and slot. `VersionConflict`:
+/// bind this candidate, target tip, Task entry and slot, or the attempt is
+/// flagged for cancellation (Cancel won). `VersionConflict`:
 /// the row changed under this transaction (impossible under `BEGIN
 /// IMMEDIATE`; kept as the fence).
 pub async fn acknowledge_integration_step_in_tx(
@@ -146,6 +147,11 @@ pub async fn acknowledge_integration_step_in_tx(
         IntegrationStepPosition::Due => {}
     }
     if let Some(permit) = &write.permit {
+        if a.cancel_requested_at.is_some() {
+            return Err(DbError::Check(
+                "integration permit refused: the Task asked to cancel this attempt".into(),
+            ));
+        }
         if !permit_binds(&a, permit) {
             return Err(DbError::Check(
                 "integration permit does not bind this candidate, target, Task entry and slot"
@@ -221,10 +227,17 @@ pub async fn request_task_integration_cancel_in_tx(
     task_id: &str,
     requested_at: &str,
 ) -> Result<TaskIntegrationCancel> {
-    let Some(a) = current_integration_attempt_in_tx(tx, task_id).await? else {
-        return Ok(TaskIntegrationCancel::NoAttempt);
+    let a = match current_integration_attempt_in_tx(tx, task_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(TaskIntegrationCancel::NoAttempt),
+        // A row that cannot be read is a row nothing can drive (the worker
+        // quarantines it): it never holds a Cancel back.
+        Err(DbError::Check(_)) => return Ok(TaskIntegrationCancel::Undriven),
+        Err(error) => return Err(error),
     };
     match request_integration_cancel_in_tx(tx, &a.id, a.revision, requested_at).await {
+        // Not a reason to refuse the Cancel: nothing is written.
+        Err(DbError::Check(_)) => Ok(TaskIntegrationCancel::Undriven),
         Ok(_) => Ok(TaskIntegrationCancel::Requested),
         Err(DbError::InvalidTransition) => {
             let protected: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='integration' AND integration_started_at IS NOT NULL AND status IN ('pending','claimed'))")

@@ -341,13 +341,17 @@ impl IntegrationSteps {
                 wall_timeout_seconds: check.wall_timeout_seconds,
             })
             .await?;
-        // A worker that asks again for a commit whose verdict was already
-        // delivered gets no second delivery: apply the stored verdict here.
+        // A worker that asks again for a commit whose verdict already exists
+        // gets no second delivery: apply the stored verdict here. That covers
+        // a delivery that was applied for an earlier `effect_seq` and one
+        // whose application failed part-way (its step is not run again). A
+        // delivery still on its way writes the same answer; whichever commits
+        // second finds it answered.
         let delivery = self
             .db
             .check_consumer_delivery(&requested.consumer.id)
             .await?;
-        if let Some(delivery) = delivery.filter(|delivery| delivery.applied_at.is_some()) {
+        if let Some(delivery) = delivery.filter(|delivery| delivery.cancelled_at.is_none()) {
             if let (Some(run_id), Some(result_id)) =
                 (&delivery.consumer.run_id, &delivery.consumer.result_id)
             {
@@ -636,7 +640,11 @@ impl IntegrationSteps {
         if current.revision != attempt.revision {
             return Ok(StepOutcome::Retry("attempt changed while deciding".into()));
         }
-        if !Self::entry_live_in_tx(&mut tx, &attempt).await? {
+        // Cancel won: the flag is written in the Cancel's own transaction,
+        // so a permit can never follow it.
+        if current.cancel_requested_at.is_some()
+            || !Self::entry_live_in_tx(&mut tx, &attempt).await?
+        {
             drop(tx);
             return self.answer_task_left(step, request, states).await;
         }

@@ -291,9 +291,23 @@ pub(super) fn follow_up_trigger(ctx: &HookContext) -> &'static str {
     }
 }
 
+tokio::task_local! { static COMMENT_KEY: String; }
+
+/// Run `work` with every system comment it writes through a hook context
+/// keyed by `key` and the comment's text, so a redelivered Task step writes
+/// each comment once. A hook step keeps its own key; nothing else sets one.
+pub(crate) async fn with_comment_key<F: std::future::Future>(key: String, work: F) -> F::Output {
+    COMMENT_KEY.scope(key, work).await
+}
+
 pub(super) async fn create_system_comment(ctx: &HookContext, content: String) -> db::Result<()> {
     let idempotency_key = crate::workflow::engine::durable::current_hook(&ctx.task_id)
-        .map(|a| format!("hook-comment:{}:{}:{}", a.step.id, a.index, content));
+        .map(|a| format!("hook-comment:{}:{}:{}", a.step.id, a.index, content))
+        .or_else(|| {
+            COMMENT_KEY
+                .try_with(|key| format!("step-comment:{key}:{content}"))
+                .ok()
+        });
     system_comment(
         &ctx.db,
         &ctx.event_bus,

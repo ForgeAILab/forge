@@ -317,6 +317,7 @@ impl TaskService {
             &*self.db,
             CompareAndMoveTask {
                 post_commit_step: None,
+                integration_cancel: false,
                 operation_id: request.operation_id.clone(),
                 project_id: task.project_id.clone(),
                 task_id: task.id.clone(),
