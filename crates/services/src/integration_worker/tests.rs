@@ -1970,7 +1970,10 @@ async fn a_head_whose_task_machine_is_removed_mid_rebase_does_not_stall_the_queu
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(receipt.operation_state, db::IntegrationOperationState::Failed);
+    assert_eq!(
+        receipt.operation_state,
+        db::IntegrationOperationState::Failed
+    );
     let queue = world.queue_of(&a).await;
     assert_eq!(queue.state, db::IntegrationQueueState::Open);
     assert_eq!(queue.head_attempt_id, None);
@@ -2009,11 +2012,13 @@ async fn a_takeover_session_releases_the_transfer_refs_of_the_head_it_finishes()
         .await
         .unwrap();
     let a = world.add_task("r", "a", "a.txt", "a\n").await;
-    sqlx::query("UPDATE integration_attempt SET repo_location_id='l-task',owner_kind='server' WHERE id=?")
-        .bind(&a.id)
-        .execute(world.db.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE integration_attempt SET repo_location_id='l-task',owner_kind='server' WHERE id=?",
+    )
+    .bind(&a.id)
+    .execute(world.db.pool())
+    .await
+    .unwrap();
     world.transfer.remote.lock().unwrap().insert("a".into());
     world.external_commit("r", "outside").await;
     let worker = world.worker();

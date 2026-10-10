@@ -362,9 +362,9 @@ impl IntegrationSteps {
                 // with it again, or every retry of the head would park on
                 // the same stored answer. The consumer asks again, with a
                 // fresh run, and this head waits for that result.
-                let no_verdict = result
-                    .as_ref()
-                    .is_some_and(|result| result.outcome == CheckResultOutcome::InfrastructureFailed);
+                let no_verdict = result.as_ref().is_some_and(|result| {
+                    result.outcome == CheckResultOutcome::InfrastructureFailed
+                });
                 let asked_again = no_verdict
                     && consumers
                         .ask_again_after_no_verdict(&delivery.consumer)

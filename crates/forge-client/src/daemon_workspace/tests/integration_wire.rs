@@ -1222,8 +1222,21 @@ impl TransferredHead {
         .await
         .unwrap();
     }
-    fn request(&self, generation: i64, candidate: &str, target: &str) -> WorkspaceIntegrationRequest {
-        let version = self.transfer.fixture.backend.state.lock().unwrap().locations["location-2"].version;
+    fn request(
+        &self,
+        generation: i64,
+        candidate: &str,
+        target: &str,
+    ) -> WorkspaceIntegrationRequest {
+        let version = self
+            .transfer
+            .fixture
+            .backend
+            .state
+            .lock()
+            .unwrap()
+            .locations["location-2"]
+            .version;
         let mut fence = self.transfer.fence.clone();
         fence.generation = generation;
         fence.target_owner = serde_json::json!({"location_id":"location-2","owner_kind":"daemon","daemon_id":"daemon-1","runtime_id":"runtime-1","generation":version});
@@ -1234,7 +1247,10 @@ impl TransferredHead {
         }
     }
     fn params(&self, request: &WorkspaceIntegrationRequest) -> Value {
-        let candidate = request.witness["expected_head_sha"].as_str().unwrap().to_owned();
+        let candidate = request.witness["expected_head_sha"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         serde_json::to_value(WorkspaceReviewedMergeParams {
             merge: WorkspaceMergeParams {
                 fence: WorkspaceMutationFence {
@@ -1267,7 +1283,9 @@ impl TransferredHead {
         .unwrap()
     }
     async fn merge(&self, backend: &DaemonWorkspaceBackend, params: Value) -> CommandResult<Value> {
-        backend.handle(METHOD_WORKSPACE_MERGE, params, Vec::new).await
+        backend
+            .handle(METHOD_WORKSPACE_MERGE, params, Vec::new)
+            .await
     }
     async fn tip(&self) -> String {
         local_git(&self.clone, &["rev-parse", "refs/heads/main"])
@@ -1333,7 +1351,9 @@ async fn a_transferred_candidate_is_fast_forwarded_once_from_its_own_generations
     assert_eq!(done["integration_receipt"]["operation_state"], "succeeded");
     assert_eq!(head.tip().await, tip);
     assert_eq!(
-        local_git(&head.clone, &["status", "--porcelain"]).await.unwrap(),
+        local_git(&head.clone, &["status", "--porcelain"])
+            .await
+            .unwrap(),
         ""
     );
     assert_eq!(head.moves().await, 1);
@@ -1470,15 +1490,26 @@ async fn an_owner_restart_during_a_transferred_fast_forward_is_settled_by_the_lo
     announce(&head.transfer.fixture.backend, &request.fence, None)
         .await
         .unwrap();
-    retain_intent(&head.transfer.fixture, METHOD_WORKSPACE_MERGE, params.clone());
+    retain_intent(
+        &head.transfer.fixture,
+        METHOD_WORKSPACE_MERGE,
+        params.clone(),
+    );
     let restarted = restart(&head.transfer.fixture);
     let found = head.lookup(&restarted, &request).await;
-    assert_eq!(receipt(&found)["result"]["kind"], "not_performed", "{found:?}");
+    assert_eq!(
+        receipt(&found)["result"]["kind"],
+        "not_performed",
+        "{found:?}"
+    );
     assert_eq!(receipt(&found)["operation_state"], "failed");
     assert_eq!(head.tip().await, base);
     // Settled for good: asked again, and the late frame, get the same
     // answer and move nothing.
-    assert_eq!(receipt(&head.lookup(&restarted, &request).await), receipt(&found));
+    assert_eq!(
+        receipt(&head.lookup(&restarted, &request).await),
+        receipt(&found)
+    );
     let late = head.merge(&restarted, params).await.unwrap_err();
     assert_eq!(
         late.details.unwrap()["integration_receipt"],
@@ -1496,7 +1527,11 @@ async fn an_owner_restart_during_a_transferred_fast_forward_is_settled_by_the_lo
     announce(&head.transfer.fixture.backend, &request.fence, None)
         .await
         .unwrap();
-    retain_intent(&head.transfer.fixture, METHOD_WORKSPACE_MERGE, params.clone());
+    retain_intent(
+        &head.transfer.fixture,
+        METHOD_WORKSPACE_MERGE,
+        params.clone(),
+    );
     let landed = git::integration::fast_forward_exact(
         &head.clone,
         "main",
@@ -1509,11 +1544,17 @@ async fn an_owner_restart_during_a_transferred_fast_forward_is_settled_by_the_lo
     )
     .await
     .unwrap();
-    assert!(matches!(landed, git::integration::MergeApplyOutcome::Applied));
+    assert!(matches!(
+        landed,
+        git::integration::MergeApplyOutcome::Applied
+    ));
     let restarted = restart(&head.transfer.fixture);
     let found = head.lookup(&restarted, &request).await;
     assert_eq!(receipt(&found)["operation_state"], "succeeded", "{found:?}");
-    assert_eq!(receipt(&found)["result"]["outcome"]["Done"]["after_sha"], tip);
+    assert_eq!(
+        receipt(&found)["result"]["outcome"]["Done"]["after_sha"],
+        tip
+    );
     let late = head.merge(&restarted, params).await.unwrap();
     assert_eq!(late["integration_receipt"], receipt(&found));
     assert_eq!(head.tip().await, tip);

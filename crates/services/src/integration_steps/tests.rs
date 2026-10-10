@@ -1639,7 +1639,9 @@ async fn a_no_verdict_answer_is_not_kept_for_the_commit_and_a_new_round_asks_aga
         let id = a.id.clone();
         async move {
             let placed = world.place(&id, "checking", round).await;
-            world.ask(&placed, IntegrationStepAction::RequestCheck).await;
+            world
+                .ask(&placed, IntegrationStepAction::RequestCheck)
+                .await;
             eventually("the request_check step to finish", || async {
                 let steps = world.step("one", IntegrationStepAction::RequestCheck).await;
                 steps.len() as i64 == round && steps.iter().all(|step| step.status == "done")
@@ -1664,7 +1666,13 @@ async fn a_no_verdict_answer_is_not_kept_for_the_commit_and_a_new_round_asks_aga
         .id
         .clone();
     let exhaust = |cleanup: &'static str, result: &'static str| {
-        let (world, run, consumer, now, step) = (&world, run.clone(), consumer.clone(), now.clone(), step.clone());
+        let (world, run, consumer, now, step) = (
+            &world,
+            run.clone(),
+            consumer.clone(),
+            now.clone(),
+            step.clone(),
+        );
         async move {
             let pool = world.db.pool();
             sqlx::query("UPDATE check_run SET state='failed',lease_owner=NULL,lease_until=NULL,finished_at=? WHERE id=?")

@@ -1659,9 +1659,15 @@ mod tests {
                 Case::WrongCommit => bind(own.clone(), unreviewed.clone()).await,
                 Case::MissingRef => {}
                 Case::OlderGeneration => {
-                    bind(key(&f.fence.attempt_id, f.fence.generation - 1), f.head.clone()).await
+                    bind(
+                        key(&f.fence.attempt_id, f.fence.generation - 1),
+                        f.head.clone(),
+                    )
+                    .await
                 }
-                Case::OtherAttempt => bind(key("another-attempt", f.fence.generation), f.head.clone()).await,
+                Case::OtherAttempt => {
+                    bind(key("another-attempt", f.fence.generation), f.head.clone()).await
+                }
                 _ => bind(own.clone(), f.head.clone()).await,
             }
             let mut tip = f.target.clone();
@@ -1758,7 +1764,9 @@ mod tests {
                 witness: json!({"workspace":away,"target_branch":"main","task_branch":"candidate","expected_head_sha":f.head,"expected_target_sha":f.target,"reviewed":{"commit_sha":f.head,"base_sha":f.target}}),
             };
             let IntegrationEffectAdmission::Started(mut guard) =
-                f.db.begin_integration_effect(request.clone()).await.unwrap()
+                f.db.begin_integration_effect(request.clone())
+                    .await
+                    .unwrap()
             else {
                 panic!("not admitted");
             };
@@ -1794,8 +1802,14 @@ mod tests {
                     .unwrap()
                     .expect("settled at start");
             if landed {
-                assert_eq!(receipt.operation_state, IntegrationOperationState::Succeeded);
-                assert_eq!(receipt.result["outcome"]["Done"]["after_sha"], json!(f.head));
+                assert_eq!(
+                    receipt.operation_state,
+                    IntegrationOperationState::Succeeded
+                );
+                assert_eq!(
+                    receipt.result["outcome"]["Done"]["after_sha"],
+                    json!(f.head)
+                );
             } else {
                 assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
                 assert_eq!(receipt.result["kind"], "not_performed");

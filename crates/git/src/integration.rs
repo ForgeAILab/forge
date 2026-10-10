@@ -180,9 +180,8 @@ pub async fn fast_forward_exact(
     limits: FastForwardLimits,
 ) -> Result<MergeApplyOutcome> {
     let target_ref = format!("refs/heads/{target_branch}");
-    let text = |output: &std::process::Output| {
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
+    let text =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let refused = |what: &str, output: &std::process::Output| MergeApplyOutcome::ReviewRequired {
         reason: format!("{what}: {}", String::from_utf8_lossy(&output.stderr).trim()),
     };
@@ -198,7 +197,12 @@ pub async fn fast_forward_exact(
     let tip = async {
         let output = crate::command_output(
             repo,
-            &["rev-parse", "--verify", "--quiet", &format!("{target_ref}^{{commit}}")],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{target_ref}^{{commit}}"),
+            ],
         )
         .await?;
         Ok::<_, GitError>(text(&output))
@@ -208,11 +212,19 @@ pub async fn fast_forward_exact(
     }
     let commit = crate::command_output(
         repo,
-        &["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{candidate}^{{commit}}"),
+        ],
     )
     .await?;
     if !commit.status.success() || text(&commit) != candidate {
-        return Ok(refused("the candidate is not a commit of this repository", &commit));
+        return Ok(refused(
+            "the candidate is not a commit of this repository",
+            &commit,
+        ));
     }
     let contains = crate::command_output(
         repo,
@@ -220,7 +232,10 @@ pub async fn fast_forward_exact(
     )
     .await?;
     if !contains.status.success() {
-        return Ok(refused("the candidate does not contain the target tip", &contains));
+        return Ok(refused(
+            "the candidate does not contain the target tip",
+            &contains,
+        ));
     }
     if candidate == expected_target {
         return Ok(MergeApplyOutcome::Applied);
@@ -240,7 +255,10 @@ pub async fn fast_forward_exact(
     {
         Ok(Ok(output)) if output.status.success() => None,
         // Checked before anything is written: the work tree is as it was.
-        Ok(Ok(output)) => Some(refused("the work tree could not be fast-forwarded", &output)),
+        Ok(Ok(output)) => Some(refused(
+            "the work tree could not be fast-forwarded",
+            &output,
+        )),
         Ok(Err(error)) => Some(MergeApplyOutcome::ReviewRequired {
             reason: error.to_string(),
         }),
@@ -268,7 +286,12 @@ pub async fn fast_forward_exact(
     .await?;
     let now = crate::command_output(
         repo,
-        &["rev-parse", "--verify", "--quiet", &format!("{target_ref}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{target_ref}^{{commit}}"),
+        ],
     )
     .await?;
     let now = text(&now);
@@ -1669,13 +1692,19 @@ mod transfer_tests {
             .await
             .unwrap();
         assert!(matches!(outcome, MergeApplyOutcome::Applied), "{outcome:?}");
-        assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), pair.tip);
+        assert_eq!(
+            git(&pair.target, &["rev-parse", "refs/heads/main"]),
+            pair.tip
+        );
         assert_eq!(git(&pair.target, &["rev-parse", "HEAD"]), pair.tip);
         assert_eq!(git(&pair.target, &["status", "--porcelain"]), "");
         assert!(pair.target.join("work.txt").exists());
         // One reflog entry for the move, from the witnessed tip.
         let reflog = git(&pair.target, &["reflog", "show", "--format=%H %gs", "main"]);
-        let moves: Vec<&str> = reflog.lines().filter(|line| line.contains("forge: fast-forward")).collect();
+        let moves: Vec<&str> = reflog
+            .lines()
+            .filter(|line| line.contains("forge: fast-forward"))
+            .collect();
         assert_eq!(moves.len(), 1, "{reflog}");
         // Asked again with the same witness the tip is no longer the
         // expected one: nothing is written a second time.
@@ -1684,7 +1713,13 @@ mod transfer_tests {
             .unwrap();
         assert!(matches!(again, MergeApplyOutcome::TargetMoved), "{again:?}");
         let reflog = git(&pair.target, &["reflog", "show", "--format=%H %gs", "main"]);
-        assert_eq!(reflog.lines().filter(|line| line.contains("forge: fast-forward")).count(), 1);
+        assert_eq!(
+            reflog
+                .lines()
+                .filter(|line| line.contains("forge: fast-forward"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1696,7 +1731,10 @@ mod transfer_tests {
         let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
             .await
             .unwrap();
-        assert!(matches!(outcome, MergeApplyOutcome::TargetMoved), "{outcome:?}");
+        assert!(
+            matches!(outcome, MergeApplyOutcome::TargetMoved),
+            "{outcome:?}"
+        );
         assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), moved);
         assert_eq!(snapshot(&pair.target), before);
         // The candidate does not contain the tip it is said to follow: the
@@ -1704,7 +1742,10 @@ mod transfer_tests {
         let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &moved, limits())
             .await
             .unwrap();
-        assert!(matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }),
+            "{outcome:?}"
+        );
         assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), moved);
         assert_eq!(snapshot(&pair.target), before);
         // An object this repository does not hold.
@@ -1712,7 +1753,10 @@ mod transfer_tests {
         let outcome = fast_forward_exact(&pair.target, "main", unknown, &moved, limits())
             .await
             .unwrap();
-        assert!(matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }),
+            "{outcome:?}"
+        );
         assert_eq!(snapshot(&pair.target), before);
     }
 
@@ -1727,14 +1771,24 @@ mod transfer_tests {
         let hooks = pair.target.join(".git/hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("reference-transaction");
-        std::fs::write(&hook, "#!/bin/sh\n[ \"$1\" = prepared ] && exit 1\nexit 0\n").unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\n[ \"$1\" = prepared ] && exit 1\nexit 0\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
             .await
             .unwrap();
-        assert!(matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }),
+            "{outcome:?}"
+        );
         std::fs::remove_file(&hook).unwrap();
-        assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), pair.base);
+        assert_eq!(
+            git(&pair.target, &["rev-parse", "refs/heads/main"]),
+            pair.base
+        );
         assert_eq!(git(&pair.target, &["status", "--porcelain"]), "");
         assert!(!pair.target.join("work.txt").exists());
     }
