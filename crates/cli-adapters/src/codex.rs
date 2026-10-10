@@ -1412,9 +1412,13 @@ fn codex_admitted_sandbox(
     let usable = |cache: &executors::compiler_cache::CacheEnv| {
         cache.kind().fails_open()
             && cache.dir().is_some_and(|store| {
-                store.parent().zip(store.file_name()).is_some_and(|(parent, name)| {
-                    resolve_path_for_overlap(store) == resolve_path_for_overlap(parent).join(name)
-                })
+                store
+                    .parent()
+                    .zip(store.file_name())
+                    .is_some_and(|(parent, name)| {
+                        resolve_path_for_overlap(store)
+                            == resolve_path_for_overlap(parent).join(name)
+                    })
             })
     };
     if sandbox.compiler_cache().is_some_and(|cache| !usable(cache)) {
@@ -2788,7 +2792,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_sandbox_gets_the_compiler_cache_only_when_it_cannot_break_the_run() {
-        use executors::compiler_cache::{CompilerCache, WrapperKind, CACHE_DIR};
+        use executors::compiler_cache::{CACHE_DIR, CompilerCache, WrapperKind};
         use executors::sandbox::{RunPurpose, SandboxEnv, TaskRoot};
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir creates");
@@ -2798,14 +2802,20 @@ mod tests {
         TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
         fs::write(
             worktree.join(".git"),
-            format!("gitdir: {}\n", root.join(".repos/repo-a/worktrees/t").display()),
+            format!(
+                "gitdir: {}\n",
+                root.join(".repos/repo-a/worktrees/t").display()
+            ),
         )
         .expect("worktree link writes");
         let wrapper = |name: &str| {
             let path = dir.path().join("bin").join(name);
             fs::create_dir_all(path.parent().unwrap()).expect("bin creates");
-            fs::write(&path, "#!/bin/sh\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n")
-                .expect("wrapper writes");
+            fs::write(
+                &path,
+                "#!/bin/sh\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
+            )
+            .expect("wrapper writes");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
             path
         };
@@ -2839,7 +2849,9 @@ mod tests {
         // an unknown wrapper is not known to do either.
         let managed = |name: &str| codex_admitted_sandbox(offered(name), &worktree, true, false);
         assert_eq!(
-            managed("kache").compiler_cache().and_then(|cache| cache.dir()),
+            managed("kache")
+                .compiler_cache()
+                .and_then(|cache| cache.dir()),
             Some(store.as_path())
         );
         for name in ["sccache", "cachepot"] {
@@ -2857,7 +2869,10 @@ mod tests {
         for (key, value) in admitted.compiler_cache().unwrap().variables() {
             command.env(key, value);
         }
-        assert_eq!(admitted.compiler_cache_dir_in_use(&command), Some(store.as_path()));
+        assert_eq!(
+            admitted.compiler_cache_dir_in_use(&command),
+            Some(store.as_path())
+        );
         command.env("RUSTC_WRAPPER", "/operator/sccache");
         assert_eq!(admitted.compiler_cache_dir_in_use(&command), None);
 
@@ -2867,9 +2882,11 @@ mod tests {
         let env = offered("kache");
         fs::remove_dir_all(&store).expect("store removes");
         std::os::unix::fs::symlink(&outside, &store).expect("link plants");
-        assert!(codex_admitted_sandbox(env, &worktree, true, false)
-            .compiler_cache()
-            .is_none());
+        assert!(
+            codex_admitted_sandbox(env, &worktree, true, false)
+                .compiler_cache()
+                .is_none()
+        );
     }
 
     #[test]

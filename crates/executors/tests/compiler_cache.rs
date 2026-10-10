@@ -18,8 +18,18 @@ use std::{
 
 fn git(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
-        .args(["-c", "user.name=Forge Test", "-c", "user.email=test@forge.invalid"])
-        .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+        .args([
+            "-c",
+            "user.name=Forge Test",
+            "-c",
+            "user.email=test@forge.invalid",
+        ])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -50,7 +60,13 @@ fn repository(root: &Path, repository: &str, files: &[(&str, String)]) -> PathBu
     fs::create_dir_all(repo.parent().unwrap()).unwrap();
     git(
         root,
-        &["clone", "-q", "--bare", source.to_str().unwrap(), repo.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            source.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
     );
     repo
 }
@@ -61,7 +77,14 @@ fn task_worktree(root: &Path, repo: &Path, task: &str) -> PathBuf {
     fs::create_dir_all(worktree.parent().unwrap()).unwrap();
     git(
         repo,
-        &["worktree", "add", "-q", "-b", task, worktree.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            task,
+            worktree.to_str().unwrap(),
+        ],
     );
     TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
     worktree
@@ -135,12 +158,18 @@ fn two_task_worktrees_of_one_repository_call_the_wrapper_with_one_store() {
         let scope = SandboxEnv::for_run(&worktree, task, RunPurpose::Execution).scoped();
         let mut command = Command::new("sh");
         command
-            .args(["-c", "\"$RUSTC_WRAPPER\" rustc -vV && printf '%s' \"$CARGO_TARGET_DIR\""])
+            .args([
+                "-c",
+                "\"$RUSTC_WRAPPER\" rustc -vV && printf '%s' \"$CARGO_TARGET_DIR\"",
+            ])
             .current_dir(&worktree);
         apply(&mut command, scope.env());
         let output = command.output().unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(output.status.success() && stdout.contains("rustc "), "{stdout}");
+        assert!(
+            output.status.success() && stdout.contains("rustc "),
+            "{stdout}"
+        );
         target_dirs.push(stdout.lines().last().unwrap().to_owned());
     }
     compiler_cache::install(&root, None);
@@ -160,7 +189,10 @@ fn two_task_worktrees_of_one_repository_call_the_wrapper_with_one_store() {
     let store = root.join(compiler_cache::CACHE_DIR).join("repo-1");
     let line = format!("rustc|{}|unset", store.display());
     assert_eq!(
-        fs::read_to_string(&calls).unwrap().lines().collect::<Vec<_>>(),
+        fs::read_to_string(&calls)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
         [line.as_str(), line.as_str()]
     );
 }
@@ -245,7 +277,10 @@ fn cargo_build(root: &Path, repo: &Path, task: &str, store: &Path) {
         String::from_utf8_lossy(&output.stderr)
     );
     let target = root.join(task).join(".forge-task/build/cargo");
-    assert!(target.join("debug").is_dir(), "{task} built into its own directory");
+    assert!(
+        target.join("debug").is_dir(),
+        "{task} built into its own directory"
+    );
 }
 
 /// The real thing, when sccache and cargo are installed: the second Task's
@@ -307,7 +342,10 @@ fn sccache_shares_a_dependency_between_two_task_worktrees() {
     build("task-c");
     assert_eq!(rust_hits(&sccache, &socket), hits, "nothing left to hit");
     build("task-d");
-    assert!(rust_hits(&sccache, &socket) > hits, "the entry was stored again");
+    assert!(
+        rust_hits(&sccache, &socket) > hits,
+        "the entry was stored again"
+    );
     compiler_cache::install(&root, None);
 }
 
@@ -367,6 +405,9 @@ fn kache_shares_a_build_between_two_task_worktrees() {
     cargo_build(&root, &repo, "task-a", &store);
     assert_eq!(local_hits(), 0);
     cargo_build(&root, &repo, "task-b", &store);
-    assert!(local_hits() >= 1, "the second Task hit the first Task's entries");
+    assert!(
+        local_hits() >= 1,
+        "the second Task hit the first Task's entries"
+    );
     compiler_cache::install(&root, None);
 }

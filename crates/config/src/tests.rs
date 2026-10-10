@@ -755,7 +755,10 @@ fn compiler_cache_is_off_by_default_and_obeys_file_then_env() {
         .compiler_cache;
     assert_eq!(cache.wrapper.as_deref(), Some("sccache"));
     assert_eq!(cache.max_bytes, 5000);
-    assert_eq!(cache.dir, Some(std::path::PathBuf::from("/var/forge-cache")));
+    assert_eq!(
+        cache.dir,
+        Some(std::path::PathBuf::from("/var/forge-cache"))
+    );
 
     env::set_var("FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER", "/opt/bin/kache");
     env::set_var("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES", "7000");

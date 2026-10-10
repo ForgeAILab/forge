@@ -2660,7 +2660,10 @@ async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
     executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
     std::fs::write(
         worktree.join(".git"),
-        format!("gitdir: {}\n", root.join(".repos/r/worktrees/task").display()),
+        format!(
+            "gitdir: {}\n",
+            root.join(".repos/r/worktrees/task").display()
+        ),
     )
     .unwrap();
     let wrapper = f.temp.path().join("kache");

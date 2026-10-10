@@ -470,7 +470,11 @@ async fn compiler_cache_is_trimmed_under_the_floor_and_reported() {
         .join(executors::compiler_cache::CACHE_DIR)
         .join("repo-a");
     std::fs::create_dir_all(store.join("0")).unwrap();
-    std::fs::write(store.join(executors::compiler_cache::MARKER_FILE), "sccache").unwrap();
+    std::fs::write(
+        store.join(executors::compiler_cache::MARKER_FILE),
+        "sccache",
+    )
+    .unwrap();
     let entry = store.join("0").join("entry");
     std::fs::write(&entry, vec![0_u8; 4096]).unwrap();
 
@@ -481,7 +485,9 @@ async fn compiler_cache_is_trimmed_under_the_floor_and_reported() {
     assert_eq!(report.cache_entries_evicted, 0);
     assert!(entry.exists());
     let facts = gc::disk_report(root).expect("the test filesystem is readable");
-    assert!(facts.compiler_cache_bytes.is_some_and(|bytes| bytes >= 4096));
+    assert!(facts
+        .compiler_cache_bytes
+        .is_some_and(|bytes| bytes >= 4096));
 
     let report = fixture
         .backend

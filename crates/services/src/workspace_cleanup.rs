@@ -3303,7 +3303,11 @@ mod tests {
             .join(executors::compiler_cache::CACHE_DIR)
             .join("repo-a");
         std::fs::create_dir_all(store.join("0")).unwrap();
-        std::fs::write(store.join(executors::compiler_cache::MARKER_FILE), "sccache").unwrap();
+        std::fs::write(
+            store.join(executors::compiler_cache::MARKER_FILE),
+            "sccache",
+        )
+        .unwrap();
         let entry = store.join("0").join("entry");
         std::fs::write(&entry, vec![0_u8; 4096]).unwrap();
         let scheduler = gc_scheduler(&db, &root).await;

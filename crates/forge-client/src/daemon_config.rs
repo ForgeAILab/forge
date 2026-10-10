@@ -214,7 +214,10 @@ mod budget_tests {
         // Flags win over the file; an empty wrapper flag turns it off.
         config.install_compiler_cache(&root, None, Some(9000), Some(dir.path().join("c")));
         let cache = executors::compiler_cache::installed(&root).unwrap();
-        assert_eq!((cache.max_bytes, cache.dir.clone()), (9000, dir.path().join("c")));
+        assert_eq!(
+            (cache.max_bytes, cache.dir.clone()),
+            (9000, dir.path().join("c"))
+        );
         config.install_compiler_cache(&root, Some(String::new()), None, None);
         assert!(executors::compiler_cache::installed(&root).is_none());
     }

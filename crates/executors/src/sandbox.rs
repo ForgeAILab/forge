@@ -20,6 +20,7 @@
 //! server and a daemon derive the same directories without a protocol change,
 //! and a run can be settled by a caller that never saw its [`SandboxEnv`].
 
+use crate::compiler_cache::CacheEnv;
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
@@ -28,7 +29,6 @@ use std::{
     sync::{LazyLock, Mutex},
     time::{Instant, SystemTime},
 };
-use crate::compiler_cache::CacheEnv;
 use tokio::process::Command;
 
 /// The reserved directory beside the worktree. A repository may not use this
@@ -1253,10 +1253,15 @@ mod tests {
             assert!(value(&vars, "CARGO_TARGET_DIR").is_some());
         }
         let scoped = SandboxEnv::for_command(&first, RunPurpose::Command);
-        assert_eq!(scoped.env().compiler_cache().unwrap().dir(), Some(store.as_path()));
+        assert_eq!(
+            scoped.env().compiler_cache().unwrap().dir(),
+            Some(store.as_path())
+        );
         drop(scoped);
         // A probe builds nothing; another repository has its own store.
-        assert!(SandboxEnv::for_run(&first, "p", RunPurpose::Probe).compiler_cache().is_none());
+        assert!(SandboxEnv::for_run(&first, "p", RunPurpose::Probe)
+            .compiler_cache()
+            .is_none());
         assert_eq!(
             SandboxEnv::for_run(&other, "run-5", RunPurpose::Check)
                 .compiler_cache()
@@ -1300,7 +1305,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let all = vec![WRAPPER_KEY, "KACHE_CACHE_DIR", "KACHE_MAX_SIZE"];
-        assert_eq!(cache_vars(env.variables(&BTreeMap::new(), unset, none)), all);
+        assert_eq!(
+            cache_vars(env.variables(&BTreeMap::new(), unset, none)),
+            all
+        );
 
         // The Project names its own wrapper, or turns the wrapper off with
         // an empty value: Forge sets nothing at all.
@@ -1322,26 +1330,39 @@ mod tests {
             assert_eq!(env.compiler_cache_dir_in_use(command.as_std()), None);
         }
         // A value already on the command, then the operator's environment.
-        assert!(cache_vars(env.variables(&BTreeMap::new(), |key| key == WRAPPER_KEY, none)).is_empty());
+        assert!(
+            cache_vars(env.variables(&BTreeMap::new(), |key| key == WRAPPER_KEY, none)).is_empty()
+        );
         let operator = |key: &str| (key == WRAPPER_KEY).then(|| OsString::from("/usr/bin/sccache"));
         assert!(cache_vars(env.variables(&BTreeMap::new(), unset, operator)).is_empty());
         // An empty operator value is no wrapper of the operator's.
         let empty = |key: &str| (key == WRAPPER_KEY).then(OsString::new);
-        assert_eq!(cache_vars(env.variables(&BTreeMap::new(), unset, empty)), all);
+        assert_eq!(
+            cache_vars(env.variables(&BTreeMap::new(), unset, empty)),
+            all
+        );
         // One of the wrapper's own variables set by the operator stays theirs,
         // and the store is then not the one in use.
-        let own_dir = |key: &str| (key == "KACHE_CACHE_DIR").then(|| OsString::from("/operator/cache"));
+        let own_dir =
+            |key: &str| (key == "KACHE_CACHE_DIR").then(|| OsString::from("/operator/cache"));
         assert_eq!(
             cache_vars(env.variables(&BTreeMap::new(), unset, own_dir)),
             vec![WRAPPER_KEY, "KACHE_MAX_SIZE"]
         );
 
         let mut command = Command::new("sh");
-        command.env_remove(WRAPPER_KEY).env_remove("KACHE_CACHE_DIR");
+        command
+            .env_remove(WRAPPER_KEY)
+            .env_remove("KACHE_CACHE_DIR");
         env.apply_with(&mut command, &BTreeMap::new(), none);
-        assert_eq!(env.compiler_cache_dir_in_use(command.as_std()), Some(store.as_path()));
         assert_eq!(
-            env.clone().without_compiler_cache().compiler_cache_dir_in_use(command.as_std()),
+            env.compiler_cache_dir_in_use(command.as_std()),
+            Some(store.as_path())
+        );
+        assert_eq!(
+            env.clone()
+                .without_compiler_cache()
+                .compiler_cache_dir_in_use(command.as_std()),
             None
         );
     }

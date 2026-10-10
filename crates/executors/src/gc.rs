@@ -1592,7 +1592,10 @@ mod tests {
             }))
             .prepared();
         let report = pass(false);
-        assert_eq!((report.cache_entries_evicted, report.builds_evicted), (2, 0));
+        assert_eq!(
+            (report.cache_entries_evicted, report.builds_evicted),
+            (2, 0)
+        );
         assert!(!old.exists() && !new.exists() && held.exists() && build.exists());
         live.settle();
 
@@ -1600,14 +1603,20 @@ mod tests {
         // registry names no repository for): now the idle Task's build goes.
         fs::write(root.join("short"), "").unwrap();
         let report = pass(true);
-        assert_eq!((report.cache_entries_evicted, report.builds_evicted), (0, 1));
+        assert_eq!(
+            (report.cache_entries_evicted, report.builds_evicted),
+            (0, 1)
+        );
         assert!(held.exists() && !build.exists());
         let report = pass(false);
         assert_eq!(report.cache_entries_evicted, 1);
         assert!(!held.exists());
         // The stores themselves stay: a wrapper's server may hold them.
         assert!(cache_dir.join("repo-a").join("0").is_dir());
-        assert!(cache_dir.join("repo-b").join(compiler_cache::MARKER_FILE).exists());
+        assert!(cache_dir
+            .join("repo-b")
+            .join(compiler_cache::MARKER_FILE)
+            .exists());
 
         // With a cache installed, half its configured size is kept.
         let wrapper = root.join("kache");
