@@ -5873,7 +5873,46 @@ candidate with no worktree, handle or placement of the Task
 from the ref in its own checkout. If the target moved between the rebase and
 the fast-forward, the target's owner refuses (`witness_mismatch` /
 `target_moved`) and the head starts a new round: new claim generation, new
-transfers, new rebase, new check. The worker reads a daemon-owned default
+transfers, new rebase, new check.
+
+**What exactly is fast-forwarded.** The outbound transfer sends the commit
+the permit binds (the attempt's `candidate_sha`), never the HEAD the Task's
+checkout happens to have; a head whose checkout no longer holds that commit
+loses its permit and nothing is sent. On the target's owner the ref is bound
+by the import only when the bundle carries exactly the named tip, and a key
+that is already bound to another commit is a conflict, never a move. The
+fast-forward then requires, under the checkout's lock: the key is exactly
+`<attempt>-<generation>-out` of the claim that asks; that ref names the
+request's candidate; the candidate contains the witnessed target tip; the
+work tree is clean; and the branch is still at that tip. The branch is moved
+by a compare-and-swap (`git::integration::fast_forward_exact`: the work tree
+is brought to the candidate with a two-tree `read-tree -m -u`, then
+`update-ref refs/heads/<target> <candidate> <witnessed tip>`), so a writer
+that moved the target after the read makes the swap fail; the work tree is
+then taken back and the outcome is `target_moved`. No `post-merge` hook runs
+for a transferred fast-forward. The fast-forward from a worktree of the
+default checkout is unchanged (`merge --ff-only` after the same witnesses).
+
+**The performing owner is verified, not trusted.** `witness.effect_owner` is
+written by the caller. `begin_integration_effect` admits it only when the
+attempt's own durable owner fields (`owner_kind`, `daemon_id`, `runtime_id`,
+and `repo_location_id` while that location exists; written at admission from
+the Task's placement) say the same, the effect is a rebase, and the named
+owner is not the target's owner. A rebase that names no owner is refused
+when the attempt records another owner than the target's. Both refusals are
+`foreign_owner` and leave no intent. The daemon transport sends an effect
+only to the daemon its request names, and a receipt is recorded only when it
+carries the stored request, so an answer from any other owner is ignored.
+
+**Owner restart during a fast-forward.** A daemon that restarts with a
+started queue fast-forward and no outcome settles it at the lookup, under the
+lock of the checkout the effect writes (a lookup that arrives while the
+effect is still running waits for it): the branch at exactly the candidate,
+clean, is the proof that it landed; a branch that does not contain the
+candidate is the proof that it did not (`not_performed`, settled). Only a
+branch that contains the candidate but is not at it (somebody committed on
+top before the lookup) stays unknown. The delayed frame of the operation is
+answered from that recorded outcome and runs no Git. The worker reads a daemon-owned default
 checkout the Task is not placed in through the owner's read-only
 `integration.target_facts` (tip, "candidate already landed", dirty), so a
 dirty checkout parks `target_dirty` at once from any checkout.
@@ -5881,14 +5920,33 @@ dirty checkout parks `target_dirty` at once from any checkout.
 Removal: a removed machine or location settles the intents it was
 **performing** as failed. Only queues whose **target** it owned are suspended;
 a removed Task owner is handled by the existing removed-machine Task
-settlement.
+settlement. An attempt the removal parks gives up its slot in the same
+transaction (head and lease cleared, as any park does): the queue claims its
+next member on the following sweep instead of re-claiming a parked head
+forever. A quarantined head keeps the slot, because its queue re-opens
+through it.
+
+Transfer refs are released on both ends whenever the head leaves the slot.
+The session that releases it may not be the one that made the transfer (a
+takeover, a restart): it then takes the two ends from the attempt's durable
+owner fields and the queue's target. Exits that no session drives (a cancel
+applied by the sweep, a machine removal) are covered by the start-time sweep
+of the transfer owner.
 
 After a reconnect the Task's placement stays `disconnected` until the owner
 reconciliation of the server runtime has looked at it. A head whose rebase
 receipt has arrived waits in `rebasing` (bounded by the Task-step wait, then
 an infrastructure park) until the placement is `ready` before it asks for the
-head check: the check owner refuses a placement that is not ready, and a
-verdict of "no result after retries" is kept for the commit.
+head check: the check owner refuses a placement that is not ready.
+
+A check that ends "no result after its retries" is not a verdict on the
+commit. The round that waited for it is told so and parks (a counted
+infrastructure retry). When a later round of the same commit asks again,
+`request_check` does not answer it from that stored row: the consumer is
+re-armed (fresh infrastructure budget, a new run, the same rule as the
+owner's `retry`) and the head waits for the new result. Only an exhausted
+answer whose cleanup is unproven is not run again from there; it stands, and
+the counted retries end at the owner.
 
 **Location version.** A claim freezes `repo_location.version` as the
 target's `generation`, and a daemon owner refuses a claim whose generation is

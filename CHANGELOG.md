@@ -986,6 +986,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     is, and the exact checked commit is moved to the default checkout and
     fast-forwarded there. The `cross_owner_unsupported` park is gone. A
     lost reply is settled with the machine that ran that step.
+  - The commit moved to the default checkout is the one the check passed
+    for, never whatever the Task's checkout holds at that moment, and the
+    default branch is moved by a compare-and-swap from the tip the rebase
+    was onto: a branch that moved meanwhile is left alone and the head
+    rebases again. No `post-merge` hook runs for such a fast-forward.
+  - Removing the machine that holds a queue head's Task no longer leaves
+    that head in front of the queue: the Tasks behind it merge.
+  - A machine that restarts in the middle of a queue fast-forward answers
+    "landed" or "did not land" from the branch itself; the head no longer
+    stays "result unknown" for a branch that never moved.
+  - A head check that ended without a result after its retries is asked
+    again by the next round of the same commit, instead of parking the head
+    on the same stored answer on every retry.
   - After a daemon reconnects, a queue head waits until the Task's checkout
     is ready on it again before asking for the head check, instead of
     parking on a check that could not start.

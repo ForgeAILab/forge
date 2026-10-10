@@ -1691,6 +1691,16 @@ impl DaemonWorkspaceClient {
         let db = self.db.as_ref().ok_or_else(|| {
             ServiceError::invalid_operation("integration transport has no attempt sink")
         })?;
+        // The effect is journaled by, and its receipt asked of, the owner
+        // the request names. Sending it to any other daemon would leave a
+        // receipt nobody looks for and an intent nobody can settle.
+        let owner = request.effect_owner();
+        if owner["owner_kind"] != "daemon" || owner["daemon_id"].as_str() != Some(daemon_id) {
+            return Err(ServiceError::invalid_operation(
+                "integration effect is addressed to another owner than the one it names",
+            )
+            .into());
+        }
         self.reconcile_integration_attempts_on(
             daemon_id,
             request.effect_owner()["location_id"].as_str(),

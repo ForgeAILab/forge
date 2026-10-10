@@ -4368,18 +4368,26 @@ async fn claimed_attempt(fixture: &Fixture, key: &str) -> (IntegrationOwnerFence
         .create_or_get_integration_queue(&workspace.repo_id, "main")
         .await
         .unwrap();
-    let attempt = database
-        .admit_integration_attempt(db::IntegrationAttempt::new(
-            Some(queue.id.clone()),
-            task.id,
-            task.project_id,
-            key.into(),
-            task.status,
-            epoch,
-            task.version,
-        ))
-        .await
-        .unwrap();
+    let mut attempt = db::IntegrationAttempt::new(
+        Some(queue.id.clone()),
+        task.id,
+        task.project_id,
+        key.into(),
+        task.status,
+        epoch,
+        task.version,
+    );
+    // What admission records about the owner of the Task's checkout. An
+    // effect performed off the target's owner is admitted only against it.
+    attempt.repo_location_id = Some(placement.repo_location_id.clone());
+    attempt.owner_kind = Some(if placement.daemon_id.is_some() {
+        db::IntegrationOwnerKind::Daemon
+    } else {
+        db::IntegrationOwnerKind::Server
+    });
+    attempt.daemon_id = placement.daemon_id.clone();
+    attempt.runtime_id = placement.runtime_id.clone();
+    let attempt = database.admit_integration_attempt(attempt).await.unwrap();
     let queue = database
         .integration_queue(&queue.id)
         .await
@@ -6227,6 +6235,124 @@ async fn queue_worker_merges_across_two_daemons() {
     // The check ran where the Task is.
     assert!(!tasks.requests(METHOD_CHECK_RUN).is_empty());
     assert!(target.requests(METHOD_CHECK_RUN).is_empty());
+    let _ = (&second.runtime, &second.token);
+}
+
+/// Two daemons, red head check: the Task's daemon rebases and runs the
+/// check, which fails. The Task is sent back; the other daemon's default
+/// checkout is never asked to fast-forward and holds no transfer ref.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_daemons_red_head_check_sends_the_task_back_without_a_merge() {
+    use db::IntegrationOperationKind as Kind;
+    let fixture = Fixture::file_backed("forge-queue-two-daemons-red").await;
+    let second = extra_daemon(&fixture, "forge-queue-two-daemons-red").await;
+    let (resolved, task_clone, candidate) = daemon_clone_task(
+        &fixture,
+        &second.daemon_id,
+        &second.runtime_id,
+        second.root.path(),
+    )
+    .await;
+    let head = admit_placed_head(
+        &fixture,
+        &resolved.placement,
+        candidate,
+        &["test -f outside.txt", "exit 3"],
+    )
+    .await;
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+    start_check_worker!(fixture, stop_checks);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the head to be sent back", {
+        queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Ejected
+            && task_status(&fixture, &head.task_id).await != "merging"
+    });
+    queue_eventually!(&fixture, &head, "the transfer refs to be released", {
+        integration_refs(&fixture.checkout).is_empty() && integration_refs(&task_clone).is_empty()
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert_eq!(
+        attempt.failure_kind,
+        Some(db::IntegrationFailureKind::CandidateCheckFailed)
+    );
+    assert_ne!(task_status(&fixture, &head.task_id).await, "done");
+    assert_eq!(
+        succeeded(&attempt, Kind::Rebase),
+        vec![Some(second.daemon_id.clone())]
+    );
+    assert!(receipt_owners(&attempt, Kind::FastForward).is_empty());
+    let target = fixture.link.as_ref().unwrap();
+    let tasks = second.link.as_ref().unwrap();
+    assert!(attempt_requests(target, METHOD_WORKSPACE_MERGE).is_empty());
+    assert!(attempt_requests(target, METHOD_WORKSPACE_RESET).is_empty());
+    assert!(!tasks.requests(METHOD_CHECK_RUN).is_empty());
+    assert!(target.requests(METHOD_CHECK_RUN).is_empty());
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        moved_tip
+    );
+    assert!(
+        git_sync(&fixture.checkout, &["status", "--porcelain"]).is_empty(),
+        "the default checkout is untouched"
+    );
+    let _ = (&second.runtime, &second.token);
+}
+
+/// Two daemons, conflict on the rebase: the Task's daemon rebases onto the
+/// tip the other daemon's default checkout sent, commits the conflict for
+/// hand-off, and the Task goes back to its coder with the conflicted path.
+/// The default checkout's daemon performs no effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_daemons_rebase_conflict_sends_the_task_back_with_the_conflict_handoff() {
+    use db::IntegrationOperationKind as Kind;
+    let fixture = Fixture::file_backed("forge-queue-two-daemons-conflict").await;
+    let second = extra_daemon(&fixture, "forge-queue-two-daemons-conflict").await;
+    let (resolved, _task_clone, candidate) = daemon_clone_task(
+        &fixture,
+        &second.daemon_id,
+        &second.runtime_id,
+        second.root.path(),
+    )
+    .await;
+    let head = admit_placed_head(&fixture, &resolved.placement, candidate, &[]).await;
+    // The same file the candidate adds, with other content.
+    std::fs::write(fixture.checkout.join("feature.txt"), "theirs\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the conflict to be handed off", {
+        queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Ejected
+            && task_status(&fixture, &head.task_id).await == "merge_failed"
+    });
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert_eq!(attempt.conflict_paths_json, Some(json!(["feature.txt"])));
+    assert_eq!(
+        succeeded(&attempt, Kind::Rebase),
+        vec![Some(second.daemon_id.clone())]
+    );
+    assert!(receipt_owners(&attempt, Kind::FastForward).is_empty());
+    let target = fixture.link.as_ref().unwrap();
+    assert!(attempt_requests(target, METHOD_WORKSPACE_MERGE).is_empty());
+    assert!(attempt_requests(target, METHOD_WORKSPACE_RESET).is_empty());
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        moved_tip
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.checkout.join("feature.txt")).unwrap(),
+        "theirs\n"
+    );
     let _ = (&second.runtime, &second.token);
 }
 

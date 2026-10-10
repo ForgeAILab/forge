@@ -1601,6 +1601,171 @@ mod tests {
         assert!(validate_attempt_receipt(&receipt).is_err());
     }
 
+    /// The default checkout is on this server and the Task's checkout on
+    /// another machine: the candidate reaches the server only as the ref
+    /// this claim generation's outbound transfer binds. The fast-forward
+    /// takes exactly that commit, from exactly the witnessed tip, once.
+    #[tokio::test]
+    async fn a_server_owned_target_fast_forwards_only_the_commit_its_transfer_ref_binds() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Case {
+            Green,
+            WrongCommit,
+            MissingRef,
+            OlderGeneration,
+            OtherAttempt,
+            MovedTarget,
+            DirtyTarget,
+        }
+        for case in [
+            Case::Green,
+            Case::WrongCommit,
+            Case::MissingRef,
+            Case::OlderGeneration,
+            Case::OtherAttempt,
+            Case::MovedTarget,
+            Case::DirtyTarget,
+        ] {
+            let f = fixture().await;
+            let away = EffectWorkspace {
+                owner: EffectOwner::Daemon {
+                    daemon_id: "d".into(),
+                    runtime_id: "rt".into(),
+                },
+                ..f.workspace.clone()
+            };
+            let key = |attempt: &str, generation: i64| {
+                api_types::object_transfer_key(
+                    attempt,
+                    generation,
+                    api_types::ObjectTransferDirection::Outbound,
+                )
+            };
+            let own = key(&f.fence.attempt_id, f.fence.generation);
+            // Another commit than the permitted candidate, also held here.
+            std::fs::write(f.tree.join("unreviewed"), "unreviewed\n").unwrap();
+            let unreviewed = git::commit_all(&f.tree, "unreviewed").await.unwrap();
+            let bind = |key: String, sha: String| {
+                let repo = f.repo.clone();
+                async move {
+                    git_at(
+                        &repo,
+                        &["update-ref", &format!("refs/forge/integration/{key}"), &sha],
+                    )
+                    .await;
+                }
+            };
+            match case {
+                Case::WrongCommit => bind(own.clone(), unreviewed.clone()).await,
+                Case::MissingRef => {}
+                Case::OlderGeneration => {
+                    bind(key(&f.fence.attempt_id, f.fence.generation - 1), f.head.clone()).await
+                }
+                Case::OtherAttempt => bind(key("another-attempt", f.fence.generation), f.head.clone()).await,
+                _ => bind(own.clone(), f.head.clone()).await,
+            }
+            let mut tip = f.target.clone();
+            if case == Case::MovedTarget {
+                std::fs::write(f.repo.join("outside"), "outside\n").unwrap();
+                tip = git::commit_all(&f.repo, "outside").await.unwrap();
+            }
+            if case == Case::DirtyTarget {
+                std::fs::write(f.repo.join("base"), "edited by hand\n").unwrap();
+            }
+            let request = || ServerMergeRequest {
+                workspace: &away,
+                ..merge_request(&f)
+            };
+            let before = untouched(&f.repo).await;
+            let receipt = f.owner.merge(request()).await.unwrap();
+            match case {
+                Case::Green => {
+                    assert!(
+                        matches!(&receipt, OwnerMergeReceipt::Completed { outcome: crate::MergeOutcome::Done { after_sha, .. } } if *after_sha == f.head),
+                        "{case:?}: {receipt:?}"
+                    );
+                    assert_eq!(git::get_current_sha(&f.repo).await.unwrap(), f.head);
+                    assert!(git::is_worktree_clean(&f.repo).await.unwrap());
+                    // A lost reply: the same request is answered by its
+                    // receipt and the branch is not written again.
+                    let reflog = git_at(&f.repo, &["reflog", "--all"]).await;
+                    let again = ServerIntegrationOwner::new(f.db.clone())
+                        .merge(request())
+                        .await
+                        .unwrap();
+                    assert_eq!(json!(again), json!(receipt));
+                    assert_eq!(git_at(&f.repo, &["reflog", "--all"]).await, reflog);
+                    let moves = git_at(&f.repo, &["reflog", "show", "--format=%gs", "main"]).await;
+                    assert_eq!(
+                        moves
+                            .lines()
+                            .filter(|line| line.contains("forge: fast-forward"))
+                            .count(),
+                        1,
+                        "{moves}"
+                    );
+                }
+                Case::DirtyTarget => {
+                    assert!(
+                        matches!(
+                            &receipt,
+                            OwnerMergeReceipt::Completed {
+                                outcome: crate::MergeOutcome::TargetDirty { .. }
+                            }
+                        ),
+                        "{case:?}: {receipt:?}"
+                    );
+                    assert_eq!(untouched(&f.repo).await, before);
+                }
+                _ => {
+                    assert!(
+                        matches!(
+                            &receipt,
+                            OwnerMergeReceipt::Refused {
+                                reason: OwnerEffectRefusal::WitnessMismatch
+                            }
+                        ),
+                        "{case:?}: {receipt:?}"
+                    );
+                    assert_eq!(untouched(&f.repo).await, before);
+                    assert_eq!(
+                        git_at(&f.repo, &["rev-parse", "refs/heads/main"]).await,
+                        tip
+                    );
+                }
+            }
+        }
+    }
+    /// A Task's checkout that is not on this server can never be merged
+    /// here without a reviewed candidate (there is no worktree to merge).
+    #[tokio::test]
+    async fn a_checkout_on_another_machine_is_not_merged_without_a_reviewed_candidate() {
+        let f = fixture().await;
+        let away = EffectWorkspace {
+            owner: EffectOwner::Daemon {
+                daemon_id: "d".into(),
+                runtime_id: "rt".into(),
+            },
+            ..f.workspace.clone()
+        };
+        let before = untouched(&f.repo).await;
+        let receipt = f
+            .owner
+            .merge(ServerMergeRequest {
+                workspace: &away,
+                reviewed: None,
+                ..merge_request(&f)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receipt,
+            OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner
+            }
+        ));
+        assert_eq!(untouched(&f.repo).await, before);
+    }
     #[tokio::test]
     async fn lost_merge_reply_replays_one_receipt_without_git_changes() {
         let f = fixture().await;
