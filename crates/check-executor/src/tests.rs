@@ -868,3 +868,76 @@ async fn check_in_a_task_worktree_gets_a_task_root_tmpdir_removed_after_pass_fai
         .get_envs()
         .any(|(key, _)| key == "TMPDIR" || key == "CARGO_TARGET_DIR"));
 }
+
+/// What a run printed for `$RUSTC_WRAPPER|$KACHE_CACHE_DIR` when Forge
+/// offered `wrapper` and `store`. The operator's own environment wins
+/// over Forge's, so on a machine whose environment names a wrapper (or a
+/// kache directory) this asserts that rule instead.
+#[cfg(unix)]
+fn assert_saw_compiler_cache(seen: &str, wrapper: &std::path::Path, store: &std::path::Path) {
+    let operator = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+    let (wrapper, store) = (wrapper.to_str().unwrap(), store.to_str().unwrap());
+    if operator("RUSTC_WRAPPER") {
+        assert!(!seen.starts_with(wrapper), "{seen}");
+    } else if operator("KACHE_CACHE_DIR") {
+        assert!(seen.starts_with(&format!("{wrapper}|")), "{seen}");
+    } else {
+        assert_eq!(seen, format!("{wrapper}|{store}"));
+    }
+}
+
+/// Plan 3.4 F: a check in a Task worktree is handed the machine's shared
+/// compiler cache, with the store of the worktree's repository.
+#[cfg(unix)]
+#[tokio::test]
+async fn check_in_a_task_worktree_gets_the_shared_compiler_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("ws");
+    let worktree = root.join("t").join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+    // A linked worktree of the repository `r1`, as the server lays it out.
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", root.join(".repos/r1/worktrees/t").display()),
+    )
+    .unwrap();
+    let wrapper = temp.path().join("kache");
+    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    executors::compiler_cache::install(
+        &root,
+        Some(executors::compiler_cache::CompilerCache {
+            kind: executors::compiler_cache::WrapperKind::of(&wrapper),
+            wrapper: wrapper.clone(),
+            dir: root.join(executors::compiler_cache::CACHE_DIR),
+            max_bytes: 1 << 30,
+        }),
+    );
+    let store = root.join(executors::compiler_cache::CACHE_DIR).join("r1");
+    let seen_file = temp.path().join("seen");
+    let script = format!(
+        "printf '%s|%s' \"$RUSTC_WRAPPER\" \"$KACHE_CACHE_DIR\" > '{}'",
+        seen_file.display()
+    );
+    let bundle = spec(&script);
+    let receipt = run_command(
+        &worktree,
+        &bundle.commands[0],
+        &BTreeMap::new(),
+        &bundle.execution_policy,
+        Some(Instant::now() + Duration::from_secs(10)),
+        &CancellationToken::new(),
+        512,
+    )
+    .await
+    .unwrap();
+    executors::compiler_cache::install(&root, None);
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_saw_compiler_cache(
+        &std::fs::read_to_string(&seen_file).unwrap(),
+        &wrapper,
+        &store,
+    );
+}

@@ -1860,3 +1860,63 @@ async fn task_step_merge_survives_a_location_version_bump_and_an_orphaned_effect
         .unwrap_err();
     assert_eq!(error.details.unwrap()["refusal"], "foreign_owner");
 }
+
+/// Plan 3.4 F: `workspace.run` in a daemon workspace is handed this
+/// machine's shared compiler cache, with the store of the worktree's
+/// repository. The operator's own environment wins over Forge's, so on a
+/// machine whose environment names a wrapper this asserts that rule instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_run_gets_this_machines_shared_compiler_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new().await;
+    let root = fixture.dir.path();
+    let worktree = root
+        .join(WORKTREE_DIRECTORY)
+        .join(&fixture.prepared.workspace.workspace_handle)
+        .join("repo");
+    let repository =
+        executors::compiler_cache::repository_id(&worktree).expect("a linked worktree");
+    let wrapper = root.join("kache");
+    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cache_dir = root.join(executors::compiler_cache::CACHE_DIR);
+    executors::compiler_cache::install(
+        root,
+        Some(executors::compiler_cache::CompilerCache {
+            kind: executors::compiler_cache::WrapperKind::of(&wrapper),
+            wrapper: wrapper.clone(),
+            dir: cache_dir.clone(),
+            max_bytes: 1 << 30,
+        }),
+    );
+    let params = fixture.run(
+        "cache-run",
+        WorkspaceRunPurpose::CiStep,
+        "printf '%s|%s' \"$RUSTC_WRAPPER\" \"$KACHE_CACHE_DIR\"",
+    );
+    let result = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_RUN,
+            serde_json::to_value(params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    executors::compiler_cache::install(root, None);
+    let output: WorkspaceRunResult = decode(result).unwrap();
+    assert_eq!(output.exit_code, Some(0));
+    let operator = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+    let (seen, wrapper) = (output.stdout.as_str(), wrapper.to_str().unwrap());
+    if operator("RUSTC_WRAPPER") {
+        assert!(!seen.starts_with(wrapper), "{seen}");
+    } else if operator("KACHE_CACHE_DIR") {
+        assert!(seen.starts_with(&format!("{wrapper}|")), "{seen}");
+    } else {
+        assert_eq!(
+            seen,
+            format!("{wrapper}|{}", cache_dir.join(repository).display())
+        );
+    }
+}

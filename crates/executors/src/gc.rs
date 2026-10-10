@@ -620,8 +620,9 @@ impl Sweep {
     /// output is evicted: a cache entry costs one recompile of one crate,
     /// a Task's build output costs that Task a cold build.
     ///
-    /// The cache directory may be anywhere the operator put it; only entry
-    /// files of stores Forge marked are deleted
+    /// The cache directory may be anywhere the operator put it on the
+    /// root's filesystem (a cache on another disk is left to its wrapper's
+    /// own size cap); only entry files of stores Forge marked are deleted
     /// ([`compiler_cache::evict`]). Also records the cache's size for the
     /// machine's disk facts.
     ///
@@ -636,7 +637,9 @@ impl Sweep {
         report: &mut GcReport,
     ) {
         let (dir, keep_bytes) = compiler_cache::store_of(&self.root);
-        if self.under_floor(floor) {
+        // A cache the operator put on another filesystem cannot give this
+        // one anything back.
+        if self.under_floor(floor) && compiler_cache::shares_filesystem(&dir, &self.root) {
             let done =
                 compiler_cache::evict(&dir, keep_bytes, live_elsewhere, self.deadline, || {
                     !self.under_floor(floor)

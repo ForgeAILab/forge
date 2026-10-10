@@ -47,6 +47,7 @@ const SCCACHE_LAUNCHER: &str = "rustc-wrapper";
 /// Longest socket path handed to sccache: a Unix socket path is limited to
 /// 104 bytes on macOS (108 on Linux).
 const MAX_SOCKET_BYTES: usize = 100;
+#[cfg_attr(not(unix), allow(dead_code))]
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// Files one eviction may look at before it stops collecting.
 const EVICTION_ENTRY_LIMIT: usize = 500_000;
@@ -367,6 +368,24 @@ pub fn store_of(workspace_root: &Path) -> (PathBuf, u64) {
         || (workspace_root.join(CACHE_DIR), 0),
         |cache| (cache.dir.clone(), cache.max_bytes / 2),
     )
+}
+
+/// Whether `cache_dir` is on the filesystem that holds `workspace_root`.
+/// Evicting a cache on another disk frees nothing on the one that is short;
+/// such a cache is bounded by its wrapper's own size cap only.
+pub fn shares_filesystem(cache_dir: &Path, workspace_root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!(
+            (fs::metadata(cache_dir), fs::metadata(workspace_root)),
+            (Ok(cache), Ok(root)) if cache.dev() == root.dev()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        cache_dir.starts_with(workspace_root)
+    }
 }
 
 /// Record what the collector of `workspace_root` measured.

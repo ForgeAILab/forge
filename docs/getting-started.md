@@ -505,7 +505,9 @@ for the build directory: a `RUSTC_WRAPPER` in the Project environment wins
 (set it to an empty value to turn the wrapper off for one Project), then a
 value already on the command, then `RUSTC_WRAPPER` in the environment Forge
 itself was started with, then this setting. When any of those names a
-wrapper, Forge sets none of the variables above.
+wrapper, Forge sets none of the variables above. Hooks, checks and
+`workspace.run` commands run in a login shell, so a `RUSTC_WRAPPER` exported
+by the operator's shell profile also replaces Forge's there.
 
 Things to know:
 
@@ -542,7 +544,10 @@ Things to know:
   of `max_bytes`, and only then takes any Task's build output. It deletes
   entry files only, never a store directory. For a `kache` store it does so
   only while no run of that repository is live. A cache left behind after
-  you remove the setting is trimmed to nothing under the same pressure.
+  you remove the setting is trimmed to nothing under the same pressure. A
+  `dir` on another filesystem than the workspace root is never trimmed by
+  Forge (it would free nothing where space is short); the wrapper's own cap
+  bounds it.
   Free space admission counts the cache like any other used disk.
 - Check results are not affected: the wrapper is added per run and is not
   part of the environment a check's identity is computed from.
