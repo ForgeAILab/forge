@@ -144,6 +144,7 @@ impl HeadCheckSource for ReviewCiHeadCheck {
                 role: crate::workflow::default_roles::REVIEWER,
                 owner_is_daemon,
                 workspace: None,
+                canonical_policy: false,
                 queue_head_bundle: Some(::review::check_spec::QueueHeadCheckBundle::CiOnly),
             },
         )
