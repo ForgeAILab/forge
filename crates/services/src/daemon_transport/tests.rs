@@ -1306,7 +1306,11 @@ async fn revision_six_daemon_is_refused_with_the_upgrade_message() {
         panic!("a revision 6 daemon was accepted");
     };
     assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
-    assert!(error.message.contains("upgrade the daemon"), "{}", error.message);
+    assert!(
+        error.message.contains("upgrade the daemon"),
+        "{}",
+        error.message
+    );
     assert!(
         error.message.contains(&format!(
             "revision {}",

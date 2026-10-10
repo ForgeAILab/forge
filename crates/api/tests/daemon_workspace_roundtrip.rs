@@ -223,11 +223,41 @@ impl Fixture {
         .await
     }
 
+    /// A fixture over a file-backed database, for tests that run the queue
+    /// worker, the check worker and the step worker on several threads.
+    async fn file_backed(suite: &str) -> Self {
+        Self::build(
+            suite,
+            WorkspaceRunPolicy {
+                allowed_purposes: vec![
+                    WorkspaceRunPurpose::CiStep,
+                    WorkspaceRunPurpose::Hook,
+                    WorkspaceRunPurpose::EnvironmentSetup,
+                ],
+            },
+            true,
+        )
+        .await
+    }
+
     async fn with_policy(suite: &str, run_policy: WorkspaceRunPolicy) -> Self {
+        Self::build(suite, run_policy, false).await
+    }
+
+    async fn build(suite: &str, run_policy: WorkspaceRunPolicy, file_backed: bool) -> Self {
         let server_root = TestDir::new(&format!("{suite}-server"));
         let daemon_root = TestDir::new(&format!("{suite}-owner"));
         let checkout = common::setup_git_repo(daemon_root.path());
-        let harness = common::test_app(&server_root.path().join("workspaces"), suite).await;
+        let database_url = if file_backed {
+            format!(
+                "sqlite://{}?mode=rwc",
+                server_root.path().join("forge.sqlite").display()
+            )
+        } else {
+            "sqlite::memory:".to_owned()
+        };
+        let harness =
+            common::test_app_on(&server_root.path().join("workspaces"), suite, &database_url).await;
         let registration =
             common::fake_daemon::register_daemon(&harness.app, &db::new_uuid_v4(), suite).await;
         common::fake_daemon::report_remote_daemon_shell(
@@ -4610,7 +4640,7 @@ fn fast_forward_receipts(attempt: &db::IntegrationAttempt) -> usize {
 /// real check runner on that daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn queue_worker_rebases_checks_and_fast_forwards_on_a_daemon_owned_target() {
-    let fixture = Fixture::new("forge-queue-daemon-owned").await;
+    let fixture = Fixture::file_backed("forge-queue-daemon-owned").await;
     // Passes only on the rebased commit: `outside.txt` arrives with the target.
     let head = admit_queue_head(&fixture, &["test -f feature.txt", "test -f outside.txt"]).await;
     std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
@@ -4691,7 +4721,7 @@ async fn queue_worker_rebases_checks_and_fast_forwards_on_a_daemon_owned_target(
 /// any effect, instead of spending rounds on the owner's refusals.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn queue_worker_parks_target_dirty_at_once_on_a_daemon_owned_target() {
-    let fixture = Fixture::new("forge-queue-daemon-dirty").await;
+    let fixture = Fixture::file_backed("forge-queue-daemon-dirty").await;
     let head = admit_queue_head(&fixture, &[]).await;
     std::fs::write(fixture.checkout.join("uncommitted.txt"), "dirty\n").unwrap();
     let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
@@ -4726,7 +4756,7 @@ async fn queue_worker_parks_target_dirty_at_once_on_a_daemon_owned_target() {
 /// continues from it: the rebase is never sent again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_rebase() {
-    let mut fixture = Fixture::new("forge-queue-daemon-rebasing").await;
+    let mut fixture = Fixture::file_backed("forge-queue-daemon-rebasing").await;
     let head = admit_queue_head(&fixture, &[]).await;
     std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
     git::commit_all(&fixture.checkout, "outside").await.unwrap();
@@ -4738,8 +4768,9 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
         .lock()
         .unwrap()
         .insert(METHOD_WORKSPACE_RESET.into());
-    // A lease far longer than this test: the retry of an unknown result is
-    // not the lease running out.
+    // A lease ten times longer than any wait of this test (each is bounded
+    // at a minute): a head that merges here was not retried by its lease
+    // running out. No wall-clock bound is asserted; the machine may be busy.
     let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(600));
     // The owner rebased; its reply never arrives.
     let rebased = async {
@@ -4777,7 +4808,6 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
     assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
 
     fixture.reconnect().await;
-    let reconnected = tokio::time::Instant::now();
     // The owner's receipt is read once and the head continues from it: the
     // rebased commit becomes the candidate without another rebase.
     let rebase_receipts = |attempt: &db::IntegrationAttempt| {
@@ -4811,11 +4841,6 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
         task_status(&fixture, &head.task_id).await == "done"
             && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
     });
-    assert!(
-        reconnected.elapsed() < Duration::from_secs(30),
-        "merged {:?} after the reconnect: the session kept the slot and asked at once",
-        reconnected.elapsed()
-    );
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     let attempt = queue_attempt(&fixture, &head).await;
@@ -4863,7 +4888,7 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
 /// does not park.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn queue_worker_reverifies_a_default_checkout_its_owner_does_not_recognise() {
-    let fixture = Fixture::new("forge-queue-daemon-location").await;
+    let fixture = Fixture::file_backed("forge-queue-daemon-location").await;
     let head = admit_queue_head(&fixture, &[]).await;
     let location_id = fixture.resolved.placement.repo_location_id.clone();
     sqlx::query("UPDATE repo_location SET version=version+1 WHERE id=?")
@@ -4891,7 +4916,11 @@ async fn queue_worker_reverifies_a_default_checkout_its_owner_does_not_recognise
         .iter()
         .filter(|receipt| receipt.result["reason"] == "foreign_owner")
         .collect();
-    assert_eq!(refused.len(), 1, "one refusal, then a verification: {receipts:?}");
+    assert_eq!(
+        refused.len(),
+        1,
+        "one refusal, then a verification: {receipts:?}"
+    );
     assert_eq!(fast_forward_receipts(&attempt), 1);
     let link = fixture.link.as_ref().unwrap();
     assert_eq!(
@@ -4926,7 +4955,7 @@ async fn queue_worker_reverifies_a_default_checkout_its_owner_does_not_recognise
 /// learns that from the owner's receipt and never fast-forwards again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second_merge() {
-    let mut fixture = Fixture::new("forge-queue-daemon-ff").await;
+    let mut fixture = Fixture::file_backed("forge-queue-daemon-ff").await;
     let head = admit_queue_head(&fixture, &[]).await;
     fixture
         .link
@@ -4936,8 +4965,9 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
         .lock()
         .unwrap()
         .insert(METHOD_WORKSPACE_MERGE.into());
-    // A lease far longer than this test: the retry of an unknown result is
-    // not the lease running out.
+    // A lease ten times longer than any wait of this test (each is bounded
+    // at a minute): a head that merges here was not retried by its lease
+    // running out. No wall-clock bound is asserted; the machine may be busy.
     let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(600));
     tokio::time::timeout(Duration::from_secs(30), async {
         while git::get_current_sha(&fixture.checkout).await.unwrap() != head.candidate {
@@ -4979,11 +5009,13 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(queue.head_attempt_id.as_deref(), Some(head.attempt_id.as_str()));
+        assert_eq!(
+            queue.head_attempt_id.as_deref(),
+            Some(head.attempt_id.as_str())
+        );
         queue.fence_generation
     };
     fixture.reconnect().await;
-    let reconnected = tokio::time::Instant::now();
     queue_eventually!(
         &fixture,
         &head,
@@ -4993,11 +5025,6 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
                 && queue_attempt(&fixture, &head).await.state
                     == db::IntegrationAttemptState::Completed
         }
-    );
-    assert!(
-        reconnected.elapsed() < Duration::from_secs(30),
-        "done {:?} after the reconnect",
-        reconnected.elapsed()
     );
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;

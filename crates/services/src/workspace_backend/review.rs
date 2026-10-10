@@ -166,8 +166,8 @@ impl ResolvedWorkspace {
             if query == WorkspaceGitQuery::TargetStatusPorcelain {
                 // The main worktree of the Task's worktree is the checkout
                 // its repo location names.
-                let listed = git::command_output(&path, &["worktree", "list", "--porcelain"])
-                    .await?;
+                let listed =
+                    git::command_output(&path, &["worktree", "list", "--porcelain"]).await?;
                 let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
                 let main = listed
                     .lines()

@@ -753,10 +753,9 @@ impl HeadDriver {
                 ],
                 facts.target_tip.clone(),
             ),
-            ObjectTransferDirection::Outbound => (
-                vec![facts.target_tip.clone()],
-                facts.candidate_head.clone(),
-            ),
+            ObjectTransferDirection::Outbound => {
+                (vec![facts.target_tip.clone()], facts.candidate_head.clone())
+            }
         };
         let mut seen = HashSet::new();
         let have: Vec<String> = have
@@ -1649,10 +1648,10 @@ impl HeadDriver {
             self.w.defer_reconcile(&self.queue_id);
             let now = self.w.clock.now();
             self.reconcile_at = Some(later(now, self.w.config.reconcile_interval));
-            self.owner_link = self
-                .w
-                .owner
-                .owner_connection(&a.effect_intent_json.as_ref().expect("checked")["request"]["fence"]["target_owner"]);
+            self.owner_link = self.w.owner.owner_connection(
+                &a.effect_intent_json.as_ref().expect("checked")["request"]["fence"]
+                    ["target_owner"],
+            );
             return Ok(Pass::Wait(
                 self.w.config.poll.min(self.w.config.reconcile_interval),
             ));

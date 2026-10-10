@@ -1703,7 +1703,9 @@ async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queu
         .unwrap();
     let first = world.add_task_in_clone("one", "one.txt", "one\n").await;
     let green = world.add_task_in_clone("two", "two.txt", "two\n").await;
-    let red = world.add_task_in_clone("three", "three.txt", "three\n").await;
+    let red = world
+        .add_task_in_clone("three", "three.txt", "three\n")
+        .await;
     review_ci(&world, "one", &["test -f one.txt"]).await;
     review_ci(&world, "two", &["test -f one.txt", "test -f two.txt"]).await;
     review_ci(&world, "three", &["test -f two.txt", "exit 3"]).await;
@@ -1748,10 +1750,7 @@ async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queu
         );
     }
     // The exact commit the Task's clone holds is what landed.
-    assert_eq!(
-        git::get_current_sha(&world.tree("two")).await.unwrap(),
-        tip
-    );
+    assert_eq!(git::get_current_sha(&world.tree("two")).await.unwrap(), tip);
     // The clone's own target branch was never written.
     assert_eq!(
         git_out(&world.clone_path(), &["rev-parse", "refs/heads/main"])

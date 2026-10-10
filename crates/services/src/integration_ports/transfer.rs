@@ -402,8 +402,8 @@ impl ObjectTransferPort for OwnerObjectTransfer {
         // daemon end (the server stopped between the transfer and the
         // release). One release per such attempt and daemon end, by the
         // existing wire; it is idempotent and deletes nothing else.
-        let since = (chrono::Utc::now() - chrono::Duration::days(OWED_RELEASE_WINDOW_DAYS))
-            .to_rfc3339();
+        let since =
+            (chrono::Utc::now() - chrono::Duration::days(OWED_RELEASE_WINDOW_DAYS)).to_rfc3339();
         let owed: Vec<(String, String, String, String)> = sqlx::query_as(
             "SELECT a.id,l.id,l.daemon_id,l.runtime_id FROM integration_attempt a \
              JOIN integration_queue q ON q.id=a.queue_id \
