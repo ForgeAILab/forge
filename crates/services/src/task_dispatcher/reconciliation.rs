@@ -862,7 +862,11 @@ impl TaskDispatcher {
         // Level-triggered disk wait: see `DISK_WAIT_RECHECK`. Also for a
         // Task that says it waits for a run slot while another machine is
         // short of disk: that machine recovering is its exit too.
-        let disk_recheck = if machine_wait && self.waits_on_disk(&p.read.task).await {
+        // A settled Task never dispatches: a wait it was left with is not
+        // worth a timer.
+        let dispatchable = p.workflow.state_kind(&p.read.task.status) != Some(StateKind::Terminal);
+        let disk_recheck = if machine_wait && dispatchable && self.waits_on_disk(&p.read.task).await
+        {
             Some((chrono::Utc::now() + DISK_WAIT_RECHECK).to_rfc3339())
         } else {
             None
