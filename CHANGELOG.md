@@ -44,6 +44,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `removed_refs`. A revision-6 daemon is refused with
   `daemon_upgrade_required`. Upgrade the server first, then each daemon.
   Nothing calls the new form yet: the merge queue is still not started.
+  Also in revision 7: `repo_location.verify` now carries in
+  `expected_version` the version the server stores the verification as (the
+  present version plus one), and `workspace.read` has a new Git query,
+  `target_status_porcelain` (the status of the checkout the workspace's repo
+  location names).
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -856,6 +861,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     retried or re-opened queue member shows "waiting" again, a failed queue
     step is asked again, and a merge that landed but could not be recorded
     is retried every 30 s instead of every 10 min.
+  - A daemon no longer refuses every merge-queue claim after it reconnects.
+    The daemon kept a location version one behind the server's after each
+    stored verification; it now keeps the stored one. When an owner still
+    does not recognise a claim's default checkout (the server changed the
+    location since), the queue asks for a verification and goes on instead
+    of only parking.
+  - A Task whose checkout is another clone than the default checkout, on
+    the same owner, now merges through the queue into the default checkout.
+    A Task on another machine than the default checkout still parks
+    (`cross_owner_unsupported`).
+  - A queue head whose result is unknown keeps its place and is asked about
+    every 60 s, and at once when its machine is back, instead of when a 60 s
+    lease ran out.
+  - A dirty default checkout on a daemon parks the head `target_dirty` at
+    once. Queue steps that tell a Task it was sent back, parked or cleared
+    are asked again when they fail (three times, then the queue's
+    `last_error` says so). Refs an interrupted transfer left on a daemon
+    are released at the next start.
 
 - **Check results can now be reused, for the canonical CI policy (plan 3.3
   stage D part 2, scope 1). Nothing runs under it yet.** A new execution

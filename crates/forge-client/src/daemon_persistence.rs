@@ -1570,6 +1570,127 @@ mod tests {
         assert_eq!(entries, 1);
     }
 
+    /// A server that never acknowledges. The journal's bound is what it has
+    /// not been acknowledged for: `max_entries` records (1024 in production)
+    /// and `max_bytes` (32 MiB). At the bound a new record is refused, so the
+    /// owner admits no further effect; nothing is evicted to make room, the
+    /// directory does not grow, and the owner's pruning rules (fence moved
+    /// on, age, number) cannot touch a receipt the server has not stored,
+    /// whatever they say.
+    #[test]
+    fn a_server_that_never_acknowledges_neither_grows_the_journal_nor_loses_a_receipt() {
+        fn usage(root: &Path) -> (usize, u64) {
+            let mut total = (0, 0);
+            let mut dirs = vec![root.to_owned()];
+            while let Some(dir) = dirs.pop() {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let metadata = entry.metadata().unwrap();
+                    if metadata.is_dir() {
+                        dirs.push(entry.path());
+                    } else {
+                        total = (total.0 + 1, total.1 + metadata.len());
+                    }
+                }
+            }
+            total
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = DaemonJournal::with_limits(dir.path(), 8, MAX_JOURNAL_BYTES);
+        store.initialize().unwrap();
+        let kept: Vec<JournalOperation> = (0..8)
+            .map(|index| attempt_receipt_on(&format!("queue-{index}"), 1))
+            .collect();
+        for operation in &kept {
+            store
+                .retain_entry(&JournalEntry::Operation {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+        }
+        let full = usage(dir.path());
+        // Two hundred more claims arrive; the server has acknowledged nothing.
+        for index in 0..200 {
+            let refused = store
+                .retain_entry(&JournalEntry::Operation {
+                    operation: attempt_receipt_on(&format!("over-{index}"), 1),
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("record bound"), "{refused}");
+        }
+        assert_eq!(usage(dir.path()), full, "a refused record writes nothing");
+        // The pruning rules are handed "prune everything": nothing goes.
+        assert!(store
+            .prune_acknowledged_attempts(|_, _| true)
+            .unwrap()
+            .is_empty());
+        assert_eq!(usage(dir.path()), full);
+        assert_eq!(store.pending().unwrap().len(), 8);
+        for operation in &kept {
+            let stored = store
+                .operation(&operation.fence.operation_id)
+                .unwrap()
+                .unwrap();
+            assert!(!stored.acknowledged);
+            assert_eq!(stored.entry_id, operation.entry_id);
+        }
+        // The byte bound refuses the same way.
+        let small = tempfile::tempdir().unwrap();
+        let bytes = DaemonJournal::with_limits(small.path(), MAX_JOURNAL_ENTRIES, 4096);
+        bytes.initialize().unwrap();
+        let mut accepted = 0;
+        let refused = loop {
+            match bytes.retain_entry(&JournalEntry::Operation {
+                operation: attempt_receipt_on(&format!("bytes-{accepted}"), 1),
+            }) {
+                Ok(_) => accepted += 1,
+                Err(error) => break error.to_string(),
+            }
+            assert!(accepted < 64, "the byte bound never refused");
+        };
+        assert!(refused.contains("byte bound"), "{refused}");
+        assert_eq!(bytes.pending().unwrap().len(), accepted);
+        assert!(bytes
+            .prune_acknowledged_attempts(|_, _| true)
+            .unwrap()
+            .is_empty());
+        // Once the server acknowledges, the slots are free again, and only
+        // then do the pruning rules apply: to the acknowledged receipts.
+        for operation in &kept {
+            store
+                .acknowledge(&JournalAckParams {
+                    entry_id: operation.entry_id.clone(),
+                })
+                .unwrap();
+        }
+        let later: Vec<JournalOperation> = (0..8)
+            .map(|index| attempt_receipt_on(&format!("later-{index}"), 1))
+            .collect();
+        for operation in &later {
+            store
+                .retain_entry(&JournalEntry::Operation {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+        }
+        let mut removed = store.prune_acknowledged_attempts(|_, _| true).unwrap();
+        removed.sort();
+        let mut acknowledged: Vec<String> = kept
+            .iter()
+            .map(|operation| operation.fence.operation_id.clone())
+            .collect();
+        acknowledged.sort();
+        assert_eq!(removed, acknowledged);
+        assert_eq!(store.pending().unwrap().len(), 8);
+        for operation in &later {
+            assert!(store
+                .operation(&operation.fence.operation_id)
+                .unwrap()
+                .is_some());
+        }
+    }
+
     /// Four hundred acknowledged attempt receipts on a journal bounded at
     /// four records (each write is several fsyncs, so the count is kept to
     /// what runs in seconds): none of them takes a slot, so the bound keeps
