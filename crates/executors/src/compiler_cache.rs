@@ -535,6 +535,15 @@ fn configured(
     Some(cache)
 }
 
+/// Whether no workspace root of this process has a compiler cache: every
+/// process that never turned the feature on.
+pub(crate) fn none_installed() -> bool {
+    INSTALLED
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
+}
+
 /// The compiler cache installed for `workspace_root`.
 pub fn installed(workspace_root: &Path) -> Option<Arc<CompilerCache>> {
     INSTALLED
@@ -1190,6 +1199,26 @@ pub(crate) mod tests {
             (name == "PATH").then(|| path.clone())
         });
         assert_eq!(found.unwrap().wrapper, wrapper);
+    }
+
+    /// The floor's eviction is for a cache on the root's own filesystem
+    /// only: entries deleted from another disk give the short one nothing
+    /// back. (The size cap is enforced wherever the cache is.)
+    #[test]
+    fn a_cache_shares_the_roots_filesystem_only_when_both_are_on_one_device() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        assert!(shares_filesystem(&cache, dir.path()));
+        assert!(!shares_filesystem(&dir.path().join("missing"), dir.path()));
+        // `/dev` is its own filesystem on every platform Forge runs on.
+        let dev = Path::new("/dev");
+        if fs::metadata(dev).unwrap().dev() == fs::metadata(dir.path()).unwrap().dev() {
+            eprintln!("skipped: /dev is on the temp directory's filesystem here");
+            return;
+        }
+        assert!(!shares_filesystem(dev, dir.path()));
     }
 
     #[test]

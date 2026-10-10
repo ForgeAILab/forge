@@ -115,13 +115,70 @@ pub fn unless_live_run_in<T>(task_root: &Path, reclaim: impl FnOnce() -> T) -> O
 }
 
 /// [`unless_live_run_in`] for one repository store of the shared compiler
-/// cache: run `reclaim` unless a run of this process was handed `store`.
+/// cache: run `reclaim` unless a run of this process was handed `store`, or
+/// a command without a run scope holds it ([`hold_compiler_cache`]).
 pub fn unless_live_cache_run_in<T>(store: &Path, reclaim: impl FnOnce() -> T) -> Option<T> {
     let live = live_run_dirs();
     if live.values().any(|run| run.cache.as_deref() == Some(store)) {
         return None;
     }
+    let held = held_cache_stores();
+    if held.contains_key(store) {
+        return None;
+    }
     Some(reclaim())
+}
+
+/// Repository stores of the shared compiler cache in use by commands that
+/// have no run scope, and how many of them.
+static HELD_CACHE_STORES: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Mutex::default);
+
+fn held_cache_stores() -> std::sync::MutexGuard<'static, HashMap<PathBuf, usize>> {
+    HELD_CACHE_STORES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keeps the collector away from one repository store until dropped.
+#[derive(Debug)]
+#[must_use = "the store is held only while this value lives"]
+pub struct CacheHold(Option<PathBuf>);
+
+impl Drop for CacheHold {
+    fn drop(&mut self) {
+        let Some(store) = self.0.take() else { return };
+        let mut held = held_cache_stores();
+        if let Some(count) = held.get_mut(&store) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&store);
+            }
+        }
+    }
+}
+
+/// Hold the shared compiler cache store of the repository of `worktree`
+/// while a command built with [`SandboxEnv::for_task`] runs there.
+///
+/// Such a command (an owner-local hook or CI step) has no run scope, so the
+/// live-run registry does not know it, yet it may be compiling through the
+/// wrapper. The collector deletes entries of a store whose wrapper is not
+/// known to tolerate that only while nothing uses the store; this is how an
+/// unscoped command says it does. Nothing is created and, with no cache
+/// installed, nothing is looked at.
+pub fn hold_compiler_cache(worktree: &Path) -> CacheHold {
+    if crate::compiler_cache::none_installed() {
+        return CacheHold(None);
+    }
+    let store = TaskRoot::of_worktree(worktree).and_then(|root| {
+        let cache = crate::compiler_cache::for_task_roots(root.0.parent()?)?;
+        (cache.kind != crate::compiler_cache::WrapperKind::Unknown).then_some(())?;
+        Some(cache.repository_dir(&crate::compiler_cache::repository_id(worktree)?))
+    });
+    if let Some(store) = &store {
+        *held_cache_stores().entry(store.clone()).or_default() += 1;
+    }
+    CacheHold(store)
 }
 
 /// When this process first used the sandbox. Nothing it runs is older.
@@ -1225,6 +1282,7 @@ mod tests {
 
         // Off by default: nothing about a wrapper reaches a run.
         let off = SandboxEnv::for_run(&first, "run-1", RunPurpose::Execution);
+        drop(hold_compiler_cache(&first));
         assert!(off.compiler_cache().is_none());
         assert!(value(&off.variables(&project, unset, none), WRAPPER_KEY).is_none());
         assert!(!root.join(CACHE_DIR).exists());
@@ -1282,6 +1340,16 @@ mod tests {
         );
         live.settle();
         assert_eq!(unless_live_cache_run_in(&store, || ()), Some(()));
+        // A command with no run scope (an owner-local hook or CI step) holds
+        // its repository's store for as long as it runs.
+        let (hook, ci_step) = (hold_compiler_cache(&first), hold_compiler_cache(&second));
+        let elsewhere = hold_compiler_cache(dir.path());
+        assert_eq!(unless_live_cache_run_in(&store, || ()), None);
+        drop(hook);
+        assert_eq!(unless_live_cache_run_in(&store, || ()), None);
+        drop(ci_step);
+        assert_eq!(unless_live_cache_run_in(&store, || ()), Some(()));
+        drop(elsewhere);
 
         compiler_cache::install(&root, None);
         assert!(SandboxEnv::for_run(&first, "run-6", RunPurpose::Check)
