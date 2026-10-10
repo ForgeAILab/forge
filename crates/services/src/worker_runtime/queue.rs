@@ -793,6 +793,13 @@ impl TaskStepWorker {
             }
             return Ok(());
         }
+        if step.kind == crate::integration_steps::INTEGRATION_STEP_KIND {
+            // The integration queue's requests (not produced until the queue
+            // is activated). Each action fences itself on its attempt.
+            return crate::integration_steps::IntegrationSteps::new(self.task_service.clone())
+                .execute(step)
+                .await;
+        }
         let task = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
         if !self.db.step_entry_matches(step).await? {
             return self

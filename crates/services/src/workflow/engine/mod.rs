@@ -57,6 +57,16 @@ fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
 /// The checks `run_ci_steps` will execute when this Task next enters review,
 /// resolved from the same merged review-state config the hook reads. Empty
 /// when the workflow has no review state or the config names no steps.
+/// A state's configuration as its hooks see it: the workflow's, overlaid by
+/// the Project's and the Task's.
+pub(crate) fn effective_state_config(
+    state: &StateDefinition,
+    project: Option<&db::Project>,
+    task_state_config_json: Option<&str>,
+) -> serde_json::Value {
+    hooks::merged_state_config(state, project, task_state_config_json)
+}
+
 pub(crate) fn review_ci_steps_for_task(
     workflow: &api_types::WorkflowDefinition,
     project: Option<&db::Project>,
@@ -1526,6 +1536,19 @@ impl WorkflowExecution<'_> {
 
                     if update.rows_affected() != 1 {
                         return Err(db::DbError::VersionConflict.into());
+                    }
+                    // A Cancel of a Task the integration queue holds asks the
+                    // queue to release its attempt, in this transaction. Once a
+                    // fast-forward may have started, the Cancel waits behind
+                    // the protected result step instead (nothing is written).
+                    if current_status != target_state
+                        && workflow.cancellation_state.as_deref() == Some(target_state.as_str())
+                        && db::request_task_integration_cancel_in_tx(&mut transaction, &task_id, &updated_at).await?
+                            == db::TaskIntegrationCancel::Protected
+                    {
+                        let pending_steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE task_id=? AND status IN ('pending','claimed')")
+                            .bind(&task_id).fetch_one(&mut *transaction).await?;
+                        return Err(db::DbError::TaskBusy { pending_steps, retry_after_ms: 250 }.into());
                     }
                     if let Some(marker)=&deferred_marker {
                         sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch',json(?)) WHERE id=?")

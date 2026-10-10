@@ -474,3 +474,61 @@ async fn the_step_kind_migration_preserves_rows_indexes_triggers_and_dependents(
     // Replay is a no-op.
     crate::run_migrations_from(&pool, dir.path()).await.unwrap();
 }
+
+#[tokio::test]
+async fn an_attempt_carry_is_recorded_once_and_spends_the_review_carry_allowance() {
+    let db = fixture().await;
+    let a = attempt(&db, "a").await;
+    let carry = |commit: &str| crate::NewReviewAuthorityCarry {
+        task_id: "a".into(),
+        contract_execution_id: "contract".into(),
+        commit_sha: commit.into(),
+        base_sha: SHA_B.into(),
+        kind: crate::ReviewCarryKind::CleanRebase,
+        changed_paths: vec!["src/lib.rs".into()],
+    };
+    let settle = |commit: String| {
+        let db = db.clone();
+        let id = a.id.clone();
+        let carry = carry(&commit);
+        async move {
+            let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+            let settled = db
+                .settle_attempt_review_carry_in_tx(&mut tx, &id, &carry, NOW)
+                .await;
+            if settled.is_ok() {
+                tx.commit().await.unwrap();
+            }
+            settled
+        }
+    };
+    let rows = || async {
+        sqlx::query_as::<_, (i64, i64)>("SELECT (SELECT COUNT(*) FROM review_authority_carry WHERE task_id='a'),COALESCE((SELECT spent FROM task_budget WHERE task_id='a' AND kind='review_carry'),0)")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    };
+    settle(SHA_A.into()).await.unwrap();
+    assert_eq!(rows().await, (1, 1));
+    // A redelivered settle records and charges nothing more.
+    settle(SHA_A.into()).await.unwrap();
+    assert_eq!(rows().await, (1, 1));
+    let kind: String =
+        sqlx::query_scalar("SELECT kind FROM review_authority_carry WHERE task_id='a'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(kind, "clean_rebase");
+    // One approval covers a bounded number of carries: the allowance refuses
+    // the next one and nothing is recorded for it.
+    let limit = i64::from(crate::budget::Kind::ReviewCarry.default_limit());
+    for n in 1..limit {
+        settle(format!("{n:040x}")).await.unwrap();
+    }
+    assert_eq!(rows().await, (limit, limit));
+    assert!(matches!(
+        settle("f".repeat(40)).await,
+        Err(DbError::Check(_))
+    ));
+    assert_eq!(rows().await, (limit, limit));
+}
