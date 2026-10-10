@@ -695,6 +695,274 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
     assert_no_synthetic_reviewer_execution(&harness.state.db, &task_id).await;
 }
 
+/// A Task in `review` with a worktree, green-able checks and, when asked, a
+/// reviewer Agent assigned (paused or not).
+async fn seed_rerun_task(
+    name: &str,
+    reviewer_paused: Option<bool>,
+) -> (TestHarness, String, Option<String>, Vec<common::TestDir>) {
+    let temp = common::TestDir::new(name);
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("create repo dir");
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
+    run_git(&repo_path, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_path, &["config", "user.name", "Test"]);
+    std::fs::write(repo_path.join("file.txt"), "base\n").expect("write file");
+    run_git(&repo_path, &["add", "."]);
+    run_git(&repo_path, &["commit", "-m", "initial"]);
+    let task_id = new_uuid_v4();
+    let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
+    std::fs::create_dir_all(worktree_path.parent().unwrap()).expect("create worktree parent");
+    run_git(
+        &repo_path,
+        &[
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "-b",
+            &::workspace::task_branch_name(&task_id),
+        ],
+    );
+    std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("write feature");
+    run_git(&worktree_path, &["add", "."]);
+    run_git(&worktree_path, &["commit", "-m", "feature"]);
+    let workspace_root = common::TestDir::new(&format!("{name}-workspaces"));
+    let harness = test_app(workspace_root.path()).await;
+    let (task_id, _) = seed_awaiting_human_review_with_workspace(
+        &harness.state.db,
+        &task_id,
+        &repo_path,
+        &worktree_path,
+    )
+    .await;
+    set_review_ci_steps(&harness.state.db, &task_id, &["true"]).await;
+    let reviewer = match reviewer_paused {
+        None => None,
+        Some(paused) => {
+            let agent_id = seed_codex_agent(&harness.state.db).await;
+            if paused {
+                AgentRepo::set_paused(&*harness.state.db, &agent_id, true)
+                    .await
+                    .expect("reviewer pauses");
+            }
+            let now = now_rfc3339();
+            TaskRoleAssignmentRepo::assign(
+                &*harness.state.db,
+                CreateTaskRoleAssignment {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    role_name: "reviewer".to_owned(),
+                    assignee_type: Some(AssigneeKind::Agent),
+                    assignee_id: Some(agent_id.clone()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("reviewer assignment creates");
+            Some(agent_id)
+        }
+    };
+    (harness, task_id, reviewer, vec![temp, workspace_root])
+}
+
+async fn count(db: &db::SqliteDb, sql: &str, task_id: &str) -> i64 {
+    sqlx::query_scalar(sql)
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("count reads")
+}
+
+async fn post_retry(
+    harness: &TestHarness,
+    task_id: &str,
+    expected: StatusCode,
+) -> serde_json::Value {
+    let uri = format!("/api/v1/tasks/{task_id}/actions");
+    json_request(
+        &harness.app,
+        Method::POST,
+        &uri,
+        json!({ "version": common::task_action_version(&harness.app, &uri).await, "action": {"verb": "retry"} }),
+        expected,
+    )
+    .await
+}
+
+// With a reviewer assigned, the owner's review retry runs the entry's CI once
+// through the check runner and then dispatches the reviewer as an ordinary,
+// Agent-backed reviewer execution. While that reviewer works, a second retry
+// starts nothing: the action is not offered and is refused 409.
+#[tokio::test]
+async fn review_retry_runs_entry_ci_once_then_the_assigned_reviewer_and_refuses_a_second_while_busy(
+) {
+    let (harness, task_id, reviewer, _dirs) =
+        seed_rerun_task("forge-rerun-review-reviewer", Some(false)).await;
+    let reviewer = reviewer.unwrap();
+    let db = &harness.state.db;
+
+    post_retry(&harness, &task_id, StatusCode::OK).await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    common::drain(&harness.state, &harness.app, &task_id).await;
+    // The entry leaves reviewer dispatch to the Task dispatcher, as every
+    // review entry does.
+    harness
+        .state
+        .task_dispatcher
+        .as_ref()
+        .expect("the harness composes a dispatcher")
+        .check_once()
+        .await
+        .expect("dispatcher pass");
+    let settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(settled.status, "review");
+
+    let reviews = ReviewRepo::list_by_task(&**db, &task_id).await.unwrap();
+    let latest = reviews.iter().max_by_key(|r| r.attempt_number).unwrap();
+    assert_eq!(reviews.len(), 2, "one new attempt for the retried entry");
+    assert_eq!(latest.status, ReviewStatus::Running);
+    let details: serde_json::Value = serde_json::from_str(&latest.step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0);
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ?",
+            &task_id
+        )
+        .await,
+        1,
+        "the entry asked the check runner once"
+    );
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_run WHERE ? IS NOT NULL",
+            &task_id
+        )
+        .await,
+        1,
+        "and one run answered"
+    );
+    let reviewers: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT agent_id, status FROM execution WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(&task_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let entry_log: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT to_state, trigger_reason, hook_results_json FROM transition_log WHERE task_id = ? ORDER BY created_at",
+    )
+    .bind(&task_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let task_row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT metadata_json, error_annotation, blocked_json FROM task WHERE id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        reviewers.len(),
+        1,
+        "the reviewer runs once: {reviewers:?}; entries {entry_log:?}; task {task_row:?}"
+    );
+    assert_eq!(reviewers[0].0.as_deref(), Some(reviewer.as_str()));
+    assert_no_synthetic_reviewer_execution(db, &task_id).await;
+
+    // Busy: the reviewer is still working.
+    let offers: serde_json::Value = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!(null),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        !offers["available_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|offer| offer["action"]["verb"] == "retry"),
+        "{offers}"
+    );
+    let refused = post_retry(&harness, &task_id, StatusCode::CONFLICT).await;
+    assert_eq!(refused["code"], "action_unavailable", "{refused}");
+    assert_eq!(
+        ReviewRepo::list_by_task(&**db, &task_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ?",
+            &task_id
+        )
+        .await,
+        1
+    );
+}
+
+// A paused reviewer Agent holds the retried entry where it holds an automatic
+// one: the checks run and are recorded, and no reviewer starts.
+#[tokio::test]
+async fn review_retry_with_a_paused_reviewer_runs_its_checks_and_starts_no_reviewer() {
+    let (harness, task_id, _reviewer, _dirs) =
+        seed_rerun_task("forge-rerun-review-paused-agent", Some(true)).await;
+    let db = &harness.state.db;
+
+    post_retry(&harness, &task_id, StatusCode::OK).await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    common::drain(&harness.state, &harness.app, &task_id).await;
+    // The entry leaves reviewer dispatch to the Task dispatcher, as every
+    // review entry does.
+    harness
+        .state
+        .task_dispatcher
+        .as_ref()
+        .expect("the harness composes a dispatcher")
+        .check_once()
+        .await
+        .expect("dispatcher pass");
+    let settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(settled.status, "review");
+
+    let reviews = ReviewRepo::list_by_task(&**db, &task_id).await.unwrap();
+    let latest = reviews.iter().max_by_key(|r| r.attempt_number).unwrap();
+    assert_eq!(reviews.len(), 2);
+    assert_eq!(latest.status, ReviewStatus::Running);
+    let details: serde_json::Value = serde_json::from_str(&latest.step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0);
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer' AND status = 'running'",
+            &task_id
+        )
+        .await,
+        0,
+        "a paused Agent starts no reviewer"
+    );
+    assert_no_synthetic_reviewer_execution(db, &task_id).await;
+}
+
 async fn set_review_ci_steps(db: &db::SqliteDb, task_id: &str, steps: &[&str]) {
     let task = TaskRepo::get_by_id(db, task_id, false)
         .await
@@ -767,11 +1035,6 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    let review_runner = Arc::new(review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::clone(&adapter_registry),
-    ));
     let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
         db,
         event_bus,
@@ -779,7 +1042,6 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         adapter_registry,
         merge_service,
         cleanup_scheduler,
-        review_runner,
         api::state::ShutdownSignal::new(),
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),

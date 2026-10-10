@@ -264,16 +264,10 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
 }
 
 #[tokio::test]
-async fn transition_to_review_runs_configured_review_runner() {
+async fn transition_to_review_runs_the_configured_review_checks() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let runner = Arc::new(::review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::new(executors::AdapterRegistry::new()),
-    ));
-    let service =
-        TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)).with_review_runner(runner);
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
@@ -348,14 +342,8 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let workspace_root = TempDir::new().unwrap();
-    let runner = Arc::new(::review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::new(executors::AdapterRegistry::new()),
-    ));
     let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_workspace_root(workspace_root.path().to_path_buf())
-        .with_review_runner(runner);
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, _, repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")

@@ -1211,7 +1211,6 @@ impl WorkflowExecution<'_> {
                     .as_ref()
                     .map(|authority| authority.workflow_definition.clone()),
                 triggered_by: actor.clone(),
-                review_runner: self.task_service.review_runner.clone(),
                 merge_service: self.task_service.merge_service.clone(),
                 cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
                 task_service: self.task_service.clone(),
@@ -1244,7 +1243,6 @@ impl WorkflowExecution<'_> {
                     .as_ref()
                     .map(|authority| authority.workflow_definition.clone()),
                 triggered_by: actor.clone(),
-                review_runner: self.task_service.review_runner.clone(),
                 merge_service: self.task_service.merge_service.clone(),
                 cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
                 task_service: self.task_service.clone(),

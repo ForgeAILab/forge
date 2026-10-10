@@ -1253,7 +1253,6 @@ async fn remote_plan_checklist_gate_matches_server_placement() {
         project_version: None,
         project_workflow_definition: None,
         triggered_by: Actor::system(SystemComponent::Test),
-        review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
         task_service: fixture.harness.state.task_service.as_ref().clone(),
@@ -1760,7 +1759,6 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
             project_version: Some(project.version),
             project_workflow_definition: Some(project.workflow_definition),
             triggered_by: Actor::system(SystemComponent::Test),
-            review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
             task_service: state.task_service.as_ref().clone(),
@@ -3013,6 +3011,90 @@ async fn connected_cancel_kills_remote_ci_and_supersedes_its_hook_step() {
             &task_id,
             TaskAction::Cancel {
                 reason: Some("owner cancelled remote CI".into()),
+            },
+            task.version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.task.status, "cancelled");
+    assert!(!completed.exists());
+    assert!(db
+        .pending_remote_cancels(None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .task_steps(&task_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.kind == "hooks" && s.expected_status == "review" && s.status == "superseded"));
+    assert_eq!(
+        fixture
+            .link
+            .as_ref()
+            .unwrap()
+            .requests(METHOD_WORKSPACE_CANCEL)
+            .len(),
+        1
+    );
+    running.await.unwrap().unwrap();
+    assert_remote_ci_abandoned(db, &task_id).await;
+    assert!(!completed.exists());
+    assert_eq!(
+        TaskRepo::get_by_id(&**db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}
+
+// A manual review re-run of a daemon-placed Task is an ordinary review entry:
+// its CI runs on the owner daemon, and cancelling the Task while it runs
+// stops the remote command and leaves no cancellation pending, exactly as
+// for an automatic entry.
+#[tokio::test]
+async fn a_review_rerun_on_a_daemon_owned_task_runs_remote_ci_under_the_cancel_fence() {
+    use db::TaskStepRepo;
+    let fixture = Fixture::new("forge-remote-ci-rerun").await;
+    let db = &fixture.harness.state.db;
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let started = fixture._daemon_root.path().join("rerun-ci-started");
+    let completed = fixture._daemon_root.path().join("rerun-ci-completed");
+    sqlx::query("UPDATE task SET task_state_config=?,status='review' WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 120; touch {}",quote(&started.to_string_lossy()),quote(&completed.to_string_lossy()))]}}).to_string()).bind(&task_id).execute(db.pool()).await.unwrap();
+    let service = fixture.harness.state.task_service.clone();
+    // The owner's review re-run: the Task re-enters `review` and its CI is
+    // asked of the check runner, which runs it on the daemon that owns the
+    // worktree.
+    let entered = service
+        .rerun_review(task_id.parse().expect("the Task id is a UUID"))
+        .await
+        .unwrap();
+    assert_eq!(entered.status, "review");
+    assert!(db.entry_hooks_pending(&task_id).await.unwrap());
+    let running = {
+        let service = service.clone();
+        let id = task_id.clone();
+        tokio::spawn(async move { service.drain(&id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let task = TaskRepo::get_by_id(&**db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let cancelled = service
+        .perform_task_action(
+            &task_id,
+            TaskAction::Cancel {
+                reason: Some("owner cancelled the re-run's remote CI".into()),
             },
             task.version,
         )

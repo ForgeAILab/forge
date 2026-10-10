@@ -1381,7 +1381,8 @@ impl SqliteDb {
         let assignment =
             task::effective_execution_assignment_in_tx(transaction, task_id, assignment_role)
                 .await?;
-        // ReviewRunner's CI-only pass is a deliberately synthetic reviewer:
+        // An agentless reviewer execution (the retired inline review re-run
+        // created them; nothing in Forge does now) is a synthetic reviewer:
         // it has no Agent principal and therefore no assignment row to
         // compare. Keep this exception scoped to the canonical reviewer
         // role and an admission that explicitly has no selected assignment;
@@ -1470,7 +1471,7 @@ impl SqliteDb {
                     status.as_str(),
                     updated_at.as_str(),
                 )),
-                // A ReviewRunner first attempt has no prior Review row to
+                // A first review attempt has no prior Review row to
                 // snapshot, but still binds the new child to its candidate
                 // execution. The candidate is checked separately below.
                 (None, None, None, None, None, None, None) => None,
@@ -1771,8 +1772,8 @@ impl SqliteDb {
 fn canonical_execution_role(role: Option<&str>) -> Option<&str> {
     role.map(|role| match role {
         "executor" => "coder",
-        // The reviewer assignment authorizes both the ReviewRunner's CI
-        // execution and its conformance auditor child.
+        // The reviewer assignment also authorizes an `auditor` execution
+        // bound to the same review attempt.
         "auditor" => "reviewer",
         role => role,
     })

@@ -206,7 +206,6 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
             project_version: Some(project.version),
             project_workflow_definition: Some(project.workflow_definition),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow),
-            review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
             task_service: fixture.engine.clone(),

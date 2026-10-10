@@ -525,11 +525,6 @@ impl World {
                 Arc::clone(&event_bus),
                 workspaces,
             )))
-            .with_review_runner(Arc::new(review::ReviewRunner::new(
-                Arc::clone(&db),
-                Arc::clone(&event_bus),
-                Arc::clone(&registry),
-            )))
             .with_workflows_dir(api::state::test_workflows_dir())
             .with_jwt_secret(api::state::test_jwt_secret())
             .with_bcrypt_cost(api::state::test_bcrypt_cost())

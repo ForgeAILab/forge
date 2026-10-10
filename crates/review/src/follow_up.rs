@@ -1,4 +1,4 @@
-use crate::runner::StepResult;
+use crate::outcome::StepResult;
 use std::path::PathBuf;
 
 pub fn render_review_fail_prompt(reason: &str, diff: &str) -> String {

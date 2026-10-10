@@ -182,11 +182,6 @@ async fn state_for_db(db: Arc<db::SqliteDb>, root: &std::path::Path) -> Arc<api:
         events.clone(),
         root.to_owned(),
     ));
-    let review = Arc::new(review::ReviewRunner::new(
-        db.clone(),
-        events.clone(),
-        adapters.clone(),
-    ));
     Arc::new(api::AppState::with_adapter_registry_services_and_shutdown(
         db,
         events,
@@ -194,7 +189,6 @@ async fn state_for_db(db: Arc<db::SqliteDb>, root: &std::path::Path) -> Arc<api:
         adapters,
         merge,
         cleanup,
-        review,
         api::state::ShutdownSignal::new(),
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),

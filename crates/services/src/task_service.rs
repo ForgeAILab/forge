@@ -13,7 +13,6 @@ use crate::{
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
 };
-use ::review::ReviewRunner;
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
 use api_types::{Actor, ProjectSettings, UserActionSource};
 use chrono::{DateTime, Utc};
@@ -445,7 +444,6 @@ pub struct TaskService {
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
     pub(crate) cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    pub(crate) review_runner: Option<Arc<ReviewRunner>>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
     placement_adapter_registry: Option<Arc<executors::AdapterRegistry>>,
     pub(crate) daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
@@ -646,7 +644,6 @@ impl TaskService {
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,
-            review_runner: None,
             task_executor: None,
             placement_adapter_registry: None,
             daemon_connections: None,
@@ -730,12 +727,6 @@ impl TaskService {
             embedded = embedded.with_repo_cache_locks(Arc::clone(locks));
         }
         self.workspace_backend_router = Arc::new(WorkspaceBackendRouter::new(Arc::new(embedded)));
-    }
-
-    pub fn with_review_runner(mut self, review_runner: Arc<ReviewRunner>) -> Self {
-        self.review_runner = Some(review_runner);
-        self.task_step_driver = Arc::default();
-        self
     }
 
     pub(crate) fn dispatch_notify(&self) -> Arc<tokio::sync::Notify> {

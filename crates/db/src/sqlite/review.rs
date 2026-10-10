@@ -300,7 +300,7 @@ async fn update_status_inner(
     Ok((updated_review, updated_task))
 }
 
-/// ReviewRunner's status boundary. Unlike the historical `update_status`
+/// The review settlement boundary. Unlike the historical `update_status`
 /// method, this always rechecks the Task/Project/workflow/candidate and the
 /// exact prior Review row under the writer lock. A Task projection is optional
 /// because CI-only failures/awaiting-human states do not change
