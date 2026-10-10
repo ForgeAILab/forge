@@ -2012,6 +2012,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Opt-in shared compiler cache (3.4 stage F).** Each Task builds into its
+  own `CARGO_TARGET_DIR`, so each Task builds cold. If a compiler-cache
+  wrapper is installed on a machine (`kache`, `sccache`), name it in
+  `workspace.compiler_cache.wrapper` (`forge.yaml`, or
+  `FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER`; a daemon: the same key in its
+  `daemon.yaml`, or `forge-daemon --compiler-cache-wrapper`) and separate
+  Tasks of one repository share compiled artifacts without sharing a build
+  directory or a lock. Runs that get the per-Task build directory
+  (executions, hooks, checks in a Task worktree, the native command tool,
+  daemon `workspace.run`) then also get `RUSTC_WRAPPER` and the wrapper's
+  cache directory, one store per repository under
+  `<workspace root>/.forge/build/cache/<repository id>`
+  (`workspace.compiler_cache.dir`), capped by `max_bytes` (default 20 GiB).
+  Off unless a wrapper is configured; Forge installs nothing. A Project
+  environment `RUSTC_WRAPPER` wins (an empty value turns the wrapper off for
+  that Project), then a value on the command, then the operator's own
+  environment. A wrapper or cache directory that cannot be used never fails
+  a run: the run builds without it and the server logs one warning. While a
+  disk is under its free-space floor the garbage collector deletes least
+  recently used cache entries, down to half of `max_bytes`, before it takes
+  any Task's build output. Machine disk facts gain `compiler_cache_bytes`.
+  See `docs/getting-started.md` for what each wrapper is given, and for the
+  two things Forge does for `sccache` (it starts one server per repository
+  store, and hands runs a launcher that drops `CARGO_TARGET_DIR` from the
+  compile's environment, which `sccache` would otherwise make part of every
+  cache key).
 - **Disk-pressure admission (3.4 stage E).** A full disk no longer silently
   kills work. Each machine's workspace filesystem is read for free bytes and
   inodes (the server reads its own root; a daemon reports its root). Under

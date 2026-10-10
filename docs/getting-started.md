@@ -466,6 +466,87 @@ a machine, free space there by hand or fix the root's ownership (below):
 nothing will reclaim it automatically. A disk that cannot be read refuses
 nothing.
 
+#### Shared compiler cache (opt-in)
+
+Every Task builds into its own directory (`CARGO_TARGET_DIR` under its Task
+root), so every Task starts with a cold build. If you have a compiler-cache
+wrapper installed, Forge can hand it to runs so that separate Tasks of one
+repository reuse each other's compiled crates, without sharing a build
+directory or a lock. Forge installs nothing and this is off until you name a
+wrapper:
+
+```yaml
+workspace:
+  compiler_cache:
+    wrapper: kache              # absolute path, or a name found on PATH at start
+    # max_bytes: 21474836480    # size cap, default 20 GiB
+    # dir: /var/cache/forge     # default <workspace root>/.forge/build/cache
+```
+
+`FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER`, `..._MAX_BYTES` and `..._DIR`
+override the file. This is per machine: a daemon reads the same
+`workspace.compiler_cache` block from its own `daemon.yaml`
+(`forge-daemon --compiler-cache-wrapper`, `--compiler-cache-max-bytes` and
+`--compiler-cache-dir` override it) and never receives the server's.
+
+What a run gets, when the wrapper is still executable and the cache
+directory can be written:
+
+| Wrapper (by program name) | Variables set on the run |
+|---|---|
+| `kache` | `RUSTC_WRAPPER`, `KACHE_CACHE_DIR=<dir>/<repository id>`, `KACHE_MAX_SIZE=<max_bytes>` |
+| `sccache` | `RUSTC_WRAPPER=<dir>/<repository id>/rustc-wrapper`, `SCCACHE_DIR=<dir>/<repository id>`, `SCCACHE_CACHE_SIZE`, `SCCACHE_SERVER_UDS=<dir>/<repository id>/s` |
+| anything else | `RUSTC_WRAPPER` only |
+
+It applies to every run that gets the per-Task build directory: agent
+executions, lifecycle hooks, checks and CI commands in a Task worktree, the
+native command tool and a daemon's `workspace.run`. Precedence is the same as
+for the build directory: a `RUSTC_WRAPPER` in the Project environment wins
+(set it to an empty value to turn the wrapper off for one Project), then a
+value already on the command, then `RUSTC_WRAPPER` in the environment Forge
+itself was started with, then this setting. When any of those names a
+wrapper, Forge sets none of the variables above.
+
+Things to know:
+
+- **`kache` shares the most.** It reuses a crate across worktrees. `sccache`
+  makes the directory the compiler runs in part of its key, so it shares
+  dependencies (registry and git crates) between Tasks but not the
+  repository's own crates.
+- **`sccache` needs two things from Forge**, both automatic. One server per
+  repository store, started by Forge (`sccache --start-server`, socket and
+  temp directory inside the store, no idle exit): a server started by a
+  run's first compile would keep that run's temporary directory and fail
+  every compile after the run ended. And a two-line launcher,
+  `<store>/rustc-wrapper`, that runs your `sccache` without
+  `CARGO_TARGET_DIR`: `sccache` makes every `CARGO_*` variable part of its
+  key, and each Task has its own. The servers outlive Forge; stop one with
+  `SCCACHE_SERVER_UDS=<store>/s sccache --stop-server`. A cache directory
+  whose socket path would exceed 100 bytes is not used: set `dir` to a
+  shorter path.
+- **A cache never fails a run.** If the wrapper is gone, the directory cannot
+  be created or written, or the `sccache` server does not start, the run
+  builds as it would without the setting and the log carries one warning per
+  cause for the life of the process.
+- **Sandboxed CLIs.** A Codex Task under Forge's managed workspace-write
+  sandbox gets the wrapper only when it is `kache` (which builds uncached
+  when it cannot reach its store), and its store is then added to the
+  sandbox's writable roots. `sccache` and unknown wrappers are not passed
+  into that sandbox: `sccache` fails a compile when it cannot reach its
+  server. Codex under `yolo` gets whatever you configured. Codex with your
+  own sandbox configuration, and Gemini with `--sandbox`, get no wrapper.
+- **Disk.** The wrapper enforces `max_bytes` per repository store. While the
+  workspace filesystem is under its free-space floor, the garbage collector
+  deletes least recently used cache entries (by access and modification
+  time) until the disk is back above the floor or the cache is down to half
+  of `max_bytes`, and only then takes any Task's build output. It deletes
+  entry files only, never a store directory. For a `kache` store it does so
+  only while no run of that repository is live. A cache left behind after
+  you remove the setting is trimmed to nothing under the same pressure.
+  Free space admission counts the cache like any other used disk.
+- Check results are not affected: the wrapper is added per run and is not
+  part of the environment a check's identity is computed from.
+
 `FORGE_WORKSPACE_LOG_RETENTION_DAYS`, `FORGE_WORKSPACE_MIN_FREE_BYTES`,
 `FORGE_WORKSPACE_MIN_FREE_PERCENT`, `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`,
 `FORGE_WORKSPACE_GC_FREE_BYTES` and `FORGE_WORKSPACE_GC_FREE_PERCENT` override

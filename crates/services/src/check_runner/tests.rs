@@ -2637,3 +2637,53 @@ async fn the_salt_is_created_once_survives_a_restart_and_no_identity_holds_a_val
     assert!(again.identity.inputs.reusable_inputs());
     assert_ne!(again.identity.key().unwrap(), before);
 }
+
+/// Plan 3.4 F: the shared compiler cache is something Forge adds to a run
+/// (`RUSTC_WRAPPER` and the wrapper's cache directory), per run and per
+/// repository. It is not part of the environment the owner inherits or of
+/// the Project environment, which are all the identity names, so turning
+/// it on or off leaves a check's identity (and every stored result) alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = canonical_fixture().await;
+    let step = f.counting_step();
+    let off = f.request("k", &step).await;
+    assert!(off.identity.inputs.reusable_inputs());
+
+    // A workspace root with the cache on, and a Task worktree in it that
+    // really is handed the wrapper.
+    let root = f.temp.path().join("ws");
+    let worktree = root.join("task").join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", root.join(".repos/r/worktrees/task").display()),
+    )
+    .unwrap();
+    let wrapper = f.temp.path().join("kache");
+    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    executors::compiler_cache::install(
+        &root,
+        Some(executors::compiler_cache::CompilerCache {
+            kind: executors::compiler_cache::WrapperKind::of(&wrapper),
+            wrapper: wrapper.clone(),
+            dir: root.join(executors::compiler_cache::CACHE_DIR),
+            max_bytes: 1 << 30,
+        }),
+    );
+    let handed = executors::sandbox::SandboxEnv::for_task(&worktree);
+    assert_eq!(
+        handed.compiler_cache().map(|cache| cache.wrapper()),
+        Some(wrapper.as_path())
+    );
+
+    let on = f.request("k", &step).await;
+    executors::compiler_cache::install(&root, None);
+    assert!(on.identity.inputs.reusable_inputs());
+    assert_eq!(on.identity.inputs, off.identity.inputs);
+    assert_eq!(on.identity.key().unwrap(), off.identity.key().unwrap());
+}
