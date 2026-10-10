@@ -8575,18 +8575,36 @@ occupancy query (`db::machine_capacity`):
    machine's queue still leave it one (`active + ahead < C`), so a sweep that
    reaches a later check first does not let it jump the queue. A check that
    borrows its own Task's slot is not subject to the order.
-3. **Checks stay within their share while a Task waits for a run slot** on
-   that machine (a `task_schedule_wait` row naming it or `'*'`): no check is
-   admitted to its own slot once `k >= S`. With no Task waiting, checks may
-   use every slot.
+3. **Checks stay within their share while a Task waits for a run slot** this
+   machine could give: no check is admitted to its own slot once `k >= S`.
+   With no Task waiting, checks may use every slot. A waiter is a Task with a
+   run-slot wait (`task_schedule_wait.daemon_id = '*'`) that holds no slot
+   itself (no running execution) and whose worktree, if it has one, is on
+   this machine. A Task that waits for a machine's readiness or reconnect
+   asks for no slot and does not count.
 
-Two approximations, both on the cautious side. Rule 1 counts every queued
-check with a live consumer, including one that will borrow its own Task's slot
-when the worker next looks at it, so a slot can be kept for one sweep (about a
-second) that nobody needed. Rule 3 reads any `task_schedule_wait` row naming
-the machine, which also covers a Task waiting for that machine's readiness or
-reconnect, so checks can be held to their share while no execution actually
-waits for a slot there.
+`q` counts a queued check only while a consumer can still use its result: the
+consumer is not cancelled and its Task is still in the status entry it asked
+from. A check whose Task was cancelled, deleted or left `review` reserves
+nothing from that commit on (the worker cancels the run when it next looks).
+A check queued for machine A is counted on A only. A check for a daemon that
+is offline reserves on that daemon only, where no execution can start either,
+and a queued run expires after 30 minutes.
+
+**A Task and its own slot.** The dispatcher's precheck answers "not waiting"
+for a Task whose own run of the role in question is running: that Task is in
+flight, nothing more is dispatched for it until the run ends, and a capacity
+wait left on it is retired. Any other running execution of the Task (an
+interactive session, a run of another role) is not that: a dispatch then needs
+a second slot, the reserve and start transactions count the first one against
+it, and the Task waits like any other. A review-entry check never needs a
+second slot while its Task's run or reservation holds one: it borrows that
+slot and takes it over when the run ends, so the machine's count does not
+change.
+
+One approximation, on the cautious side. Rule 1 counts a queued check that
+will borrow its own Task's slot when the worker next looks at it, so a slot
+can be kept for one sweep (about a second) that nobody needed.
 
 **A run-slot waiter cannot miss its wake.** A Task that waits for a run slot
 has a `task_schedule_wait` row with `daemon_id = '*'`; every commit that frees
@@ -8994,6 +9012,19 @@ froze, it continues under the current Project version; a changed workflow or
 state configuration still ends it with a version conflict. Without this the
 woken step failed, the attempt was cancelled, and recovery dispatched a
 reviewer that had no CI result to read.
+
+What changed while the step waited decides what happens to the result:
+
+| Changed during the wait | The finished check |
+|---|---|
+| Nothing the entry was admitted under (a pause, a resume, a rename, a limit) | applied; the attempt settles |
+| The Project environment | applied: the run that ran is the run that was asked for. Its result answers the old environment only (the environment is part of the check identity), so the next entry runs again |
+| The Project workflow, or the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it | not applied. The attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
+| The Task's own state configuration (`task_state_config`, with its `ci_steps`) | not applied, as above. No Project version moves for this, so the step compares what it froze whenever it waited for a check |
+
+The verdict of commands the entry no longer has is never written to the
+review attempt. The Task does not ask for a new check by itself: its owner
+restarts it or sends it back, and the next entry runs the current commands.
 
 **Liveness of the wait.** Every way the answer can fail to arrive ends in a
 resume or a typed condition, never a silent wait:

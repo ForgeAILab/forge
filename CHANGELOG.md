@@ -2323,6 +2323,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   every Task that waits for a run slot is read again at least every 60
   seconds (30 while a machine is short of disk), also after a restart.
 
+- **Slot rules count only what is real.** (1) A Task with a running
+  interactive session (or a run of another role) on a full machine was told
+  it did not wait for a slot; every dispatcher pass then cleared its wait,
+  tried, was refused and recorded the wait again. It now waits, once, like
+  any other Task. (2) A queued check whose Task was cancelled, deleted or
+  left `review` kept a free slot from new runs until the check worker next
+  looked at it; it reserves nothing from that commit on. (3) Checks were held
+  to their share of a machine's slots while a Task waited for that machine's
+  readiness or reconnect; only Tasks that wait for a run slot the machine
+  could give count now.
+
+- **A review check for commands the Task no longer has is not applied.**
+  Editing a Task's own review configuration (`task_state_config`, with its
+  `ci_steps`) while its review-entry check ran moved no Project version, so
+  the finished check of the old commands was applied to the review attempt.
+  The step now compares what it was admitted under whenever it waited for a
+  check; on a difference the attempt is cancelled and the Task parks for its
+  owner, exactly as after a Project workflow or review-configuration edit.
+
 - **A machine limited to one run no longer parks its own running Task.**
   With `max_concurrent_runs: 1` (server setting, or a daemon's cap or admin
   run limit) the dispatcher's capacity precheck counted a Task's own running

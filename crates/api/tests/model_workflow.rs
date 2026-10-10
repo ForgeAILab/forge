@@ -2315,7 +2315,8 @@ enum RestartPoint {
     AfterRequestBeforeSuspend,
     /// The result's delivery step is enqueued and has not run.
     AfterDeliveryBeforeWake,
-    /// The delivery woke the hooks step, which has not run yet.
+    /// The delivery woke the hooks step and the runtime stopped as that
+    /// step, claimed, was about to read the result.
     AfterWakeBeforeSettle,
     /// The delivery step is dead-lettered: nothing wakes the hooks step but
     /// its own deadline.
@@ -2407,37 +2408,65 @@ async fn restart_with_two_slots_then_one(point: RestartPoint) {
             }
             match point {
                 RestartPoint::AfterWakeBeforeSettle => {
-                    // What the delivery step does, up to its own completion.
-                    let consumer: String = sqlx::query_scalar(
-                        "SELECT id FROM check_consumer WHERE task_id = ? AND delivery_step_id = ?",
+                    // The real runtime runs the delivery step and claims the
+                    // woken hooks step, and is stopped right there: the step
+                    // parks at the armed point and the drain that carries it
+                    // is dropped, as a process that died holding the claim.
+                    use services::workflow::actions::review_entry_halt as halt;
+                    let reached = halt::arm(&task_id, halt::AFTER_WAKE_BEFORE_SETTLE);
+                    let service = world.live().state.task_service.clone();
+                    let id = task_id.clone();
+                    let running = tokio::spawn(async move { service.drain(&id).await });
+                    let stopped =
+                        tokio::time::timeout(Duration::from_secs(60), reached.notified()).await;
+                    running.abort();
+                    let _ = running.await;
+                    halt::disarm(&task_id);
+                    if stopped.is_err() {
+                        return Err("the woken hooks step never ran".to_owned());
+                    }
+                    let delivered: Option<String> =
+                        sqlx::query_scalar("SELECT status FROM task_step WHERE id = ?")
+                            .bind(&delivery)
+                            .fetch_optional(&pool)
+                            .await
+                            .map_err(sql)?;
+                    let applied: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
                     )
                     .bind(&task_id)
-                    .bind(&delivery)
                     .fetch_one(&pool)
                     .await
                     .map_err(sql)?;
-                    let woken = world
-                        .live()
-                        .state
-                        .db
-                        .wake_suspended_hooks(&task_id, &consumer)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    if woken != 1 {
-                        return Err("the delivery woke no step".to_owned());
-                    }
-                    sqlx::query("UPDATE check_consumer SET applied_at = ? WHERE id = ?")
-                        .bind(db::now_rfc3339())
-                        .bind(&consumer)
-                        .execute(&pool)
-                        .await
-                        .map_err(sql)?;
-                    sqlx::query(
-                        "UPDATE task_step SET status='done', completed_at=?, updated_at=? WHERE id = ?",
+                    let claimed: Vec<(String, String)> = sqlx::query_as(
+                        "SELECT kind, status FROM task_step WHERE task_id = ? AND status IN ('claimed','pending','suspended')",
                     )
-                    .bind(db::now_rfc3339())
-                    .bind(db::now_rfc3339())
-                    .bind(&delivery)
+                    .bind(&task_id)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(sql)?;
+                    if delivered.as_deref() != Some("done")
+                        || applied != 1
+                        || claimed != [("hooks".to_owned(), "claimed".to_owned())]
+                    {
+                        return Err(format!(
+                            "expected a finished delivery and a claimed hooks step, got {delivered:?} / {applied} / {claimed:?}"
+                        ));
+                    }
+                    let reviews: Vec<String> =
+                        sqlx::query_scalar("SELECT status FROM review WHERE task_id = ?")
+                            .bind(&task_id)
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(sql)?;
+                    if reviews != ["running"] {
+                        return Err(format!("the attempt settled before the stop: {reviews:?}"));
+                    }
+                    // Time passes: the dead process's claim runs out.
+                    sqlx::query(
+                        "UPDATE task_step SET lease_until='2000-01-01T00:00:00+00:00' WHERE task_id = ? AND status = 'claimed'",
+                    )
+                    .bind(&task_id)
                     .execute(&pool)
                     .await
                     .map_err(sql)?;

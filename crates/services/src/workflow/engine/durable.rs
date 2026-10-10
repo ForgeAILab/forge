@@ -55,6 +55,9 @@ pub(crate) struct HookPhaseResult {
     pub suspend: Option<HookSuspension>,
 }
 
+/// Not a version any Project has: every Project-version fence fails under it.
+const SUPERSEDED_PROJECT_VERSION: i64 = -1;
+
 impl HookPhaseResult {
     fn suspended(suspension: HookSuspension) -> Self {
         Self {
@@ -288,6 +291,13 @@ impl WorkflowExecution<'_> {
         };
         let definition: HookDefinition = serde_json::from_str(&self.db.step_workflow(id).await?)
             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+        if step.awaited_consumer_id.is_some() {
+            crate::workflow::actions::review_entry_halt::reach(
+                &step.task_id,
+                crate::workflow::actions::review_entry_halt::AFTER_WAKE_BEFORE_SETTLE,
+            )
+            .await;
+        }
         let workflow = &definition.workflow;
         let from_state = WorkflowEngine::find_state(workflow, &payload.from).ok_or_else(|| {
             ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
@@ -329,21 +339,29 @@ impl WorkflowExecution<'_> {
         // configurations; while those are unchanged the step continues under
         // the Project's current version. A changed workflow or state
         // configuration still ends it.
+        //
+        // The reverse holds too. The Task's own state configuration can
+        // change under the wait without any Project version moving (its
+        // review commands were edited). The check that ran then answers
+        // commands the entry no longer has: the step ends as it does for a
+        // Project edit, under a version no Project has, so no fence passes
+        // and the verdict is applied to nothing.
         if let (Some(authority), true) = (authority.as_mut(), step.awaited_consumer_id.is_some()) {
             let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-            if project.version != authority.project_version
-                && project.workflow_definition == authority.workflow_definition
+            let admitted_as_is = project.workflow_definition == authority.workflow_definition
                 && merged_state_config(
                     from_state,
                     Some(&project),
                     task.task_state_config.as_deref(),
                 ) == payload.from_config
                 && merged_state_config(to_state, Some(&project), task.task_state_config.as_deref())
-                    == payload.to_config
-            {
+                    == payload.to_config;
+            if admitted_as_is {
                 authority.project_version = project.version;
+            } else if project.version == authority.project_version {
+                authority.project_version = SUPERSEDED_PROJECT_VERSION;
             }
         }
         let transition_log_id = payload.transition_log_id.clone();

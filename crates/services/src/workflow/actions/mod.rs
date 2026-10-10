@@ -24,6 +24,8 @@ pub(crate) use merge::{conflict_handoff_result, merge_failure_result, record_int
 pub use merge::{
     AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
 };
+#[doc(hidden)]
+pub use review::halt as review_entry_halt;
 pub use review::{
     run_ci_steps_in_step, set_entry_check_wall_seconds_for_test, AutoCascadeOnReviewPass,
     AutoCascadeOnUnconfiguredReview, RunCiSteps,
