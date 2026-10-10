@@ -1336,10 +1336,10 @@ fn adopt_legacy_managed_home(legacy: Option<&Path>, home: &Path, task_id: &str) 
         return;
     }
     let Some(parent) = home.parent() else { return };
-    if std::fs::create_dir_all(parent).is_ok() {
-        if let Err(error) = std::fs::rename(legacy, home) {
-            tracing::warn!(from = %legacy.display(), to = %home.display(), %error, "could not move the managed Codex home into the Task root; a fresh one is created");
-        }
+    if std::fs::create_dir_all(parent).is_ok()
+        && let Err(error) = std::fs::rename(legacy, home)
+    {
+        tracing::warn!(from = %legacy.display(), to = %home.display(), %error, "could not move the managed Codex home into the Task root; a fresh one is created");
     }
 }
 

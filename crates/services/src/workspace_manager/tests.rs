@@ -108,6 +108,8 @@ impl Fixture {
         let mut names = std::fs::read_dir(self.path.parent().expect("Task root"))
             .expect("Task root is readable")
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            // Forge's own reserved directory is in every Task root.
+            .filter(|name| name != executors::sandbox::TASK_DIR_NAME)
             .collect::<Vec<_>>();
         names.sort();
         names
@@ -1171,7 +1173,9 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     ("services/src/terminal_service.rs", 1),
     // Task-root anchors only: plan and outbox files beside the worktree.
     ("services/src/plan_artifact.rs", 5),
-    ("services/src/recovery.rs", 1),
+    // recovery.rs: also the directory that holds the Task roots, to sweep
+    // the temp directories of dead runs.
+    ("services/src/recovery.rs", 2),
     ("services/src/task_service/execution.rs", 1),
 ];
 
@@ -1199,7 +1203,7 @@ fn raw_workspace_path_getter_uses_are_exactly_the_recorded_ones() {
         .collect::<Vec<_>>();
     recorded.sort();
     assert_eq!(found, recorded);
-    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 38);
+    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 39);
 }
 
 fn raw_path_uses(source: &str) -> usize {
