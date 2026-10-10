@@ -6,7 +6,9 @@
 //! silently switches to another one: a default that changed between releases
 //! does not move an install, and an operator's changed setting is honoured
 //! only while nothing lives under the recorded root. Everything else goes
-//! through the explicit move, `forge --migrate-workspace-root`.
+//! through the explicit move, [`migrate`] (`forge --migrate-workspace-root`).
+
+pub mod migrate;
 
 use db::{now_rfc3339, SqliteDb};
 use std::path::{Path, PathBuf};
@@ -52,6 +54,10 @@ pub enum WorkspaceRootError {
     /// operator and names what to do.
     #[error("{0}")]
     Refused(String),
+    /// A move stopped part way. Its journal is kept: the same command
+    /// finishes it, and no server starts before that.
+    #[error("{0}")]
+    Incomplete(String),
     #[error("workspace root record: {0}")]
     Database(#[from] sqlx::Error),
     #[error("workspace root: {0}")]

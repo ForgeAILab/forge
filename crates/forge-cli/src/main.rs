@@ -59,6 +59,25 @@ struct Cli {
     /// quarantined and deleted a day later.
     #[arg(long = "reclaim-workspace-gc")]
     reclaim_workspace_gc: bool,
+    /// Move the workspace root (Task worktrees, repository clones, execution
+    /// logs) to NEW_ROOT, or to <data dir>/worktrees when no path is given,
+    /// then exit. Stop Forge first. Every file is kept: entries are renamed
+    /// on one filesystem, otherwise copied, compared and only then removed;
+    /// Git worktree links and every stored path are rewritten. A run that
+    /// was interrupted is finished by running the command again.
+    #[arg(
+        long = "migrate-workspace-root",
+        value_name = "NEW_ROOT",
+        num_args = 0..=1,
+        conflicts_with_all = [
+            "demo",
+            "no_mcp",
+            "no_embedded_daemon",
+            "reclaim_workspace_gc",
+            "convert_db_to_incremental_vacuum"
+        ]
+    )]
+    migrate_workspace_root: Option<Option<PathBuf>>,
     /// Convert an existing database to incremental auto-vacuum, then exit.
     /// Stop Forge first. Full VACUUM locks the database and needs extra disk space.
     #[arg(long, conflicts_with_all = ["demo", "no_mcp", "no_embedded_daemon"])]
@@ -111,6 +130,10 @@ async fn run() {
             db_path.display()
         );
         return;
+    }
+
+    if let Some(target) = cli.migrate_workspace_root {
+        std::process::exit(migrate_workspace_root(&config, target).await);
     }
 
     init_tracing(&config.forge.data_dir.join("logs"));
@@ -492,6 +515,46 @@ async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathB
     }
 }
 
+/// `forge --migrate-workspace-root [NEW_ROOT]`: the process exit code. The
+/// caller holds the data directory's runtime lock, so no server is running.
+async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -> i32 {
+    let opened = async {
+        let data_dir = absolute_path(config.forge.data_dir.clone()).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+        let database_url = format!("sqlite:{}", data_dir.join("forge.db").display());
+        let pool = db::create_sqlite_pool(&database_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        db::run_migrations(&pool).await.map_err(|e| e.to_string())?;
+        Ok::<_, String>((db::SqliteDb::new(pool), data_dir))
+    };
+    let (db, data_dir) = match opened.await {
+        Ok(opened) => opened,
+        Err(error) => {
+            eprintln!(
+                "The workspace root was not moved: the database could not be opened ({error})."
+            );
+            return 1;
+        }
+    };
+    let request = services::workspace_root::migrate::MigrateRequest::new(
+        data_dir,
+        target,
+        std::env::temp_dir(),
+        config.workspace.min_free_bytes,
+    );
+    match services::workspace_root::migrate::migrate(&db, &request).await {
+        Ok(report) => {
+            print!("{report}");
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn absolute_path(path: PathBuf) -> std::io::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path)
@@ -720,6 +783,49 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:49152".parse().expect("addr parses");
 
         assert_eq!(server_url_for_addr(addr), "http://127.0.0.1:49152");
+    }
+}
+
+#[cfg(test)]
+mod migrate_workspace_root_tests {
+    use super::*;
+
+    #[test]
+    fn flag_takes_an_optional_target_and_excludes_a_server_start() {
+        assert_eq!(
+            Cli::try_parse_from(["forge"])
+                .unwrap()
+                .migrate_workspace_root,
+            None
+        );
+        assert_eq!(
+            Cli::try_parse_from(["forge", "--migrate-workspace-root"])
+                .unwrap()
+                .migrate_workspace_root,
+            Some(None)
+        );
+        assert_eq!(
+            Cli::try_parse_from(["forge", "--migrate-workspace-root", "/srv/forge/worktrees"])
+                .unwrap()
+                .migrate_workspace_root,
+            Some(Some(PathBuf::from("/srv/forge/worktrees")))
+        );
+        let with_data_dir =
+            Cli::try_parse_from(["forge", "--data-dir", "./test", "--migrate-workspace-root"])
+                .unwrap();
+        assert_eq!(with_data_dir.migrate_workspace_root, Some(None));
+        for other in [
+            "--demo",
+            "--no-mcp",
+            "--no-embedded-daemon",
+            "--reclaim-workspace-gc",
+            "--convert-db-to-incremental-vacuum",
+        ] {
+            assert!(
+                Cli::try_parse_from(["forge", "--migrate-workspace-root", other]).is_err(),
+                "{other}"
+            );
+        }
     }
 }
 
