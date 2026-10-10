@@ -114,12 +114,25 @@ impl CommandBuilder {
 /// The child also learns its Task, execution, and outbox (see
 /// [`executors::execution_outbox_path`]); the outbox is created here so the
 /// harness can write to it without first discovering that it is missing.
-pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionContext) {
+///
+/// The returned scope owns the execution's temp directory (`TMPDIR`, `TMP`,
+/// `TEMP` inside the Task root): hold it until the child has exited.
+#[must_use = "dropping the scope removes the execution's temp directory"]
+pub fn run_in_task_worktree(
+    command: &mut Command,
+    ctx: &executors::ExecutionContext,
+) -> executors::sandbox::RunScope {
     // The Project environment goes first so Forge's own variables below
     // always win.
     let environment = executors::environment::task_environment(&ctx.agent_config);
     command.envs(&environment);
-    executors::run_process::apply(command, &environment);
+    let run_scope = executors::sandbox::SandboxEnv::for_run(
+        std::path::Path::new(&ctx.worktree_path),
+        &ctx.execution_id,
+        executors::sandbox::RunPurpose::Execution,
+    )
+    .scoped();
+    executors::run_process::apply_sandboxed(command, &environment, run_scope.env());
     command
         .current_dir(&ctx.worktree_path)
         .env("PWD", &ctx.worktree_path)
@@ -129,7 +142,7 @@ pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionCon
         std::path::Path::new(&ctx.worktree_path),
         &ctx.execution_id,
     ) else {
-        return;
+        return run_scope;
     };
     match std::fs::create_dir_all(&outbox) {
         Ok(()) => {
@@ -148,6 +161,7 @@ pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionCon
             "execution outbox could not be created; worklog and evidence will not be delivered"
         ),
     }
+    run_scope
 }
 
 #[cfg(test)]
@@ -239,7 +253,7 @@ mod worktree_tests {
             log_sender: None,
         };
         let mut command = CommandBuilder::new("true").build();
-        run_in_task_worktree(&mut command, &ctx);
+        let _run_scope = run_in_task_worktree(&mut command, &ctx);
 
         let std_command = command.as_std();
         assert_eq!(std_command.get_current_dir(), Some(worktree.as_path()));
@@ -289,7 +303,7 @@ mod worktree_tests {
         };
         let mut command = CommandBuilder::new("true").build();
 
-        run_in_task_worktree(&mut command, &ctx);
+        let _run_scope = run_in_task_worktree(&mut command, &ctx);
 
         assert!(
             command
@@ -322,7 +336,7 @@ mod run_budget_tests {
             log_sender: None,
         };
         let mut command = CommandBuilder::new("codex").build();
-        run_in_task_worktree(&mut command, &ctx);
+        let _run_scope = run_in_task_worktree(&mut command, &ctx);
         let envs: std::collections::BTreeMap<_, _> = command
             .as_std()
             .get_envs()
@@ -344,5 +358,67 @@ mod run_budget_tests {
                 Some(&std::env::var_os(key).unwrap_or(default.into()))
             );
         }
+    }
+
+    fn launch_ctx(worktree: &std::path::Path, execution_id: &str) -> executors::ExecutionContext {
+        executors::ExecutionContext {
+            task_id: "t".to_owned(),
+            execution_id: execution_id.to_owned(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            description: String::new(),
+            agent_config: serde_json::json!({}),
+            logs_path: String::new(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        }
+    }
+
+    /// Every CLI adapter launches through `CommandBuilder::build` (which
+    /// copies the server environment, `TMPDIR` included) and then
+    /// `run_in_task_worktree`.
+    #[tokio::test]
+    async fn adapter_launch_gets_a_task_root_tmpdir_that_goes_when_the_execution_returns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        for (script, code) in [("exit 0", 0), ("exit 3", 3)] {
+            let mut command = CommandBuilder::new("sh")
+                .adapter_args(vec![
+                    "-c".into(),
+                    format!("touch \"$TMPDIR/made\"; printf '%s' \"$TMPDIR\"; {script}"),
+                ])
+                .build();
+            command.env("TMPDIR", "/server/tmp");
+            let run_scope = run_in_task_worktree(&mut command, &launch_ctx(&worktree, "exec-1"));
+            let output = command.output().await.expect("child runs");
+            assert_eq!(output.status.code(), Some(code));
+            let seen = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap());
+            assert_eq!(
+                seen,
+                worktree.parent().unwrap().join(".forge-task/tmp/exec1")
+            );
+            assert!(seen.join("made").exists());
+            // Success, failure and cancellation all end the adapter's
+            // `execute`, which drops the scope.
+            drop(run_scope);
+            assert!(!seen.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_launch_in_an_unreserved_task_root_keeps_the_inherited_tmpdir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("legacy").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let mut command = CommandBuilder::new("sh")
+            .adapter_args(vec!["-c".into(), "printf '%s' \"$TMPDIR\"".into()])
+            .build();
+        command.env("TMPDIR", "/server/tmp");
+        let _run_scope = run_in_task_worktree(&mut command, &launch_ctx(&worktree, "exec-1"));
+        let output = command.output().await.expect("child runs");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "/server/tmp");
+        assert!(!worktree.parent().unwrap().join(".forge-task").exists());
     }
 }

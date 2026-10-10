@@ -389,9 +389,18 @@ impl LifecycleHookRunner {
         };
         let environment_preview = environment_preview(ctx);
 
+        // The hook's temp directory lives until this function returns.
+        let run_scope = ctx.worktree_path.as_deref().map_or_else(
+            || executors::sandbox::SandboxEnv::none().scoped(),
+            |worktree| {
+                executors::sandbox::SandboxEnv::for_command(
+                    std::path::Path::new(worktree),
+                    executors::sandbox::RunPurpose::Hook,
+                )
+            },
+        );
         let mut child_command = Command::new("bash");
-        executors::run_process::apply(&mut child_command, &ctx.env);
-        let child = match child_command
+        child_command
             .arg("-lc")
             .arg(command)
             .current_dir(&working_dir)
@@ -419,9 +428,9 @@ impl LifecycleHookRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        executors::run_process::apply_sandboxed(&mut child_command, &ctx.env, run_scope.env());
+        let child = match child_command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -1024,5 +1033,31 @@ mod tests {
         assert!(!run.timed_out);
         let log_path = run.log_path.as_deref().expect("log path");
         assert!(std::path::Path::new(log_path).exists());
+    }
+
+    #[tokio::test]
+    async fn script_hook_gets_a_task_root_tmpdir_removed_after_success_failure_and_timeout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        let tmp_root = worktree.parent().unwrap().join(".forge-task/tmp");
+        let seen_file = temp.path().join("seen");
+        for (tail, timeout_seconds) in [("exit 0", 5), ("exit 7", 5), ("sleep 30", 1)] {
+            let hooks = vec![api_types::LifecycleHookDef::Script {
+                command: format!(
+                    "touch \"$TMPDIR/made\" && printf '%s' \"$TMPDIR\" > {}; {tail}",
+                    seen_file.display()
+                ),
+                timeout_seconds,
+                blocking: true,
+            }];
+            let failure =
+                LifecycleHookRunner::run_blocking_before_work_hooks(ctx(&worktree), &hooks).await;
+            assert_eq!(failure.is_some(), tail != "exit 0");
+            let seen = std::path::PathBuf::from(std::fs::read_to_string(&seen_file).unwrap());
+            assert_eq!(seen.parent(), Some(tmp_root.as_path()));
+            assert_eq!(std::fs::read_dir(&tmp_root).unwrap().count(), 0, "{tail}");
+        }
     }
 }

@@ -56,6 +56,8 @@ async fn discard_execution_plan_artifacts(db: &SqliteDb, execution: &Execution) 
         return;
     };
     let worktree = path.as_path();
+    // A run that died with the process never removed its temp directory.
+    executors::sandbox::settle_run(worktree, &execution.id);
     if let Some(outbox) = executors::execution_outbox_path(worktree, &execution.id) {
         if let Err(error) = std::fs::remove_dir_all(&outbox) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -83,6 +85,45 @@ pub struct CrashRecovery {
 impl CrashRecovery {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self { db, event_bus }
+    }
+
+    /// Remove the per-run temp directories the previous process left in
+    /// server-owned Task roots. Hooks, checks and tool commands die with the
+    /// process; an execution still recorded as running keeps its directory
+    /// (an owner may still be running it) and loses it when it is settled.
+    async fn sweep_dead_run_temp_dirs(&self) -> Result<()> {
+        let live: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM execution WHERE status = 'running'")
+                .fetch_all(self.db.pool())
+                .await?;
+        let mut task_root_dirs = HashSet::new();
+        for placement in
+            WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Ready).await?
+        {
+            if let Some(dir) = crate::workspace_manager::task_root_anchor_of(&placement)
+                .ok()
+                .and_then(|worktree| Some(worktree.parent()?.parent()?.to_path_buf()))
+            {
+                task_root_dirs.insert(dir);
+            }
+        }
+        let swept = tokio::task::spawn_blocking(move || {
+            task_root_dirs
+                .iter()
+                .map(|dir| {
+                    executors::sandbox::sweep_dead_runs(dir, live.iter().map(String::as_str))
+                })
+                .sum::<usize>()
+        })
+        .await
+        .unwrap_or(0);
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "removed temp directories of runs that did not settle"
+            );
+        }
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -116,6 +157,7 @@ impl CrashRecovery {
                 }
             }
         }
+        self.sweep_dead_run_temp_dirs().await?;
         // Expire stale grants before recovering active Tasks. The recovery
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.

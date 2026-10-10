@@ -22,6 +22,11 @@ pub enum WorkspaceError {
     #[error("workspace not found")]
     NotFound,
 
+    /// The worktree would take a directory name Forge keeps for itself in
+    /// every Task root.
+    #[error("repository name {name:?} is reserved by Forge; rename the repository")]
+    ReservedName { name: String },
+
     #[error("git error: {0}")]
     Git(#[from] git::GitError),
 
@@ -30,6 +35,31 @@ pub enum WorkspaceError {
 }
 
 pub type Result<T> = std::result::Result<T, WorkspaceError>;
+
+/// The directory beside the worktree that holds a Task's run temp
+/// directories, managed homes and build output (`executors::sandbox`).
+pub const RESERVED_TASK_DIR_NAME: &str = ".forge-task";
+
+/// Mark a Task root this manager just created as Forge's, so the runs in its
+/// worktree get their temp directory, managed homes and build directory there.
+async fn reserve_task_dir(task_root: &Path) -> Result<()> {
+    match fs::create_dir(task_root.join(RESERVED_TASK_DIR_NAME)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A worktree is `<root>/<task>/<name>`; `<root>/<task>/.forge-task` is
+/// Forge's, so a repository of that name cannot have a worktree.
+fn refuse_reserved_name(name: &str) -> Result<()> {
+    if name.eq_ignore_ascii_case(RESERVED_TASK_DIR_NAME) {
+        return Err(WorkspaceError::ReservedName {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
 
 fn git_command() -> Command {
     let mut command = Command::new("git");
@@ -77,6 +107,7 @@ impl WorkspaceManager {
         repo_name: &str,
         base_branch: &str,
     ) -> Result<PathBuf> {
+        refuse_reserved_name(repo_name)?;
         let task_root = self.root.join(task_id);
         let worktree_path = task_root.join(repo_name);
 
@@ -85,6 +116,7 @@ impl WorkspaceManager {
         }
 
         fs::create_dir_all(&task_root).await?;
+        reserve_task_dir(&task_root).await?;
 
         let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
             Some(locks.acquire(repo_url).await)
@@ -135,6 +167,7 @@ impl WorkspaceManager {
         name: &str,
         base_branch: &str,
     ) -> Result<PathBuf> {
+        refuse_reserved_name(name)?;
         let owner_root = self.root.join(owner_id);
         let worktree_path = owner_root.join(name);
 
@@ -234,6 +267,7 @@ impl WorkspaceManager {
         repo_name: &str,
         existing_branch: &str,
     ) -> Result<PathBuf> {
+        refuse_reserved_name(repo_name)?;
         let task_root = self.root.join(task_id);
         let worktree_path = task_root.join(repo_name);
 
@@ -242,6 +276,7 @@ impl WorkspaceManager {
         }
 
         fs::create_dir_all(&task_root).await?;
+        reserve_task_dir(&task_root).await?;
 
         let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
             Some(locks.acquire(repo_url).await)
@@ -1449,5 +1484,86 @@ mod tests {
         assert!(registrations(&repo_path)
             .await
             .contains(user_worktree.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn repository_named_like_the_reserved_task_directory_is_refused() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let manager = WorkspaceManager::new(workspace_dir.path().to_path_buf());
+        let repo = repo_path.to_str().unwrap();
+        for name in [".forge-task", ".Forge-Task"] {
+            for result in [
+                manager
+                    .create_worktree_named(repo, "task-1", name, "HEAD")
+                    .await,
+                manager
+                    .recover_worktree_named(repo, "task-1", name, "main")
+                    .await,
+                manager
+                    .create_detached_worktree_named(repo, "task-1", name, "HEAD")
+                    .await,
+            ] {
+                assert!(
+                    matches!(result, Err(WorkspaceError::ReservedName { name: ref refused }) if refused == name),
+                    "{result:?}"
+                );
+            }
+        }
+        // Refused before anything is created.
+        assert!(!workspace_dir.path().join("task-1").exists());
+    }
+
+    /// `.forge-task` is beside the worktree, so Git never sees it: not as
+    /// dirt, not in `git clean`; and cleanup takes it with the Task root even
+    /// when a build left read-only files there. The repository here is a
+    /// user's own local checkout, the same shape as Forge's clone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reserved_task_directory_is_invisible_to_git_and_removed_by_cleanup() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let manager = WorkspaceManager::new(workspace_dir.path().to_path_buf());
+        let worktree_path = manager
+            .create_worktree(repo_path.to_str().unwrap(), "task-1", "HEAD")
+            .await
+            .unwrap();
+        let task_root = workspace_dir.path().join("task-1");
+        let reserved = task_root.join(RESERVED_TASK_DIR_NAME);
+        let registry = reserved.join("build/cargo/registry");
+        fs::create_dir_all(&registry).await.unwrap();
+        fs::create_dir_all(reserved.join("tmp/run")).await.unwrap();
+        fs::create_dir_all(reserved.join("home/codex"))
+            .await
+            .unwrap();
+        fs::write(registry.join("lib.rlib"), "object")
+            .await
+            .unwrap();
+        set_mode(&registry.join("lib.rlib"), 0o400);
+        set_mode(&registry, 0o500);
+        set_mode(&reserved.join("build/cargo"), 0o500);
+
+        let git = |args: &'static [&'static str]| {
+            let worktree_path = worktree_path.clone();
+            async move {
+                let output = git_command()
+                    .args(args)
+                    .current_dir(&worktree_path)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                String::from_utf8(output.stdout).unwrap()
+            }
+        };
+        assert_eq!(git(&["status", "--porcelain", "--ignored"]).await, "");
+        assert_eq!(git(&["clean", "-fdxn"]).await, "");
+        assert!(registry.join("lib.rlib").exists());
+
+        manager
+            .cleanup_worktree("task-1", &repo_path, &worktree_path)
+            .await
+            .unwrap();
+        assert!(!task_root.exists());
     }
 }

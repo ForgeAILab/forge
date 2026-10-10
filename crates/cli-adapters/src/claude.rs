@@ -259,7 +259,8 @@ impl ClaudeCodeAdapter {
         let worktree = Path::new(&ctx.worktree_path);
         let mut cmd =
             Self::build_command_for_cwd(&config, resume_session_id.as_deref(), Some(worktree));
-        crate::command::run_in_task_worktree(&mut cmd, &ctx);
+        // Owns the execution's temp directory until this execution returns.
+        let _run_scope = crate::command::run_in_task_worktree(&mut cmd, &ctx);
         let run_started_at = std::time::SystemTime::now();
         let claude_home = dirs::home_dir();
 

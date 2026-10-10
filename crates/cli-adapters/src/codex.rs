@@ -372,10 +372,23 @@ impl CodexAdapter {
         if executors::task_role(&ctx.agent_config).is_none() {
             return Ok(None);
         }
-        let logs_parent = Path::new(&ctx.logs_path).parent().ok_or_else(|| {
-            ExecutorError::Other("managed Codex execution has no log directory".to_owned())
-        })?;
-        let managed_home = logs_parent.join(".codex-managed-home");
+        let legacy_home = Path::new(&ctx.logs_path)
+            .parent()
+            .map(|logs| logs.join(".codex-managed-home"));
+        // The home belongs to the Task root, so two executions of different
+        // Tasks never share or reset one home, wherever their logs go.
+        let managed_home =
+            match executors::sandbox::TaskRoot::of_worktree(Path::new(&ctx.worktree_path)) {
+                Some(task_root) => {
+                    let home = task_root.home("codex");
+                    adopt_legacy_managed_home(legacy_home.as_deref(), &home, &ctx.task_id);
+                    home
+                }
+                // A Task root Forge did not reserve keeps the home beside its logs.
+                None => legacy_home.ok_or_else(|| {
+                    ExecutorError::Other("managed Codex execution has no log directory".to_owned())
+                })?,
+            };
         prepare_managed_codex_home(&managed_home, &ambient_codex_home())?;
         Ok(Some(managed_home))
     }
@@ -553,11 +566,25 @@ impl CodingExecutorAdapter for CodexAdapter {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
         let managed_codex_home = Self::managed_codex_home(&ctx)?;
-        let managed_scratch_root = managed_codex_home
-            .as_ref()
-            .map(|home| home.join("task-scratch"));
         let mut command = Self::build_command(&config, managed_codex_home.as_deref());
-        crate::command::run_in_task_worktree(&mut command, &ctx);
+        // Owns the execution's temp directory until this execution returns.
+        let run_scope = crate::command::run_in_task_worktree(&mut command, &ctx);
+        // The Worker's TMPDIR: the per-run directory of the Task root, or the
+        // home's own scratch when the Task root is not Forge's.
+        let managed = ManagedRoots {
+            scratch: managed_codex_home.as_ref().map(|home| {
+                run_scope
+                    .env()
+                    .tmp_dir()
+                    .map_or_else(|| home.join("task-scratch"), Path::to_path_buf)
+            }),
+            build: managed_codex_home
+                .as_ref()
+                .and_then(|_| run_scope.env().build_dir("CARGO_TARGET_DIR"))
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+            home: managed_codex_home,
+        };
         let mut child = command.group_spawn()?;
 
         let stdout = match child.inner().stdout.take() {
@@ -617,7 +644,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             .drive_codex(
                 ctx.clone(),
                 config,
-                managed_scratch_root,
+                managed,
                 stdin,
                 stdout,
                 stderr_rx,
@@ -811,7 +838,7 @@ impl CodexAdapter {
         &self,
         ctx: ExecutionContext,
         config: CodexConfig,
-        managed_scratch_root: Option<PathBuf>,
+        managed: ManagedRoots,
         stdin: tokio::process::ChildStdin,
         stdout: tokio::process::ChildStdout,
         stderr_rx: mpsc::Receiver<String>,
@@ -841,7 +868,7 @@ impl CodexAdapter {
                     "approval_policy": "never",
                     "isolated_codex_home": true,
                     "ambient_temp_roots_writable": false,
-                    "task_scratch_root": managed_scratch_root.as_ref().map(|path| path.display().to_string()),
+                    "task_scratch_root": managed.scratch.as_ref().map(|path| path.display().to_string()),
                 }),
             )
             .await?;
@@ -876,7 +903,7 @@ impl CodexAdapter {
                 let daemon_root = ctx.agent_config["_forge_workspace_root"]
                     .as_str()
                     .map(Path::new);
-                let managed_home = managed_scratch_root.as_deref().and_then(Path::parent);
+                let managed_home = managed.home.as_deref();
                 let cache_roots = home.as_deref().map_or_else(Vec::new, |home| {
                     package_cache_roots(home, |key| std::env::var_os(key))
                         .into_iter()
@@ -895,18 +922,27 @@ impl CodexAdapter {
                 });
                 // Forge creates these exact delivery/scratch directories. Cache
                 // configuration must never grant additional Task or daemon paths.
-                let scratch =
-                    managed_home.map(|home| resolve_path_for_overlap(home).join("task-scratch"));
+                let scratch = managed.scratch.as_deref().map(resolve_path_for_overlap);
+                // The per-Task build directory sits beside the worktree, so
+                // a build that follows CARGO_TARGET_DIR must be able to write it.
+                let build = managed.build.as_deref().and_then(|build| {
+                    std::fs::create_dir_all(build).ok()?;
+                    Some(resolve_path_for_overlap(build))
+                });
                 let outbox = Path::new(&ctx.worktree_path).parent().map(|task| {
                     resolve_path_for_overlap(task)
                         .join(".forge-outbox")
                         .join(&ctx.execution_id)
                 });
-                managed_scratch_root.iter().cloned()
+                managed.scratch.iter().cloned()
+                    .chain(managed.build.iter().cloned())
                     .chain(executors::execution_outbox_path(Path::new(&ctx.worktree_path), &ctx.execution_id))
                     .filter_map(|root| {
                         let resolved = resolve_path_for_overlap(&root);
-                        if scratch.as_ref() == Some(&resolved) || outbox.as_ref() == Some(&resolved) {
+                        if scratch.as_ref() == Some(&resolved)
+                            || build.as_ref() == Some(&resolved)
+                            || outbox.as_ref() == Some(&resolved)
+                        {
                             Some(resolved)
                         } else {
                             tracing::warn!(root = %root.display(), resolved = %resolved.display(), "dropped redirected Codex scratch or outbox root");
@@ -1269,6 +1305,42 @@ fn dirs_path(name: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(format!(".{name}"))
+}
+
+/// The directories outside the worktree a managed Codex execution uses.
+#[derive(Debug, Default)]
+struct ManagedRoots {
+    home: Option<PathBuf>,
+    /// The Worker's `TMPDIR`.
+    scratch: Option<PathBuf>,
+    /// `<task root>/.forge-task/build`, when the Task root is Forge's.
+    build: Option<PathBuf>,
+}
+
+/// Move a Task's managed home from its pre-0.14 place beside the logs into
+/// the Task root, so a Task that resumes after the upgrade keeps its Codex
+/// sessions. Only the server layout (`logs/<project>/<task>/`) is per Task;
+/// the old daemon home was shared by every execution and is left alone.
+/// Any failure leaves a fresh home to be created.
+fn adopt_legacy_managed_home(legacy: Option<&Path>, home: &Path, task_id: &str) {
+    let Some(legacy) = legacy else { return };
+    let per_task = legacy
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == task_id);
+    let is_dir = |path: &Path| {
+        path.symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    if !per_task || home.symlink_metadata().is_ok() || !is_dir(legacy) {
+        return;
+    }
+    let Some(parent) = home.parent() else { return };
+    if std::fs::create_dir_all(parent).is_ok() {
+        if let Err(error) = std::fs::rename(legacy, home) {
+            tracing::warn!(from = %legacy.display(), to = %home.display(), %error, "could not move the managed Codex home into the Task root; a fresh one is created");
+        }
+    }
 }
 
 fn ambient_codex_home() -> PathBuf {
@@ -2434,6 +2506,94 @@ mod tests {
             0,
             "the next execution starts from an empty scratch directory"
         );
+    }
+
+    fn managed_ctx(worktree: &Path, task_id: &str, logs_path: &Path) -> ExecutionContext {
+        let mut agent_config = json!({});
+        executors::mark_task_role(&mut agent_config, "coder");
+        ExecutionContext {
+            task_id: task_id.to_owned(),
+            execution_id: format!("exec-{task_id}"),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            description: String::new(),
+            agent_config,
+            logs_path: logs_path.to_string_lossy().into_owned(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        }
+    }
+
+    /// A daemon writes every execution log into one flat directory. The home
+    /// used to be derived from it, so concurrent executions of different
+    /// Tasks shared and reset one home.
+    #[test]
+    fn concurrent_codex_executions_of_two_tasks_get_distinct_homes_in_their_task_roots() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let logs = dir.path().join("execution-logs");
+        let mut homes = Vec::new();
+        for task in ["task-a", "task-b"] {
+            let worktree = dir.path().join(task).join("repo");
+            fs::create_dir_all(&worktree).expect("worktree creates");
+            executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+            let ctx = managed_ctx(&worktree, task, &logs.join(format!("{task}.jsonl")));
+            let home = CodexAdapter::managed_codex_home(&ctx)
+                .expect("home prepares")
+                .expect("managed execution has a home");
+            assert_eq!(home, dir.path().join(task).join(".forge-task/home/codex"));
+            assert!(home.join("config.toml").is_file());
+            homes.push(home);
+        }
+        // Preparing the second home reset nothing in the first.
+        fs::write(homes[0].join("config.toml"), "first").expect("marker writes");
+        let worktree = dir.path().join("task-b/repo");
+        CodexAdapter::managed_codex_home(&managed_ctx(&worktree, "task-b", &logs.join("b.jsonl")))
+            .expect("home prepares again");
+        assert_eq!(
+            fs::read_to_string(homes[0].join("config.toml")).unwrap(),
+            "first"
+        );
+        assert!(!logs.join(".codex-managed-home").exists());
+    }
+
+    #[test]
+    fn managed_codex_home_adopts_the_per_task_legacy_home_and_legacy_roots_keep_theirs() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        // Server layout before the move: logs/<project>/<task>/.codex-managed-home.
+        let logs = dir.path().join("logs/project/task-a");
+        let legacy = logs.join(".codex-managed-home");
+        fs::create_dir_all(legacy.join("sessions")).expect("legacy home creates");
+        fs::write(legacy.join("sessions/rollout.jsonl"), "thread").expect("session writes");
+        let worktree = dir.path().join("task-a/repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        let home = CodexAdapter::managed_codex_home(&managed_ctx(
+            &worktree,
+            "task-a",
+            &logs.join("exec.jsonl"),
+        ))
+        .expect("home prepares")
+        .expect("managed home");
+        assert_eq!(home, dir.path().join("task-a/.forge-task/home/codex"));
+        assert_eq!(
+            fs::read_to_string(home.join("sessions/rollout.jsonl")).unwrap(),
+            "thread"
+        );
+        assert!(!legacy.exists());
+
+        // A Task root Forge did not reserve: today's home, nothing beside it.
+        let unreserved = dir.path().join("user/repo");
+        fs::create_dir_all(&unreserved).expect("worktree creates");
+        let logs = dir.path().join("logs/project/task-b");
+        let home = CodexAdapter::managed_codex_home(&managed_ctx(
+            &unreserved,
+            "task-b",
+            &logs.join("exec.jsonl"),
+        ))
+        .expect("home prepares")
+        .expect("managed home");
+        assert_eq!(home, logs.join(".codex-managed-home"));
+        assert!(!dir.path().join("user/.forge-task").exists());
     }
 
     #[test]

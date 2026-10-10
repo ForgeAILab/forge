@@ -2935,7 +2935,12 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
-    executors::run_process::apply(&mut command, environment);
+    // One temp directory per command, inside the Task root, removed when
+    // the command returns. The environment is cleared above, so without it a
+    // child falls back to the shared platform temp directory.
+    let run_scope =
+        executors::sandbox::SandboxEnv::for_command(root, executors::sandbox::RunPurpose::Command);
+    executors::run_process::apply_sandboxed(&mut command, environment, run_scope.env());
     let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;

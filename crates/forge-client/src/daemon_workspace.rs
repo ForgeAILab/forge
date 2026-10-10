@@ -167,6 +167,16 @@ impl DaemonWorkspaceBackend {
                 }
             }
         }
+        // No run survives a daemon restart, so every per-run temp directory
+        // left under an owned Task root belongs to a dead run.
+        let swept =
+            executors::sandbox::sweep_dead_runs(&workspace_root.join(WORKTREE_DIRECTORY), []);
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "removed temp directories of runs that did not settle"
+            );
+        }
         let state = journal.load_workspace_state()?;
         object_transfer::sweep_at_start(&workspace_root, &state);
         Ok(Self {
@@ -1052,7 +1062,11 @@ impl DaemonWorkspaceBackend {
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE");
-            executors::run_process::apply(&mut command, &params.env);
+            let run_scope = executors::sandbox::SandboxEnv::for_command(
+                path,
+                executors::sandbox::RunPurpose::Probe,
+            );
+            executors::run_process::apply_sandboxed(&mut command, &params.env, run_scope.env());
             let output =
                 bounded_command_inner(command, check.timeout_seconds, 4096, true, true).await?;
             let raw = [output.stdout, output.stderr].concat();
@@ -1405,6 +1419,12 @@ impl DaemonWorkspaceBackend {
         }
         let path = confined_existing(&owned.path, &self.workspace_root)?;
         verify_git_dir(&path, &self.workspace_root).await?;
+        // `<root>/.forge/workspaces/<handle>/` is this daemon's Task root:
+        // reserve `.forge-task` beside the worktree for run temp directories,
+        // managed homes and build output.
+        if let Some(task_root) = path.parent() {
+            executors::sandbox::TaskRoot::reserve(task_root).map_err(io_error)?;
+        }
         if !owned.prepared {
             if git::branch_exists(&repo_path, &owned.branch)
                 .await
@@ -1596,7 +1616,16 @@ impl DaemonWorkspaceBackend {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE");
-        executors::run_process::apply(&mut command, &params.env.iter().cloned().collect());
+        // The command's temp directory, removed when this call returns.
+        let run_scope = executors::sandbox::SandboxEnv::for_command(
+            &owned.path,
+            executors::sandbox::RunPurpose::Check,
+        );
+        executors::run_process::apply_sandboxed(
+            &mut command,
+            &params.env.iter().cloned().collect(),
+            run_scope.env(),
+        );
         // Persist the version before launching; journal pressure after the
         // command exits must never discard its exit result.
         owned.version += 1;
