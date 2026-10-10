@@ -4707,16 +4707,21 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
         .filter(|receipt| receipt.request.kind == db::IntegrationOperationKind::Rebase)
         .collect::<Vec<_>>()
     };
-    queue_eventually!(&fixture, &head, "the head to continue from the owner's receipt", {
-        let attempt = queue_attempt(&fixture, &head).await;
-        attempt.candidate_sha.as_deref() == Some(rebased.as_str())
-            && !matches!(
-                attempt.state,
-                db::IntegrationAttemptState::Reconciling
-                    | db::IntegrationAttemptState::Quarantined
-                    | db::IntegrationAttemptState::Rebasing
-            )
-    });
+    queue_eventually!(
+        &fixture,
+        &head,
+        "the head to continue from the owner's receipt",
+        {
+            let attempt = queue_attempt(&fixture, &head).await;
+            attempt.candidate_sha.as_deref() == Some(rebased.as_str())
+                && !matches!(
+                    attempt.state,
+                    db::IntegrationAttemptState::Reconciling
+                        | db::IntegrationAttemptState::Quarantined
+                        | db::IntegrationAttemptState::Rebasing
+                )
+        }
+    );
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     let attempt = queue_attempt(&fixture, &head).await;
