@@ -3398,8 +3398,15 @@ field.
     not creatable or writable, `sccache` socket path over 100 bytes or its
     server not starting: the run gets no wrapper, and one warning per cause
     is logged per process. After three failed server starts in a row for a
-    store, runs skip the start for ten minutes (a start may block a run's
-    start for up to ten seconds). Compilers are never given a timeout.
+    store, runs skip the start for ten minutes. A start can take ten
+    seconds and never runs on an async worker: a run's start awaits it on
+    the blocking pool (`sandbox::start_compiler_cache`) while every other
+    task keeps being polled, and the sandbox constructors themselves never
+    wait: with the server not up they hand its start to a thread of its
+    own and offer that one run no wrapper (owner-local review steps and
+    hooks built without a run scope take this path). The `--version` probe
+    (five seconds at most) runs once, at process start. Compilers are never
+    given a timeout.
   - `sccache` keeps one server per socket, and the server keeps the cache
     directory and the environment it started with. Forge therefore starts
     it itself, once per store (`--start-server` with the store's socket, a

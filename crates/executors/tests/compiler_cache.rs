@@ -153,8 +153,18 @@ fn two_task_worktrees_of_one_repository_call_the_wrapper_with_one_store() {
     );
 
     let mut target_dirs = Vec::new();
+    let mut server = None;
     for task in ["task-a", "task-b"] {
         let worktree = task_worktree(&root, &repo, task);
+        executors::sandbox::start_compiler_cache_blocking(&worktree);
+        // The stand-in wrapper starts no server: answer on the store's
+        // socket as a started one does.
+        server.get_or_insert_with(|| {
+            std::os::unix::net::UnixListener::bind(
+                root.join(compiler_cache::CACHE_DIR).join("repo-1").join("s"),
+            )
+            .unwrap()
+        });
         let scope = SandboxEnv::for_run(&worktree, task, RunPurpose::Execution).scoped();
         let mut command = Command::new("sh");
         command
@@ -258,6 +268,9 @@ fn app_with_a_shared_dependency(base: &Path, root: &Path) -> PathBuf {
 /// gives the run. The run's temp directory is removed when this returns.
 fn cargo_build(root: &Path, repo: &Path, task: &str, store: &Path) {
     let worktree = task_worktree(root, repo, task);
+    // What a run's start awaits: the sandbox constructors never wait for a
+    // server that is not up yet.
+    executors::sandbox::start_compiler_cache_blocking(&worktree);
     let scope = SandboxEnv::for_run(&worktree, task, RunPurpose::Execution).scoped();
     assert_eq!(
         scope.env().compiler_cache().and_then(|cache| cache.dir()),

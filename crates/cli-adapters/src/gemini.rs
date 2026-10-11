@@ -222,6 +222,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
                 .find(|(name, _)| *name == std::ffi::OsStr::new(key))
                 .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
         });
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = crate::command::run_in_task_worktree_with(&mut cmd, &ctx, |sandbox| {
             if sandboxed {
                 executors::sandbox::SandboxEnv::none()

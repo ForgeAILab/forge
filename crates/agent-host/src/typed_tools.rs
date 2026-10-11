@@ -2935,6 +2935,7 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
+    executors::sandbox::start_compiler_cache(root).await;
     // One temp directory per command, inside the Task root, removed when
     // the command returns. The environment is cleared above, so without it a
     // child falls back to the shared platform temp directory.

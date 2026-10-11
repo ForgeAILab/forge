@@ -266,6 +266,7 @@ mod worktree_tests {
             log_sender: None,
         };
         let mut command = CommandBuilder::new("true").build();
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = run_in_task_worktree(&mut command, &ctx);
 
         let std_command = command.as_std();
@@ -316,6 +317,7 @@ mod worktree_tests {
         };
         let mut command = CommandBuilder::new("true").build();
 
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = run_in_task_worktree(&mut command, &ctx);
 
         assert!(
@@ -349,6 +351,7 @@ mod run_budget_tests {
             log_sender: None,
         };
         let mut command = CommandBuilder::new("codex").build();
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = run_in_task_worktree(&mut command, &ctx);
         let envs: std::collections::BTreeMap<_, _> = command
             .as_std()

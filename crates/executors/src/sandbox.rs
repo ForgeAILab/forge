@@ -181,6 +181,33 @@ pub fn hold_compiler_cache(worktree: &Path) -> CacheHold {
     CacheHold(store)
 }
 
+/// Make the shared compiler cache of the repository of `worktree` ready for
+/// a run that is about to start there, without blocking the async runtime.
+///
+/// Starting an sccache server can take the whole start timeout (10 s). The
+/// sandbox constructors never wait for that (the run would simply build
+/// without the wrapper); a caller on the runtime awaits this first, so the
+/// start happens on the blocking pool while every other task keeps being
+/// polled, and the run then finds the server running. Does nothing, and
+/// looks at nothing, when no cache is installed.
+pub async fn start_compiler_cache(worktree: &Path) {
+    if crate::compiler_cache::none_installed() {
+        return;
+    }
+    let worktree = worktree.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || start_compiler_cache_blocking(&worktree)).await;
+}
+
+/// [`start_compiler_cache`] for a thread that may block (never an async
+/// worker): returns once the store's server runs or its start has failed.
+pub fn start_compiler_cache_blocking(worktree: &Path) {
+    let cache = TaskRoot::of_worktree(worktree)
+        .and_then(|root| crate::compiler_cache::for_task_roots(root.0.parent()?));
+    if let Some(cache) = cache {
+        let _ = cache.for_worktree(worktree);
+    }
+}
+
 /// When this process first used the sandbox. Nothing it runs is older.
 pub fn process_start() -> SystemTime {
     *PROCESS_START
@@ -340,8 +367,13 @@ impl SandboxEnv {
 
     /// What the compiler cache installed for the workspace root of
     /// `task_root` offers a run in `worktree`.
+    ///
+    /// Never waits for a compiler-cache server to start: these constructors
+    /// are called on async workers. A caller that can await calls
+    /// [`start_compiler_cache`] first, so its run finds the server running.
     fn cache_of(task_root: &TaskRoot, worktree: &Path) -> Option<CacheEnv> {
-        crate::compiler_cache::for_task_roots(task_root.0.parent()?)?.for_worktree(worktree)
+        crate::compiler_cache::for_task_roots(task_root.0.parent()?)?
+            .for_worktree_without_waiting(worktree)
     }
 
     /// This environment with `cache` as its shared compiler cache.
@@ -1390,6 +1422,87 @@ mod tests {
         assert!(SandboxEnv::for_run(&first, "run-6", RunPurpose::Check)
             .compiler_cache()
             .is_none());
+    }
+
+    /// An sccache server start takes seconds. No sandbox constructor waits
+    /// for it, and the awaited start runs on the blocking pool: every other
+    /// future of a single-threaded runtime keeps being polled meanwhile.
+    #[test]
+    fn a_slow_compiler_cache_server_start_never_stalls_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        const START: Duration = Duration::from_secs(2);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        let worktree = cache_tests::linked_worktree(&root, "t1", "repo-slow");
+        let wrapper = dir.path().join("bin").join("sccache");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --start-server ] && sleep {}\nexit 0\n",
+                START.as_secs()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        compiler_cache::install(&root, Some(cache_tests::cache(&root, &wrapper)));
+        let store = root.join(CACHE_DIR).join("repo-slow");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // The constructors return at once and offer no wrapper while
+            // the server is not up: the run builds as it did before.
+            for build in [
+                (|w: &Path| SandboxEnv::for_run(w, "run-1", RunPurpose::Execution))
+                    as fn(&Path) -> SandboxEnv,
+                |w: &Path| SandboxEnv::for_task(w),
+            ] {
+                let called = Instant::now();
+                let env = build(&worktree);
+                assert!(called.elapsed() < START / 2, "{:?}", called.elapsed());
+                assert!(env.compiler_cache().is_none());
+            }
+
+            // The awaited start takes as long as the wrapper does, and the
+            // ticker beside it on the same thread never misses a beat.
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let longest_gap = std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO));
+            let ticker = tokio::spawn({
+                let (ticks, longest_gap) = (ticks.clone(), longest_gap.clone());
+                async move {
+                    let mut last = Instant::now();
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut gap = longest_gap.lock().unwrap();
+                        *gap = (*gap).max(last.elapsed());
+                        last = Instant::now();
+                    }
+                }
+            });
+            let started = Instant::now();
+            start_compiler_cache(&worktree).await;
+            let waited = started.elapsed();
+            ticker.abort();
+            assert!(waited >= START, "the start was awaited: {waited:?}");
+            let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(ticks >= 40, "other futures made progress: {ticks} ticks");
+            let gap = *longest_gap.lock().unwrap();
+            assert!(gap < START / 2, "no poll waited for the start: {gap:?}");
+        });
+
+        // With the server answering on its socket the constructors offer
+        // the wrapper, still without waiting.
+        let _server = std::os::unix::net::UnixListener::bind(store.join("s")).unwrap();
+        let called = Instant::now();
+        let env = SandboxEnv::for_run(&worktree, "run-2", RunPurpose::Execution);
+        assert!(called.elapsed() < START / 2);
+        assert_eq!(env.compiler_cache().and_then(CacheEnv::dir), Some(&*store));
+        compiler_cache::install(&root, None);
     }
 
     #[tokio::test]

@@ -225,7 +225,25 @@ impl CompilerCache {
     /// What a run in `worktree` gets, or `None` when the cache cannot be
     /// used there right now (the run then builds as it did before, and the
     /// reason is logged once per process).
+    ///
+    /// Blocks while an sccache server that is not running is started (up to
+    /// the start timeout): for a thread that may block. Code on an async
+    /// runtime calls [`crate::sandbox::start_compiler_cache`] instead, and
+    /// the sandbox constructors use [`Self::for_worktree_without_waiting`].
     pub fn for_worktree(&self, worktree: &Path) -> Option<CacheEnv> {
+        self.offer(worktree, ServerStart::Wait)
+    }
+
+    /// [`Self::for_worktree`] that never waits for a server start: when the
+    /// store's sccache server is not running, its start is handed to a
+    /// thread of its own and this run gets no wrapper (it builds as it did
+    /// before; the next run finds the server). Never blocks the caller for
+    /// longer than a socket connect and two small file writes.
+    pub fn for_worktree_without_waiting(&self, worktree: &Path) -> Option<CacheEnv> {
+        self.offer(worktree, ServerStart::Detached)
+    }
+
+    fn offer(&self, worktree: &Path, start: ServerStart) -> Option<CacheEnv> {
         if !is_executable(&self.wrapper) {
             warn_once(&WARNED_WRAPPER, || {
                 tracing::warn!(wrapper = %self.wrapper.display(), "the compiler-cache wrapper is missing or not executable: runs build without it");
@@ -258,8 +276,14 @@ impl CompilerCache {
                     return None;
                 }
                 let size = sccache_size(self.max_bytes);
-                if server_start_given_up(&dir) {
-                    return None;
+                if !sccache_running(&socket) {
+                    if server_start_given_up(&dir) {
+                        return None;
+                    }
+                    if start == ServerStart::Detached {
+                        start_server_detached(&self.wrapper, &dir, &socket, &size);
+                        return None;
+                    }
                 }
                 let started = ensure_sccache_server(&self.wrapper, &dir, &socket, &size)
                     .and_then(|()| write_sccache_launcher(&self.wrapper, &dir));
@@ -296,6 +320,15 @@ impl CompilerCache {
             vars,
         })
     }
+}
+
+/// What to do about an sccache server that is not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerStart {
+    /// Start it and wait for the start to return.
+    Wait,
+    /// Start it on a thread of its own and offer this run nothing.
+    Detached,
 }
 
 /// The compiler-cache part of one run's environment.
@@ -376,6 +409,76 @@ fn note_server_start(store: &Path, started: bool) {
             .entry(store.to_path_buf())
             .or_insert((0, Instant::now()));
         *entry = (entry.0.saturating_add(1), Instant::now());
+    }
+}
+
+/// Whether the sccache server of a store answers on `socket`.
+fn sccache_running(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// Stores whose sccache server a detached thread is starting right now.
+static STARTING: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    LazyLock::new(Mutex::default);
+
+/// Start the sccache server of `dir` on a thread of its own, one at a time
+/// per store. The caller does not wait: a start may take the whole start
+/// timeout, and the caller is usually an async worker with other tasks to
+/// poll. A start that returns without a server answering counts as a failed
+/// one, so a wrapper that cannot serve stops being tried.
+fn start_server_detached(wrapper: &Path, dir: &Path, socket: &Path, size: &str) {
+    if !STARTING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir.to_path_buf())
+    {
+        return;
+    }
+    let (wrapper, dir, socket, size) = (
+        wrapper.to_path_buf(),
+        dir.to_path_buf(),
+        socket.to_path_buf(),
+        size.to_owned(),
+    );
+    let store = dir.clone();
+    let spawned = std::thread::Builder::new()
+        .name("forge-sccache-start".to_owned())
+        .spawn(move || {
+            let started = ensure_sccache_server(&wrapper, &dir, &socket, &size)
+                .and_then(|()| write_sccache_launcher(&wrapper, &dir))
+                .and_then(|_| {
+                    if sccache_running(&socket) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(
+                            "--start-server returned but no server answers on the socket",
+                        ))
+                    }
+                });
+            note_server_start(&dir, started.is_ok());
+            if let Err(error) = started {
+                warn_once(&WARNED_SERVER, || {
+                    tracing::warn!(wrapper = %wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
+                });
+            }
+            STARTING
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&dir);
+        });
+    if spawned.is_err() {
+        STARTING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&store);
     }
 }
 
@@ -764,7 +867,7 @@ fn prepare_store(cache_dir: &Path, dir: &Path, kind: WrapperKind) -> io::Result<
 fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let running = || std::os::unix::net::UnixStream::connect(socket).is_ok();
+        let running = || sccache_running(socket);
         if running() {
             return Ok(());
         }

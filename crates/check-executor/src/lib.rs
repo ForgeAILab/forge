@@ -390,6 +390,7 @@ async fn run_command_group(
 ) -> Result<(CheckCommandReceipt, Option<u32>), String> {
     let started_at = now();
     let start = Instant::now();
+    executors::sandbox::start_compiler_cache(path).await;
     // Removed when this command returns: pass, fail, timeout or cancel.
     let run_scope =
         executors::sandbox::SandboxEnv::for_command(path, executors::sandbox::RunPurpose::Check);

@@ -584,6 +584,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             PermissionPolicy::Yolo
         );
         let managed_task = managed_codex_home.is_some();
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let run_scope = crate::command::run_in_task_worktree_with(&mut command, &ctx, |sandbox| {
             codex_admitted_sandbox(
                 sandbox,

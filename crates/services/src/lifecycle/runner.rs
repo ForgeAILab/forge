@@ -389,6 +389,9 @@ impl LifecycleHookRunner {
         };
         let environment_preview = environment_preview(ctx);
 
+        if let Some(worktree) = ctx.worktree_path.as_deref() {
+            executors::sandbox::start_compiler_cache(std::path::Path::new(worktree)).await;
+        }
         // The hook's temp directory lives until this function returns.
         let run_scope = ctx.worktree_path.as_deref().map_or_else(
             || executors::sandbox::SandboxEnv::none().scoped(),
