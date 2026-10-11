@@ -319,6 +319,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         operation_registry::mcp::lookup("forge_set_main_agent").unwrap().descriptor(scoped_project, true),
         operation_registry::mcp::lookup("forge_get_project_agent").unwrap().descriptor(scoped_project, true),
         operation_registry::mcp::lookup("forge_set_project_agent").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_get_integration_queue").unwrap().descriptor(scoped_project, true),
         operation_registry::mcp::lookup("forge_list_agent_chats").unwrap().descriptor(scoped_project, true),
         operation_registry::mcp::lookup("forge_get_agent_chat").unwrap().descriptor(scoped_project, true),
         operation_registry::mcp::lookup("forge_list_agent_chat_messages").unwrap().descriptor(scoped_project, true),
@@ -358,6 +359,10 @@ mod tests {
     use super::*;
 
     #[test]
+    // `forge_get_integration_queue` was added to both lists of the baseline
+    // with the merge-queue reads: it is a new tool, so the baseline carries
+    // the descriptor a hand-written tool would have had and the prefix
+    // ceilings below still compare like with like.
     fn serialized_mcp_tool_definitions() {
         for (name, scoped) in [("mcp_account", false), ("mcp_project", true)] {
             let definitions = tool_descriptors(scoped);
@@ -389,6 +394,7 @@ mod tests {
                     | "forge_list_agent_handoffs" => &["cursor", "limit"],
                     "forge_list_agent_chat_messages" => &["before_sequence", "cursor", "limit"],
                     "forge_send_agent_chat_message" => &["dedupe_key"],
+                    "forge_get_integration_queue" => &["limit", "target_branch"],
                     "forge_create_agent_handoff" => &["source_message_id", "source_turn_job_id"],
                     _ => &[],
                 };

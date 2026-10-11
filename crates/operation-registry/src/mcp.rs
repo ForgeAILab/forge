@@ -91,6 +91,18 @@ pub struct GetProjectAgentParams {
     pub project_id: String,
 }
 
+// The merge queues of one Project's repository: the arguments of the native
+// `repo.integration_queue` read, plus the Project an MCP caller names. (A doc
+// comment here would be published as the schema's description.)
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetIntegrationQueueParams {
+    pub project_id: String,
+    pub target_branch: Option<String>,
+    // The handler clamps to 1..=100, including zero and larger inputs.
+    pub limit: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListAgentChatsParams {
@@ -385,6 +397,7 @@ pub enum McpInput {
     BindMainAgent(BindMainAgentParams),
     GetProjectAgent(GetProjectAgentParams),
     BindProjectAgent(BindProjectAgentParams),
+    GetIntegrationQueue(GetIntegrationQueueParams),
     ListAgentChats(ListAgentChatsParams),
     GetAgentChat(GetAgentChatParams),
     ListAgentChatMessages(ListAgentChatMessagesParams),
@@ -472,6 +485,15 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
             RequiredRole::Admin,
             ResourceRule::Project,
             McpInput::BindProjectAgent,
+        ),
+        typed::<GetIntegrationQueueParams>(
+            "forge_get_integration_queue",
+            "Read the merge queues of a Project's repository: who is merging, who waits, and why.",
+            // The rule of `GET /repos/{id}/integration-queues`: the Project
+            // is visible to the caller. The handler reads it by that rule.
+            RequiredRole::Project,
+            ResourceRule::None,
+            McpInput::GetIntegrationQueue,
         ),
         typed::<ListAgentChatsParams>(
             "forge_list_agent_chats",
