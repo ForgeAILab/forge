@@ -1336,6 +1336,41 @@ async fn an_aged_waiter_stays_behind_older_checks_and_holds_newer_ones_for_a_bou
             .await
             .unwrap();
     assert!(yielded.is_some());
+    // The bound is on the check, not per waiter. Nine more aged waiters on
+    // this machine (subtasks that share the holder's worktree), each ahead
+    // of the check: it stands back for them too, and the moment it first
+    // stood back does not move, so ten waiters cost it the same 90 seconds
+    // as one.
+    for n in 0..9 {
+        let id = format!("waiter-{n}");
+        sqlx::query("INSERT INTO task(id,project_id,title,status,parent_task_id,created_at,updated_at) VALUES(?,'p',?,'in_progress','holder',?,?)")
+            .bind(&id).bind(&id).bind(db::now_rfc3339()).bind(db::now_rfc3339())
+            .execute(store.pool()).await.unwrap();
+        store
+            .schedule_wait(&id, ("p", false), None, Some("*"), None)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE task_slot_wait_age SET releases=3, since=(SELECT since FROM task_slot_wait_age WHERE task_id='holder') WHERE task_id LIKE 'waiter-%'").execute(store.pool()).await.unwrap();
+    {
+        let mut tx = db::begin_immediate(store.pool()).await.unwrap();
+        assert_eq!(
+            db::machine_capacity::aged_waiters_ahead(&mut tx, &newer.id, None, "server-machine")
+                .await
+                .unwrap(),
+            10
+        );
+    }
+    for _ in 0..3 {
+        assert!(stream.try_admit(&newer).await.is_none());
+    }
+    let still: Option<String> =
+        sqlx::query_scalar("SELECT yielded_since FROM check_run WHERE id=?")
+            .bind(&newer.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(still, yielded, "another waiter restarted the check's bound");
     // The waiter does not take the slot. After 90 seconds of standing back
     // the check takes it: a waiter that cannot run never starves a check.
     sqlx::query("UPDATE check_run SET yielded_since=? WHERE id=?")
