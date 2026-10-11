@@ -9480,7 +9480,8 @@ What changed while the step waited decides what happens to the result:
 | Nothing the entry was admitted under (a pause, a resume, a rename, a limit) | applied; the attempt settles |
 | The Project environment | applied: the run that ran is the run that was asked for. Its result answers the old environment only (the environment is part of the check identity), so the next entry runs again |
 | The entry's state configuration: the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it, or the Task's own (`task_state_config`; no Project version moves for this) | not applied. The woken step asks again for the current configuration, in the same review entry (below) |
-| The Project workflow | not applied. The hook list the step froze may no longer be the workflow's: the attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
+| The Project workflow, in a way that leaves the entered state as it was (its hooks, gate, role and configuration) | applied; the step continues under the current workflow |
+| The entered state in the Project workflow | not applied. The hook list the step froze is no longer that state's: the attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
 
 **A changed configuration asks again by itself.** `run_ci_steps` records the
 merged configuration of the entered state it asked under (hook effect
@@ -9595,8 +9596,20 @@ the re-run while the hold stands, and a system re-entry (recovery settling a
 retired inline re-run, a queued `rerun_review` command, a budget reset) does
 nothing: no attempt is superseded and no status entry, hooks step, check or
 review attempt is created. `settle_retired_review_rerun` leaves a held Task
-as it is (the stopped execution says why it ended; the hold, not a failure,
-is what the Task shows). After the release the same request runs the entry.
+as it is (the stopped execution says why it ended and that the entry runs at
+the release; the hold, not a failure, is what the Task shows).
+
+**The release gives a review its entry back.** Two things can take the entry
+of a held Task in `review` away, and `resume_review_entry_after_release` runs
+it again at the release, as an automatic entry: (1) a hold command that
+reached the Task while its entry hooks waited (for the entry check or for
+free disk) superseded the hooks step, which `entry_hooks_preempted` reads
+from the steps of the current status entry; (2) recovery stopped a retired
+inline review re-run and did not re-enter the held Task. Without it the
+released Task had no check and no attempt: with a reviewer it parked on a
+refused dispatch, without one it showed the gate's approval. A hold in
+`review` that stopped nothing (the reviewer was waiting or running) needs no
+re-entry: the dispatcher gives the review its reviewer run again.
 
 **Where a failed entry goes.** `review_failure_target` sends a red entry with
 budget left to the review gate's `reject_target`, and to `in_progress` when
