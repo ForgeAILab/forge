@@ -517,6 +517,7 @@ async fn report_once(
     let request = DaemonReportRequest {
         max_concurrent_runs: Some(max_concurrent_runs),
         disk: crate::daemon_workspace::gc::disk_report(workspace_root),
+        workspace_disk: crate::daemon_workspace::gc::workspace_disk_report(workspace_root),
         detected_clis: detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),
@@ -531,7 +532,12 @@ async fn report_once(
         .await?;
     // The server holds every machine to one floor; the collector here
     // evicts to the same one.
+    crate::daemon_workspace::gc::workspace_disk_reported(workspace_root, &request.workspace_disk);
     crate::daemon_workspace::gc::accept_floor(workspace_root, daemon.workspace_floor);
+    crate::daemon_workspace::gc::accept_check_run_timeout(
+        workspace_root,
+        daemon.check_run_timeout_seconds,
+    );
     Ok(daemon)
 }
 

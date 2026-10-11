@@ -409,6 +409,35 @@ impl OperatorStatusService {
                 });
             }
         }
+        // Tasks configured before v0.14 can still name an auditor
+        // (`review.auditor_agent_id`). Nothing runs an auditor pass any more
+        // and new configurations that name one are refused: say which Tasks
+        // still carry it, for as long as they do.
+        let auditor_tasks: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM task WHERE deleted_at IS NULL AND status NOT IN ('done','cancelled') AND task_state_config IS NOT NULL AND json_valid(task_state_config) AND COALESCE(json_extract(task_state_config,'$.review.auditor_agent_id'), json_extract(task_state_config,'$.auditor_agent_id')) IS NOT NULL ORDER BY id LIMIT 11",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        if !auditor_tasks.is_empty() {
+            recent_errors.push(RecentErrorSummary {
+                severity: api_types::OperatorSeverity::Attention,
+                entity_type: "retired_review_auditor_config".into(),
+                entity_id: auditor_tasks[0].clone(),
+                error: format!(
+                    "{}{} open Task(s) still name an auditor ({}{}). {}",
+                    auditor_tasks.len().min(10),
+                    if auditor_tasks.len() > 10 { "+" } else { "" },
+                    auditor_tasks[..auditor_tasks.len().min(10)].join(", "),
+                    if auditor_tasks.len() > 10 {
+                        ", ..."
+                    } else {
+                        ""
+                    },
+                    crate::task_service::RETIRED_AUDITOR_CONFIG,
+                ),
+                occurred_at: now.to_rfc3339(),
+            });
+        }
         // A root in the system temp directory loses worktrees to the
         // operating system's cleaner: say so until the operator moves it.
         let root_status = sqlx::query_as::<_, (String, String)>(
@@ -1577,6 +1606,84 @@ mod tests {
             .unwrap();
             assert!(subscription.unwrap().contains("task.transitioned"));
         }
+    }
+
+    // A Task configured before v0.14 can name an auditor, which nothing runs
+    // any more. The owner is told which open Tasks still carry the key; a
+    // finished Task, or one whose key was removed, is not reported.
+    #[tokio::test]
+    async fn open_tasks_that_still_name_an_auditor_are_reported() {
+        let (db, service) = test_service().await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for (id, status, config) in [
+            (
+                "names-auditor",
+                "review",
+                Some(r#"{"review":{"auditor_agent_id":"agent"}}"#),
+            ),
+            (
+                "names-auditor-flat",
+                "todo",
+                Some(r#"{"auditor_agent_id":"agent"}"#),
+            ),
+            (
+                "finished",
+                "done",
+                Some(r#"{"review":{"auditor_agent_id":"agent"}}"#),
+            ),
+            (
+                "removed",
+                "review",
+                Some(r#"{"review":{"auditor_agent_id":null,"ci_steps":[]}}"#),
+            ),
+            ("plain", "review", None),
+        ] {
+            sqlx::query("INSERT INTO task(id,project_id,title,status,task_state_config,created_at,updated_at) VALUES(?,'p',?,?,?,?,?)")
+                .bind(id)
+                .bind(id)
+                .bind(status)
+                .bind(config)
+                .bind(&now)
+                .bind(&now)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sync_fixtures(&service).await;
+        let status = service.compute_status().await.expect("status computes");
+        let reported = status
+            .recent_errors
+            .iter()
+            .filter(|issue| issue.entity_type == "retired_review_auditor_config")
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 1, "{:?}", status.recent_errors);
+        assert_eq!(reported[0].severity, OperatorSeverity::Attention);
+        assert!(
+            reported[0].error.starts_with(
+                "2 open Task(s) still name an auditor (names-auditor, names-auditor-flat)"
+            ) && reported[0].error.contains("`reviewer` role"),
+            "{}",
+            reported[0].error
+        );
+        for id in ["finished", "removed", "plain"] {
+            assert!(!reported[0].error.contains(id), "{}", reported[0].error);
+        }
+
+        sqlx::query("UPDATE task SET task_state_config = NULL")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let status = service.compute_status().await.expect("status computes");
+        assert!(status
+            .recent_errors
+            .iter()
+            .all(|issue| issue.entity_type != "retired_review_auditor_config"));
     }
 
     #[tokio::test]

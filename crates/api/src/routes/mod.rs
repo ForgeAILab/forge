@@ -1040,6 +1040,7 @@ pub fn daemon_response(db: &db::SqliteDb, mut daemon: Daemon) -> DaemonResponse 
     DaemonResponse {
         disk,
         workspace_floor: db.disk_admission.floor(),
+        check_run_timeout_seconds: db.disk_admission.check_run_timeout_seconds(),
         max_concurrent_runs: daemon.max_concurrent_runs,
         run_limit: daemon.run_limit,
         effective_max_concurrent_runs: services::placement::capacity::effective_machine_cap(

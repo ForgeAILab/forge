@@ -82,6 +82,81 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     `forge-ctl` (position, phase and timings are on the Task's `condition`
     only), and deleting a repository, a location or a Project is not yet
     refused while a merge into it has an unknown result.
+- **A manual review re-run goes through the ordinary review entry; the
+  separate review runner is gone (3.3 stage E).** The review `retry` Task
+  action ("Re-run Review" / "Recheck Review") keeps its verb and payload, but
+  it no longer runs CI and an auditor inline:
+  - **It is asynchronous and durable.** The action only re-enters `review`;
+    the checks and the review run afterwards in the Task's own steps and
+    survive a restart. Read the Task and its Reviews for the outcome.
+  - **Its CI is bounded.** The checks run on the durable check runner: each
+    command under `check_timeout_seconds` and the whole run under the
+    3,600-second wall limit of a review-entry check run (they ran unbounded
+    before). The run is admitted against the machine's run cap. An unchanged
+    commit, worktree and environment reuse a certified green result instead of
+    running again; the review itself is always asked for again.
+  - **No synthetic reviewer executions.** A re-run no longer creates a
+    `reviewer` execution that no Agent ran (nor an `auditor` child), so these
+    stop appearing in execution history and in Agent and machine occupancy.
+    Existing rows stay readable. One found still `running` after the upgrade
+    is stopped by recovery with an error naming it, and the Task's review
+    entry runs again.
+  - **The reviewer is an ordinary reviewer.** It is dispatched as on any
+    review entry, under the ordinary read-only policy: a reviewer that changes
+    the worktree fails. The re-run no longer restores the worktree to the
+    pre-auditor commit and carries on.
+  - **An owner's re-run still spends no review retry budget.** The re-entry
+    is routed as the workflow's own (failed checks go to remediation, a Task
+    without a reviewer passes on its checks), but it records who asked for it
+    (`transition_log.bridge_kind = "recovery"`, `bridge_payload = {"verb":
+    "review_rerun", "requested_by": ...}`). Nothing an entry the owner asked
+    for causes is charged: red checks, a failing reviewer, the bounce to
+    remediation. Any number of failed owner re-runs leaves the budget where
+    it was. A re-entry Forge asks for itself (settling an upgraded install)
+    spends as an automatic entry does.
+  - **One attempt per entry.** The open attempt a re-run replaces is closed as
+    `cancelled` (`execution_retry.status = "superseded_by_rerun"`), and the
+    new attempt reviews the Task's current candidate. A failed attempt the
+    re-run was asked to replace is never taken for the re-run's own verdict.
+    A Task with neither checks nor a reviewer still records the re-run as an
+    empty passed attempt (`{"ci_steps": []}`) before it goes on to merging.
+  - **Busy Tasks are refused.** While a review entry or a reviewer is still
+    running no review `retry` is offered (`409 action_unavailable`); the
+    internal `rerun_review` command answers `409 task_busy`.
+  - **`review.auditor_agent_id` is refused.** The key (in a Task's
+    `task_state_config`, under `review` or at the top level) asked the inline
+    re-run for a second, "auditor" pass run by the Task's reviewer Agent.
+    There is no auditor pass any more: the review is the one done by the
+    Agent assigned to the Task's `reviewer` role. Creating or updating a Task
+    with a configuration that names an auditor now fails with
+    `invalid_operation`. A Task that still carries the key from an earlier
+    version keeps working, with two differences so the review it expects is
+    not dropped silently: operator status lists such open Tasks
+    (`recent_errors`, `entity_type = "retired_review_auditor_config"`), and a
+    review re-run on one that has no reviewer Agent assigned is refused with
+    `409 conflict` (as the inline re-run refused it) instead of passing on its
+    checks alone. **What to do:** assign the reviewing Agent to the Task's
+    `reviewer` role and remove the key from `task_state_config`.
+  - **After an upgrade.** A re-run the previous version left in flight is
+    settled when the server starts, without waiting for its lease to expire:
+    its reviewer execution, and its auditor child if it had one, are stopped
+    with an error that names them, and the Task's review entry runs again
+    once. If the entry cannot run at all, the Task is blocked on the stopped
+    execution with its recovery actions. A `rerun_review` step queued by the
+    previous version still runs, as the owner's re-run it was. A queued
+    reservation of the inline re-run that nothing can apply any more is
+    closed (`superseded`) by migration `V202610110112`; its row is kept.
+  - Review details of a re-run without a reviewer are now the object every
+    entry writes (`{"ci_steps": [...]}`), not a bare step array.
+  - Rust API: `review::ReviewRunner`, `review::ReviewRequest`,
+    `TaskService::with_review_runner`, `ForgeRuntimeBuilder::with_review_runner`
+    and the `review_runner` fields of `AppState`, `ForgeRuntime` and
+    `HookContext` are removed; `TaskService::rerun_review` takes the
+    requesting `Actor` and returns the re-entered `Task`;
+    `ReviewRepo::create_attempt_with_execution_and_lease` and
+    `TaskMutation::ReviewCreateAttemptWithExecution` are removed, and an
+    execution admission no longer accepts a `reviewer` execution without an
+    Agent.
 - **New installs keep the workspace root in the data directory (3.4 D1).**
   A server that never set `workspace.root` / `FORGE_WORKSPACE_ROOT` now uses
   `<data dir>/worktrees` (`~/.forge/worktrees`) instead of
@@ -1102,6 +1177,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **CI runs the Rust gates as parallel jobs.** The single `Rust` job is split
+  into `Rust lint` (fmt, clippy, the `make types` drift check, the script
+  tests) and four test jobs by crate (`services`, `api`, `db`, and every other
+  crate). The same commands and checks run as before; CI wall time is now the
+  slowest job, not the sum. `Rust` remains as the check that is green only
+  when all five are, so branch protection and the release gate need no change.
+  Each job has its own dependency cache, still saved only by default-branch
+  runs. `scripts/ci-rust.sh` without arguments still runs everything locally;
+  `scripts/ci_rust_shards.py check` fails CI if a workspace crate is not
+  covered by exactly one test job. See [docs/ci.md](docs/ci.md#rust-jobs).
 - **A freed machine slot goes to a queued review check before a new run.**
   A queued check reserved nothing, so under sustained load the dispatcher
   could give every freed slot to a new execution and a Task in `review` waited
@@ -2234,6 +2319,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Daemon-owned workspaces report their disk usage.** A daemon's garbage
+  collector now measures the Task roots of its live handles (bounded, like
+  the server's) and sends the sizes in its report (`workspace_disk`, an
+  optional array in the unreleased protocol revision 7 payload); the server
+  stores them in `workspace.disk_bytes` / `disk_measured_at`, which were
+  always `null` for a daemon-owned workspace.
+- **Daemons take the check-checkout age from the server.** The reply to a
+  daemon report carries `check_run_timeout_seconds` beside `workspace_floor`,
+  and the daemon's collector keeps an unheld check checkout exactly as long
+  as the server's does. A daemon has no built-in value of its own for either.
+- **Compiler-cache stores of deleted repositories are removed.** The
+  collector removes the store of a repository the owner no longer has, 24
+  hours after its last run start and never while a run holds it; its
+  `sccache` server is stopped first.
+
 - **`forge --migrate-workspace-root [<new root>]` moves the server's
   workspace root and keeps every file (3.4 D1).** Run with the server
   stopped; the default target is the configured root, else
@@ -2485,6 +2585,87 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   re-running review for every lost race (3.2 stage D2b).
 - A long merge or its checks no longer occupy the long Task-step slots of
   unrelated Projects.
+- **Native command tool and isolated checks built inside the worktree when
+  the server had `CARGO_TARGET_DIR` set.** Those commands clear the child's
+  environment, yet Forge still deferred to the server's own
+  `CARGO_TARGET_DIR` (and compiler-wrapper variables), so the child got
+  neither. For a cleared environment nothing is inherited: the Task's build
+  directory and the shared compiler cache apply.
+
+- **`forge --migrate-workspace-root` no longer waits for integration
+  attempts that are at rest.** An attempt in `needs_review` or `ejected`
+  (the Task is back with a reviewer or coder) does not block the move any
+  more; `quarantined`, `reconciling` and any attempt with an owner effect
+  outstanding or an operation result unknown still do, and the refusal now
+  names each Task and its attempt state.
+- **The root-change refusal counted other databases' clones.** A start that
+  switches roots counted every directory under `<root>/.repos`; in a shared
+  root it now counts only the clones of this database's repositories, like
+  the move does.
+
+- **A slow compiler-cache server start no longer stalls other work.** An
+  `sccache` server start (up to ten seconds) ran on the async worker that
+  started the run; it now runs on the blocking pool, and a sandbox
+  constructor never waits for one.
+- **Collector deletes could be redirected through a planted link.** A Task
+  with write access could replace a directory by a link between the
+  collector's walk and its delete. Cache eviction, tree removal and
+  build-output eviction now walk by file descriptor and never follow a link.
+- **A worktree is no longer recreated under the disk floor for a claim, a
+  before-work hook or a reassignment reset.** For a caller that opts in
+  (`WorkspaceManager::waiting_for_disk`), `ensure_valid` returns a typed disk
+  outcome for a recreate (never for a worktree that is there and valid),
+  which is the same `disk_pressure` placement refusal a claim takes, and the
+  Task takes the disk capacity wait. A launch after its claim, a review, a
+  check and a merge or rebase step still have a missing worktree made again
+  under the floor: they would report a failed step instead of waiting, and
+  keep doing what they did until their owners map the typed outcome.
+- **A live repository's compiler-cache store was treated as a deleted
+  repository's.** Stores are named after the repository's Git directory
+  (`<id>-<hash>` for Forge's own clone, the checkout for a local
+  repository); the server compared them with bare row ids. The collector now
+  knows the store of every clone, every `local_path` and every worktree
+  still on record. It removes nothing for an owner that records no
+  repository at all, and never sweeps a cache directory configured outside
+  the workspace root for deleted repositories (another server may share it;
+  the size cap still applies).
+- **Collector removals could go through a link to another directory of the
+  same root, hold a file descriptor per directory level without limit, and
+  enter a filesystem mounted inside a tree.** Removals and trash moves now
+  go down from the workspace root by file descriptor, hold at most 32
+  directory levels open, and never enter a directory on another device.
+- **A native command with a Project `CARGO_TARGET_DIR` (or wrapper, cache
+  or temp variable) got neither value.** The tool clears the child's
+  environment and Forge stands back for a key the Project declares, but
+  nothing delivered the Project's value. It is now set on the command.
+- **A daemon re-sent every Task-root size with every report, and a root too
+  large to measure blocked the ones after it.** Each measurement is sent
+  until the server has taken it and not again; an attempt that could not
+  finish moves the root to the back of the rotation.
+- **A compiler-cache server start could wait without end.** The start lock
+  (a file a run can hold) now has the start timeout, a wrapper that returns
+  without a server answering counts as a failed start on every path, run
+  starts share two blocking threads under a 15-second deadline, and the
+  liveness probe never blocks.
+- **A review check that ran longer than a second could stop every database
+  write for 30 seconds.** The check worker looked at the run's consumers
+  (every second) and renewed its lease from the body of a `select!` branch,
+  which stopped polling the owner's operation. The server owner records its
+  receipt in a write transaction inside that operation; when the look came
+  due while that transaction was open, the worker waited for a write lock its
+  own stopped operation held, until SQLite gave up (`database is locked`,
+  code 5) and the run was left to lease recovery. The lease and the consumers
+  are now looked after beside the operation. The same wait in the bounded
+  lookup and cancel exchanges is fixed the same way.
+- **A database refused as busy now says who held it.** Every write
+  transaction records where it began; one held, or waited for, longer than
+  five seconds is logged with its call site, and a `database is locked`
+  refusal is logged with the write transactions open at that moment.
+  `FORGE_DB_BUSY_TIMEOUT_MS` shortens SQLite's busy timeout for diagnosis.
+- **A failed check job is logged.** The check worker dropped a job that
+  returned an error without a line; it now logs it before lease recovery
+  takes the run up again.
+
 - **Garbage collection could take a build directory from a run that had just
   started, and other collector safety gaps (3.4 stage E).** Build eviction is
   now decided per Task under its lifecycle lock after reading its state

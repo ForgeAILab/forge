@@ -1186,6 +1186,8 @@ export interface Daemon {
   disk?: MachineDisk | null
   /** The free-space floor the server applies to this machine. */
   workspace_floor?: DiskFloor | null
+  /** The server's check-run wall limit; a daemon's collector derives its check-checkout age from it. */
+  check_run_timeout_seconds?: number | null
   id: string
   machine_id: string
   hostname: string

@@ -1072,8 +1072,25 @@ impl TaskService {
                     self.repo_cache_locks.clone(),
                     &self.workspace_backend_router,
                 )
+                .waiting_for_disk()
                 .ensure_valid(task, workspace, crate::workspace_manager::Purpose::Reset)
-                .await?;
+                .await;
+                let valid = match valid {
+                    Ok(valid) => valid,
+                    Err(unavailable) => {
+                        // The worktree would have to be made again under
+                        // the disk floor: the Task takes the disk capacity
+                        // wait its next claim would take, and the typed
+                        // refusal goes back to the caller.
+                        let error = ServiceError::from(unavailable);
+                        if crate::placement::capacity_wait_of(&error)
+                            == Some(crate::placement::CapacityWait::Disk)
+                        {
+                            self.defer_placement_refusal(task, &error).await?;
+                        }
+                        return Err(error);
+                    }
+                };
                 let worktree_path = valid.path().ok_or_else(|| {
                     ServiceError::invalid_operation("server workspace has no validated path")
                 })?;

@@ -384,7 +384,6 @@ impl WorkflowExecution<'_> {
             project_version: authority.as_ref().map(|a| a.project_version),
             project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()),
             triggered_by: actor.clone(),
-            review_runner: self.task_service.review_runner.clone(),
             merge_service: self.task_service.merge_service.clone(),
             cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
             task_service: self.task_service.clone(),

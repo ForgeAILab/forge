@@ -473,6 +473,11 @@ pub struct DaemonResponse {
     /// uses it for its own garbage collector, so eviction and refusal agree.
     #[serde(default)]
     pub workspace_floor: Option<crate::DiskFloor>,
+    /// The server's `server.check_run_timeout_seconds`. A daemon's garbage
+    /// collector derives from it the age after which a check checkout
+    /// nobody holds is dead, exactly as the server's collector does.
+    #[serde(default)]
+    pub check_run_timeout_seconds: Option<u64>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -526,11 +531,34 @@ pub struct DaemonReportRequest {
     /// read for this report.
     #[serde(default)]
     pub disk: Option<crate::MachineDiskFacts>,
+    /// Disk bytes of the Task roots this daemon owns, as its garbage
+    /// collector last measured them. The server stores them on the
+    /// workspace rows (`workspace.disk_bytes`). A root not measured yet, or
+    /// too large to walk inside one pass, is not listed.
+    #[serde(default)]
+    pub workspace_disk: Vec<DaemonWorkspaceDisk>,
     pub detected_clis: Vec<DetectedCli>,
     pub runtimes: Option<Vec<RuntimeReport>>,
     pub labels: Option<Value>,
     pub active_execution_ids: Option<Vec<String>>,
 }
+
+/// The measured size of one daemon-owned Task root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonWorkspaceDisk {
+    /// The handle the daemon issued for the workspace.
+    pub workspace_handle: String,
+    /// Disk bytes of the whole Task root: worktree, build output, run
+    /// directories.
+    pub disk_bytes: u64,
+    /// When the daemon measured it (RFC 3339, the daemon's clock).
+    pub measured_at: String,
+}
+
+/// Most Task roots one report carries sizes for. A daemon sends each
+/// measurement until the server has taken it, oldest first, so the rest
+/// follow in later reports.
+pub const DAEMON_WORKSPACE_DISK_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeReport {

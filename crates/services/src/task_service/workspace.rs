@@ -990,12 +990,15 @@ impl TaskService {
             // repairs what it can, so a CLI executor is never started in a
             // directory that is gone or off the Task branch.
             let workspace = if admission.workspace.status == WorkspaceStatus::Ready {
+                // A claim that cannot have its worktree made again under
+                // the disk floor takes the disk capacity wait.
                 let manager = crate::workspace_manager::WorkspaceManager::new(
                     &self.db,
                     &self.workspace_root,
                     self.repo_cache_locks.clone(),
                     &self.workspace_backend_router,
-                );
+                )
+                .waiting_for_disk();
                 let workspace = admission.workspace.clone();
                 // Only the Task that owns the row may forget it when its
                 // branch is gone too; a subtask never drops the shared root.
@@ -1446,6 +1449,16 @@ pub(crate) async fn ensure_valid(
     .await
 }
 
+/// Whether the callers that prepare a workspace for `purpose` turn a
+/// worktree that cannot be made again under the disk floor into the Task's
+/// disk capacity wait: a claim (`Execute`) and a before-work hook do. A
+/// review, a check and an integration step would fail instead, so their
+/// recreate is admitted under the floor as it was before the typed outcome
+/// existed, until their owners map it.
+fn waits_for_disk(purpose: Purpose) -> bool {
+    matches!(purpose, Purpose::Execute | Purpose::Hook)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_valid_for(
     db: &SqliteDb,
@@ -1463,6 +1476,11 @@ async fn ensure_valid_for(
         repo_cache_locks,
         router,
     );
+    let manager = if waits_for_disk(purpose) {
+        manager.waiting_for_disk()
+    } else {
+        manager
+    };
     let valid = if delete_missing_workspace {
         manager
             .ensure_valid_or_forget(task, workspace, purpose)
@@ -1616,6 +1634,9 @@ pub(crate) async fn prepare_workspace_owned(
                         true,
                         router,
                         false,
+                        waits_for_disk(purpose)
+                            .then(|| db.disk_admission.server_pressure())
+                            .flatten(),
                     )
                     .await?,
                 )
@@ -1694,6 +1715,7 @@ pub(crate) async fn recover_missing_worktree(
     delete_missing_workspace: bool,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
     foreign: bool,
+    disk_pressure: Option<api_types::DiskPressureKind>,
 ) -> Result<Workspace> {
     let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
     let existing_path = resolved.embedded_path()?;
@@ -1718,6 +1740,13 @@ pub(crate) async fn recover_missing_worktree(
         )));
     }
 
+    // `git worktree repair` writes the directory's `.git` link even when it
+    // then fails, which turns a directory that is not a worktree into one
+    // Git accepts (every tracked file "deleted"). That is harmless when the
+    // directory is moved aside right after; a refusal below must leave the
+    // directory as it was found.
+    let dot_git = existing_path.join(".git");
+    let had_dot_git = tokio::fs::symlink_metadata(&dot_git).await.is_ok();
     if matches!(readiness, WorktreeReadiness::Invalid)
         && !foreign
         && try_repair_worktree_gitdir(Path::new(&repo_source), &existing_path).await
@@ -1735,6 +1764,21 @@ pub(crate) async fn recover_missing_worktree(
     let branch_exists = recovery_branch_exists(Path::new(&repo_source), branch).await?;
 
     if branch_exists {
+        // From here the tree is checked out again (an unusable one is moved
+        // aside first, not deleted): a whole checkout of new disk. Under the
+        // floor nothing is touched and the caller waits for disk, as it
+        // does for a new worktree. The relink above writes two small files
+        // and is never refused.
+        if disk_pressure.is_some() {
+            if !had_dot_git
+                && tokio::fs::symlink_metadata(&dot_git)
+                    .await
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                let _ = tokio::fs::remove_file(&dot_git).await;
+            }
+            return Err(recreation_refused_for_disk(db, task_id, &workspace).await?);
+        }
         if !matches!(readiness, WorktreeReadiness::Missing) {
             move_unusable_worktree_aside(&existing_path).await?;
         }
@@ -1788,6 +1832,40 @@ pub(crate) async fn recover_missing_worktree(
             ),
         })
     }
+}
+
+/// The `disk_pressure` placement refusal for a worktree of `workspace` that
+/// would have to be made again for `task_id`: the refusal a new worktree
+/// gets on a machine under its floor, so the disk capacity wait is the same
+/// one (`placement::capacity_wait_of`).
+pub(crate) async fn recreation_refused_for_disk(
+    db: &SqliteDb,
+    task_id: &str,
+    workspace: &Workspace,
+) -> Result<ServiceError> {
+    let placement = WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id).await?;
+    Ok(ServiceError::PlacementUnavailable(
+        crate::placement::PlacementUnavailable {
+            task_id: task_id.to_owned(),
+            repo_id: workspace.repo_id.clone(),
+            rejected_candidates: vec![crate::placement::CandidateRejection {
+                failing_checks: Vec::new(),
+                repo_location_id: placement
+                    .as_ref()
+                    .map(|placement| placement.repo_location_id.clone())
+                    .unwrap_or_default(),
+                owner_kind: placement.as_ref().map_or_else(
+                    || PlacementOwnerKind::Server.to_string(),
+                    |placement| placement.owner_kind.to_string(),
+                ),
+                daemon_id: placement
+                    .as_ref()
+                    .and_then(|placement| placement.daemon_id.clone()),
+                runtime_id: placement.and_then(|placement| placement.runtime_id),
+                filter_codes: vec![crate::placement::PlacementFilterCode::DiskPressure],
+            }],
+        },
+    ))
 }
 
 #[derive(Debug)]

@@ -145,6 +145,8 @@ pub struct GcReport {
     pub builds_evicted: usize,
     /// Entries deleted from the shared compiler cache.
     pub cache_entries_evicted: usize,
+    /// Compiler-cache stores of deleted repositories removed whole.
+    pub cache_stores_removed: usize,
     pub errors: usize,
     /// The pass ran out of time; the caller keeps its cursor.
     pub out_of_time: bool,
@@ -158,6 +160,7 @@ impl GcReport {
         self.run_dirs_removed += other.run_dirs_removed;
         self.builds_evicted += other.builds_evicted;
         self.cache_entries_evicted += other.cache_entries_evicted;
+        self.cache_stores_removed += other.cache_stores_removed;
         self.errors += other.errors;
         self.out_of_time |= other.out_of_time;
     }
@@ -169,6 +172,7 @@ impl GcReport {
             + self.run_dirs_removed
             + self.builds_evicted
             + self.cache_entries_evicted
+            + self.cache_stores_removed
             + self.errors
             > 0
     }
@@ -683,6 +687,58 @@ impl Sweep {
         }
     }
 
+    /// Remove the compiler-cache stores of repositories the owner no longer
+    /// has: `known` is every repository id in the owner's records (the
+    /// server's repository rows; a daemon's repository locations and the
+    /// repositories of its handles). A store goes [`ORPHAN_GRACE`] after it
+    /// was last handed to a run, like an orphaned Task root, and never while
+    /// a run of this process holds it or while `live_elsewhere` (the owner
+    /// runs something the live-run registry names no repository for).
+    /// Nothing is looked at on a root with no cache, nothing is removed for
+    /// an owner that knows no repository at all, and a cache directory
+    /// configured outside the managed root is never swept this way (it is
+    /// bounded by its size cap only).
+    pub fn remove_cache_stores_of_deleted_repositories(
+        &self,
+        known: &HashSet<String>,
+        live_elsewhere: bool,
+        report: &mut GcReport,
+    ) {
+        if live_elsewhere {
+            return;
+        }
+        // An owner with no repository at all proves nothing about any
+        // store (a reset database, a daemon that lost its table).
+        if known.is_empty() {
+            return;
+        }
+        let Some(cache) = compiler_cache::collected(&self.root) else {
+            return;
+        };
+        // Only a cache inside the managed root is this owner's alone: the
+        // root's ownership marker keeps every other database out of it. A
+        // directory configured elsewhere can be shared by several servers,
+        // and the repositories of the others are not in `known`.
+        let inside_root = matches!(
+            (fs::canonicalize(&cache.dir), fs::canonicalize(&self.root)),
+            (Ok(dir), Ok(root)) if dir != root && dir.starts_with(&root)
+        );
+        if !inside_root {
+            return;
+        }
+        let wrapper = compiler_cache::installed(&self.root).map(|cache| cache.wrapper.clone());
+        let done = compiler_cache::remove_stores_of_deleted_repositories(
+            &cache.dir,
+            wrapper.as_deref(),
+            known,
+            self.now,
+            ORPHAN_GRACE,
+            self.deadline,
+        );
+        report.cache_stores_removed += done.stores;
+        report.out_of_time |= done.out_of_time;
+    }
+
     /// Take the build output of one Task root the caller proved idle: moved
     /// to the trash (one rename) and deleted later by [`Sweep::empty_trash`].
     ///
@@ -700,7 +756,20 @@ impl Sweep {
         if !sandbox::is_real_dir(&task_root.join(TASK_DIR_NAME)) || !sandbox::is_real_dir(&build) {
             return false;
         }
-        let moved = sandbox::unless_live_run_in(&task_root, || self.trash(&build, report));
+        // Reached from the Task-root directory by file descriptor: the
+        // Task can write its root and could put a link where `.forge-task`
+        // was just seen, and a rename by path would then take the `build`
+        // of some directory outside the root.
+        let moved = sandbox::unless_live_run_in(&task_root, || {
+            self.trash_from(
+                &build,
+                Some((
+                    &self.task_roots,
+                    &Path::new(name).join(TASK_DIR_NAME).join("build"),
+                )),
+                report,
+            )
+        });
         if moved == Some(true) {
             report.builds_evicted += 1;
             tracing::warn!(path = %build.display(), "disk is under its free-space floor: evicted the build output of an idle Task");
@@ -745,6 +814,19 @@ impl Sweep {
     /// rename, so a caller may do it under a lock it must not hold for the
     /// length of a delete. `false` when it could not be moved; it then stays.
     pub fn trash(&self, path: &Path, report: &mut GcReport) -> bool {
+        self.trash_from(path, None, report)
+    }
+
+    /// [`Self::trash`], with `path` given a second time as `(base,
+    /// relative)` when directories between `base` and the entry are
+    /// writable by a Task: the entry is then moved without following any of
+    /// them, and stays when one has become a link.
+    fn trash_from(
+        &self,
+        path: &Path,
+        anchored: Option<(&Path, &Path)>,
+        report: &mut GcReport,
+    ) -> bool {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if fs::symlink_metadata(path).is_err() {
             return false;
@@ -770,7 +852,21 @@ impl Sweep {
                 .as_nanos(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        if fs::symlink_metadata(&target).is_ok() || fs::rename(path, &target).is_err() {
+        // Every entry is moved from the root by file descriptor, so no
+        // directory on the way is followed when a Task made it a link.
+        let from_root = self.anchored(path);
+        let anchored = anchored.or(from_root
+            .as_ref()
+            .map(|(root, relative)| (root.as_path(), relative.as_path())));
+        let rename = || match anchored {
+            #[cfg(unix)]
+            Some((base, relative)) => crate::fd_tree::rename_under(base, relative, &target),
+            #[cfg(unix)]
+            None => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            #[cfg(not(unix))]
+            _ => fs::rename(path, &target),
+        };
+        if fs::symlink_metadata(&target).is_ok() || rename().is_err() {
             report.errors += 1;
             return false;
         }
@@ -809,7 +905,28 @@ impl Sweep {
             report.errors += 1;
             return;
         }
-        remove_entry(path, report, Some(self.deadline));
+        // Reached from the root by file descriptor: `confined` looked at
+        // where the parent resolves, and a Task that can write a directory
+        // on the way could have put a link there since.
+        match self.anchored(path) {
+            Some((root, relative)) => {
+                remove_entry_under(&root, &relative, report, Some(self.deadline));
+            }
+            None => report.errors += 1,
+        }
+    }
+
+    /// `path` as the resolved managed root and the plain names from there
+    /// to the entry.
+    fn anchored(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let plain = relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+        (plain && relative.file_name().is_some())
+            .then(|| fs::canonicalize(&self.root).ok())
+            .flatten()
+            .map(|root| (root, relative.to_path_buf()))
     }
 
     /// `path` is strictly inside the managed root and its parent resolves
@@ -882,7 +999,24 @@ fn forge_made(task_root: &Path) -> bool {
 /// the pass is out of time: what is left stays where it is (in the trash, in
 /// quarantine, in its Task root) and the next pass carries on with it.
 fn remove_entry(path: &Path, report: &mut GcReport, deadline: Option<Instant>) {
-    if !sandbox::remove_tree_until(path, deadline) {
+    let finished = sandbox::remove_tree_until(path, deadline);
+    removal_outcome(path, finished, report);
+}
+
+/// [`remove_entry`] for `base.join(relative)`, with no directory between
+/// the two followed when it is a link.
+fn remove_entry_under(
+    base: &Path,
+    relative: &Path,
+    report: &mut GcReport,
+    deadline: Option<Instant>,
+) {
+    let finished = sandbox::remove_tree_under_until(base, relative, deadline);
+    removal_outcome(&base.join(relative), finished, report);
+}
+
+fn removal_outcome(path: &Path, finished: bool, report: &mut GcReport) {
+    if !finished {
         report.out_of_time = true;
         return;
     }
@@ -1215,6 +1349,43 @@ mod tests {
         assert_eq!(report, GcReport::default());
         assert!(root.join("notes").exists() && root.join(".repos").exists());
         assert!(root.join(GC_DIR).join("notes-1000").exists());
+    }
+
+    /// A link inside the managed root to another directory inside it: the
+    /// parent "resolves inside the root", so a removal or a move by path
+    /// would take the entry of the directory the link points at (another
+    /// Task's). Both go down from the root by descriptor and refuse.
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_removed_or_trashed_through_a_link_to_another_directory_of_the_root() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        let victim = task_root(&root, "victim");
+        fs::write(victim.join("repo").join("work"), "keep").unwrap();
+        fs::create_dir_all(root.join("attacker")).unwrap();
+        symlink(&victim, root.join("attacker").join("swapped")).unwrap();
+        let through = root.join("attacker").join("swapped").join("repo");
+        let pass = sweep(&root);
+        assert!(pass.confined(&through), "the check by path is satisfied");
+
+        let mut report = GcReport::default();
+        pass.remove(&through, &mut report);
+        assert_eq!((report.removed, report.errors), (0, 1));
+        let mut report = GcReport::default();
+        assert!(!pass.trash(&through, &mut report));
+        assert_eq!(report.errors, 1);
+        assert_eq!(
+            fs::read_to_string(victim.join("repo").join("work")).unwrap(),
+            "keep"
+        );
+
+        // The link itself, and a real entry, still go.
+        let mut report = GcReport::default();
+        pass.remove(&root.join("attacker").join("swapped"), &mut report);
+        assert!(pass.trash(&root.join("attacker"), &mut report));
+        assert_eq!((report.removed, report.errors), (1, 0));
+        assert!(!root.join("attacker").exists() && victim.join("repo").join("work").exists());
     }
 
     #[cfg(unix)]
@@ -1666,6 +1837,158 @@ mod tests {
         let report = pass(false);
         assert_eq!(report.cache_entries_evicted, 1);
         assert!(!oldest.exists() && kept_a.exists() && kept_b.exists());
+        compiler_cache::install(&root, None);
+    }
+
+    /// The store of a repository the owner no longer has goes a day after
+    /// its last run start: never a known repository's, never a fresh one,
+    /// never one a run holds, never a directory Forge did not mark, and its
+    /// sccache server is stopped first.
+    #[test]
+    fn compiler_cache_stores_of_deleted_repositories_are_removed_after_the_grace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let wrapper = dir.path().join("bin").join("sccache");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        let calls = dir.path().join("calls");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$SCCACHE_SERVER_UDS\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let cache_dir = root.join(compiler_cache::CACHE_DIR);
+        compiler_cache::install(
+            &root,
+            Some(compiler_cache::CompilerCache {
+                kind: compiler_cache::WrapperKind::of(&wrapper),
+                wrapper,
+                dir: cache_dir.clone(),
+                max_bytes: 1 << 30,
+            }),
+        );
+        let day = Duration::from_secs(24 * 60 * 60);
+        let store = |repository: &str, kind: Option<&str>, age: Duration| {
+            let store = cache_dir.join(repository);
+            fs::create_dir_all(store.join("0")).unwrap();
+            fs::write(store.join("0").join("entry"), "x").unwrap();
+            if let Some(kind) = kind {
+                let marker = store.join(compiler_cache::MARKER_FILE);
+                fs::write(&marker, kind).unwrap();
+                let then = SystemTime::now() - age;
+                fs::File::options()
+                    .write(true)
+                    .open(&marker)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_accessed(then).set_modified(then))
+                    .unwrap();
+            }
+            store
+        };
+        let known_old = store("repo-known", Some("kache"), day * 3);
+        let gone_fresh = store("repo-gone-fresh", Some("kache"), day / 2);
+        let gone_held = store("repo-gone-held", Some("kache"), day * 3);
+        let gone = store("repo-gone", Some("sccache"), day * 3);
+        let unmarked = store("not-forges", None, day * 3);
+        // The dead store's server still answers on its socket.
+        let server = std::os::unix::net::UnixListener::bind(gone.join("s")).unwrap();
+        let holder = root.join("holder").join("repo");
+        fs::create_dir_all(&holder).unwrap();
+        TaskRoot::reserve(holder.parent().unwrap()).unwrap();
+        let live = SandboxEnv::for_run(&holder, "holder", RunPurpose::Execution)
+            .with_compiler_cache(Some(compiler_cache::CacheEnv {
+                wrapper: PathBuf::from("/opt/kache"),
+                kind: compiler_cache::WrapperKind::Kache,
+                dir: Some(gone_held.clone()),
+                vars: Vec::new(),
+            }))
+            .prepared();
+        let known: HashSet<String> = ["repo-known".to_owned()].into();
+        let pass = |live_elsewhere: bool| {
+            let mut report = GcReport::default();
+            sweep(&root).remove_cache_stores_of_deleted_repositories(
+                &known,
+                live_elsewhere,
+                &mut report,
+            );
+            report
+        };
+
+        // The owner runs something the registry names no repository for.
+        assert_eq!(pass(true).cache_stores_removed, 0);
+        assert!(gone.exists());
+        // An owner that knows no repository at all proves nothing.
+        let mut report = GcReport::default();
+        sweep(&root).remove_cache_stores_of_deleted_repositories(
+            &HashSet::new(),
+            false,
+            &mut report,
+        );
+        assert_eq!(report, GcReport::default());
+        assert!(gone.exists() && known_old.exists());
+        // A cache directory outside the managed root may be another
+        // server's too: nothing in it is removed for a missing repository.
+        let elsewhere = dir.path().canonicalize().unwrap().join("shared-cache");
+        let others = elsewhere.join("repo-of-another-server");
+        fs::create_dir_all(others.join("0")).unwrap();
+        let marker = others.join(compiler_cache::MARKER_FILE);
+        fs::write(&marker, "kache").unwrap();
+        let then = SystemTime::now() - day * 3;
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(then).set_modified(then))
+            .unwrap();
+        let installed = compiler_cache::installed(&root).unwrap();
+        compiler_cache::install(
+            &root,
+            Some(compiler_cache::CompilerCache {
+                kind: installed.kind,
+                wrapper: installed.wrapper.clone(),
+                dir: elsewhere.clone(),
+                max_bytes: installed.max_bytes,
+            }),
+        );
+        assert_eq!(pass(false), GcReport::default());
+        assert!(others.join("0").exists());
+        compiler_cache::install(&root, Some((*installed).clone()));
+
+        let report = pass(false);
+        assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
+        assert!(!gone.exists(), "the dead repository's store is gone");
+        for kept in [&known_old, &gone_fresh, &gone_held, &unmarked] {
+            assert!(kept.join("0").join("entry").exists(), "{}", kept.display());
+        }
+        assert_eq!(
+            fs::read_dir(&cache_dir).unwrap().count(),
+            4,
+            "nothing is left renamed aside"
+        );
+        // Stopped through the socket of the store as it was moved aside,
+        // after the lock every run start takes was released.
+        let stopped = fs::read_to_string(&calls).unwrap();
+        let prefix = format!(
+            "--stop-server|{}",
+            cache_dir.join(".forge-removed-").display()
+        );
+        assert!(
+            stopped.starts_with(&prefix)
+                && stopped.ends_with("/s\n")
+                && stopped.lines().count() == 1,
+            "{stopped}"
+        );
+        drop(server);
+
+        // The run settles: its store goes on the next pass.
+        live.settle();
+        assert_eq!(pass(false).cache_stores_removed, 1);
+        assert!(!gone_held.exists() && known_old.exists() && gone_fresh.exists());
         compiler_cache::install(&root, None);
     }
 

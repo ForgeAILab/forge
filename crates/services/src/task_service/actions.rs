@@ -651,11 +651,12 @@ impl TaskService {
                                     .into_iter()
                                     .find(|offer| offer.action.verb() == "retry")
                                     .and_then(|offer| offer.target_execution_id);
-                                self.queue_task_action(
+                                self.queue_task_action_as(
                                     &snapshot,
                                     work,
                                     action.clone(),
                                     actor.clone(),
+                                    true,
                                 )
                                 .await?
                             }
@@ -1067,8 +1068,8 @@ impl TaskService {
     ) -> Result<Task> {
         let id = Uuid::parse_str(&task.id)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let (updated, _) = TASK_ACTION_COMMAND
-            .scope((), Box::pin(self.rerun_review(id)))
+        let updated = TASK_ACTION_COMMAND
+            .scope((), Box::pin(self.rerun_review(id, actor.clone())))
             .await?;
         self.queue_deferred_action_role(updated, offer, action, actor)
             .await
@@ -1131,7 +1132,7 @@ impl TaskService {
             .find(|offer| offer.action.verb() == "retry")
             .and_then(|offer| offer.target_execution_id);
         offer.reason = "role_retry".to_owned();
-        self.queue_task_action(&snapshot, offer, action, actor)
+        self.queue_task_action_as(&snapshot, offer, action, actor, true)
             .await
     }
 
@@ -1141,6 +1142,19 @@ impl TaskService {
         offer: Offer,
         action: TaskAction,
         actor: Actor,
+    ) -> Result<Task> {
+        self.queue_task_action_as(snapshot, offer, action, actor, false)
+            .await
+    }
+
+    /// `continuation`: see [`crate::deferred_dispatch::QueuedRecovery::continuation`].
+    async fn queue_task_action_as(
+        &self,
+        snapshot: &TaskSnapshot,
+        offer: Offer,
+        action: TaskAction,
+        actor: Actor,
+        continuation: bool,
     ) -> Result<Task> {
         let task = &snapshot.task;
         // A replay fallback retains its accepted authority and intent, even
@@ -1222,6 +1236,7 @@ impl TaskService {
             error_annotation: saved_annotation,
             blocked_json: task.blocked_json.clone(),
             failed_json: task.failed_json.clone(),
+            continuation,
         };
         if let Some(existing) = crate::deferred_dispatch::queued_recovery(&current) {
             if existing.target_state == queued.target_state

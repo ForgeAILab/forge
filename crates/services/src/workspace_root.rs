@@ -536,14 +536,40 @@ impl LiveData {
             .fetch_one(db.pool())
             .await?;
         }
-        let clones = std::fs::read_dir(root.join(".repos"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                    .count()
-            })
-            .unwrap_or(0);
+        // Only this database's clones: a directory under `.repos` named
+        // after one of its repository rows, which is what the move takes.
+        // A root can be shared (a temp root used by several installs, a
+        // test beside a server), and another database's clones are not
+        // this one's to strand or to wait for.
+        // A directory that cannot be listed is not an empty one: only a
+        // `.repos` that is not there (or cannot be, below a file) holds no
+        // clone; anything else refuses the change.
+        let names: Vec<String> = match std::fs::read_dir(root.join(".repos")) {
+            Ok(entries) => entries
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(sqlx::Error::Io)?
+                .into_iter()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(sqlx::Error::Io(error)),
+        };
+        let mut clones = 0;
+        for name in names {
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id = ?")
+                .bind(&name)
+                .fetch_one(db.pool())
+                .await?;
+            clones += usize::from(rows > 0);
+        }
         Ok(Self {
             workspaces,
             clones,

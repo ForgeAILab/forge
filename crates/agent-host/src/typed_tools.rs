@@ -2935,12 +2935,15 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
+    executors::sandbox::start_compiler_cache(root).await;
     // One temp directory per command, inside the Task root, removed when
     // the command returns. The environment is cleared above, so without it a
     // child falls back to the shared platform temp directory.
     let run_scope =
         executors::sandbox::SandboxEnv::for_command(root, executors::sandbox::RunPurpose::Command);
-    executors::run_process::apply_sandboxed(&mut command, environment, run_scope.env());
+    // Cleared above: the server's own `CARGO_TARGET_DIR` or compiler wrapper
+    // is not inherited, so it must not hold back the Task root's.
+    executors::run_process::apply_sandboxed_cleared(&mut command, environment, run_scope.env());
     let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
@@ -3732,6 +3735,55 @@ mod tests {
             &wrapper,
             &store,
         );
+    }
+
+    /// The tool clears the child's environment, so the server's own
+    /// `CARGO_TARGET_DIR` is not inherited and must not hold Forge's back: the
+    /// command builds into its Task root's build directory, never inside the
+    /// worktree. (A test run under Cargo with a configured target directory
+    /// has the variable in its own environment, which is the case that
+    /// regressed.) A value the Project declares still wins.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_command_builds_into_the_task_root_whatever_the_server_environment_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let build = worktree.parent().unwrap().join(".forge-task/build/cargo");
+        let run = |environment: std::collections::BTreeMap<String, String>| {
+            let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+                root: worktree.to_string_lossy().into_owned(),
+            });
+            async move {
+                let ctx = command_invocation_context(workspace);
+                let output = super::execute_workspace_command(
+                    "sh",
+                    &[
+                        "-c".into(),
+                        "printf '%s' \"${CARGO_TARGET_DIR-unset}\"".into(),
+                    ],
+                    None,
+                    &environment,
+                    &ctx,
+                )
+                .await
+                .unwrap();
+                String::from_utf8(output.stdout).unwrap()
+            }
+        };
+        assert_eq!(
+            std::path::PathBuf::from(run(std::collections::BTreeMap::new()).await),
+            build
+        );
+        // A key the Project declares is the Project's: the command gets
+        // that value (not Forge's directory, and not nothing, which would
+        // build inside the worktree).
+        let project = std::collections::BTreeMap::from([(
+            "CARGO_TARGET_DIR".to_owned(),
+            "/project/target".to_owned(),
+        )]);
+        assert_eq!(run(project).await, "/project/target");
     }
 
     /// The native command tool clears the child's environment, so without the

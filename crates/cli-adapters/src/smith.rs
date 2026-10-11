@@ -220,6 +220,7 @@ impl CodingExecutorAdapter for SmithAdapter {
 
         let mut cmd = Self::build_command(&config, &prompt);
         // Owns the execution's temp directory until this execution returns.
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
         let mut child = cmd.spawn()?;

@@ -138,6 +138,32 @@ fn gemini_sandbox_enabled(
             .is_some_and(|value| !matches!(value.to_str(), Some("" | "false" | "0" | "none")))
 }
 
+/// Give `cmd` the environment of an execution in its Task worktree.
+///
+/// A sandboxed Gemini (container or seatbelt) writes only the worktree and
+/// what the CLI itself mounts, so it keeps the inherited temp and build
+/// directories (and gets no compiler cache) rather than ones under
+/// `.forge-task` it could not write.
+fn enter_task_worktree(
+    cmd: &mut tokio::process::Command,
+    ctx: &ExecutionContext,
+    config: &GeminiConfig,
+) -> executors::sandbox::RunScope {
+    let sandboxed = gemini_sandbox_enabled(config, |key| {
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+    });
+    crate::command::run_in_task_worktree_with(cmd, ctx, |sandbox| {
+        if sandboxed {
+            executors::sandbox::SandboxEnv::none()
+        } else {
+            sandbox
+        }
+    })
+}
+
 /// When Forge injects a provider API key, point the CLI at a Forge-owned
 /// home whose settings select API-key auth so the key actually drives the
 /// run.
@@ -212,23 +238,9 @@ impl CodingExecutorAdapter for GeminiAdapter {
         if key_injected && let Some(home) = ensure_api_key_home(Path::new(&ctx.worktree_path)) {
             cmd.env("GEMINI_CLI_HOME", home);
         }
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         // Owns the execution's temp directory until this execution returns.
-        // A sandboxed Gemini (container or seatbelt) writes only the worktree
-        // and what the CLI itself mounts, so it keeps the inherited temp and
-        // build directories rather than ones under `.forge-task`.
-        let sandboxed = gemini_sandbox_enabled(&config, |key| {
-            cmd.as_std()
-                .get_envs()
-                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
-                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
-        });
-        let _run_scope = crate::command::run_in_task_worktree_with(&mut cmd, &ctx, |sandbox| {
-            if sandboxed {
-                executors::sandbox::SandboxEnv::none()
-            } else {
-                sandbox
-            }
-        });
+        let _run_scope = enter_task_worktree(&mut cmd, &ctx, &config);
 
         let mut child = cmd.spawn()?;
 
@@ -830,6 +842,91 @@ mod tests {
 
         assert!(args.contains(&"--yolo".to_owned()));
         assert!(!args.contains(&"--sandbox".to_owned()));
+    }
+
+    /// A Gemini run inside the CLI's own sandbox (`--sandbox` from the Agent
+    /// config, or a `GEMINI_SANDBOX` the command carries) keeps the temp and
+    /// build directories it inherited: nothing under `.forge-task` is
+    /// handed to it or created for it. Without the sandbox, and with the
+    /// sandbox turned off by yolo or an explicit "off" value, the run gets
+    /// its Task root's directories.
+    #[tokio::test]
+    async fn sandboxed_launch_keeps_the_inherited_temp_and_build_directories() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        let task_dir = worktree.parent().unwrap().join(".forge-task");
+        let ctx = |execution_id: &str| ExecutionContext {
+            task_id: "t".to_owned(),
+            execution_id: execution_id.to_owned(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            description: String::new(),
+            agent_config: serde_json::json!({}),
+            logs_path: String::new(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        };
+        let launch = |config: &GeminiConfig, gemini_sandbox: Option<&str>, id: &str| {
+            let mut cmd = crate::command::CommandBuilder::new("sh")
+                .adapter_args(vec![
+                    "-c".into(),
+                    "printf '%s|%s' \"$TMPDIR\" \"${CARGO_TARGET_DIR-unset}\"".into(),
+                ])
+                .build();
+            cmd.env("TMPDIR", "/server/tmp")
+                .env("CARGO_TARGET_DIR", "/server/target");
+            if let Some(value) = gemini_sandbox {
+                cmd.env("GEMINI_SANDBOX", value);
+            }
+            let scope = enter_task_worktree(&mut cmd, &ctx(id), config);
+            async move {
+                let output = cmd.output().await.expect("child runs");
+                let seen = String::from_utf8(output.stdout).unwrap();
+                (seen, scope)
+            }
+        };
+        let flag = GeminiConfig {
+            sandbox: Some("docker".to_owned()),
+            ..GeminiConfig::default()
+        };
+        let yolo = GeminiConfig {
+            sandbox: Some("docker".to_owned()),
+            permission_policy: Some(PermissionPolicy::Yolo),
+            ..GeminiConfig::default()
+        };
+        let plain = GeminiConfig::default();
+
+        for (config, variable, id) in [
+            (&flag, None, "exec-1"),
+            (&plain, Some("docker"), "exec-2"),
+            (&plain, Some("true"), "exec-3"),
+        ] {
+            let (seen, scope) = launch(config, variable, id).await;
+            assert_eq!(seen, "/server/tmp|/server/target", "{id}");
+            assert!(scope.env().tmp_dir().is_none(), "{id}");
+            assert!(
+                !task_dir.join("tmp").exists(),
+                "{id}: no run directory was made for a sandboxed launch"
+            );
+        }
+        for (config, variable, id) in [
+            (&plain, None, "exec-4"),
+            (&yolo, None, "exec-5"),
+            (&plain, Some("false"), "exec-6"),
+        ] {
+            let (seen, scope) = launch(config, variable, id).await;
+            let tmp = scope
+                .env()
+                .tmp_dir()
+                .expect("a per-run directory")
+                .to_owned();
+            assert!(tmp.starts_with(&task_dir), "{id}: {}", tmp.display());
+            // The server's build directory is on the command already and
+            // keeps its precedence; the temp directory is the run's own.
+            assert_eq!(seen, format!("{}|/server/target", tmp.display()), "{id}");
+        }
     }
 
     #[test]

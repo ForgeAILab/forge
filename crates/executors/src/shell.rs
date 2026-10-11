@@ -120,6 +120,7 @@ impl TaskExecutor for ShellExecutor {
             command.env(key, value);
         }
         // Held until this execution returns: success, failure or cancel.
+        crate::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let run_scope = crate::sandbox::SandboxEnv::for_run(
             std::path::Path::new(&ctx.worktree_path),
             &ctx.execution_id,

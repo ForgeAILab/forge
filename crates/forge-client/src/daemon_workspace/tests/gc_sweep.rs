@@ -331,6 +331,7 @@ fn disk_report_reads_the_root_and_says_whether_its_collector_runs() {
     let wire = serde_json::to_value(api_types::DaemonReportRequest {
         max_concurrent_runs: None,
         disk: Some(report.clone()),
+        workspace_disk: Vec::new(),
         detected_clis: Vec::new(),
         runtimes: None,
         labels: None,
@@ -339,6 +340,93 @@ fn disk_report_reads_the_root_and_says_whether_its_collector_runs() {
     .unwrap();
     assert_eq!(wire["disk"]["free_bytes"], report.free_bytes);
     assert_eq!(wire["disk"]["gc_state"], "unclaimed");
+}
+
+/// The daemon's collector measures the Task roots of its live handles and
+/// its report carries the sizes, in the wire shape the server stores.
+#[tokio::test]
+async fn sweep_measures_live_task_roots_for_the_report() {
+    let fixture = Fixture::new().await;
+    let root = fixture.dir.path();
+    let handle = fixture.prepared.workspace.workspace_handle.clone();
+    let task_root = root.join(WORKTREE_DIRECTORY).join(&handle);
+    std::fs::write(task_root.join("repo").join("big"), vec![1_u8; 256 * 1024]).unwrap();
+    assert!(
+        gc::workspace_disk_report(root).is_empty(),
+        "nothing before a pass"
+    );
+
+    sweep_at(&fixture.backend, &[], Duration::ZERO).await;
+    let sizes = gc::workspace_disk_report(root);
+    assert_eq!(sizes.len(), 1);
+    assert_eq!(sizes[0].workspace_handle, handle);
+    assert!(sizes[0].disk_bytes >= 256 * 1024, "{}", sizes[0].disk_bytes);
+    assert!(chrono::DateTime::parse_from_rfc3339(&sizes[0].measured_at).is_ok());
+    // A report the server did not take is sent again; one it took is not,
+    // until the root is measured anew.
+    assert_eq!(gc::workspace_disk_report(root).len(), 1);
+    gc::workspace_disk_reported(root, &sizes);
+    assert!(gc::workspace_disk_report(root).is_empty(), "sent once");
+    sweep_at(&fixture.backend, &[], Duration::ZERO).await;
+    let again = gc::workspace_disk_report(root);
+    assert_eq!(again.len(), 1, "measured anew");
+    assert!(again[0].measured_at > sizes[0].measured_at);
+    // An acknowledgement of the older measurement does not cover this one.
+    gc::workspace_disk_reported(root, &sizes);
+    assert_eq!(gc::workspace_disk_report(root).len(), 1);
+    let wire = serde_json::to_value(api_types::DaemonReportRequest {
+        max_concurrent_runs: None,
+        disk: None,
+        workspace_disk: sizes,
+        detected_clis: Vec::new(),
+        runtimes: None,
+        labels: None,
+        active_execution_ids: None,
+    })
+    .unwrap();
+    assert_eq!(wire["workspace_disk"][0]["workspace_handle"], handle);
+    // An older daemon sends none; the server reads that as an empty list.
+    let old: api_types::DaemonReportRequest =
+        serde_json::from_value(serde_json::json!({"detected_clis": []})).unwrap();
+    assert!(old.workspace_disk.is_empty());
+}
+
+/// The age after which an unheld check checkout is dead follows the
+/// server's `check_run_timeout_seconds` from its reply, by the server
+/// collector's own rule, per workspace root. A daemon has no value of its own.
+#[test]
+fn check_checkout_age_follows_the_limit_the_server_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    // Before the first reply: the shortest age the shared rule gives.
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        executors::gc::CHECK_CHECKOUT_AGE
+    );
+    gc::accept_check_run_timeout(&first, Some(4 * 60 * 60));
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        executors::gc::check_checkout_age(4 * 60 * 60)
+    );
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        Duration::from_secs(9 * 60 * 60)
+    );
+    // A reply without one keeps what was sent; another root is its own.
+    gc::accept_check_run_timeout(&first, None);
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        Duration::from_secs(9 * 60 * 60)
+    );
+    assert_eq!(
+        gc::check_checkout_age(&second),
+        executors::gc::CHECK_CHECKOUT_AGE
+    );
+    // The reply shape: an older server sends none.
+    let reply = serde_json::json!({"check_run_timeout_seconds": 1800});
+    assert_eq!(reply["check_run_timeout_seconds"].as_u64(), Some(1800));
 }
 
 #[test]
@@ -457,6 +545,45 @@ async fn prepare_of_a_new_worktree_is_refused_under_the_floor_and_an_existing_on
         .await
         .expect("an existing worktree is not refused");
     gc::accept_floor(&root, Some(FreeFloor::of_bytes(0, 0)));
+}
+
+/// The store of a repository this daemon has neither a location nor a live
+/// handle for is removed a day after its last run start; the store of the
+/// fixture's own repository stays.
+#[tokio::test]
+async fn compiler_cache_store_of_a_repository_the_daemon_no_longer_has_is_removed() {
+    let fixture = Fixture::new().await;
+    let root = fixture.dir.path();
+    let worktree = root
+        .join(WORKTREE_DIRECTORY)
+        .join(&fixture.prepared.workspace.workspace_handle)
+        .join("repo");
+    let repository =
+        executors::compiler_cache::repository_id(&worktree).expect("a linked worktree");
+    let cache_dir = root.join(executors::compiler_cache::CACHE_DIR);
+    let store = |repository: &str| {
+        let store = cache_dir.join(repository);
+        std::fs::create_dir_all(store.join("0")).unwrap();
+        std::fs::write(store.join(executors::compiler_cache::MARKER_FILE), "kache").unwrap();
+        std::fs::write(store.join("0").join("entry"), "x").unwrap();
+        store
+    };
+    let (kept, gone) = (store(&repository), store("repo-gone"));
+    let floor = || FreeFloor::of_bytes(0, 0);
+    let hour = Duration::from_secs(60 * 60);
+
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now() + hour, floor())
+        .await;
+    assert_eq!(report.cache_stores_removed, 0, "inside the grace period");
+    assert!(gone.exists());
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now() + hour * 25, floor())
+        .await;
+    assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
+    assert!(!gone.exists() && kept.join("0").join("entry").exists());
 }
 
 /// Plan 3.4 F: under the floor a daemon's collector trims its shared

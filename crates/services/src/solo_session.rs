@@ -1908,7 +1908,7 @@ fn parse_review_checks(raw: &str) -> Vec<SoloCheckSnapshot> {
                 .and_then(Value::as_str)
                 .and_then(safe_diagnostic);
             let exit_code = object.get("exit_code").and_then(Value::as_i64);
-            // ReviewRunner's durable CI rows use exit_code as the canonical
+            // Durable review CI rows use exit_code as the canonical
             // outcome today; older/custom producers may also supply the
             // explicit boolean. Keep both shapes visible in Solo instead of
             // rendering a successful completed check as pending.

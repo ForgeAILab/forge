@@ -584,6 +584,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             PermissionPolicy::Yolo
         );
         let managed_task = managed_codex_home.is_some();
+        executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let run_scope = crate::command::run_in_task_worktree_with(&mut command, &ctx, |sandbox| {
             codex_admitted_sandbox(
                 sandbox,
@@ -2839,6 +2840,10 @@ mod tests {
                 .with_compiler_cache(cache.for_worktree(&worktree))
         };
         let store = root.join(CACHE_DIR).join("repo-a");
+        // The store's sccache server: a start that leaves nothing listening
+        // on the store's socket is a failed start, and no cache is offered.
+        assert!(offered("kache").compiler_cache().is_some());
+        let _server = std::os::unix::net::UnixListener::bind(store.join("s")).expect("server");
         for name in ["kache", "sccache", "cachepot"] {
             assert!(offered(name).compiler_cache().is_some(), "{name}");
             // Yolo has no sandbox: whatever the operator configured.

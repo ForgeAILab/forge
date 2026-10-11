@@ -271,7 +271,6 @@ pub struct ForgeRuntime {
     notification_started: Arc<AtomicBool>,
     _notification_worker: Arc<RuntimeTaskHandle>,
     pub cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
-    pub review_runner: Arc<review::ReviewRunner>,
     pub adapter_registry: Arc<AdapterRegistry>,
     pub task_executor: Arc<dyn TaskExecutor>,
     pub task_dispatcher: Arc<TaskDispatcher>,
@@ -424,7 +423,6 @@ pub struct ForgeRuntimeBuilder {
     start_notification_service: bool,
     merge_service: Option<Arc<MergeService>>,
     cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    review_runner: Option<Arc<review::ReviewRunner>>,
 }
 
 impl ForgeRuntimeBuilder {
@@ -452,7 +450,6 @@ impl ForgeRuntimeBuilder {
             start_notification_service: false,
             merge_service: None,
             cleanup_scheduler: None,
-            review_runner: None,
         }
     }
 
@@ -528,12 +525,6 @@ impl ForgeRuntimeBuilder {
         self
     }
 
-    #[must_use]
-    pub fn with_review_runner(mut self, review_runner: Arc<review::ReviewRunner>) -> Self {
-        self.review_runner = Some(review_runner);
-        self
-    }
-
     /// Build one complete graph.  All service instances that need to share
     /// identity (executor routing, terminal activity, event sinks, and task
     /// dependencies) are created once here and wired by `Arc`.
@@ -600,13 +591,6 @@ impl ForgeRuntimeBuilder {
         });
         merge_service.set_workspace_backend_router(Arc::clone(&workspace_backend_router));
         cleanup_scheduler.set_workspace_backend_router(Arc::clone(&workspace_backend_router));
-        let review_runner = self.review_runner.unwrap_or_else(|| {
-            Arc::new(review::ReviewRunner::new(
-                Arc::clone(&self.db),
-                Arc::clone(&self.event_bus),
-                Arc::clone(&self.adapter_registry),
-            ))
-        });
         let effective_config = self.config;
         let run_process_policy = Arc::new(executors::run_process::MachineRunPolicy::new(
             (&effective_config.server).into(),
@@ -671,7 +655,6 @@ impl ForgeRuntimeBuilder {
             cli_task_executor,
             embedded_task_executor,
         ));
-        let review_runner = Arc::new(review_runner.with_task_executor(Arc::clone(&task_executor)));
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&self.db)));
         let workflow_template_service = Arc::new(
@@ -697,7 +680,6 @@ impl ForgeRuntimeBuilder {
             .with_placement_adapter_registry(Arc::clone(&self.adapter_registry))
             .with_merge_service(Arc::clone(&merge_service))
             .with_cleanup_scheduler(Arc::clone(&cleanup_scheduler))
-            .with_review_runner(Arc::clone(&review_runner))
             .with_task_executor(Arc::clone(&task_executor))
             .with_daemon_connections(Arc::clone(&daemon_connections))
             .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
@@ -891,7 +873,6 @@ impl ForgeRuntimeBuilder {
             notification_started: Arc::new(AtomicBool::new(false)),
             _notification_worker: Arc::new(RuntimeTaskHandle::default()),
             cleanup_scheduler,
-            review_runner,
             adapter_registry: self.adapter_registry,
             task_executor,
             task_dispatcher,

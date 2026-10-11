@@ -181,6 +181,51 @@ pub fn hold_compiler_cache(worktree: &Path) -> CacheHold {
     CacheHold(store)
 }
 
+/// Make the shared compiler cache of the repository of `worktree` ready for
+/// a run that is about to start there, without blocking the async runtime.
+///
+/// Starting an sccache server can take the whole start timeout (10 s). The
+/// sandbox constructors never wait for that (the run would simply build
+/// without the wrapper); a caller on the runtime awaits this first, so the
+/// start happens on the blocking pool while every other task keeps being
+/// polled, and the run then finds the server running. Does nothing, and
+/// looks at nothing, when no cache is installed.
+pub async fn start_compiler_cache(worktree: &Path) {
+    if crate::compiler_cache::none_installed() {
+        return;
+    }
+    /// Starts on the blocking pool at once, in the whole process. Runs
+    /// that start together wait here as futures, not as pool threads: once
+    /// a store's server runs each takes a moment, and a wrapper that never
+    /// starts is given up after a few tries.
+    static STARTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let worktree = worktree.to_path_buf();
+    let start = async move {
+        let Ok(permit) = STARTS.acquire().await else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            // Held until the start returns, also when the caller stopped
+            // waiting for it.
+            let _permit = permit;
+            start_compiler_cache_blocking(&worktree);
+        })
+        .await;
+    };
+    // The run then simply builds without the wrapper.
+    let _ = tokio::time::timeout(crate::compiler_cache::START_WAIT, start).await;
+}
+
+/// [`start_compiler_cache`] for a thread that may block (never an async
+/// worker): returns once the store's server runs or its start has failed.
+pub fn start_compiler_cache_blocking(worktree: &Path) {
+    let cache = TaskRoot::of_worktree(worktree)
+        .and_then(|root| crate::compiler_cache::for_task_roots(root.0.parent()?));
+    if let Some(cache) = cache {
+        let _ = cache.for_worktree(worktree);
+    }
+}
+
 /// When this process first used the sandbox. Nothing it runs is older.
 pub fn process_start() -> SystemTime {
     *PROCESS_START
@@ -340,8 +385,13 @@ impl SandboxEnv {
 
     /// What the compiler cache installed for the workspace root of
     /// `task_root` offers a run in `worktree`.
+    ///
+    /// Never waits for a compiler-cache server to start: these constructors
+    /// are called on async workers. A caller that can await calls
+    /// [`start_compiler_cache`] first, so its run finds the server running.
     fn cache_of(task_root: &TaskRoot, worktree: &Path) -> Option<CacheEnv> {
-        crate::compiler_cache::for_task_roots(task_root.0.parent()?)?.for_worktree(worktree)
+        crate::compiler_cache::for_task_roots(task_root.0.parent()?)?
+            .for_worktree_without_waiting(worktree)
     }
 
     /// This environment with `cache` as its shared compiler cache.
@@ -628,8 +678,49 @@ pub fn settle_run(worktree: &Path, run_id: &str) {
 /// removed through.
 fn remove_run_tmp(tmp: &Path) {
     if tmp.parent().is_some_and(is_real_dir) {
-        remove_tree(tmp);
+        remove_run_tree(tmp);
     }
+}
+
+/// Remove the per-run directory `tmp` with everything in it.
+///
+/// A Task can write its root, so `.forge-task` and `.forge-task/tmp` can
+/// become links between any check and the removal. The directory is
+/// therefore reached by file descriptor from the directory that holds the
+/// Task roots (which no Task can write), and nothing is removed when a
+/// directory on the way is a link.
+fn remove_run_tree(tmp: &Path) {
+    match run_tmp_anchor(tmp) {
+        Some((task_roots, relative)) => {
+            remove_tree_under_until(&task_roots, &relative, None);
+        }
+        None => remove_tree(tmp),
+    }
+}
+
+/// `tmp` (as [`TaskRoot::run_tmp`] lays it out) as the resolved directory
+/// that holds the Task roots and the plain names from there.
+fn run_tmp_anchor(tmp: &Path) -> Option<(PathBuf, PathBuf)> {
+    let key = tmp.file_name()?;
+    let parent = tmp.parent()?;
+    let (task_roots, relative) = if parent.file_name()? == SHORT_TMP_DIR_NAME {
+        (parent.parent()?, Path::new(SHORT_TMP_DIR_NAME).join(key))
+    } else {
+        let task_dir = parent.parent()?;
+        if parent.file_name()? != "tmp" || task_dir.file_name()? != TASK_DIR_NAME {
+            return None;
+        }
+        let task_root = task_dir.parent()?;
+        (
+            task_root.parent()?,
+            Path::new(task_root.file_name()?)
+                .join(TASK_DIR_NAME)
+                .join("tmp")
+                .join(key),
+        )
+    };
+    // The operator's own path may go through links; a Task's may not.
+    Some((fs::canonicalize(task_roots).ok()?, relative))
 }
 
 /// Remove the temp directories of runs that are dead.
@@ -703,7 +794,7 @@ fn sweep_dead_runs_older_than<'a>(
             {
                 continue;
             }
-            remove_tree(&path);
+            remove_run_tree(&path);
             removed += 1;
         }
     }
@@ -769,7 +860,7 @@ fn prepare_run_tmp(tmp: &Path) -> io::Result<()> {
         ));
     }
     // A leftover of an earlier run with the same key is not this run's.
-    remove_tree(tmp);
+    remove_run_tree(tmp);
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -785,121 +876,68 @@ pub(crate) fn remove_tree(path: &Path) {
     remove_tree_until(path, None);
 }
 
-/// Entries removed between two looks at the deadline. A tree smaller than
-/// this always goes in one call, so every pass makes progress.
-const REMOVE_STRIDE: usize = 256;
-
 /// [`remove_tree`] that stops between entries once `deadline` has passed.
 /// `false` when it stopped early: what is left is still a tree under `path`
 /// and the next call carries on. `true` otherwise, whether or not every
 /// entry could be removed.
+///
+/// Nothing is followed, also not a directory that a process with write
+/// access to the tree replaces by a link while this runs: the walk goes
+/// down by file descriptor ([`crate::fd_tree`]).
 pub(crate) fn remove_tree_until(path: &Path, deadline: Option<Instant>) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return true;
-    };
-    if !metadata.file_type().is_dir() {
-        let _ = fs::remove_file(path);
+    remove_tree_anchored(path, None, deadline)
+}
+
+/// [`remove_tree_until`] for `base.join(relative)` when a Task can write
+/// directories between `base` and the entry: every one of them is opened by
+/// descriptor and must be a real directory, so the entry removed is the one
+/// under `base`, wherever a path through a swapped directory would lead.
+/// Nothing is removed when one of them is a link.
+pub(crate) fn remove_tree_under_until(
+    base: &Path,
+    relative: &Path,
+    deadline: Option<Instant>,
+) -> bool {
+    remove_tree_anchored(&base.join(relative), Some((base, relative)), deadline)
+}
+
+fn remove_tree_anchored(
+    path: &Path,
+    anchored: Option<(&Path, &Path)>,
+    deadline: Option<Instant>,
+) -> bool {
+    if fs::symlink_metadata(path).is_err() {
         return true;
     }
-    let Some(deadline) = deadline else {
-        if fs::remove_dir_all(path).is_ok() {
-            return true;
-        }
-        #[cfg(unix)]
-        make_dirs_owner_writable(path);
-        if let Err(error) = fs::remove_dir_all(path) {
-            if error.kind() != io::ErrorKind::NotFound {
+    #[cfg(unix)]
+    {
+        let removed = match anchored {
+            Some((base, relative)) => crate::fd_tree::remove_tree_under(base, relative, deadline),
+            None => crate::fd_tree::remove_tree(path, deadline),
+        };
+        match removed {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "directory tree could not be removed");
+                return true;
             }
         }
-        return true;
-    };
-    // Depth first, children before their directory. An entry that cannot be
-    // removed is remembered so the walk goes past it and ends.
-    let mut stuck: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut stack = vec![path.to_path_buf()];
-    let mut removed = 0_usize;
-    while let Some(dir) = stack.last().cloned() {
-        make_owner_writable(&dir);
-        let mut descended = false;
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let child = entry.path();
-                if stuck.contains(&child) {
-                    continue;
-                }
-                // `file_type` does not follow a link: a link is a file here.
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    stack.push(child);
-                    descended = true;
-                    break;
-                }
-                if fs::remove_file(&child).is_err() {
-                    stuck.insert(child);
-                }
-                removed += 1;
-                if removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline {
-                    return false;
-                }
-            }
-        }
-        if descended {
-            continue;
-        }
-        stack.pop();
-        if fs::remove_dir(&dir).is_err() && fs::symlink_metadata(&dir).is_ok() {
-            stuck.insert(dir);
-        }
-        removed += 1;
-        if !stack.is_empty() && removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline
-        {
-            return false;
-        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (deadline, anchored);
+        let _ = if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
     }
     if fs::symlink_metadata(path).is_ok() {
         tracing::warn!(path = %path.display(), "directory tree could not be removed");
     }
     true
-}
-
-#[cfg(unix)]
-fn make_owner_writable(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(metadata) = fs::symlink_metadata(dir) {
-        let mode = metadata.permissions().mode();
-        if metadata.file_type().is_dir() && mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700));
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn make_owner_writable(_dir: &Path) {}
-
-#[cfg(unix)]
-fn make_dirs_owner_writable(root: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(metadata) = fs::symlink_metadata(&dir) else {
-            continue;
-        };
-        let mode = metadata.permissions().mode();
-        if mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(mode | 0o700));
-        }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-            {
-                pending.push(entry.path());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1296,6 +1334,45 @@ mod tests {
         assert!(real_root.join(".forge-task/tmp/runabc").exists());
     }
 
+    /// A Task swaps its `.forge-task/tmp` (or `.forge-task`) for a link to
+    /// another Task root's after Forge looked: the run directory is reached
+    /// from the Task-roots directory by descriptor, so the other Task's
+    /// directory of the same name stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_directory_is_never_removed_through_a_swapped_task_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().canonicalize().unwrap().join("tasks");
+        let victim = tasks.join("victim");
+        fs::create_dir_all(victim.join(".forge-task/tmp/runabc")).unwrap();
+        fs::write(victim.join(".forge-task/tmp/runabc/keep"), "x").unwrap();
+        let attacker = tasks.join("attacker");
+        fs::create_dir_all(attacker.join(".forge-task")).unwrap();
+
+        // `tmp` is a link.
+        symlink(
+            victim.join(".forge-task/tmp"),
+            attacker.join(".forge-task/tmp"),
+        )
+        .unwrap();
+        remove_run_tree(&attacker.join(".forge-task/tmp/runabc"));
+        assert!(victim.join(".forge-task/tmp/runabc/keep").exists());
+        // `.forge-task` is a link.
+        fs::remove_dir_all(attacker.join(".forge-task")).unwrap();
+        symlink(victim.join(".forge-task"), attacker.join(".forge-task")).unwrap();
+        remove_run_tree(&attacker.join(".forge-task/tmp/runabc"));
+        assert!(victim.join(".forge-task/tmp/runabc/keep").exists());
+
+        // The real thing goes, in the Task root and in the short directory.
+        remove_run_tree(&victim.join(".forge-task/tmp/runabc"));
+        assert!(!victim.join(".forge-task/tmp/runabc").exists());
+        let short = tasks.join(SHORT_TMP_DIR_NAME).join("runabc");
+        fs::create_dir_all(short.join("sub")).unwrap();
+        remove_run_tree(&short);
+        assert!(!short.exists() && tasks.join(SHORT_TMP_DIR_NAME).exists());
+    }
+
     use crate::compiler_cache::{self, tests as cache_tests, CACHE_DIR, WRAPPER_KEY};
 
     fn value(vars: &[(&'static str, Option<OsString>)], key: &str) -> Option<Option<OsString>> {
@@ -1390,6 +1467,156 @@ mod tests {
         assert!(SandboxEnv::for_run(&first, "run-6", RunPurpose::Check)
             .compiler_cache()
             .is_none());
+    }
+
+    /// An sccache server start takes seconds. No sandbox constructor waits
+    /// for it, and the awaited start runs on the blocking pool: every other
+    /// future of a single-threaded runtime keeps being polled meanwhile.
+    #[test]
+    fn a_slow_compiler_cache_server_start_never_stalls_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        const START: Duration = Duration::from_secs(2);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        let worktree = cache_tests::linked_worktree(&root, "t1", "repo-slow");
+        let wrapper = dir.path().join("bin").join("sccache");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --start-server ] && sleep {}\nexit 0\n",
+                START.as_secs()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        compiler_cache::install(&root, Some(cache_tests::cache(&root, &wrapper)));
+        let store = root.join(CACHE_DIR).join("repo-slow");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // The constructors return at once and offer no wrapper while
+            // the server is not up: the run builds as it did before.
+            for build in [
+                (|w: &Path| SandboxEnv::for_run(w, "run-1", RunPurpose::Execution))
+                    as fn(&Path) -> SandboxEnv,
+                |w: &Path| SandboxEnv::for_task(w),
+            ] {
+                let called = Instant::now();
+                let env = build(&worktree);
+                assert!(called.elapsed() < START / 2, "{:?}", called.elapsed());
+                assert!(env.compiler_cache().is_none());
+            }
+
+            // The awaited start takes as long as the wrapper does, and the
+            // ticker beside it on the same thread never misses a beat.
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let longest_gap = std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO));
+            let ticker = tokio::spawn({
+                let (ticks, longest_gap) = (ticks.clone(), longest_gap.clone());
+                async move {
+                    let mut last = Instant::now();
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut gap = longest_gap.lock().unwrap();
+                        *gap = (*gap).max(last.elapsed());
+                        last = Instant::now();
+                    }
+                }
+            });
+            let started = Instant::now();
+            start_compiler_cache(&worktree).await;
+            let waited = started.elapsed();
+            ticker.abort();
+            assert!(waited >= START, "the start was awaited: {waited:?}");
+            let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(ticks >= 40, "other futures made progress: {ticks} ticks");
+            let gap = *longest_gap.lock().unwrap();
+            assert!(gap < START / 2, "no poll waited for the start: {gap:?}");
+        });
+
+        // With the server answering on its socket the constructors offer
+        // the wrapper, still without waiting.
+        let _server = std::os::unix::net::UnixListener::bind(store.join("s")).unwrap();
+        let called = Instant::now();
+        let env = SandboxEnv::for_run(&worktree, "run-2", RunPurpose::Execution);
+        assert!(called.elapsed() < START / 2);
+        assert_eq!(env.compiler_cache().and_then(CacheEnv::dir), Some(&*store));
+        compiler_cache::install(&root, None);
+    }
+
+    /// A command with a cleared environment inherits nothing, so an
+    /// operator `CARGO_TARGET_DIR` or compiler-cache variable that would win
+    /// for an inheriting child does not hold Forge's back: the child gets
+    /// the Task root's build directory and the cache's whole set.
+    #[tokio::test]
+    async fn a_cleared_command_gets_forges_build_dir_and_cache_whatever_the_operator_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let worktree = cache_tests::linked_worktree(&root, "t1", "repo-a");
+        let wrapper = cache_tests::fake_wrapper(&dir.path().join("bin"), "kache");
+        let env = SandboxEnv::for_run(&worktree, "run-1", RunPurpose::Command)
+            .with_compiler_cache(cache_tests::cache(&root, &wrapper).for_worktree(&worktree));
+        let build = root
+            .join("t1")
+            .join(TASK_DIR_NAME)
+            .join("build")
+            .join("cargo");
+        let operator = |key: &str| {
+            matches!(key, "CARGO_TARGET_DIR" | "KACHE_CACHE_DIR")
+                .then(|| OsString::from("/operator/value"))
+        };
+        let set = |command: &Command, key: &str| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(key))
+                .and_then(|(_, value)| value.map(OsStr::to_owned))
+        };
+
+        // Inheriting child: the operator's values reach it, Forge sets none.
+        let mut inheriting = Command::new("true");
+        env.apply_with(&mut inheriting, &BTreeMap::new(), operator);
+        assert_eq!(set(&inheriting, "CARGO_TARGET_DIR"), None);
+        assert_eq!(set(&inheriting, WRAPPER_KEY), None);
+
+        // Cleared child: it would get neither. Forge's apply.
+        let mut cleared = Command::new("true");
+        cleared.env_clear();
+        crate::run_process::apply_sandboxed_cleared(&mut cleared, &BTreeMap::new(), &env);
+        assert_eq!(
+            set(&cleared, "CARGO_TARGET_DIR"),
+            Some(build.into_os_string())
+        );
+        assert_eq!(
+            set(&cleared, WRAPPER_KEY),
+            Some(wrapper.clone().into_os_string())
+        );
+        assert_eq!(
+            set(&cleared, "KACHE_CACHE_DIR"),
+            Some(root.join(CACHE_DIR).join("repo-a").into_os_string())
+        );
+
+        // The Project's value and the command's own still win. Nothing
+        // else hands a cleared child the Project's value, so it is set.
+        let project = BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/project".to_owned())]);
+        let mut cleared = Command::new("true");
+        cleared.env_clear().env(WRAPPER_KEY, "/command/wrapper");
+        crate::run_process::apply_sandboxed_cleared(&mut cleared, &project, &env);
+        assert_eq!(
+            set(&cleared, "CARGO_TARGET_DIR"),
+            Some(OsString::from("/project"))
+        );
+        assert_eq!(
+            set(&cleared, WRAPPER_KEY),
+            Some(OsString::from("/command/wrapper"))
+        );
+        assert_eq!(set(&cleared, "KACHE_CACHE_DIR"), None);
     }
 
     #[tokio::test]

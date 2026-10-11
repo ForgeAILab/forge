@@ -389,11 +389,6 @@ async fn test_app(
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    let review_runner = Arc::new(review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::clone(&adapter_registry),
-    ));
     let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
         db,
         event_bus,
@@ -401,7 +396,6 @@ async fn test_app(
         adapter_registry,
         merge_service,
         cleanup_scheduler,
-        review_runner,
         api::state::ShutdownSignal::new(),
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),

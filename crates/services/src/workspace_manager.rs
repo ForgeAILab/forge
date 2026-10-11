@@ -38,8 +38,6 @@ pub(crate) enum Purpose {
     /// Launch an execution. May recreate the worktree and may put a clean
     /// worktree back on the Task branch.
     Execute,
-    /// Review the candidate. May recreate; never moves HEAD.
-    Review,
     /// Run a check or CI step. May recreate; never moves HEAD.
     Check,
     /// Rebase, merge or deliver. May recreate; never moves HEAD.
@@ -139,6 +137,14 @@ pub(crate) enum WorkspaceUnavailable {
     OwnerUnreachable { daemon_id: String },
     /// A repair is needed while an execution is still running there.
     Busy { reason: String },
+    /// The worktree would have to be made again and the machine that owns
+    /// it is under its free-space floor. Nothing was changed. Only ever for
+    /// a recreate asked by a caller that waits for disk
+    /// ([`WorkspaceManager::waiting_for_disk`]): a worktree that is there
+    /// and valid is never refused.
+    /// Carries the same `disk_pressure` placement refusal a new worktree
+    /// gets, so every caller takes the disk capacity wait it already has.
+    DiskPressure(Box<crate::placement::PlacementUnavailable>),
     /// A database, filesystem or Git failure, carried unchanged so callers
     /// keep their existing retry classification.
     Infrastructure(Box<ServiceError>),
@@ -155,6 +161,11 @@ impl std::fmt::Display for WorkspaceUnavailable {
                 write!(f, "workspace owner daemon {daemon_id} is unreachable")
             }
             Self::Busy { reason } => write!(f, "{reason}"),
+            Self::DiskPressure(refusal) => write!(
+                f,
+                "the worktree of task {} must be recreated and the workspace disk is under its free-space floor",
+                refusal.task_id
+            ),
             Self::Infrastructure(error) => write!(f, "{error}"),
         }
     }
@@ -167,6 +178,11 @@ impl From<ServiceError> for WorkspaceUnavailable {
                 Self::ResetRequired { task_id, reason }
             }
             ServiceError::DaemonUnavailable { daemon_id } => Self::OwnerUnreachable { daemon_id },
+            ServiceError::PlacementUnavailable(refusal)
+                if crate::placement::is_disk_pressure_only(&refusal) =>
+            {
+                Self::DiskPressure(Box::new(refusal))
+            }
             error => Self::Infrastructure(Box::new(error)),
         }
     }
@@ -203,6 +219,9 @@ impl From<WorkspaceUnavailable> for ServiceError {
                 Self::DaemonUnavailable { daemon_id }
             }
             WorkspaceUnavailable::Busy { reason } => Self::conflict(reason),
+            // The typed placement refusal: `placement::capacity_wait_of`
+            // reads it as the disk wait.
+            WorkspaceUnavailable::DiskPressure(refusal) => Self::PlacementUnavailable(*refusal),
             WorkspaceUnavailable::Infrastructure(error) => *error,
         }
     }
@@ -236,6 +255,9 @@ pub(crate) struct WorkspaceManager<'a> {
     workspace_root: &'a Path,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     router: &'a WorkspaceBackendRouter,
+    /// Whether a recreate under the free-space floor is refused with
+    /// [`WorkspaceUnavailable::DiskPressure`]. See [`Self::waiting_for_disk`].
+    wait_for_disk: bool,
 }
 
 impl<'a> WorkspaceManager<'a> {
@@ -250,7 +272,23 @@ impl<'a> WorkspaceManager<'a> {
             workspace_root,
             repo_cache_locks,
             router,
+            wait_for_disk: false,
         }
+    }
+
+    /// Refuse to make a worktree again while the server's disk is under its
+    /// free-space floor ([`WorkspaceUnavailable::DiskPressure`]).
+    ///
+    /// Only for a caller that turns the refusal into the Task's disk
+    /// capacity wait: a claim, a before-work hook, a reassignment reset.
+    /// Every other caller (launch after a claim, review, check, merge and
+    /// rebase) would turn it into a failed step, which is worse than the
+    /// checkout it avoids, so without this the recreate is admitted as it
+    /// always was. A worktree that is there and valid is never refused
+    /// either way.
+    pub(crate) fn waiting_for_disk(mut self) -> Self {
+        self.wait_for_disk = true;
+        self
     }
 
     /// Check `workspace` against disk and Git for `purpose`, repairing it
@@ -425,6 +463,12 @@ impl<'a> WorkspaceManager<'a> {
                     delete_missing_workspace && !foreign,
                     self.router,
                     foreign,
+                    // Making the tree again is new disk; a caller that can
+                    // wait for disk does. Relinking a tree that is still
+                    // there is not, and is never refused.
+                    self.wait_for_disk
+                        .then(|| self.db.disk_admission.server_pressure())
+                        .flatten(),
                 )
                 .await?;
                 let workspace = clear_workspace_cleanup_after(self.db, recovered).await?;

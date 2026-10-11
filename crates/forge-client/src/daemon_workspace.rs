@@ -1685,6 +1685,7 @@ impl DaemonWorkspaceBackend {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE");
+        executors::sandbox::start_compiler_cache(&owned.path).await;
         // The command's temp directory, removed when this call returns.
         let run_scope = executors::sandbox::SandboxEnv::for_command(
             &owned.path,

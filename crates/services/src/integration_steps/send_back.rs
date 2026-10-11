@@ -58,7 +58,6 @@ impl IntegrationSteps {
             project_version: Some(project.version),
             project_workflow_definition: Some(project.workflow_definition.clone()),
             triggered_by: crate::worker_runtime::queue::cascade_actor(),
-            review_runner: service.review_runner.clone(),
             merge_service: service.merge_service.clone(),
             cleanup_scheduler: service.cleanup_scheduler.clone(),
             task_service: service.clone(),

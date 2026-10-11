@@ -411,7 +411,9 @@ no longer counts.
 `forge-ctl daemon` tables print the reading in the `Disk` column: free space,
 or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
 floor, or `-` before the first reading. `--output json` carries the same as
-`disk` and `workspace_floor`.
+`disk` and `workspace_floor`, beside `check_run_timeout_seconds` (the
+server's check-run limit, from which the daemon's collector derives how long
+it keeps an unheld check checkout).
 
 ### Moving the server workspace root
 
@@ -441,7 +443,7 @@ It cannot be combined with `--demo`, `--no-mcp`, `--no-embedded-daemon`,
 It refuses while a Forge server or another maintenance command holds the
 data directory, while work is recorded in flight (a running execution or
 check run, a claimed or suspended task step, an integration attempt that is
-neither finished nor parked, an active workspace lease), when a submodule or
+not at rest (`needs_review` and `ejected` are at rest), an active workspace lease), when a submodule or
 nested worktree names the old root by absolute path, when `<NEW_ROOT>` is
 not empty (unless the old root is gone), is a file, is inside the old root or
 contains it, cannot be a workspace root (the home directory or a parent of

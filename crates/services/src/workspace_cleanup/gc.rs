@@ -103,6 +103,10 @@ impl WorkspaceCleanupScheduler {
 
     /// The configured wall limit of one check run, in seconds.
     pub fn set_check_timeout(&self, seconds: u64) {
+        // Every daemon is told the same limit in the reply to its report.
+        self.db
+            .disk_admission
+            .set_check_run_timeout_seconds(seconds);
         self.update_gc_settings(|settings| {
             settings.check_checkout_age = gc::check_checkout_age(seconds);
         });
@@ -501,6 +505,65 @@ impl WorkspaceCleanupScheduler {
             .await
             .unwrap_or_default();
             report.merge(&evicted);
+        }
+        // Stores of repositories this server no longer has a row for.
+        if !out_of_time(&sweep) && executors::compiler_cache::collected(&root).is_some() {
+            // A store is named after the repository's Git directory: the
+            // row id for Forge's own clone, the checkout for a repository
+            // the operator keeps (`local_path`). The repository of every
+            // worktree still on record is known too, whatever it is.
+            let records = async {
+                let repositories: Vec<(String, Option<String>)> =
+                    sqlx::query_as("SELECT id, local_path FROM repo")
+                        .fetch_all(self.db.pool())
+                        .await?;
+                let worktrees: Vec<String> = sqlx::query_scalar(
+                    "SELECT worktree_path FROM workspace WHERE status != 'cleaned'",
+                )
+                .fetch_all(self.db.pool())
+                .await?;
+                Ok::<_, sqlx::Error>((repositories, worktrees))
+            };
+            match records.await {
+                Ok((repositories, worktrees)) => {
+                    let pass = sweep.clone();
+                    // Forge's own clone of a repository, under the root as
+                    // configured and as it resolves (a store is named after
+                    // the path Git recorded).
+                    let clones = [self.workspace_root.join(".repos"), root.join(".repos")];
+                    let removed = blocking(move || {
+                        let mut known: HashSet<String> = worktrees
+                            .iter()
+                            .filter_map(|path| {
+                                executors::compiler_cache::repository_id(Path::new(path))
+                            })
+                            .collect();
+                        for (id, local_path) in repositories {
+                            known.extend(local_path.and_then(|path| {
+                                executors::compiler_cache::repository_id_of(Path::new(&path))
+                            }));
+                            known.extend(clones.iter().filter_map(|clones| {
+                                executors::compiler_cache::repository_id_of(&clones.join(&id))
+                            }));
+                            known.insert(id);
+                        }
+                        let mut report = GcReport::default();
+                        pass.remove_cache_stores_of_deleted_repositories(
+                            &known,
+                            live_checks > 0,
+                            &mut report,
+                        );
+                        report
+                    })
+                    .await
+                    .unwrap_or_default();
+                    report.merge(&removed);
+                }
+                // An unreadable table proves nothing about any store.
+                Err(error) => {
+                    tracing::warn!(%error, "workspace gc: repositories unreadable; compiler-cache stores are left alone");
+                }
+            }
         }
         if !out_of_time(&sweep) && live_checks == 0 {
             if let Err(error) = self

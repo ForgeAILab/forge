@@ -707,6 +707,7 @@ fn daemon_response() -> DaemonResponse {
     DaemonResponse {
         disk: None,
         workspace_floor: None,
+        check_run_timeout_seconds: None,
         max_concurrent_runs: None,
         run_limit: None,
         effective_max_concurrent_runs: None,

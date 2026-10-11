@@ -34,6 +34,29 @@ pub const GC_PRESSURE_INTERVAL: Duration = Duration::from_secs(60);
 /// a server) answer to their own servers and never see each other's floor.
 static SERVER_FLOORS: std::sync::Mutex<Option<HashMap<PathBuf, FreeFloor>>> =
     std::sync::Mutex::new(None);
+/// The server's check-run wall limit (`server.check_run_timeout_seconds`)
+/// each workspace root was given in the reply to its report. Like the
+/// floor, a daemon has none of its own.
+static SERVER_CHECK_TIMEOUTS: std::sync::Mutex<Option<HashMap<PathBuf, u64>>> =
+    std::sync::Mutex::new(None);
+/// Bytes of each handle's Task root as the collector of its workspace root
+/// last measured them, with the time, for the report.
+type MeasuredRoots = HashMap<PathBuf, HashMap<String, MeasuredRoot>>;
+/// What the collector knows about the size of one handle's Task root.
+#[derive(Debug, Clone, Default)]
+struct MeasuredRoot {
+    /// The last size a walk finished with, and when.
+    size: Option<(u64, String)>,
+    /// When a walk was last tried, finished or not: what the rotation goes
+    /// by, so a root too large to walk does not stay first for ever.
+    attempted_at: String,
+    /// The time of the measurement the server last acknowledged. A size is
+    /// sent until then, and not again before it is measured anew.
+    reported: Option<String>,
+}
+static MEASURED_ROOTS: std::sync::Mutex<Option<MeasuredRoots>> = std::sync::Mutex::new(None);
+/// Task roots one pass measures; the least recently measured go first.
+const MEASURE_LIMIT: usize = 32;
 /// What each root's ownership check found, for the disk report.
 static GC_STATES: std::sync::Mutex<Option<HashMap<PathBuf, &'static str>>> =
     std::sync::Mutex::new(None);
@@ -61,6 +84,84 @@ pub fn accept_floor(workspace_root: &Path, floor: Option<FreeFloor>) {
             "workspace free-space floor received from the server"
         );
         floors.insert(key, floor);
+    }
+}
+
+/// Take the server's check-run wall limit for `workspace_root` from its
+/// reply to a report. A reply without one (an older server) changes nothing.
+pub fn accept_check_run_timeout(workspace_root: &Path, seconds: Option<u64>) {
+    let Some(seconds) = seconds else {
+        return;
+    };
+    SERVER_CHECK_TIMEOUTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(root_key(workspace_root), seconds);
+}
+
+/// The age after which a check checkout nobody holds is dead on
+/// `workspace_root`: derived from the server's check-run wall limit by the
+/// rule the server's own collector uses (`executors::gc::check_checkout_age`).
+/// Until the server has sent its limit, the shortest age that rule can give.
+pub fn check_checkout_age(workspace_root: &Path) -> Duration {
+    SERVER_CHECK_TIMEOUTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|timeouts| timeouts.get(&root_key(workspace_root)).copied())
+        .map_or(
+            executors::gc::CHECK_CHECKOUT_AGE,
+            executors::gc::check_checkout_age,
+        )
+}
+
+/// The sizes of the Task roots of `workspace_root` for a daemon report: what
+/// this daemon's collector measured and the server has not acknowledged
+/// yet, at most [`api_types::DAEMON_WORKSPACE_DISK_LIMIT`] of them, the
+/// oldest measurements first; the rest follow in later reports.
+pub fn workspace_disk_report(workspace_root: &Path) -> Vec<api_types::DaemonWorkspaceDisk> {
+    let measured = MEASURED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(roots) = measured
+        .as_ref()
+        .and_then(|measured| measured.get(&root_key(workspace_root)))
+    else {
+        return Vec::new();
+    };
+    let mut sizes: Vec<api_types::DaemonWorkspaceDisk> = roots
+        .iter()
+        .filter_map(|(handle, root)| {
+            let (disk_bytes, measured_at) = root.size.as_ref()?;
+            (root.reported.as_ref() != Some(measured_at)).then(|| api_types::DaemonWorkspaceDisk {
+                workspace_handle: handle.clone(),
+                disk_bytes: *disk_bytes,
+                measured_at: measured_at.clone(),
+            })
+        })
+        .collect();
+    sizes.sort_by(|a, b| {
+        a.measured_at
+            .cmp(&b.measured_at)
+            .then_with(|| a.workspace_handle.cmp(&b.workspace_handle))
+    });
+    sizes.truncate(api_types::DAEMON_WORKSPACE_DISK_LIMIT);
+    sizes
+}
+
+/// The server took a report carrying `sent`: those measurements are not
+/// sent again. A root measured anew since is.
+pub fn workspace_disk_reported(workspace_root: &Path, sent: &[api_types::DaemonWorkspaceDisk]) {
+    let mut measured = MEASURED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(roots) = measured
+        .as_mut()
+        .and_then(|measured| measured.get_mut(&root_key(workspace_root)))
+    else {
+        return;
+    };
+    for size in sent {
+        if let Some(root) = roots.get_mut(&size.workspace_handle) {
+            root.reported = Some(size.measured_at.clone());
+        }
     }
 }
 
@@ -254,6 +355,46 @@ impl DaemonWorkspaceBackend {
     /// memory joined with what is persisted. A handle another runtime
     /// recorded since this one loaded is as real as its own, and a handle
     /// counts as cleaned only when nobody holds it live.
+    /// The compiler-cache store name of every repository this daemon still
+    /// has. `None` when the table cannot be read (nothing is then removed),
+    /// and when no cache exists (nothing is then looked at).
+    fn gc_repositories(
+        &self,
+        handles: &HashMap<String, OwnedWorkspace>,
+    ) -> Option<std::collections::HashSet<String>> {
+        executors::compiler_cache::collected(&self.workspace_root)?;
+        let mut locations: Vec<PathBuf> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .locations
+            .values()
+            .map(|location| location.path.clone())
+            .collect();
+        let persisted = self
+            .journal
+            .load_workspace_state::<WorkspaceRegistry>()
+            .ok()?;
+        locations.extend(
+            persisted
+                .locations
+                .into_values()
+                .map(|location| location.path),
+        );
+        Some(
+            locations
+                .iter()
+                .filter_map(|path| executors::compiler_cache::repository_id_of(path))
+                .chain(
+                    handles
+                        .values()
+                        .filter(|owned| !owned.cleaned)
+                        .filter_map(|owned| executors::compiler_cache::repository_id(&owned.path)),
+                )
+                .collect(),
+        )
+    }
+
     fn gc_handles(&self) -> Option<HashMap<String, OwnedWorkspace>> {
         let mut handles = self
             .state
@@ -291,6 +432,7 @@ impl DaemonWorkspaceBackend {
         sweep.now = now;
         sweep.creating = workspace::is_creating;
         sweep.owner_file = DAEMON_OWNER_FILE;
+        sweep.check_checkout_age = check_checkout_age(&self.workspace_root);
         let mut report = GcReport::default();
         let out_of_time = |sweep: &Sweep| std::time::Instant::now() >= sweep.deadline;
         // Only the holder of the root lock sweeps, and only while the root
@@ -394,6 +536,9 @@ impl DaemonWorkspaceBackend {
         } else {
             Vec::new()
         };
+        // The repositories this daemon still has: every repository
+        // location in its table and the repository of every live handle.
+        let repositories = self.gc_repositories(&handles);
         let pass = sweep.clone();
         let done = blocking(move || {
             let mut report = GcReport::default();
@@ -406,17 +551,87 @@ impl DaemonWorkspaceBackend {
             // Before any Task's build output: a cache entry is cheaper to
             // lose than a Task's whole build.
             pass.evict_compiler_cache(&floor, live_commands > 0, &mut report);
+            if let Some(repositories) = &repositories {
+                pass.remove_cache_stores_of_deleted_repositories(
+                    repositories,
+                    live_commands > 0,
+                    &mut report,
+                );
+            }
             pass.evict_builds(&candidates, &floor, &mut report);
             report
         })
         .await
         .unwrap_or_default();
         report.merge(&done);
+        if !out_of_time(&sweep) {
+            self.gc_measure(&sweep, &handles).await;
+        }
         report.out_of_time |= out_of_time(&sweep);
         if report.did_something() {
             tracing::info!(?report, "workspace gc pass");
         }
         report
+    }
+
+    /// Measure the Task roots of live handles for the report, like the
+    /// server's collector does for its own: a bounded walk each, the least
+    /// recently measured first, at most [`MEASURE_LIMIT`] a pass and never
+    /// past the pass's deadline. A root too large to walk keeps its last
+    /// size and its turn passes. Sizes of handles that are gone are dropped.
+    async fn gc_measure(&self, sweep: &Sweep, handles: &HashMap<String, OwnedWorkspace>) {
+        let key = root_key(&self.workspace_root);
+        let live: std::collections::HashSet<&String> = handles
+            .iter()
+            .filter(|(_, owned)| !owned.cleaned && owned.prepared)
+            .map(|(handle, _)| handle)
+            .collect();
+        let mut due: Vec<(Option<String>, String)> = {
+            let mut measured = MEASURED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+            let known = measured
+                .get_or_insert_with(HashMap::new)
+                .entry(key.clone())
+                .or_default();
+            known.retain(|handle, _| live.contains(handle));
+            live.iter()
+                .map(|handle| {
+                    (
+                        known.get(*handle).map(|root| root.attempted_at.clone()),
+                        (*handle).clone(),
+                    )
+                })
+                .collect()
+        };
+        // Never tried first (`None` sorts before every time), then the
+        // least recently tried.
+        due.sort();
+        for (_, handle) in due.into_iter().take(MEASURE_LIMIT) {
+            let (task_root, deadline) = (sweep.task_roots.join(&handle), sweep.deadline);
+            let bytes = blocking(move || executors::gc::measure(&task_root, deadline))
+                .await
+                .flatten();
+            // The attempt is recorded whatever came of it: a root too
+            // large to walk (in entries, or in what is left of the pass)
+            // keeps its last size and goes to the back of the rotation,
+            // so the roots after it get their turn.
+            let now = chrono::Utc::now().to_rfc3339();
+            {
+                let mut measured = MEASURED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
+                let root = measured
+                    .get_or_insert_with(HashMap::new)
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(handle)
+                    .or_default();
+                root.attempted_at = now.clone();
+                if let Some(bytes) = bytes {
+                    root.size = Some((bytes, now));
+                }
+            }
+            if std::time::Instant::now() >= sweep.deadline {
+                return;
+            }
+        }
     }
 
     /// Leftovers of a handle that was cleaned: moved to the trash under the

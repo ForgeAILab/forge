@@ -6,6 +6,10 @@ pub mod compiler_cache;
 pub mod config;
 pub mod effective_policy;
 pub mod environment;
+// Audited syscalls only: `openat`/`unlinkat`/`renameat` on descriptors it owns.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod fd_tree;
 pub mod gc;
 pub mod log_reader;
 pub mod log_schema;

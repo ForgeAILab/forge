@@ -55,6 +55,9 @@ const SCCACHE_LAUNCHER: &str = "rustc-wrapper";
 const MAX_SOCKET_BYTES: usize = 100;
 #[cfg_attr(not(unix), allow(dead_code))]
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a run start waits for its store's server at most: one start,
+/// and a moment for the starts ahead of it.
+pub(crate) const START_WAIT: Duration = Duration::from_secs(15);
 /// How long the wrapper may take to answer `--version` when it is resolved.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Failed starts of one store's sccache server in a row after which runs
@@ -225,7 +228,25 @@ impl CompilerCache {
     /// What a run in `worktree` gets, or `None` when the cache cannot be
     /// used there right now (the run then builds as it did before, and the
     /// reason is logged once per process).
+    ///
+    /// Blocks while an sccache server that is not running is started (up to
+    /// the start timeout): for a thread that may block. Code on an async
+    /// runtime calls [`crate::sandbox::start_compiler_cache`] instead, and
+    /// the sandbox constructors use [`Self::for_worktree_without_waiting`].
     pub fn for_worktree(&self, worktree: &Path) -> Option<CacheEnv> {
+        self.offer(worktree, ServerStart::Wait)
+    }
+
+    /// [`Self::for_worktree`] that never waits for a server start: when the
+    /// store's sccache server is not running, its start is handed to a
+    /// thread of its own and this run gets no wrapper (it builds as it did
+    /// before; the next run finds the server). Never blocks the caller for
+    /// longer than a socket connect and two small file writes.
+    pub fn for_worktree_without_waiting(&self, worktree: &Path) -> Option<CacheEnv> {
+        self.offer(worktree, ServerStart::Detached)
+    }
+
+    fn offer(&self, worktree: &Path, start: ServerStart) -> Option<CacheEnv> {
         if !is_executable(&self.wrapper) {
             warn_once(&WARNED_WRAPPER, || {
                 tracing::warn!(wrapper = %self.wrapper.display(), "the compiler-cache wrapper is missing or not executable: runs build without it");
@@ -258,17 +279,34 @@ impl CompilerCache {
                     return None;
                 }
                 let size = sccache_size(self.max_bytes);
-                if server_start_given_up(&dir) {
-                    return None;
+                if !sccache_running(&socket) {
+                    if server_start_given_up(&dir) {
+                        return None;
+                    }
+                    let started = match start {
+                        // Never on the caller's thread, whatever happens
+                        // to the server meanwhile.
+                        ServerStart::Detached => {
+                            start_server_detached(&self.wrapper, &dir, &socket, &size);
+                            return None;
+                        }
+                        ServerStart::Wait => {
+                            ensure_sccache_server(&self.wrapper, &dir, &socket, &size)
+                        }
+                    };
+                    note_server_start(&dir, started.is_ok());
+                    if let Err(error) = started {
+                        warn_once(&WARNED_SERVER, || {
+                            tracing::warn!(wrapper = %self.wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
+                        });
+                        return None;
+                    }
                 }
-                let started = ensure_sccache_server(&self.wrapper, &dir, &socket, &size)
-                    .and_then(|()| write_sccache_launcher(&self.wrapper, &dir));
-                note_server_start(&dir, started.is_ok());
-                let launcher = match started {
+                let launcher = match write_sccache_launcher(&self.wrapper, &dir) {
                     Ok(launcher) => launcher,
                     Err(error) => {
                         warn_once(&WARNED_SERVER, || {
-                            tracing::warn!(wrapper = %self.wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
+                            tracing::warn!(wrapper = %self.wrapper.display(), %error, "the sccache launcher could not be written: runs build without the wrapper");
                         });
                         return None;
                     }
@@ -296,6 +334,15 @@ impl CompilerCache {
             vars,
         })
     }
+}
+
+/// What to do about an sccache server that is not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerStart {
+    /// Start it and wait for the start to return.
+    Wait,
+    /// Start it on a thread of its own and offer this run nothing.
+    Detached,
 }
 
 /// The compiler-cache part of one run's environment.
@@ -377,6 +424,72 @@ fn note_server_start(store: &Path, started: bool) {
             .or_insert((0, Instant::now()));
         *entry = (entry.0.saturating_add(1), Instant::now());
     }
+}
+
+/// Whether the sccache server of a store answers on `socket`.
+fn sccache_running(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        // Never a blocking connect: this is asked on async workers, and a
+        // server that accepts nothing would hold one for ever.
+        crate::fd_tree::unix_socket_answers(socket)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// Stores whose sccache server a detached thread is starting right now.
+static STARTING: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    LazyLock::new(Mutex::default);
+
+/// Start the sccache server of `dir` on a thread of its own, one at a time
+/// per store. The caller does not wait: a start may take the whole start
+/// timeout, and the caller is usually an async worker with other tasks to
+/// poll. A start that returns without a server answering counts as a failed
+/// one, so a wrapper that cannot serve stops being tried.
+fn start_server_detached(wrapper: &Path, dir: &Path, socket: &Path, size: &str) {
+    if !STARTING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir.to_path_buf())
+    {
+        return;
+    }
+    let (wrapper, dir, socket, size) = (
+        wrapper.to_path_buf(),
+        dir.to_path_buf(),
+        socket.to_path_buf(),
+        size.to_owned(),
+    );
+    /// Takes the store out of [`STARTING`] however the start ends, also
+    /// when the thread cannot be spawned or panics.
+    struct InFlight(PathBuf);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            STARTING
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.0);
+        }
+    }
+    let in_flight = InFlight(dir.clone());
+    // A spawn that fails drops the closure, and the guard with it.
+    let _ = std::thread::Builder::new()
+        .name("forge-sccache-start".to_owned())
+        .spawn(move || {
+            let _in_flight = in_flight;
+            let started = ensure_sccache_server(&wrapper, &dir, &socket, &size)
+                .and_then(|()| write_sccache_launcher(&wrapper, &dir));
+            note_server_start(&dir, started.is_ok());
+            if let Err(error) = started {
+                warn_once(&WARNED_SERVER, || {
+                    tracing::warn!(wrapper = %wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
+                });
+            }
+        });
 }
 
 /// Run `command` to its end, or kill it at `timeout`.
@@ -680,7 +793,24 @@ pub fn repository_id(worktree: &Path) -> Option<String> {
     if back.canonicalize().ok()? != dot_git.canonicalize().ok()? {
         return None;
     }
-    let common = worktrees.parent()?;
+    store_name(worktrees.parent()?)
+}
+
+/// The store name [`repository_id`] gives every worktree of the repository
+/// at `repository`: a bare repository directory (Forge's own clones), or a
+/// checkout whose Git directory is its `.git`. What an owner lists as the
+/// repositories it still has.
+pub fn repository_id_of(repository: &Path) -> Option<String> {
+    let dot_git = repository.join(".git");
+    if sandbox::is_real_dir(&dot_git) {
+        store_name(&dot_git)
+    } else {
+        store_name(repository)
+    }
+}
+
+/// The store name of the repository whose Git directory is `common`.
+fn store_name(common: &Path) -> Option<String> {
     let name = common.file_name()?.to_str()?;
     let name = if name == ".git" {
         let checkout = common.parent()?.file_name()?.to_str()?;
@@ -750,6 +880,34 @@ fn prepare_store(cache_dir: &Path, dir: &Path, kind: WrapperKind) -> io::Result<
     write_replacing(&dir.join(MARKER_FILE), kind.as_str(), false)
 }
 
+/// Take the lock that makes one process at a time start the server of the
+/// store `dir`, waiting for it `wait` at most. A run can write its store
+/// and so can hold this lock: it is never waited on without an end.
+#[cfg(unix)]
+fn lock_for_start(dir: &Path, wait: Duration) -> io::Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("start.lock"))?;
+    let give_up = Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another start of this store's server did not finish in time",
+                ));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
 /// Make sure the sccache server of one repository store runs, started by
 /// Forge and not by a run.
 ///
@@ -764,21 +922,23 @@ fn prepare_store(cache_dir: &Path, dir: &Path, kind: WrapperKind) -> io::Result<
 fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let running = || std::os::unix::net::UnixStream::connect(socket).is_ok();
+        let running = || sccache_running(socket);
         if running() {
             return Ok(());
         }
         // One starter at a time across every Forge process on this store: a
         // second `--start-server` would take the socket over and leave the
         // first server running for ever.
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("start.lock"))?;
-        lock.lock()?;
+        let _lock = lock_for_start(dir, SERVER_START_TIMEOUT)?;
         if running() {
             return Ok(());
+        }
+        // The starts this one queued behind failed: it does not add its own
+        // wait to theirs.
+        if server_start_given_up(dir) {
+            return Err(io::Error::other(
+                "the server of this store failed to start repeatedly",
+            ));
         }
         let tmp = dir.join(SERVER_TMP_DIR);
         sandbox::create_private_dir(&tmp)?;
@@ -804,12 +964,18 @@ fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) 
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let status = run_bounded(&mut start, SERVER_START_TIMEOUT)?;
-        if status.success() {
-            Ok(())
-        } else {
+        if !status.success() {
             Err(io::Error::other(format!(
                 "--start-server exited with {status}"
             )))
+        } else if !running() {
+            // Counted as a failed start by every caller, so a wrapper that
+            // returns without serving stops being tried.
+            Err(io::Error::other(
+                "--start-server returned but no server answers on the socket",
+            ))
+        } else {
+            Ok(())
         }
     }
     #[cfg(not(unix))]
@@ -894,6 +1060,166 @@ pub fn measure(cache_dir: &Path, deadline: Instant) -> Option<u64> {
         .try_fold(0_u64, |total, (store, _)| {
             Some(total.saturating_add(crate::gc::measure(store, deadline)?))
         })
+}
+
+/// Prefix of a store renamed aside for removal. Never a repository id: an
+/// id never starts with a dot.
+const REMOVED_PREFIX: &str = ".forge-removed-";
+/// How long `--stop-server` may take before a store is removed anyway.
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What one removal of dead repository stores did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoresRemoved {
+    pub stores: usize,
+    pub out_of_time: bool,
+}
+
+/// Remove the stores under `cache_dir` whose repository the owner no longer
+/// has: a marked store whose name is not in `known`, last handed to a run
+/// (its marker is rewritten at every run start) at least `grace` before
+/// `now`, and held by no run of this process.
+///
+/// The live-run check and a rename aside happen under the lock every run
+/// start takes, so a run either is seen or starts after the rename and gets
+/// a fresh store; the delete happens outside the lock, never follows a link
+/// and carries on in the next pass when `deadline` cuts it short. An
+/// sccache server still answering on the store's socket is stopped first
+/// through `wrapper` (it was started with no idle exit and would otherwise
+/// run for ever on a directory that is gone).
+pub fn remove_stores_of_deleted_repositories(
+    cache_dir: &Path,
+    wrapper: Option<&Path>,
+    known: &std::collections::HashSet<String>,
+    now: SystemTime,
+    grace: Duration,
+    deadline: Instant,
+) -> StoresRemoved {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut done = StoresRemoved::default();
+    if !sandbox::is_real_dir(cache_dir) {
+        return done;
+    }
+    let mut condemned = Vec::new();
+    // What an earlier pass renamed aside and could not finish deleting.
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        condemned.extend(
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(REMOVED_PREFIX))
+                })
+                .map(|entry| (entry.path(), false)),
+        );
+    }
+    for (store, kind) in stores(cache_dir) {
+        let Some(name) = store.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(REMOVED_PREFIX) || known.contains(name) {
+            continue;
+        }
+        let old = fs::symlink_metadata(store.join(MARKER_FILE))
+            .and_then(|marker| marker.modified())
+            .is_ok_and(|used| now.duration_since(used).is_ok_and(|age| age >= grace));
+        if !old {
+            continue;
+        }
+        // A short name: the store's server is stopped through its socket
+        // in the directory as moved, and a socket path has a small limit.
+        let aside = cache_dir.join(format!(
+            "{REMOVED_PREFIX}{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let socket = store.join(SCCACHE_SOCKET);
+        let moved_socket = aside.join(SCCACHE_SOCKET);
+        // Stopping takes up to `SERVER_STOP_TIMEOUT`; the lock below is the
+        // one every run start takes. So the server is stopped after the
+        // rename, outside the lock, unless its socket could not be reached
+        // there.
+        let stop_first = moved_socket.as_os_str().len() > MAX_SOCKET_BYTES;
+        let renamed = sandbox::unless_live_cache_run_in(&store, || {
+            // Not held by any run: nothing compiles through it.
+            let serving = kind == WrapperKind::Sccache && sccache_running(&socket);
+            if serving && stop_first {
+                stop_sccache_server(wrapper, &store, &socket);
+            }
+            let renamed =
+                fs::symlink_metadata(&aside).is_err() && fs::rename(&store, &aside).is_ok();
+            (renamed, serving && !stop_first)
+        });
+        if let Some((true, serving)) = renamed {
+            tracing::info!(store = %store.display(), "removing the compiler-cache store of a repository that no longer exists");
+            if serving {
+                stop_sccache_server(wrapper, &aside, &moved_socket);
+            }
+            condemned.push((aside, true));
+        }
+    }
+    for (path, counted) in condemned {
+        if Instant::now() >= deadline {
+            done.out_of_time = true;
+            break;
+        }
+        if !sandbox::is_real_dir(&path) {
+            // A link or a file under the reserved name: removed as itself.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if !sandbox::remove_tree_until(&path, Some(deadline)) {
+            done.out_of_time = true;
+        }
+        done.stores += usize::from(counted);
+    }
+    done
+}
+
+/// Ask the sccache server of `store` to stop. Best effort and bounded.
+fn stop_sccache_server(wrapper: Option<&Path>, store: &Path, socket: &Path) {
+    let Some(wrapper) = wrapper.filter(|wrapper| WrapperKind::of(wrapper) == WrapperKind::Sccache)
+    else {
+        return;
+    };
+    let mut stop = std::process::Command::new(wrapper);
+    stop.arg("--stop-server")
+        .env_clear()
+        .envs(
+            ["PATH", "HOME"]
+                .into_iter()
+                .filter_map(|key| Some((key, std::env::var_os(key)?))),
+        )
+        .env("SCCACHE_DIR", store)
+        .env("SCCACHE_SERVER_UDS", socket)
+        .current_dir(store)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(error) = run_bounded(&mut stop, SERVER_STOP_TIMEOUT) {
+        tracing::warn!(store = %store.display(), %error, "the sccache server of a removed store could not be stopped");
+    }
+}
+
+/// Delete one cache entry of `store`.
+///
+/// A run has write access to its store and can replace a directory in it by
+/// a link between the walk and this delete; by path the delete would then
+/// land outside the store. So the file is reached from the store by file
+/// descriptor, no component followed, and only a regular file is deleted.
+fn remove_entry_file(store: &Path, entry: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        entry
+            .strip_prefix(store)
+            .is_ok_and(|relative| crate::fd_tree::remove_file_under(store, relative).is_ok())
+    }
+    #[cfg(not(unix))]
+    {
+        entry.starts_with(store) && fs::remove_file(entry).is_ok()
+    }
 }
 
 /// What one eviction did.
@@ -999,7 +1325,7 @@ pub fn evict(
             }
         }
         let (store, kind) = &stores[entry.store];
-        let remove = || fs::remove_file(&entry.path).is_ok();
+        let remove = || remove_entry_file(store, &entry.path);
         let removed = if kind.evictable_under_a_live_build() {
             remove()
         } else if live_elsewhere {
@@ -1019,6 +1345,7 @@ pub fn evict(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
 
     /// An executable shell script at `<dir>/<name>` that appends
     /// `arguments|SCCACHE_DIR|KACHE_CACHE_DIR|TMPDIR` to `<dir>/calls`, answers
@@ -1030,13 +1357,32 @@ pub(crate) mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
-                dir.join("calls").display()
+                "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\nif [ \"$1\" = --start-server ]; then\n  n=0\n  while [ -e '{}' ] && [ ! -S \"$SCCACHE_SERVER_UDS\" ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done\n  exit 0\nfi\nexec \"$@\"\n",
+                dir.join("calls").display(),
+                dir.join("serve").display()
             ),
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Make the [`fake_wrapper`] in `dir` start a server the way sccache
+    /// does: its `--start-server` returns once something listens on
+    /// `socket`, which the returned thread does as soon as the wrapper was
+    /// called. The listener lives as long as the value returned.
+    fn serving(dir: &Path, socket: &Path) -> std::thread::JoinHandle<Option<UnixListener>> {
+        fs::write(dir.join("serve"), "").unwrap();
+        let (calls, socket) = (dir.join("calls"), socket.to_path_buf());
+        std::thread::spawn(move || {
+            for _ in 0..1000 {
+                if calls.exists() {
+                    return UnixListener::bind(&socket).ok();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        })
     }
 
     /// A worktree at `<root>/<task>/repo` whose `.git` names the repository
@@ -1243,8 +1589,10 @@ pub(crate) mod tests {
         let worktree = linked_worktree(&root, "t1", "repo-a");
 
         let sccache = cache(&root, &fake_wrapper(&dir.path().join("a"), "sccache"));
-        let env = sccache.for_worktree(&worktree).unwrap();
         let store = root.join(CACHE_DIR).join("repo-a");
+        let server = serving(&dir.path().join("a"), &store.join(SCCACHE_SOCKET));
+        let env = sccache.for_worktree(&worktree).unwrap();
+        let _server = server.join().unwrap().expect("the server was started");
         assert_eq!(env.dir(), Some(store.as_path()));
         let vars: Vec<_> = env.variables().collect();
         assert_eq!(
@@ -1438,6 +1786,46 @@ pub(crate) mod tests {
         assert!(!server_start_given_up(&store));
     }
 
+    /// A wrapper whose `--start-server` returns without anything listening
+    /// has not started a server: counted like any failed start, on the
+    /// waiting path too, so it stops being tried. And the start lock, which
+    /// a run could hold, is waited on for a bounded time only.
+    #[test]
+    fn a_start_that_leaves_no_server_is_a_failed_start_and_a_held_lock_has_a_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let worktree = linked_worktree(&root, "t1", "repo-quiet");
+        let quiet = cache(&root, &fake_wrapper(&dir.path().join("quiet"), "sccache"));
+        let store = root.join(CACHE_DIR).join("repo-quiet");
+        let calls = || {
+            fs::read_to_string(dir.path().join("quiet").join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        for attempt in 1..=SERVER_START_ATTEMPTS {
+            assert!(!server_start_given_up(&store));
+            assert_eq!(quiet.for_worktree(&worktree), None);
+            assert_eq!(calls(), attempt as usize);
+        }
+        assert!(server_start_given_up(&store));
+        assert_eq!(quiet.for_worktree(&worktree), None);
+        assert_eq!(quiet.for_worktree_without_waiting(&worktree), None);
+        assert_eq!(calls(), SERVER_START_ATTEMPTS as usize, "not tried again");
+        // A start that queued behind the failed ones does not run its own.
+        assert!(ensure_sccache_server(&quiet.wrapper, &store, &store.join("s"), "1M").is_err());
+        assert_eq!(calls(), SERVER_START_ATTEMPTS as usize);
+        note_server_start(&store, true);
+
+        let held = lock_for_start(&store, Duration::from_millis(200)).unwrap();
+        let asked = Instant::now();
+        let error = lock_for_start(&store, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        drop(held);
+        lock_for_start(&store, Duration::from_millis(200)).unwrap();
+    }
+
     #[test]
     fn install_is_per_workspace_root_and_covers_the_daemon_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1550,5 +1938,41 @@ pub(crate) mod tests {
             Eviction::default()
         );
         assert_eq!(measure(&linked, deadline), Some(0));
+    }
+    /// A run with write access to its store replaces a directory in it by a
+    /// link to somewhere else after the walk and before the delete. Nothing
+    /// behind the link is deleted.
+    #[test]
+    fn eviction_never_deletes_through_a_directory_swapped_for_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let a = store(&cache_dir, "repo-a", WrapperKind::Sccache);
+        let entry_in_store = entry(&a, "0/1/entry", 1000, 4000);
+        let kept = entry(&a, "9/1/entry", 1000, 10);
+        // The same relative path outside the store.
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(outside.join("1")).unwrap();
+        fs::write(outside.join("1").join("entry"), "precious").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let swapped = std::cell::Cell::new(false);
+
+        // `enough` is asked after the walk, before the first delete.
+        let done = evict(&cache_dir, 1000, false, deadline, || {
+            if !swapped.replace(true) {
+                fs::rename(a.join("0"), a.join("moved-away")).unwrap();
+                std::os::unix::fs::symlink(&outside, a.join("0")).unwrap();
+            }
+            false
+        });
+        assert!(swapped.get());
+        assert_eq!(
+            fs::read_to_string(outside.join("1").join("entry")).unwrap(),
+            "precious",
+            "the file outside the store is untouched"
+        );
+        assert!(a.join("moved-away").join("1").join("entry").exists());
+        assert!(!entry_in_store.exists() || entry_in_store.is_file());
+        // The eviction went on to the next entry instead.
+        assert_eq!((done.files_removed, kept.exists()), (1, false));
     }
 }
