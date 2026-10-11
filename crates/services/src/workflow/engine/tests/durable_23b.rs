@@ -2767,3 +2767,91 @@ async fn a_hold_while_the_entry_waits_for_disk_is_resumed_by_its_release() {
         1
     );
 }
+
+// The Project workflow is edited while the entry check is pending. An edit
+// that leaves the entered state as it was does not concern the entry: the
+// check that ran is applied, nothing is asked again and nobody is needed.
+// An edit of the entered state itself (here: its hooks) still ends the
+// step: the hook list the step froze is no longer that state's, the verdict
+// is applied to nothing and the Task parks for its owner.
+#[tokio::test]
+async fn a_workflow_edit_that_leaves_the_entered_state_alone_keeps_the_entry_check() {
+    let store = |fixture: &FailedCiFixture, workflow: &api_types::WorkflowDefinition| {
+        let (pool, id) = (fixture.db.pool().clone(), fixture.task.project_id.clone());
+        let workflow = serde_json::to_string(workflow).unwrap();
+        async move {
+            sqlx::query("UPDATE project SET workflow_definition = ?, version = version + 1 WHERE id = ?")
+                .bind(workflow)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let mut edited = fixture.workflow.clone();
+    let other = edited
+        .states
+        .iter_mut()
+        .find(|state| state.name != "review" && state.name != "in_progress")
+        .expect("a state the entry does not touch");
+    other.config = json!({ "edited_while_the_check_ran": true });
+    store(&fixture, &edited).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(
+        reviews[0].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[0].1.contains("first-commands"));
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
+
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let mut edited = fixture.workflow.clone();
+    let review = edited
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap();
+    let hook = review
+        .hooks
+        .on_enter
+        .first()
+        .cloned()
+        .expect("the review state has entry hooks");
+    review.hooks.on_enter.push(hook);
+    store(&fixture, &edited).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert!(
+        reviews
+            .iter()
+            .all(|review| review.0 == db::ReviewStatus::Cancelled),
+        "a verdict was applied under an edited entry: {reviews:?}"
+    );
+    assert_eq!(task.status, "review");
+    assert!(task
+        .error_annotation
+        .as_deref()
+        .is_some_and(|annotation| annotation.contains("cascade_failed")));
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1,
+        "an entry whose state was edited asked again"
+    );
+}

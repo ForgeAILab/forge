@@ -1117,7 +1117,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   for its owner. The stale attempt is closed as `cancelled`
   (`execution_retry.status = "superseded_by_config_change"`), no review budget
   is spent, and an entry asks again at most three times before it parks as it
-  used to. A changed Project workflow still parks. The same now happens when
+  used to. A Project workflow edit that leaves the entered state as it was
+  no longer costs the Task its finished check; an edit of the entered state
+  still parks. The same now happens when
   a check is withdrawn under a waiting entry (`superseded_by_withdrawn_check`):
   a forced Project deletion that is refused after cancelling the Project's
   checks no longer leaves those reviews failed.
@@ -1153,7 +1155,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   ended; a Task cannot age its own wait.
 - **Tasks that still name `review.auditor_agent_id` say so to their owner.**
   At start, each open Task with the retired key gets one non-blocking
-  Attention item (`review_risk`); it resolves when the key is removed.
+  Attention item (`review_risk`, status `acknowledged`: listed, and no wake of
+  the Project Agent); it resolves when the key is removed.
 - **`forge-ctl operations status`** is new (see Added).
 - **CI runs the Rust gates as parallel jobs.** The single `Rust` job is split
   into `Rust lint` (fmt, clippy, the `make types` drift check, the script

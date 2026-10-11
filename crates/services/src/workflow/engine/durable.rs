@@ -363,9 +363,9 @@ impl WorkflowExecution<'_> {
         // enters; `run_ci_steps` sees that it differs from what it asked
         // under, drops the stale check and asks again for the current
         // commands (`ENTRY_CHECK_REREQUEST_LIMIT` times per entry at most).
-        // Past that bound, or when the Project workflow itself changed (the
-        // hook list this step froze may no longer be the workflow's), the
-        // step ends as before: the verdict is applied to nothing and the Task
+        // Past that bound, or when the Project workflow changed the state
+        // this step enters (the hook list this step froze is no longer that
+        // state's), the step ends as before: the verdict is applied to nothing and the Task
         // parks for its owner. The exit hooks ran before the wait, so the
         // configuration of the state the Task left no longer decides
         // anything.
@@ -396,11 +396,25 @@ impl WorkflowExecution<'_> {
                 .await?
                 .and_then(|raw| raw.parse::<u32>().ok())
                 .unwrap_or(0);
-            let continues = project.workflow_definition == authority.workflow_definition
+            // An edit of the Project workflow that left the entered state as
+            // it was (its hooks, gate, role and configuration) does not
+            // concern this entry either: the hook list this step froze is
+            // still that state's. Any other workflow edit ends the step.
+            let same_entry = project.workflow_definition == authority.workflow_definition
+                || WorkflowEngine::find_state(
+                    &WorkflowEngine::resolve_workflow_for_task(
+                        &task,
+                        &project.workflow_definition,
+                        &payload.actor,
+                    ),
+                    &payload.to,
+                ) == Some(to_state);
+            let continues = same_entry
                 && (current == asked_under
                     || rerequests < crate::workflow::actions::ENTRY_CHECK_REREQUEST_LIMIT);
             if continues {
                 authority.project_version = project.version;
+                authority.workflow_definition = project.workflow_definition.clone();
                 entered_config = current;
             } else if project.version == authority.project_version {
                 authority.project_version = SUPERSEDED_PROJECT_VERSION;

@@ -9466,8 +9466,10 @@ A Project pause or resume (like any Project edit) moves the Project version,
 which is the fence a hooks step was admitted under. A step that waited for a
 check therefore re-reads the Project when it continues: while the Project
 workflow and the entry's two merged state configurations are what the step
-froze, it continues under the current Project version; a changed workflow or
-state configuration still ends it with a version conflict. Without this the
+froze, it continues under the current Project version. An edit of the Project
+workflow that leaves the entered state as it was (its hooks, gate, role and
+configuration) counts as unchanged; an edit of the entered state ends the
+step with a version conflict. Without this the
 woken step failed, the attempt was cancelled, and recovery dispatched a
 reviewer that had no CI result to read.
 
@@ -9581,7 +9583,10 @@ that still carry it (`retired_review_auditor_config`). The Task's owner is
 told on the Task as well: at start, `state_retired_auditor_notices` opens one
 Attention item per such Task (category `review_risk`, dedupe key
 `retired-auditor:<task id>`, the Task named in its details), which blocks
-nothing and changes no Task. It is stated once and resolved when the owner
+nothing and changes no Task. The item is a notice, not an incident: it is
+written `acknowledged`, so it is listed to the owner and is no wake source
+(an `open` item of this category is a blocker that the wake sweep hands to
+the Project Agent, at the cost of a blocker wake per Task). It is stated once and resolved when the owner
 removes the key (Task update) or the Task closes.
 
 **A held Task is not re-entered.** `rerun_review` refuses a Task on hold
