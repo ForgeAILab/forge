@@ -83,9 +83,16 @@ fn unreadable(what: &str) -> ServiceError {
     ServiceError::invalid_operation(format!("integration head facts: {what}"))
 }
 
-#[async_trait]
-impl IntegrationFactsPort for WorkspaceHeadFacts {
-    async fn task_gate(&self, attempt: &IntegrationAttempt) -> Result<TaskGate> {
+impl WorkspaceHeadFacts {
+    /// Whether the Task is still in the entry the attempt was admitted in,
+    /// and that entry is one the queue may merge from. An attempt the
+    /// start-time import made for a Task that was already out of its merge
+    /// state when the server was upgraded (with its coder for a conflict or
+    /// a dirty checkout, or back in review) names that state as its entry:
+    /// once its old merge is known not to have landed there is nothing for
+    /// the queue to do, the Task's own flow continues and its next entry of
+    /// the merge state is admitted. Only imported attempts are read twice.
+    async fn entry_live(&self, attempt: &IntegrationAttempt) -> Result<bool> {
         let live: bool = sqlx::query_scalar(db::STEP_FENCE)
             .bind(&attempt.task_ref)
             .bind(&attempt.expected_status)
@@ -93,7 +100,31 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             .fetch_one(self.db.pool())
             .await
             .map_err(db::DbError::from)?;
-        if !live {
+        if !live || attempt.import_source_json.is_none() {
+            return Ok(live);
+        }
+        let Some(task) = db::TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await? else {
+            return Ok(false);
+        };
+        let Some(project) = db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(false);
+        };
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &crate::worker_runtime::queue::cascade_actor(),
+        );
+        Ok(crate::integration_steps::reconcile::merge_state(
+            &workflow,
+            &attempt.expected_status,
+        ))
+    }
+}
+
+#[async_trait]
+impl IntegrationFactsPort for WorkspaceHeadFacts {
+    async fn task_gate(&self, attempt: &IntegrationAttempt) -> Result<TaskGate> {
+        if !self.entry_live(attempt).await? {
             return Ok(TaskGate::Left);
         }
         Ok(
@@ -109,14 +140,7 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
         attempt: &IntegrationAttempt,
         queue: &IntegrationQueue,
     ) -> Result<HeadFacts> {
-        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
-        if !live {
+        if !self.entry_live(attempt).await? {
             return Ok(Self::left(queue));
         }
         let gate =

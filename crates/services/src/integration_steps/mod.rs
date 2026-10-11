@@ -377,9 +377,25 @@ impl IntegrationSteps {
             Some(IntegrationReason::Waiting {
                 attempt_id: attempt_ref(&attempt.id),
             })
-        } else if project_paused {
-            // The pause is the Task's reason; integration adds none.
-            None
+        } else if project_paused
+            || (attempt.state == S::Parked
+                && attempt
+                    .failure_message
+                    .as_deref()
+                    .is_some_and(crate::integration_worker::GateCause::parked_under))
+        {
+            // Parked under the Task gate: the Task's own stop (a Hold, a
+            // block, a failure, a blocked entry, a wait for a person) is its
+            // reason and carries the action that lifts it; a paused Project
+            // is resumed on the Project. Integration says only that the Task
+            // is in line behind it. A `deferred` here would take the place
+            // of that reason and offer a Retry of the merge, which cannot
+            // lift a stop on the Task; saying nothing would leave a Task
+            // that was never told it is in line (one taken over from before
+            // the queue) with no reason at all while its Project is paused.
+            Some(IntegrationReason::Waiting {
+                attempt_id: attempt_ref(&attempt.id),
+            })
         } else {
             let (kind, message) = if attempt.state == S::Queued {
                 (

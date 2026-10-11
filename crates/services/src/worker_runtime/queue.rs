@@ -439,11 +439,24 @@ impl TaskStepWorker {
             // ready, so a member of one is read again after the sweep.
             let (mut queued_head, suspended) = self.integration_head_task(task_id).await?;
             let pump = !integration.is_running();
-            if pump && (queued_head.is_some() || suspended) {
+            // A parked attempt whose wait is over (its retry time came, or
+            // an owner action or a resume made it due) is taken back into
+            // line by the worker's sweep, whether or not the Task is still
+            // in the entry it was admitted in: one that left is cancelled
+            // and its statement cleared.
+            let due: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE task_ref=? AND current=1 \
+                 AND state='parked' AND cancel_requested_at IS NULL AND available_at IS NOT NULL \
+                 AND julianday(available_at)<=julianday('now'))",
+            )
+            .bind(task_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            if pump && (queued_head.is_some() || suspended || due) {
                 for driver in integration.sweep_once().await? {
                     drivers.spawn(driver.run(stop.child_token()));
                 }
-                if suspended {
+                if suspended || due {
                     queued_head = self.integration_head_task(task_id).await?.0;
                 }
             }

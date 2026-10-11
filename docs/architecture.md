@@ -6517,7 +6517,10 @@ per attempt.
 
 **Facts.** The gate is `left` when the Task is no longer in the status entry
 the attempt was admitted in (nothing else is read for a Task that left: its
-checkout may be gone), `gated(cause)` when it is still there and its owner
+checkout may be gone), or when that entry is not a merge state at all (an
+attempt the start-time import made for a Task that was with its coder or back
+in review at the upgrade: once its old merge is known not to have landed the
+attempt is cancelled and the Task's own flow continues), `gated(cause)` when it is still there and its owner
 or its Project stopped it, and `live` otherwise. The causes are one
 rule (`integration_steps::gate`), read from the Task's own columns: `task_held`
 (the owner's Hold), `task_blocked`, `task_failed`, `task_entry_blocked`,
@@ -6530,7 +6533,12 @@ counted, before the rebase, while it waits for a check and before it asks for
 a permit; `settle` reads it before it writes one. A gated head leaves the
 slot at once: the attempt is `parked` with the cause's code leading
 `failure_message`, no Git effect runs, no counted retry and no round is spent,
-and the next member is claimed. The worker's sweep looks again every sweep
+and the next member is claimed. The Task keeps its own reason and the action
+that lifts it (the Hold and its Release, the failure and its Retry): the
+`park` step of a gated attempt states `waiting`, never `deferred`, because a
+`deferred` would replace that reason and offer a Retry of the merge, which
+cannot lift a stop on the Task. Under a paused Project it states `waiting`
+too. The worker's sweep looks again every sweep
 interval; the owner action that lifts the gate (Release, an unblock, a retry,
 a Project resume) makes the attempt due at once
 (`expedite_parked_integration_attempt`). A check that was running when the

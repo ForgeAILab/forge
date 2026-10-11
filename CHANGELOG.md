@@ -57,8 +57,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     not rebased, checked or merged; it leaves the head of the queue at once
     and the Tasks behind it go on. It is back in line as soon as the stop is
     lifted (Release, unblock, retry, resume). A Hold on a Task in the queue
-    is now recorded (it used to change nothing). A merge that stopped for
-    its owner (`deferred`) offers **Retry** (`integration_retry`).
+    is now recorded (it used to change nothing). A stopped Task keeps its
+    own reason and action (Release for a Hold, Retry for a failure) and shows
+    the merge as `waiting` beside it. A merge that stopped for its owner by
+    itself (`deferred`: a dirty target, exhausted retries) offers **Retry**
+    (`integration_retry`).
   - **A Task in a merge state that nothing drives is admitted by the
     dispatcher.** The merge state is identified by its `run_merge` entry
     hook, not by the name `merging`; the states a merge outcome moves the

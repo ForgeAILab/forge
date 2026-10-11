@@ -736,18 +736,31 @@ impl World {
         drop(old);
 
         let live = Self::boot(self.dir.path(), &self.shared).await;
+        Self::start(&live).await?;
+        self.live = Some(live);
+        Ok(())
+    }
+
+    /// What `RuntimeSupervisor::start` does before its workers run, call for
+    /// call and in its order: crash recovery, the integration import, the
+    /// dispatcher's startup reconciliation.
+    async fn start(
+        live: &Live,
+    ) -> Result<services::integration_steps::import::ImportReport, String> {
         live.runtime
             .crash_recovery
             .run()
             .await
             .map_err(|error| format!("crash recovery failed: {error}"))?;
+        let report = services::integration_steps::import::import_at_start(&live.state.db)
+            .await
+            .map_err(|error| format!("integration import failed: {error}"))?;
         live.runtime
             .task_dispatcher
             .startup_reconcile()
             .await
             .map_err(|error| format!("startup reconciliation failed: {error}"))?;
-        self.live = Some(live);
-        Ok(())
+        Ok(report)
     }
 
     async fn request(
@@ -932,6 +945,30 @@ impl World {
         const FROZEN: &str = "2099-01-01T00:00:00+00:00";
         let soon = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
         let mut moved = 0;
+        if advance {
+            // The retry time of a merge the queue worker parked.
+            for id in &self.tasks {
+                let waits: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE task_ref = ? AND current = 1
+                     AND state = 'parked' AND julianday(available_at) > julianday('now'))",
+                )
+                .bind(id)
+                .fetch_one(&self.live().pool)
+                .await
+                .map_err(|error| error.to_string())?;
+                if waits
+                    && self
+                        .live()
+                        .state
+                        .db
+                        .expedite_parked_integration_attempt(id, &db::now_rfc3339(), false)
+                        .await
+                        .map_err(|error| error.to_string())?
+                {
+                    moved += 1;
+                }
+            }
+        }
         for id in &self.tasks {
             let metadata: Option<String> =
                 sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ?")
@@ -1613,7 +1650,9 @@ impl World {
                 .fetch_one(&self.live().pool)
                 .await
                 .map_err(|error| error.to_string())?;
-                if moving {
+                // A paused Project stops the queue for its Tasks; the exit
+                // is the resume, which the model can do.
+                if moving || self.project_paused {
                     Ok(())
                 } else {
                     wedge("the merge queue that owns it has no live head and cannot be claimed")
@@ -3337,4 +3376,558 @@ async fn a_subtask_of_a_held_parent_shows_why_it_waits() {
         vec![step(Create), step(Take(0, "hold")), step(CreateChild(0))],
     )])
     .await;
+}
+
+// ===========================================================================
+// Upgrade: databases and repositories the last pre-queue build really wrote
+// (`tests/fixtures/pre_queue/README.md`), restored and started on this build.
+// ===========================================================================
+
+/// The machine id the fixtures' daemon row carries (scrubbed when packed).
+const PRE_QUEUE_MACHINE: &str = "embedded:fixture-host:macos:aarch64";
+
+/// Replace `from` by `to` in every text file under `dir`: the database dump,
+/// the manifest and Git's worktree link files. Git objects are not text.
+fn reroot(dir: &Path, from: &str, to: &str) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if meta.is_dir() {
+            reroot(&path, from, to)?;
+        } else if meta.is_file() && meta.len() < 16 * 1024 * 1024 {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if text.contains(from) {
+                std::fs::write(&path, text.replace(from, to)).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a start must leave alone the second time: every Task's state,
+/// condition, offers, attempts and history, and every branch.
+#[derive(Debug, PartialEq, Eq)]
+struct UpgradePrint {
+    tasks: Vec<String>,
+    refs: String,
+}
+
+impl World {
+    /// Restore the fixture into a fresh directory, re-rooted there, and start
+    /// this build on it. Returns the fixture's manifest and the first
+    /// start's import report.
+    async fn restore(
+        name: &str,
+        shadow: bool,
+    ) -> Result<
+        (
+            Self,
+            Value,
+            services::integration_steps::import::ImportReport,
+        ),
+        String,
+    > {
+        let io = |error: std::io::Error| error.to_string();
+        let dir = tempfile::tempdir().map_err(io)?;
+        let unpack = tempfile::tempdir().map_err(io)?;
+        let archive =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_queue/pre_queue.tar.xz");
+        let tar = Command::new("tar")
+            .arg("-xJf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(unpack.path())
+            .arg(name)
+            .output()
+            .map_err(io)?;
+        if !tar.status.success() {
+            return Err(format!(
+                "unpacking {name}: {}",
+                String::from_utf8_lossy(&tar.stderr)
+            ));
+        }
+        for entry in std::fs::read_dir(unpack.path().join(name)).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            std::fs::rename(entry.path(), dir.path().join(entry.file_name())).map_err(io)?;
+        }
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("manifest.json")).map_err(io)?,
+        )
+        .map_err(|error| error.to_string())?;
+        let old_root = manifest["root"]
+            .as_str()
+            .ok_or("the manifest names its root")?;
+        reroot(dir.path(), old_root, &dir.path().display().to_string())?;
+        reroot(
+            dir.path(),
+            PRE_QUEUE_MACHINE,
+            &services::embedded_daemon::embedded_machine_id(),
+        )?;
+        let dump = std::fs::read_to_string(dir.path().join("db.sql")).map_err(io)?;
+        if dump.contains(old_root) {
+            return Err(format!("{name}: the dump still names {old_root}"));
+        }
+        {
+            use sqlx::Connection;
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("forge.db"))
+                .foreign_keys(false)
+                .create_if_missing(true);
+            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::raw_sql(&dump)
+                .execute(&mut connection)
+                .await
+                .map_err(|error| format!("loading the dump of {name}: {error}"))?;
+            if !shadow {
+                // An install that never ran the passive queue stages (the
+                // last release) has no attempt and no queue row at all.
+                sqlx::raw_sql("DELETE FROM integration_attempt; DELETE FROM integration_queue;")
+                    .execute(&mut connection)
+                    .await
+                    .map_err(|error| format!("removing the shadow rows of {name}: {error}"))?;
+            }
+            connection
+                .close()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        std::fs::remove_file(dir.path().join("db.sql")).map_err(io)?;
+        std::fs::create_dir_all(dir.path().join("web")).map_err(io)?;
+        std::fs::write(dir.path().join("web/index.html"), "<html></html>").map_err(io)?;
+
+        let shared = Arc::new(Shared::default());
+        let mut tasks = Vec::new();
+        for task in manifest["tasks"].as_array().into_iter().flatten() {
+            let id = task["id"].as_str().unwrap_or_default().to_owned();
+            shared.index.lock().unwrap().insert(id.clone(), tasks.len());
+            tasks.push(id);
+        }
+        // Later than every write of the run that made the fixture.
+        shared.writes.store(1000, Ordering::SeqCst);
+        let live = Self::boot(dir.path(), &shared).await;
+        let agent = |name: &'static str| {
+            let pool = live.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT id FROM agent_identity WHERE name = ?")
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|error| format!("{name}: {error}"))
+            }
+        };
+        let (coder_id, reviewer_id) = (agent("model-coder").await?, agent("model-reviewer").await?);
+        let report = Self::start(&live).await?;
+        let world = Self {
+            _storm: lock_storm(dir.path()),
+            dir,
+            live: Some(live),
+            shared,
+            project_id: manifest["project_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            coder_id,
+            reviewer_id,
+            project_paused: manifest["project_paused"] == true,
+            agent_paused: false,
+            avoid_open_findings: false,
+            tasks,
+            settled: BTreeMap::new(),
+            trace: Vec::new(),
+        };
+        Ok((world, manifest, report))
+    }
+
+    fn main_sha(&self) -> Result<String, String> {
+        git(
+            &self.dir.path().join("repo"),
+            &["rev-parse", "refs/heads/main"],
+        )
+    }
+
+    /// Whether `commit` is on main.
+    fn on_main(&self, commit: &str) -> bool {
+        git(
+            &self.dir.path().join("repo"),
+            &["merge-base", "--is-ancestor", commit, "refs/heads/main"],
+        )
+        .is_ok()
+    }
+
+    async fn upgrade_print(&self) -> Result<UpgradePrint, String> {
+        let sql = |error: sqlx::Error| error.to_string();
+        let pool = &self.live().pool;
+        let mut tasks = Vec::new();
+        for (index, id) in self.tasks.iter().enumerate() {
+            let task = self.task(index).await?;
+            let (_, offers) = self.offers(index).await?;
+            let verbs: Vec<String> = offers
+                .iter()
+                .map(|offer| format!("{}:{}", offer["action"]["verb"], offer["reason"]))
+                .collect();
+            let attempts: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+                "SELECT state, admission_key, current, failure_message FROM integration_attempt
+                 WHERE task_ref = ? ORDER BY created_at, rowid",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .map_err(sql)?;
+            let history: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT from_state, to_state, bridge_kind FROM transition_log
+                 WHERE task_id = ? ORDER BY created_at, rowid",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .map_err(sql)?;
+            let reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(sql)?;
+            let budgets: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT kind, spent FROM task_budget WHERE task_id = ? ORDER BY kind",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            tasks.push(format!(
+                "{index}: {} condition {} / {} offers {verbs:?} attempts {attempts:?} history {history:?} reviews {reviews} budgets {budgets:?}",
+                task["status"], task["condition"]["primary"], task["condition"]["additional"],
+            ));
+        }
+        Ok(UpgradePrint {
+            tasks,
+            refs: git(
+                &self.dir.path().join("repo"),
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads",
+                ],
+            )?,
+        })
+    }
+
+    /// The rows behind a failure: each Task's own columns, its attempts with
+    /// their journals, its open steps and the trace.
+    async fn upgrade_rows(&self) -> String {
+        let pool = &self.live().pool;
+        let mut out = String::new();
+        for id in &self.tasks {
+            let task: Vec<(String, i64, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT status,version,status_epoch,blocked_json,failed_json,error_annotation,metadata_json,condition_json FROM task WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            out.push_str(&format!("ROW task {id}: {task:?}\n"));
+            let attempts: Vec<(String, String, String, i64, Option<String>, Option<String>, Option<String>, String, Option<String>)> = sqlx::query_as(
+                "SELECT id,state,admission_key,current,failure_kind,failure_message,available_at,operation_receipts_json,import_source_json FROM integration_attempt WHERE task_ref = ? ORDER BY created_at, rowid",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for attempt in attempts {
+                out.push_str(&format!("ROW   attempt {attempt:?}\n"));
+            }
+            let steps: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT kind,status,expected_status,causation_key,last_error FROM task_step WHERE task_id = ? AND (status NOT IN ('done','completed','cancelled','superseded') OR last_error IS NOT NULL) ORDER BY seq",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for step in steps {
+                out.push_str(&format!("ROW   step {step:?}\n"));
+            }
+        }
+        format!("{out}TRACE {:#?}", self.trace)
+    }
+
+    /// The typed-statement refusal round 2 found on rows written with plain
+    /// SQL, on any step of any Task.
+    async fn refused_statements(&self) -> Result<Vec<String>, String> {
+        sqlx::query_scalar(
+            "SELECT task_id || ' ' || kind || ': ' || last_error FROM task_step
+             WHERE last_error LIKE '%differs from its legacy and owner witnesses%'",
+        )
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// What design section 5 says the upgrade does with the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Upgraded {
+    /// The merge had landed: it is reported, once, and never repeated.
+    Reported,
+    /// Nothing had landed: the queue merges it once, with no owner action.
+    Merges,
+    /// A coder repair is the Task's own flow; it merges after the repair.
+    Repaired,
+    /// The Task waits with a typed reason and an offered action.
+    Parked,
+}
+
+async fn pre_queue_upgrade(name: &str, shadow: bool, expected: Upgraded) -> Result<(), String> {
+    let (mut world, manifest, report) = World::restore(name, shadow).await?;
+    match pre_queue_upgraded(name, expected, &mut world, &manifest, &report).await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("{error}\n{}", world.upgrade_rows().await)),
+    }
+}
+
+async fn pre_queue_upgraded(
+    name: &str,
+    expected: Upgraded,
+    world: &mut World,
+    manifest: &Value,
+    report: &services::integration_steps::import::ImportReport,
+) -> Result<(), String> {
+    let old_main = manifest["main"].as_str().unwrap_or_default().to_owned();
+    eprintln!(
+        "UPGRADE {name}: first start imported {} quarantined {} needs_fact {} unreadable {} continuations {}",
+        report.imported, report.quarantined, report.needs_fact, report.unreadable, report.continuations
+    );
+    if report.unreadable > 0 {
+        return Err(format!(
+            "{name}: {} Task(s) were unreadable to the importer",
+            report.unreadable
+        ));
+    }
+    let clock = std::time::Instant::now();
+    world.quiesce().await?;
+    eprintln!(
+        "UPGRADE {name}: first quiescence after {:?}",
+        clock.elapsed()
+    );
+    // A merge the queue worker put off (the old build's rebase or lock was
+    // still on disk) is retried at its own time, with no owner action.
+    for _ in 0..4 {
+        if world.project_paused || world.move_deadlines(true).await? == 0 {
+            break;
+        }
+        world.quiesce().await?;
+    }
+    eprintln!(
+        "UPGRADE {name}: retry deadlines passed after {:?}",
+        clock.elapsed()
+    );
+    let line = world.check_quiescent().await?;
+    let first = world.upgrade_print().await?;
+    eprintln!(
+        "UPGRADE {name}: after the first start: {line}\n  {}",
+        first.tasks.join("\n  ")
+    );
+    let refused = world.refused_statements().await?;
+    if !refused.is_empty() {
+        return Err(format!(
+            "{name}: the typed integration statement was refused: {refused:?}"
+        ));
+    }
+    let unknown: Vec<String> = sqlx::query_scalar(
+        "SELECT kind || ' ' || expected_status || ': ' || last_error FROM task_step
+         WHERE last_error LIKE '%unknown action%'",
+    )
+    .fetch_all(&world.live().pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{name}: a step of the old build named a hook this build does not have: {unknown:?}"
+        ));
+    }
+
+    // A second start changes nothing. A run in flight loses its process on
+    // a restart, so this is asked only of a state with no run.
+    let running = (0..world.tasks.len()).any(|index| world.waiting(index));
+    if !running {
+        world.crash_and_restart().await?;
+        world.quiesce().await?;
+        world.check_quiescent().await?;
+        let second = world.upgrade_print().await?;
+        if first != second {
+            return Err(format!(
+                "{name}: a second start changed the state:\n first {first:#?}\n second {second:#?}"
+            ));
+        }
+    }
+
+    eprintln!(
+        "UPGRADE {name}: second start checked after {:?}",
+        clock.elapsed()
+    );
+    let last = world.tasks.len() - 1;
+    let subject = world.task(last).await?;
+    let status = subject["status"].as_str().unwrap_or_default().to_owned();
+    let main_after_start = world.main_sha()?;
+    match expected {
+        Upgraded::Reported => {
+            if status != "done" || main_after_start != old_main {
+                return Err(format!(
+                    "{name}: a landed merge is reported once and not repeated; the Task is {status}, main {old_main} -> {main_after_start}"
+                ));
+            }
+        }
+        Upgraded::Merges => {
+            if status != "done" || main_after_start == old_main {
+                return Err(format!(
+                    "{name}: the Task merges with no owner action; it is {status} with condition {}, main {old_main} -> {main_after_start}",
+                    subject["condition"]
+                ));
+            }
+        }
+        Upgraded::Repaired => {
+            if TERMINAL.contains(&status.as_str()) {
+                return Err(format!(
+                    "{name}: the Task was settled without its repair: {status}"
+                ));
+            }
+        }
+        Upgraded::Parked => {
+            let condition = &subject["condition"];
+            let integration = condition["primary"]["kind"] == "integration"
+                || condition["additional"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|reason| reason["kind"] == "integration");
+            let (_, offers) = world.offers(last).await?;
+            if status == "done" || main_after_start != old_main {
+                return Err(format!(
+                    "{name}: a stopped Task merged with its stop in place: {status}, main {old_main} -> {main_after_start}"
+                ));
+            }
+            if !integration {
+                return Err(format!(
+                    "{name}: the parked Task does not state its integration reason: {condition}"
+                ));
+            }
+            if offers.is_empty() && !world.project_paused {
+                return Err(format!(
+                    "{name}: the parked Task offers no action: {condition}"
+                ));
+            }
+        }
+    }
+
+    // What the fixture left on disk for the owner to clean up.
+    if name == "p19_target_dirty" {
+        git(&world.dir.path().join("repo"), &["checkout", "--", "."])?;
+    }
+    // The offered actions, and the runs they need, get every Task merged.
+    world.drive_to_settlement().await?;
+    for index in 0..world.tasks.len() {
+        let task = world.task(index).await?;
+        if task["status"] != "done" {
+            return Err(format!(
+                "{name}: task {index} ended {} and not done: {}; trace {:#?}",
+                task["status"], task["condition"], world.trace
+            ));
+        }
+        let branch = format!("refs/heads/task/{}", &world.tasks[index][..8]);
+        let merged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM transition_log WHERE task_id = ? AND to_state = 'done'",
+        )
+        .bind(&world.tasks[index])
+        .fetch_one(&world.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if merged != 1 {
+            return Err(format!(
+                "{name}: task {index} was reported done {merged} times"
+            ));
+        }
+        if let Ok(tip) = git(&world.dir.path().join("repo"), &["rev-parse", &branch]) {
+            if !world.on_main(&tip) {
+                return Err(format!(
+                    "{name}: task {index} is done and its branch {tip} is not on main"
+                ));
+            }
+        }
+    }
+    if expected == Upgraded::Reported && world.main_sha()? != old_main {
+        return Err(format!(
+            "{name}: main moved after a landed merge was reported"
+        ));
+    }
+    // One commit per Task on main: nothing merged twice.
+    let subjects = git(
+        &world.dir.path().join("repo"),
+        &["log", "--format=%s", "refs/heads/main"],
+    )?;
+    let mut seen = std::collections::BTreeSet::new();
+    for subject in subjects.lines() {
+        if !seen.insert(subject.to_owned()) {
+            return Err(format!(
+                "{name}: main carries `{subject}` twice:\n{subjects}"
+            ));
+        }
+    }
+    eprintln!("UPGRADE {name}: settled after {:?}", clock.elapsed());
+    // And a start after the end changes nothing either.
+    let settled = world.upgrade_print().await?;
+    world.crash_and_restart().await?;
+    world.quiesce().await?;
+    let again = world.upgrade_print().await?;
+    if settled != again {
+        return Err(format!(
+            "{name}: a start after settlement changed the state:\n before {settled:#?}\n after {again:#?}"
+        ));
+    }
+    eprintln!("UPGRADE {name}: settled: {}", settled.tasks.join("\n  "));
+    Ok(())
+}
+
+/// Each fixture twice: as the last pre-queue build left it (with the passive
+/// "shadow" attempt that build recorded for a merge), and with every attempt
+/// and queue row removed, which is what an install that never ran the passive
+/// stages has (the importer classifies those Tasks from their own rows).
+macro_rules! pre_queue {
+    ($($test:ident, $bare:ident: $name:literal => $expected:ident;)*) => {$(
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $test() {
+            log_to_stderr();
+            if let Err(error) = pre_queue_upgrade($name, true, Upgraded::$expected).await {
+                panic!("{error}");
+            }
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $bare() {
+            log_to_stderr();
+            if let Err(error) = pre_queue_upgrade($name, false, Upgraded::$expected).await {
+                panic!("{error}");
+            }
+        }
+    )*};
+}
+
+pre_queue! {
+    pre_queue_p01_outcome_done_task_merging, pre_queue_bare_p01_outcome_done_task_merging: "p01_outcome_done_task_merging" => Reported;
+    pre_queue_p02_merge_intent_landed_no_outcome, pre_queue_bare_p02_merge_intent_landed_no_outcome: "p02_merge_intent_landed_no_outcome" => Reported;
+    pre_queue_p02_merge_intent_not_landed, pre_queue_bare_p02_merge_intent_not_landed: "p02_merge_intent_not_landed" => Merges;
+    pre_queue_p04_pending_hooks, pre_queue_bare_p04_pending_hooks: "p04_pending_hooks" => Merges;
+    pre_queue_p05_rebase_target_no_outcome, pre_queue_bare_p05_rebase_target_no_outcome: "p05_rebase_target_no_outcome" => Merges;
+    pre_queue_p06_clean_rebase_in_merge_failed, pre_queue_bare_p06_clean_rebase_in_merge_failed: "p06_clean_rebase_in_merge_failed" => Merges;
+    pre_queue_p06_clean_rebase_in_review, pre_queue_bare_p06_clean_rebase_in_review: "p06_clean_rebase_in_review" => Merges;
+    pre_queue_p07_conflict_coder_repairing, pre_queue_bare_p07_conflict_coder_repairing: "p07_conflict_coder_repairing" => Repaired;
+    pre_queue_p07_conflict_handoff_entry_pending, pre_queue_bare_p07_conflict_handoff_entry_pending: "p07_conflict_handoff_entry_pending" => Repaired;
+    pre_queue_p09_back_at_merge_gate_after_bounce, pre_queue_bare_p09_back_at_merge_gate_after_bounce: "p09_back_at_merge_gate_after_bounce" => Merges;
+    pre_queue_p10_project_paused_at_merge_gate, pre_queue_bare_p10_project_paused_at_merge_gate: "p10_project_paused_at_merge_gate" => Parked;
+    pre_queue_p11_project_resumed_not_continued, pre_queue_bare_p11_project_resumed_not_continued: "p11_project_resumed_not_continued" => Merges;
+    pre_queue_p13_held_in_merging_project_paused, pre_queue_bare_p13_held_in_merging_project_paused: "p13_held_in_merging_project_paused" => Parked;
+    pre_queue_p13_held_in_merging, pre_queue_bare_p13_held_in_merging: "p13_held_in_merging" => Parked;
+    pre_queue_p14_merge_failed_on_a_locked_index, pre_queue_bare_p14_merge_failed_on_a_locked_index: "p14_merge_failed_on_a_locked_index" => Repaired;
+    pre_queue_p19_dirty_worktree, pre_queue_bare_p19_dirty_worktree: "p19_dirty_worktree" => Repaired;
+    pre_queue_p19_target_dirty, pre_queue_bare_p19_target_dirty: "p19_target_dirty" => Parked;
 }

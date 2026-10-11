@@ -846,7 +846,21 @@ async fn the_cutover_migration_drops_only_the_removed_hook_from_stored_workflows
     sqlx::query(
         "INSERT INTO task_step_workflow(id,definition_json,last_used_at) VALUES('snapshot',?,?)",
     )
-    .bind(stored.to_string())
+    // The shape a step's retained snapshot really has (`durable::
+    // HookDefinition`): the resolved workflow, and the Project's stored
+    // definition as JSON text.
+    .bind(
+        serde_json::json!({"workflow": stored, "project_workflow_definition": stored.to_string()})
+            .to_string(),
+    )
+    .bind(FIXED_TIME)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_step_workflow(id,definition_json,last_used_at) VALUES('no-project',?,?)",
+    )
+    .bind(serde_json::json!({"workflow": stored, "project_workflow_definition": null}).to_string())
     .bind(FIXED_TIME)
     .execute(db.pool())
     .await
@@ -866,16 +880,31 @@ async fn the_cutover_migration_drops_only_the_removed_hook_from_stored_workflows
                 {"name": "bare"}
             ]
         });
-        for sql in [
-            "SELECT workflow_definition FROM project WHERE id='p'",
-            "SELECT definition_json FROM task_step_workflow WHERE id='snapshot'",
-        ] {
-            let text: String = sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&text).unwrap(),
-                expected,
-                "{sql}"
-            );
+        let text: String =
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id='p'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), expected);
+        for (id, project) in [("snapshot", true), ("no-project", false)] {
+            let text: String =
+                sqlx::query_scalar("SELECT definition_json FROM task_step_workflow WHERE id=?")
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            let snapshot = serde_json::from_str::<Value>(&text).unwrap();
+            assert_eq!(snapshot["workflow"], expected, "{id}");
+            if project {
+                // Still JSON text inside the snapshot, as the engine reads it.
+                let nested = snapshot["project_workflow_definition"]
+                    .as_str()
+                    .expect("the Project definition stays a string");
+                assert_eq!(serde_json::from_str::<Value>(nested).unwrap(), expected);
+            } else {
+                assert!(snapshot["project_workflow_definition"].is_null());
+            }
+            assert_eq!(snapshot.as_object().unwrap().len(), 2, "{id}");
         }
         let other: String =
             sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id='other'")

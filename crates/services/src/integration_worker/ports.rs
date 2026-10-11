@@ -242,6 +242,23 @@ impl GateCause {
             Self::ProjectPaused => "project_paused",
         }
     }
+    /// Whether an attempt's `failure_message` is a park under the gate.
+    pub fn parked_under(message: &str) -> bool {
+        [
+            Self::Held,
+            Self::Blocked,
+            Self::Failed,
+            Self::EntryBlocked,
+            Self::AwaitingHuman,
+            Self::ProjectPaused,
+        ]
+        .into_iter()
+        .any(|cause| {
+            message
+                .strip_prefix(cause.code())
+                .is_some_and(|rest| rest.starts_with(':'))
+        })
+    }
     /// What the owner reads, with the action that lifts the gate.
     pub fn message(self) -> &'static str {
         match self {
