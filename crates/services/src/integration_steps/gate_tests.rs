@@ -214,6 +214,98 @@ fn gate_code(attempt: &IntegrationAttempt) -> String {
         .to_owned()
 }
 
+/// `settle`'s own gate read. The head driver read the Task gate, found it
+/// open and asked for the decision; the owner's Hold lands before the step
+/// runs. The step is held here by the test (nothing runs it until it is
+/// asked), which is the seam between the driver's read and the step. The
+/// step reads the gate itself: no permit is written, no protected `result`
+/// step exists, the answer names the gate, and the Task did not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_between_the_drivers_gate_read_and_settle_writes_no_permit() {
+    let world = World::new().await;
+    let a = world.reconciled("t", "t.txt").await;
+    // The driver's side: gate read open, the head waits for the decision.
+    assert_eq!(
+        crate::integration_steps::gate::task_gate(&world.db, "t")
+            .await
+            .unwrap(),
+        None
+    );
+    let asked = world.place(&a.id, "awaiting_task_step", 1).await;
+    // The Hold lands now.
+    let held = world.act("t", TaskAction::Hold { reason: None }).await;
+    assert_eq!(held.status, "merging");
+    world.ask(&asked, IntegrationStepAction::Settle).await;
+    settled(&world, "t", IntegrationStepAction::Settle, "done").await;
+
+    let after = world.attempt(&a.id).await;
+    assert!(after.permit_json.is_none(), "no permit under a Hold");
+    let answer = ack(&after, IntegrationStepAction::Settle).expect("settle answered");
+    assert_eq!(answer.outcome, IntegrationStepOutcome::Infrastructure);
+    assert!(
+        answer
+            .message
+            .as_deref()
+            .is_some_and(crate::integration_worker::GateCause::parked_under),
+        "the answer names the gate: {:?}",
+        answer.message
+    );
+    assert!(world
+        .step("t", IntegrationStepAction::Result)
+        .await
+        .is_empty());
+    assert_eq!(world.task("t").await.status, "merging");
+    assert_eq!(world.merges("t").await, 0);
+}
+
+/// An attempt was sent back (`ejected`, `needs_review`) but its `send_back`
+/// step never moved the Task: the Task is still in the `merging` entry the
+/// attempt was admitted in, with an attempt nothing drives. The reconciler
+/// gives the Task a successor (same place in line), which merges; the
+/// sent-back row is history. Nothing is merged twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_sent_back_attempt_whose_task_stayed_in_the_entry_gets_a_successor() {
+    for state in ["ejected", "needs_review"] {
+        let world = World::new().await;
+        let attempt = world.reconciled("t", "t.txt").await;
+        world
+            .set(
+                &attempt.id,
+                &format!("state='{state}',failure_kind='infrastructure',failure_message='task_step_failed: send_back'"),
+            )
+            .await;
+        assert_eq!(world.task("t").await.status, "merging");
+        let production = Production::new(&world);
+        let running = production.run();
+        // The worker alone does not take it up: the row left the queue.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(world.task("t").await.status, "merging", "{state}");
+        assert_eq!(world.merges("t").await, 0, "{state}");
+        let dispatcher = dispatcher(&world).await;
+        world
+            .until("t", &format!("{state}: the successor merges"), || async {
+                dispatcher.reconcile_all().await.unwrap();
+                world.task("t").await.status == "done"
+            })
+            .await;
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        assert_eq!(world.merges("t").await, 1, "{state}");
+        let old = world.attempt(&attempt.id).await;
+        assert_eq!(old.state, S::Superseded, "{state}");
+        let successor = world
+            .db
+            .current_integration_attempt("t")
+            .await
+            .unwrap()
+            .map(|current| (current.id != attempt.id, current.queue_seq == old.queue_seq));
+        // The successor is the Task's record now, in the same place in line.
+        if let Some((different, same_seq)) = successor {
+            assert!(different && same_seq, "{state}");
+        }
+    }
+}
+
 /// Hold while queued, then Release. The held member is skipped (it leaves
 /// the slot at once, with no Git effect, no check and no counted retry), the
 /// member behind it merges, and the Release alone puts it back: it merges
