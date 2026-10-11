@@ -1381,21 +1381,6 @@ impl SqliteDb {
         let assignment =
             task::effective_execution_assignment_in_tx(transaction, task_id, assignment_role)
                 .await?;
-        // An agentless reviewer execution (the retired inline review re-run
-        // created them; nothing in Forge does now) is a synthetic reviewer:
-        // it has no Agent principal and therefore no assignment row to
-        // compare. Keep this exception scoped to the canonical reviewer
-        // role and an admission that explicitly has no selected assignment;
-        // every Agent-backed launch still requires the exact assignment CAS.
-        let allows_absent_ci_review = canonical_execution_role(Some(input.role.as_str()))
-            == Some("reviewer")
-            && input.agent_id.is_none()
-            && admission.expected_assignment_id.is_none();
-        let allows_null_assignment_ci_review = canonical_execution_role(Some(input.role.as_str()))
-            == Some("reviewer")
-            && input.agent_id.is_none()
-            && admission.expected_assignment_id.is_some()
-            && admission.expected_assignment_updated_at.is_some();
         if let Some(assignment) = assignment {
             let actual_assignment_id: String = assignment.try_get("id")?;
             let actual_assignment_updated_at: String = assignment.try_get("updated_at")?;
@@ -1409,14 +1394,11 @@ impl SqliteDb {
             let assignee_id: Option<String> = assignment.try_get("assignee_id")?;
             let assignment_matches = (assignee_type.as_deref() == Some("agent")
                 && assignee_id.as_deref() == assignment_agent_id.as_deref())
-                || (assignee_type.as_deref() == Some("user") && input.agent_id.is_none())
-                || (allows_null_assignment_ci_review
-                    && assignee_type.is_none()
-                    && assignee_id.is_none());
+                || (assignee_type.as_deref() == Some("user") && input.agent_id.is_none());
             if !assignment_matches {
                 return Err(DbError::VersionConflict);
             }
-        } else if !allows_absent_ci_review {
+        } else {
             return Err(DbError::VersionConflict);
         }
         if canonical_execution_role(Some(input.role.as_str())) == Some("reviewer") {
