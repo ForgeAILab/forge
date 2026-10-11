@@ -2786,7 +2786,7 @@ cancelled). MCP `forge_get_task` and `forge_list_tasks` return the same field.
 | `phase` | Set while `state` is `owned`: `validating`, `rebasing`, `checking`, `awaiting_carry`, `awaiting_authorization`, `fast_forwarding`, `reconciling` |
 | `position` | Members ahead of this one: `0` at the head, `n` for a waiter with `n` ahead, `null` when the Task is not in line (sent back, deferred) |
 | `wait` | Why the merge is not moving, or `null`: `{ code, message, machine_id, machine_name, retry_at }` |
-| `action_hint` | `retry` (Task action `retry`, offered as `integration_retry`), `release` (Task action `release`), `resume_project`, or `null`. A hint only: `available_actions` on Task detail is the authority |
+| `action_hint` | `retry` (Task action `retry`, offered as `integration_retry`), `release` (Task action `release`), `resume_project` (the Project action `POST /api/v1/projects/{id}/resume`; never a Task offer), or `null`. A hint only: `available_actions` on Task detail is the authority. `retry` is computed by the function the `integration_retry` offer is built from, so it is hinted exactly when that offer exists: a merge the queue stopped a moment ago, whose Task the park step has not told yet, reads `deferred` with no hint |
 | `timings` | `{ enqueued_at, head_since, rounds, queued_ms, rebase_ms, check_ms, fast_forward_ms }`. `head_since` is `null` while the Task waits; durations are cumulative over the attempt's rounds and `null` until the phase has run |
 
 `wait.code` is one of `queue` (others are ahead), `queue_suspended`,
@@ -2798,18 +2798,82 @@ itself at `retry_at`), `budget_exhausted`, `owner_required`,
 `unresolved_result` and `cancel_requested`. A Task stopped by its owner (a
 Hold, a block, a failure) or by a paused Project reads `waiting` with that
 cause: the Task's own stop is the reason and carries the action that lifts
-it.
+it. The cause is the one that holds now: once the stop is lifted the summary
+stops naming it, even before the queue has put the Task back in line.
+
+**The enums are open.** `queue_state`, `state`, `phase`, `wait.code`,
+`action_hint` and a queue's `state` are stable snake_case strings, and the
+queue will add more of them. A client must tolerate a value it does not know:
+show it neutrally (the web reads an unknown state as "In merge queue" and an
+unknown wait as the server's `message`) and never fail the read. The Rust
+types end each enum with an `unknown` variant for that; the server never
+sends the literal `unknown`. Timestamps are RFC 3339. `machine_id` is the id
+of `GET /api/v1/daemons`; no lease owner, runtime id or machine path is part
+of these reads.
+
+A Task in its merge state that has no attempt yet (the queue admits it on its
+next pass) has `integration: null`, like a Task that is not merging.
+
+Example (`TaskIntegrationSummary`; a test reads this block into the type and
+back):
+
+<!-- example: task-integration-summary -->
+```json
+{
+  "attempt_id": "0b9c2a4e-6f1d-4c57-9d0a-3f5e8f1c2b7a",
+  "queue_id": "5d1e7c90-2a44-4b8e-8f0b-9a6c3d2e1f00",
+  "repo_id": "c1a2b3d4-0000-4e5f-8a9b-112233445566",
+  "target_branch": "main",
+  "queue_state": "open",
+  "state": "waiting",
+  "phase": null,
+  "position": 2,
+  "wait": {
+    "code": "queue",
+    "message": null,
+    "machine_id": null,
+    "machine_name": null,
+    "retry_at": null
+  },
+  "action_hint": null,
+  "timings": {
+    "enqueued_at": "2026-10-11T09:14:03+00:00",
+    "head_since": null,
+    "rounds": 0,
+    "queued_ms": null,
+    "rebase_ms": null,
+    "check_ms": null,
+    "fast_forward_ms": null
+  }
+}
+```
 
 The Task list reads the summaries of a page in one statement, whatever the
-page holds. The list's `ETag` covers the queue: a queue that advances changes
-the validator although it writes no Task and no Project row, and a lease
-renewal does not.
+page holds, and Task detail reads its summary in one. The list's `ETag` covers
+the queue: a queue that advances, and a Project that is paused or resumed,
+change the validator although neither writes a Task, and a lease renewal does
+not.
 
 **`GET /api/v1/repos/{id}/integration-queues`** lists the repository's queues
 by target branch. Query: `limit` (default 20, at most 100) and the opaque
 `cursor` of the page before. The response is `{ items, next_cursor, has_more }`.
 A caller who cannot see the repository's Project gets `404`, the same answer
-as for a repository that does not exist; an invalid cursor is `400`.
+as for a repository that does not exist; an invalid cursor is `400`. The
+cursor is a place among this repository's target branches: clients must not
+decode it, a queue created or removed between two pages is neither repeated
+nor skips another, and a cursor sent to another repository reads only that
+repository's own queues.
+
+**Who is listed.** A queue belongs to a repository of one Project, and
+admission refuses a Task of any other Project, so the members are that
+Project's Tasks. The read does not rest on it: `members` lists only members of
+the Project the caller was admitted to. A member of any other Project is
+counted, in `member_count` and in every `position`, because it is really in
+the line, and it is never listed: no Task id, title, status or attempt id, and
+`head_task_id` / `head_attempt_id` are `null` for such a head (`head_since`
+still says the queue has one). A Task that was deleted while its attempt is
+still in the line keeps its place and its `task_id`; its `task_title` and
+`task_status` are `null`.
 
 Each item:
 
@@ -2821,7 +2885,59 @@ Each item:
 | `head_task_id`, `head_attempt_id`, `head_since` | The member being merged now, or `null` |
 | `member_count` | Members with an attempt in progress, including those sent back or deferred |
 | `members` | The head first, then queue order; at most 100. Each is `{ task_id, task_title, task_status, integration }` with the same `TaskIntegrationSummary` as the Task reads |
-| `members_truncated` | `true` when `member_count` exceeds `members` |
+| `members_truncated` | `true` when the queue has more members than the 100 a read returns |
+
+Example (a test reads this block into `IntegrationQueuesResponse` and back):
+
+<!-- example: integration-queues -->
+```json
+{
+  "items": [
+    {
+      "id": "5d1e7c90-2a44-4b8e-8f0b-9a6c3d2e1f00",
+      "repo_id": "c1a2b3d4-0000-4e5f-8a9b-112233445566",
+      "target_branch": "main",
+      "state": "open",
+      "state_reason": null,
+      "head_task_id": "4f0c2a1e-7b6d-4d0e-9c1a-0a1b2c3d4e5f",
+      "head_attempt_id": "a7e3d9c1-55aa-4f0e-b3c2-6d7e8f901234",
+      "head_since": "2026-10-11T09:15:10+00:00",
+      "member_count": 1,
+      "members": [
+        {
+          "task_id": "4f0c2a1e-7b6d-4d0e-9c1a-0a1b2c3d4e5f",
+          "task_title": "Add login",
+          "task_status": "merging",
+          "integration": {
+            "attempt_id": "a7e3d9c1-55aa-4f0e-b3c2-6d7e8f901234",
+            "queue_id": "5d1e7c90-2a44-4b8e-8f0b-9a6c3d2e1f00",
+            "repo_id": "c1a2b3d4-0000-4e5f-8a9b-112233445566",
+            "target_branch": "main",
+            "queue_state": "open",
+            "state": "owned",
+            "phase": "rebasing",
+            "position": 0,
+            "wait": null,
+            "action_hint": null,
+            "timings": {
+              "enqueued_at": "2026-10-11T09:12:40+00:00",
+              "head_since": "2026-10-11T09:15:10+00:00",
+              "rounds": 1,
+              "queued_ms": 150000,
+              "rebase_ms": null,
+              "check_ms": null,
+              "fast_forward_ms": null
+            }
+          }
+        }
+      ],
+      "members_truncated": false
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}
+```
 
 ### Transition responses and queued cascades
 
@@ -5154,21 +5270,34 @@ annotation changes, same-column reorders and same-state recovery markers do not.
 
 ```json
 { "event_type": "integration.updated", "entity_id": "<queue_id>", "timestamp": "...",
-  "repo_id": "<repo_id>", "queue_id": "<queue_id>", "task_id": "<task_id or null>" }
+  "repo_id": "<repo_id>", "queue_id": "<queue_id>", "task_id": "<task_id or null>",
+  "project_ids": ["<project_id>"] }
 ```
 
-It is a cache invalidation and nothing else: refetch the Task (`task_id`) and
-the repository's queues, and treat a `null` `task_id` as "the queue's own
-state or head changed". It is published on the event bus only. It is not in
-the durable ledger (no `id`, not replayed on resume: a client that reconnects
-refetches), it has no Attention category, raises no notification and wakes no
-Agent. One event is published per member whose state, phase, position or
-attempt changed and per member that left the queue; a queue that is idle
-publishes nothing, however long its head runs. The events come from a
-read-only projector in the server process that compares two reads of the
-queues (at most ten a second, at least one a second, and at once when an
-integration Task step settles); the queue worker itself still writes nothing
-but queue, attempt and Task-step rows.
+It is a cache invalidation and nothing else, and it carries ids only (no
+title, branch or machine name). `task_id` is the one Task whose summary
+changed; it is `null` when more than one member changed or the queue's own
+state or head did, and a client then refetches what it shows of that queue
+(`queue_id`). `project_ids` are the Projects of the members concerned: refetch
+their Task lists and no other Project's. Like every bus event it is delivered
+to every connected client of this local server (the stream has no per-Project
+filter); the ids it names read as `404` to a caller who may not see them. It
+is published on the event bus only. It is not in the durable ledger (no `id`,
+not replayed on resume: a client that reconnects refetches), it has no
+Attention category, raises no notification and wakes no Agent.
+
+At most one event is published per queue and read of the projector, whatever
+happened in between: a head that runs through six phases inside a read
+interval, or a line of fifty that moves up one place, is one event. An event
+is published only when something a reader of the summary sees changed (state,
+phase, position, wait, timings, the queue's state or head); a lease renewal or
+a receipt written on an attempt publishes nothing, and neither does a queue
+that is idle, however long its head runs. The events come from a read-only
+projector in the server process that compares two reads of the queues (one
+SELECT each; at most four a second, at least one a second, and promptly when
+an integration Task step settles). A process that starts publishes nothing
+for what it finds. The queue worker itself still writes nothing but queue,
+attempt and Task-step rows.
 
 Agent Chat events already committed to the durable outbox (message admission,
 response completion, awaiting-input, failure, cancellation, retry, and control
@@ -5265,6 +5394,13 @@ role through that status alone:
 | Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
 | Project not visible to the user | No moved tools |
 
+`forge_get_integration_queue` is a nineteenth registry-built tool, added with
+the merge-queue reads rather than moved: Project-classified, and offered to
+every grant whose Project is visible to the user (the rule of `GET
+/api/v1/repos/{id}/integration-queues`), with or without owner/member
+authority. An account grant names the Project; a Project the user cannot see
+answers `-32004` like one that does not exist.
+
 The eight account-wide names above are never offered to a constrained grant.
 For an account grant, the referenced Project determines member/owner/admin
 permissions; an authorized reference is still required even though the tool
@@ -5345,6 +5481,7 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_set_main_agent` | Replace the singular Main Agent binding with optimistic concurrency |
 | `forge_get_project_agent` | Inspect the singular Project Agent binding |
 | `forge_set_project_agent` | Replace a Project Agent binding with optimistic concurrency |
+| `forge_get_integration_queue` | Read the merge queues of a Project's repository: `{project_id, target_branch?, limit?}` returns `{project_id, repo_id, items, has_more}` with `items` in the shape of `GET /api/v1/repos/{id}/integration-queues` (see [Merge queue reads](#merge-queue-reads)). Authorized like that route: the Project is visible to the caller; in a Project-constrained session `project_id` is the session's and any other is refused |
 | `forge_list_agent_chats` | List the authenticated Main Chat and authorized Project Agent Chats |
 | `forge_get_agent_chat` | Inspect one authorized Agent Chat and finite turn state |
 | `forge_list_agent_chat_messages` | List immutable Agent Chat messages and bounded provenance |
@@ -6020,9 +6157,12 @@ an optional `target_branch` and an optional unsigned `limit` (clamped to
 1–100) and returns `{ project_id, repo_id, items, has_more }`, where `items`
 are the merge queues of the bound Project's repository in the shape of `GET
 /api/v1/repos/{id}/integration-queues` (see [Merge queue
-reads](#merge-queue-reads)). It never accepts a Project or repository
-selector, writes nothing, and returns an empty `items` for a Project without a
-repository. One spec generates its schema, validator, dispatch and the
+reads](#merge-queue-reads)), as the bound Project may see them: members of any
+other Project are counted and never listed. It never accepts a Project or
+repository selector, writes nothing, and returns an empty `items` for a
+Project without a repository. `POST /mcp` has the same read as
+`forge_get_integration_queue` (`{project_id, target_branch?, limit?}`, the same
+result from the same function). One spec generates its schema, validator, dispatch and the
 contract line the model is shown (`repo.integration_queue: {limit?,
 target_branch?}`).
 

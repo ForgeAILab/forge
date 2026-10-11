@@ -346,7 +346,19 @@ forge-ctl repo queue <REPO_ID> [--limit 1..100] [--cursor <opaque>]
 
 Reads `GET /api/v1/repos/{id}/integration-queues`: one section per target
 branch with the queue's state (and why it is not open) and its members in
-queue order, the head first. `--output json` prints the route's response.
+queue order, the head first. `--output json` prints the route's response as
+the server sent it (every field, including values a newer server adds), on
+stdout, whether or not stdout is a terminal. A repository with no queue prints
+`No merge queue: nothing has been queued for this repository.` and exits 0. A
+repository that does not exist, or whose Project you cannot see, is a request
+error (exit 1); an invalid argument exits 2.
+
+The table keeps each member on one line: a title longer than 60 characters is
+cut with `…`, line breaks in a title become spaces, and a member whose Task
+was deleted reads `(deleted)`. A state or wait reason this build does not know
+(a newer server) reads `in merge queue` and `see the message`. The table is
+plain text with no colour and no terminal-width detection, so it reads the
+same piped to a file.
 
 ```text
 Queue main: open  members 3

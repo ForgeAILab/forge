@@ -222,6 +222,33 @@ pub struct IntegrationQueuesResponse {
 mod tests {
     use super::*;
 
+    /// The examples of `docs/api.md` are these types: each block reads into
+    /// its type and writes back the same JSON, field for field (no field of
+    /// the type is missing from the example, none of the example is unknown
+    /// to the type, and no enum value is one the type does not name).
+    #[test]
+    fn the_documented_examples_are_the_types() {
+        let docs = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/api.md"
+        ))
+        .unwrap();
+        let example = |name: &str| -> serde_json::Value {
+            let marker = format!("<!-- example: {name} -->\n```json\n");
+            let start = docs.find(&marker).unwrap_or_else(|| panic!("{name}")) + marker.len();
+            let end = start + docs[start..].find("\n```").unwrap();
+            serde_json::from_str(&docs[start..end]).unwrap()
+        };
+        let documented = example("integration-queues");
+        let typed: IntegrationQueuesResponse = serde_json::from_value(documented.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), documented);
+        assert!(!documented.to_string().contains("\"unknown\""));
+        let documented = example("task-integration-summary");
+        let typed: TaskIntegrationSummary = serde_json::from_value(documented.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), documented);
+        assert!(!documented.to_string().contains("\"unknown\""));
+    }
+
     /// A client built today reads a summary a later server sends: values it
     /// does not know become `unknown`, and the read does not fail.
     #[test]

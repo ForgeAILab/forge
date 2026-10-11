@@ -4931,7 +4931,7 @@ Task.
 
 | Read | Built from | Where |
 |---|---|---|
-| `GET /api/v1/repos/{id}/integration-queues`, `forge-ctl repo queue`, native `repo.integration_queue` | a keyset page of `integration_queue` by `(repo_id, target_branch)`, the members in progress of those queues in one statement, their Task rows in one, the Project's pause in one | `db::integration_queue::reads`, `services::integration_reads::repo_integration_queues` |
+| `GET /api/v1/repos/{id}/integration-queues`, `forge-ctl repo queue`, native `repo.integration_queue`, MCP `forge_get_integration_queue` | a keyset page of `integration_queue` by `(repo_id, target_branch)`, the members in progress of those queues in one statement (pinned to `integration_attempt_current_seq`: never the queue's attempt history), their Task rows in one | `db::integration_queue::reads`, `services::integration_reads::repo_integration_queues` |
 | `integration` on Task detail, Task list items, MCP `forge_get_task` / `forge_list_tasks`, `forge-ctl task show` | the Task's current attempt joined to its queue (`integration_attempt_current_task`), with the members ahead counted on `integration_attempt_current_seq` | `db::integration_members_of_tasks`, `services::integration_reads::task_integration_summary` |
 
 One function derives the summary for every surface. The attempt's state gives
@@ -4940,8 +4940,21 @@ same `attempt_id`) refines what only a Task step knows: which decision a head
 in `awaiting_task_step` waits for, a failed candidate check, and the cause of
 a deferral. A Task stopped by its owner or by a paused Project reads `waiting`
 with that cause, from the same `task_row_gate` the worker and the `settle`
-step apply, so the summary never offers a merge Retry for a stop that only a
-Release or a Resume lifts. An attempt is "in progress" while it is `current`;
+step apply, and the cause is the one that holds now (a member parked under a
+stop that was lifted names none). The member row carries whether its own
+Project is paused, so no reader asks for the Project again. `action_hint` is
+never a second rule: `retry` is `task_actions::integration_retry_offered`,
+the function `available_actions` builds the `integration_retry` offer from,
+so an attempt the worker parked before its park step told the Task hints at
+nothing; `release` is the owner's Hold; `resume_project` is a Project action.
+
+Who is listed: admission refuses a Task whose Project is not the queue's
+repository's, so a queue's members are one Project's. The reads do not rest on
+that. A queue read lists the members of the reader's Project only (the
+repository's Project on REST, the bound Project for an agent, whose
+`primary_repo_id` can name another Project's repository); any other member is
+counted, in `member_count` and in positions, and never listed, not even as the
+head. A deleted Task keeps its place and loses its title. An attempt is "in progress" while it is `current`;
 the table's CHECK makes a finished attempt non-current, so no read filters on
 state.
 
@@ -4951,25 +4964,38 @@ triggers cover the tables a Task write touches, and the queue worker writes
 none of them. Adding a trigger on `integration_attempt` would make the worker
 write the Project row and break "the worker writes nothing outside queue,
 attempt and Task step". The validator instead hashes an `integration_revision`
-read with the snapshot: count, revision sum and newest write of the Project's
-members in progress (index `integration_attempt_project_live`, migration
-`V202610111630`) plus each of their queues' state and head. A lease renewal
-changes none of these.
+read with the snapshot: count, revision sum, queue-sequence sum and newest
+write of the Project's members in progress (index
+`integration_attempt_project_live`, migration `V202610111630`) plus each of
+their queues' state and head, and the Project's pause (a wait cause of every
+member that writes no Task). The sums are over values that only grow, so a
+member that leaves and one that joins between two reads cannot cancel out. A
+lease renewal changes none of these.
 
-`integration.updated {repo_id, queue_id, task_id}` is published by
-`services::queue_invalidation::IntegrationUpdateProjector`, a periodic worker
-(`integration-read-projection`) of the runtime supervisor. Each tick is one
-SELECT of every queue with its members in progress; the projector keeps the
-previous read in memory and publishes one bus event per member whose state,
-revision or number of members ahead changed (counted as the summary counts
-it: a waiter carrying a cancel request is ahead of nobody), per member that left, and per
-queue whose own state or head changed. The first read after a start publishes
-nothing. It waits at least 100 ms and at most 1 s between reads and is woken
-by the domain-event notifier, which every integration Task step already
-signals when it settles: a step's change is published at once, a change with
-no Task step (the line moved, the head changed phase) within a second. The
-event is bus-only: no ledger row, no Attention category, no notification, no
-wake. The integration steps were not edited for it.
+`integration.updated {repo_id, queue_id, task_id, project_ids}` is published
+by `services::queue_invalidation::IntegrationUpdateProjector`, a periodic
+worker (`integration-read-projection`) of the runtime supervisor. Each tick is
+one SELECT on the pool (no transaction, no write) of every queue with its
+members in progress, on `integration_attempt_current_seq`. The projector keeps
+the previous read in memory and compares what a reader sees: per queue its
+state, head and reason, per member the attempt columns the summary is
+projected from and the number of members ahead (counted as the summary counts
+it: a waiter carrying a cancel request is ahead of nobody). The row `revision`
+is not compared, so a receipt, a fence or a lease renewal publishes nothing.
+A queue in which anything visible changed gets exactly one event per tick:
+`task_id` names the member when one member alone changed, and is `null` when
+several did or the queue itself did; `project_ids` are the Projects of the
+members concerned, so a client refetches those Projects' lists only. The first
+read after a start publishes nothing: a restart replays no history. It waits
+at least 250 ms and at most 1 s between reads and is woken by the domain-event
+notifier, which every integration Task step already signals when it settles:
+a step's change is published promptly, a change with no Task step (the line
+moved, the head changed phase) within a second, and a burst inside one
+interval is one event. The event is bus-only and carries ids only: no ledger
+row, no Attention category, no notification, no wake. `GET /api/v1/events`
+has no per-Project filter for any bus event; this one names nothing but ids
+that read as `404` to a caller who may not see them. The integration steps
+were not edited for it.
 
 ### Task condition dual-write foundation
 
