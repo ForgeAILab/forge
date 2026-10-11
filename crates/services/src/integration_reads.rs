@@ -460,3 +460,284 @@ pub async fn repo_integration_queues(
         has_more,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_types::IntegrationAttemptId;
+    use db::{IntegrationQueueRepo, TaskRepo};
+
+    struct Fixture {
+        db: SqliteDb,
+        task: db::Task,
+        attempt: String,
+    }
+    async fn fixture() -> Fixture {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('r','p','r','main',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t','p','t','merging',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let queue = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE integration_queue SET state='open',last_error_kind=NULL,last_error=NULL",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let attempt = db
+            .admit_integration_attempt(db::IntegrationAttempt::new(
+                Some(queue.id),
+                "t".into(),
+                "p".into(),
+                "admission".into(),
+                "merging".into(),
+                0,
+                1,
+            ))
+            .await
+            .unwrap()
+            .id;
+        let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+        Fixture { db, task, attempt }
+    }
+    impl Fixture {
+        async fn attempt(&self, assignments: &str) {
+            sqlx::query(&format!(
+                "UPDATE integration_attempt SET {assignments} WHERE id=?"
+            ))
+            .bind(&self.attempt)
+            .execute(self.db.pool())
+            .await
+            .unwrap();
+        }
+        /// The summary of the Task as if a Task step had told it `reason`.
+        async fn told(&self, reason: Option<IntegrationReason>) -> TaskIntegrationSummary {
+            let mut task = self.task.clone();
+            if let Some(reason) = reason {
+                task.condition = db::TaskCondition::Parked {
+                    resume: db::task_condition::ConditionContinuation::Integration {
+                        attempt_id: reason.attempt_id().clone(),
+                    },
+                    primary: db::ParkReason::Integration { reason },
+                    additional: Vec::new(),
+                    since: None,
+                    evidence: Default::default(),
+                };
+            }
+            task_integration(&self.db, &task).await.unwrap().unwrap()
+        }
+        fn id(&self) -> IntegrationAttemptId {
+            IntegrationAttemptId::new(self.attempt.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_step_statement_refines_what_the_attempt_alone_cannot_say() {
+        let fixture = fixture().await;
+
+        // Which decision the head waits for is the step's knowledge.
+        fixture.attempt("state='awaiting_task_step'").await;
+        assert_eq!(
+            fixture.told(None).await.phase,
+            Some(IntegrationPhase::AwaitingAuthorization)
+        );
+        let carried = fixture
+            .told(Some(IntegrationReason::Owned {
+                attempt_id: fixture.id(),
+                phase: IntegrationPhase::AwaitingCarry,
+            }))
+            .await;
+        assert_eq!(carried.state, IntegrationMemberState::Owned);
+        assert_eq!(carried.phase, Some(IntegrationPhase::AwaitingCarry));
+        // A stale statement (the head has moved on) never overrides the attempt.
+        fixture.attempt("state='ff_inflight'").await;
+        assert_eq!(
+            fixture
+                .told(Some(IntegrationReason::Owned {
+                    attempt_id: fixture.id(),
+                    phase: IntegrationPhase::AwaitingCarry,
+                }))
+                .await
+                .phase,
+            Some(IntegrationPhase::FastForwarding)
+        );
+
+        // Sent back: a repair, unless the candidate's check failed.
+        fixture.attempt("state='ejected'").await;
+        let repair = fixture.told(None).await;
+        assert_eq!(repair.state, IntegrationMemberState::Repair);
+        assert_eq!((repair.position, repair.action_hint), (None, None));
+        let failed = fixture
+            .told(Some(IntegrationReason::CandidateCheckFailed {
+                attempt_id: fixture.id(),
+                check: "unit".into(),
+                message: "candidate exit 1".into(),
+            }))
+            .await;
+        assert_eq!(failed.state, IntegrationMemberState::CandidateCheckFailed);
+        assert_eq!(
+            failed.wait.and_then(|wait| wait.message).as_deref(),
+            Some("candidate exit 1")
+        );
+        fixture
+            .attempt("state='ejected',failure_kind='candidate_check_failed'")
+            .await;
+        assert_eq!(
+            fixture.told(None).await.state,
+            IntegrationMemberState::CandidateCheckFailed
+        );
+        fixture
+            .attempt("state='needs_review',failure_kind=NULL")
+            .await;
+        assert_eq!(
+            fixture.told(None).await.state,
+            IntegrationMemberState::ReviewRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferral_names_its_cause_its_machine_and_the_retry() {
+        let fixture = fixture().await;
+        fixture
+            .attempt("state='parked',failure_kind='target_unavailable',failure_message='target_not_ready: the default checkout is not connected'")
+            .await;
+        // From the attempt alone: the worker's own park reason.
+        let parked = fixture.told(None).await;
+        assert_eq!(parked.state, IntegrationMemberState::Deferred);
+        let wait = parked.wait.unwrap();
+        assert_eq!(wait.code, IntegrationWaitCode::OwnerOffline);
+        assert_eq!(
+            wait.message.as_deref(),
+            Some("the default checkout is not connected")
+        );
+        assert_eq!(parked.action_hint, Some(IntegrationActionHint::Retry));
+
+        // What the park step told the Task wins: cause, machine, message.
+        let told = fixture
+            .told(Some(IntegrationReason::Deferred {
+                attempt_id: fixture.id(),
+                cause: IntegrationDeferralCause::OwnerOffline,
+                owner_id: Some("daemon-7".into()),
+                message: "build-box is not connected".into(),
+            }))
+            .await;
+        let wait = told.wait.unwrap();
+        assert_eq!(wait.code, IntegrationWaitCode::OwnerOffline);
+        assert_eq!(wait.machine_id.as_deref(), Some("daemon-7"));
+        assert_eq!(wait.message.as_deref(), Some("build-box is not connected"));
+        // A cause with no machine carries none.
+        let dirty = fixture
+            .told(Some(IntegrationReason::Deferred {
+                attempt_id: fixture.id(),
+                cause: IntegrationDeferralCause::TargetDirty,
+                owner_id: Some("daemon-7".into()),
+                message: "uncommitted changes".into(),
+            }))
+            .await;
+        let wait = dirty.wait.unwrap();
+        assert_eq!(wait.code, IntegrationWaitCode::TargetDirty);
+        assert_eq!(wait.machine_id, None);
+
+        // A statement about an earlier attempt of the Task says nothing
+        // about this one.
+        let other = fixture
+            .told(Some(IntegrationReason::Deferred {
+                attempt_id: IntegrationAttemptId::new("an-earlier-attempt"),
+                cause: IntegrationDeferralCause::TargetDirty,
+                owner_id: None,
+                message: "old".into(),
+            }))
+            .await;
+        assert_eq!(
+            other.wait.map(|wait| wait.code),
+            Some(IntegrationWaitCode::OwnerOffline)
+        );
+
+        // Counted retries: Forge's own while one is scheduled, the owner's after.
+        fixture
+            .attempt("failure_kind='infrastructure',failure_message='infrastructure: owner did not answer',available_at='2026-10-01T00:05:00+00:00'")
+            .await;
+        let retrying = fixture.told(None).await.wait.unwrap();
+        assert_eq!(retrying.code, IntegrationWaitCode::Infrastructure);
+        assert_eq!(
+            retrying.retry_at.as_deref(),
+            Some("2026-10-01T00:05:00+00:00")
+        );
+        fixture.attempt("available_at=NULL").await;
+        assert_eq!(
+            fixture.told(None).await.wait.map(|wait| wait.code),
+            Some(IntegrationWaitCode::BudgetExhausted)
+        );
+        fixture.attempt("state='quarantined'").await;
+        assert_eq!(
+            fixture.told(None).await.wait.map(|wait| wait.code),
+            Some(IntegrationWaitCode::UnresolvedResult)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_its_owner_stopped_waits_in_line_with_that_cause() {
+        let fixture = fixture().await;
+        // In line, nothing ahead, nothing stops it.
+        let free = fixture.told(None).await;
+        assert_eq!(
+            (free.state, free.position, free.wait),
+            (IntegrationMemberState::Waiting, Some(0), None)
+        );
+        // The owner's Hold on the Task row is the same gate the worker reads.
+        let mut held = fixture.task.clone();
+        held.condition = db::TaskCondition::Parked {
+            primary: db::ParkReason::Held {
+                actor: "user".into(),
+            },
+            additional: Vec::new(),
+            resume: db::task_condition::ConditionContinuation::Reconcile,
+            since: None,
+            evidence: Default::default(),
+        };
+        let summary = task_integration(&fixture.db, &held).await.unwrap().unwrap();
+        assert_eq!(summary.state, IntegrationMemberState::Waiting);
+        assert_eq!(
+            summary.wait.map(|wait| wait.code),
+            Some(IntegrationWaitCode::TaskHeld)
+        );
+        assert_eq!(summary.action_hint, Some(IntegrationActionHint::Release));
+        // A cancel request is being applied: nothing else is said.
+        fixture
+            .attempt("cancel_requested_at='2026-10-01T00:00:00+00:00'")
+            .await;
+        assert_eq!(
+            fixture.told(None).await.wait.map(|wait| wait.code),
+            Some(IntegrationWaitCode::CancelRequested)
+        );
+        // A finished attempt is no summary.
+        fixture
+            .attempt("state='completed',current=0,completed_at=updated_at")
+            .await;
+        assert_eq!(
+            task_integration(&fixture.db, &fixture.task).await.unwrap(),
+            None
+        );
+    }
+}
