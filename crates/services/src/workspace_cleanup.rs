@@ -3334,12 +3334,16 @@ mod tests {
         let db = sqlite_db().await;
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let (workspace_id, worktree) = seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
         let repo_id = WorkspaceRepo::get_by_id(&*db, &workspace_id)
             .await
             .unwrap()
             .unwrap()
             .repo_id;
+        // What a run in the worktree is given: named after the clone's Git
+        // directory, which is not the bare row id.
+        let run_store = executors::compiler_cache::repository_id(&worktree).unwrap();
+        assert_ne!(run_store, repo_id);
         let cache_dir = root.join(executors::compiler_cache::CACHE_DIR);
         let store = |repository: &str| {
             let store = cache_dir.join(repository);
@@ -3349,6 +3353,35 @@ mod tests {
             store
         };
         let (kept, gone) = (store(&repo_id), store(&new_uuid_v4()));
+        // A repository the operator keeps as a checkout: its store is named
+        // after the checkout, not after the row.
+        let checkout = root.join("operator").join("checkout");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM repo WHERE id = ?")
+            .bind(&repo_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        RepoRepo::create(
+            &*db,
+            CreateRepo {
+                id: new_uuid_v4(),
+                project_id,
+                name: "operator".to_owned(),
+                remote_url: None,
+                local_path: Some(checkout.to_str().unwrap().to_owned()),
+                default_branch: "main".to_owned(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let local = store(&executors::compiler_cache::repository_id_of(&checkout).unwrap());
+        let in_use = store(&run_store);
+        // The same repository with no worktree on record any more.
+        let other = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
+        let idle = store(&executors::compiler_cache::repository_id(&other.1).unwrap());
         let scheduler = gc_scheduler(&db, &root).await;
         scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(0, 0));
 
@@ -3358,6 +3391,13 @@ mod tests {
         let report = gc_at(&scheduler, Duration::from_secs(25 * 60 * 60)).await;
         assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
         assert!(!gone.exists() && kept.join("0").join("entry").exists());
+        for (store, what) in [
+            (&local, "a repository the operator keeps"),
+            (&in_use, "the repository of a worktree on record"),
+            (&idle, "a repository with a row and no worktree"),
+        ] {
+            assert!(store.join("0").join("entry").exists(), "{what}");
+        }
     }
 
     async fn gc_at(

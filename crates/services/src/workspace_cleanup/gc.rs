@@ -508,14 +508,45 @@ impl WorkspaceCleanupScheduler {
         }
         // Stores of repositories this server no longer has a row for.
         if !out_of_time(&sweep) && executors::compiler_cache::collected(&root).is_some() {
-            match sqlx::query_scalar::<_, String>("SELECT id FROM repo")
+            // A store is named after the repository's Git directory: the
+            // row id for Forge's own clone, the checkout for a repository
+            // the operator keeps (`local_path`). The repository of every
+            // worktree still on record is known too, whatever it is.
+            let records = async {
+                let repositories: Vec<(String, Option<String>)> =
+                    sqlx::query_as("SELECT id, local_path FROM repo")
+                        .fetch_all(self.db.pool())
+                        .await?;
+                let worktrees: Vec<String> = sqlx::query_scalar(
+                    "SELECT worktree_path FROM workspace WHERE status != 'cleaned'",
+                )
                 .fetch_all(self.db.pool())
-                .await
-            {
-                Ok(repositories) => {
-                    let known: HashSet<String> = repositories.into_iter().collect();
+                .await?;
+                Ok::<_, sqlx::Error>((repositories, worktrees))
+            };
+            match records.await {
+                Ok((repositories, worktrees)) => {
                     let pass = sweep.clone();
+                    // Forge's own clone of a repository, under the root as
+                    // configured and as it resolves (a store is named after
+                    // the path Git recorded).
+                    let clones = [self.workspace_root.join(".repos"), root.join(".repos")];
                     let removed = blocking(move || {
+                        let mut known: HashSet<String> = worktrees
+                            .iter()
+                            .filter_map(|path| {
+                                executors::compiler_cache::repository_id(Path::new(path))
+                            })
+                            .collect();
+                        for (id, local_path) in repositories {
+                            known.extend(local_path.and_then(|path| {
+                                executors::compiler_cache::repository_id_of(Path::new(&path))
+                            }));
+                            known.extend(clones.iter().filter_map(|clones| {
+                                executors::compiler_cache::repository_id_of(&clones.join(&id))
+                            }));
+                            known.insert(id);
+                        }
                         let mut report = GcReport::default();
                         pass.remove_cache_stores_of_deleted_repositories(
                             &known,

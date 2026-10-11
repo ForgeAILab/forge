@@ -1128,21 +1128,35 @@ pub fn remove_stores_of_deleted_repositories(
         if !old {
             continue;
         }
+        // A short name: the store's server is stopped through its socket
+        // in the directory as moved, and a socket path has a small limit.
         let aside = cache_dir.join(format!(
-            "{REMOVED_PREFIX}{name}-{}-{}",
+            "{REMOVED_PREFIX}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let socket = store.join(SCCACHE_SOCKET);
+        let moved_socket = aside.join(SCCACHE_SOCKET);
+        // Stopping takes up to `SERVER_STOP_TIMEOUT`; the lock below is the
+        // one every run start takes. So the server is stopped after the
+        // rename, outside the lock, unless its socket could not be reached
+        // there.
+        let stop_first = moved_socket.as_os_str().len() > MAX_SOCKET_BYTES;
         let renamed = sandbox::unless_live_cache_run_in(&store, || {
-            if kind == WrapperKind::Sccache && sccache_running(&socket) {
-                // Not held by any run: nothing compiles through it.
+            // Not held by any run: nothing compiles through it.
+            let serving = kind == WrapperKind::Sccache && sccache_running(&socket);
+            if serving && stop_first {
                 stop_sccache_server(wrapper, &store, &socket);
             }
-            fs::symlink_metadata(&aside).is_err() && fs::rename(&store, &aside).is_ok()
+            let renamed =
+                fs::symlink_metadata(&aside).is_err() && fs::rename(&store, &aside).is_ok();
+            (renamed, serving && !stop_first)
         });
-        if renamed == Some(true) {
+        if let Some((true, serving)) = renamed {
             tracing::info!(store = %store.display(), "removing the compiler-cache store of a repository that no longer exists");
+            if serving {
+                stop_sccache_server(wrapper, &aside, &moved_socket);
+            }
             condemned.push((aside, true));
         }
     }

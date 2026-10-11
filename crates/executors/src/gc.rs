@@ -694,7 +694,10 @@ impl Sweep {
     /// was last handed to a run, like an orphaned Task root, and never while
     /// a run of this process holds it or while `live_elsewhere` (the owner
     /// runs something the live-run registry names no repository for).
-    /// Nothing is looked at on a root with no cache.
+    /// Nothing is looked at on a root with no cache, nothing is removed for
+    /// an owner that knows no repository at all, and a cache directory
+    /// configured outside the managed root is never swept this way (it is
+    /// bounded by its size cap only).
     pub fn remove_cache_stores_of_deleted_repositories(
         &self,
         known: &HashSet<String>,
@@ -704,9 +707,25 @@ impl Sweep {
         if live_elsewhere {
             return;
         }
+        // An owner with no repository at all proves nothing about any
+        // store (a reset database, a daemon that lost its table).
+        if known.is_empty() {
+            return;
+        }
         let Some(cache) = compiler_cache::collected(&self.root) else {
             return;
         };
+        // Only a cache inside the managed root is this owner's alone: the
+        // root's ownership marker keeps every other database out of it. A
+        // directory configured elsewhere can be shared by several servers,
+        // and the repositories of the others are not in `known`.
+        let inside_root = matches!(
+            (fs::canonicalize(&cache.dir), fs::canonicalize(&self.root)),
+            (Ok(dir), Ok(root)) if dir != root && dir.starts_with(&root)
+        );
+        if !inside_root {
+            return;
+        }
         let wrapper = compiler_cache::installed(&self.root).map(|cache| cache.wrapper.clone());
         let done = compiler_cache::remove_stores_of_deleted_repositories(
             &cache.dir,
@@ -1900,6 +1919,42 @@ mod tests {
         // The owner runs something the registry names no repository for.
         assert_eq!(pass(true).cache_stores_removed, 0);
         assert!(gone.exists());
+        // An owner that knows no repository at all proves nothing.
+        let mut report = GcReport::default();
+        sweep(&root).remove_cache_stores_of_deleted_repositories(
+            &HashSet::new(),
+            false,
+            &mut report,
+        );
+        assert_eq!(report, GcReport::default());
+        assert!(gone.exists() && known_old.exists());
+        // A cache directory outside the managed root may be another
+        // server's too: nothing in it is removed for a missing repository.
+        let elsewhere = dir.path().canonicalize().unwrap().join("shared-cache");
+        let others = elsewhere.join("repo-of-another-server");
+        fs::create_dir_all(others.join("0")).unwrap();
+        let marker = others.join(compiler_cache::MARKER_FILE);
+        fs::write(&marker, "kache").unwrap();
+        let then = SystemTime::now() - day * 3;
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(then).set_modified(then))
+            .unwrap();
+        let installed = compiler_cache::installed(&root).unwrap();
+        compiler_cache::install(
+            &root,
+            Some(compiler_cache::CompilerCache {
+                kind: installed.kind,
+                wrapper: installed.wrapper.clone(),
+                dir: elsewhere.clone(),
+                max_bytes: installed.max_bytes,
+            }),
+        );
+        assert_eq!(pass(false), GcReport::default());
+        assert!(others.join("0").exists());
+        compiler_cache::install(&root, Some((*installed).clone()));
 
         let report = pass(false);
         assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
@@ -1912,9 +1967,16 @@ mod tests {
             4,
             "nothing is left renamed aside"
         );
-        assert_eq!(
-            fs::read_to_string(&calls).unwrap(),
-            format!("--stop-server|{}\n", gone.join("s").display())
+        // Stopped through the socket of the store as it was moved aside,
+        // after the lock every run start takes was released.
+        let stopped = fs::read_to_string(&calls).unwrap();
+        let prefix = format!(
+            "--stop-server|{}",
+            cache_dir.join(".forge-removed-").display()
+        );
+        assert!(
+            stopped.starts_with(&prefix) && stopped.ends_with("/s\n") && stopped.lines().count() == 1,
+            "{stopped}"
         );
         drop(server);
 
