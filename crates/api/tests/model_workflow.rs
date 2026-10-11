@@ -3615,6 +3615,64 @@ impl World {
         })
     }
 
+    /// One Task in one line: where it is and what its owner is told.
+    async fn upgrade_row(&self, index: usize) -> Result<String, String> {
+        let task = self.task(index).await?;
+        let (epoch, version): (i64, i64) =
+            sqlx::query_as("SELECT status_epoch, version FROM task WHERE id = ?")
+                .bind(&self.tasks[index])
+                .fetch_one(&self.live().pool)
+                .await
+                .map_err(|error| error.to_string())?;
+        let (_, offers) = self.offers(index).await?;
+        let offers: Vec<String> = offers
+            .iter()
+            .map(|offer| {
+                format!(
+                    "{}({})",
+                    offer["action"]["verb"].as_str().unwrap_or_default(),
+                    offer["reason"].as_str().unwrap_or_default()
+                )
+            })
+            .collect();
+        let attempts: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, failure_message FROM integration_attempt WHERE task_ref = ? AND current = 1",
+        )
+        .bind(&self.tasks[index])
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let reason = |reason: &Value| match reason["kind"].as_str() {
+            Some("integration") => format!(
+                "integration:{}{}",
+                reason["reason"]["kind"].as_str().unwrap_or_default(),
+                reason["reason"]["cause"]
+                    .as_str()
+                    .map(|cause| format!("/{cause}"))
+                    .unwrap_or_default()
+            ),
+            Some("failure") => format!(
+                "failure:{}",
+                reason["failure_kind"].as_str().unwrap_or_default()
+            ),
+            Some(kind) => kind.to_owned(),
+            None => "-".to_owned(),
+        };
+        let condition = &task["condition"];
+        let additional: Vec<String> = condition["additional"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(reason)
+            .collect();
+        Ok(format!(
+            "{}@{epoch} v{version} {} primary {} additional {additional:?} offers {offers:?} attempt {attempts:?}",
+            task["status"].as_str().unwrap_or_default(),
+            condition["kind"].as_str().unwrap_or_default(),
+            reason(&condition["primary"]),
+        ))
+    }
+
     /// The rows behind a failure: each Task's own columns, its attempts with
     /// their journals, its open steps and the trace.
     async fn upgrade_rows(&self) -> String {
@@ -3679,17 +3737,30 @@ enum Upgraded {
     Parked,
 }
 
-async fn pre_queue_upgrade(name: &str, shadow: bool, expected: Upgraded) -> Result<(), String> {
+async fn pre_queue_upgrade(
+    name: &str,
+    shadow: bool,
+    expected: Upgraded,
+    take: Option<&'static str>,
+) -> Result<(), String> {
     let (mut world, manifest, report) = World::restore(name, shadow).await?;
-    match pre_queue_upgraded(name, expected, &mut world, &manifest, &report).await {
+    let variant = if shadow { "shadow" } else { "bare" };
+    match pre_queue_upgraded(
+        name, variant, expected, take, &mut world, &manifest, &report,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) => Err(format!("{error}\n{}", world.upgrade_rows().await)),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pre_queue_upgraded(
     name: &str,
+    variant: &str,
     expected: Upgraded,
+    take: Option<&'static str>,
     world: &mut World,
     manifest: &Value,
     report: &services::integration_steps::import::ImportReport,
@@ -3769,6 +3840,49 @@ async fn pre_queue_upgraded(
     );
     let last = world.tasks.len() - 1;
     let subject = world.task(last).await?;
+    let before: i64 = manifest["tasks"][last]["transitions"]
+        .as_array()
+        .map_or(0, |rows| rows.len() as i64);
+    let moves = |world: &World| {
+        let (pool, id) = (world.live().pool.clone(), world.tasks[last].clone());
+        async move {
+            let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT from_state, to_state, bridge_kind FROM transition_log
+                 WHERE task_id = ? ORDER BY created_at, rowid LIMIT -1 OFFSET ?",
+            )
+            .bind(id)
+            .bind(before)
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok::<String, String>(
+                rows.iter()
+                    .map(|(from, to, bridge)| match bridge {
+                        Some(bridge) => format!("{from}>{to}[{bridge}]"),
+                        None => format!("{from}>{to}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
+    };
+    let runs = manifest["tasks"][last]["executions"]
+        .as_array()
+        .map_or(0, Vec::len);
+    eprintln!(
+        "TABLE {name} {variant} start: was {}@{} | now {} | moves [{}] | main {}",
+        manifest["tasks"][last]["status"]
+            .as_str()
+            .unwrap_or_default(),
+        manifest["tasks"][last]["epoch"],
+        world.upgrade_row(last).await?,
+        moves(world).await?,
+        if world.main_sha()? == old_main {
+            "unchanged"
+        } else {
+            "advanced"
+        },
+    );
     let status = subject["status"].as_str().unwrap_or_default().to_owned();
     let main_after_start = world.main_sha()?;
     match expected {
@@ -3825,10 +3939,75 @@ async fn pre_queue_upgraded(
     if name == "p19_target_dirty" {
         git(&world.dir.path().join("repo"), &["checkout", "--", "."])?;
     }
+    // One owner command through the real action endpoint, traced.
+    let main_before_command = world.main_sha()?;
+    if let Some(verb) = take {
+        let was = world.upgrade_row(last).await?;
+        let taken = world.apply(&Action::Take(last, verb)).await?;
+        if taken != verb {
+            return Err(format!(
+                "{name}: `{verb}` on the Task: {taken}; it is {was}"
+            ));
+        }
+        world.quiesce().await?;
+        eprintln!(
+            "COMMAND {name} {verb}: before {was} | after {} | moves [{}]",
+            world.upgrade_row(last).await?,
+            moves(world).await?,
+        );
+    }
     // The offered actions, and the runs they need, get every Task merged.
     world.drive_to_settlement().await?;
+    let new_runs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT role, status FROM execution WHERE task_id = ? ORDER BY created_at, rowid LIMIT -1 OFFSET ?",
+    )
+    .bind(&world.tasks[last])
+    .bind(runs as i64)
+    .fetch_all(&world.live().pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    eprintln!(
+        "TABLE {name} {variant} settled{}: {} | moves [{}] | new runs {new_runs:?} | owner actions {:?}",
+        take.map(|verb| format!(" after {verb}")).unwrap_or_default(),
+        world.upgrade_row(last).await?,
+        moves(world).await?,
+        world
+            .trace
+            .iter()
+            .filter_map(|line| line.split_once(": ").map(|(taken, _)| taken.to_owned()))
+            .collect::<Vec<_>>(),
+    );
     for index in 0..world.tasks.len() {
         let task = world.task(index).await?;
+        if take == Some("cancel") && index == last {
+            if task["status"] != "cancelled" {
+                return Err(format!(
+                    "{name}: the cancelled Task ended {}",
+                    task["status"]
+                ));
+            }
+            continue;
+        }
+        // The owner's override at the merge gate declares the Task done
+        // without a merge (as before the queue): nothing may merge it after.
+        if take == Some("approve") && index == last {
+            let live: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref = ? AND current = 1
+                 AND state NOT IN ('completed','cancelled','superseded')",
+            )
+            .bind(&world.tasks[index])
+            .fetch_one(&world.live().pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            if task["status"] != "done" || world.main_sha()? != main_before_command || live != 0 {
+                return Err(format!(
+                    "{name}: an approved Task is done with nothing merged and no live attempt; it is {}, main {main_before_command} -> {}, live attempts {live}",
+                    task["status"],
+                    world.main_sha()?
+                ));
+            }
+            continue;
+        }
         if task["status"] != "done" {
             return Err(format!(
                 "{name}: task {index} ended {} and not done: {}; trace {:#?}",
@@ -3875,6 +4054,11 @@ async fn pre_queue_upgraded(
         }
     }
     eprintln!("UPGRADE {name}: settled after {:?}", clock.elapsed());
+    // An attempt left parked behind a Task that was cancelled or approved is
+    // cancelled by the worker's sweep at its retry time.
+    if world.move_deadlines(true).await? > 0 {
+        world.quiesce().await?;
+    }
     // And a start after the end changes nothing either.
     let settled = world.upgrade_print().await?;
     world.crash_and_restart().await?;
@@ -3898,18 +4082,45 @@ macro_rules! pre_queue {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn $test() {
             log_to_stderr();
-            if let Err(error) = pre_queue_upgrade($name, true, Upgraded::$expected).await {
+            if let Err(error) = pre_queue_upgrade($name, true, Upgraded::$expected, None).await {
                 panic!("{error}");
             }
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn $bare() {
             log_to_stderr();
-            if let Err(error) = pre_queue_upgrade($name, false, Upgraded::$expected).await {
+            if let Err(error) = pre_queue_upgrade($name, false, Upgraded::$expected, None).await {
                 panic!("{error}");
             }
         }
     )*};
+}
+
+/// One owner command, through the real action endpoint, on a Task the
+/// upgrade left stopped in its merge state: what it does to the Task's status
+/// and epoch, and that the Task then merges (or, cancelled, stays cancelled).
+macro_rules! pre_queue_command {
+    ($($test:ident: $name:literal, $verb:literal;)*) => {$(
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $test() {
+            log_to_stderr();
+            if let Err(error) =
+                pre_queue_upgrade($name, true, Upgraded::Parked, Some($verb)).await
+            {
+                panic!("{error}");
+            }
+        }
+    )*};
+}
+
+pre_queue_command! {
+    pre_queue_command_hold_under_a_paused_project: "p10_project_paused_at_merge_gate", "hold";
+    pre_queue_command_release_a_held_task: "p13_held_in_merging", "release";
+    pre_queue_command_restart_a_held_task: "p13_held_in_merging", "restart";
+    pre_queue_command_approve_a_held_task: "p13_held_in_merging", "approve";
+    pre_queue_command_cancel_a_held_task: "p13_held_in_merging", "cancel";
+    pre_queue_command_retry_a_failed_merge: "p19_target_dirty", "retry";
+    pre_queue_command_approve_a_failed_merge: "p19_target_dirty", "approve";
 }
 
 pre_queue! {
