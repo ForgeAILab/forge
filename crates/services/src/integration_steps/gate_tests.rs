@@ -99,12 +99,15 @@ impl World {
     }
 }
 
+/// `(admission key, state, failure message, available_at, effect_seq, journal)`.
+type AttemptRow = (String, String, Option<String>, Option<String>, i64, String);
+
 impl World {
     /// Everything a failed wait needs to be read: the Task's condition, its
     /// attempts and its steps.
     async fn dump(&self, task: &str) -> String {
         let row = self.task(task).await;
-        let attempts: Vec<(String, String, Option<String>, Option<String>, i64, String)> = sqlx::query_as(
+        let attempts: Vec<AttemptRow> = sqlx::query_as(
             "SELECT admission_key,state,failure_message,available_at,effect_seq,operation_receipts_json FROM integration_attempt WHERE task_ref=? ORDER BY created_at,id",
         )
         .bind(task)
