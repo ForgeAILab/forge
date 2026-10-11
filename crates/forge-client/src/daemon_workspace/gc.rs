@@ -98,7 +98,10 @@ pub fn check_checkout_age(workspace_root: &Path) -> Duration {
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|timeouts| timeouts.get(&root_key(workspace_root)).copied())
-        .map_or(executors::gc::CHECK_CHECKOUT_AGE, executors::gc::check_checkout_age)
+        .map_or(
+            executors::gc::CHECK_CHECKOUT_AGE,
+            executors::gc::check_checkout_age,
+        )
 }
 
 /// The sizes of the Task roots of `workspace_root` for a daemon report: what
@@ -342,7 +345,12 @@ impl DaemonWorkspaceBackend {
             .journal
             .load_workspace_state::<WorkspaceRegistry>()
             .ok()?;
-        locations.extend(persisted.locations.into_values().map(|location| location.path));
+        locations.extend(
+            persisted
+                .locations
+                .into_values()
+                .map(|location| location.path),
+        );
         Some(
             locations
                 .iter()

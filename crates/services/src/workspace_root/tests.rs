@@ -268,7 +268,10 @@ async fn a_configured_root_that_would_strand_live_data_refuses_the_start() {
     // Only cleaned rows left, and under `.repos` only what is not this
     // database's: the operator's change is taken and recorded.
     std::fs::remove_dir_all(&clone).unwrap();
-    assert_eq!(std::fs::read_dir(recorded.join(".repos")).unwrap().count(), 2);
+    assert_eq!(
+        std::fs::read_dir(recorded.join(".repos")).unwrap().count(),
+        2
+    );
     let settled = settle(&db, &dirs.explicit_choice(&other)).await.unwrap();
     assert_eq!((settled.root, settled.recorded_now), (other.clone(), true));
     assert_eq!(recorded_root(&db).await.unwrap(), Some(other));

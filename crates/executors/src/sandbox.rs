@@ -1439,7 +1439,11 @@ mod tests {
         let wrapper = cache_tests::fake_wrapper(&dir.path().join("bin"), "kache");
         let env = SandboxEnv::for_run(&worktree, "run-1", RunPurpose::Command)
             .with_compiler_cache(cache_tests::cache(&root, &wrapper).for_worktree(&worktree));
-        let build = root.join("t1").join(TASK_DIR_NAME).join("build").join("cargo");
+        let build = root
+            .join("t1")
+            .join(TASK_DIR_NAME)
+            .join("build")
+            .join("cargo");
         let operator = |key: &str| {
             matches!(key, "CARGO_TARGET_DIR" | "KACHE_CACHE_DIR")
                 .then(|| OsString::from("/operator/value"))
@@ -1462,8 +1466,14 @@ mod tests {
         let mut cleared = Command::new("true");
         cleared.env_clear();
         crate::run_process::apply_sandboxed_cleared(&mut cleared, &BTreeMap::new(), &env);
-        assert_eq!(set(&cleared, "CARGO_TARGET_DIR"), Some(build.into_os_string()));
-        assert_eq!(set(&cleared, WRAPPER_KEY), Some(wrapper.clone().into_os_string()));
+        assert_eq!(
+            set(&cleared, "CARGO_TARGET_DIR"),
+            Some(build.into_os_string())
+        );
+        assert_eq!(
+            set(&cleared, WRAPPER_KEY),
+            Some(wrapper.clone().into_os_string())
+        );
         assert_eq!(
             set(&cleared, "KACHE_CACHE_DIR"),
             Some(root.join(CACHE_DIR).join("repo-a").into_os_string())

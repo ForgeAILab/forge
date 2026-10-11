@@ -744,7 +744,10 @@ impl Sweep {
         let moved = sandbox::unless_live_run_in(&task_root, || {
             self.trash_from(
                 &build,
-                Some((&self.task_roots, &Path::new(name).join(TASK_DIR_NAME).join("build"))),
+                Some((
+                    &self.task_roots,
+                    &Path::new(name).join(TASK_DIR_NAME).join("build"),
+                )),
                 report,
             )
         });

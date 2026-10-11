@@ -1937,7 +1937,10 @@ async fn a_process_that_outlives_a_preempted_workspace_run_loses_its_temp_dir() 
             |_| tmp.starts_with(&root) || tmp.starts_with(fixture.dir.path()),
             |tmp| tmp.starts_with(&root),
         ) {
-            return Err(format!("not the command's own directory: {}", tmp.display()));
+            return Err(format!(
+                "not the command's own directory: {}",
+                tmp.display()
+            ));
         }
         if !kill("-0") {
             return Err("the process in its own session did not survive".to_owned());
@@ -1958,13 +1961,22 @@ async fn a_process_that_outlives_a_preempted_workspace_run_loses_its_temp_dir() 
     let task_root = fixture.path().parent().unwrap().to_path_buf();
     let no_live_run = executors::sandbox::unless_live_run_in(&task_root, || ()).is_some();
     kill("-9");
-    assert!(wrote, "the survivor wrote into the command's temp directory");
+    assert!(
+        wrote,
+        "the survivor wrote into the command's temp directory"
+    );
     assert!(result.is_err(), "the command was preempted");
     assert_eq!(cancel.state, WorkspaceCancelState::Killed);
     checked.unwrap();
-    assert!(failed.is_ok(), "the survivor's writes fail once the directory is gone");
+    assert!(
+        failed.is_ok(),
+        "the survivor's writes fail once the directory is gone"
+    );
     assert!(gone, "nothing brought the temp directory back");
-    assert!(no_live_run, "the Task root holds no live run after the preemption");
+    assert!(
+        no_live_run,
+        "the Task root holds no live run after the preemption"
+    );
 }
 
 #[cfg(unix)]

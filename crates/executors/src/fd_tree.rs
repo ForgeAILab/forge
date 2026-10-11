@@ -368,7 +368,10 @@ mod tests {
 
         assert!(remove_tree(&tree, None).unwrap());
         assert!(fs::symlink_metadata(&tree).is_err());
-        assert_eq!(fs::read_to_string(outside.join("precious")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(outside.join("precious")).unwrap(),
+            "keep"
+        );
         assert_eq!(
             fs::read_to_string(outside.join("sub").join("precious")).unwrap(),
             "keep"
@@ -436,13 +439,22 @@ mod tests {
 
         assert!(remove_file_under(&base, Path::new("linked/sub/precious")).is_err());
         assert!(remove_file_under(&base, Path::new("linked/precious")).is_err());
-        assert!(remove_file_under(&base, Path::new("sub/link")).is_err(), "a link");
-        assert!(remove_file_under(&base, Path::new("sub")).is_err(), "a directory");
+        assert!(
+            remove_file_under(&base, Path::new("sub/link")).is_err(),
+            "a link"
+        );
+        assert!(
+            remove_file_under(&base, Path::new("sub")).is_err(),
+            "a directory"
+        );
         assert!(remove_file_under(&base, Path::new("../outside/precious")).is_err());
         assert!(rename_under(&base, Path::new("linked/sub"), &moved).is_err());
         assert!(rename_under(&dir.path().join("base/linked"), Path::new("sub"), &moved).is_err());
         assert!(!moved.exists());
-        assert_eq!(fs::read_to_string(outside.join("precious")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(outside.join("precious")).unwrap(),
+            "keep"
+        );
         assert!(outside.join("sub").join("precious").exists());
 
         remove_file_under(&base, Path::new("sub/precious")).unwrap();

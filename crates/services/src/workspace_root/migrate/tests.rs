@@ -1049,9 +1049,7 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
     )
     .await
     .expect("agent creates");
-    for statement in [
-        "UPDATE execution SET status = 'running', agent_id = ? WHERE id = ?",
-    ] {
+    for statement in ["UPDATE execution SET status = 'running', agent_id = ? WHERE id = ?"] {
         sqlx::query(statement)
             .bind(&agent.id)
             .bind(&execution)
@@ -1059,35 +1057,36 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
             .await
             .unwrap();
     }
-    let lease = db::WorkspaceLeaseRepo::issue(
-        &install.db,
-        db::CreateWorkspaceLease {
-            id: db::new_uuid_v4(),
-            project_id: task.project_id.clone(),
-            task_id: task.id.clone(),
-            task_version: task.version,
-            execution_id: execution.clone(),
-            operation_idempotency_key: db::new_uuid_v4(),
-            repository_binding_id: workspace.repo_id.clone(),
-            base_ref: "main".to_owned(),
-            role: "worker".to_owned(),
-            capabilities_json: "[\"repository_write\"]".to_owned(),
-            assigned_principal_type: "agent".to_owned(),
-            assigned_principal_id: agent.id,
-            capability_profile_revision: "forge.capability-profile/v1".to_owned(),
-            capability_profile_digest:
-                "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8"
-                    .to_owned(),
-            issuing_principal_type: "system".to_owned(),
-            issuing_principal_id: "task-service-scheduler".to_owned(),
-            issued_at: now.clone(),
-            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("lease issues");
+    let lease =
+        db::WorkspaceLeaseRepo::issue(
+            &install.db,
+            db::CreateWorkspaceLease {
+                id: db::new_uuid_v4(),
+                project_id: task.project_id.clone(),
+                task_id: task.id.clone(),
+                task_version: task.version,
+                execution_id: execution.clone(),
+                operation_idempotency_key: db::new_uuid_v4(),
+                repository_binding_id: workspace.repo_id.clone(),
+                base_ref: "main".to_owned(),
+                role: "worker".to_owned(),
+                capabilities_json: "[\"repository_write\"]".to_owned(),
+                assigned_principal_type: "agent".to_owned(),
+                assigned_principal_id: agent.id,
+                capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+                capability_profile_digest:
+                    "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8"
+                        .to_owned(),
+                issuing_principal_type: "system".to_owned(),
+                issuing_principal_id: "task-service-scheduler".to_owned(),
+                issued_at: now.clone(),
+                expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("lease issues");
     sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
         .bind(&execution)
         .execute(install.db.pool())

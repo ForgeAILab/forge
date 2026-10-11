@@ -351,7 +351,10 @@ async fn sweep_measures_live_task_roots_for_the_report() {
     let handle = fixture.prepared.workspace.workspace_handle.clone();
     let task_root = root.join(WORKTREE_DIRECTORY).join(&handle);
     std::fs::write(task_root.join("repo").join("big"), vec![1_u8; 256 * 1024]).unwrap();
-    assert!(gc::workspace_disk_report(root).is_empty(), "nothing before a pass");
+    assert!(
+        gc::workspace_disk_report(root).is_empty(),
+        "nothing before a pass"
+    );
 
     sweep_at(&fixture.backend, &[], Duration::ZERO).await;
     let sizes = gc::workspace_disk_report(root);
@@ -386,17 +389,29 @@ fn check_checkout_age_follows_the_limit_the_server_sent() {
     std::fs::create_dir_all(&first).unwrap();
     std::fs::create_dir_all(&second).unwrap();
     // Before the first reply: the shortest age the shared rule gives.
-    assert_eq!(gc::check_checkout_age(&first), executors::gc::CHECK_CHECKOUT_AGE);
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        executors::gc::CHECK_CHECKOUT_AGE
+    );
     gc::accept_check_run_timeout(&first, Some(4 * 60 * 60));
     assert_eq!(
         gc::check_checkout_age(&first),
         executors::gc::check_checkout_age(4 * 60 * 60)
     );
-    assert_eq!(gc::check_checkout_age(&first), Duration::from_secs(9 * 60 * 60));
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        Duration::from_secs(9 * 60 * 60)
+    );
     // A reply without one keeps what was sent; another root is its own.
     gc::accept_check_run_timeout(&first, None);
-    assert_eq!(gc::check_checkout_age(&first), Duration::from_secs(9 * 60 * 60));
-    assert_eq!(gc::check_checkout_age(&second), executors::gc::CHECK_CHECKOUT_AGE);
+    assert_eq!(
+        gc::check_checkout_age(&first),
+        Duration::from_secs(9 * 60 * 60)
+    );
+    assert_eq!(
+        gc::check_checkout_age(&second),
+        executors::gc::CHECK_CHECKOUT_AGE
+    );
     // The reply shape: an older server sends none.
     let reply = serde_json::json!({"check_run_timeout_seconds": 1800});
     assert_eq!(reply["check_run_timeout_seconds"].as_u64(), Some(1800));

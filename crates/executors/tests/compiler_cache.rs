@@ -161,7 +161,9 @@ fn two_task_worktrees_of_one_repository_call_the_wrapper_with_one_store() {
         // socket as a started one does.
         server.get_or_insert_with(|| {
             std::os::unix::net::UnixListener::bind(
-                root.join(compiler_cache::CACHE_DIR).join("repo-1").join("s"),
+                root.join(compiler_cache::CACHE_DIR)
+                    .join("repo-1")
+                    .join("s"),
             )
             .unwrap()
         });

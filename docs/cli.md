@@ -411,7 +411,9 @@ no longer counts.
 `forge-ctl daemon` tables print the reading in the `Disk` column: free space,
 or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
 floor, or `-` before the first reading. `--output json` carries the same as
-`disk` and `workspace_floor`.
+`disk` and `workspace_floor`, beside `check_run_timeout_seconds` (the
+server's check-run limit, from which the daemon's collector derives how long
+it keeps an unheld check checkout).
 
 ### Moving the server workspace root
 

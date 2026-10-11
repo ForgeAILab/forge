@@ -2683,7 +2683,11 @@ async fn remote_daemon_report_stores_task_root_sizes_and_returns_the_check_limit
             .unwrap()
             .unwrap()
     };
-    assert_eq!(row().await.disk_bytes, None, "a daemon's root was never sized");
+    assert_eq!(
+        row().await.disk_bytes,
+        None,
+        "a daemon's root was never sized"
+    );
     db.disk_admission.set_check_run_timeout_seconds(5400);
     let report_url = format!("/api/v1/daemons/{}/report", fixture.daemon_id);
     let size = |handle: &str, bytes: u64| json!({"workspace_handle": handle, "disk_bytes": bytes, "measured_at": "2026-10-10T00:00:00Z"});

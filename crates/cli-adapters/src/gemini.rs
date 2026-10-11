@@ -917,7 +917,11 @@ mod tests {
             (&plain, Some("false"), "exec-6"),
         ] {
             let (seen, scope) = launch(config, variable, id).await;
-            let tmp = scope.env().tmp_dir().expect("a per-run directory").to_owned();
+            let tmp = scope
+                .env()
+                .tmp_dir()
+                .expect("a per-run directory")
+                .to_owned();
             assert!(tmp.starts_with(&task_dir), "{id}: {}", tmp.display());
             // The server's build directory is on the command already and
             // keeps its precedence; the temp directory is the run's own.
