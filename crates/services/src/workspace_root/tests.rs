@@ -265,6 +265,25 @@ async fn a_configured_root_that_would_strand_live_data_refuses_the_start() {
         .unwrap();
     assert!(settle(&db, &dirs.explicit_choice(&other)).await.is_err());
 
+    // A `.repos` that cannot be listed is not an empty one: the count
+    // fails, and the start with it, where it used to read "no clones".
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let repos = recorded.join(".repos");
+        std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Not for a user no mode stops.
+        let locked = std::fs::read_dir(&repos).is_err();
+        let counted = LiveData::under(&db, &recorded).await;
+        let refused = settle(&db, &dirs.explicit_choice(&other)).await;
+        std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if locked {
+            assert!(counted.is_err(), "{counted:?}");
+            assert!(refused.is_err());
+            assert_eq!(recorded_root(&db).await.unwrap(), Some(recorded.clone()));
+        }
+    }
+
     // Only cleaned rows left, and under `.repos` only what is not this
     // database's: the operator's change is taken and recorded.
     std::fs::remove_dir_all(&clone).unwrap();

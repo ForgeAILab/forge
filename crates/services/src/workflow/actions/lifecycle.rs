@@ -129,6 +129,7 @@ impl HookAction for RunBeforeWorkHooks {
                             ctx.repo_cache_locks.clone(),
                             &ctx.workspace_backend_router,
                         )
+                        .waiting_for_disk()
                         .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Hook)
                         .await
                         .map_err(crate::ServiceError::from)

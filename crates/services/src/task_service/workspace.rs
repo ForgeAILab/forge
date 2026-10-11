@@ -990,12 +990,15 @@ impl TaskService {
             // repairs what it can, so a CLI executor is never started in a
             // directory that is gone or off the Task branch.
             let workspace = if admission.workspace.status == WorkspaceStatus::Ready {
+                // A claim that cannot have its worktree made again under
+                // the disk floor takes the disk capacity wait.
                 let manager = crate::workspace_manager::WorkspaceManager::new(
                     &self.db,
                     &self.workspace_root,
                     self.repo_cache_locks.clone(),
                     &self.workspace_backend_router,
-                );
+                )
+                .waiting_for_disk();
                 let workspace = admission.workspace.clone();
                 // Only the Task that owns the row may forget it when its
                 // branch is gone too; a subtask never drops the shared root.
@@ -1446,6 +1449,16 @@ pub(crate) async fn ensure_valid(
     .await
 }
 
+/// Whether the callers that prepare a workspace for `purpose` turn a
+/// worktree that cannot be made again under the disk floor into the Task's
+/// disk capacity wait: a claim (`Execute`) and a before-work hook do. A
+/// review, a check and an integration step would fail instead, so their
+/// recreate is admitted under the floor as it was before the typed outcome
+/// existed, until their owners map it.
+fn waits_for_disk(purpose: Purpose) -> bool {
+    matches!(purpose, Purpose::Execute | Purpose::Hook)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_valid_for(
     db: &SqliteDb,
@@ -1463,6 +1476,11 @@ async fn ensure_valid_for(
         repo_cache_locks,
         router,
     );
+    let manager = if waits_for_disk(purpose) {
+        manager.waiting_for_disk()
+    } else {
+        manager
+    };
     let valid = if delete_missing_workspace {
         manager
             .ensure_valid_or_forget(task, workspace, purpose)
@@ -1616,7 +1634,9 @@ pub(crate) async fn prepare_workspace_owned(
                         true,
                         router,
                         false,
-                        db.disk_admission.server_pressure(),
+                        waits_for_disk(purpose)
+                            .then(|| db.disk_admission.server_pressure())
+                            .flatten(),
                     )
                     .await?,
                 )

@@ -935,7 +935,7 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
     // Each kind of recorded work in flight refuses it, with a real row.
     let task = &install.tasks[0];
     let project_id = task.project_id.clone();
-    let rows: [(&str, String, &str); 8] = [
+    let rows: [(&str, String, &str); 9] = [
         (
             "1 claimed or suspended task step(s)",
             step_sql(&task.id, 901, "hooks", "claimed", "{}"),
@@ -978,6 +978,16 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
                 attempt_sql("unknown-attempt", "ejected", "/elsewhere")
             ),
             "DELETE FROM integration_attempt WHERE id = 'unknown-attempt'",
+        ),
+        // Only a settled operation is at rest: one the queue has not
+        // started yet (or a state this code does not know) blocks.
+        (
+            "Task task: parked, operation pending",
+            format!(
+                "{}; UPDATE integration_attempt SET current_operation_state = 'pending' WHERE id = 'pending-attempt'",
+                attempt_sql("pending-attempt", "parked", "/elsewhere")
+            ),
+            "DELETE FROM integration_attempt WHERE id = 'pending-attempt'",
         ),
         (
             "1 running check run(s)",

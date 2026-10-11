@@ -952,17 +952,21 @@ struct Running {
 /// `superseded`) or hands the Task back with nothing in flight (`parked`:
 /// waiting for an operator; `needs_review`, `ejected`: the Task is back
 /// with a reviewer or coder), AND it has no outstanding owner effect
-/// (`effect_intent_json`) and no operation whose result is running or
-/// unknown. That second half is the queue's own definition of an unsettled
-/// attempt. Every other state names a repository location or owner state
-/// that the queue is still acting on, or (`quarantined`) that nobody has
-/// established.
+/// (`effect_intent_json`) and no operation other than a settled one
+/// (`succeeded`, `failed`, `acknowledged`, or none). That second half is
+/// the queue's own definition of an unsettled attempt. Every other state
+/// names a repository location or owner state that the queue is still
+/// acting on, or (`quarantined`) that nobody has established.
+///
+/// Both halves name what is at rest, never what is not: a state or an
+/// operation state this code does not know (a later queue revision adds
+/// some) blocks the move until somebody decides it is at rest.
 const UNSETTLED_ATTEMPTS: &str = "SELECT task_ref, state, effect_intent_json IS NOT NULL,
             COALESCE(current_operation_state, '')
      FROM integration_attempt
      WHERE state NOT IN ('completed', 'cancelled', 'superseded', 'parked', 'needs_review', 'ejected')
         OR effect_intent_json IS NOT NULL
-        OR COALESCE(current_operation_state, '') IN ('running', 'uncertain')
+        OR COALESCE(current_operation_state, '') NOT IN ('', 'succeeded', 'failed', 'acknowledged')
      ORDER BY updated_at, id";
 
 impl Running {
@@ -987,10 +991,14 @@ impl Running {
                     if intent {
                         why.push_str(", owner effect outstanding");
                     }
-                    if operation == "uncertain" {
-                        why.push_str(", operation result unknown");
-                    } else if operation == "running" {
-                        why.push_str(", operation running");
+                    match operation.as_str() {
+                        "" | "succeeded" | "failed" | "acknowledged" => {}
+                        "uncertain" => why.push_str(", operation result unknown"),
+                        "running" => why.push_str(", operation running"),
+                        other => {
+                            why.push_str(", operation ");
+                            why.push_str(other);
+                        }
                     }
                     why
                 })

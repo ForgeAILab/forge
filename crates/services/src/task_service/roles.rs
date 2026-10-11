@@ -1072,6 +1072,7 @@ impl TaskService {
                     self.repo_cache_locks.clone(),
                     &self.workspace_backend_router,
                 )
+                .waiting_for_disk()
                 .ensure_valid(task, workspace, crate::workspace_manager::Purpose::Reset)
                 .await;
                 let valid = match valid {

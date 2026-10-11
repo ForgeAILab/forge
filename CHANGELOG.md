@@ -2412,10 +2412,34 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   with write access could replace a directory by a link between the
   collector's walk and its delete. Cache eviction, tree removal and
   build-output eviction now walk by file descriptor and never follow a link.
-- **A worktree is no longer recreated under the disk floor for review, hook,
-  check, integrate or reset.** `WorkspaceManager::ensure_valid` returns a
-  typed disk outcome for a recreate (never for a worktree that is there and
-  valid), which is the same `disk_pressure` placement refusal a claim takes.
+- **A worktree is no longer recreated under the disk floor for a claim, a
+  before-work hook or a reassignment reset.** For a caller that opts in
+  (`WorkspaceManager::waiting_for_disk`), `ensure_valid` returns a typed disk
+  outcome for a recreate (never for a worktree that is there and valid),
+  which is the same `disk_pressure` placement refusal a claim takes, and the
+  Task takes the disk capacity wait. A launch after its claim, a review, a
+  check and a merge or rebase step still have a missing worktree made again
+  under the floor: they would report a failed step instead of waiting, and
+  keep doing what they did until their owners map the typed outcome.
+- **A live repository's compiler-cache store was treated as a deleted
+  repository's.** Stores are named after the repository's Git directory
+  (`<id>-<hash>` for Forge's own clone, the checkout for a local
+  repository); the server compared them with bare row ids. The collector now
+  knows the store of every clone, every `local_path` and every worktree
+  still on record. It removes nothing for an owner that records no
+  repository at all, and never sweeps a cache directory configured outside
+  the workspace root for deleted repositories (another server may share it;
+  the size cap still applies).
+- **Collector removals could go through a link to another directory of the
+  same root, hold a file descriptor per directory level without limit, and
+  enter a filesystem mounted inside a tree.** Removals and trash moves now
+  go down from the workspace root by file descriptor, hold at most 32
+  directory levels open, and never enter a directory on another device.
+- **A compiler-cache server start could wait without end.** The start lock
+  (a file a run can hold) now has the start timeout, a wrapper that returns
+  without a server answering counts as a failed start on every path, run
+  starts share two blocking threads under a 15-second deadline, and the
+  liveness probe never blocks.
 
 - **Garbage collection could take a build directory from a run that had just
   started, and other collector safety gaps (3.4 stage E).** Build eviction is

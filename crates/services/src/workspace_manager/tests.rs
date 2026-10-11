@@ -95,6 +95,19 @@ impl Fixture {
             .await
     }
 
+    /// [`Self::check`] by a caller that turns a refused recreate into the
+    /// Task's disk wait (a claim, a before-work hook, a reset).
+    async fn check_waiting(
+        &self,
+        purpose: Purpose,
+    ) -> Result<ValidWorkspace, WorkspaceUnavailable> {
+        let workspace = self.row().await.expect("workspace row exists");
+        WorkspaceManager::new(&self.db, &self.root_path, None, &self.router)
+            .waiting_for_disk()
+            .ensure_valid(&self.task, workspace, purpose)
+            .await
+    }
+
     fn head_ref(&self) -> String {
         git(&self.path, &["rev-parse", "--symbolic-full-name", "HEAD"])
     }
@@ -271,24 +284,24 @@ fn assert_disk_wait(fixture: &Fixture, result: Result<ValidWorkspace, WorkspaceU
     ));
 }
 
-/// Under the free-space floor a worktree is never made again, for any
-/// purpose: the caller gets the typed disk outcome and nothing on disk or in
-/// the row changes. A worktree that is there and valid is never refused.
-/// When the reading recovers the recreate goes through.
+/// Under the free-space floor a caller that waits for disk never has a
+/// worktree made again: it gets the typed disk outcome and nothing on disk
+/// or in the row changes. A worktree that is there and valid is never
+/// refused. When the reading recovers the recreate goes through.
 #[tokio::test]
-async fn recreating_a_worktree_under_the_disk_floor_is_a_typed_disk_wait_for_every_purpose() {
+async fn recreating_a_worktree_under_the_disk_floor_is_a_typed_disk_wait_for_a_caller_that_waits() {
     for purpose in REPAIRING {
         let fixture = Fixture::new().await;
         disk_reading(&fixture.db, 10);
         assert!(fixture.db.disk_admission.server_pressure().is_some());
 
         // There and valid: admitted under the floor.
-        let valid = fixture.check(purpose).await.expect("never refused");
+        let valid = fixture.check_waiting(purpose).await.expect("never refused");
         assert_eq!(valid.repair(), Repair::None);
 
         // Gone: making it again is new disk.
         std::fs::remove_dir_all(&fixture.path).unwrap();
-        assert_disk_wait(&fixture, fixture.check(purpose).await);
+        assert_disk_wait(&fixture, fixture.check_waiting(purpose).await);
         assert!(!fixture.path.exists(), "{purpose:?}: nothing was made");
         assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
         // A read-only look is not an admission.
@@ -298,17 +311,39 @@ async fn recreating_a_worktree_under_the_disk_floor_is_a_typed_disk_wait_for_eve
         // checked out again. Refused the same way, and left where it is.
         std::fs::create_dir_all(&fixture.path).unwrap();
         std::fs::write(fixture.path.join("stray.txt"), "not a worktree").unwrap();
-        assert_disk_wait(&fixture, fixture.check(purpose).await);
+        assert_disk_wait(&fixture, fixture.check_waiting(purpose).await);
         assert!(fixture.path.join("stray.txt").exists());
         assert_eq!(fixture.siblings(), ["repo"], "{purpose:?}");
         // The failed relink attempt left no Git link behind: the directory
         // is still not a worktree, and is refused again, not used.
         assert!(!fixture.path.join(".git").exists());
-        assert_disk_wait(&fixture, fixture.check(purpose).await);
+        assert_disk_wait(&fixture, fixture.check_waiting(purpose).await);
 
         // The disk recovers: the same call recreates it.
         disk_reading(&fixture.db, 500);
-        let valid = fixture.check(purpose).await.expect("worktree recreated");
+        let valid = fixture
+            .check_waiting(purpose)
+            .await
+            .expect("worktree recreated");
+        assert_recovered(&fixture, &valid);
+    }
+}
+
+/// A caller that cannot wait (a launch after its claim, a review, a check,
+/// a merge or rebase step would report a failed step) is not refused: its
+/// missing worktree is made again under the floor, as it was before the
+/// disk outcome existed.
+#[tokio::test]
+async fn a_caller_that_cannot_wait_for_disk_still_has_its_worktree_recreated_under_the_floor() {
+    for purpose in REPAIRING {
+        let fixture = Fixture::new().await;
+        disk_reading(&fixture.db, 10);
+        assert!(fixture.db.disk_admission.server_pressure().is_some());
+        std::fs::remove_dir_all(&fixture.path).unwrap();
+        let valid = fixture
+            .check(purpose)
+            .await
+            .unwrap_or_else(|error| panic!("{purpose:?} was refused: {error:?}"));
         assert_recovered(&fixture, &valid);
     }
 }
