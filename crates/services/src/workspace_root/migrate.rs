@@ -130,7 +130,7 @@ impl StoredPath {
         } else {
             (
                 format!("{column} = ?2 || substr({column}, length(?1) + 1)"),
-                under_sql(column),
+                moved_sql(column),
             )
         };
         if self.bump_version {
@@ -155,13 +155,23 @@ impl StoredPath {
         let mut rows = if self.embedded {
             format!("(instr({column}, ?1 || '/') > 0 OR instr({column}, ?1 || '\"') > 0)")
         } else {
-            under_sql(column)
+            moved_sql(column)
         };
         if let Some(only) = self.only {
             rows = format!("{rows} AND {only}");
         }
         format!("SELECT COUNT(*) FROM {} WHERE {rows}", self.table)
     }
+}
+
+/// SQL: `column` is the root bound as `?1` or a path inside it, and not a
+/// path inside `<root>/.forge/workspaces`: what a daemon sharing the root
+/// keeps there stays in the old root, so a path into it stays as it is.
+fn moved_sql(column: &str) -> String {
+    format!(
+        "({} AND NOT ({column} = ?1 || '/.forge/{DAEMON_WORKSPACES}' OR substr({column}, 1, length(?1 || '/.forge/{DAEMON_WORKSPACES}/')) = ?1 || '/.forge/{DAEMON_WORKSPACES}/'))",
+        under_sql(column)
+    )
 }
 
 /// `text` as it appears inside a JSON string.
@@ -190,7 +200,12 @@ pub fn stored_path_columns() -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct MigrateRequest {
     data_dir: PathBuf,
+    /// The new root the operator named, if any.
     target: Option<PathBuf>,
+    /// Where to move when no root is named, if not `<data dir>/worktrees`:
+    /// the root this configuration starts on. Never a reason to refuse an
+    /// unfinished move to another target (only a named root is).
+    default_target: Option<PathBuf>,
     system_temp: PathBuf,
     free_floor_bytes: u64,
     /// The command as its operator types it, for messages.
@@ -217,6 +232,7 @@ impl MigrateRequest {
         Self {
             data_dir,
             target,
+            default_target: None,
             system_temp,
             free_floor_bytes,
             command: MIGRATE_COMMAND.to_owned(),
@@ -233,6 +249,15 @@ impl MigrateRequest {
     #[must_use]
     pub fn with_command(mut self, command: String) -> Self {
         self.command = command;
+        self
+    }
+
+    /// The root to move to when the operator names none: the configured
+    /// root (`workspace.root`, `FORGE_WORKSPACE_ROOT`), so the next start is
+    /// not refused for a configured root that differs from the recorded one.
+    #[must_use]
+    pub fn with_default_target(mut self, target: Option<PathBuf>) -> Self {
+        self.default_target = target;
         self
     }
 
@@ -363,7 +388,7 @@ impl std::fmt::Display for MigrateReport {
         for (column, rows) in &self.remaining_mentions {
             writeln!(
                 formatter,
-                "  note: {rows} row(s) of {column} still mention the old root as history; no path Forge opens"
+                "  note: {rows} row(s) of {column} still mention the old root: history, or a path that did not move (another daemon's own root, a path that only starts with the same text)"
             )?;
         }
         writeln!(
@@ -537,7 +562,7 @@ pub async fn migrate(
     let worktrees = if run.journal.phase == Phase::Database {
         Vec::new()
     } else {
-        let repaired = repair_worktrees(db, &run.journal, &target, &request.command).await?;
+        let repaired = repair_worktrees(db, &run.journal, &target).await?;
         user_repositories = repaired.user_repositories;
         warnings = repaired.warnings;
         let worktrees = repaired.worktrees;
@@ -634,7 +659,10 @@ enum Planned {
 
 /// Check everything that can refuse the move, before anything changes.
 async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, WorkspaceRootError> {
-    let default_target = config::default_workspace_root(&request.data_dir);
+    let default_target = request
+        .default_target
+        .clone()
+        .unwrap_or_else(|| config::default_workspace_root(&request.data_dir));
     let wanted = absolute(request.target.as_deref().unwrap_or(&default_target))?;
     let command = request.command.as_str();
     // The root a start would run on: the recorded one, else the one this
@@ -1488,7 +1516,6 @@ async fn repair_worktrees(
     db: &SqliteDb,
     journal: &Journal,
     target: &Path,
-    command: &str,
 ) -> Result<Repaired, WorkspaceRootError> {
     // Repositories that can hold a moved worktree: the clones under the
     // root, and every repository the database knows by a local path (a
@@ -1610,7 +1637,6 @@ async fn repair_worktrees(
             repaired.push(worktree);
         }
     }
-    let _ = command;
     repaired.sort();
     Ok(Repaired {
         worktrees: repaired,

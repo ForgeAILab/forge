@@ -226,7 +226,7 @@ impl Install {
             ),
             format!("INSERT INTO daemon (id, machine_id, hostname, os, arch, status, created_at, updated_at) VALUES ('embedded-daemon', 'embedded:host:os:arch', 'host', 'os', 'arch', 'offline', '{now}', '{now}'), ('other-daemon', 'other-machine', 'other', 'os', 'arch', 'offline', '{now}', '{now}')"),
             format!("INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, created_at, updated_at) VALUES ('embedded-runtime', 'embedded-daemon', 'codex', {root}, 'offline', '{now}', '{now}'), ('other-runtime', 'other-daemon', 'codex', {root}, 'offline', '{now}', '{now}')", root = sql_text(&root)),
-            format!("INSERT INTO agent_context_scope (id, identity_id, scope_type, scope_id, workspace_access, workspace_path, created_at, updated_at) VALUES ('scope-1', 'identity', 'account', 'account', 'account_scratch', {}, '{now}', '{now}'), ('scope-2', 'identity', 'project', 'project', 'project_verify', {}, '{now}', '{now}')", sql_text(&format!("{root}/main-agents/account")), sql_text(&format!("{root}/project-agent-space"))),
+            format!("INSERT INTO agent_context_scope (id, identity_id, scope_type, scope_id, workspace_access, workspace_path, created_at, updated_at) VALUES ('scope-1', 'identity', 'account', 'account', 'account_scratch', {}, '{now}', '{now}'), ('scope-2', 'identity', 'project', 'project', 'project_verify', {}, '{now}', '{now}'), ('scope-3', 'identity', 'project', 'daemon-project', 'project_verify', {}, '{now}', '{now}')", sql_text(&format!("{root}/main-agents/account")), sql_text(&format!("{root}/project-agent-space")), sql_text(&format!("{root}/.forge/workspaces/workspace-7b0c9f6e/repo"))),
             format!("INSERT INTO agent_inquiry (id, chat_id, identity_id, owner_user_id, title, question, status, findings_path, workspace_path, created_at, updated_at, started_at) VALUES ('inquiry-1', 'chat', 'identity', 'user', 'title', 'question', 'completed', {}, {}, '{now}', '{now}', '{now}')", sql_text(&format!("{root}/main-agents/account/inquiries/one/findings.md")), sql_text(&format!("{root}/main-agents/account/inquiries/one"))),
             attempt_sql("done-attempt", "completed", &format!("{root}/.repos/{}", self.repo_id)),
             step_sql(&self.tasks[0].id, 900, "hooks", "done", &payload),
@@ -263,6 +263,10 @@ impl Install {
             (
                 "agent_context_scope.project",
                 "SELECT workspace_path FROM agent_context_scope WHERE id = 'scope-2'",
+            ),
+            (
+                "agent_context_scope.daemon",
+                "SELECT workspace_path FROM agent_context_scope WHERE id = 'scope-3'",
             ),
             (
                 "agent_inquiry.findings_path",
@@ -489,8 +493,14 @@ impl Install {
             stored["integration_attempt.repo_location_ref"],
             format!("{new}/.repos/{}", self.repo_id)
         );
-        // Another daemon's runtime keeps the root it reported.
+        // Another daemon's runtime keeps the root it reported, and a path
+        // into what a daemon keeps in the old root still names it there.
         assert_eq!(stored["runtime.other"], old);
+        assert_eq!(
+            stored["agent_context_scope.daemon"],
+            format!("{old}/.forge/workspaces/workspace-7b0c9f6e/repo")
+        );
+        assert!(Path::new(&stored["agent_context_scope.daemon"]).is_dir());
         // JSON: parsed back, the root and paths under it are rewritten, a
         // path that only starts with the same text is not, nothing else
         // changed.
@@ -519,6 +529,7 @@ impl Install {
             assert!(
                 left.iter().all(|column| [
                     "runtime.workspace_root",
+                    "agent_context_scope.workspace_path",
                     "task_step.payload_json",
                     "task_step.result_json"
                 ]
@@ -1370,4 +1381,40 @@ async fn what_another_database_keeps_in_a_shared_root_stays() {
     assert!(target.join(".repos").join(&install.repo_id).is_dir());
     let log = install.log_path.strip_prefix(root).unwrap();
     assert!(target.join(log).is_file());
+}
+
+/// Without a named root the move goes to the configured root; and a move
+/// that did not finish is finished by the bare command whatever root is
+/// configured by then (only a root the operator names can conflict).
+#[tokio::test]
+async fn the_configured_root_is_the_default_target_and_never_blocks_a_rerun() {
+    let install = Install::new().await;
+    let configured = install
+        .dirs
+        .data
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("configured-root");
+    let crashed = migrate(
+        &install.db,
+        &install
+            .request()
+            .with_default_target(Some(configured.clone()))
+            .crashing_at(3),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(crashed, WorkspaceRootError::Incomplete(_)));
+    let other = install.dirs.data.path().join("configured-later");
+    let report = migrate(
+        &install.db,
+        &install.request().with_default_target(Some(other.clone())),
+    )
+    .await
+    .unwrap();
+    assert!(report.resumed);
+    assert_eq!(report.target, configured);
+    assert_eq!(recorded_root(&install.db).await.unwrap(), Some(configured));
+    assert!(!other.exists());
 }

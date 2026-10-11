@@ -744,8 +744,10 @@ half-made copy is made again from the untouched original.
 Forge Solo always keeps its root at `<Solo data root>/worktrees` and records
 it the same way; it was never in the temp directory. Solo has no move
 command of its own: when its start is refused (its data root was moved, or
-copied from another machine), the message prints the `forge --data-dir
-<Solo data root> --migrate-workspace-root` command to run. A Solo data root
+copied from another machine), the message prints the command to run, with
+both paths: `forge --data-dir <Solo data root> --migrate-workspace-root
+<Solo data root>/worktrees`. Type the target as printed: without it `forge`
+would use the root of the server's own configuration, if one is set. A Solo data root
 *copied* beside an original that still exists is not supported: both
 databases name the original's worktrees, so remove the copy or the original.
 

@@ -556,18 +556,17 @@ async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -
     };
     // No path given: where this configuration would start, so the next
     // start is not refused for a root that is set and differs.
-    let target = target.or_else(|| {
-        config
-            .workspace
-            .root_explicit
-            .then(|| config.workspace.root.clone())
-    });
+    let configured = config
+        .workspace
+        .root_explicit
+        .then(|| config.workspace.root.clone());
     let request = services::workspace_root::migrate::MigrateRequest::new(
         data_dir,
         target,
         std::env::temp_dir(),
         config.workspace.min_free_bytes,
     )
+    .with_default_target(configured)
     .with_command(migrate_command(config));
     match services::workspace_root::migrate::migrate(&db, &request).await {
         Ok(report) => {

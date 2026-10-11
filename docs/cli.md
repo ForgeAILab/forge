@@ -460,8 +460,12 @@ again and finishes. The move rolls forward only; there is no `--abort`. See
 [getting started](getting-started.md#where-the-server-keeps-workspaces-and-how-to-move-them)
 for when a move is needed and what a start does after an upgrade. Forge Solo
 has no such flag: its root always follows its data root, and a refused Solo
-start prints the `forge --data-dir <Solo data root> --migrate-workspace-root`
-command to run.
+start prints the command to run, `forge --data-dir <Solo data root>
+--migrate-workspace-root <Solo data root>/worktrees`. The configured-root
+default is the configuration `forge` itself loads (`forge.yaml`,
+`FORGE_WORKSPACE_ROOT`), so name the target when moving another data
+directory. An unfinished move is finished by the command without a path
+whatever root is configured.
 
 ### Linking an external daemon
 

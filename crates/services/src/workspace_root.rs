@@ -241,8 +241,15 @@ pub async fn settle(db: &SqliteDb, choice: &RootChoice) -> Result<SettledRoot, W
         let live = LiveData::under(db, &root).await?;
         if let Err(error) = std::fs::create_dir_all(&root) {
             return Err(WorkspaceRootError::Refused(format!(
-                "the workspace root {root} does not exist and cannot be created ({error}). If it is on a volume that is not mounted, mount it and start Forge again. If it is gone for good (the data directory was moved or copied from another machine), run `{command}`: nothing is there to move, and the command points the database at the new root",
+                "the workspace root {root} does not exist and cannot be created ({error}). If it is on a volume that is not mounted, mount it and start Forge again. If it is gone for good (the data directory was moved or copied from another machine), run `{command}{target}`: nothing is there to move, and the command points the database at the new root",
                 root = root.display(),
+                // A chosen root is named, so the move goes there whatever
+                // configuration the `forge` that runs it loads.
+                target = if choice.explicit {
+                    format!(" {}", choice.configured.display())
+                } else {
+                    String::new()
+                },
             )));
         }
         if live.workspaces > 0 || live.running > 0 {
