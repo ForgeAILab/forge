@@ -3191,9 +3191,33 @@ have `details.owner = integration_worker`, `recovery = wait_for_integration`,
 no diagnostic/interruption, and false blocked/failed/human/entry flags. Real
 owner-fixable causes (dirty target, exhausted budget, owner required) expose a
 blocked diagnostic and `repair_integration` guidance. Guidance does not authorize
-an action: stage A offers Hold/Cancel on integration waits, and preserves normal
-Release on an independent user hold. These variants are emitted only in tests
-until queue activation; there are no new routes, queue tables or worker yet.
+an action: an integration wait offers Hold (`integration_wait`) and Cancel, and
+an independent user hold keeps its normal Release.
+
+Offers of a Task in its merge state (`GET /api/v1/tasks/{id}/actions`, field
+`reason` of each offer):
+
+| Condition | Offered | What the action does |
+|---|---|---|
+| primary `integration`, `waiting` / `owned` / `applied` | `hold` (`integration_wait`), `cancel` | The queue worker owns the Task; nothing to retry. A Hold is recorded on the Task and the Task leaves the head of the queue. |
+| primary `integration`, `deferred` | `retry` (`integration_retry`), `hold`, `cancel` | The merge stopped for its owner by itself (dirty target, dirty checkout, exhausted retries, a candidate that cannot be named). Retry puts the attempt back in line with its counted retries started again, or admits the Task again when it has no attempt. `409 invalid_operation` while the result of an effect is unknown. |
+| primary `held`, additional `integration` `waiting` | `release` (`held_waiting`), `restart`, `approve`, `cancel` | Release lifts the Hold and the attempt is due at once. Restart starts the Task's work over from its first state; it comes back through review and is admitted again. |
+| primary `failure` (for example `target_repo_dirty`, `cascade_failed`), additional `integration` `waiting` | `retry` (`merge_gate_retry`), `approve`, `cancel` | Retry clears the failure and the attempt is due at once. |
+| any, in the merge state | `approve` (`state_advance_override`, owner only) | Declares the Task done without a merge, as before the queue; its attempt is cancelled and nothing is merged afterwards. |
+
+A Task the queue may not merge now keeps its own reason as `primary` and its
+own action; integration only adds `waiting`. The attempt's
+`failure_message` (not part of the public condition) leads with the gate code:
+`task_held`, `task_blocked`, `task_failed`, `task_entry_blocked`,
+`task_awaiting_human`, `project_paused`. Under a paused Project the Task shows
+`integration` `waiting` and offers `hold` and `cancel`; resuming the Project
+puts it back in line. A paused Agent does not stop a merge.
+
+A Task in a merge state that cannot join the queue (no workspace, no
+implementation run, the repository is gone) is blocked with
+`blocked.kind = "integration_admission_failed"` (`details.diagnostic.type =
+"workspace_error"`, `blocking_reason = "integration_admission_failed"`); its
+`retry` asks again.
 
 The durable check runner adds `ConditionReason::Check`, serialized as
 `{ "kind": "check", "wait": { "phase": "...", "consumer_id": "opaque-id", "origin": "entry" } }`,

@@ -3615,6 +3615,81 @@ impl World {
         })
     }
 
+    /// `rounds` passes of the step worker and the dispatcher (its sweep and
+    /// the integration reconciler in it) over a state with nothing to do
+    /// commit nothing: SQLite's `data_version`, read on a connection of its
+    /// own, moves with every commit of any other connection.
+    async fn idle_passes_write_nothing(&self, rounds: usize) -> Result<(), String> {
+        use sqlx::Connection;
+        let sql = |error: sqlx::Error| error.to_string();
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(self.dir.path().join("forge.db"))
+            .read_only(true);
+        let mut watch = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .map_err(sql)?;
+        let counts = |pool: sqlx::SqlitePool| async move {
+            let mut out = Vec::new();
+            for table in ["task_step", "domain_event", "transition_log", "integration_attempt"] {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or(-1);
+                out.push(format!("{table}={n}"));
+            }
+            let moved: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COALESCE(SUM(version),0) FROM task), (SELECT COALESCE(SUM(revision),0) FROM integration_attempt)",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap_or((-1, -1));
+            format!("{out:?} task versions {} attempt revisions {}", moved.0, moved.1)
+        };
+        // Let the check worker's own start-up writes pass first.
+        let mut before: i64 = -1;
+        for _ in 0..40 {
+            let now: i64 = sqlx::query_scalar("PRAGMA data_version")
+                .fetch_one(&mut watch)
+                .await
+                .map_err(sql)?;
+            if now == before {
+                break;
+            }
+            before = now;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let rows = counts(self.live().pool.clone()).await;
+        for _ in 0..rounds {
+            for id in &self.tasks {
+                self.live()
+                    .state
+                    .task_service
+                    .drain(id)
+                    .await
+                    .map_err(|error| format!("draining an idle Task failed: {error}"))?;
+            }
+            self.live()
+                .runtime
+                .task_dispatcher
+                .check_once()
+                .await
+                .map_err(|error| format!("dispatcher pass failed: {error}"))?;
+        }
+        let after: i64 = sqlx::query_scalar("PRAGMA data_version")
+            .fetch_one(&mut watch)
+            .await
+            .map_err(sql)?;
+        watch.close().await.map_err(sql)?;
+        if after != before {
+            return Err(format!(
+                "{rounds} idle passes committed {} write(s): rows before {rows}, after {}",
+                after - before,
+                counts(self.live().pool.clone()).await
+            ));
+        }
+        Ok(())
+    }
+
     /// One Task in one line: where it is and what its owner is told.
     async fn upgrade_row(&self, index: usize) -> Result<String, String> {
         let task = self.task(index).await?;
@@ -3935,6 +4010,14 @@ async fn pre_queue_upgraded(
         }
     }
 
+    // A stopped Task is not worked on: the reconciler, the gate reads and
+    // the dispatcher's sweep commit nothing while it waits.
+    if expected == Upgraded::Parked && take.is_none() {
+        world
+            .idle_passes_write_nothing(10)
+            .await
+            .map_err(|error| format!("{name}: {error}"))?;
+    }
     // What the fixture left on disk for the owner to clean up.
     if name == "p19_target_dirty" {
         git(&world.dir.path().join("repo"), &["checkout", "--", "."])?;
@@ -4141,4 +4224,83 @@ pre_queue! {
     pre_queue_p14_merge_failed_on_a_locked_index, pre_queue_bare_p14_merge_failed_on_a_locked_index: "p14_merge_failed_on_a_locked_index" => Repaired;
     pre_queue_p19_dirty_worktree, pre_queue_bare_p19_dirty_worktree: "p19_dirty_worktree" => Repaired;
     pre_queue_p19_target_dirty, pre_queue_bare_p19_target_dirty: "p19_target_dirty" => Parked;
+}
+
+/// A coordination root and its subtask: the subtask's work lands on the
+/// root's branch, and the root merges through the queue like any Task (one
+/// completed attempt, its branch on main), with no owner action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coordination_root_merges_through_the_queue() {
+    log_to_stderr();
+    let run = async {
+        let mut world = World::new().await;
+        world.create(None).await?;
+        let child = world.create(Some(0)).await?;
+        if child.starts_with("refused") {
+            return Err(format!("the subtask was {child}"));
+        }
+        world.quiesce().await?;
+        world.drive_to_settlement().await?;
+        let owner: Vec<&String> = world
+            .trace
+            .iter()
+            .filter(|line| line.contains("(0)") || line.contains("(1)"))
+            .collect();
+        if !owner.is_empty() {
+            return Err(format!("an owner action was needed: {owner:#?}"));
+        }
+        for index in 0..world.tasks.len() {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!(
+                    "task {index} ended {}: {}; trace {:#?}",
+                    task["status"], task["condition"], world.trace
+                ));
+            }
+        }
+        let attempts: Vec<(String, String)> = sqlx::query_as(
+            "SELECT task_ref, state FROM integration_attempt ORDER BY created_at, rowid",
+        )
+        .fetch_all(&world.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let of = |index: usize| -> Vec<&str> {
+            attempts
+                .iter()
+                .filter(|(task, _)| task == &world.tasks[index])
+                .map(|(_, state)| state.as_str())
+                .collect()
+        };
+        if of(0).last() != Some(&"completed") {
+            return Err(format!(
+                "the root has no completed attempt: root {:?}, subtask {:?}",
+                of(0),
+                of(1)
+            ));
+        }
+        if !of(1).is_empty() {
+            return Err(format!("a subtask was in the queue: {:?}", of(1)));
+        }
+        let tip = git(
+            &world.dir.path().join("repo"),
+            &["rev-parse", &format!("refs/heads/task/{}", &world.tasks[0][..8])],
+        )?;
+        if !world.on_main(&tip) {
+            return Err(format!("the root's branch {tip} is not on main"));
+        }
+        for index in 0..2 {
+            let file = world.dir.path().join("repo").join(deliverable(index));
+            let tracked = git(
+                &world.dir.path().join("repo"),
+                &["cat-file", "-e", &format!("refs/heads/main:{}", deliverable(index))],
+            );
+            if tracked.is_err() {
+                return Err(format!("main lacks {}", file.display()));
+            }
+        }
+        Ok(())
+    };
+    if let Err(error) = run.await {
+        panic!("{error}");
+    }
 }
