@@ -2720,6 +2720,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Cancel and Hold no longer strand a merge-queue step at transaction startup.**
+  Preemption could drop SQLx's `BEGIN IMMEDIATE` after SQLite acknowledged it
+  but before a rollback guard existed, returning a connection that held the
+  write lock. The pool now rolls back remaining transactions before reuse so
+  preemption cleanup settles the step and releases its lease.
+
 - **Merge queue: a Task is not reported merged, or cancelled, against what
   Git says.** Three faults of the queue cutover, found by CI:
   - The queue read "already merged" from the Task checkout's HEAD alone. A
