@@ -110,8 +110,8 @@ fn non_empty(text: &str) -> Option<String> {
 pub fn task_integration_summary(
     row: &IntegrationMemberRead,
     task: Option<&db::Task>,
-    project_paused: bool,
 ) -> Option<TaskIntegrationSummary> {
+    let project_paused = row.project_paused;
     // What the steps last told the Task about this very attempt.
     let told = task.and_then(|task| match &task.condition {
         db::TaskCondition::Parked {
@@ -211,11 +211,13 @@ pub fn task_integration_summary(
             match (row.state, told, reason) {
                 // Parked under the Task gate: the Task is in line behind its
                 // own stop, which is the reason and carries the action.
-                (S::Parked, _, Some(ParkReason::Gate(cause))) => (
-                    IntegrationMemberState::Waiting,
-                    None,
-                    Some(gate_wait(gate.unwrap_or(cause))),
-                ),
+                // The cause is the one that holds NOW (the Task's row and its
+                // Project), never the one the attempt was parked under: once
+                // the stop is lifted the worker puts the attempt back in line
+                // by itself, and until it has, nothing is said to stop it.
+                (S::Parked, _, Some(ParkReason::Gate(_))) => {
+                    (IntegrationMemberState::Waiting, None, gate.map(gate_wait))
+                }
                 (
                     _,
                     Some(IntegrationReason::Deferred {
@@ -287,10 +289,28 @@ pub fn task_integration_summary(
         }
         S::Completed | S::Cancelled | S::Superseded => return None,
     };
-    let action_hint = match (&state, wait.as_ref().map(|wait| wait.code)) {
-        (IntegrationMemberState::Deferred, _) => Some(IntegrationActionHint::Retry),
-        (_, Some(IntegrationWaitCode::TaskHeld)) => Some(IntegrationActionHint::Release),
-        (_, Some(IntegrationWaitCode::ProjectPaused)) => Some(IntegrationActionHint::ResumeProject),
+    // The hint is never a rule of its own. `retry` is the action system's
+    // own decision to offer `integration_retry` for this attempt
+    // (`task_actions::integration_retry_offered`, the function the offer is
+    // built from): an attempt the worker parked a moment ago, whose Task the
+    // park step has not told yet, has no hint, because the action would be
+    // refused. `release` is the owner's Hold on the Task, which the action
+    // system releases (proved against `available_actions` by test).
+    // `resume_project` is a Project action and no Task
+    // offer: it is said only while the member's own Project is paused.
+    let action_hint = match wait.as_ref().map(|wait| wait.code) {
+        _ if task.is_some_and(|task| {
+            crate::task_actions::integration_retry_offered(task, &row.attempt_id)
+        }) =>
+        {
+            Some(IntegrationActionHint::Retry)
+        }
+        Some(IntegrationWaitCode::TaskHeld) if matches!(gate, Some(GateCause::Held)) => {
+            Some(IntegrationActionHint::Release)
+        }
+        Some(IntegrationWaitCode::ProjectPaused) if project_paused => {
+            Some(IntegrationActionHint::ResumeProject)
+        }
         _ => None,
     };
     let timings = row.timings.as_ref();
@@ -328,7 +348,6 @@ pub fn task_integration_summary(
 pub fn task_integration_summaries<'a>(
     rows: &[IntegrationMemberRead],
     tasks: impl IntoIterator<Item = &'a db::Task>,
-    project_paused: bool,
 ) -> HashMap<String, TaskIntegrationSummary> {
     let rows = rows
         .iter()
@@ -338,48 +357,50 @@ pub fn task_integration_summaries<'a>(
         .into_iter()
         .filter_map(|task| {
             let row = rows.get(task.id.as_str())?;
-            Some((
-                task.id.clone(),
-                task_integration_summary(row, Some(task), project_paused)?,
-            ))
+            Some((task.id.clone(), task_integration_summary(row, Some(task))?))
         })
         .collect()
 }
 
-async fn project_paused(db: &SqliteDb, project_id: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM project WHERE id=? AND paused_at IS NOT NULL)",
-    )
-    .bind(project_id)
-    .fetch_one(db.pool())
-    .await
-    .map_err(db::DbError::from)?)
-}
-
-/// One Task's place in the merge queue; `None` without an attempt in progress.
+/// One Task's place in the merge queue; `None` without an attempt in
+/// progress. One statement: the member row carries its queue, its machine
+/// and whether its Project is paused.
 pub async fn task_integration(
     db: &SqliteDb,
     task: &db::Task,
 ) -> Result<Option<TaskIntegrationSummary>> {
     let rows = db::integration_members_of_tasks(db.pool(), &[task.id.as_str()]).await?;
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    let paused = project_paused(db, &task.project_id).await?;
-    Ok(task_integration_summary(row, Some(task), paused))
+    Ok(rows
+        .first()
+        .and_then(|row| task_integration_summary(row, Some(task))))
 }
 
-/// A page of one repository's merge queues with their members. The caller
-/// has already decided that the repository's Project is visible; a queue and
-/// every member in it belong to that one Project. Four statements whatever
-/// the page holds.
+/// A page of one repository's merge queues with their members, as a reader
+/// of `project_id` may see them. The caller has already decided that this
+/// Project is visible to the reader.
+///
+/// Admission puts a Task in the queue of a repository of its own Project and
+/// refuses any other, so every member of a queue belongs to one Project. This
+/// read does not rest on that: a member is listed only if it belongs to
+/// `project_id`. A member of any other Project (an agent whose Project names
+/// another Project's repository as its checkout reads that repository's
+/// queues) is still counted, in `member_count` and in every `position`,
+/// because it is really in the line, and it is never listed: no Task id, no
+/// title, no status, no attempt id, not even as the head. A Task that was
+/// deleted keeps its place and its id (its attempt is still in the line) and
+/// loses its title and status.
+///
+/// Three statements whatever the page holds.
 pub async fn repo_integration_queues(
     db: &SqliteDb,
-    repo: &db::Repo,
+    repo_id: &str,
+    project_id: &str,
+    target_branch: Option<&str>,
     cursor: Option<&str>,
     limit: i64,
 ) -> Result<IntegrationQueuesResponse> {
-    let page = db::integration_queues_of_repo(db.pool(), &repo.id, cursor, limit).await?;
+    let page =
+        db::integration_queues_of_repo(db.pool(), repo_id, target_branch, cursor, limit).await?;
     let queue_ids = page
         .items
         .iter()
@@ -393,6 +414,7 @@ pub async fn repo_integration_queues(
     .await?;
     let task_ids = members
         .iter()
+        .filter(|member| member.project_ref == project_id)
         .map(|member| member.task_ref.as_str())
         .collect::<Vec<_>>();
     let tasks = if task_ids.is_empty() {
@@ -402,9 +424,9 @@ pub async fn repo_integration_queues(
     };
     let tasks = tasks
         .iter()
+        .filter(|task| task.deleted_at.is_none() && task.project_id == project_id)
         .map(|task| (task.id.as_str(), task))
         .collect::<HashMap<_, _>>();
-    let paused = project_paused(db, &repo.project_id).await?;
     let mut by_queue = HashMap::<&str, Vec<&IntegrationMemberRead>>::new();
     for member in &members {
         if let Some(queue_id) = member.queue_id.as_deref() {
@@ -417,17 +439,21 @@ pub async fn repo_integration_queues(
         .iter()
         .map(|queue| {
             let rows = by_queue.remove(queue.id.as_str()).unwrap_or_default();
+            let visible = |row: &&&IntegrationMemberRead| row.project_ref == project_id;
             let head = rows.iter().find(|row| row.is_head);
+            let shown_head = head.filter(visible);
             let member_count = rows.first().map_or(0, |row| row.queue_members);
+            let read = rows.len();
             let members = rows
                 .iter()
+                .filter(visible)
                 .filter_map(|row| {
                     let task = tasks.get(row.task_ref.as_str()).copied();
                     Some(IntegrationQueueMemberResponse {
                         task_id: row.task_ref.clone(),
                         task_title: task.map(|task| task.title.clone()),
                         task_status: task.map(|task| task.status.clone()),
-                        integration: task_integration_summary(row, task, paused)?,
+                        integration: task_integration_summary(row, task)?,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -445,10 +471,10 @@ pub async fn repo_integration_queues(
                     }
                 }),
                 state,
-                head_task_id: head.map(|row| row.task_ref.clone()),
-                head_attempt_id: queue.head_attempt_id.clone(),
+                head_task_id: shown_head.map(|row| row.task_ref.clone()),
+                head_attempt_id: shown_head.map(|row| row.attempt_id.clone()),
                 head_since: head.and_then(|row| row.started_at.clone()),
-                members_truncated: member_count as usize > members.len(),
+                members_truncated: member_count as usize > read,
                 member_count,
                 members,
             }
@@ -459,6 +485,43 @@ pub async fn repo_integration_queues(
         next_cursor: page.next_cursor,
         has_more,
     })
+}
+
+/// The merge queues an agent bound to `project_id` reads (`repo.integration_queue`
+/// natively, `forge_get_integration_queue` on `POST /mcp`): the queues of the
+/// Project's repository as that Project sees them, or the one queue of
+/// `target_branch`. One function, so both tools answer alike.
+pub async fn project_integration_queues(
+    db: &SqliteDb,
+    project_id: &str,
+    target_branch: Option<&str>,
+    limit: Option<u64>,
+) -> Result<serde_json::Value> {
+    use db::{ProjectRepo, RepoRepo};
+    let limit = limit.unwrap_or(20).clamp(1, 100) as i64;
+    let repo_id = ProjectRepo::get_by_id(db, project_id)
+        .await?
+        .and_then(|project| project.primary_repo_id);
+    let repo = match repo_id.as_deref() {
+        Some(repo_id) => RepoRepo::get_by_id(db, repo_id).await?,
+        None => None,
+    };
+    let Some(repo) = repo else {
+        return Ok(serde_json::json!({
+            "project_id": project_id,
+            "repo_id": serde_json::Value::Null,
+            "items": [],
+            "has_more": false,
+        }));
+    };
+    let page =
+        repo_integration_queues(db, &repo.id, project_id, target_branch, None, limit).await?;
+    Ok(serde_json::json!({
+        "project_id": project_id,
+        "repo_id": repo.id,
+        "items": page.items,
+        "has_more": page.has_more,
+    }))
 }
 
 #[cfg(test)]
@@ -622,7 +685,9 @@ mod tests {
         fixture
             .attempt("state='parked',failure_kind='target_unavailable',failure_message='target_not_ready: the default checkout is not connected'")
             .await;
-        // From the attempt alone: the worker's own park reason.
+        // From the attempt alone: the worker's own park reason. The park
+        // step has not told the Task yet, so the action system does not
+        // offer the retry and the summary does not hint at it.
         let parked = fixture.told(None).await;
         assert_eq!(parked.state, IntegrationMemberState::Deferred);
         let wait = parked.wait.unwrap();
@@ -631,7 +696,7 @@ mod tests {
             wait.message.as_deref(),
             Some("the default checkout is not connected")
         );
-        assert_eq!(parked.action_hint, Some(IntegrationActionHint::Retry));
+        assert_eq!(parked.action_hint, None);
 
         // What the park step told the Task wins: cause, machine, message.
         let told = fixture
@@ -642,6 +707,7 @@ mod tests {
                 message: "build-box is not connected".into(),
             }))
             .await;
+        assert_eq!(told.action_hint, Some(IntegrationActionHint::Retry));
         let wait = told.wait.unwrap();
         assert_eq!(wait.code, IntegrationWaitCode::OwnerOffline);
         assert_eq!(wait.machine_id.as_deref(), Some("daemon-7"));
@@ -739,5 +805,328 @@ mod tests {
             task_integration(&fixture.db, &fixture.task).await.unwrap(),
             None
         );
+    }
+
+    /// Every state an attempt in progress can be in, under every queue state
+    /// and place in line, against the one summary. `None` is "no summary".
+    #[tokio::test]
+    async fn the_summary_says_what_the_attempt_and_its_queue_say_in_every_state() {
+        use IntegrationMemberState as M;
+        use IntegrationPhase as P;
+        use IntegrationWaitCode as W;
+        let fixture = fixture().await;
+        // Two more members behind the fixture's: `t` is first in line.
+        let mut behind = Vec::new();
+        for task in ["t2", "t3"] {
+            sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p',?,'merging','2026-10-01T00:00:00+00:00','2026-10-01T00:00:00+00:00')")
+                .bind(task)
+                .bind(task)
+                .execute(fixture.db.pool())
+                .await
+                .unwrap();
+            let queue: String = sqlx::query_scalar("SELECT id FROM integration_queue")
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
+            fixture
+                .db
+                .admit_integration_attempt(db::IntegrationAttempt::new(
+                    Some(queue),
+                    task.into(),
+                    "p".into(),
+                    format!("admission-{task}"),
+                    "merging".into(),
+                    0,
+                    1,
+                ))
+                .await
+                .unwrap();
+            behind.push(
+                TaskRepo::get_by_id(&fixture.db, task, false)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let queue = |assignments: &'static str| {
+            let db = fixture.db.clone();
+            let head = fixture.attempt.clone();
+            async move {
+                sqlx::query(&format!("UPDATE integration_queue SET {assignments}"))
+                    .bind(head)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+        };
+        type Expected = Option<(M, Option<P>, Option<u32>, Option<W>)>;
+        // (attempt columns, at the head, expected of the member itself)
+        let table: Vec<(&str, bool, Expected)> = vec![
+            ("state='queued'", false, Some((M::Waiting, None, Some(0), None))),
+            ("state='path_wait'", false, Some((M::Waiting, None, Some(0), None))),
+            ("state='validating'", true, Some((M::Owned, Some(P::Validating), Some(0), None))),
+            ("state='rebasing'", true, Some((M::Owned, Some(P::Rebasing), Some(0), None))),
+            ("state='checking'", true, Some((M::Owned, Some(P::Checking), Some(0), None))),
+            ("state='awaiting_task_step'", true, Some((M::Owned, Some(P::AwaitingAuthorization), Some(0), None))),
+            ("state='ready_ff'", true, Some((M::Owned, Some(P::FastForwarding), Some(0), None))),
+            ("state='ff_inflight'", true, Some((M::Owned, Some(P::FastForwarding), Some(0), None))),
+            ("state='reconciling'", true, Some((M::Owned, Some(P::Reconciling), Some(0), None))),
+            ("state='applied'", true, Some((M::Applied, None, None, None))),
+            ("state='needs_review'", false, Some((M::ReviewRequired, None, None, None))),
+            ("state='ejected'", false, Some((M::Repair, None, None, None))),
+            ("state='ejected',failure_kind='candidate_check_failed'", false, Some((M::CandidateCheckFailed, None, None, None))),
+            ("state='quarantined',failure_message='the fast-forward has no answer'", true, Some((M::Deferred, None, None, Some(W::UnresolvedResult)))),
+            ("state='parked',failure_message='target_not_ready: gone'", false, Some((M::Deferred, None, None, Some(W::OwnerOffline)))),
+            ("state='parked',failure_message='target_dirty: local changes'", false, Some((M::Deferred, None, None, Some(W::TargetDirty)))),
+            ("state='parked',failure_message='worktree_dirty: local changes'", false, Some((M::Deferred, None, None, Some(W::OwnerRequired)))),
+            ("state='parked',failure_message='unsupported_conflict: binary'", false, Some((M::Deferred, None, None, Some(W::OwnerRequired)))),
+            ("state='parked',failure_message='transfer_too_large: 3 GiB'", false, Some((M::Deferred, None, None, Some(W::OwnerRequired)))),
+            ("state='parked',failure_message='external_target_moves_exhausted: 5'", false, Some((M::Deferred, None, None, Some(W::BudgetExhausted)))),
+            ("state='parked',failure_message='rounds_exhausted: 5'", false, Some((M::Deferred, None, None, Some(W::BudgetExhausted)))),
+            ("state='parked',failure_message='infrastructure: no answer',available_at='2026-10-01T00:05:00+00:00'", false, Some((M::Deferred, None, None, Some(W::Infrastructure)))),
+            ("state='parked',failure_message='timeout: 600 s',available_at='2026-10-01T00:05:00+00:00'", false, Some((M::Deferred, None, None, Some(W::Infrastructure)))),
+            ("state='parked',failure_message='task_step_failed: no',available_at=NULL", false, Some((M::Deferred, None, None, Some(W::BudgetExhausted)))),
+            ("state='parked',failure_kind='needs_fact',failure_message='not a known reason'", false, Some((M::Deferred, None, None, Some(W::UnresolvedResult)))),
+            // Parked under a stop of the Task that is no longer there: the
+            // worker is about to put it back in line; nothing stops it.
+            ("state='parked',failure_message='task_held: on hold'", false, Some((M::Waiting, None, None, None))),
+            ("state='parked',failure_message='project_paused: paused'", false, Some((M::Waiting, None, None, None))),
+            ("state='completed',current=0,completed_at=updated_at", false, None),
+            ("state='cancelled',current=0,completed_at=updated_at", false, None),
+            ("state='superseded',current=0,completed_at=updated_at", false, None),
+        ];
+        // Every state the attempt table admits is in the table above.
+        for state in [
+            S::Queued,
+            S::PathWait,
+            S::Validating,
+            S::Rebasing,
+            S::Checking,
+            S::AwaitingTaskStep,
+            S::ReadyFf,
+            S::FfInflight,
+            S::Reconciling,
+            S::Applied,
+            S::Ejected,
+            S::NeedsReview,
+            S::Parked,
+            S::Quarantined,
+            S::Completed,
+            S::Cancelled,
+            S::Superseded,
+        ] {
+            assert!(
+                table
+                    .iter()
+                    .any(|(columns, ..)| columns.starts_with(&format!("state='{state}'"))),
+                "{state} has no row"
+            );
+        }
+        for (columns, at_head, expected) in table {
+            fixture
+                .attempt(&format!(
+                    "current=1,completed_at=NULL,failure_kind=NULL,failure_message=NULL,available_at=NULL,{columns}"
+                ))
+                .await;
+            queue(if at_head {
+                "head_attempt_id=?"
+            } else {
+                "head_attempt_id=NULL AND ? IS NOT NULL"
+            })
+            .await;
+            let summary = task_integration(&fixture.db, &fixture.task).await.unwrap();
+            assert_eq!(
+                summary.as_ref().map(|summary| (
+                    summary.state,
+                    summary.phase.clone(),
+                    summary.position,
+                    summary.wait.as_ref().map(|wait| wait.code)
+                )),
+                expected,
+                "{columns}"
+            );
+            // No step has told the Task anything: no action is hinted.
+            assert_eq!(
+                summary.and_then(|summary| summary.action_hint),
+                None,
+                "{columns}"
+            );
+            // The members behind: one ahead for each waiter in front, plus
+            // the head. A parked or sent-back member is ahead of nobody.
+            let in_line =
+                columns.starts_with("state='queued'") || columns.starts_with("state='path_wait'");
+            let ahead = u32::from(at_head) + u32::from(in_line);
+            for (n, task) in behind.iter().enumerate() {
+                let summary = task_integration(&fixture.db, task).await.unwrap().unwrap();
+                assert_eq!(
+                    (summary.state, summary.position),
+                    (M::Waiting, Some(ahead + n as u32)),
+                    "{columns}: member {n} behind"
+                );
+                assert_eq!(
+                    summary.wait.map(|wait| wait.code),
+                    (ahead + n as u32 > 0).then_some(W::Queue),
+                    "{columns}: member {n} behind"
+                );
+            }
+        }
+
+        // The queue's own state is the wait of every member in line, and of
+        // none that is not in line.
+        fixture
+            .attempt("current=1,completed_at=NULL,state='queued',failure_message=NULL")
+            .await;
+        for (state, code, queue_state) in [
+            (
+                "suspended",
+                W::QueueSuspended,
+                IntegrationQueueState::Suspended,
+            ),
+            (
+                "quarantined",
+                W::QueueQuarantined,
+                IntegrationQueueState::Quarantined,
+            ),
+        ] {
+            sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,state=?,last_error_kind='target_unavailable',last_error='not ready'")
+                .bind(state)
+                .execute(fixture.db.pool())
+                .await
+                .unwrap();
+            for task in std::iter::once(&fixture.task).chain(&behind) {
+                let summary = task_integration(&fixture.db, task).await.unwrap().unwrap();
+                assert_eq!(summary.queue_state, Some(queue_state));
+                let wait = summary.wait.unwrap();
+                assert_eq!(
+                    (wait.code, wait.message.as_deref()),
+                    (code, Some("not ready"))
+                );
+                assert_eq!(summary.action_hint, None);
+            }
+        }
+        sqlx::query(
+            "UPDATE integration_queue SET state='open',last_error_kind=NULL,last_error=NULL",
+        )
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+        // A paused Project is the wait of its members, read from the member
+        // row itself, and the one hint that is a Project action.
+        sqlx::query("UPDATE project SET paused_at='2026-10-01T00:00:00+00:00'")
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let paused = task_integration(&fixture.db, &fixture.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.wait.map(|wait| wait.code), Some(W::ProjectPaused));
+        assert_eq!(
+            paused.action_hint,
+            Some(IntegrationActionHint::ResumeProject)
+        );
+        fixture
+            .attempt("state='parked',failure_message='project_paused: paused'")
+            .await;
+        let parked = task_integration(&fixture.db, &fixture.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                parked.state,
+                parked.position,
+                parked.wait.map(|wait| wait.code)
+            ),
+            (M::Waiting, None, Some(W::ProjectPaused))
+        );
+        // A Task in its merge state that has no attempt yet (the reconciler
+        // will admit it) has no summary: `null`, never an error.
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('new','p','new','merging','2026-10-01T00:00:00+00:00','2026-10-01T00:00:00+00:00')")
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let unadmitted = TaskRepo::get_by_id(&fixture.db, "new", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task_integration(&fixture.db, &unadmitted).await.unwrap(),
+            None
+        );
+    }
+
+    /// The hint is the action system's own answer: for every statement a
+    /// step can have made to the Task and every state its attempt can be in,
+    /// `retry` is hinted exactly when `available_actions` offers
+    /// `integration_retry`, and `release` only when it offers `release`.
+    #[tokio::test]
+    async fn the_action_hint_is_what_the_action_system_offers() {
+        let fixture = fixture().await;
+        let mut hinted_retry = 0;
+        for condition in crate::task_actions::tests::integration_conditions() {
+            for state in [
+                "queued",
+                "validating",
+                "awaiting_task_step",
+                "parked",
+                "quarantined",
+                "ejected",
+                "needs_review",
+                "applied",
+            ] {
+                fixture
+                    .attempt(&format!(
+                        "state='{state}',failure_message='infrastructure: no answer'"
+                    ))
+                    .await;
+                let mut snapshot = crate::task_actions::tests::snapshot("merging", None);
+                snapshot.task.condition = condition.clone();
+                for (attempt, same) in [("attempt", true), ("an-earlier-attempt", false)] {
+                    let mut rows = db::integration_members_of_tasks(fixture.db.pool(), &["t"])
+                        .await
+                        .unwrap();
+                    rows[0].attempt_id = attempt.to_owned();
+                    let hint = task_integration_summary(&rows[0], Some(&snapshot.task))
+                        .unwrap()
+                        .action_hint;
+                    let offered = crate::available_actions(&snapshot).iter().any(|offer| {
+                        offer.action.verb() == "retry" && offer.reason == "integration_retry"
+                    });
+                    assert_eq!(
+                        hint == Some(IntegrationActionHint::Retry),
+                        offered && same,
+                        "{state} {condition:?}"
+                    );
+                    hinted_retry += usize::from(hint == Some(IntegrationActionHint::Retry));
+                }
+                // The owner's Hold: the action system releases it.
+                let mut held = snapshot.clone();
+                held.task.condition = db::TaskCondition::Parked {
+                    primary: db::ParkReason::Held {
+                        actor: "user".into(),
+                    },
+                    additional: Vec::new(),
+                    resume: db::task_condition::ConditionContinuation::Reconcile,
+                    since: None,
+                    evidence: Default::default(),
+                };
+                let rows = db::integration_members_of_tasks(fixture.db.pool(), &["t"])
+                    .await
+                    .unwrap();
+                let hint = task_integration_summary(&rows[0], Some(&held.task))
+                    .unwrap()
+                    .action_hint;
+                let offers = crate::available_actions(&held);
+                if hint == Some(IntegrationActionHint::Release) {
+                    assert!(
+                        offers.iter().any(|offer| offer.action.verb() == "release"),
+                        "{state}"
+                    );
+                }
+                assert_ne!(hint, Some(IntegrationActionHint::Retry), "{state}");
+            }
+        }
+        assert!(hinted_retry > 0, "no deferred statement was tried");
     }
 }

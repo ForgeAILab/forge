@@ -142,3 +142,43 @@ pub async fn set_head(h: &common::Harness, queue: &str, attempt: Option<&str>) {
         .await
         .unwrap();
 }
+/// What a Task step would have told the Task, written directly.
+pub async fn tell(h: &common::Harness, task: &str, condition: &db::TaskCondition) {
+    sqlx::query("UPDATE task SET condition_json=?,version=version+1 WHERE id=?")
+        .bind(serde_json::to_string(condition).unwrap())
+        .bind(task)
+        .execute(h.state.db.pool())
+        .await
+        .unwrap();
+}
+/// The owner's Hold on a Task, as the hold writes it.
+pub async fn hold(h: &common::Harness, task: &str) {
+    let annotation =
+        json!({"type":"manual_stop","blocking_reason":"held","blocked_by":"user"}).to_string();
+    let condition = db::map_legacy_condition(&db::LegacyConditionInput {
+        error_annotation: Some(annotation.clone()),
+        ..Default::default()
+    });
+    sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
+        .bind(annotation)
+        .bind(task)
+        .execute(h.state.db.pool())
+        .await
+        .unwrap();
+    tell(h, task, &condition).await;
+}
+/// What the park step tells a Task whose merge stopped.
+pub fn deferred(task: &str, attempt: &str, message: &str) -> db::TaskCondition {
+    db::ConditionFacts {
+        task_id: task.to_owned(),
+        state: "merging".to_owned(),
+        integration: Some(api_types::IntegrationReason::Deferred {
+            attempt_id: api_types::IntegrationAttemptId::new(attempt.to_owned()),
+            cause: api_types::IntegrationDeferralCause::TargetDirty,
+            owner_id: None,
+            message: message.to_owned(),
+        }),
+        ..Default::default()
+    }
+    .condition(&db::LegacyConditionInput::default())
+}

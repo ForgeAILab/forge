@@ -2,13 +2,13 @@
 //! repository, one per target branch, with their members in queue order.
 use api_types::IntegrationQueuesResponse;
 use axum::extract::{Path, Query, State};
-use db::RepoRepo;
+use db::{ProjectRepo, RepoRepo};
 use serde::Deserialize;
 
 use crate::{
     errors::{ApiError, ApiResult},
     json::Json,
-    routes::{auth::AuthenticatedUser, projects::require_project_visible},
+    routes::auth::AuthenticatedUser,
     state::AppState,
 };
 
@@ -24,20 +24,23 @@ pub async fn list_integration_queues(
     Path(id): Path<String>,
     Query(params): Query<IntegrationQueueParams>,
 ) -> ApiResult<Json<IntegrationQueuesResponse>> {
-    // Visibility is decided before anything is counted or paged: a queue and
-    // all of its members belong to the repository's one Project, and a
-    // caller who cannot see that Project is told the repository is unknown.
+    // Visibility is decided before anything is counted or paged. A caller
+    // who cannot see the repository's Project is told the repository is
+    // unknown, exactly like a repository that does not exist; any other
+    // failure of the check is that failure, not a 404.
     let missing = || ApiError::not_found("repo", id.clone());
     let repo = RepoRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(missing)?;
-    require_project_visible(&state, &repo.project_id, &user.user_id)
-        .await
-        .map_err(|_| missing())?;
+    ProjectRepo::get_visible_by_id(&*state.db, &repo.project_id, &user.user_id)
+        .await?
+        .ok_or_else(missing)?;
     Ok(Json(
         services::integration_reads::repo_integration_queues(
             &state.db,
-            &repo,
+            &repo.id,
+            &repo.project_id,
+            None,
             params.cursor.as_deref(),
             db::clamp_page_limit(params.limit),
         )

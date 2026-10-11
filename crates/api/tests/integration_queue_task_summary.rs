@@ -152,11 +152,24 @@ async fn task_detail_and_list_carry_the_summary_and_the_list_reads_it_in_one_sta
         (count(&queries), etag, statements)
     };
     let (small, _, small_statements) = measure().await;
-    for n in 3..23 {
+    // 200 Tasks in line across 5 queues; the list reads its largest page.
+    let mut queues = vec![queue.clone()];
+    for branch in ["release-1", "release-2", "release-3", "release-4"] {
+        queues.push(open_queue(&h, &repo, branch).await);
+    }
+    for n in 3..200 {
         let id = task(&h, &project, &format!("queued {n}")).await;
-        admit(&h, &queue, &project, &id).await;
+        admit(&h, &queues[n % 5], &project, &id).await;
     }
     let (large, etag, large_statements) = measure().await;
+    let listed: Value = get_json(&h, &uri).await;
+    let queued = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| !item["integration"].is_null())
+        .count();
+    assert!(queued >= 99, "the page holds {queued} queued Tasks");
     assert!(small.0 > 0, "the statement log is not being read");
     assert_eq!(
         small, large,
@@ -169,21 +182,73 @@ async fn task_detail_and_list_carry_the_summary_and_the_list_reads_it_in_one_sta
     // Task and no Project row was written, and accepted again when idle.
     let idle = get_as(&h, &uri, &common::test_jwt(), Some(&etag)).await;
     assert_eq!(idle.status(), StatusCode::NOT_MODIFIED);
+    // A lease renewal rewrites every queue row and nothing a list shows.
+    sqlx::query("UPDATE integration_queue SET revision=revision+1,lease_owner='worker',lease_until=?1,updated_at=?1")
+        .bind(db::now_rfc3339())
+        .execute(h.state.db.pool())
+        .await
+        .unwrap();
+    let renewed = get_as(&h, &uri, &common::test_jwt(), Some(&etag)).await;
+    assert_eq!(renewed.status(), StatusCode::NOT_MODIFIED);
+    // Task detail reads its summary in one statement, the Project's pause
+    // included: no second read of the Project for it.
+    queries.statements.lock().unwrap().clear();
+    queries.active.store(true, Ordering::Relaxed);
+    get_json(&h, &format!("/api/v1/tasks/{}", tasks[2])).await;
+    queries.active.store(false, Ordering::Relaxed);
+    {
+        let statements = queries.statements.lock().unwrap();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.contains("FROM integration_attempt a LEFT JOIN"))
+                .count(),
+            1
+        );
+        assert!(
+            !statements
+                .iter()
+                .any(|statement| statement.contains("paused_at IS NOT NULL)")),
+            "{statements:#?}"
+        );
+        // A read path: nothing is written and no write transaction is taken.
+        assert!(
+            !statements.iter().any(|statement| {
+                let statement = statement.trim_start().to_ascii_uppercase();
+                ["INSERT", "UPDATE", "DELETE", "BEGIN IMMEDIATE"]
+                    .iter()
+                    .any(|write| statement.starts_with(write))
+            }),
+            "{statements:#?}"
+        );
+    }
     set_attempt(&h, &attempts[0], "state='checking'").await;
     let moved = get_as(&h, &uri, &common::test_jwt(), Some(&etag)).await;
     assert_eq!(moved.status(), StatusCode::OK);
     let etag = moved.headers()["etag"].to_str().unwrap().to_owned();
-    let list: Value =
-        serde_json::from_slice(&to_bytes(moved.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let head = list["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["id"] == tasks[0].as_str())
-        .unwrap();
+    to_bytes(moved.into_body(), usize::MAX).await.unwrap();
+    let head = get_json(&h, &format!("/api/v1/tasks/{}", tasks[0])).await;
     assert_eq!(head["integration"]["phase"], "checking");
     // The head leaves: every waiter moves up, and the old validator is stale.
     set_head(&h, &queue, None).await;
     let advanced = get_as(&h, &uri, &common::test_jwt(), Some(&etag)).await;
     assert_eq!(advanced.status(), StatusCode::OK);
+    // A pause is the wait of every member and writes no Task: the cached
+    // list is stale as soon as the Project is paused.
+    let etag = advanced.headers()["etag"].to_str().unwrap().to_owned();
+    sqlx::query("UPDATE project SET paused_at=? WHERE id=?")
+        .bind(T0)
+        .bind(&project)
+        .execute(h.state.db.pool())
+        .await
+        .unwrap();
+    let paused = get_as(&h, &uri, &common::test_jwt(), Some(&etag)).await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let list: Value =
+        serde_json::from_slice(&to_bytes(paused.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["integration"]["wait"]["code"] == "project_paused"));
 }

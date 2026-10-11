@@ -74,6 +74,8 @@ pub async fn list_tasks(
             snapshot.list_revision,
             // The merge queue advances without a Task or Project write.
             snapshot.integration_revision.as_str(),
+            // A pause is a wait cause of every member and writes no Task.
+            snapshot.project_paused,
             TASK_LIST_PROJECTION_VERSION,
             &params
         ))?))
@@ -199,7 +201,6 @@ pub async fn list_tasks(
     let mut integration = services::integration_reads::task_integration_summaries(
         &integration_rows,
         tasks.iter().map(|(task, _)| task),
-        snapshot.project_paused,
     );
     let reviews = reviews
         .into_iter()

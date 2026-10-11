@@ -123,6 +123,7 @@ async fn three_members_read_in_queue_order_with_the_head_in_each_phase() {
 async fn gated_and_parked_members_carry_their_cause_and_a_suspended_queue_its_reason() {
     let dir = common::TestDir::new("iq-waits");
     let h = common::test_app(dir.path(), "iq-waits").await;
+    h.stop_step_worker();
     let (project, repo) = project_and_repo(&h, "waits").await;
     let queue = open_queue(&h, &repo, "main").await;
     let held = task(&h, &project, "held").await;
@@ -133,13 +134,29 @@ async fn gated_and_parked_members_carry_their_cause_and_a_suspended_queue_its_re
     let dirty_attempt = admit(&h, &queue, &project, &dirty).await;
     let flaky_attempt = admit(&h, &queue, &project, &flaky).await;
     admit(&h, &queue, &project, &waiting).await;
+    let released = task(&h, &project, "released").await;
+    let released_attempt = admit(&h, &queue, &project, &released).await;
+    set_attempt(&h, &released_attempt, "state='parked',failure_kind='owner_required',failure_message='task_held: the Task is on hold; release it to continue the merge'").await;
+    // The owner's Hold is on the Task row, and the park step has told the
+    // Task of the dirty target: both are what the action system reads.
+    hold(&h, &held).await;
+    tell(
+        &h,
+        &dirty,
+        &deferred(
+            &dirty,
+            &dirty_attempt,
+            "the target checkout has uncommitted changes",
+        ),
+    )
+    .await;
     set_attempt(&h, &held_attempt, "state='parked',failure_kind='owner_required',failure_message='task_held: the Task is on hold; release it to continue the merge'").await;
     set_attempt(&h, &dirty_attempt, "state='parked',failure_kind='owner_required',failure_message='target_dirty: the target checkout has uncommitted changes'").await;
     set_attempt(&h, &flaky_attempt, "state='parked',failure_kind='infrastructure',failure_message='infrastructure: the owner did not answer',available_at='2026-10-01T00:05:00+00:00'").await;
 
     let page = queues(&h, &repo, "").await;
     let item = &page.items[0];
-    assert_eq!(item.member_count, 4);
+    assert_eq!(item.member_count, 5);
     let member = |task: &str| {
         &item
             .members
@@ -173,6 +190,32 @@ async fn gated_and_parked_members_carry_their_cause_and_a_suspended_queue_its_re
     let wait = summary.wait.as_ref().unwrap();
     assert_eq!(wait.code, IntegrationWaitCode::Infrastructure);
     assert_eq!(wait.retry_at.as_deref(), Some("2026-10-01T00:05:00+00:00"));
+    // The park step has not told this Task yet: the action system would
+    // refuse a retry, so none is hinted.
+    assert_eq!(summary.action_hint, None);
+    // The hint is an offer of the Task itself.
+    for (task, verb) in [(&dirty, "retry"), (&flaky, "")] {
+        let detail = get_json(&h, &format!("/api/v1/tasks/{task}")).await;
+        let offered = detail["available_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|offer| offer["reason"] == "integration_retry");
+        assert_eq!(offered, verb == "retry", "{detail}");
+        assert_eq!(
+            detail["integration"]["action_hint"],
+            if offered {
+                serde_json::json!("retry")
+            } else {
+                serde_json::Value::Null
+            }
+        );
+    }
+    // Parked under a Hold that was released since: nothing holds the Task
+    // now, so no stale cause and no action is said.
+    let summary = member(&released);
+    assert_eq!(summary.state, IntegrationMemberState::Waiting);
+    assert_eq!((summary.wait.clone(), summary.action_hint), (None, None));
     // The one member still in line has nobody ahead of it.
     let summary = member(&waiting);
     assert_eq!(summary.state, IntegrationMemberState::Waiting);
@@ -320,4 +363,157 @@ async fn a_user_without_access_to_the_project_sees_no_queue() {
     )
     .await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+/// Admission keeps every member of a queue in the queue's own Project. The
+/// read does not rest on it: rows of another Project in the line (written
+/// here directly, as no writer would) are counted, because they are really
+/// ahead, and never listed: no id, no title, not even as the head.
+#[tokio::test]
+async fn members_of_another_project_in_the_line_are_counted_and_never_listed() {
+    let dir = common::TestDir::new("iq-shared");
+    let h = common::test_app(dir.path(), "iq-shared").await;
+    h.stop_step_worker();
+    let (mine, repo) = project_and_repo(&h, "mine").await;
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*h.state.db,
+        &db::User {
+            id: "stranger".to_owned(),
+            email: "stranger@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO project(id,name,owner_id,primary_repo_id,created_at,updated_at) VALUES('theirs','theirs','stranger',?,?,?)")
+        .bind(&repo)
+        .bind(T0)
+        .bind(T0)
+        .execute(h.state.db.pool())
+        .await
+        .unwrap();
+    let queue = open_queue(&h, &repo, "main").await;
+    let secret_head = task(&h, &mine, "secret head").await;
+    let first = task(&h, &mine, "first of mine").await;
+    let secret_waiter = task(&h, &mine, "secret waiter").await;
+    let second = task(&h, &mine, "second of mine").await;
+    let deleted = task(&h, &mine, "deleted title").await;
+    let head_attempt = admit(&h, &queue, &mine, &secret_head).await;
+    admit(&h, &queue, &mine, &first).await;
+    let secret_attempt = admit(&h, &queue, &mine, &secret_waiter).await;
+    admit(&h, &queue, &mine, &second).await;
+    admit(&h, &queue, &mine, &deleted).await;
+    for secret in [&secret_head, &secret_waiter] {
+        sqlx::query("UPDATE task SET project_id='theirs' WHERE id=?")
+            .bind(secret)
+            .execute(h.state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET project_ref='theirs' WHERE task_ref=?")
+            .bind(secret)
+            .execute(h.state.db.pool())
+            .await
+            .unwrap();
+    }
+    set_head(&h, &queue, Some(&head_attempt)).await;
+    set_attempt(
+        &h,
+        &head_attempt,
+        &format!("state='rebasing',started_at='{T0}'"),
+    )
+    .await;
+    sqlx::query("UPDATE task SET deleted_at=? WHERE id=?")
+        .bind(T0)
+        .bind(&deleted)
+        .execute(h.state.db.pool())
+        .await
+        .unwrap();
+
+    let uri = format!("/api/v1/repos/{repo}/integration-queues");
+    let response = get_as(&h, &uri, &common::test_jwt(), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for hidden in [
+        secret_head.as_str(),
+        secret_waiter.as_str(),
+        head_attempt.as_str(),
+        secret_attempt.as_str(),
+        "secret",
+        "deleted title",
+        "theirs",
+    ] {
+        assert!(!body.contains(hidden), "{hidden} leaked: {body}");
+    }
+    let page: api_types::IntegrationQueuesResponse = serde_json::from_str(&body).unwrap();
+    let item = &page.items[0];
+    assert_eq!((item.member_count, item.members.len()), (5, 3));
+    assert!(!item.members_truncated);
+    // The head is another Project's: the queue has one, and it is not named.
+    assert_eq!((&item.head_task_id, &item.head_attempt_id), (&None, &None));
+    assert_eq!(item.head_since.as_deref(), Some(T0));
+    assert_eq!(
+        item.members
+            .iter()
+            .map(|member| (
+                member.task_id.as_str(),
+                member.task_title.as_deref(),
+                member.integration.position
+            ))
+            .collect::<Vec<_>>(),
+        [
+            // The head and the hidden waiter are ahead, and say so.
+            (first.as_str(), Some("first of mine"), Some(1)),
+            (second.as_str(), Some("second of mine"), Some(3)),
+            // A deleted Task keeps its place and its id, and loses its title.
+            (deleted.as_str(), None, Some(4)),
+        ]
+    );
+    assert_eq!(item.members[2].task_status, None);
+    // The Task read of a visible member counts the same members ahead.
+    let detail = get_json(&h, &format!("/api/v1/tasks/{second}")).await;
+    assert_eq!(detail["integration"]["position"], 3);
+    // The other Project's owner may not read this repository's route at
+    // all: the repository is not their Project's own row.
+    let theirs = get_as(&h, &uri, &jwt_for("stranger"), None).await;
+    assert_eq!(theirs.status(), StatusCode::NOT_FOUND);
+    // A cursor is a place in ONE repository's branches: taken from this
+    // repository and sent to another, it reads that other repository's own
+    // queues after that branch and nothing of this one.
+    for branch in ["alpha", "omega"] {
+        open_queue(&h, &repo, branch).await;
+    }
+    let (_, elsewhere) = project_and_repo(&h, "elsewhere").await;
+    let zeta = open_queue(&h, &elsewhere, "zeta").await;
+    open_queue(&h, &elsewhere, "aaa").await;
+    let cursor = queues(&h, &repo, "?limit=2").await.next_cursor.unwrap();
+    let other = queues(&h, &elsewhere, &format!("?cursor={cursor}")).await;
+    assert_eq!(
+        other
+            .items
+            .iter()
+            .map(|queue| queue.id.as_str())
+            .collect::<Vec<_>>(),
+        [zeta.as_str()]
+    );
+    // A queue created between two pages is neither repeated nor skips one.
+    open_queue(&h, &repo, "beta").await;
+    let rest = queues(&h, &repo, &format!("?limit=2&cursor={cursor}")).await;
+    assert_eq!(
+        rest.items
+            .iter()
+            .map(|queue| queue.target_branch.as_str())
+            .collect::<Vec<_>>(),
+        ["omega"]
+    );
 }

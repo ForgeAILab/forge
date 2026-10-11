@@ -332,11 +332,15 @@ pub enum EventContext {
     OperationsStatusChanged {
         trigger: String,
     },
-    /// `task_id` is the member that changed; `null` when only the queue did.
+    /// One per queue and read of the projector. `task_id` is the one member
+    /// whose summary changed; `null` when several did or the queue itself
+    /// did. `project_ids` are the Projects of the members concerned. Ids
+    /// only: no title, branch or machine name travels on the bus.
     IntegrationUpdated {
         repo_id: String,
         queue_id: String,
         task_id: Option<String>,
+        project_ids: Vec<String>,
     },
     ProjectHookRunChanged {
         project_id: String,
