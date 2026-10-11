@@ -40,6 +40,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - **Busy Tasks are refused.** While a review entry or a reviewer is still
     running no review `retry` is offered (`409 action_unavailable`); the
     internal `rerun_review` command answers `409 task_busy`.
+  - `review.auditor_agent_id` in a Task's state configuration is no longer
+    read (only the inline re-run read it). The reviewer is the Agent assigned
+    to the Task's `reviewer` role.
   - Review details of a re-run without a reviewer are now the object every
     entry writes (`{"ci_steps": [...]}`), not a bare step array.
   - Rust API: `review::ReviewRunner`, `review::ReviewRequest`,
