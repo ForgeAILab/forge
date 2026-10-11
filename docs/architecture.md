@@ -3517,12 +3517,20 @@ server, and in this order:
    entries are renamed or copied, the entries, what stays, and what is
    finished. It is written whole (temp file, `fsync`, rename) before the
    next step.
-3. **Entries**: only what Forge made. A top-level entry of the old root
-   moves when it has a name Forge uses (`.repos`, `repos`, `main-agents`,
-   `.forge-tmp`, a Task id), or any text column names it or a path inside
-   it; `.forge` and `.forge/gc` are opened one level, and what a daemon
-   sharing the root owns (`.forge/workspaces`, `.forge/gc/daemon-owner`)
-   stays. Everything else stays and is listed in the summary. On one
+3. **Entries**: only what this database's Forge made. Every data
+   directory on a machine used to share `<system temp>/forge/worktrees`,
+   so the old root may hold another database's entries side by side with
+   this one's. The root's top level is listed with `.forge`, `.forge/gc`,
+   `.forge/logs`, `.repos`, `repos` and `main-agents` opened, and each
+   entry moves on its own: a Task root when the Task is in this database, a
+   clone under `.repos` when the repository is, a log directory when the
+   Project is, or any entry a text column names (or names a path inside);
+   garbage-collection state, `.forge/build` and `.forge-tmp` unless
+   `.forge/gc/owner` names another database (then they, and the marker,
+   are that database's and stay). What a daemon sharing the root owns
+   (`.forge/workspaces`, `.forge/gc/daemon-owner`) always stays. Containers
+   the move emptied are removed.
+   Everything else stays and is listed in the summary. On one
    filesystem each entry is renamed. Across filesystems each is copied
    (links as links, never followed; permissions and modification times
    kept; two names of one file inside an entry stay one file; extended
