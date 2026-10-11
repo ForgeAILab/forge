@@ -1198,6 +1198,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         PROJECT_OBSERVATIONS_OPERATION,
         PROJECT_CHARTER_READ_OPERATION,
         PROJECT_SKILL_SECTION_OPERATION,
+        forge_agent_host::REPO_INTEGRATION_QUEUE_OPERATION,
     ] {
         assert!(
             project_read_operations
@@ -2102,6 +2103,14 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
             "section",
             "research",
         ),
+        (
+            fixture.project_scope.clone(),
+            "repo.integration_queue",
+            json!({"target_branch":"main","limit":5}),
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            "project_id",
+            PROJECT_ID,
+        ),
     ] {
         assert!(operation_registry::READ_CATALOG.lookup(operation).is_some());
         let composition = ScopeToolComposition::for_scope_with_permissions(
@@ -2121,7 +2130,10 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
                 .await
                 .unwrap();
             assert!(!outcome.is_error, "{operation}: {}", outcome.value);
-            let result = if matches!(operation, "project.charter" | "skill.section") {
+            let result = if matches!(
+                operation,
+                "project.charter" | "skill.section" | "repo.integration_queue"
+            ) {
                 &outcome.value["result"]
             } else {
                 &outcome.value

@@ -2402,6 +2402,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   return the same field. The Task list reads a page's summaries in one
   statement, and its `ETag` now changes when the queue advances. New index
   migration `V202610111630` (additive).
+- **Merge queue in `forge-ctl` and for agents (3.2 stage D3a).** `forge-ctl
+  repo queue <REPO_ID>` lists a repository's merge queues (table, or the
+  route's response with `--output json`). `forge-ctl task show` (a second name
+  for `task get`, which the documentation already used) prints the queue
+  target, phase, position and wait reason of a Task in the queue. A bound
+  Project Agent reads the same queues with the new registered read
+  `repo.integration_queue` (`{limit?, target_branch?}`) of the Project
+  orchestration read tool; the Project and `project_verify_solo` tool prefix
+  ceilings grow by 77 bytes for it.
 
 - **Operations status has a `checks` section.** `GET /api/v1/operations/status`
   reports what the check runner is doing now: `queued`, `running`,

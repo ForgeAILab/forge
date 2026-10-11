@@ -42,6 +42,9 @@ pub enum TaskCmd {
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Show one Task. A Task in the merge queue also prints its queue
+    /// target, phase, position and wait reason.
+    #[command(visible_alias = "show")]
     Get {
         id: String,
     },
@@ -203,7 +206,14 @@ impl TaskArgs {
             }
             TaskCmd::Get { id } => {
                 let task: TaskResponse = client.get(&format!("/api/v1/tasks/{id}")).await?;
-                print_task(output, &task)
+                print_task(output, &task)?;
+                if let (OutputFormat::Table, Some(integration)) = (output, &task.integration) {
+                    print!(
+                        "{}",
+                        crate::integration_queue::task_integration_text(integration)
+                    );
+                }
+                Ok(())
             }
             TaskCmd::Claim { id, agent_id } => {
                 let request = ClaimTaskRequest {
@@ -594,6 +604,15 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         task: TaskArgs,
+    }
+    #[test]
+    fn show_is_the_documented_name_of_get() {
+        for name in ["show", "get"] {
+            assert!(matches!(
+                Cli::try_parse_from(["ctl", name, "t"]).unwrap().task.cmd,
+                TaskCmd::Get { .. }
+            ));
+        }
     }
     #[test]
     fn actions_and_action_commands_parse() {

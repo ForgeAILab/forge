@@ -161,8 +161,12 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // registry field name), and the two Project orchestration descriptions
     // state their purpose once (-226). Hand Task operations keep their
     // payload fields declared.
-    ("project", 23_870),
-    ("project_verify_solo", 25_119),
+    // Plus 77 for the read `repo.integration_queue` (3.2 stage D3a): its
+    // name in the read tool's operation list and its generated contract
+    // line. It is how a Project Agent sees where a Task is in the merge
+    // queue and why it waits.
+    ("project", 23_947),
+    ("project_verify_solo", 25_196),
     // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
     // and the same two descriptions (-226). The hand Charter adoption
     // schema dominates (12,418 bytes).

@@ -2082,6 +2082,60 @@ impl CoordinationToolProvider {
         }))
     }
 
+    /// `repo.integration_queue`: the merge queues of the bound Project's
+    /// repository. Read-only; the Project is the admitted scope's.
+    async fn repo_integration_queue_read(
+        &self,
+        project_id: &str,
+        input: operation_registry::project_reads::IntegrationQueueArguments,
+    ) -> Result<Value, AgentHostError> {
+        let limit = input.limit.unwrap_or(20).clamp(1, 100) as i64;
+        let project = db::ProjectRepo::get_by_id(&*self.db, project_id)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .ok_or(AgentHostError::ProtectedPersistence)?;
+        let repo = match project.primary_repo_id.as_deref() {
+            Some(repo_id) => db::RepoRepo::get_by_id(&*self.db, repo_id)
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?,
+            None => None,
+        };
+        let Some(repo) = repo else {
+            return Ok(json!({
+                "project_id": project_id,
+                "repo_id": Value::Null,
+                "items": [],
+                "has_more": false,
+            }));
+        };
+        // One queue per target branch: a named branch is looked for in the
+        // largest page instead of the caller's.
+        let fetch = if input.target_branch.is_some() {
+            100
+        } else {
+            limit
+        };
+        let page = crate::integration_reads::repo_integration_queues(&self.db, &repo, None, fetch)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let items = page
+            .items
+            .into_iter()
+            .filter(|queue| {
+                input
+                    .target_branch
+                    .as_deref()
+                    .is_none_or(|branch| queue.target_branch == branch)
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "project_id": project_id,
+            "repo_id": repo.id,
+            "items": items,
+            "has_more": input.target_branch.is_none() && page.has_more,
+        }))
+    }
+
     async fn project_observations_read(
         &self,
         _actor_identity_id: &str,

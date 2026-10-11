@@ -5989,6 +5989,19 @@ fields accept integer-valued strings or floats through normalization. Unknown
 read fields and malformed scalar values are refused with an in-turn contract
 error after the authority check.
 
+`repo.integration_queue` (3.2 stage D3a) is a registered read of the Project
+orchestration read tool, available to a bound Project Agent once setup is
+complete (`read_project`, or `read_agent_chat` in a Project Chat). It accepts
+an optional `target_branch` and an optional unsigned `limit` (clamped to
+1–100) and returns `{ project_id, repo_id, items, has_more }`, where `items`
+are the merge queues of the bound Project's repository in the shape of `GET
+/api/v1/repos/{id}/integration-queues` (see [Merge queue
+reads](#merge-queue-reads)). It never accepts a Project or repository
+selector, writes nothing, and returns an empty `items` for a Project without a
+repository. One spec generates its schema, validator, dispatch and the
+contract line the model is shown (`repo.integration_queue: {limit?,
+target_branch?}`).
+
 Project review configuration, Documents, Decisions, milestones, validation,
 release-candidate proposals and escalation now use typed registry contracts.
 Document fields are specific to the selected action; milestone actions accept

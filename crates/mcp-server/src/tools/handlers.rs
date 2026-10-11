@@ -195,6 +195,12 @@ async fn tasks_with_role_assignments(
             .push(assignment);
     }
     let mut budget_spent = db::budget::load_many(state.db.pool(), &ids).await?;
+    // The merge-queue attempts of the page, in one statement.
+    let integration = db::integration_members_of_tasks(state.db.pool(), &ids).await?;
+    let integration = integration
+        .iter()
+        .map(|row| (row.task_ref.as_str(), row))
+        .collect::<HashMap<_, _>>();
     let mut projects = HashMap::<String, db::Project>::new();
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
@@ -216,7 +222,15 @@ async fn tasks_with_role_assignments(
         let remaining = db::budget::projection(&task, &workflow, &counts, recovery_limit)?;
         let limits = db::budget::projection(&task, &workflow, &Default::default(), recovery_limit)?;
         let assignments = assignments_by_task.remove(&task.id).unwrap_or_default();
+        let summary = integration.get(task.id.as_str()).and_then(|row| {
+            services::integration_reads::task_integration_summary(
+                row,
+                Some(&task),
+                project.paused_at.is_some(),
+            )
+        });
         let mut value = task_value(task);
+        value["integration"] = json!(summary);
         value["remaining_retries"] = json!(remaining);
         value["retry_limits"] = json!(limits);
         if let Some(object) = value.as_object_mut() {
@@ -460,7 +474,11 @@ pub(super) async fn forge_get_task(
         .task_service
         .task_action_snapshot(&params.task_id, &actor)
         .await?;
-    task_snapshot_value(snapshot)
+    let integration =
+        services::integration_reads::task_integration(&state.db, &snapshot.task).await?;
+    let mut value = task_snapshot_value(snapshot)?;
+    value["integration"] = json!(integration);
+    Ok(value)
 }
 
 fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {

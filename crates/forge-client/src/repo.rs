@@ -38,6 +38,14 @@ enum RepoCmd {
         #[arg(long)]
         project_id: String,
     },
+    /// List the repository's merge queues: who is merging, who waits, and why.
+    Queue {
+        repo_id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
     /// Register and manage machine-local checkouts of a repository.
     Location(RepoLocationArgs),
 }
@@ -73,6 +81,25 @@ impl RepoArgs {
                     OutputFormat::Json => print_json(&response),
                     OutputFormat::Table => {
                         print_table_repos(&response.items);
+                        Ok(())
+                    }
+                }
+            }
+            RepoCmd::Queue {
+                repo_id,
+                cursor,
+                limit,
+            } => {
+                let response: api_types::IntegrationQueuesResponse = client
+                    .get(&queue_path(repo_id, cursor.as_deref(), *limit))
+                    .await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        print!("{}", crate::integration_queue::queues_text(&response.items));
+                        if let Some(cursor) = &response.next_cursor {
+                            println!("More queues: --cursor {cursor}");
+                        }
                         Ok(())
                     }
                 }
@@ -262,6 +289,26 @@ impl RepoLocationArgs {
     }
 }
 
+fn queue_path(repo_id: &str, cursor: Option<&str>, limit: Option<i64>) -> String {
+    let mut url = url::Url::parse("http://localhost/api/v1/repos/").expect("static URL");
+    url.path_segments_mut()
+        .expect("hierarchical URL")
+        .pop_if_empty()
+        .push(repo_id)
+        .push("integration-queues");
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut().append_pair("cursor", cursor);
+    }
+    if let Some(limit) = limit {
+        url.query_pairs_mut()
+            .append_pair("limit", &limit.to_string());
+    }
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    }
+}
+
 fn print_location(output: &OutputFormat, location: &RepoLocationResponse) -> Result<()> {
     match output {
         OutputFormat::Json => print_json(location),
@@ -325,6 +372,30 @@ mod tests {
     #[derive(clap::Subcommand)]
     enum TestCommand {
         Repo(super::RepoArgs),
+    }
+
+    #[test]
+    fn repo_queue_parses_and_builds_its_path() {
+        TestCli::command().debug_assert();
+        let parsed =
+            TestCli::try_parse_from(["ctl", "repo", "queue", "repo 1", "--limit", "2"]).unwrap();
+        let TestCommand::Repo(args) = parsed.cmd;
+        assert!(matches!(
+            args.cmd,
+            super::RepoCmd::Queue {
+                limit: Some(2),
+                cursor: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            super::queue_path("repo 1", None, None),
+            "/api/v1/repos/repo%201/integration-queues"
+        );
+        assert_eq!(
+            super::queue_path("repo", Some("a b"), Some(2)),
+            "/api/v1/repos/repo/integration-queues?cursor=a+b&limit=2"
+        );
     }
 
     #[test]

@@ -1075,7 +1075,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: {limit?}\n- project.observations: {limit?, task_id?}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
+            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: {limit?}\n- project.observations: {limit?, task_id?}\n- repo.integration_queue: {limit?, target_branch?}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
             "type": "object"
           },
           "operation": {
@@ -1083,6 +1083,7 @@
               "project.charter",
               "project.current_state",
               "project.observations",
+              "repo.integration_queue",
               "skill.section"
             ],
             "type": "string"
@@ -1851,7 +1852,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: {limit?}\n- project.observations: {limit?, task_id?}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
+            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: {limit?}\n- project.observations: {limit?, task_id?}\n- repo.integration_queue: {limit?, target_branch?}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
             "type": "object"
           },
           "operation": {
@@ -1859,6 +1860,7 @@
               "project.charter",
               "project.current_state",
               "project.observations",
+              "repo.integration_queue",
               "skill.section"
             ],
             "type": "string"

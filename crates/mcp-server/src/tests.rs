@@ -2789,6 +2789,79 @@ fn task_lists_omit_offers_but_single_task_reads_keep_them() {
 }
 
 #[test]
+fn task_reads_carry_the_merge_queue_summary() {
+    use db::IntegrationQueueRepo;
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, repo_id) = seed_project_repo(&state).await;
+        let head = seed_task_in_project(&state, project_id.clone()).await;
+        let waiter = seed_task_in_project(&state, project_id.clone()).await;
+        let outside = seed_task_in_project(&state, project_id.clone()).await;
+        let queue = state
+            .db
+            .create_or_get_integration_queue(&repo_id, "main")
+            .await
+            .unwrap();
+        let mut attempts = Vec::new();
+        for task in [&head, &waiter] {
+            attempts.push(
+                state
+                    .db
+                    .admit_integration_attempt(db::IntegrationAttempt::new(
+                        Some(queue.id.clone()),
+                        task.id.clone(),
+                        project_id.clone(),
+                        format!("admission-{}", task.id),
+                        "merging".into(),
+                        0,
+                        1,
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+        // What the queue worker writes when it takes the head and rebases.
+        sqlx::query("UPDATE integration_queue SET state='open',last_error_kind=NULL,last_error=NULL,head_attempt_id=? WHERE id=?")
+            .bind(&attempts[0].id)
+            .bind(&queue.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET state='rebasing',started_at=? WHERE id=?")
+            .bind(now_rfc3339())
+            .bind(&attempts[0].id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let single = call_tool(&state, "forge_get_task", json!({"task_id":head.id})).await;
+        assert_eq!(single["integration"]["attempt_id"], attempts[0].id);
+        assert_eq!(single["integration"]["target_branch"], "main");
+        assert_eq!(single["integration"]["state"], "owned");
+        assert_eq!(single["integration"]["phase"], "rebasing");
+        assert_eq!(single["integration"]["position"], 0);
+        let single = call_tool(&state, "forge_get_task", json!({"task_id":outside.id})).await;
+        assert_eq!(single["integration"], Value::Null);
+
+        let listed = call_tool(&state, "forge_list_tasks", json!({"project_id":project_id})).await;
+        let item = |id: &str| {
+            listed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(item(&head.id)["integration"]["state"], "owned");
+        assert_eq!(item(&waiter.id)["integration"]["state"], "waiting");
+        assert_eq!(item(&waiter.id)["integration"]["position"], 1);
+        assert_eq!(item(&waiter.id)["integration"]["wait"]["code"], "queue");
+        assert_eq!(item(&outside.id)["integration"], Value::Null);
+    });
+}
+
+#[test]
 fn paused_task_action_error_preserves_wait_cause_and_turn_scope() {
     for cause in [
         api_types::DeniedBy::TargetAgentPaused,

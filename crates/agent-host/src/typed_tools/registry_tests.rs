@@ -20,6 +20,7 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("project.charter", "PC", true),
         ("project.current_state", "PC", false),
         ("project.observations", "PC", true),
+        ("repo.integration_queue", "PC", true),
         ("skill.section", "PC", true),
         ("genesis.project_agent.select", "AM", false),
         ("charter.draft", "AM", false),

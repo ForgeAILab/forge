@@ -127,7 +127,7 @@ ceiling per surface (`SURFACE_BYTE_CEILINGS`, the unit
 `scripts/measure-tool-definitions.py` prints). Raise a ceiling only on purpose.
 
 Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
-`skill.section`, `project.current_state`, `project.observations`, `genesis.project_agents.read`, `charter.read`,
+`skill.section`, `project.current_state`, `project.observations`, `repo.integration_queue`, `genesis.project_agents.read`, `charter.read`,
 `charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
 `portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
 input types directly; their former dispatcher and handwritten decoders are

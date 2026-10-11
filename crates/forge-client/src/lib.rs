@@ -15,6 +15,7 @@ mod daemon_plan;
 pub mod daemon_runtime;
 pub mod daemon_workspace;
 pub mod embedded;
+pub mod integration_queue;
 pub mod mcp;
 pub mod memory;
 pub mod operations;

@@ -252,6 +252,26 @@ forge-ctl task prompt-preview <TASK_ID> --role coder
 forge-ctl task action <TASK_ID> cancel
 ```
 
+`task show` (also `task get`) prints the Task's row. For a Task in the merge
+queue the table output adds where it is and why it waits, from the Task's
+`integration` summary; `--output json` prints the whole Task, `integration`
+included:
+
+```text
+Merge queue: main
+  state     in merge queue (2 ahead)
+  position  2 ahead
+  wait      others are ahead
+  queued    2026-10-11T09:14:03+00:00 (round 0)
+```
+
+`state` reads `in merge queue (n ahead)`, `merging: rebasing` (or `validating`,
+`checking`, `fast-forwarding`, ...), `waiting: project paused` / `held` / `for
+<machine>`, `fix merge: sent back to its coder`, `sent back for a fresh
+review`, `merge check failed`, `merge stopped: <cause>` or `merged; closing
+the Task`. `wait` adds the server's message and, when Forge retries by itself,
+the time of the next try.
+
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
 to preview the prompt for a transition target instead of the task's current
 state.
@@ -317,6 +337,29 @@ report failure or unavailability. Inspect `passed` and `error` for those
 outcomes. Request/HTTP errors exit 1, and invalid CLI arguments exit 2. Authority
 is the same as the API. This command does not wait for the scheduled re-check
 interval (default 600 seconds).
+
+### Merge queue
+
+```bash
+forge-ctl repo queue <REPO_ID> [--limit 1..100] [--cursor <opaque>]
+```
+
+Reads `GET /api/v1/repos/{id}/integration-queues`: one section per target
+branch with the queue's state (and why it is not open) and its members in
+queue order, the head first. `--output json` prints the route's response.
+
+```text
+Queue main: open  members 3
++-------------+----------+------------+--------------------------+---------------------------+
+| Position    | Task     | Title      | State                    | Queued                    |
++-------------+----------+------------+--------------------------+---------------------------+
+| head        | 4f0c2a1e | Add login  | merging: rebasing        | 2026-10-11T09:12:40+00:00 |
++-------------+----------+------------+--------------------------+---------------------------+
+| 1 ahead     | 9b7d03c5 | Fix logout | in merge queue (1 ahead) | 2026-10-11T09:14:03+00:00 |
++-------------+----------+------------+--------------------------+---------------------------+
+| not in line | 2ce81f77 | Docs       | merge stopped: held      | 2026-10-11T09:02:11+00:00 |
++-------------+----------+------------+--------------------------+---------------------------+
+```
 
 ### Repository locations
 
