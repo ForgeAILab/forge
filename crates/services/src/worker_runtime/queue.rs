@@ -628,7 +628,9 @@ impl TaskStepWorker {
     ///
     /// The flag: the Task is a queued member of a queue that is not open.
     async fn integration_head_task(&self, task_id: &str) -> Result<(Option<String>, bool)> {
-        let row: Option<(String, Option<String>, Option<String>, bool, bool, bool)> = sqlx::query_as(
+        /// State, queue state, head Task, claimable, holds the slot, in its entry.
+        type Member = (String, Option<String>, Option<String>, bool, bool, bool);
+        let row: Option<Member> = sqlx::query_as(
             "SELECT a.state, \
                     (SELECT q.state FROM integration_queue q WHERE q.id=a.queue_id), \
                     (SELECT h.task_ref FROM integration_queue q JOIN integration_attempt h ON h.id=q.head_attempt_id WHERE q.id=a.queue_id), \
