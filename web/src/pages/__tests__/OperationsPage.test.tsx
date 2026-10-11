@@ -81,12 +81,18 @@ const usageSummary: UsageAggregate = {
 }
 
 const degradedStatus: OperatorStatusResponse = {
-  check_runs: {
+  checks: {
     by_state: { queued: 0, running: 0, cancelling: 0, cleaning: 0, uncertain: 0, succeeded: 0, failed: 0, cancelled: 0 },
     reusable_results: 0,
     admitted_runs: 0,
-    waiting_for_capacity: 0,
     borrowed_runs: 0,
+    queued: { count: 0, oldest_age_seconds: null },
+    running: { count: 0, oldest_age_seconds: null },
+    waiting_for_slot: { count: 0, oldest_age_seconds: null },
+    waiting_for_disk: { count: 0, oldest_age_seconds: null },
+    reuse_hits_24h: 0,
+    runs_24h: 0,
+    last_worker_error: null,
   },
   integration_queues: {
     queues_by_state: {},

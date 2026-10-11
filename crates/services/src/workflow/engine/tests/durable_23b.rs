@@ -1263,10 +1263,13 @@ async fn hold_while_review_ci_is_suspended_closes_the_wait_and_frees_the_slot() 
 
 // A wait nothing will answer does not last: when the consumer is cancelled
 // under a suspended step (and nobody superseded the step), the step's
-// deadline wakes it, it finds the consumer lost, cancels the review attempt
-// and fails the hook instead of suspending again.
+// deadline wakes it and it finds the consumer lost. It closes the attempt
+// that asked and asks again for its check instead of waiting on the lost
+// consumer (the bound on asking again is tested by
+// `an_entry_whose_check_keeps_being_withdrawn_stops_asking_after_three_times`,
+// where the hook then fails with "review check was lost").
 #[tokio::test]
-async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_forever() {
+async fn a_suspended_step_whose_consumer_is_lost_asks_again_instead_of_waiting_forever() {
     let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
     enter_review(&fixture, "CI entry").await;
     // Composed, but no check worker runs: the run stays queued.
@@ -1308,8 +1311,13 @@ async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_foreve
             let reviews = db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
                 .await
                 .unwrap();
-            if count(&fixture, suspended).await == 0
-                && reviews[0].status == db::ReviewStatus::Cancelled
+            if reviews.len() == 2
+                && count(
+                    &fixture,
+                    "SELECT COUNT(*) FROM task_step s JOIN check_consumer c ON c.id=s.awaited_consumer_id WHERE s.status='suspended' AND c.cancelled_at IS NULL",
+                )
+                .await
+                    == 1
             {
                 break;
             }
@@ -1317,16 +1325,19 @@ async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_foreve
         }
     })
     .await
-    .expect("the woken step gives up on the lost consumer");
-    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 1);
+    .expect("the woken step asks again for the lost check");
+    let mut reviews = db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    reviews.sort_by_key(|review| review.attempt_number);
+    assert_eq!(reviews[0].status, db::ReviewStatus::Cancelled);
+    assert!(reviews[0]
+        .step_results_json
+        .contains("superseded_by_withdrawn_check"));
+    assert_eq!(reviews[1].status, db::ReviewStatus::Running);
     assert_eq!(
-        count(
-            &fixture,
-            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json LIKE '%review check was lost%'"
-        )
-        .await,
-        1,
-        "the failure is on the Task's history"
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        2
     );
     stop.send(true).unwrap();
     worker.await.unwrap();
@@ -1700,13 +1711,50 @@ async fn set_project_review_commands(fixture: &FailedCiFixture, command: &str) {
         .unwrap();
 }
 
+/// Wake the suspended hooks step as its deadline would and run the step
+/// worker (no check worker) until it waits on another consumer than `before`.
+async fn wake_and_resuspend(fixture: &FailedCiFixture, before: &str) -> String {
+    fixture
+        .db
+        .wake_suspended_hooks(&fixture.task.id, before)
+        .await
+        .unwrap();
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    let awaited = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let awaited = awaited_consumer(fixture).await;
+            if awaited.as_deref().is_some_and(|id| id != before) {
+                break awaited.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hooks step asks again and suspends");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    awaited
+}
+
+async fn awaited_consumer(fixture: &FailedCiFixture) -> Option<String> {
+    fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|step| step.kind == "hooks" && step.status == "suspended")
+        .and_then(|step| step.awaited_consumer_id)
+}
+
 // The Project's review commands change while the entry check of the old
 // commands is pending. The finished check answers a question nobody asks any
-// more: its verdict is applied to nothing, the attempt is closed, and the
-// Task parks for its owner. (It does not ask again by itself: see the pause
-// decisions in docs/architecture.md.)
+// more: its verdict is applied to nothing and its attempt is closed. The
+// woken step asks again for the current commands inside the same review
+// entry, without the owner and without spending review budget.
 #[tokio::test]
-async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verdict() {
+async fn a_review_config_change_while_the_entry_check_is_pending_asks_again_for_the_new_commands() {
     let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
     sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
         .bind(json!({"retry_budgets":{"review":3}}).to_string())
@@ -1716,24 +1764,200 @@ async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verd
         .unwrap();
     set_project_review_commands(&fixture, "echo first-commands").await;
     suspend_on_entry_check(&fixture).await;
+    let entered: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
     set_project_review_commands(&fixture, "echo other-commands").await;
     let task = drain(fixture.engine.clone(), &fixture.task.id).await;
     let reviews = review_summaries(&fixture).await;
-    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
     assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(reviews[0].1.contains("superseded_by_config_change"));
     assert!(
         !reviews[0].1.contains("first-commands"),
         "the old commands' verdict was written to the attempt: {reviews:?}"
     );
+    assert_eq!(
+        reviews[1].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[1].1.contains("other-commands"), "{reviews:?}");
+    assert!(!reviews[1].1.contains("first-commands"), "{reviews:?}");
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.condition.check_witness().is_none());
+    // One new consumer and one new run, in the same status entry.
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 2);
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        2
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(DISTINCT status_epoch) FROM check_consumer"
+        )
+        .await,
+        1
+    );
+    let now: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(now, entered, "the Task did not leave and re-enter review");
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE kind='hooks'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
+            .await
+            .unwrap(),
+        0,
+        "asking again spends no review budget"
+    );
+}
+
+// The Task's own review commands change while the entry check is pending. No
+// Project version moves, so nothing but the comparison of what the check was
+// asked under notices. The stale run is still queued: its consumer is
+// cancelled (the run is stopped by the worker) and the entry asks again.
+#[tokio::test]
+async fn a_task_review_config_change_while_the_entry_check_is_pending_asks_again() {
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let first = awaited_consumer(&fixture).await.unwrap();
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(
+            json!({"retry_budgets":{"review":3},"review":{"ci_steps":["echo other-commands"]}})
+                .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let second = wake_and_resuspend(&fixture, &first).await;
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_consumer WHERE cancelled_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "the stale consumer is cancelled"
+    );
+    let waiting = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        waiting
+            .condition
+            .check_witness()
+            .map(|(wait, _)| wait.consumer_id.clone()),
+        Some(second),
+        "the Task states the wait for the check it asked for now"
+    );
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(!reviews[0].1.contains("first-commands"), "{reviews:?}");
+    assert_eq!(reviews[1].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+    assert!(reviews[1].1.contains("other-commands"), "{reviews:?}");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_run WHERE state='succeeded'"
+        )
+        .await,
+        1,
+        "only the current commands ran to a verdict"
+    );
+}
+
+// A configuration that keeps changing does not make the entry ask forever:
+// after three re-requests the next change ends the step as before. The
+// verdict is applied to nothing and the Task parks typed, with its actions.
+#[tokio::test]
+async fn an_entry_asks_again_at_most_three_times_then_parks_for_its_owner() {
+    let fixture = approval_ci_fixture(json!(["echo commands-0"])).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"retry_budgets":{"review":3}}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    set_project_review_commands(&fixture, "echo commands-0").await;
+    suspend_on_entry_check(&fixture).await;
+    let mut awaited = awaited_consumer(&fixture).await.unwrap();
+    for round in 1..=3 {
+        set_project_review_commands(&fixture, &format!("echo commands-{round}")).await;
+        awaited = wake_and_resuspend(&fixture, &awaited).await;
+    }
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        4
+    );
+    // The count is durable and belongs to this entry: it is an effect of
+    // the entry's own hooks step (every round above ran on a new worker and
+    // read it back from there), so the step of a later entry starts at zero.
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint k JOIN task_step s ON s.id=k.step_id WHERE s.status='suspended' AND s.kind='hooks' AND CAST(json_extract(k.effects_json,'$.ci_rerequests') AS INTEGER)=3"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE json_extract(effects_json,'$.ci_rerequests') IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    set_project_review_commands(&fixture, "echo commands-4").await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 4, "{reviews:?}");
+    assert!(
+        reviews
+            .iter()
+            .all(|review| review.0 == db::ReviewStatus::Cancelled),
+        "{reviews:?}"
+    );
+    assert!(reviews.iter().all(|review| !review.1.contains("commands-")));
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        4,
+        "no fifth request"
+    );
     assert_eq!(task.status, "review");
     assert!(task.review_passed_at.is_none());
-
     assert!(task
         .error_annotation
         .as_deref()
         .is_some_and(|annotation| annotation.contains("cascade_failed")));
-    // The owner is not left without an action: the Task can be restarted,
-    // sent back, advanced by override or cancelled.
     match fixture
         .engine
         .perform_task_action(&task.id, api_types::TaskAction::retry(), task.version)
@@ -1752,31 +1976,612 @@ async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verd
         }
         other => panic!("retry on a parked review entry: {:?}", other.map(|_| ())),
     }
-    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
 }
 
-// The Task's own review commands change while the entry check is pending. No
-// Project version moves, so nothing but the comparison of what the entry was
-// admitted under notices: the verdict of the old commands is applied to
-// nothing, as for a Project edit.
+// A forced Project deletion cancels the Project's check consumers and is
+// then refused (a run did not settle in time). From the Task's point of view
+// nothing happened: the review entry that lost its check is woken and asks
+// again, instead of failing with "review check was lost".
 #[tokio::test]
-async fn a_task_review_config_change_while_the_entry_check_is_pending_applies_no_verdict() {
-    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+async fn a_refused_project_deletion_re_requests_the_entry_checks_it_cancelled() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
     suspend_on_entry_check(&fixture).await;
-    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
-        .bind(
-            json!({"retry_budgets":{"review":3},"review":{"ci_steps":["echo other-commands"]}})
-                .to_string(),
+    let first = awaited_consumer(&fixture).await.unwrap();
+    // Phase two of the forced delete, then the refusal.
+    assert_eq!(
+        fixture
+            .db
+            .cancel_project_check_consumers(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .resume_project_check_waits(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(reviews[0].1.contains("superseded_by_withdrawn_check"));
+    assert_eq!(
+        reviews[1].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[1].1.contains("entry-commands"), "{reviews:?}");
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_consumer WHERE cancelled_at IS NULL"
         )
-        .bind(&fixture.task.id)
+        .await,
+        1
+    );
+    let second: String =
+        sqlx::query_scalar("SELECT id FROM check_consumer WHERE cancelled_at IS NULL")
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
+            .await
+            .unwrap(),
+        0
+    );
+    // Nothing is left to wake.
+    assert_eq!(
+        fixture
+            .engine
+            .resume_project_check_waits(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+// The usual refusal: the forced delete cancelled the consumers, the run did
+// not stop within the bound, and the run is still being stopped when the
+// entries are woken. A request made now would join that run and be handed
+// its cancellation (a second re-request for one refusal, and after two
+// refused deletes a parked Task). The entry waits for the run to end and
+// asks once: one new consumer, one new run, one re-request counted.
+#[tokio::test]
+async fn a_refused_deletion_whose_run_is_still_stopping_asks_once_when_the_run_has_ended() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let first = awaited_consumer(&fixture).await.unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .cancel_project_check_consumers(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("UPDATE check_run SET state='cancelling'")
         .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .engine
+            .resume_project_check_waits(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    // Three rechecks pass while the run is being stopped: nothing is asked.
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1,
+        "the entry joined a run that is being stopped"
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 1);
+    assert_eq!(awaited_consumer(&fixture).await.as_deref(), Some(&*first));
+    let steps = count(&fixture, "SELECT COUNT(*) FROM task_step").await;
+    // The run ends: the next recheck asks again.
+    sqlx::query("UPDATE check_run SET state='cancelled', finished_at=updated_at, lease_owner=NULL, lease_until=NULL")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let awaited = awaited_consumer(&fixture).await;
+            if awaited.as_deref().is_some_and(|id| id != first) {
+                break awaited.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the entry asks again once the run has ended");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        2
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 2);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_run r JOIN check_consumer c ON c.run_id=r.id WHERE c.id<>'' AND r.state='queued' AND c.cancelled_at IS NULL"
+        )
+        .await,
+        1,
+        "{second}"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT CAST(json_extract(effects_json,'$.ci_rerequests') AS INTEGER) FROM task_hook_checkpoint WHERE json_extract(effects_json,'$.ci_rerequests') IS NOT NULL"
+        )
+        .await,
+        1,
+        "one refusal used one re-request"
+    );
+    // Waiting wrote no new step: the same step was suspended again.
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM task_step").await,
+        steps
+    );
+    assert_eq!(
+        db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+// A check that keeps being withdrawn does not make the entry ask forever:
+// after three re-requests the hook fails as an unanswered check always did.
+#[tokio::test]
+async fn an_entry_whose_check_keeps_being_withdrawn_stops_asking_after_three_times() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let mut awaited = awaited_consumer(&fixture).await.unwrap();
+    for _ in 0..3 {
+        fixture
+            .db
+            .cancel_project_check_consumers(&fixture.task.project_id)
+            .await
+            .unwrap();
+        awaited = wake_and_resuspend(&fixture, &awaited).await;
+    }
+    fixture
+        .db
+        .cancel_project_check_consumers(&fixture.task.project_id)
+        .await
+        .unwrap();
+    fixture
+        .db
+        .wake_suspended_hooks(&fixture.task.id, &awaited)
         .await
         .unwrap();
     drain(fixture.engine.clone(), &fixture.task.id).await;
     let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 4, "{reviews:?}");
+    assert!(reviews
+        .iter()
+        .all(|review| review.0 == db::ReviewStatus::Cancelled));
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        4
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE kind='hooks' AND status='suspended'"
+        )
+        .await,
+        0,
+        "the entry does not wait for a check nobody will answer"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json LIKE '%review check was lost%'"
+        )
+        .await,
+        1,
+        "the failure is on the Task's history"
+    );
+}
+
+/// The Task's worktree directory is gone and the disk is under its floor:
+/// whoever needs the worktree would have to make it again and may not.
+/// Returns the injected free-bytes reading.
+async fn worktree_gone_under_the_disk_floor(
+    fixture: &FailedCiFixture,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    let path: String = sqlx::query_scalar("SELECT worktree_path FROM workspace WHERE task_id=?")
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&path).expect("the worktree directory is removed");
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    fixture.db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: now_rfc3339(),
+                gc_state: Some("unclaimed".to_owned()),
+                compiler_cache_bytes: None,
+            })
+        }),
+    );
+    free
+}
+
+/// Run the step worker (no check worker) until the hooks step is suspended
+/// on the disk wait.
+async fn suspend_on_disk(fixture: &FailedCiFixture) {
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while awaited_consumer(fixture).await.as_deref() != Some("disk") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hooks step suspends on the disk wait");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+/// The disk recheck passes: the running step worker wakes the step at its
+/// deadline (nobody delivers anything to a disk wait), the hook runs again
+/// and the entry goes on to ask for its check.
+async fn resume_after_the_disk_recheck(fixture: &FailedCiFixture) {
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            fixture.db.domain_event_notify().notify_waiters();
+            if awaited_consumer(fixture)
+                .await
+                .is_some_and(|awaited| awaited != "disk")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the step leaves the disk wait and asks for its check");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+async fn waits_for_disk(fixture: &FailedCiFixture) -> bool {
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none() && task.entry_barrier_json.is_none());
+    crate::deferred_dispatch::dispatch_disposition_for_test(&task).is_some_and(|wait| {
+        wait.capability == "machine_capacity"
+            && wait.capacity_scope.as_deref() == Some(api_types::CAPACITY_SCOPE_DISK)
+    })
+}
+
+// The review entry's check needs the Task worktree, which is gone, and the
+// disk is under its floor. That is a wait, never a failed review: the hooks
+// step suspends on the disk wait, the Task shows the disk capacity wait, no
+// review attempt and no check exist. When the disk recovers the step's
+// recheck runs the hook again and the entry settles with its verdict.
+#[tokio::test]
+async fn a_review_entry_whose_worktree_cannot_be_recreated_under_the_disk_floor_waits_for_disk() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    let free = worktree_gone_under_the_disk_floor(&fixture).await;
+    let entered = enter_review(&fixture, "CI entry").await;
+    assert_eq!(entered.pending_steps, 1);
+    let _ = fixture.engine.check_worker_or_embedded();
+    suspend_on_disk(&fixture).await;
+    assert!(
+        waits_for_disk(&fixture).await,
+        "the Task states the disk wait"
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 0);
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        0
+    );
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT attempts FROM task_step WHERE kind='hooks' AND task_id=?")
+            .bind(&fixture.task.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(attempts, 0, "the wait is not charged to the step");
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    resume_after_the_disk_recheck(&fixture).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?} {:?}", task.error_annotation);
+    assert_eq!(reviews[0].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+    assert!(reviews[0].1.contains("entry-commands"));
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&task).is_none(),
+        "the disk wait is over"
+    );
+}
+
+// A blocking before-work hook needs the worktree too. It used to record the
+// disk wait and then report the hook as failed, which parked the Task as a
+// failed transition hook for its owner. Now the hook waits: nothing ran,
+// nothing failed, and the script runs once the disk recovers.
+#[tokio::test]
+async fn a_before_work_hook_whose_worktree_cannot_be_recreated_waits_for_disk_and_does_not_fail() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    let marker = TempDir::new().unwrap();
+    let ran = marker.path().join("ran");
+    let scripts = json!([{"type":"script","command":format!("echo run >> '{}'", ran.display()),"timeout_seconds":30,"blocking":true}]);
+    sqlx::query("UPDATE project SET settings=? WHERE id=?")
+        .bind(json!({"lifecycle_hooks":{"before_work":scripts}}).to_string())
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let free = worktree_gone_under_the_disk_floor(&fixture).await;
+    enter_review(&fixture, "entry with a before-work hook").await;
+    let _ = fixture.engine.check_worker_or_embedded();
+    suspend_on_disk(&fixture).await;
+    assert!(!ran.exists(), "the script ran without its worktree");
+    assert!(
+        waits_for_disk(&fixture).await,
+        "the Task states the disk wait"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json IS NOT NULL"
+        )
+        .await,
+        0,
+        "no hook result (and no failure) was recorded"
+    );
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    resume_after_the_disk_recheck(&fixture).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "run\n");
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+}
+
+// A held Task is its owner's decision to stop. A system re-entry of its
+// review (recovery settling a retired inline re-run, a queued `rerun_review`
+// command) does nothing while the hold stands: no attempt is superseded, no
+// status entry, hooks step, check or review attempt is created. The release
+// runs the review entry by itself.
+#[tokio::test]
+async fn a_system_review_re_entry_on_a_held_task_does_nothing_until_release() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    // Held while its entry check is queued: the wait is abandoned.
+    suspend_on_entry_check(&fixture).await;
+    let entered = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let held = fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Hold { reason: None },
+            entered.version,
+        )
+        .await
+        .expect("the Task is held")
+        .task;
+    assert_eq!(held.status, "review");
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    let snapshot = || async {
+        let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+            .bind(&fixture.task.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        (
+            epoch,
+            review_summaries(&fixture).await,
+            count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+            count(
+                &fixture,
+                "SELECT COUNT(*) FROM task_step WHERE kind='hooks'",
+            )
+            .await,
+            count(&fixture, "SELECT COUNT(*) FROM transition_log").await,
+        )
+    };
+    let before = snapshot().await;
+    let id = uuid::Uuid::parse_str(&fixture.task.id).unwrap();
+    let recovery = api_types::Actor::system(api_types::SystemComponent::CrashRecovery);
+    let refused = fixture.engine.rerun_review(id, recovery).await;
+    assert!(
+        matches!(&refused, Err(ServiceError::Conflict(_))),
+        "a system re-entry ran on a held Task: {:?}",
+        refused.map(|task| task.status)
+    );
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(
+        snapshot().await,
+        before,
+        "the refused re-entry changed the Task"
+    );
+    // The owner is not offered the re-run either while the hold stands.
+    assert!(matches!(
+        fixture
+            .engine
+            .perform_task_action(
+                &fixture.task.id,
+                api_types::TaskAction::retry(),
+                held.version
+            )
+            .await,
+        Err(ServiceError::TaskActionUnavailable { .. })
+    ));
+
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Release { reason: None },
+            current.version,
+        )
+        .await
+        .expect("the Task is released");
+    // Nobody asks again: the release itself runs the entry the hold stopped
+    // (the hold reached the Task while its entry check was pending and
+    // superseded the hooks step). Without that the released Task sat in
+    // `review` with no check and no attempt, its approval on offer.
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(task.status, "review");
+    let after = snapshot().await;
+    assert!(after.0 > before.0, "a new review entry ran after release");
+    assert_eq!(after.2, before.2 + 1, "the entry asked for its check once");
+    assert!(after
+        .1
+        .iter()
+        .any(|review| review.0 == db::ReviewStatus::AwaitingHuman
+            && review.1.contains("entry-commands")));
+    assert_eq!(
+        after
+            .1
+            .iter()
+            .filter(|review| matches!(
+                review.0,
+                db::ReviewStatus::Running | db::ReviewStatus::AwaitingHuman
+            ))
+            .count(),
+        1,
+        "one open attempt: {:?}",
+        after.1
+    );
+    // A second release has nothing to resume.
+    assert!(!fixture
+        .db
+        .entry_hooks_preempted(&fixture.task.id)
+        .await
+        .unwrap());
+}
+
+// Red CI with no remediation target. A review gate without a
+// `reject_target` is not that case: the target falls back to `in_progress`
+// (`review_failure_target`), which is why nulling it still sent the Task
+// back to work. The case exists only when the state the failed review would
+// go to is not in the workflow. Then the transition cannot be made, and the
+// failed entry parks typed in `review` with its owner's actions.
+#[tokio::test]
+async fn red_review_ci_with_no_remediation_state_parks_typed_with_an_offered_action() {
+    let mut fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    // No `reject_target`: the fallback is `in_progress`, as documented.
+    fixture
+        .workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .reject_target = Some("nowhere".to_owned());
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&fixture.workflow).unwrap())
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let entered = enter_review(&fixture, "CI entry").await;
+    let settled = drain_result(fixture.engine.clone(), entered).await.task;
+    assert_eq!(settled.status, "review", "{:?}", settled.error_annotation);
+    let reviews = review_summaries(&fixture).await;
     assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
-    assert!(!reviews[0].1.contains("first-commands"), "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::Failed, "{reviews:?}");
+    let blocked: serde_json::Value = serde_json::from_str(
+        settled
+            .blocked_json
+            .as_deref()
+            .expect("the Task is blocked"),
+    )
+    .unwrap();
+    assert_eq!(
+        blocked["reason"],
+        "review failed and the workflow has no remediation state"
+    );
+    assert_eq!(blocked["kind"], "review_gate_failed");
+    assert!(settled
+        .error_annotation
+        .as_deref()
+        .is_some_and(
+            |annotation| annotation.contains("nowhere") && !annotation.contains("cascade_failed")
+        ));
+    match fixture
+        .engine
+        .perform_task_action(&settled.id, api_types::TaskAction::Start, settled.version)
+        .await
+    {
+        Err(ServiceError::TaskActionUnavailable {
+            available_actions, ..
+        }) => {
+            let offered: Vec<String> = available_actions
+                .iter()
+                .map(|offer| offer.label.clone())
+                .collect();
+            assert!(
+                offered.iter().any(|label| label == "Cancel Task") && offered.len() > 1,
+                "a blocked review entry offers its owner a way on: {offered:?}"
+            );
+        }
+        other => panic!("start on a blocked review entry: {:?}", other.map(|_| ())),
+    }
 }
 
 // The Project environment changes while the entry check is pending (with
@@ -1808,5 +2613,251 @@ async fn a_project_environment_change_while_the_entry_check_is_pending_applies_t
         count(&fixture, "SELECT COUNT(*) FROM check_run").await,
         2,
         "the old environment's result was reused for the new one"
+    );
+}
+
+// While its entry waits for disk the Task offers `cancel` and no `hold`. A
+// hold used to be on offer (the disk wait is a capacity wait like a dispatch
+// wait): it superseded the hooks step, and its release left the Task in
+// `review` with its entry never run: no check, no attempt, and the gate's
+// approval on offer. Cancel works: the step is superseded, nothing failed.
+#[tokio::test]
+async fn a_task_whose_entry_waits_for_disk_offers_cancel_and_no_hold() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    let _free = worktree_gone_under_the_disk_floor(&fixture).await;
+    enter_review(&fixture, "CI entry").await;
+    let _ = fixture.engine.check_worker_or_embedded();
+    suspend_on_disk(&fixture).await;
+    assert!(waits_for_disk(&fixture).await);
+    let offers = fixture
+        .engine
+        .task_action_offers(
+            &fixture.task.id,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+        )
+        .await
+        .unwrap();
+    let verbs: Vec<&str> = offers
+        .available_actions
+        .iter()
+        .map(|offer| offer.action.verb())
+        .collect();
+    assert_eq!(verbs, ["cancel"]);
+    // Two more rechecks: the wait is one step that is suspended again, not
+    // a new step (or a review attempt) per recheck.
+    let rows = |fixture: &FailedCiFixture| {
+        let pool = fixture.db.pool().clone();
+        async move {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT (SELECT COUNT(*) FROM task_step),(SELECT COUNT(*) FROM review),(SELECT COALESCE(SUM(attempts),0) FROM task_step WHERE kind='hooks')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = rows(&fixture).await;
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(rows(&fixture).await, before, "a recheck added rows");
+    assert_eq!(awaited_consumer(&fixture).await.as_deref(), Some("disk"));
+
+    let cancelled = fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Cancel { reason: None },
+            TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+        )
+        .await
+        .expect("cancel is accepted while the entry waits for disk");
+    assert_eq!(cancelled.task.status, "cancelled");
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(task.status, "cancelled");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE status IN ('pending','claimed','suspended')"
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 0);
+}
+
+// A hold command reaches the Task while its entry waits for disk (the offer
+// list does not have it; the command is accepted all the same, because a
+// hold may stop hooks in flight). It supersedes the hooks step. The release
+// runs the entry again by itself: the Task does not sit in `review` with its
+// checks unrun.
+#[tokio::test]
+async fn a_hold_while_the_entry_waits_for_disk_is_resumed_by_its_release() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    let free = worktree_gone_under_the_disk_floor(&fixture).await;
+    enter_review(&fixture, "CI entry").await;
+    let _ = fixture.engine.check_worker_or_embedded();
+    suspend_on_disk(&fixture).await;
+    let version = |fixture: &FailedCiFixture| {
+        let (db, id) = (fixture.db.clone(), fixture.task.id.clone());
+        async move {
+            TaskRepo::get_by_id(&*db, &id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .version
+        }
+    };
+    fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Hold { reason: None },
+            version(&fixture).await,
+        )
+        .await
+        .expect("the hold command is accepted");
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert!(fixture
+        .db
+        .entry_hooks_preempted(&fixture.task.id)
+        .await
+        .unwrap());
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 0);
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Release { reason: None },
+            version(&fixture).await,
+        )
+        .await
+        .expect("the Task is released");
+    // The release ran the entry again: a new hooks step of a new status
+    // entry, which reads the disk again at its recheck and asks for its
+    // check.
+    assert!(!fixture
+        .db
+        .entry_hooks_preempted(&fixture.task.id)
+        .await
+        .unwrap());
+    resume_after_the_disk_recheck(&fixture).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?} {:?}", task.error_annotation);
+    assert_eq!(reviews[0].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+    assert!(reviews[0].1.contains("entry-commands"));
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1
+    );
+}
+
+// The Project workflow is edited while the entry check is pending. An edit
+// that leaves the entered state as it was does not concern the entry: the
+// check that ran is applied, nothing is asked again and nobody is needed.
+// An edit of the entered state itself (here: its hooks) still ends the
+// step: the hook list the step froze is no longer that state's, the verdict
+// is applied to nothing and the Task parks for its owner.
+#[tokio::test]
+async fn a_workflow_edit_that_leaves_the_entered_state_alone_keeps_the_entry_check() {
+    let store = |fixture: &FailedCiFixture, workflow: &api_types::WorkflowDefinition| {
+        let (pool, id) = (fixture.db.pool().clone(), fixture.task.project_id.clone());
+        let workflow = serde_json::to_string(workflow).unwrap();
+        async move {
+            sqlx::query(
+                "UPDATE project SET workflow_definition = ?, version = version + 1 WHERE id = ?",
+            )
+            .bind(workflow)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let mut edited = fixture.workflow.clone();
+    let other = edited
+        .states
+        .iter_mut()
+        .find(|state| state.name != "review" && state.name != "in_progress")
+        .expect("a state the entry does not touch");
+    other.config = json!({ "edited_while_the_check_ran": true });
+    store(&fixture, &edited).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(
+        reviews[0].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[0].1.contains("first-commands"));
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
+
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let mut edited = fixture.workflow.clone();
+    let review = edited
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap();
+    let hook = review
+        .hooks
+        .on_enter
+        .first()
+        .cloned()
+        .expect("the review state has entry hooks");
+    review.hooks.on_enter.push(hook);
+    store(&fixture, &edited).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert!(
+        reviews
+            .iter()
+            .all(|review| review.0 == db::ReviewStatus::Cancelled),
+        "a verdict was applied under an edited entry: {reviews:?}"
+    );
+    assert_eq!(task.status, "review");
+    assert!(task
+        .error_annotation
+        .as_deref()
+        .is_some_and(|annotation| annotation.contains("cascade_failed")));
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1,
+        "an entry whose state was edited asked again"
     );
 }

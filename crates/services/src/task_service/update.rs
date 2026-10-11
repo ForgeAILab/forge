@@ -114,6 +114,12 @@ impl TaskService {
             )
             .await?;
         }
+        // The owner removed the retired auditor key: its notice is over.
+        if names_retired_auditor(task.task_state_config.as_deref())
+            && !names_retired_auditor(updated.task_state_config.as_deref())
+        {
+            resolve_retired_auditor_notice(&self.db, &updated.id).await?;
+        }
         Ok(updated)
     }
 }
@@ -140,6 +146,94 @@ pub(crate) fn names_retired_auditor(config: Option<&str>) -> bool {
                         .is_some_and(|value| !value.is_null())
                 })
         })
+}
+
+/// The dedupe key of the owner notice a Task carries while its configuration
+/// still names an auditor.
+pub(crate) fn retired_auditor_notice_key(task_id: &str) -> String {
+    format!("retired-auditor:{task_id}")
+}
+
+/// State on each open Task that still names an auditor that it does, as an
+/// owner notice in the Project's Attention feed (category `review_risk`,
+/// which the Task and Project views already render), in status
+/// `acknowledged`: listed, and never a wake of the Project Agent. It blocks
+/// nothing and changes no Task. Operator status reports the same Tasks for the operator;
+/// this is for the Task's owner. Run at start: such a configuration can only
+/// predate v0.14 (new ones are refused), so one pass after an upgrade finds
+/// them all. Notices of Tasks that no longer name one, or are closed, are
+/// resolved. Returns how many notices were opened.
+pub(crate) async fn state_retired_auditor_notices(db: &db::SqliteDb) -> Result<usize> {
+    let named: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM task WHERE deleted_at IS NULL AND status NOT IN ('done','cancelled') AND task_state_config IS NOT NULL AND json_valid(task_state_config) AND COALESCE(json_extract(task_state_config,'$.review.auditor_agent_id'), json_extract(task_state_config,'$.auditor_agent_id')) IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db::DbError::from)?;
+    let open: Vec<String> = sqlx::query_scalar(
+        "SELECT dedupe_key FROM attention_projection WHERE status <> 'resolved' AND dedupe_key LIKE 'retired-auditor:%'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db::DbError::from)?;
+    let mut opened = 0;
+    for task_id in &named {
+        let key = retired_auditor_notice_key(task_id);
+        if open.contains(&key) {
+            continue;
+        }
+        let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
+            continue;
+        };
+        // One short write transaction per Task.
+        let mut tx = db::begin_immediate(db.pool()).await?;
+        crate::placement::admission::record_wait_attention_in_tx(
+            db,
+            &mut tx,
+            &task,
+            "review_risk",
+            &format!("This Task's configuration names a review auditor. {RETIRED_AUDITOR_CONFIG}"),
+            &key,
+        )
+        .await?;
+        // A notice, not an incident. An `open` item of this category is a
+        // blocker the wake sweep gives to the Project Agent (one turn of its
+        // blocker budget per Task, with the instruction to recover a Task
+        // that needs no recovery). `acknowledged` items are listed to the
+        // owner like open ones and are no wake source.
+        sqlx::query("UPDATE attention_projection SET status = 'acknowledged', acknowledged_at = updated_at WHERE dedupe_key = ? AND status = 'open'")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db::DbError::from)?;
+        tx.commit().await.map_err(db::DbError::from)?;
+        opened += 1;
+    }
+    for key in open {
+        let still_named = key
+            .strip_prefix("retired-auditor:")
+            .is_some_and(|task_id| named.iter().any(|id| id == task_id));
+        if !still_named {
+            resolve_attention(db, &key).await?;
+        }
+    }
+    Ok(opened)
+}
+
+async fn resolve_retired_auditor_notice(db: &db::SqliteDb, task_id: &str) -> Result<()> {
+    resolve_attention(db, &retired_auditor_notice_key(task_id)).await
+}
+
+async fn resolve_attention(db: &db::SqliteDb, dedupe_key: &str) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key = ?")
+        .bind(&now)
+        .bind(&now)
+        .bind(dedupe_key)
+        .execute(db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+    Ok(())
 }
 
 pub(super) fn reject_retired_auditor_config(config: Option<&str>) -> Result<()> {

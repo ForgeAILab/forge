@@ -1451,12 +1451,13 @@ pub(crate) async fn ensure_valid(
 
 /// Whether the callers that prepare a workspace for `purpose` turn a
 /// worktree that cannot be made again under the disk floor into the Task's
-/// disk capacity wait: a claim (`Execute`) and a before-work hook do. A
-/// review, a check and an integration step would fail instead, so their
-/// recreate is admitted under the floor as it was before the typed outcome
-/// existed, until their owners map it.
+/// disk capacity wait: a claim (`Execute`), a before-work hook and the
+/// review entry's check request (`Check`, whose hooks step suspends on the
+/// wait) do. An integration step would fail instead, so its recreate is
+/// admitted under the floor as it was before the typed outcome existed,
+/// until its owner maps it.
 fn waits_for_disk(purpose: Purpose) -> bool {
-    matches!(purpose, Purpose::Execute | Purpose::Hook)
+    matches!(purpose, Purpose::Execute | Purpose::Hook | Purpose::Check)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3080,6 +3081,8 @@ pub(crate) mod tests {
                         | 202610100137
                         | 202610100820
                         | 202610101906
+                        | 202610110650
+                        | 202610111217
                 ))
                 .then_some((version, path))
             })
@@ -3110,6 +3113,22 @@ pub(crate) mod tests {
         // The check slot-release triggers write the scheduler's tables.
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610101906__check_slot_release.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // So do the slot-wait age triggers.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610110650__slot_wait_age.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The cutover rewrites stored workflows and retained step snapshots;
+        // it is the newest migration and follows the rest, as in version
+        // order.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610111217__integration_cutover.sql"
         ))
         .execute(&pool)
         .await
@@ -4071,6 +4090,85 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap(),
             task
+        );
+    }
+
+    /// A launch after the claim finds its worktree gone under the disk
+    /// floor. That is the claim's wait, not a failed run: the execution ends
+    /// before dispatch, auto-resumable and without blocking the Task, and the
+    /// Task takes the disk capacity wait.
+    #[tokio::test]
+    async fn a_launch_refused_for_disk_takes_the_claims_disk_wait_instead_of_failing_the_task() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        db.disk_admission.configure(
+            api_types::DiskFloor::of_bytes(100, 0),
+            Arc::new(move || {
+                Some(api_types::MachineDiskFacts {
+                    free_bytes: 10,
+                    total_bytes: 1_000,
+                    free_inodes: None,
+                    total_inodes: None,
+                    measured_at: now_rfc3339(),
+                    gc_state: Some("unclaimed".to_owned()),
+                    compiler_cache_bytes: None,
+                })
+            }),
+        );
+        let error = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .err()
+            .expect("a new worktree is refused under the floor");
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('launch',?,'coder','running',?,?)")
+            .bind(&task.id)
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // Any other launch error is not this wait.
+        assert!(
+            !service
+                .defer_launch_for_disk("launch", &ServiceError::invalid_operation("boom"))
+                .await
+        );
+        assert_eq!(execution_count(&db, &task.id).await, 1);
+        assert!(service.defer_launch_for_disk("launch", &error).await);
+
+        let (status, resume_policy, message): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status,resume_policy,error FROM execution WHERE id='launch'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(resume_policy.as_deref(), Some("auto"), "{message:?}");
+        assert!(message.is_some_and(|message| message
+            .starts_with(crate::task_service::execution::DISK_PRE_DISPATCH_ERROR_PREFIX)));
+        let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(waiting.blocked_json.is_none(), "{:?}", waiting.blocked_json);
+        assert!(
+            waiting.error_annotation.is_none(),
+            "{:?}",
+            waiting.error_annotation
+        );
+        let disposition = crate::deferred_dispatch::dispatch_disposition(&waiting)
+            .expect("the Task takes the disk wait");
+        assert_eq!(disposition.capability, "machine_capacity");
+        assert_eq!(
+            disposition.capacity_scope.as_deref(),
+            Some(api_types::CAPACITY_SCOPE_DISK)
         );
     }
 

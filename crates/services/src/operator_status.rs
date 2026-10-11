@@ -527,12 +527,31 @@ impl OperatorStatusService {
             quarantined_imports: integration_counts.quarantined_imports,
         };
         let check_counts = self.db.check_run_counts().await?;
-        let check_runs = api_types::CheckRunStatus {
+        let check_summary = self.db.check_operator_summary().await?;
+        let backlog = |(count, oldest_age_seconds): db::CheckBacklogRow| api_types::CheckBacklog {
+            count,
+            oldest_age_seconds,
+        };
+        let checks = api_types::ChecksStatus {
             by_state: check_counts.by_state,
             reusable_results: check_counts.reusable_results,
             admitted_runs: check_counts.admitted_runs,
-            waiting_for_capacity: check_counts.waiting_for_capacity,
             borrowed_runs: check_counts.borrowed_runs,
+            queued: backlog(check_summary.queued),
+            running: backlog(check_summary.running),
+            waiting_for_slot: backlog(check_summary.waiting_for_slot),
+            waiting_for_disk: backlog(check_summary.waiting_for_disk),
+            reuse_hits_24h: check_summary.reuse_hits_24h,
+            runs_24h: check_summary.runs_24h,
+            last_worker_error: periodic_workers
+                .iter()
+                .find(|worker| worker.worker_name == crate::check_runner::worker::WORKER_NAME)
+                .and_then(|worker| {
+                    Some(api_types::CheckWorkerError {
+                        error: worker.last_error.clone()?,
+                        occurred_at: worker.last_error_at.clone()?,
+                    })
+                }),
         };
         Ok(OperatorStatusResponse {
             overall_severity,
@@ -550,7 +569,7 @@ impl OperatorStatusService {
             periodic_workers,
             task_steps,
             integration_queues,
-            check_runs,
+            checks,
             pending_remote_cancels,
             event_relay,
             database,
@@ -1711,6 +1730,65 @@ mod tests {
             assert!(!reported[0].error.contains(id), "{}", reported[0].error);
         }
 
+        // The same Tasks state it to their owner: one non-blocking notice
+        // each in the Project's Attention feed, stated once.
+        let notices = || async {
+            sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT dedupe_key, attention_type, status, json_extract(details_json,'$.task.id') FROM attention_projection WHERE dedupe_key LIKE 'retired-auditor:%' ORDER BY dedupe_key",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            crate::task_service::state_retired_auditor_notices(&db)
+                .await
+                .unwrap(),
+            2
+        );
+        let stated = notices().await;
+        assert_eq!(
+            stated,
+            ["names-auditor", "names-auditor-flat"].map(|id| (
+                crate::task_service::retired_auditor_notice_key(id),
+                "review_risk".to_owned(),
+                "acknowledged".to_owned(),
+                id.to_owned()
+            ))
+        );
+        // Listed to the owner like an open item, and no wake source: the
+        // wake sweep reads `status = 'open'` only, so the Project Agent is
+        // not woken for it and none of its wake budget is spent.
+        // (The Attention list reads `status <> 'resolved'`.)
+        let listed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attention_projection WHERE status <> 'resolved' AND (snoozed_until IS NULL OR snoozed_until <= ?)",
+        )
+        .bind(db::now_rfc3339())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(listed, 2);
+        let wake_sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE status = 'open'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(wake_sources, 0);
+        assert_eq!(
+            crate::task_service::state_retired_auditor_notices(&db)
+                .await
+                .unwrap(),
+            0,
+            "a notice is stated once"
+        );
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task WHERE blocked_json IS NOT NULL OR error_annotation IS NOT NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(blocked, 0, "the notice blocks nothing");
+
         sqlx::query("UPDATE task SET task_state_config = NULL")
             .execute(db.pool())
             .await
@@ -1720,6 +1798,16 @@ mod tests {
             .recent_errors
             .iter()
             .all(|issue| issue.entity_type != "retired_review_auditor_config"));
+        assert_eq!(
+            crate::task_service::state_retired_auditor_notices(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(notices()
+            .await
+            .iter()
+            .all(|(_, _, status, _)| status == "resolved"));
     }
 
     #[tokio::test]
@@ -1775,6 +1863,75 @@ mod tests {
         assert!(status.workspace_cleanup.is_empty());
         assert!(status.retry_pressure.is_empty());
         assert!(status.recent_errors.is_empty());
+    }
+
+    /// The `checks` section: zero and silent on an idle server; a run that
+    /// waits for a slot and the check worker's last error are reported.
+    #[tokio::test]
+    async fn checks_section_reports_backlog_and_the_check_workers_last_error() {
+        let (db, service) = test_service().await;
+        sync_fixtures(&service).await;
+        let idle = service
+            .compute_status()
+            .await
+            .expect("status computes")
+            .checks;
+        assert_eq!(idle.queued, api_types::CheckBacklog::default());
+        assert_eq!(idle.running, api_types::CheckBacklog::default());
+        assert_eq!(idle.waiting_for_slot, api_types::CheckBacklog::default());
+        assert_eq!(idle.waiting_for_disk, api_types::CheckBacklog::default());
+        assert_eq!((idle.runs_24h, idle.reuse_hits_24h), (0, 0));
+        assert!(idle.last_worker_error.is_none());
+
+        let now = db::now_rfc3339();
+        let waiting_since = (Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        sqlx::raw_sql("INSERT INTO project(id,name,created_at,updated_at) VALUES('checks-p','p','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('checks-r','checks-p','repo','main','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at,capacity_wait_since) VALUES('waiting','checks-p','checks-r','c','d','i','{}',1,'queued','op',?,?,?)")
+            .bind(&waiting_since).bind(&now).bind(&waiting_since)
+            .execute(db.pool()).await.unwrap();
+        // The supervised worker has failed a tick.
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let _handle = service
+            .periodic_workers()
+            .worker(crate::check_runner::worker::WORKER_NAME)
+            .start(rx, || false, {
+                let entered = Arc::clone(&entered);
+                move |worker, _| {
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        let _ = worker
+                            .tick(async {
+                                Err::<(), _>(ServiceError::invalid_operation("owner port refused"))
+                            })
+                            .await;
+                        entered.notify_one();
+                        std::future::pending::<crate::Result<()>>().await
+                    }
+                }
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let checks = service
+            .compute_status()
+            .await
+            .expect("status computes")
+            .checks;
+        assert_eq!(checks.waiting_for_slot.count, 1);
+        assert!(checks
+            .waiting_for_slot
+            .oldest_age_seconds
+            .is_some_and(|age| (300..310).contains(&age)));
+        assert_eq!(checks.queued.count, 0);
+        assert_eq!(checks.runs_24h, 1);
+        let error = checks.last_worker_error.expect("the worker's last error");
+        assert!(
+            error.error.contains("owner port refused"),
+            "{}",
+            error.error
+        );
+        assert!(!error.occurred_at.is_empty());
     }
 
     #[tokio::test]

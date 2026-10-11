@@ -3771,18 +3771,38 @@ Under the floor a machine starts no new disk-consuming work:
   work is how space comes back. A ready placement whose directory is gone
   would be made again at claim, which is new disk: that recreate is refused
   with the same code. The same holds for the other callers that turn the
-  refusal into the Task's disk wait, a before-work hook and a reassignment
-  reset: they ask with `WorkspaceManager::waiting_for_disk()`, and
+  refusal into the Task's disk wait (a before-work hook, the review entry's
+  check request, a launch after its claim and a reassignment reset): they
+  ask with `WorkspaceManager::waiting_for_disk()`, and
   `ensure_valid` then returns the typed outcome
   `WorkspaceUnavailable::DiskPressure` when the worktree would have to be
   made again under the floor (directory gone, or there and unusable so that
   it would be moved aside and checked out again), and changes nothing. It
   converts to the `disk_pressure` placement refusal a claim gets
-  (`placement::capacity_wait_of` reads it as the disk wait). Callers that
-  do not ask (a launch after its claim, review, check, merge and rebase)
-  are not refused: they would report a failed step, so a missing worktree
-  is made again under the floor for them until their owners map the typed
-  outcome. A worktree that is there and valid is never refused,
+  (`placement::capacity_wait_of` reads it as the disk wait). What each
+  caller does with it:
+  - *A hook of a Task step* (`run_before_work_hooks`, `run_ci_steps`): the
+    hook waits (`workflow::actions::common::wait_for_disk`). The Task takes
+    the disk wait and the hooks step suspends on it (`awaited_consumer_id =
+    'disk'`, uncharged), to run the hook again every 30 s until the disk
+    recovers. Nothing is recorded as a hook result. A hook that reported the
+    refusal as a failure instead sent the entry down its failure path: a
+    blocking `before_enter` failure settles the step `failed` and annotates
+    the Task "Transition committed; hook failed", which parks it for its
+    owner, and the annotation moves the Task version, so the disk wait
+    recorded a moment earlier was stale at once.
+  - *A launch after its claim* (`run_execution`, the provider's
+    `owner_execution_path`, the embedded executor's turn start):
+    `TaskService::defer_launch_for_disk` ends the execution before dispatch
+    (error prefix `waiting for free disk before launch:`, `resume_policy =
+    auto`, the Task is not blocked) and records the Task's disk wait; the
+    next claim waits for disk like any other.
+  - *A reassignment reset*: records the wait and returns the typed refusal.
+
+  Callers that do not ask (merge and rebase) are not refused: they would
+  report a failed step, so a missing worktree is made again under the floor
+  for them until their owner maps the typed outcome. A worktree that is
+  there and valid is never refused,
   and neither is the in-place relink of one whose Git link broke (`git
   worktree repair`: two pointer files). A running execution is never stopped
   for disk.
@@ -8542,13 +8562,44 @@ switch all projections together, replace the visible park annotation with the
 condition's own park, preserve the material-blocker digest and slot
 classification, regenerate bindings and document the single public beta break.
 
-### Passive canonical checks (3.3 stage A)
+### Checks: the final state (3.3)
 
-**Nothing executes through this contract or these repositories yet.** Entry
-hooks, the manual review re-run, conformance, lifecycle scripts and environment probes
-retain their existing commands, scheduling, timeout, output and cleanup
-behavior. No legacy Review or check evidence is imported into a trusted cache.
-The new server timeout setting is defined but no execution reads it.
+There is one path for review CI. This overview is the map; the sections
+after it hold the detail and keep their stage names because the code comments
+cite them.
+
+| What | Where it is decided | Section |
+|---|---|---|
+| What runs | `review::check_spec::build_check_spec` builds a `CheckSpec` from the entry's effective configuration. Review entry asks for `canonical-ci/1` in a server-owned Task worktree; a daemon placement and a bundle with no worktree get the frozen `legacy-daemon/1` / `legacy-server/1` policies, which always run and are never reused | "Check contract", "Reusable results" |
+| Who runs it | `check-executor`, a persistence-free owner primitive, on the machine that owns the checkout (server or daemon) | "Owner check execution" |
+| When it runs | The `check-runs` worker: single-flight per identity, machine run-cap admission in the shared writer transaction, slot fairness with aging, recovery by operation id | "Durable check runner" |
+| Who asks | A Task step, through `TaskCheckConsumers`. Two families: review entry (`run_ci_steps`, in production) and the merge path (integration, passive until the queue is activated) | "Task-step consumer contract" |
+| How the Task waits | Its hooks step suspends on the consumer (or on the disk wait) and the Task states a typed condition (`check`, or `capacity` with scope `disk`); every wait has a deadline or a typed park | "Review-entry CI on the check runner", "Typed check conditions" |
+| What a re-run is | The same review entry again (`rerun_review`); there is no second review pipeline | "Manual review re-run through the review entry" |
+| What changes under a wait | Configuration: the entry asks again by itself (at most 3 times). A withdrawn check (refused forced delete): the same. Workflow: typed park | "Review-entry CI on the check runner" |
+| How long history lives | `server.check_retention_days` (30); deny-by-default predicate | "Retention of check history" |
+| What the operator sees | `GET /api/v1/operations/status`: `checks`, `check_runs`, per-machine `check_runs` / `borrowed_check_runs`, `recent_errors` (`task_check_exhausted`, `retired_review_auditor_config`) | docs/api.md |
+
+Not on the runner, and unchanged: conformance setup and required checks,
+before-work and other lifecycle scripts, environment preflight and readiness
+probes. They keep their inline orchestration, limits and verdicts; the
+contract below characterizes them so that a later move changes no behaviour.
+Deleted since the stages below were written: the manual `ReviewRunner` and
+its synthetic reviewer/auditor executions (stage E), `legacy_ci_bundle` and
+`review::auditor::render_auditor_prompt` (stage F; both had only test
+callers).
+
+### Check contract (3.3 stage A)
+
+`CheckSpec` and its builder describe every execution family. Review-entry CI
+(and so the manual review re-run) executes through this contract and the
+check tables; conformance, lifecycle scripts and environment probes are
+characterized here and still run inline, with their existing commands,
+scheduling, timeout, output and cleanup behavior. No legacy Review or check
+evidence is imported into a trusted cache. `server.check_run_timeout_seconds`
+is read by workspace garbage collection (how long a `check-*` build directory
+may be in use); a review-entry run executes under its own 3,600-second wall
+limit.
 
 `api-types::check_spec` is the shared, dependency-free contract location.
 `review::check_spec::build_check_spec` builds `CheckSpec` from the same review
@@ -8845,8 +8896,8 @@ advance the audited execution revision rather than duplicating that identity.
 Consumer authority and current attestation must be revalidated by the future
 Task-step consumer before applying any hit; these tables confer no authority.
 
-Operator status adds `check_runs.by_state` (all eight states, zeros included)
-and `check_runs.reusable_results`. These are read-only observations, separate
+Operator status adds `checks.by_state` (all eight states, zeros included)
+and `checks.reusable_results`. These are read-only observations, separate
 from machine occupancy and severity; no worker or capacity behavior is enabled.
 
 Stage B implements the persistence-free owner execution/transport seam below.
@@ -9070,7 +9121,7 @@ counts; per-machine `active_runs` includes exclusive check slots.
 **Who gets a freed slot.** Work closer to done goes first. On a machine with a
 run cap `C`, let `k` be the checks that hold a slot of their own, `q` the
 queued checks a consumer still waits for, and `S = max(C - 1, 1)` the checks'
-share. Three rules, all evaluated in the admission transactions on the shared
+share. Four rules, all evaluated in the admission transactions on the shared
 occupancy query (`db::machine_capacity`):
 
 1. **An execution leaves room for queued checks.** A reservation, an execution
@@ -9107,14 +9158,50 @@ wait left on it is retired. Any other running execution of the Task (an
 interactive session, a run of another role) is not that: a dispatch then needs
 a second slot, the reserve and start transactions count the first one against
 it, and the Task waits for a run slot. Fairness is per slot, not per Task:
-such a Task already fills one slot, so under rule 1 it is admitted only at a
-release where no queued check is kept a slot (with the machine otherwise full
-of checks, `active = C - 1` and one kept slot refuse it). While checks keep
-queuing it keeps waiting, visibly, until its other run ends; it is not one of
-the waiters the bound below speaks of. A review-entry check never needs a
+such a Task already fills one slot, so under rule 1 it is refused at a
+release where a queued check is kept a slot (with the machine otherwise full
+of checks, `active = C - 1` and one kept slot refuse it). Rule 4 below ends
+that wait. A review-entry check never needs a
 second slot while its Task's run or reservation holds one: it borrows that
 slot and takes it over when the run ends, so the machine's count does not
 change.
+
+4. **An aged waiter goes ahead of checks queued since it began to wait.** A
+   wait for a run slot has an age (`task_slot_wait_age`, kept by triggers
+   since `V202610110650`): when it began, and how many capacity releases the
+   Task was woken for and still refused. The wait is *aged* after 3 releases
+   or 120 seconds, whichever comes first (`SLOT_WAIT_AGED_RELEASES`,
+   `SLOT_WAIT_AGED_SECONDS`). Both sides order an aged waiter and a queued
+   check by time:
+   - *Execution side* (the precheck, the placement selection and the
+     reserve/start transaction, through `machine_capacity::capacity_for_task`
+     and `machine_precheck::snapshot_for_task`): for an aged waiter, rule 1
+     keeps slots only for the checks queued **no later than** the start of
+     its wait. Checks queued since reserve nothing against it.
+   - *Check side* (`admit_check_run`): a queued check counts the aged waiters
+     whose wait began **before** the check was queued as ahead of it in the
+     queue (`aged_waiters_ahead`), so a sweep that reaches the freed slot
+     first does not take it. Counted are Tasks that wait for nothing but a
+     run slot (`daemon_id = '*'`, no Project-limit wait), have their worktree
+     on this machine, and are not the check's own Task. A waiter without a
+     worktree can run on any machine and holds no machine's checks back.
+
+   The age belongs to the wait, not to the row: a dispatch attempt drops the
+   wait row before its start transaction decides, so the age survives a gap
+   of up to 30 seconds (`lapsed_at`) and a wait that ended longer ago starts
+   afresh. It ends when the Task starts a run. The release count is of
+   slots really given back while the Task waited: a run of another Task
+   that left `running`, and an admitted check that ended and was not asked
+   for by this Task (triggers on `execution` and `check_run`). The dirty
+   marks that wake a waiter are not counted: a Task receives those for its
+   own placement, comments and Project edits too, so it cannot age its own
+   wait.
+
+   A check stands back for aged waiters for at most 90 seconds in total
+   (`check_run.yielded_since`, `CHECK_YIELD_SECONDS`): one dispatcher wake
+   plus the 60 s recheck backstop. A waiter that cannot use the slot after
+   all (it also waits for disk, its Agent is busy elsewhere) therefore never
+   starves a check.
 
 One approximation, on the cautious side. Rule 1 counts a queued check that
 will borrow its own Task's slot when the worker next looks at it, so a slot
@@ -9156,11 +9243,71 @@ can still produce, because a check is only ever requested by a Task entering
 review or its integration attempt, and no new run means no new check. Among
 executions the dispatcher's existing order is unchanged.
 
+Aging (rule 4) keeps both bounds and closes the one case they did not cover.
+*The cap*: rule 4 changes how many free slots are kept for whom, never the
+test `active < C` that every admission still passes in its own writer
+transaction. *The waiter*: a Task that needs a second slot was refused for as
+long as checks kept queuing. Once aged it waits only for the checks queued
+before its wait began, a set that is fixed at that moment and shrinks by one
+at each release it loses; every later check stands back for it. It is
+admitted at the first release after those checks ran, unless its other run
+ended first. *The checks*: a check is held back only by aged waiters older
+than itself, again a set fixed when the check is queued, each of which takes
+one slot once (starting its run ends its age); and for no more than 90
+seconds of standing back in total, after which the existing argument applies
+to it unchanged. Two parties never wait for each other: the order between an
+aged waiter and a check is their timestamps (a tie goes to the check).
+
 Result delivery enqueues an entry-fenced `apply_check_result` Task command with
 consumer/result/run identities, exact commit and spec digest. The consumer's
 `delivery_step_id` and enqueue share a transaction. Its marker survives Task-step
 retention, so restart and pruning cannot enqueue a second notification. Already
 stale epochs are enqueued as superseded and leave the Task untouched.
+
+#### Retention of check history
+
+`check_run`, `check_result` (with the output tails in `steps_json` and the
+owner receipt on the run) and `check_consumer` are history once a run is
+terminal and its consumers are answered. The `storage-maintenance` periodic
+worker deletes them hourly, after its Task-step retention pass:
+`StorageMaintenanceWorker::prune_check_history` calls
+`SqliteDb::prune_check_history(cutoff, 100)` at most 20 times per hour. Each
+call is two statements, each its own short write (at most 100 consumers, then
+at most 100 runs); no write transaction spans a batch. The cutoff is
+`server.check_retention_days` ago (default 30; `0` disables the job;
+`FORGE_SERVER_CHECK_RETENTION_DAYS` overrides the file).
+
+The predicate is deny-by-default (`crates/db/src/check_run/retention.rs`):
+
+| Row | Deleted only when |
+|---|---|
+| consumer | older than the cutoff; **and** finished (cancelled, applied, its Task gone, or its Task no longer in the status entry it asked from); **and** it holds no undelivered result; **and** no Task step that is `pending`, `claimed` or `suspended` awaits it (`task_step.awaited_consumer_id`); **and** its delivery step is not `pending`, `claimed` or `suspended`; **and** the Review attempt named in its request key is not `running` or `awaiting_human`; **and** its run is terminal |
+| run (its results go with it, `ON DELETE CASCADE`) | terminal (`succeeded`, `failed`, `cancelled`); finished before the cutoff and more than 26 hours ago (the owner acknowledgement window is 25); **and no consumer row at all** still names the run or one of its results |
+
+The last condition is what makes it deny-by-default: a consumer this job did
+not delete, for whatever reason, keeps its run and its result. A reusable
+green result therefore lives as long as some request used it within the
+retention period (a `Hit` writes a consumer that names the result), and for
+the retention period after its last use. "A reusable result has no expiry"
+now reads: none but retention. After it is deleted the same request is
+`Scheduled` and runs again.
+
+Delivery steps (`apply_check_result`, `apply_check_progress`) are Task steps
+and are pruned by Task-step retention (7 days settled, 30 unresolved); a
+consumer's `delivery_step_id` marker outlives its step and goes with the
+consumer. A Review keeps its own copy of the verdict and tails
+(`review.step_results_json`), which no retention touches.
+
+Every column that points at one of the three tables is listed in
+`db::CHECK_REFERENCES`: the foreign keys `check_result(run_id, identity_key)`,
+`check_consumer.run_id` and `check_consumer.result_id`, and the id column
+`task_step.awaited_consumer_id`. The test
+`every_reference_to_a_check_row_is_known_to_the_retention_predicate`
+enumerates them from the migrated schema (`pragma_foreign_key_list` over
+every table, plus every column whose name says it holds a check run, result
+or consumer id, and every `run_id`/`result_id` column of an `integration_*`
+table). A reference added later, as the merge queue will add, fails that test
+until the predicate keeps the rows the new reader can still read.
 
 #### Task-step consumer contract
 
@@ -9264,8 +9411,10 @@ retain their current inline orchestration, limits and verdicts. The 3.2 integrat
 the merge-queue cutover and managed-checkout activation. The
 owners execute the frozen legacy policies and the canonical CI policy below;
 only the canonical one attests its inputs and may be reused. A reusable result
-has no expiry: reuse ends only when the commit, spec digest, owner environment
-identity or audited execution revision differs. No historical review or legacy
+has no expiry of its own: reuse ends when the commit, spec digest, owner
+environment identity or audited execution revision differs, or when retention
+deletes a result nobody used for `server.check_retention_days` (see "Retention
+of check history"). No historical review or legacy
 CI row is promoted to cache.
 
 #### Reusable results: the canonical CI policy (3.3 stage D part 2, scope 1)
@@ -9423,8 +9572,30 @@ this definition, so the policy revision stays `1`.
    infrastructure, see below) makes the hook ask the engine to suspend the
    step (`durable::suspend_hook`). A consumer nothing will answer any more
    (cancelled under a step nobody superseded, or its run or result row is
-   gone) cancels the review attempt and fails the hook with `review check was
-   lost before it produced a result` instead of suspending again.
+   gone) is asked for again: the attempt is closed
+   (`superseded_by_withdrawn_check`) and the hook asks once more, by the
+   mechanism and under the bound of a changed configuration (below). The
+   same holds for a result whose outcome is `cancelled` (the entry joined a
+   run that was being stopped for someone else). Past the bound the review
+   attempt is cancelled and the hook fails with `review check was lost
+   before it produced a result` instead of suspending again.
+
+**A worktree that cannot be made again is a wait.** The entry check runs in
+the Task worktree. When that directory is gone and the disk is under its
+free-space floor, `prepare_workspace_for(.., Purpose::Check)` returns the
+typed disk refusal (`WorkspaceUnavailable::DiskPressure`,
+`placement::capacity_wait_of(..) == Some(CapacityWait::Disk)`) instead of
+recreating it. `run_ci_steps` then discards the attempt it had opened (no
+command ran), records the Task's disk capacity wait
+(`Capacity{disk}`, the wait a claim takes) and suspends its hooks step on the
+disk wait (`durable::suspend_hook_for_disk`: `awaited_consumer_id = 'disk'`,
+`suspended_until` 30 s ahead, uncharged). No check consumer has that id, so
+nothing is delivered to it: `wake_due_suspended` wakes the step at its
+deadline, the hook runs again, and it either waits another 30 s or proceeds
+(clearing the Task's disk wait) and asks for its check. It is never a failed
+review. The readers below treat this step like any suspended step; the
+queries that join `check_consumer` on the awaited id simply do not match it.
+`run_before_work_hooks` waits the same way (see "Disk-pressure admission").
 
 **A suspended hooks step is its own durable state.** `task_step.status =
 'suspended'` (V202610100820) with `suspended_until` (the latest time it looks
@@ -9502,9 +9673,16 @@ run: the delete guard counts unfinished runs (`project_in_use`,
 anything, it looks for a run dispatched to a daemon that is not connected and
 not removed (`TaskService::project_deletion_unreachable_machines`): such a
 run cannot be stopped now, so the request is refused naming the machine and
-nothing is cancelled. Only then does it cancel the consumers, settle queued
+nothing is cancelled. The same look covers the running executions: one whose
+provider is a machine that cannot be reached would refuse the delete in phase
+two after earlier executions had already been cancelled, so it refuses here.
+Only then does it cancel the consumers, settle queued
 runs and wait (four seconds for the whole request) for the worker to stop
-running ones. A machine that is gone for good is removed by its owner: the
+running ones. Phase two is all-or-nothing for the Tasks: when the delete is
+refused after it cancelled (a run did not settle within the bound, a provider
+refused, new work was admitted), `TaskService::resume_project_check_waits`
+wakes every review entry whose consumer was cancelled, and each asks again
+for its check instead of failing as lost. A machine that is gone for good is removed by its owner: the
 worker settles the runs of a removed machine and the delete goes through. Should a run row disappear under its worker anyway,
 the worker finds no consumer at its next look, tells the owner to stop (best
 effort) and drops the run.
@@ -9516,14 +9694,16 @@ asked for, so no pause stops it:
 |---|---|---|
 | Project pause | runs to its end; the result is delivered and applied, the review attempt settles | the reviewer run is held by the pause; resume dispatches it. The check is not run again |
 | Agent pause (coder, reviewer) | as above | the Task waits in `review` for its paused reviewer (`agent`); resume dispatches it |
-| Task `hold` | not offered while the Task waits for its entry check: the Task offers `cancel` only, which abandons the wait as described above | - |
+| Task `hold` | not offered while the Task waits for its entry check, whether the check is queued behind a full machine or runs: the Task offers `cancel` only, which abandons the wait as described above. (The check wait is what parks the Task, also under a Project or Agent pause, so no `hold` is on offer beside it. A hold command that reaches such a Task below the offer list is accepted, because a hold may stop hooks in flight: it supersedes the hooks step, cancels its consumer and its review attempt, and a run nobody else waits for is stopped and gives its slot back. Its release runs the review entry again by itself (`resume_review_entry_after_release`), so a held Task never sits in `review` with its checks unrun. The same holds for an entry that waits for free disk.) | - |
 
 A Project pause or resume (like any Project edit) moves the Project version,
 which is the fence a hooks step was admitted under. A step that waited for a
 check therefore re-reads the Project when it continues: while the Project
 workflow and the entry's two merged state configurations are what the step
-froze, it continues under the current Project version; a changed workflow or
-state configuration still ends it with a version conflict. Without this the
+froze, it continues under the current Project version. An edit of the Project
+workflow that leaves the entered state as it was (its hooks, gate, role and
+configuration) counts as unchanged; an edit of the entered state ends the
+step with a version conflict. Without this the
 woken step failed, the attempt was cancelled, and recovery dispatched a
 reviewer that had no CI result to read.
 
@@ -9533,12 +9713,37 @@ What changed while the step waited decides what happens to the result:
 |---|---|
 | Nothing the entry was admitted under (a pause, a resume, a rename, a limit) | applied; the attempt settles |
 | The Project environment | applied: the run that ran is the run that was asked for. Its result answers the old environment only (the environment is part of the check identity), so the next entry runs again |
-| The Project workflow, or the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it | not applied. The attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
-| The Task's own state configuration (`task_state_config`, with its `ci_steps`) | not applied, as above. No Project version moves for this, so the step compares what it froze whenever it waited for a check |
+| The entry's state configuration: the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it, or the Task's own (`task_state_config`; no Project version moves for this) | not applied. The woken step asks again for the current configuration, in the same review entry (below) |
+| The Project workflow, in a way that leaves the entered state as it was (its hooks, gate, role and configuration) | applied; the step continues under the current workflow |
+| The entered state in the Project workflow | not applied. The hook list the step froze is no longer that state's: the attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
 
-The verdict of commands the entry no longer has is never written to the
-review attempt. The Task does not ask for a new check by itself: its owner
-restarts it or sends it back, and the next entry runs the current commands.
+**A changed configuration asks again by itself.** `run_ci_steps` records the
+merged configuration of the entered state it asked under (hook effect
+`ci_config`). A woken step runs under the Project's current version and the
+state's CURRENT merged configuration (`execute_hook_step`), and the hook
+compares the two. When they differ and the attempt has no verdict yet
+(`supersede_stale_ask`):
+
+1. the stale consumer is cancelled (`review_entry::withdraw_consumer`): a late
+   delivery is `Stale`, the worker stops a run nobody else waits for, and a
+   run still executing on a daemon is put under the remote-cancellation fence
+   as for a superseded step;
+2. the attempt that asked is closed `cancelled` with
+   `execution_retry.status = "superseded_by_config_change"`; the verdict of
+   commands the entry no longer has is never written to it;
+3. the re-request is counted (hook effect `ci_rerequests`) and the hook opens
+   a new review attempt and asks once for the current configuration: one new
+   consumer (request key `status epoch | new review id`), at most one new run
+   (a certified pass of the same identity is a `Hit`, a run in flight is
+   joined). The Task's check wait is replaced by the new consumer's.
+
+The Task does not leave `review`, its status epoch and its hooks step are
+unchanged, and no review budget is charged (no verdict was produced). The
+change is noticed when the step is next woken: by the stale check's delivery,
+or at the step's deadline. An entry asks again at most three times
+(`ENTRY_CHECK_REREQUEST_LIMIT`); the next change ends the step as a workflow
+change does (the typed `cascade_failed` park with its actions), so a
+configuration that keeps changing cannot keep a Task asking forever.
 
 **Liveness of the wait.** Every way the answer can fail to arrive ends in a
 resume or a typed condition, never a silent wait:
@@ -9546,7 +9751,7 @@ resume or a typed condition, never a silent wait:
 | What happens | Outcome |
 |---|---|
 | check worker not running | the Task shows the typed check wait (`check`, phase `result` or `slot`) stated when it asked; the step looks again at `suspended_until` and re-suspends while the run is still pending |
-| run or result row lost, consumer cancelled under a live step | the woken step fails the hook (`review check was lost...`) and cancels the attempt |
+| run or result row lost, consumer cancelled under a live step | the woken step asks again (at most three re-requests per entry); past that it fails the hook (`review check was lost...`) and cancels the attempt |
 | delivery step dead-lettered or never enqueued | the step wakes at `suspended_until` and reads the verdict itself |
 | daemon unreachable | the run stays `uncertain`; on reconnect the daemon's journaled result is looked up (the command is not run again) and the step resumes. Past the disconnected-owner bound the run is an infrastructure failure: retried, then the Task parks on `check` / `infrastructure_exhausted` (offers `retry`, `cancel`) |
 | restart after the request, before the suspend | the redelivered step asks again with the same request key and gets the same consumer |
@@ -9609,7 +9814,48 @@ A Task whose `task_state_config` still names an auditor
 reviewer Agent assigned is refused with a conflict before step 2: the re-run
 would otherwise pass on its checks where the old one refused. The key is
 refused at Task create and update, and operator status reports open Tasks
-that still carry it (`retired_review_auditor_config`).
+that still carry it (`retired_review_auditor_config`). The Task's owner is
+told on the Task as well: at start, `state_retired_auditor_notices` opens one
+Attention item per such Task (category `review_risk`, dedupe key
+`retired-auditor:<task id>`, the Task named in its details), which blocks
+nothing and changes no Task. The item is a notice, not an incident: it is
+written `acknowledged`, so it is listed to the owner and is no wake source
+(an `open` item of this category is a blocker that the wake sweep hands to
+the Project Agent, at the cost of a blocker wake per Task). It is stated once and resolved when the owner
+removes the key (Task update) or the Task closes.
+
+**A held Task is not re-entered.** `rerun_review` refuses a Task on hold
+(`ParkReason::Held`) with a conflict, whoever asks: the owner is not offered
+the re-run while the hold stands, and a system re-entry (recovery settling a
+retired inline re-run, a queued `rerun_review` command, a budget reset) does
+nothing: no attempt is superseded and no status entry, hooks step, check or
+review attempt is created. `settle_retired_review_rerun` leaves a held Task
+as it is (the stopped execution says why it ended and that the entry runs at
+the release; the hold, not a failure, is what the Task shows).
+
+**The release gives a review its entry back.** Two things can take the entry
+of a held Task in `review` away, and `resume_review_entry_after_release` runs
+it again at the release, as an automatic entry: (1) a hold command that
+reached the Task while its entry hooks waited (for the entry check or for
+free disk) superseded the hooks step, which `entry_hooks_preempted` reads
+from the steps of the current status entry; (2) recovery stopped a retired
+inline review re-run and did not re-enter the held Task. Without it the
+released Task had no check and no attempt: with a reviewer it parked on a
+refused dispatch, without one it showed the gate's approval. A hold in
+`review` that stopped nothing (the reviewer was waiting or running) needs no
+re-entry: the dispatcher gives the review its reviewer run again.
+
+**Where a failed entry goes.** `review_failure_target` sends a red entry with
+budget left to the review gate's `reject_target`, and to `in_progress` when
+the gate names none. That fallback is why a workflow whose gate has no
+`reject_target` still sends the Task back to work: "red CI and no remediation
+target" cannot be built by nulling the field. A workflow has no remediation
+target only when the state the failed review would go to does not exist in it
+(the gate names a state the workflow lacks, or a custom workflow has no
+`in_progress`). That transition cannot be made, so the failed entry parks
+typed in `review`: `blocked` with kind `review_gate_failed`, reason `review
+failed and the workflow has no remediation state`, an annotation naming the
+missing state, and the blocked Task's owner actions (never a failed cascade).
 
 **Budget.** `rerun_review` takes the requesting actor. The Task action passes
 the owner (only the owner is offered the action); the budget-reset retry of a

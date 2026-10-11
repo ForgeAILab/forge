@@ -804,13 +804,13 @@ resolver_row!(resolver_no_default, "no_default");
 resolver_row!(resolver_two_defaults, "two_defaults");
 resolver_row!(resolver_not_ready, "not_ready");
 
-/// Migration `V202610110247`: the removed hook name is dropped from every
+/// Migration `V202610111217`: the removed hook name is dropped from every
 /// hook list of stored Project workflows and retained step snapshots;
 /// every other key, state and hook stays, in order. Running it again
 /// changes nothing.
 #[tokio::test]
 async fn the_cutover_migration_drops_only_the_removed_hook_from_stored_workflows() {
-    const MIGRATION: &str = include_str!("../../migrations/V202610110247__integration_cutover.sql");
+    const MIGRATION: &str = include_str!("../../migrations/V202610111217__integration_cutover.sql");
     let db = fixture().await;
     let stored = serde_json::json!({
         "roles": [{"name": "coder"}],

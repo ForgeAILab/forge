@@ -544,6 +544,44 @@ impl SqliteDb {
             .rows_affected()
             == 1)
     }
+    /// Hooks steps of this Project that still wait, suspended, for a check
+    /// consumer that was cancelled under them: `(task_id, consumer_id)`.
+    pub async fn cancelled_project_check_waits(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as("SELECT s.task_id,s.awaited_consumer_id FROM task_step s JOIN task t ON t.id=s.task_id JOIN check_consumer c ON c.id=s.awaited_consumer_id WHERE t.project_id=? AND s.status='suspended' AND c.cancelled_at IS NOT NULL ORDER BY s.seq")
+            .bind(project_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
+    /// Whether the entry of the Task's current status was stopped before its
+    /// hooks finished: the hooks step of this status entry is `superseded`
+    /// and no other step of the entry finished or still runs. A hold that
+    /// reaches a Task while its entry hooks wait does this.
+    pub async fn entry_hooks_preempted(&self, task_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.task_id=?1 AND s.kind='hooks' AND s.status='superseded' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch)
+                AND NOT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.task_id=?1 AND s.kind='hooks' AND s.status<>'superseded' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch)",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+    /// Whether the run of a consumer that was cancelled in the last
+    /// `within_seconds` is still being stopped. A request for the same check
+    /// would join that run and receive its cancellation.
+    pub async fn cancelled_consumer_run_is_stopping(
+        &self,
+        consumer_id: &str,
+        within_seconds: i64,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c JOIN check_run r ON r.id=c.run_id WHERE c.id=? AND c.cancelled_at IS NOT NULL AND (julianday('now')-julianday(c.cancelled_at))*86400.0<? AND r.state IN ('cancelling','cleaning','uncertain'))")
+            .bind(consumer_id)
+            .bind(within_seconds)
+            .fetch_one(self.pool())
+            .await?)
+    }
     /// Project deletion: nobody waits for this Project's unfinished check
     /// runs any more. The check worker stops a run without consumers (a
     /// queued one is cancelled, a running one is cancelled on its owner).
@@ -616,6 +654,13 @@ impl SqliteDb {
     ) -> Result<Option<String>> {
         Ok(sqlx::query_scalar("SELECT json_extract(effects_json,?) FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?")
             .bind(format!("$.{key}")).bind(&step.id).bind(index).fetch_one(self.pool()).await?)
+    }
+    /// One recorded effect of any hook of this step (the newest checkpoint
+    /// that has it). The step reads what one of its hooks recorded before
+    /// the step was suspended.
+    pub async fn step_hook_effect(&self, step_id: &str, key: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT json_extract(effects_json,?1) FROM task_hook_checkpoint WHERE step_id=?2 AND json_extract(effects_json,?1) IS NOT NULL ORDER BY hook_index DESC LIMIT 1")
+            .bind(format!("$.{key}")).bind(step_id).fetch_optional(self.pool()).await?.flatten())
     }
     pub async fn record_hook_effect(
         &self,

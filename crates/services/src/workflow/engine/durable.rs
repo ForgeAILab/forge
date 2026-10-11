@@ -128,6 +128,25 @@ pub(crate) fn note_hook_failure(task_id: &str, error: &ServiceError) {
 
 /// Suspend the running hooks step once this hook returns: the hook asked for
 /// a check and its result arrives later. `false` outside a hooks step.
+/// What a hooks step that waits for free disk (and not for a check) records
+/// as the thing it awaits. No check consumer has this id, so nothing is
+/// delivered to it: the step is woken by its deadline only.
+pub(crate) const DISK_WAIT: &str = db::DISK_WAIT_SENTINEL;
+/// How long a step that waits for disk sleeps before it looks again: the
+/// dispatcher's period for the same wait (`DISK_WAIT_RECHECK`).
+const DISK_WAIT_RECHECK_SECONDS: i64 = if cfg!(test) { 1 } else { 30 };
+
+/// The current hook cannot have its worktree made (again) while the disk is
+/// under its free-space floor. Its step waits, suspended and uncharged, and
+/// runs the hook again in 30 seconds. `false` outside a durable hooks step.
+pub(crate) fn suspend_hook_for_disk(task_id: &str) -> bool {
+    suspend_hook(
+        task_id,
+        DISK_WAIT,
+        (chrono::Utc::now() + chrono::Duration::seconds(DISK_WAIT_RECHECK_SECONDS)).to_rfc3339(),
+    )
+}
+
 pub(crate) fn suspend_hook(task_id: &str, consumer_id: &str, until: String) -> bool {
     match current_hook(task_id) {
         Some(attempt) => {
@@ -335,31 +354,68 @@ impl WorkflowExecution<'_> {
         // changed). The frozen Project version would then cost the Task its
         // finished check: the hook failed with a version conflict and the
         // recovery dispatched a reviewer without the CI result. What this
-        // entry was admitted under is the workflow and the two state
-        // configurations; while those are unchanged the step continues under
-        // the Project's current version. A changed workflow or state
-        // configuration still ends it.
+        // entry was admitted under is the workflow and the entered state's
+        // configuration; while those are unchanged the step continues under
+        // the Project's current version.
         //
-        // The reverse holds too. The Task's own state configuration can
-        // change under the wait without any Project version moving (its
-        // review commands were edited). The check that ran then answers
-        // commands the entry no longer has: the step ends as it does for a
-        // Project edit, under a version no Project has, so no fence passes
-        // and the verdict is applied to nothing.
+        // A changed entry configuration does not need the owner either. The
+        // woken step runs under the CURRENT configuration of the state it
+        // enters; `run_ci_steps` sees that it differs from what it asked
+        // under, drops the stale check and asks again for the current
+        // commands (`ENTRY_CHECK_REREQUEST_LIMIT` times per entry at most).
+        // Past that bound, or when the Project workflow changed the state
+        // this step enters (the hook list this step froze is no longer that
+        // state's), the step ends as before: the verdict is applied to nothing and the Task
+        // parks for its owner. The exit hooks ran before the wait, so the
+        // configuration of the state the Task left no longer decides
+        // anything.
+        let mut entered_config = payload.to_config.clone();
         if let (Some(authority), true) = (authority.as_mut(), step.awaited_consumer_id.is_some()) {
             let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-            let admitted_as_is = project.workflow_definition == authority.workflow_definition
-                && merged_state_config(
-                    from_state,
-                    Some(&project),
-                    task.task_state_config.as_deref(),
-                ) == payload.from_config
-                && merged_state_config(to_state, Some(&project), task.task_state_config.as_deref())
-                    == payload.to_config;
-            if admitted_as_is {
+            let current =
+                merged_state_config(to_state, Some(&project), task.task_state_config.as_deref());
+            let asked_under = match self
+                .db
+                .step_hook_effect(
+                    &step.id,
+                    crate::workflow::actions::ENTRY_CHECK_CONFIG_EFFECT,
+                )
+                .await?
+            {
+                Some(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                None => payload.to_config.clone(),
+            };
+            let rerequests = self
+                .db
+                .step_hook_effect(
+                    &step.id,
+                    crate::workflow::actions::ENTRY_CHECK_REREQUESTS_EFFECT,
+                )
+                .await?
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .unwrap_or(0);
+            // An edit of the Project workflow that left the entered state as
+            // it was (its hooks, gate, role and configuration) does not
+            // concern this entry either: the hook list this step froze is
+            // still that state's. Any other workflow edit ends the step.
+            let same_entry = project.workflow_definition == authority.workflow_definition
+                || WorkflowEngine::find_state(
+                    &WorkflowEngine::resolve_workflow_for_task(
+                        &task,
+                        &project.workflow_definition,
+                        &payload.actor,
+                    ),
+                    &payload.to,
+                ) == Some(to_state);
+            let continues = same_entry
+                && (current == asked_under
+                    || rerequests < crate::workflow::actions::ENTRY_CHECK_REREQUEST_LIMIT);
+            if continues {
                 authority.project_version = project.version;
+                authority.workflow_definition = project.workflow_definition.clone();
+                entered_config = current;
             } else if project.version == authority.project_version {
                 authority.project_version = SUPERSEDED_PROJECT_VERSION;
             }
@@ -399,7 +455,7 @@ impl WorkflowExecution<'_> {
             state_config: config,
         };
         let exit_ctx = context(from_state, payload.from_config.clone());
-        let enter_ctx = context(to_state, payload.to_config.clone());
+        let enter_ctx = context(to_state, entered_config);
         let mut hook_results = payload.pre_results.clone();
         let mut failure = None;
         let mut blocking_failure = None;

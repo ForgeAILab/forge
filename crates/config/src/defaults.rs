@@ -1,4 +1,6 @@
 pub const DEFAULT_CHECK_RUN_TIMEOUT_SECONDS: u32 = 1800;
+/// Days a finished check run, its result and its consumers are kept. Zero keeps them forever.
+pub const DEFAULT_CHECK_RETENTION_DAYS: u32 = 30;
 
 pub const DEFAULT_USAGE_INDEX_BUDGET_MB: u32 = 128;
 

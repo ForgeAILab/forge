@@ -3617,8 +3617,12 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `integration_queues.queues_by_state` | Passive integration queues counted by `open`, `suspended`, `quarantined`, `closed` (zero states included). |
 | `integration_queues.current_attempts_by_state` | Current membership counted by attempt state; terminal history is excluded. Zero states are included. |
 | `integration_queues.quarantined_imports` | Import rows with an explicit `quarantined` disposition, including rows with no resolvable queue. |
-| `check_runs.by_state` | Passive check runs counted by `queued`, `running`, `cancelling`, `cleaning`, `uncertain`, `succeeded`, `failed`, `cancelled`; all zero states included. No check worker executes through these tables yet. |
-| `check_runs.reusable_results` | Certified passing results with successful cleanup and cacheable attested inputs whose source run succeeded; exact-identity reuse only. Zero on a fresh or upgraded database; no legacy cache is seeded. |
+| `checks.by_state` | Check runs counted by `queued`, `running`, `cancelling`, `cleaning`, `uncertain`, `succeeded`, `failed`, `cancelled`; all zero states included. History older than `server.check_retention_days` is deleted, so the terminal counts cover that period. |
+| `checks.reusable_results` | Certified passing results with successful cleanup and cacheable attested inputs whose source run succeeded; exact-identity reuse only. Zero on a fresh or upgraded database; no legacy cache is seeded. |
+| `checks.admitted_runs`, `checks.borrowed_runs` | Runs that hold a machine slot (`running`, `cancelling`, `cleaning` or `uncertain` and admitted to one), and how many of those share the slot of their own Task's run or reservation. |
+| `checks` | The one section about checks. Besides the counts above, four backlogs, each `{ "count": <integer>, "oldest_age_seconds": <integer or null> }` (the age of the oldest one counted; `null` when the count is zero): `queued` (queued runs the worker has not refused a slot, by creation), `running` (admitted runs: `running`, `cancelling`, `cleaning`, `uncertain`, by admission), `waiting_for_slot` (queued runs behind a full machine, by the start of that wait), `waiting_for_disk` (review entries whose check is not asked for yet because the Task worktree cannot be made again under the disk floor, by the time the entry was queued). |
+| `checks.runs_24h`, `checks.reuse_hits_24h` | Runs scheduled in the last 24 hours, and requests of the last 24 hours that a stored result answered with no run (a consumer whose result existed before it asked). |
+| `checks.last_worker_error` | `null`, or `{ "error", "occurred_at" }`: the `check-runs` periodic worker's most recent error, the same fact as that worker's `periodic_workers[]` entry. |
 | `task_steps` | Cascade step queue health. No consumer cursor or dead-letter actions. |
 | `task_steps.pending`, `.claimed` | Current pending and claimed step rows. |
 | `task_steps.failed`, `.parked` | Unresolved failed and parked (loop-detected) steps: rows the Task's error annotation still references. Resolved history does not count. |
@@ -6011,10 +6015,11 @@ admission. Readiness also remains on its hand path.
 
 ### Durable check orchestration observations (3.3 stage C, partial)
 
-`GET /api/v1/operations/status` extends `check_runs` with integer
-`admitted_runs`, `waiting_for_capacity` and `borrowed_runs`, in addition to
-`by_state` and `reusable_results`. Admitted includes running/cancelling/cleaning/
-uncertain runs. Capacity wait is a subset of queued runs; borrowed runs share an
+`GET /api/v1/operations/status` reports check runs in its `checks` section:
+integer `admitted_runs` and `borrowed_runs`, in addition to `by_state` and
+`reusable_results`. Admitted includes running/cancelling/cleaning/uncertain
+runs that hold a slot. The runs that wait for capacity are
+`checks.waiting_for_slot`, a subset of queued runs; borrowed runs share an
 existing reservation/execution slot for the same Task and physical machine.
 
 Each `daemon_pressure` entry adds `check_runs` (checks taking their own slot)
@@ -6022,4 +6027,5 @@ and `borrowed_check_runs` (informational). `active_runs` includes exclusive chec
 slots; borrowed checks add no second slot. Agent pressure excludes checks.
 The supervised worker appears as `check-runs` in `periodic_workers`. There is no
 new REST check execution or result-application route, and daemon protocol 5 is
-unchanged. Existing CI consumers have not moved to the runner in this slice.
+unchanged. Review-entry CI, and with it the review `retry` re-run, runs on this
+runner; the `checks` section of the status (above) is its operator summary.

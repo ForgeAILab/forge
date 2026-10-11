@@ -137,6 +137,124 @@ impl MachineCapacity {
     }
 }
 
+impl MachineCapacity {
+    /// The same machine as an aged run-slot waiter sees it: only the checks
+    /// queued before it began to wait are kept a slot ahead of it.
+    pub fn for_aged_waiter(mut self, queued_before: i64) -> Self {
+        self.queued_checks = self.queued_checks.min(queued_before.max(0));
+        self
+    }
+}
+
+/// A run-slot waiter is aged after this many capacity releases it was woken
+/// for and still refused, or this long, whichever comes first.
+pub const SLOT_WAIT_AGED_RELEASES: i64 = 3;
+pub const SLOT_WAIT_AGED_SECONDS: i64 = 120;
+/// A queued check stands back for aged waiters for this long in total.
+pub const CHECK_YIELD_SECONDS: i64 = 90;
+/// The occupancy key of the server host; a daemon's key is its id.
+pub const SERVER_MACHINE_KEY: &str = "server_host";
+
+const AGED_WAIT: &str = "(a.releases>=3 OR (julianday('now')-julianday(a.since))*86400.0>=120)";
+
+/// When this Task began to wait for a run slot, if that wait is aged. A wait
+/// row dropped by the dispatch attempt that is now being admitted still
+/// counts for 30 seconds (`task_slot_wait_age.lapsed_at`).
+pub async fn aged_slot_wait<'e, E>(executor: E, task_id: &str) -> Result<Option<String>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT a.since FROM task_slot_wait_age a WHERE a.task_id=?
+           AND (a.lapsed_at IS NULL OR (julianday('now')-julianday(a.lapsed_at))*86400.0<30)
+           AND {AGED_WAIT}"
+    ))
+    .bind(task_id)
+    .fetch_optional(executor)
+    .await?)
+}
+
+/// Per machine key, the queued checks a consumer still waits for that were
+/// queued no later than `since`: the checks an aged waiter stays behind.
+pub async fn queued_checks_before<'e, E>(
+    executor: E,
+    since: &str,
+    embedded_machine_id: &str,
+) -> Result<std::collections::HashMap<String, i64>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let sql = format!(
+        "{} SELECT machine_key, COUNT(*) FROM check_queue
+            WHERE queue_rank IS NOT NULL AND julianday(created_at)<=julianday(?)
+            GROUP BY machine_key",
+        include_str!("machine_occupancy.sql")
+    );
+    Ok(sqlx::query_as::<_, (String, i64)>(&sql)
+        .bind(embedded_machine_id)
+        .bind(since)
+        .fetch_all(executor)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+/// `capacity` as `task_id` is admitted against it: unchanged, unless the Task
+/// is an aged run-slot waiter.
+pub async fn capacity_for_task(
+    tx: &mut Transaction<'_, Sqlite>,
+    capacity: MachineCapacity,
+    machine: Option<&str>,
+    task_id: &str,
+    embedded_machine_id: &str,
+) -> Result<MachineCapacity> {
+    if capacity.slots_kept_for_checks() == 0 {
+        return Ok(capacity);
+    }
+    let Some(since) = aged_slot_wait(&mut **tx, task_id).await? else {
+        return Ok(capacity);
+    };
+    let before = queued_checks_before(&mut **tx, &since, embedded_machine_id).await?;
+    Ok(capacity.for_aged_waiter(
+        before
+            .get(machine.unwrap_or(SERVER_MACHINE_KEY))
+            .copied()
+            .unwrap_or(0),
+    ))
+}
+
+/// Aged run-slot waiters this queued check stands back for: Tasks that wait
+/// for nothing but a run slot, began to wait before the check was queued,
+/// and have their worktree on this machine. A waiter without a worktree can
+/// run anywhere and holds no machine's checks back; a Task never stands in
+/// front of its own check.
+pub async fn aged_waiters_ahead(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    machine: Option<&str>,
+    embedded_machine_id: &str,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM task_slot_wait_age a
+            JOIN task_schedule_wait w ON w.task_id=a.task_id AND w.daemon_id='*' AND w.project_capacity=0
+            JOIN task t ON t.id=a.task_id AND t.deleted_at IS NULL
+            JOIN workspace_placement p ON p.task_id=COALESCE(t.parent_task_id,t.id) AND p.state<>'cleaned'
+            JOIN check_run r ON r.id=?1
+            WHERE a.lapsed_at IS NULL AND {AGED_WAIT}
+              AND julianday(a.since)<julianday(r.created_at)
+              AND NOT EXISTS(SELECT 1 FROM check_consumer c WHERE c.run_id=r.id AND c.task_id=a.task_id)
+              AND CASE WHEN COALESCE(p.execution_daemon_id,p.daemon_id) IS NULL
+                        OR COALESCE(p.execution_daemon_id,p.daemon_id) IN (SELECT id FROM daemon WHERE machine_id=?2)
+                       THEN 'server_host' ELSE COALESCE(p.execution_daemon_id,p.daemon_id) END
+                  = COALESCE(?3,'server_host')"
+    ))
+    .bind(run_id)
+    .bind(embedded_machine_id)
+    .bind(machine)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 /// Missing or zero reported cap contributes no ceiling. Admin limits are positive.
 pub fn effective_machine_cap(reported: Option<i64>, admin: Option<u32>) -> Option<i64> {
     match (

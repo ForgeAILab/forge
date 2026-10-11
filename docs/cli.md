@@ -828,6 +828,35 @@ the current version. The help text names each flag's verb. Exit code 3 means
 Fixed boolean values and omitted presets are supplied by the server; contradictory
 values are refused.
 
+## Operations status
+
+```bash
+forge-ctl operations status
+```
+
+Reads `GET /api/v1/operations/status` (administrator login). `--output json`
+prints the whole status. Table output prints one summary line and the check
+runner's section:
+
+```text
+Operations: healthy  active executions 2  blocked Tasks 0  recent errors 0
+Checks:
+  queued                2  oldest 45 s
+  running               1  oldest 10 min
+  waiting for slot      3  oldest 2 h
+  waiting for disk      0
+  holding a slot: 1 (0 on their Task's own slot); reusable results: 4
+  last 24 h: 12 run(s), 7 answered from a stored result
+  last worker error: none
+```
+
+`queued`, `running`, `waiting for slot` and `waiting for disk` are the
+`checks` backlogs of the status, each with the age of its oldest entry.
+"Holding a slot" is `checks.admitted_runs` (with `borrowed_runs`) and
+"reusable results" is `checks.reusable_results`.
+"Answered from a stored result" counts requests that reused a green result and
+ran nothing. A worker error is printed with its time.
+
 ## Operations dead letters
 
 These commands require an administrator login and share the normal `--server`,
@@ -855,6 +884,11 @@ There is no automatic replay, bulk command or dead-letter retention job.
 
 The server also accepts `--check-run-timeout-seconds N` (positive integer,
 1800 seconds by default), overriding `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`
-and `server.check_run_timeout_seconds` in `forge.yaml`. This defines the future
-whole-check bundle deadline; no execution reads it in 3.3 stage A. It does not
-change today's per-command review timeout or unbounded entry CI.
+and `server.check_run_timeout_seconds` in `forge.yaml`. Workspace garbage
+collection reads it (how long a check's build directory may be in use). It
+does not change the per-command review timeout; a review-entry run has its
+own 3,600-second wall limit.
+
+Check history retention has no flag: set `server.check_retention_days` in
+`forge.yaml` or `FORGE_SERVER_CHECK_RETENTION_DAYS` (default 30 days, `0`
+keeps check history forever). See [getting-started](getting-started.md).

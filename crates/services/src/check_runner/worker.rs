@@ -44,6 +44,9 @@ pub trait CheckOwnerPort: Send + Sync {
     async fn acknowledge(&self, record: &CheckWorkerRecord) -> Result<()>;
 }
 
+/// The name the check worker is supervised and reported under.
+pub const WORKER_NAME: &str = "check-runs";
+
 pub struct CheckRunWorker {
     store: Arc<dyn CheckWorkerRepo>,
     owners: Arc<dyn CheckOwnerPort>,
@@ -65,7 +68,7 @@ impl CheckRunWorker {
         workers: &crate::worker_runtime::PeriodicWorkers,
         shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
-        workers.worker("check-runs").start(shutdown, || false, move |worker, mut shutdown| {
+        workers.worker(WORKER_NAME).start(shutdown, || false, move |worker, mut shutdown| {
             let this=self.clone();
             async move {
                 let mut jobs=JoinSet::new();

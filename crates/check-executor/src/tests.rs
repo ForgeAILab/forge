@@ -593,16 +593,21 @@ async fn candidate() -> (tempfile::TempDir, String) {
     (temp, head)
 }
 fn canonical_spec(steps: &[&str]) -> CheckSpec {
-    let mut spec = legacy_ci_bundle(
-        &steps.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-        &BTreeMap::new(),
-        0,
-        false,
-    );
+    let mut spec = legacy_ci_spec("template", &BTreeMap::new(), 0, false);
+    let template = spec.commands[0].clone();
+    spec.commands = steps
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let mut command = template.clone();
+            command.id = format!("ci:{index}");
+            command.shell_text = (*text).to_owned();
+            command.cacheability = CheckCacheability::DeclaredControlledInputs;
+            command
+        })
+        .collect();
+    spec.configured_commands = spec.commands.len();
     spec.execution_policy = CANONICAL_CI_POLICY.into();
-    for command in &mut spec.commands {
-        command.cacheability = CheckCacheability::DeclaredControlledInputs;
-    }
     spec
 }
 async fn canonical_run(

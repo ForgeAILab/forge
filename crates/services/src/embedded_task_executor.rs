@@ -417,8 +417,24 @@ impl EmbeddedTaskExecutor {
                 .and_then(|service| service.repo_cache_locks.clone()),
             &self.workspace_backend_router,
         )
+        .waiting_for_disk()
         .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Execute)
-        .await?;
+        .await;
+        let valid = match valid {
+            Ok(valid) => valid,
+            Err(unavailable) => {
+                // Under the disk floor the worktree is not made again: the
+                // turn does not start and the Task takes the claim's disk
+                // wait instead of a failed run.
+                let error = ServiceError::from(unavailable);
+                if let Some(service) = task_service.as_ref() {
+                    service
+                        .defer_launch_for_disk(&ctx.execution_id, &error)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
         let worktree_path = valid.path().map(Path::to_path_buf).ok_or_else(|| {
             ServiceError::from(
                 crate::workspace_backend::WorkspaceBackendError::OwnerUnsupported {

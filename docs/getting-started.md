@@ -1821,7 +1821,7 @@ automatically. An explicit topic request during a live turn is saved and complet
 at that same idle admission boundary. A rotation that fails three times is
 abandoned with a visible notice, and the chat continues on its current topic.
 
-### Whole-check wall timeout (passive contract setting)
+### Whole-check wall timeout
 
 `server.check_run_timeout_seconds` defines the whole mechanical-check bundle
 wall limit, default **1800 seconds**, positive integer. Precedence is
@@ -1834,7 +1834,29 @@ server:
   check_run_timeout_seconds: 1800
 ```
 
-This stage only defines the setting and the canonical spec field. No execution
-reads it yet: existing CI and per-command `review.check_timeout_seconds` behavior
-is unchanged. The durable runner will start wall timing at actual admission and
-clamp each separate command limit to the remaining wall time.
+Workspace garbage collection reads this setting (a check's build directory
+is not collected while a run could still use it). Review-entry CI runs on the
+durable check runner under a fixed 3,600-second wall limit, timed from the
+moment the run is admitted to a machine slot, with each command under
+`review.check_timeout_seconds`.
+
+### Check history retention
+
+`server.check_retention_days` is how long Forge keeps a finished check run
+with its result, the output tails of its commands and the requests that
+waited for it. Default **30** days; `0` keeps them forever. Precedence is
+`FORGE_SERVER_CHECK_RETENTION_DAYS`, then `server.check_retention_days` in
+`forge.yaml`, then the default.
+
+```yaml
+server:
+  check_retention_days: 30
+```
+
+An hourly job deletes older rows in small batches. It never deletes a check
+that something can still read: a check a Task still waits for, one that
+belongs to a review that is still open, or a reusable green result that a
+request used within the retention period. The verdict and command output
+recorded on a Review are part of the Review and are not deleted. Deleting the
+history of a green result only means the next review of that same commit runs
+its checks again.

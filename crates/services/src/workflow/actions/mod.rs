@@ -28,6 +28,9 @@ pub use review::{
     run_ci_steps_in_step, set_entry_check_wall_seconds_for_test, AutoCascadeOnReviewPass,
     AutoCascadeOnUnconfiguredReview, RunCiSteps,
 };
+pub(crate) use review::{
+    ENTRY_CHECK_CONFIG_EFFECT, ENTRY_CHECK_REREQUESTS_EFFECT, ENTRY_CHECK_REREQUEST_LIMIT,
+};
 pub use subtasks::{
     CancelPendingSubtasks, PropagateDoneToSubtasks, SatisfyDependents, SubtaskSequenceComplete,
 };

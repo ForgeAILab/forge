@@ -394,6 +394,9 @@ impl TaskService {
         match result {
             Ok(result) => Ok(result),
             Err(error) => {
+                if self.defer_launch_for_disk(&execution.id, &error).await {
+                    return Err(error);
+                }
                 if matches!(
                     &error,
                     ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. }
@@ -478,8 +481,17 @@ impl TaskService {
             self.repo_cache_locks.clone(),
             &self.workspace_backend_router,
         )
+        .waiting_for_disk()
         .claimed_path(&task, workspace)
-        .await?;
+        .await;
+        let valid = match valid {
+            Ok(valid) => valid,
+            Err(unavailable) => {
+                let error = ServiceError::from(unavailable);
+                self.defer_launch_for_disk(&execution.id, &error).await;
+                return Err(error);
+            }
+        };
         let worktree_path = valid
             .path()
             .map(std::path::Path::to_path_buf)
@@ -2181,7 +2193,7 @@ impl TaskService {
         Ok(())
     }
 
-    async fn execution_provider_for_execution(
+    pub(in crate::task_service) async fn execution_provider_for_execution(
         &self,
         execution: &Execution,
     ) -> Result<Arc<dyn crate::daemon_transport::ExecutionProvider>> {
@@ -2288,6 +2300,10 @@ impl TaskService {
                 self.repo_cache_locks.clone(),
                 &self.workspace_backend_router,
             )
+            // A worktree that vanished since the claim is made again here,
+            // unless the disk is under its floor: that is the claim's disk
+            // wait (the launch's caller records it), not a failed run.
+            .waiting_for_disk()
             .ensure_valid(
                 task,
                 workspace.clone(),

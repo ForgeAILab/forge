@@ -14,10 +14,16 @@ const STEP_PRUNE_BATCH: i64 = 100;
 const STEP_PRUNE_MAX_BATCHES: usize = 20;
 const SETTLED_STEP_RETENTION_DAYS: i64 = 7;
 const UNRESOLVED_STEP_RETENTION_DAYS: i64 = 30;
+// Check history retention shares the hourly slot: at most 20 batches of 100
+// consumers and 100 runs per hour, each batch its own short write.
+const CHECK_PRUNE_BATCH: i64 = 100;
+const CHECK_PRUNE_MAX_BATCHES: usize = 20;
 
 pub struct StorageMaintenanceWorker {
     db: Arc<SqliteDb>,
     last_step_prune: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// `server.check_retention_days`; zero keeps check history forever.
+    check_retention_days: u32,
 }
 
 impl StorageMaintenanceWorker {
@@ -25,7 +31,13 @@ impl StorageMaintenanceWorker {
         Self {
             db,
             last_step_prune: std::sync::Mutex::new(None),
+            check_retention_days: config::DEFAULT_CHECK_RETENTION_DAYS,
         }
+    }
+
+    pub fn with_check_retention_days(mut self, days: u32) -> Self {
+        self.check_retention_days = days;
+        self
     }
 
     pub fn start(
@@ -57,6 +69,7 @@ impl StorageMaintenanceWorker {
         if !*shutdown.borrow() {
             if self.step_prune_due() {
                 self.prune_steps(shutdown).await?;
+                self.prune_check_history(shutdown).await?;
             }
             db::incremental_vacuum(self.db.pool()).await?;
         }
@@ -98,6 +111,48 @@ impl StorageMaintenanceWorker {
     }
 }
 
+impl StorageMaintenanceWorker {
+    /// Delete finished check runs, results and consumers older than the
+    /// configured retention (`db::SqliteDb::prune_check_history` holds the
+    /// rule for what may go). Nothing is deleted when retention is zero.
+    async fn prune_check_history(
+        &self,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<db::CheckHistoryPruned> {
+        let mut total = db::CheckHistoryPruned::default();
+        if self.check_retention_days == 0 {
+            return Ok(total);
+        }
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::days(i64::from(self.check_retention_days)))
+        .to_rfc3339();
+        for _ in 0..CHECK_PRUNE_MAX_BATCHES {
+            if *shutdown.borrow() {
+                break;
+            }
+            let pruned = self
+                .db
+                .prune_check_history(&cutoff, CHECK_PRUNE_BATCH)
+                .await?;
+            total.consumers += pruned.consumers;
+            total.runs += pruned.runs;
+            if pruned.consumers < CHECK_PRUNE_BATCH as u64 && pruned.runs < CHECK_PRUNE_BATCH as u64
+            {
+                break;
+            }
+        }
+        if total != db::CheckHistoryPruned::default() {
+            tracing::info!(
+                consumers = total.consumers,
+                runs = total.runs,
+                retention_days = self.check_retention_days,
+                "check history pruned"
+            );
+        }
+        Ok(total)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +172,42 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('old', 'test', 'test', 'test', 'system', 'system', 'system', 'old', '2000-01-01T00:00:00Z')").execute(&pool).await.unwrap();
         Arc::new(SqliteDb::new(pool))
+    }
+
+    /// `server.check_retention_days`: old finished check runs are deleted on
+    /// the hourly pass, a recent one is kept, and zero keeps everything.
+    #[tokio::test]
+    async fn check_history_is_pruned_after_the_configured_days_and_never_when_zero() {
+        let db = database().await;
+        let old = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let recent = (chrono::Utc::now() - chrono::Duration::days(29)).to_rfc3339();
+        sqlx::raw_sql("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('r','p','repo','main','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").execute(db.pool()).await.unwrap();
+        for (id, at) in [("old", &old), ("recent", &recent)] {
+            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at,finished_at) VALUES(?,'p','r','c','d',?,'{}',1,'succeeded',?,?,?,?)")
+                .bind(id).bind(id).bind(id).bind(at).bind(at).bind(at)
+                .execute(db.pool()).await.unwrap();
+            sqlx::query("INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) VALUES(?,?,?,'pass','success',1,1,'[]',0,?)")
+                .bind(id).bind(id).bind(id).bind(at).execute(db.pool()).await.unwrap();
+        }
+        let runs = || async {
+            sqlx::query_scalar::<_, String>("SELECT id FROM check_run ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+        };
+        let (_tx, rx) = watch::channel(false);
+        let forever = StorageMaintenanceWorker::new(Arc::clone(&db)).with_check_retention_days(0);
+        forever.maintain_once(&rx).await.unwrap();
+        assert_eq!(runs().await, ["old", "recent"]);
+        let worker = StorageMaintenanceWorker::new(Arc::clone(&db));
+        assert_eq!(worker.check_retention_days, 30);
+        worker.maintain_once(&rx).await.unwrap();
+        assert_eq!(runs().await, ["recent"]);
+        let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_result")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(results, 1);
     }
 
     #[tokio::test]

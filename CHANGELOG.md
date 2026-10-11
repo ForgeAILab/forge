@@ -68,7 +68,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     Task to are found by role in a workflow that renamed them.
   - **Workflow hook `auto_cascade_on_merge_result` is removed; `run_merge`
     only admits to the queue.** Stored Project workflows and retained step
-    workflow snapshots are rewritten by migration `V202610110247`, which
+    workflow snapshots are rewritten by migration `V202610111217`, which
     drops the removed hook name and keeps everything else. A workflow
     template file in the data directory's `workflows/` folder that names the
     hook gets the same rewrite when it is first read: the hook is dropped,
@@ -88,6 +88,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     `forge-ctl` (position, phase and timings are on the Task's `condition`
     only), and deleting a repository, a location or a Project is not yet
     refused while a merge into it has an unknown result.
+- **Check history is deleted after 30 days.** Finished check runs, their
+  results (with the output tails of their commands) and the requests that
+  waited for them used to be kept forever. An hourly job now deletes them
+  once they are older than `server.check_retention_days` (new setting,
+  default `30`; `FORGE_SERVER_CHECK_RETENTION_DAYS` overrides the file). Set
+  it to `0` to keep them forever, as before. Nothing something can still read
+  is deleted: a check a Task waits for, a check of a review that is still
+  open, or a reusable green result that a request used within the retention
+  period. Reviews keep their own copy of the verdict and command output. A
+  green result whose history was deleted is simply not reused: the next
+  review of that commit runs its checks again.
+- **A forced Project deletion refuses before cancelling anything when a
+  running execution is on a machine that cannot be reached.** It used to
+  cancel the executions it could reach and then answer `503`. It now answers
+  `409 project_in_use` with `cancelled: false` and the machine in
+  `unreachable_machines`, as it already did for a check run on such a
+  machine.
+
 - **A manual review re-run goes through the ordinary review entry; the
   separate review runner is gone (3.3 stage E).** The review `retry` Task
   action ("Re-run Review" / "Recheck Review") keeps its verb and payload, but
@@ -1183,6 +1201,54 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **A review entry asks for its checks again by itself.** When the review
+  commands of a Task or its Project change while the entry's checks run, the
+  finished check is not applied (as before) and the entry now asks again for
+  the current commands in the same review entry, instead of parking the Task
+  for its owner. The stale attempt is closed as `cancelled`
+  (`execution_retry.status = "superseded_by_config_change"`), no review budget
+  is spent, and an entry asks again at most three times before it parks as it
+  used to. A Project workflow edit that leaves the entered state as it was
+  no longer costs the Task its finished check; an edit of the entered state
+  still parks. The same now happens when
+  a check is withdrawn under a waiting entry (`superseded_by_withdrawn_check`):
+  a forced Project deletion that is refused after cancelling the Project's
+  checks no longer leaves those reviews failed.
+- **A missing worktree under the disk floor is a wait in three more places.**
+  The review entry's check request, a blocking before-work hook and a launch
+  after its claim no longer fail (or recreate the worktree under the floor):
+  the Task shows the disk capacity wait and continues by itself when the disk
+  recovers. A launch deferred this way ends its execution with the error
+  prefix `waiting for free disk before launch:` and `resume_policy = auto`.
+- **A Task that needs a second machine slot is no longer starved by queued
+  checks.** A wait for a run slot ages after three capacity releases or two
+  minutes; an aged waiter goes ahead of checks queued after it began to wait,
+  and such a check stands back for at most 90 seconds. Checks queued earlier
+  still go first, and the machine cap is unchanged.
+- **Review re-runs and held Tasks.** A review re-run is refused on a held Task
+  for every requester (409), including recovery; it runs after the release. A
+  failed review entry whose workflow does not define the state it would be
+  sent back to parks `blocked` (`review_gate_failed`, "review failed and the
+  workflow has no remediation state") instead of failing its cascade. A gate
+  without `reject_target` still sends the Task to `in_progress`.
+- **Releasing a Task whose review entry a hold stopped runs the entry again.**
+  A `hold` sent while a Task's entry check was pending, or while its entry
+  waited for free disk, is accepted (it is not on offer there) and stops the
+  entry. Its release used to leave the Task in `review` with no check and no
+  review attempt: parked on a refused reviewer dispatch, or with the gate's
+  approval on offer. The release now runs the review entry again by itself.
+  A Task whose entry waits for free disk offers `cancel` only, as a Task
+  waiting for its entry check does. A refused forced Project deletion whose
+  check run is still stopping no longer costs the entry two of its three
+  re-requests: the entry waits for the run to end and asks once.
+- **A wait for a run slot ages by slots given back, not by wake-ups.** The
+  three "capacity releases" are runs of other Tasks and admitted checks that
+  ended; a Task cannot age its own wait.
+- **Tasks that still name `review.auditor_agent_id` say so to their owner.**
+  At start, each open Task with the retired key gets one non-blocking
+  Attention item (`review_risk`, status `acknowledged`: listed, and no wake of
+  the Project Agent); it resolves when the key is removed.
+- **`forge-ctl operations status`** is new (see Added).
 - **CI runs the Rust gates as parallel jobs.** The single `Rust` job is split
   into `Rust lint` (fmt, clippy, the `make types` drift check, the script
   tests) and four test jobs by crate (`services`, `api`, `db`, and every other
@@ -1392,8 +1458,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   runs the check. No existing check uses it yet: review CI, merge CI and every
   other check run exactly as before, and with no check requested the worker
   makes five indexed reads a second and writes nothing. `GET /api/v1/operations`
-  gains `check_runs.admitted_runs`, `check_runs.waiting_for_capacity`,
-  `check_runs.borrowed_runs` and, per machine, `check_runs` and
+  gains `checks.admitted_runs`, `checks.borrowed_runs` and, per machine, `check_runs` and
   `borrowed_check_runs`; a machine's `active_runs` includes checks that hold a
   slot of their own. The fields are additive and zero until a check uses the
   runner.
@@ -1653,7 +1718,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   positive integer; `--check-run-timeout-seconds`, then
   `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`, then `forge.yaml`). It defines the
   future whole-bundle wall limit and is read by nothing yet.
-- **`GET /api/v1/operations/status` adds `check_runs`**: `by_state` (all eight
+- **`GET /api/v1/operations/status` adds `checks`**: `by_state` (all eight
   run states, zeros included) and `reusable_results`. Additive; both are zero
   until a later stage runs checks through the new storage.
 - **Merge, rebase, CI and daemon RPC effects split from their persistence
@@ -2324,6 +2389,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- **Operations status has a `checks` section.** `GET /api/v1/operations/status`
+  reports what the check runner is doing now: `queued`, `running`,
+  `waiting_for_slot` and `waiting_for_disk`, each with a count and the age of
+  its oldest entry; `runs_24h` against `reuse_hits_24h` (requests a stored
+  green result answered with no run); and `last_worker_error`. `forge-ctl
+  operations status` prints it, and the Operations page shows it as one line.
+  It is the one section about checks: the run counts of earlier unreleased
+  builds (`check_runs.by_state`, `reusable_results`, `admitted_runs`,
+  `borrowed_runs`) are fields of `checks`, there is no `check_runs` section,
+  and `check_runs.waiting_for_capacity` is `checks.waiting_for_slot.count`.
 
 - **Daemon-owned workspaces report their disk usage.** A daemon's garbage
   collector now measures the Task roots of its live handles (bounded, like

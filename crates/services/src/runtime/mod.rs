@@ -808,7 +808,10 @@ impl ForgeRuntimeBuilder {
             None,
         ));
         operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
-        let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
+        let storage_maintenance = Arc::new(
+            StorageMaintenanceWorker::new(Arc::clone(&self.db))
+                .with_check_retention_days(effective_config.server.check_retention_days),
+        );
         // One configuration for both sides of the queue's Task-step
         // handshake: the worker and the merge-path check family.
         let integration_config = crate::integration_worker::IntegrationWorkerConfig::default();

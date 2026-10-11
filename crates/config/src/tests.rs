@@ -680,6 +680,7 @@ fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
 fn clear_forge_env() {
     for key in [
         "FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS",
+        "FORGE_SERVER_CHECK_RETENTION_DAYS",
         "FORGE_SERVER_USAGE_INDEX_BUDGET_MB",
         "FORGE_EVENT_CONSUMER_STALL_SECONDS",
         "FORGE_SERVER_BIND",
@@ -1125,5 +1126,21 @@ fn check_run_timeout_obeys_file_env_cli_precedence_and_rejects_zero() {
         config.check_run_timeout_seconds,
         crate::DEFAULT_CHECK_RUN_TIMEOUT_SECONDS
     );
+    // Check retention: 30 days by default, the file, then the environment;
+    // zero is accepted and means forever.
+    assert_eq!(config.check_retention_days, 30);
+    fs::write(&path, "server:\n  check_run_timeout_seconds: 90\n").unwrap();
+    assert_eq!(load(None).unwrap().server.check_retention_days, 30);
+    fs::write(&path, "server:\n  check_retention_days: 7\n").unwrap();
+    assert_eq!(load(None).unwrap().server.check_retention_days, 7);
+    env::set_var("FORGE_SERVER_CHECK_RETENTION_DAYS", "0");
+    assert_eq!(load(None).unwrap().server.check_retention_days, 0);
+    env::set_var("FORGE_SERVER_CHECK_RETENTION_DAYS", "90");
+    assert_eq!(load(None).unwrap().server.check_retention_days, 90);
+    for invalid in ["-1", "1.5", "no"] {
+        env::set_var("FORGE_SERVER_CHECK_RETENTION_DAYS", invalid);
+        assert!(load(None).is_err(), "{invalid}");
+    }
+    env::remove_var("FORGE_SERVER_CHECK_RETENTION_DAYS");
     clear_forge_env();
 }

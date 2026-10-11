@@ -444,7 +444,9 @@ async fn reviewer_prompt_bytes_for_server_workspace() {
     let diff = review::read_git_diff(&fixture.worktree, "main")
         .await
         .unwrap();
-    let prompt = review::auditor::render_auditor_prompt(TITLE, Some(DESCRIPTION), &diff, None);
+    let prompt = format!(
+        "Review this task implementation.\n\nTask title:\n{TITLE}\n\nTask description:\n{DESCRIPTION}\n\nGit diff:\n```diff\n{diff}\n```"
+    );
     let prompt = review::contract::prepare_prompt(
         &db,
         REVIEWER_ID,

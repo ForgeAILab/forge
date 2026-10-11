@@ -217,12 +217,49 @@ impl CheckWorkerRepo for SqliteDb {
             // A slot of its own needs a free one that the checks queued ahead
             // of this run leave it, and room in the checks' share while a
             // Task waits for a run slot here. Borrowing needs none of it.
-            let own_slot = capacity.has_capacity()
-                && capacity.admits_check(
-                    crate::machine_capacity::checks_queued_ahead(&mut tx, &run.id, &embedded)
-                        .await?,
-                    crate::machine_capacity::run_slot_waiters(&mut tx, machine, &embedded).await?,
-                );
+            let queued_ahead =
+                crate::machine_capacity::checks_queued_ahead(&mut tx, &run.id, &embedded).await?;
+            let run_waiters =
+                crate::machine_capacity::run_slot_waiters(&mut tx, machine, &embedded).await?;
+            let mut own_slot =
+                capacity.has_capacity() && capacity.admits_check(queued_ahead, run_waiters);
+            // Aging: a Task that has waited for a run slot on this machine
+            // since before this check was queued, and is aged, goes first.
+            // The check stands back while the slots do not cover both, for
+            // at most `CHECK_YIELD_SECONDS` in total: a waiter that cannot
+            // use the slot after all does not starve it.
+            if own_slot {
+                let aged = crate::machine_capacity::aged_waiters_ahead(
+                    &mut tx, &run.id, machine, &embedded,
+                )
+                .await?;
+                if aged > 0
+                    && !capacity.admits_check(queued_ahead.saturating_add(aged), run_waiters)
+                {
+                    let yielded: Option<String> =
+                        sqlx::query_scalar("SELECT yielded_since FROM check_run WHERE id=?")
+                            .bind(&run.id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    let stands_back = match yielded.as_deref() {
+                        None => {
+                            sqlx::query("UPDATE check_run SET yielded_since=? WHERE id=?")
+                                .bind(now)
+                                .bind(&run.id)
+                                .execute(&mut *tx)
+                                .await?;
+                            true
+                        }
+                        Some(since) => {
+                            chrono::DateTime::parse_from_rfc3339(since).is_ok_and(|since| {
+                                (clock - since).num_seconds()
+                                    < crate::machine_capacity::CHECK_YIELD_SECONDS
+                            })
+                        }
+                    };
+                    own_slot = !stands_back;
+                }
+            }
             if !own_slot
                 && !crate::machine_capacity::check_borrows_machine_slot(
                     &mut tx, &run.id, machine, &embedded,

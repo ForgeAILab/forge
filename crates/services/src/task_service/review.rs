@@ -1,6 +1,12 @@
 use super::*;
 use ::review::ReviewWorkspace;
 use api_types::Actor;
+/// What a stopped execution of the retired inline review re-run says while
+/// its Task is on hold. The release looks for it and runs the review entry.
+pub(crate) const RETIRED_REVIEW_RERUN_HELD: &str =
+    "this execution belonged to the inline review re-run, \
+     which this Forge version no longer has; it was stopped at upgrade. The Task is on hold: \
+     its review entry runs again when it is released";
 
 /// Until v0.14 a manual review re-run ran inline: Forge created a reviewer
 /// execution that no role ran, leased it to itself (`review-owner:<uuid>`,
@@ -57,6 +63,27 @@ impl TaskService {
             .iter()
             .any(retired_review_rerun)
         {
+            return Ok(());
+        }
+        // A held Task waits for its owner: the stopped execution says why it
+        // ended, and the hold (not a failure) is what the Task shows. The
+        // review is not re-entered behind the hold. The execution remembers
+        // it: the release settles it again, and then the entry runs
+        // (`resume_review_entry_after_release`).
+        if task
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            sqlx::query(
+                "UPDATE execution SET error = ?, updated_at = ? WHERE id = ? AND status <> 'running'",
+            )
+            .bind(RETIRED_REVIEW_RERUN_HELD)
+            .bind(now_rfc3339())
+            .bind(&execution.id)
+            .execute(self.db.pool())
+            .await
+            .map_err(DbError::from)?;
             return Ok(());
         }
         let id = Uuid::parse_str(&task.id)
@@ -255,6 +282,19 @@ impl TaskService {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status
+            )));
+        }
+        // A held Task is its owner's decision to stop. Nothing re-enters its
+        // review while the hold stands, whoever asks: recovery, a queued
+        // command, a budget reset. (The owner is not offered the re-run on a
+        // held Task.) After the release the request runs as usual.
+        if task
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            return Err(ServiceError::conflict(format!(
+                "task {task_id} is on hold; its review runs again once it is released"
             )));
         }
         // A review needs something to review.

@@ -902,3 +902,38 @@ pub(super) fn publish_review_failed(
         },
     });
 }
+
+/// A hook could not have its worktree made valid. When that is only because
+/// the worktree would have to be made again on a disk under its free-space
+/// floor, this is a wait and not a failure of the hook: the Task takes the
+/// disk capacity wait a claim takes for the same reason (`Capacity{disk}`)
+/// and the hooks step suspends, to run the hook again at the 30 s disk
+/// recheck. `None` for every other error, and for a hook that does not run
+/// from a durable step (it cannot wait): the caller reports its failure.
+pub(super) async fn wait_for_disk(
+    ctx: &HookContext,
+    task: &db::Task,
+    error: &crate::ServiceError,
+) -> Option<HookResult> {
+    if crate::placement::capacity_wait_of(error) != Some(crate::placement::CapacityWait::Disk) {
+        return None;
+    }
+    if let Err(defer_error) = ctx.task_service.defer_placement_refusal(task, error).await {
+        tracing::warn!(task_id = %task.id, error = %defer_error, "the disk wait of a hook whose worktree must be recreated could not be recorded");
+    }
+    crate::workflow::engine::durable::suspend_hook_for_disk(&ctx.task_id).then_some(HookResult::Ok)
+}
+
+/// The hook has its worktree: a disk wait this Task took for it is over.
+pub(super) async fn disk_wait_over(ctx: &HookContext, task: &db::Task) {
+    let waited_for_disk =
+        crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(|wait| {
+            wait.capability == "machine_capacity"
+                && wait.capacity_scope.as_deref() == Some(api_types::CAPACITY_SCOPE_DISK)
+        });
+    if waited_for_disk {
+        if let Err(error) = crate::deferred_dispatch::clear_capacity_wait(&ctx.db, task).await {
+            tracing::warn!(task_id = %task.id, %error, "a finished disk wait could not be cleared");
+        }
+    }
+}

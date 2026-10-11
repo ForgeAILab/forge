@@ -5805,3 +5805,135 @@ async fn task_step_suspended_migration_preserves_populated_steps_indexes_and_tri
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// `V202610110650` adds the age of a run-slot wait and nothing else: wait
+/// rows, dirty marks and check runs are exactly as they were, a Task that
+/// already waited for a run slot gets an age that starts at the upgrade, and
+/// from then on the triggers keep the age (begin, real releases, lapse, end).
+#[tokio::test]
+async fn slot_wait_age_migration_preserves_waits_and_checks_and_ages_existing_waiters() {
+    let migration_dir = unique_temp_path("slot-age-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir creates");
+    copy_migrations_up_to(202610110112, &migration_dir);
+    let db_path = unique_temp_path("slot-age-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("migrations before the slot-wait age apply");
+    let now = "2026-10-10T00:00:00Z";
+    sqlx::raw_sql(
+        "INSERT INTO project(id,name,created_at,updated_at) VALUES('p','Project','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z');
+         INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES
+           ('slot','p','slot','todo','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z'),
+           ('named','p','named','todo','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z'),
+           ('later','p','later','todo','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z');
+         INSERT INTO task_schedule_wait(task_id,project_id,daemon_id,deadline) VALUES
+           ('slot','p','*','2026-10-10T00:01:00Z'),('named','p','machine',NULL);",
+    )
+    .execute(&pool)
+    .await
+    .expect("rows before the migration insert");
+    let _ = now;
+    let waits = |pool: db::SqlitePool| async move {
+        sqlx::query_scalar::<_, String>("SELECT group_concat(quote(task_id)||quote(project_id)||quote(agent_id)||quote(daemon_id)||quote(deadline)||quote(project_capacity),';') FROM (SELECT * FROM task_schedule_wait ORDER BY task_id)")
+            .fetch_one(&pool)
+            .await
+            .expect("waits read")
+    };
+    let before = waits(pool.clone()).await;
+    let check_columns_before: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('check_run') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .expect("columns read");
+
+    let all = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &all)
+        .await
+        .expect("the slot-wait age migration applies");
+
+    assert_eq!(waits(pool.clone()).await, before);
+    let check_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('check_run') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .expect("columns read");
+    assert_eq!(
+        check_columns[..check_columns_before.len()],
+        check_columns_before[..]
+    );
+    assert!(check_columns.iter().any(|name| name == "yielded_since"));
+    let age = |pool: db::SqlitePool, id: &'static str| async move {
+        sqlx::query_as::<_, (i64, bool)>(
+            "SELECT releases, lapsed_at IS NOT NULL FROM task_slot_wait_age WHERE task_id=?",
+        )
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .expect("age reads")
+    };
+    assert_eq!(age(pool.clone(), "slot").await, Some((0, false)));
+    assert_eq!(age(pool.clone(), "named").await, None);
+
+    // A dirty mark wakes a waiter and is not a release: a Task receives
+    // those for its own writes too and must not age its own wait with them.
+    let mark = "INSERT INTO task_schedule_dirty(task_id,external) VALUES(?,1) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1";
+    for _ in 0..5 {
+        sqlx::query(mark).bind("slot").execute(&pool).await.unwrap();
+    }
+    assert_eq!(age(pool.clone(), "slot").await, Some((0, false)));
+    // A wait that begins later starts its own age. A run of another Task
+    // that ends is a release for every waiter but that Task itself.
+    sqlx::raw_sql(
+        "INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES
+           ('other','named','coder','running','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z'),
+           ('own','later','interactive','running','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z');
+         INSERT INTO task_schedule_wait(task_id,project_id,daemon_id) VALUES('later','p','*');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(age(pool.clone(), "later").await, Some((0, false)));
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='other'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "slot").await, Some((1, false)));
+    assert_eq!(age(pool.clone(), "later").await, Some((1, false)));
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='own'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "slot").await, Some((2, false)));
+    assert_eq!(
+        age(pool.clone(), "later").await,
+        Some((1, false)),
+        "a Task aged its own wait by ending its own run"
+    );
+    sqlx::query("UPDATE task_schedule_wait SET daemon_id='*' WHERE task_id='named'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "named").await, Some((0, false)));
+    sqlx::query("UPDATE task_schedule_wait SET daemon_id=NULL WHERE task_id='named'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "named").await, Some((0, true)));
+    sqlx::query("DELETE FROM task_schedule_wait WHERE task_id='slot'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "slot").await, Some((2, true)));
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('e','slot','coder','running','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "slot").await, None);
+
+    pool.close().await;
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}

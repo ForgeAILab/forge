@@ -98,6 +98,19 @@ impl HookAction for RunCiSteps {
                     }
                 }
             };
+        // The entry configuration changed while this step waited for its
+        // check: the check that ran answers commands the entry no longer has.
+        // Its consumer and the attempt that asked are closed, and the hook
+        // asks again below for the current configuration.
+        let asked = match asked {
+            Some(asked) => match supersede_stale_ask(ctx, &asked).await {
+                Ok(true) => None,
+                Ok(false) => Some(asked),
+                Err(reason) => return HookResult::Failed { reason },
+            },
+            None => None,
+        };
+        let reasked = asked.is_none();
         let had_review_passed = task.review_passed_at.is_some();
         let reviewer_assignment =
             match get_role_assignment(ctx, crate::workflow::default_roles::REVIEWER).await {
@@ -177,22 +190,33 @@ impl HookAction for RunCiSteps {
         };
         let consumer_id =
             match crate::workflow::engine::durable::hook_effect(&ctx.task_id, CI_CONSUMER).await {
-                Ok(Some(consumer_id)) => {
+                // A consumer recorded for an attempt this invocation did not
+                // open belongs to that attempt.
+                Ok(Some(consumer_id)) if !reasked => {
                     serde_json::from_str::<String>(&consumer_id).unwrap_or_default()
                 }
-                Ok(None) => match request_entry_check(ctx, &task, &review, &consumers).await {
-                    Ok(EntryCheck::NothingToRun) => String::new(),
-                    Ok(EntryCheck::Asked(consumer_id)) => {
-                        if let Err(error) = crate::workflow::engine::durable::record_hook_effect(
-                            &ctx.task_id,
-                            CI_CONSUMER,
-                            &json!(consumer_id),
-                        )
-                        .await
-                        {
-                            return HookResult::Failed {
-                                reason: error.to_string(),
-                            };
+                Ok(_) => match request_entry_check(ctx, &task, &review, &consumers).await {
+                    Ok(asked) => {
+                        let consumer_id = match asked {
+                            EntryCheck::NothingToRun => String::new(),
+                            EntryCheck::Asked(consumer_id) => consumer_id,
+                        };
+                        for (key, value) in [
+                            (ENTRY_CHECK_CONFIG_EFFECT, ctx.state_config.clone()),
+                            (CI_CONSUMER, json!(consumer_id)),
+                        ] {
+                            if let Err(error) =
+                                crate::workflow::engine::durable::record_hook_effect(
+                                    &ctx.task_id,
+                                    key,
+                                    &value,
+                                )
+                                .await
+                            {
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
                         }
                         consumer_id
                     }
@@ -236,6 +260,54 @@ impl HookAction for RunCiSteps {
                 // attempt is cancelled and the hook fails as an unfinished
                 // check does.
                 Ok(CheckWaitState::Lost) => {
+                    // The run this consumer waited for is still being
+                    // stopped (the forced deletion that cancelled it was
+                    // refused because the run had not settled). A request
+                    // now would join that run and get its cancellation, so
+                    // the step looks again shortly, for two minutes at most.
+                    match ctx
+                        .db
+                        .cancelled_consumer_run_is_stopping(
+                            &consumer_id,
+                            WITHDRAWN_RUN_STOPPING_SECONDS,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            let until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(WITHDRAWN_RUN_RECHECK_SECONDS))
+                            .to_rfc3339();
+                            if crate::workflow::engine::durable::suspend_hook(
+                                &ctx.task_id,
+                                &consumer_id,
+                                until,
+                            ) {
+                                return HookResult::Ok;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return HookResult::Failed {
+                                reason: error.to_string(),
+                            }
+                        }
+                    }
+                    // A consumer withdrawn under a live step (a forced
+                    // Project deletion that was then refused cancels them)
+                    // is asked for again, like a changed configuration.
+                    match ask_again(
+                        ctx,
+                        &consumer_id,
+                        &review,
+                        "superseded_by_withdrawn_check",
+                        "the review check was withdrawn before it produced a result",
+                    )
+                    .await
+                    {
+                        Ok(true) => return self.execute(ctx).await,
+                        Ok(false) => {}
+                        Err(reason) => return HookResult::Failed { reason },
+                    }
                     let reason = "review check was lost before it produced a result";
                     cancel_review_after_authority_loss(ctx, &review, reason).await;
                     return HookResult::Failed {
@@ -262,6 +334,24 @@ impl HookAction for RunCiSteps {
                     db::CheckResultOutcome::TimedOut => Some("review command timed out"),
                     _ => Some("review check did not finish"),
                 };
+                // A cancelled run is nobody's verdict on the candidate: the
+                // entry joined a run that was being stopped for another
+                // reason. It asks again.
+                if result.outcome == db::CheckResultOutcome::Cancelled {
+                    match ask_again(
+                        ctx,
+                        &consumer_id,
+                        &review,
+                        "superseded_by_withdrawn_check",
+                        "the review check was cancelled before it produced a result",
+                    )
+                    .await
+                    {
+                        Ok(true) => return self.execute(ctx).await,
+                        Ok(false) => {}
+                        Err(reason) => return HookResult::Failed { reason },
+                    }
+                }
                 if let Some(reason) = unfinished {
                     cancel_review_after_authority_loss(ctx, &review, reason).await;
                     return HookResult::Failed {
@@ -464,6 +554,170 @@ impl HookAction for RunCiSteps {
 /// consumer it asked with. They make a woken or redelivered step continue.
 const CI_REVIEW: &str = "ci_review";
 const CI_CONSUMER: &str = "ci_consumer";
+/// The entry state configuration the recorded consumer was asked under, and
+/// how often this entry dropped a stale check and asked again.
+pub(crate) const ENTRY_CHECK_CONFIG_EFFECT: &str = "ci_config";
+pub(crate) const ENTRY_CHECK_REREQUESTS_EFFECT: &str = "ci_rerequests";
+/// A withdrawn consumer whose run is still being stopped: the entry waits
+/// for the run to end before it asks again, looking this often and for this
+/// long after the consumer was cancelled.
+const WITHDRAWN_RUN_RECHECK_SECONDS: i64 = if cfg!(test) { 1 } else { 5 };
+const WITHDRAWN_RUN_STOPPING_SECONDS: i64 = 120;
+/// An entry asks again at most this often (a configuration that keeps
+/// changing, or a check that keeps being withdrawn); then it parks typed.
+pub(crate) const ENTRY_CHECK_REREQUEST_LIMIT: u32 = 3;
+
+async fn entry_check_rerequests(task_id: &str) -> Result<u32, String> {
+    Ok(
+        crate::workflow::engine::durable::hook_effect(task_id, ENTRY_CHECK_REREQUESTS_EFFECT)
+            .await
+            .map_err(|error| error.to_string())?
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// Whether the check this hook asked for is stale because the entry's state
+/// configuration is no longer the one it was asked under. If so (and the
+/// entry may still ask again), the stale consumer is cancelled, a run it
+/// alone waited for on a daemon is fenced, the attempt that asked is closed
+/// as superseded and the re-request is counted. No budget is charged: the
+/// attempt never produced a verdict. Returns `true` when the caller must ask
+/// again.
+async fn supersede_stale_ask(ctx: &HookContext, asked: &AskedReview) -> Result<bool, String> {
+    let durable_effect = |key: &'static str| async move {
+        crate::workflow::engine::durable::hook_effect(&ctx.task_id, key)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let Some(consumer_id) = durable_effect(CI_CONSUMER)
+        .await?
+        .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
+    else {
+        return Ok(false);
+    };
+    let asked_under = durable_effect(ENTRY_CHECK_CONFIG_EFFECT)
+        .await?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    if asked_under.as_ref() == Some(&ctx.state_config) {
+        return Ok(false);
+    }
+    let Some(review) = ReviewRepo::get_by_id(&*ctx.db, &asked.review_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    // An attempt that already has its verdict is not asked again.
+    if settled_ci_result(&review).is_some() {
+        return Ok(false);
+    }
+    ask_again(
+        ctx,
+        &consumer_id,
+        &review,
+        "superseded_by_config_change",
+        "the review configuration changed while its checks ran",
+    )
+    .await
+}
+
+/// The check this entry waits for will not produce a verdict for it (its
+/// configuration changed, the check was withdrawn, or the run it joined was
+/// cancelled for somebody else). Close the consumer and the attempt that
+/// asked and count the re-request; the caller then runs the hook again, which
+/// opens a new attempt and asks once for the current configuration. `false`
+/// when the entry may not ask again: the bound is reached, the step's
+/// authority was withdrawn, or the hook does not run from a durable step.
+async fn ask_again(
+    ctx: &HookContext,
+    consumer_id: &str,
+    review: &db::Review,
+    status: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    if ctx.project_version.is_some_and(|version| version < 0)
+        || crate::workflow::engine::durable::current_hook(&ctx.task_id).is_none()
+    {
+        return Ok(false);
+    }
+    let rerequests = entry_check_rerequests(&ctx.task_id).await?;
+    if rerequests >= ENTRY_CHECK_REREQUEST_LIMIT {
+        return Ok(false);
+    }
+    // Counted before anything is closed: a step that dies or fails between
+    // here and the new request has still used one of its three, so no
+    // sequence of failures asks again without bound.
+    crate::workflow::engine::durable::record_hook_effect(
+        &ctx.task_id,
+        ENTRY_CHECK_REREQUESTS_EFFECT,
+        &json!(rerequests + 1),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if !drop_entry_check(ctx, consumer_id, review, status, reason).await? {
+        return Ok(false);
+    }
+    // No attempt is recorded any more: the hook opens the next one.
+    crate::workflow::engine::durable::record_hook_effect(&ctx.task_id, CI_REVIEW, &Value::Null)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Close a check this entry no longer waits for: first the attempt that
+/// asked, then its consumer. `false` when the attempt is no longer the one
+/// this hook asked with (somebody else wrote the Review row meanwhile) and
+/// is still open: nothing is closed then and the entry does not ask again,
+/// so one entry never has two open attempts.
+async fn drop_entry_check(
+    ctx: &HookContext,
+    consumer_id: &str,
+    review: &db::Review,
+    status: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let mut details: Value = serde_json::from_str(&review.step_results_json)
+        .unwrap_or_else(|_| json!({ "ci_steps": [] }));
+    if !details.is_object() {
+        details = json!({ "ci_steps": [] });
+    }
+    let now = now_rfc3339();
+    details["execution_retry"] = json!({ "status": status, "reason": reason, "cancelled_at": now });
+    let closed = ReviewRepo::cancel_if_unchanged(
+        &*ctx.db,
+        &review.id,
+        review.status.clone(),
+        &review.updated_at,
+        details.to_string(),
+        &now,
+        &now,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if closed.is_none() {
+        // A redelivered step finds the attempt it already closed.
+        let current = ReviewRepo::get_by_id(&*ctx.db, &review.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if current.is_some_and(|current| current.status != ReviewStatus::Cancelled) {
+            return Ok(false);
+        }
+    }
+    if !consumer_id.is_empty() {
+        let step_id = crate::workflow::engine::durable::current_hook(&ctx.task_id)
+            .map(|attempt| attempt.step.id.clone());
+        crate::check_runner::review_entry::withdraw_consumer(
+            &ctx.db,
+            ctx.daemon_connections.clone(),
+            step_id.as_deref(),
+            consumer_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(true)
+}
 /// The wall limit of one review-entry CI run.
 pub const ENTRY_CHECK_WALL_SECONDS: u64 = 3600;
 static ENTRY_CHECK_WALL_OVERRIDE: std::sync::Mutex<Vec<(String, u64)>> =
@@ -604,8 +858,34 @@ async fn request_entry_check(
     )
     .await
     {
-        Ok(workspace) => workspace,
+        Ok(workspace) => {
+            super::common::disk_wait_over(ctx, task).await;
+            workspace
+        }
         Err(error) => {
+            // The worktree would have to be made again under the disk
+            // floor: the entry waits for disk and asks again. No command
+            // ran and no attempt exists; the woken hook opens its own.
+            if crate::placement::capacity_wait_of(&error)
+                == Some(crate::placement::CapacityWait::Disk)
+            {
+                let _ = ctx.db.discard_unstarted_review(&review.id).await;
+                if let Err(effect) = crate::workflow::engine::durable::record_hook_effect(
+                    &ctx.task_id,
+                    CI_REVIEW,
+                    &Value::Null,
+                )
+                .await
+                {
+                    return Err(failed(effect.to_string()));
+                }
+                return Err(
+                    match super::common::wait_for_disk(ctx, task, &error).await {
+                        Some(waiting) => waiting,
+                        None => failed(error.to_string()),
+                    },
+                );
+            }
             let reset = matches!(error, crate::ServiceError::WorkspaceResetRequired { .. });
             let retry = matches!(
                 error,

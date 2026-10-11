@@ -365,7 +365,7 @@ impl WorkflowTemplateService {
 /// Drop every hook whose action was removed from the registry
 /// ([`crate::workflow::registry::REMOVED_HOOK_ACTIONS`]) from `definition`.
 /// Returns the names dropped, once each. The same rewrite migration
-/// `V202610110247` applies to stored workflows.
+/// `V202610111217` applies to stored workflows.
 pub(crate) fn strip_removed_hooks(definition: &mut WorkflowDefinition) -> Vec<&'static str> {
     let mut dropped = Vec::new();
     for state in &mut definition.states {

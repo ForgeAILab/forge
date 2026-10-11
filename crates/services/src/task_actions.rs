@@ -490,14 +490,20 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         return offers;
     }
     // A running Task is held through its execution (below); a dispatch-wait
-    // Hold only applies to work that is waiting to be dispatched.
+    // Hold only applies to work that is waiting to be dispatched. A Task
+    // whose entry hooks have not finished is not that: its hooks step waits
+    // (for a check, or for free disk to make its worktree again), a hold
+    // would supersede that step, and the release has no entry to resume: the
+    // Task would sit in its state with its entry never run (a review with no
+    // check and no attempt, offered for approval). It offers `cancel` only.
     let running_live = running && !snapshot.owner_disconnected;
     if !held
         && !running_live
         && (queued
             || (snapshot.wait_cause.is_some()
                 && condition.is_none()
-                && !condition_read.hard_failure))
+                && !condition_read.hard_failure
+                && !snapshot.entry_hooks_running))
     {
         offer(
             TaskAction::Hold { reason: None },
@@ -579,7 +585,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                         )
                     }));
     if placement_wait {
-        if !queued && snapshot.wait_cause.is_none() {
+        if !queued && snapshot.wait_cause.is_none() && !snapshot.entry_hooks_running {
             offer(
                 TaskAction::Hold { reason: None },
                 &[],
