@@ -776,7 +776,10 @@ async fn a_move_on_one_filesystem_keeps_every_file_git_state_and_database_path()
     assert!(report.not_copied.is_empty() && report.warnings.is_empty());
     // A user's own repository: Git re-registered the worktree there, and
     // nothing else in it changed.
-    assert_eq!(report.user_repositories, [install.user_repo.clone()]);
+    assert_eq!(
+        report.user_repositories,
+        std::slice::from_ref(&install.user_repo)
+    );
     assert_eq!(tree(&install.user_repo), user_repo_before);
     let summary = report.to_string();
     assert!(summary.contains("left in the old root (not this database's): someone-elses"));
