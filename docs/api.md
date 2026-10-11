@@ -3573,6 +3573,14 @@ the first such Task and an `error` that lists up to ten of them and says what
 to do (assign the Agent to the `reviewer` role and remove the key). It goes
 away when no open Task names an auditor.
 
+While the import of merges that were in progress when the server was upgraded
+has not completed (it failed at start and is retried every 30 seconds),
+`recent_errors` carries one entry with `entity_type` `integration_import`,
+severity `error`, `entity_id` `start`, the last error in `error` and the time
+of the first failure in `occurred_at`. The merge queue does not run and no
+Task is admitted to it meanwhile. The entry goes away when the import
+completes.
+
 While the server's workspace root is inside the system temp directory (an
 install of a release that kept the default there), `recent_errors` carries
 one entry with `entity_type` `workspace_root`, `entity_id` the root path and

@@ -41,6 +41,10 @@ pub struct OperatorStatusService {
     relay_enabled: AtomicBool,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    /// The start-time integration import that has not completed: its last
+    /// error and when it first failed. While it is set the merge queue does
+    /// not run (`RuntimeSupervisor::start` retries the import).
+    integration_import: RwLock<Option<(String, String)>>,
 }
 
 impl OperatorStatusService {
@@ -61,6 +65,7 @@ impl OperatorStatusService {
             event_relay: RwLock::new(None),
             relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
+            integration_import: RwLock::new(None),
             workspace_backend_router,
         }
     }
@@ -88,6 +93,7 @@ impl OperatorStatusService {
             event_relay: RwLock::new(None),
             relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
+            integration_import: RwLock::new(None),
         }
     }
 
@@ -142,6 +148,18 @@ impl OperatorStatusService {
             .collect();
     }
 
+    /// `Some(error)`: the start-time integration import failed and is being
+    /// retried; `None`: it completed. Reported as the `integration_import`
+    /// entry of `recent_errors` for as long as it is set.
+    pub fn set_integration_import_failure(&self, error: Option<String>) {
+        let mut state = self.integration_import.write().expect("import status lock");
+        *state = error.map(|error| {
+            let since = state
+                .as_ref()
+                .map_or_else(db::now_rfc3339, |(_, since)| since.clone());
+            (error, since)
+        });
+    }
     pub fn set_event_relay(&self, relay: Arc<crate::DomainEventBroadcastConsumer>) {
         *self.event_relay.write().expect("relay status lock") = Some(relay);
     }
@@ -436,6 +454,24 @@ impl OperatorStatusService {
                     crate::task_service::RETIRED_AUDITOR_CONFIG,
                 ),
                 occurred_at: now.to_rfc3339(),
+            });
+        }
+        // The start-time import of merges that were in flight before the
+        // queue has not completed: nothing merges until it does.
+        let import = self
+            .integration_import
+            .read()
+            .expect("import status lock")
+            .clone();
+        if let Some((error, since)) = import {
+            recent_errors.push(RecentErrorSummary {
+                severity: api_types::OperatorSeverity::Error,
+                entity_type: "integration_import".into(),
+                entity_id: "start".into(),
+                error: format!(
+                    "The import of merges that were in progress when the server was upgraded has not completed: {error}. The merge queue is not running and no Task is admitted to it; the server retries the import every 30 seconds."
+                ),
+                occurred_at: since,
             });
         }
         // A root in the system temp directory loses worktrees to the
@@ -1684,6 +1720,45 @@ mod tests {
             .recent_errors
             .iter()
             .all(|issue| issue.entity_type != "retired_review_auditor_config"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_integration_import_is_an_operator_error_until_it_completes() {
+        let (_db, service) = test_service().await;
+        sync_fixtures(&service).await;
+        service.set_integration_import_failure(Some("database is locked".into()));
+        let status = service.compute_status().await.expect("status computes");
+        let reported = status
+            .recent_errors
+            .iter()
+            .filter(|issue| issue.entity_type == "integration_import")
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 1, "{:?}", status.recent_errors);
+        assert_eq!(reported[0].severity, OperatorSeverity::Error);
+        assert!(
+            reported[0].error.contains("database is locked")
+                && reported[0].error.contains("merge queue is not running"),
+            "{}",
+            reported[0].error
+        );
+        let since = reported[0].occurred_at.clone();
+        // A later failure keeps the time of the first.
+        service.set_integration_import_failure(Some("still failing".into()));
+        let status = service.compute_status().await.expect("status computes");
+        let again = status
+            .recent_errors
+            .iter()
+            .find(|issue| issue.entity_type == "integration_import")
+            .expect("still reported");
+        assert_eq!(again.occurred_at, since);
+        assert!(again.error.contains("still failing"));
+
+        service.set_integration_import_failure(None);
+        let status = service.compute_status().await.expect("status computes");
+        assert!(status
+            .recent_errors
+            .iter()
+            .all(|issue| issue.entity_type != "integration_import"));
     }
 
     #[tokio::test]

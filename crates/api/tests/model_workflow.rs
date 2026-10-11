@@ -3630,7 +3630,12 @@ impl World {
             .map_err(sql)?;
         let counts = |pool: sqlx::SqlitePool| async move {
             let mut out = Vec::new();
-            for table in ["task_step", "domain_event", "transition_log", "integration_attempt"] {
+            for table in [
+                "task_step",
+                "domain_event",
+                "transition_log",
+                "integration_attempt",
+            ] {
                 let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                     .fetch_one(&pool)
                     .await
@@ -3643,7 +3648,10 @@ impl World {
             .fetch_one(&pool)
             .await
             .unwrap_or((-1, -1));
-            format!("{out:?} task versions {} attempt revisions {}", moved.0, moved.1)
+            format!(
+                "{out:?} task versions {} attempt revisions {}",
+                moved.0, moved.1
+            )
         };
         // Let the check worker's own start-up writes pass first.
         let mut before: i64 = -1;
@@ -3750,6 +3758,7 @@ impl World {
 
     /// The rows behind a failure: each Task's own columns, its attempts with
     /// their journals, its open steps and the trace.
+    #[allow(clippy::type_complexity)]
     async fn upgrade_rows(&self) -> String {
         let pool = &self.live().pool;
         let mut out = String::new();
@@ -4283,7 +4292,10 @@ async fn a_coordination_root_merges_through_the_queue() {
         }
         let tip = git(
             &world.dir.path().join("repo"),
-            &["rev-parse", &format!("refs/heads/task/{}", &world.tasks[0][..8])],
+            &[
+                "rev-parse",
+                &format!("refs/heads/task/{}", &world.tasks[0][..8]),
+            ],
         )?;
         if !world.on_main(&tip) {
             return Err(format!("the root's branch {tip} is not on main"));
@@ -4292,7 +4304,11 @@ async fn a_coordination_root_merges_through_the_queue() {
             let file = world.dir.path().join("repo").join(deliverable(index));
             let tracked = git(
                 &world.dir.path().join("repo"),
-                &["cat-file", "-e", &format!("refs/heads/main:{}", deliverable(index))],
+                &[
+                    "cat-file",
+                    "-e",
+                    &format!("refs/heads/main:{}", deliverable(index)),
+                ],
             );
             if tracked.is_err() {
                 return Err(format!("main lacks {}", file.display()));

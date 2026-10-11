@@ -78,7 +78,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - **Upgrade.** Merges that are in flight when the server is upgraded are
     taken into the queue at the first start: a merge that already landed is
     reported, an unknown result is looked up before anything is repeated, a
-    Task waiting on its owner keeps waiting with the reason shown. Upgrade
+    Task waiting on its owner keeps waiting with the reason shown. If that
+    import fails, the merge queue does not start, the server retries it every
+    30 seconds, and operator status lists it (`recent_errors`, `entity_type =
+    "integration_import"`, severity `error`) until it completes. Upgrade
     the server, then each daemon (daemon protocol revision 7 is required for
     Tasks or default checkouts on a daemon).
   - Not in this release yet: the queue is not readable through REST, MCP or

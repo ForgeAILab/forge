@@ -1033,6 +1033,9 @@ impl RuntimeSupervisor {
                     .task_service
                     .integration_import_pending()
                     .store(true, std::sync::atomic::Ordering::Release);
+                self.runtime
+                    .operator_status_service
+                    .set_integration_import_failure(Some(error.to_string()));
                 tracing::error!(%error, "integration import failed at start; the merge queue waits and retries it")
             }
         }
@@ -1091,6 +1094,7 @@ impl RuntimeSupervisor {
         // sweep: every failed try is this worker's reported tick error.
         let import_pending = self.runtime.task_service.integration_import_pending();
         let import_db = Arc::clone(&self.runtime.db);
+        let import_status = Arc::clone(&self.runtime.operator_status_service);
         let integration_worker = Arc::clone(&self.runtime.integration_worker);
         self.handles.push((
             RuntimeWorker::IntegrationQueue,
@@ -1098,10 +1102,11 @@ impl RuntimeSupervisor {
                 shutdown.clone(),
                 || false,
                 move |periodic, mut shutdown| {
-                    let (worker, db, pending) = (
+                    let (worker, db, pending, status) = (
                         Arc::clone(&integration_worker),
                         Arc::clone(&import_db),
                         Arc::clone(&import_pending),
+                        Arc::clone(&import_status),
                     );
                     async move {
                         use std::sync::atomic::Ordering;
@@ -1116,9 +1121,11 @@ impl RuntimeSupervisor {
                             match imported {
                                 Ok(()) => {
                                     pending.store(false, Ordering::Release);
+                                    status.set_integration_import_failure(None);
                                     tracing::info!("integration import completed; the merge queue starts");
                                 }
                                 Err(error) => {
+                                    status.set_integration_import_failure(Some(error.to_string()));
                                     tracing::error!(%error, "integration import failed; the merge queue waits and retries");
                                     tokio::select! {
                                         changed = shutdown.changed() => {
