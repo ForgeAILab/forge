@@ -844,6 +844,72 @@ async fn review_retry_on_an_unchanged_commit_reuses_green_ci_and_dispatches_the_
     assert_no_synthetic_reviewer_execution(db, &task_id).await;
 }
 
+// A Task with a reviewer Agent, whose checks are red. The owner's retry queues
+// the reviewer launch that follows a green entry; the entry fails and the
+// Task goes to remediation. That launch belonged to the entry that ended: it
+// is dropped, and the Task is not parked on "stale queued Task action".
+#[tokio::test]
+async fn review_retry_with_a_reviewer_and_red_checks_goes_to_remediation_without_a_stale_action() {
+    let (harness, task_id, _reviewer, _dirs) =
+        seed_rerun_task("forge-rerun-review-reviewer-red", Some(false)).await;
+    let db = &harness.state.db;
+    set_review_ci_steps(db, &task_id, &["false"]).await;
+    let dispatcher = harness
+        .state
+        .task_dispatcher
+        .as_ref()
+        .expect("the harness composes a dispatcher");
+
+    post_retry(&harness, &task_id, StatusCode::OK).await;
+    let mut settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    for _ in 0..6 {
+        let _ = harness
+            .state
+            .task_service
+            .test_dispatch_task_action(&task_id)
+            .await;
+        dispatcher.check_once().await.expect("dispatcher pass");
+        settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    }
+
+    assert_eq!(settled.status, "in_progress");
+    let row: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT metadata_json, error_annotation, blocked_json, failed_json FROM task WHERE id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !format!("{row:?} {:?}", settled.condition).contains("stale queued Task action"),
+        "{row:?} {:?}",
+        settled.condition
+    );
+    assert!(
+        !row.0
+            .as_deref()
+            .unwrap_or_default()
+            .contains("queued_recovery"),
+        "the launch queued for the ended entry is gone: {row:?}"
+    );
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+            &task_id
+        )
+        .await,
+        0,
+        "no reviewer runs for an entry whose checks failed"
+    );
+    assert_eq!(review_budget_spent(db, &task_id).await, (0, 0));
+}
+
 // The retried entry with an assigned reviewer that passes: checks, then the
 // reviewer's verdict on the new attempt, then merging and done, exactly as an
 // automatic entry ends. Nothing is spent.

@@ -1359,3 +1359,295 @@ async fn a_rerun_is_refused_while_the_entry_step_is_claimed_or_woken() {
         );
     }
 }
+
+async fn seed_reviewer_agent(fixture: &FailedCiFixture) -> String {
+    let db = &*fixture.db;
+    let now = now_rfc3339();
+    let daemon_id = new_uuid_v4();
+    db::DaemonRepo::upsert_by_machine_id(
+        db,
+        db::UpsertDaemon {
+            max_concurrent_runs: None,
+            id: daemon_id.clone(),
+            machine_id: format!("machine-{daemon_id}"),
+            hostname: "test-host".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: None,
+            labels_json: "{}".to_owned(),
+            status: db::DaemonStatus::Online,
+            registration_token_hash: None,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::DaemonRepo::update_report(
+        db,
+        db::UpdateDaemonReport {
+            max_concurrent_runs: None,
+            id: daemon_id.clone(),
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            status: db::DaemonStatus::Online,
+            last_report_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let agent_id = new_uuid_v4();
+    db::AgentRepo::create(
+        db,
+        db::CreateAgent {
+            id: agent_id.clone(),
+            name: "reviewer".to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: Some(daemon_id),
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    assign_agent_role(db, &fixture.task.id, "reviewer", &agent_id).await;
+    agent_id
+}
+
+/// The Task is a coordination root (its one child is done and owns the only
+/// implementation run) parked in `review` on an exhausted review budget.
+async fn park_root_on_exhausted_review_budget(fixture: &FailedCiFixture) {
+    if count(
+        fixture,
+        "SELECT COUNT(*) FROM task WHERE parent_task_id IS NOT NULL",
+    )
+    .await
+        == 0
+    {
+        let child_id = new_uuid_v4();
+        let now = now_rfc3339();
+        TaskRepo::create(
+            &*fixture.db,
+            db::CreateTask {
+                id: child_id.clone(),
+                project_id: fixture.task.project_id.clone(),
+                parent_task_id: Some(fixture.task.id.clone()),
+                subtask_order: Some(0),
+                assignee_type: None,
+                assignee_id: None,
+                title: "the root's only subtask".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "done".to_owned(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution SET task_id = ? WHERE task_id = ?")
+            .bind(&child_id)
+            .bind(&fixture.task.id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+    }
+    // An automatic entry fails on the red check and spends the last of the
+    // review budget: the root parks in `review`.
+    sqlx::query("UPDATE task SET status = 'review' WHERE id = ?")
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let spent = review_budget_spent(fixture).await.0;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(
+            json!({"retry_budgets":{"review":spent + 1},"review":{"ci_steps":["false"]}})
+                .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    fixture
+        .engine
+        .rerun_review(
+            task_uuid(fixture),
+            api_types::Actor::system(api_types::SystemComponent::Workflow),
+        )
+        .await
+        .unwrap();
+    let parked = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(parked.status, "review", "{parked:?}");
+    assert!(
+        parked
+            .blocked_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("review retry budget exhausted"),
+        "{parked:?}"
+    );
+}
+
+async fn owner_offers(fixture: &FailedCiFixture) -> (crate::TaskSnapshot, Vec<(String, String)>) {
+    let actor = owner();
+    let snapshot = fixture
+        .engine
+        .task_action_snapshot(&fixture.task.id, &actor)
+        .await
+        .unwrap();
+    let offers = crate::available_actions(&snapshot)
+        .iter()
+        .map(|offer| (offer.action.verb().to_owned(), offer.reason.clone()))
+        .collect();
+    (snapshot, offers)
+}
+
+/// Run the Task's queued action and steps until nothing moves any more.
+async fn settle_actions(fixture: &FailedCiFixture) -> db::Task {
+    let mut task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    for _ in 0..6 {
+        let _ = fixture
+            .engine
+            .test_dispatch_task_action(&fixture.task.id)
+            .await;
+        task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    }
+    task
+}
+
+// Found by the model (`a_coordination_root_that_fails_aggregate_review_can_recover`
+// under load). A coordination root with a reviewer Agent is parked on an
+// exhausted review budget and its aggregate check is still red. The owner's
+// `retry` resets the budget and re-runs the review; the re-run queues the
+// reviewer launch that would follow a green entry. The entry fails and the
+// workflow sends the root to its working state. That queued launch belonged to
+// the entry that just ended: it is dropped. It used to be consumed in the new
+// state as "invalid operation: stale queued Task action", which parked the
+// root with only `restart` on offer, and `restart` led back to the exhausted
+// budget, for ever. The root is now where an automatic failed review leaves
+// it, unparked, for the scheduler to take to its aggregate review again; and
+// from the exhausted budget the owner can still reopen it for a corrective
+// subtask, which is the recovery that makes the check fixable.
+#[tokio::test]
+async fn an_owner_retry_on_an_exhausted_root_whose_check_is_still_red_never_parks_it_on_a_stale_action(
+) {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    seed_reviewer_agent(&fixture).await;
+    park_root_on_exhausted_review_budget(&fixture).await;
+
+    let (snapshot, offers) = owner_offers(&fixture).await;
+    assert!(snapshot.coordination_root);
+    assert!(
+        offers.contains(&("retry".to_owned(), "retry_budget_exhausted".to_owned()))
+            && offers.contains(&("send_back".to_owned(), "root_review_reopen".to_owned())),
+        "{offers:?}"
+    );
+
+    const RERUNS: &str = "SELECT COUNT(*) FROM transition_log WHERE from_state='review' AND to_state='review' AND json_extract(bridge_payload,'$.verb')='review_rerun'";
+    let reruns = count(&fixture, RERUNS).await;
+    fixture
+        .engine
+        .perform_task_action(
+            fixture.task.id.clone(),
+            api_types::TaskAction::retry(),
+            snapshot.task.version,
+        )
+        .await
+        .expect("the offered retry is accepted");
+    let after_retry = settle_actions(&fixture).await;
+
+    assert_eq!(
+        count(&fixture, RERUNS).await,
+        reruns + 1,
+        "the retry re-ran the aggregate review"
+    );
+    assert_eq!(
+        after_retry.status, "in_progress",
+        "the red check sent it back"
+    );
+    let visible = format!(
+        "{:?} {:?} {:?} {:?}",
+        after_retry.error_annotation,
+        after_retry.blocked_json,
+        after_retry.failed_json,
+        after_retry.metadata_json
+    );
+    assert!(!visible.contains("stale queued Task action"), "{visible}");
+    assert!(
+        after_retry.error_annotation.is_none()
+            && after_retry.blocked_json.is_none()
+            && after_retry.failed_json.is_none(),
+        "the root is not parked: {visible}"
+    );
+    assert!(
+        crate::deferred_dispatch::queued_recovery(&after_retry).is_none()
+            && crate::deferred_dispatch::pending_until(&after_retry).is_none(),
+        "the launch queued for the ended entry is gone: {visible}"
+    );
+    assert_eq!(synthetic_reviewer_executions(&fixture).await, 0);
+    assert_eq!(
+        review_budget_spent(&fixture).await.0,
+        0,
+        "the reset budget is untouched by the owner's failed re-run"
+    );
+
+    // The budget runs out again (the check is still red). The owner reopens
+    // the root for a corrective subtask: it goes to its working state with a
+    // fresh budget and accepts the subtask.
+    park_root_on_exhausted_review_budget(&fixture).await;
+    let (snapshot, offers) = owner_offers(&fixture).await;
+    assert!(
+        offers.contains(&("send_back".to_owned(), "root_review_reopen".to_owned())),
+        "{offers:?}"
+    );
+    fixture
+        .engine
+        .perform_task_action(
+            fixture.task.id.clone(),
+            api_types::TaskAction::SendBack {
+                guidance: "add the missing file".to_owned(),
+            },
+            snapshot.task.version,
+        )
+        .await
+        .expect("the offered reopen is accepted");
+    let reopened = settle_actions(&fixture).await;
+    assert_eq!(reopened.status, "in_progress", "{reopened:?}");
+    assert_eq!(review_budget_spent(&fixture).await.0, 0, "a fresh budget");
+    let visible = format!(
+        "{:?} {:?}",
+        reopened.error_annotation, reopened.blocked_json
+    );
+    assert!(!visible.contains("stale queued Task action"), "{visible}");
+    let (_, offers) = owner_offers(&fixture).await;
+    assert!(
+        !offers.iter().any(|(verb, _)| verb == "restart") || offers.len() > 1,
+        "the reopened root is not left with `restart` alone: {offers:?}"
+    );
+}

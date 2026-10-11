@@ -600,6 +600,38 @@ impl TaskService {
             }
             return Ok(false);
         };
+        if queued.continuation && queued.target_state != task.status {
+            // The entry this launch continued has ended by its own hooks. The
+            // Task is where the workflow sent it, in the condition the
+            // workflow gave it: the intent goes, and nothing is failed.
+            let raw = raw.as_ref().expect("queued marker came from metadata");
+            let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            if crate::deferred_dispatch::queued_recovery(&task)
+                .is_none_or(|current| current.id != queued.id)
+            {
+                return Ok(false);
+            }
+            TaskRepo::restore_queued_recovery(
+                &*self.db,
+                db::RestoreQueuedRecovery {
+                    task_id: task.id.clone(),
+                    expected_version: task.version,
+                    queued_recovery_id: raw
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    error_annotation: task.error_annotation.clone(),
+                    blocked_json: task.blocked_json.clone(),
+                    failed_json: task.failed_json.clone(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            return Ok(false);
+        }
         if queued.target_state != task.status
             || task.archived_at.is_some()
             || task.condition.read().hard_failure
