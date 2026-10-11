@@ -109,6 +109,7 @@ impl ForgeConfig {
         if let Some(workspace) = file.workspace {
             if let Some(root) = workspace.root {
                 self.workspace.root = expand_path(&root);
+                self.workspace.root_explicit = true;
             }
             if let Some(cleanup_delay_seconds) = workspace.cleanup_delay_seconds {
                 self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
@@ -310,6 +311,7 @@ impl ForgeConfig {
         }
         if let Some(value) = env_value("FORGE_WORKSPACE_ROOT") {
             self.workspace.root = expand_path(&value);
+            self.workspace.root_explicit = true;
         }
         if let Some(value) = env_value("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS") {
             self.workspace.cleanup_delay_seconds =
@@ -428,6 +430,7 @@ impl ForgeConfig {
         }
         if let Some(workspace_root) = overrides.workspace_root {
             self.workspace.root = workspace_root;
+            self.workspace.root_explicit = true;
         }
         if let Some(cleanup_delay_seconds) = overrides.workspace_cleanup_delay_seconds {
             self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;

@@ -409,6 +409,45 @@ impl OperatorStatusService {
                 });
             }
         }
+        // A root in the system temp directory loses worktrees to the
+        // operating system's cleaner: say so until the operator moves it.
+        let root_status = sqlx::query_as::<_, (String, String)>(
+            "SELECT value, updated_at FROM system_setting WHERE key = ?",
+        )
+        .bind(crate::workspace_root::STATUS_KEY)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((value, since)) = root_status {
+            let status: Value = serde_json::from_str(&value).unwrap_or_default();
+            let root = status["root"].as_str().unwrap_or_default().to_owned();
+            if status["state"].as_str() == Some("system_temp") {
+                recent_errors.push(RecentErrorSummary {
+                    severity: api_types::OperatorSeverity::Attention,
+                    entity_type: "workspace_root".into(),
+                    error: crate::workspace_root::system_temp_warning(
+                        std::path::Path::new(&root),
+                        status["migrate_command"]
+                            .as_str()
+                            .unwrap_or(crate::workspace_root::MIGRATE_COMMAND),
+                    ),
+                    entity_id: root.clone(),
+                    occurred_at: since.clone(),
+                });
+            }
+            // What the last start found and went on with: stored paths
+            // outside the root, a root that was missing, a foreign owner.
+            for warning in status["warnings"].as_array().into_iter().flatten() {
+                if let Some(warning) = warning.as_str() {
+                    recent_errors.push(RecentErrorSummary {
+                        severity: api_types::OperatorSeverity::Attention,
+                        entity_type: "workspace_root".into(),
+                        error: warning.to_owned(),
+                        entity_id: root.clone(),
+                        occurred_at: since.clone(),
+                    });
+                }
+            }
+        }
         for issue in &recent_errors {
             raise_severity(&mut overall_severity, issue.severity.clone());
         }

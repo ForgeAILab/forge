@@ -149,6 +149,12 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
+    /// Whether the operator chose `root` (config file, `FORGE_WORKSPACE_ROOT`
+    /// or an override) rather than taking the default. A chosen root that
+    /// differs from the one the database recorded is a deliberate move; a
+    /// default never is.
+    #[serde(skip)]
+    pub root_explicit: bool,
     pub cleanup_delay_seconds: u64,
     #[serde(default = "default_max_disconnect_seconds")]
     pub max_disconnect_seconds: u64,
@@ -474,7 +480,9 @@ impl ForgeConfig {
     #[must_use]
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            forge: ForgePaths { data_dir },
+            forge: ForgePaths {
+                data_dir: data_dir.clone(),
+            },
             server: ServerConfig {
                 check_run_timeout_seconds: default_check_run_timeout_seconds(),
                 main_working_set_target_tokens: 48000,
@@ -495,7 +503,8 @@ impl ForgeConfig {
                 event_consumer_stall_seconds: default_event_consumer_stall_seconds(),
             },
             workspace: WorkspaceConfig {
-                root: default_workspace_root(),
+                root: default_workspace_root(&data_dir),
+                root_explicit: false,
                 cleanup_delay_seconds: DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
                 max_disconnect_seconds: DEFAULT_MAX_DISCONNECT_SECONDS,
                 log_retention_days: DEFAULT_LOG_RETENTION_DAYS,

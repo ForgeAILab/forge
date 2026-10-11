@@ -289,7 +289,7 @@ impl EmbeddedTaskExecutor {
         let workspace_backend_router =
             crate::lifecycle::context::embedded_workspace_router_for_test(
                 Arc::clone(&db),
-                crate::task_service::workspace::default_workspace_root(),
+                crate::workspace_root::fixture_root(),
                 None,
             );
         Self {
@@ -403,10 +403,12 @@ impl EmbeddedTaskExecutor {
         // The Task service's own root and repository-cache locks, so a
         // recreate here is serialized with every other user of that cache.
         let task_service = self.embedded_agents.task_service_handle();
-        let workspace_root = task_service.as_ref().map_or_else(
-            crate::task_service::workspace::default_workspace_root,
-            |service| service.workspace_root().to_path_buf(),
-        );
+        let workspace_root = match task_service.as_ref() {
+            Some(service) => service.workspace_root().to_path_buf(),
+            None => crate::workspace_root::root_of(&self.db)
+                .await
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        };
         let valid = crate::workspace_manager::WorkspaceManager::new(
             &self.db,
             &workspace_root,

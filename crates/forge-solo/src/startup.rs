@@ -71,6 +71,9 @@ pub enum StartupError {
     #[error(transparent)]
     Tracing(#[from] TracingError),
 
+    #[error("{0}")]
+    WorkspaceRoot(String),
+
     #[error("Solo Agent {executor} is not authenticated or available on this machine")]
     AgentUnavailable { executor: String },
 
@@ -203,6 +206,42 @@ impl SoloStartup {
         let db = Arc::new(SqliteDb::new(pool));
         let event_bus = Arc::new(events::EventBus::new(EVENT_BUS_CAPACITY));
         let adapter_registry = Arc::new(cli_adapters::default_registry());
+
+        // Solo's root always follows its data root. It is recorded like the
+        // server's, and a database that recorded another root with live
+        // workspaces in it (a copied or relocated data root) is not started
+        // on: its stored paths would point at the other root.
+        // Solo's data root is never the server's default one, so the
+        // command always names it.
+        let migrate_command = format!(
+            "forge --data-dir {} --migrate-workspace-root",
+            paths.root.display()
+        );
+        let settled = services::workspace_root::settle(
+            &db,
+            &services::workspace_root::RootChoice {
+                configured: paths.worktrees.clone(),
+                explicit: true,
+                data_dir: paths.root.clone(),
+                system_temp: std::env::temp_dir(),
+                migrate_command: migrate_command.clone(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            StartupError::WorkspaceRoot(format!(
+                "{error}. Solo has no move command of its own: the `forge` binary runs it on Solo's data root exactly as written above"
+            ))
+        })?;
+        if settled.in_system_temp {
+            tracing::warn!(
+                "{}",
+                services::workspace_root::system_temp_warning(&settled.root, &migrate_command)
+            );
+        }
+        for warning in &settled.warnings {
+            tracing::warn!("{warning}");
+        }
 
         let runtime = Arc::new(
             ForgeRuntimeBuilder::from_config(

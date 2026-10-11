@@ -59,6 +59,25 @@ struct Cli {
     /// quarantined and deleted a day later.
     #[arg(long = "reclaim-workspace-gc")]
     reclaim_workspace_gc: bool,
+    /// Move the workspace root (Task worktrees, repository clones, execution
+    /// logs) to NEW_ROOT, or to <data dir>/worktrees when no path is given,
+    /// then exit. Stop Forge first. Every file is kept: entries are renamed
+    /// on one filesystem, otherwise copied, compared and only then removed;
+    /// Git worktree links and every stored path are rewritten. A run that
+    /// was interrupted is finished by running the command again.
+    #[arg(
+        long = "migrate-workspace-root",
+        value_name = "NEW_ROOT",
+        num_args = 0..=1,
+        conflicts_with_all = [
+            "demo",
+            "no_mcp",
+            "no_embedded_daemon",
+            "reclaim_workspace_gc",
+            "convert_db_to_incremental_vacuum"
+        ]
+    )]
+    migrate_workspace_root: Option<Option<PathBuf>>,
     /// Convert an existing database to incremental auto-vacuum, then exit.
     /// Stop Forge first. Full VACUUM locks the database and needs extra disk space.
     #[arg(long, conflicts_with_all = ["demo", "no_mcp", "no_embedded_daemon"])]
@@ -113,10 +132,35 @@ async fn run() {
         return;
     }
 
+    if let Some(target) = cli.migrate_workspace_root {
+        std::process::exit(migrate_workspace_root(&config, target).await);
+    }
+
     init_tracing(&config.forge.data_dir.join("logs"));
     executors::run_process::install_machine_policy(Arc::new(
         executors::run_process::MachineRunPolicy::new((&config.server).into()),
     ));
+
+    // 1. Create database pool and run migrations, then settle the workspace
+    // root against what this database recorded. A start that must be
+    // refused is refused here: before a port is bound, before the server
+    // state file is written, before anything is told where the root is.
+    let db_path = config.db_path();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).expect("Failed to create data directory");
+    }
+    let database_url = format!("sqlite:{}", db_path.display());
+    let forge_home = db_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("Failed to create database pool");
+    db::run_migrations(&pool)
+        .await
+        .expect("Failed to run migrations");
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let workspace_root = settle_workspace_root(&db, &config).await;
 
     let configured_addr: SocketAddr = config
         .server
@@ -152,20 +196,9 @@ async fn run() {
             "web UI assets not found; API routes will still run, but browser navigation may return 404"
         );
     }
-    let db_path = config.db_path();
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).expect("Failed to create data directory");
-    }
-    let database_url = format!("sqlite:{}", db_path.display());
-    let forge_home = db_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let workspace_root = absolute_path(config.workspace.root.clone())
-        .expect("Failed to resolve workspace root path");
-    // Components that cannot be handed the resolved root explicitly (e.g.
-    // Genesis repo provisioning inside the services crate) fall back to this
-    // env var; export the configured value so every path agrees.
-    std::env::set_var("FORGE_WORKSPACE_ROOT", &workspace_root);
+    // The settled root is handed to the runtime builder below; code that
+    // holds only the database reads the record `settle` wrote
+    // (`services::workspace_root::root_of`). Nothing reads the environment.
     // Opt-in: nothing is installed while `workspace.compiler_cache.wrapper`
     // is unset.
     executors::compiler_cache::install_configured(
@@ -191,15 +224,6 @@ async fn run() {
         "initializing forge"
     );
 
-    // 1. Create database pool and run migrations
-    let pool = db::create_sqlite_pool(&database_url)
-        .await
-        .expect("Failed to create database pool");
-    db::run_migrations(&pool)
-        .await
-        .expect("Failed to run migrations");
-
-    let db = Arc::new(db::SqliteDb::new(pool));
     let event_bus = Arc::new(events::EventBus::with_default_capacity());
     let mut registry = cli_adapters::default_registry();
     if cli.demo {
@@ -462,6 +486,100 @@ fn init_tracing(log_dir: &std::path::Path) {
     }
 }
 
+/// The workspace root this server runs on: the one its database recorded,
+/// or on a first start the configured one (see `services::workspace_root`).
+/// A configured root that would leave recorded workspaces behind, and a move
+/// that did not finish, stop the start here.
+async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathBuf {
+    let choice = services::workspace_root::RootChoice {
+        configured: absolute_path(config.workspace.root.clone())
+            .expect("Failed to resolve workspace root path"),
+        explicit: config.workspace.root_explicit,
+        data_dir: config.forge.data_dir.clone(),
+        system_temp: std::env::temp_dir(),
+        migrate_command: migrate_command(config),
+    };
+    match services::workspace_root::settle(db, &choice).await {
+        Ok(settled) => {
+            if settled.in_system_temp {
+                warn!(
+                    "{}",
+                    services::workspace_root::system_temp_warning(
+                        &settled.root,
+                        &choice.migrate_command
+                    )
+                );
+            }
+            for warning in &settled.warnings {
+                warn!("{warning}");
+            }
+            settled.root
+        }
+        Err(error) => {
+            // Tracing writes to stderr and to the log file.
+            error!("Forge cannot start on this workspace root: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The move command as this server's operator types it.
+fn migrate_command(config: &ForgeConfig) -> String {
+    services::workspace_root::RootChoice::migrate_command_for(
+        &config.forge.data_dir,
+        &config::default_data_dir(),
+    )
+}
+
+/// `forge --migrate-workspace-root [NEW_ROOT]`: the process exit code. The
+/// caller holds the data directory's runtime lock, so no server is running.
+async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -> i32 {
+    let opened = async {
+        let data_dir = absolute_path(config.forge.data_dir.clone()).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+        // The same file a start opens.
+        let database_url = format!("sqlite:{}", config.db_path().display());
+        let pool = db::create_sqlite_pool(&database_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        db::run_migrations(&pool).await.map_err(|e| e.to_string())?;
+        Ok::<_, String>((db::SqliteDb::new(pool), data_dir))
+    };
+    let (db, data_dir) = match opened.await {
+        Ok(opened) => opened,
+        Err(error) => {
+            eprintln!(
+                "The workspace root was not moved: the database could not be opened ({error})."
+            );
+            return 1;
+        }
+    };
+    // No path given: where this configuration would start, so the next
+    // start is not refused for a root that is set and differs.
+    let configured = config
+        .workspace
+        .root_explicit
+        .then(|| config.workspace.root.clone());
+    let request = services::workspace_root::migrate::MigrateRequest::new(
+        data_dir,
+        target,
+        std::env::temp_dir(),
+        config.workspace.min_free_bytes,
+    )
+    .with_default_target(configured)
+    .with_command(migrate_command(config));
+    match services::workspace_root::migrate::migrate(&db, &request).await {
+        Ok(report) => {
+            print!("{report}");
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn absolute_path(path: PathBuf) -> std::io::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path)
@@ -690,6 +808,49 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:49152".parse().expect("addr parses");
 
         assert_eq!(server_url_for_addr(addr), "http://127.0.0.1:49152");
+    }
+}
+
+#[cfg(test)]
+mod migrate_workspace_root_tests {
+    use super::*;
+
+    #[test]
+    fn flag_takes_an_optional_target_and_excludes_a_server_start() {
+        assert_eq!(
+            Cli::try_parse_from(["forge"])
+                .unwrap()
+                .migrate_workspace_root,
+            None
+        );
+        assert_eq!(
+            Cli::try_parse_from(["forge", "--migrate-workspace-root"])
+                .unwrap()
+                .migrate_workspace_root,
+            Some(None)
+        );
+        assert_eq!(
+            Cli::try_parse_from(["forge", "--migrate-workspace-root", "/srv/forge/worktrees"])
+                .unwrap()
+                .migrate_workspace_root,
+            Some(Some(PathBuf::from("/srv/forge/worktrees")))
+        );
+        let with_data_dir =
+            Cli::try_parse_from(["forge", "--data-dir", "./test", "--migrate-workspace-root"])
+                .unwrap();
+        assert_eq!(with_data_dir.migrate_workspace_root, Some(None));
+        for other in [
+            "--demo",
+            "--no-mcp",
+            "--no-embedded-daemon",
+            "--reclaim-workspace-gc",
+            "--convert-db-to-incremental-vacuum",
+        ] {
+            assert!(
+                Cli::try_parse_from(["forge", "--migrate-workspace-root", other]).is_err(),
+                "{other}"
+            );
+        }
     }
 }
 

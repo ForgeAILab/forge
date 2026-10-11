@@ -566,15 +566,6 @@ fn primary_worktree_from_list(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn managed_worktree_root(worktree: &Path) -> Option<PathBuf> {
-    if let Some(configured_root) = std::env::var_os("FORGE_WORKSPACE_ROOT") {
-        let configured_root = PathBuf::from(configured_root);
-        if let Ok(configured_root) = fs::canonicalize(configured_root) {
-            if worktree.starts_with(&configured_root) && worktree != configured_root {
-                return Some(configured_root);
-            }
-        }
-    }
-
     // WorkspaceManager places `.forge.lock` beside each task worktree. Walk
     // only ancestors of the resolved root so a tracked `.forge.lock` inside
     // the source checkout cannot trigger this check accidentally.
