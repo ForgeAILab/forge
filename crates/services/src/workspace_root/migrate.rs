@@ -941,9 +941,29 @@ struct Running {
     executions: i64,
     checks: i64,
     steps: i64,
-    integrations: i64,
+    /// Integration attempts that are not at rest: the Task and why.
+    integrations: Vec<String>,
     leases: i64,
 }
+
+/// The integration attempts a move must wait for.
+///
+/// An attempt is at rest when its state is final (`completed`, `cancelled`,
+/// `superseded`) or hands the Task back with nothing in flight (`parked`:
+/// waiting for an operator; `needs_review`, `ejected`: the Task is back
+/// with a reviewer or coder), AND it has no outstanding owner effect
+/// (`effect_intent_json`) and no operation whose result is running or
+/// unknown. That second half is the queue's own definition of an unsettled
+/// attempt. Every other state names a repository location or owner state
+/// that the queue is still acting on, or (`quarantined`) that nobody has
+/// established.
+const UNSETTLED_ATTEMPTS: &str = "SELECT task_ref, state, effect_intent_json IS NOT NULL,
+            COALESCE(current_operation_state, '')
+     FROM integration_attempt
+     WHERE state NOT IN ('completed', 'cancelled', 'superseded', 'parked', 'needs_review', 'ejected')
+        OR effect_intent_json IS NOT NULL
+        OR COALESCE(current_operation_state, '') IN ('running', 'uncertain')
+     ORDER BY updated_at, id";
 
 impl Running {
     async fn read(db: &SqliteDb) -> Result<Self, sqlx::Error> {
@@ -958,13 +978,23 @@ impl Running {
             // check it started in a worktree.
             steps: count("SELECT COUNT(*) FROM task_step WHERE status IN ('claimed', 'suspended')")
                 .await?,
-            // An integration attempt carries its repository location and
-            // owner state through every state but the final and parked ones.
-            integrations: count(
-                "SELECT COUNT(*) FROM integration_attempt
-                 WHERE state NOT IN ('completed', 'cancelled', 'superseded', 'parked')",
-            )
-            .await?,
+            integrations: sqlx::query_as::<_, (String, String, bool, String)>(UNSETTLED_ATTEMPTS)
+                .fetch_all(db.pool())
+                .await?
+                .into_iter()
+                .map(|(task, state, intent, operation)| {
+                    let mut why = format!("Task {task}: {state}");
+                    if intent {
+                        why.push_str(", owner effect outstanding");
+                    }
+                    if operation == "uncertain" {
+                        why.push_str(", operation result unknown");
+                    } else if operation == "running" {
+                        why.push_str(", operation running");
+                    }
+                    why
+                })
+                .collect(),
             leases: sqlx::query_scalar(
                 "SELECT COUNT(*) FROM workspace_lease WHERE status = 'active' AND expires_at > ?",
             )
@@ -978,7 +1008,7 @@ impl Running {
         self.executions == 0
             && self.checks == 0
             && self.steps == 0
-            && self.integrations == 0
+            && self.integrations.is_empty()
             && self.leases == 0
     }
 }
@@ -987,9 +1017,33 @@ impl std::fmt::Display for Running {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "the database records work in flight: {} running execution(s), {} running check run(s), {} claimed or suspended task step(s), {} integration attempt(s) that are neither finished nor parked and {} active workspace lease(s)",
-            self.executions, self.checks, self.steps, self.integrations, self.leases
-        )
+            "the database records work in flight: {} running execution(s), {} running check run(s), {} claimed or suspended task step(s), {} integration attempt(s) that are not at rest and {} active workspace lease(s)",
+            self.executions,
+            self.checks,
+            self.steps,
+            self.integrations.len(),
+            self.leases
+        )?;
+        if !self.integrations.is_empty() {
+            // Enough to find them; the rest are counted above.
+            const NAMED: usize = 8;
+            write!(
+                formatter,
+                " (integration: {}{})",
+                self.integrations
+                    .iter()
+                    .take(NAMED)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                if self.integrations.len() > NAMED {
+                    "; ..."
+                } else {
+                    ""
+                }
+            )?;
+        }
+        Ok(())
     }
 }
 

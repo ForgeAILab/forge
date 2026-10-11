@@ -2386,6 +2386,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **`forge --migrate-workspace-root` no longer waits for integration
+  attempts that are at rest.** An attempt in `needs_review` or `ejected`
+  (the Task is back with a reviewer or coder) does not block the move any
+  more; `quarantined`, `reconciling` and any attempt with an owner effect
+  outstanding or an operation result unknown still do, and the refusal now
+  names each Task and its attempt state.
+- **The root-change refusal counted other databases' clones.** A start that
+  switches roots counted every directory under `<root>/.repos`; in a shared
+  root it now counts only the clones of this database's repositories, like
+  the move does.
+
 - **A slow compiler-cache server start no longer stalls other work.** An
   `sccache` server start (up to ten seconds) ran on the async worker that
   started the run; it now runs on the blocking pool, and a sandbox

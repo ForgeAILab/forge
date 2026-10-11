@@ -3508,8 +3508,13 @@ server, and in this order:
 
 1. **Refusals, before anything changes**: work recorded in flight (an
    execution `running`; a check run `running` / `cancelling` / `cleaning`;
-   a task step `claimed` or `suspended`; an integration attempt in any state
-   but `completed`, `cancelled`, `superseded` or `parked`; a workspace lease
+   a task step `claimed` or `suspended`; an integration attempt that is
+   not at rest (at rest: `completed`, `cancelled`, `superseded`, `parked`,
+   and `needs_review` / `ejected`, where the Task is back with a reviewer or
+   coder; each only without an owner effect outstanding and without an
+   operation whose result is running or unknown. `quarantined` and
+   `reconciling` block, and the refusal names each Task with its attempt
+   state); a workspace lease
    `active` and not expired); a target that is not empty (unless the old
    root no longer exists), not a directory, inside the old root or around
    it, or refused by the garbage collector's `refuse_root`; a `.git` file

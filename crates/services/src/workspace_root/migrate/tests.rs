@@ -935,7 +935,7 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
     // Each kind of recorded work in flight refuses it, with a real row.
     let task = &install.tasks[0];
     let project_id = task.project_id.clone();
-    let rows: [(&str, String, &str); 5] = [
+    let rows: [(&str, String, &str); 8] = [
         (
             "1 claimed or suspended task step(s)",
             step_sql(&task.id, 901, "hooks", "claimed", "{}"),
@@ -952,9 +952,32 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
             "DELETE FROM integration_attempt WHERE id = 'live-attempt'",
         ),
         (
-            "1 integration attempt(s)",
-            attempt_sql("review-attempt", "needs_review", "/elsewhere"),
-            "DELETE FROM integration_attempt WHERE id = 'review-attempt'",
+            "Task task: quarantined",
+            attempt_sql("quarantined-attempt", "quarantined", "/elsewhere"),
+            "DELETE FROM integration_attempt WHERE id = 'quarantined-attempt'",
+        ),
+        (
+            "Task task: reconciling",
+            attempt_sql("reconciling-attempt", "reconciling", "/elsewhere"),
+            "DELETE FROM integration_attempt WHERE id = 'reconciling-attempt'",
+        ),
+        // A state that is at rest by itself still blocks with an owner
+        // effect outstanding or an operation whose result is unknown.
+        (
+            "Task task: needs_review, owner effect outstanding",
+            format!(
+                "{}; UPDATE integration_attempt SET effect_intent_json = '{{}}' WHERE id = 'intent-attempt'",
+                attempt_sql("intent-attempt", "needs_review", "/elsewhere")
+            ),
+            "DELETE FROM integration_attempt WHERE id = 'intent-attempt'",
+        ),
+        (
+            "Task task: ejected, operation result unknown",
+            format!(
+                "{}; UPDATE integration_attempt SET current_operation_state = 'uncertain' WHERE id = 'unknown-attempt'",
+                attempt_sql("unknown-attempt", "ejected", "/elsewhere")
+            ),
+            "DELETE FROM integration_attempt WHERE id = 'unknown-attempt'",
         ),
         (
             "1 running check run(s)",
@@ -967,7 +990,12 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
         ),
     ];
     for (expected, insert, delete) in rows {
-        raw(&install.db, &[insert.as_str()]).await;
+        let statements: Vec<&str> = insert.split("; UPDATE").collect();
+        let update = statements.get(1).map(|rest| format!("UPDATE{rest}"));
+        raw(&install.db, &[statements[0]]).await;
+        if let Some(update) = &update {
+            raw(&install.db, &[update.as_str()]).await;
+        }
         let refused = migrate(&install.db, &install.request()).await.unwrap_err();
         let WorkspaceRootError::Refused(message) = &refused else {
             panic!("{expected}: {refused:?}");
@@ -982,23 +1010,122 @@ async fn a_move_is_refused_while_a_run_is_recorded_running() {
             "{expected}"
         );
     }
-    // An active lease refuses it as well. (The schema lets only the
-    // scheduler's governed path write one, so no fixture row: the count is
-    // the query `status = 'active' AND expires_at > now`.)
-    let leased = Running {
-        leases: 1,
-        ..Running::default()
-    };
-    assert!(!leased.is_empty());
-    assert!(leased.to_string().contains("1 active workspace lease(s)"));
-    let _ = execution;
-    // A parked attempt holds nothing.
-    raw(
+    // An active lease refuses it as well, issued the way the scheduler
+    // issues one (the schema refuses every other writer): to a running
+    // execution of the Task's agent. The execution then stops and leaves
+    // the lease, as an interrupted settlement does.
+    let task = db::TaskRepo::get_by_id(&install.db, &workspace.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = now_rfc3339();
+    let agent = db::AgentRepo::create(
         &install.db,
-        &[attempt_sql("parked-attempt", "parked", "/elsewhere").as_str()],
+        db::CreateAgent {
+            id: db::new_uuid_v4(),
+            name: "Migrate lease worker".to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .await;
+    .await
+    .expect("agent creates");
+    for statement in [
+        "UPDATE execution SET status = 'running', agent_id = ? WHERE id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(&agent.id)
+            .bind(&execution)
+            .execute(install.db.pool())
+            .await
+            .unwrap();
+    }
+    let lease = db::WorkspaceLeaseRepo::issue(
+        &install.db,
+        db::CreateWorkspaceLease {
+            id: db::new_uuid_v4(),
+            project_id: task.project_id.clone(),
+            task_id: task.id.clone(),
+            task_version: task.version,
+            execution_id: execution.clone(),
+            operation_idempotency_key: db::new_uuid_v4(),
+            repository_binding_id: workspace.repo_id.clone(),
+            base_ref: "main".to_owned(),
+            role: "worker".to_owned(),
+            capabilities_json: "[\"repository_write\"]".to_owned(),
+            assigned_principal_type: "agent".to_owned(),
+            assigned_principal_id: agent.id,
+            capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+            capability_profile_digest:
+                "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8"
+                    .to_owned(),
+            issuing_principal_type: "system".to_owned(),
+            issuing_principal_id: "task-service-scheduler".to_owned(),
+            issued_at: now.clone(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("lease issues");
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+        .bind(&execution)
+        .execute(install.db.pool())
+        .await
+        .unwrap();
+    let refused = migrate(&install.db, &install.request()).await.unwrap_err();
+    let WorkspaceRootError::Refused(message) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert!(
+        message.contains("0 running execution(s)")
+            && message.contains("1 active workspace lease(s)"),
+        "{message}"
+    );
+    install.assert_untouched(&before).await;
+    assert!(!install.target().exists());
+    db::WorkspaceLeaseRepo::revoke(&install.db, &lease.id, lease.version, &now_rfc3339())
+        .await
+        .expect("lease revokes");
     assert!(Running::read(&install.db).await.unwrap().is_empty());
+
+    // Attempts at rest hold nothing: parked, and handed back to a reviewer
+    // or coder. With them recorded, the move goes through.
+    for (id, state) in [
+        ("parked-attempt", "parked"),
+        ("review-attempt", "needs_review"),
+        ("ejected-attempt", "ejected"),
+    ] {
+        raw(
+            &install.db,
+            &[attempt_sql(id, state, "/elsewhere").as_str()],
+        )
+        .await;
+    }
+    assert!(Running::read(&install.db).await.unwrap().is_empty());
+    migrate(&install.db, &install.request())
+        .await
+        .expect("attempts at rest do not block the move");
 }
 
 /// Fixture rows written straight into tables whose own writers need a
