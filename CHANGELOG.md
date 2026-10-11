@@ -1110,6 +1110,39 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **A review entry asks for its checks again by itself.** When the review
+  commands of a Task or its Project change while the entry's checks run, the
+  finished check is not applied (as before) and the entry now asks again for
+  the current commands in the same review entry, instead of parking the Task
+  for its owner. The stale attempt is closed as `cancelled`
+  (`execution_retry.status = "superseded_by_config_change"`), no review budget
+  is spent, and an entry asks again at most three times before it parks as it
+  used to. A changed Project workflow still parks. The same now happens when
+  a check is withdrawn under a waiting entry (`superseded_by_withdrawn_check`):
+  a forced Project deletion that is refused after cancelling the Project's
+  checks no longer leaves those reviews failed.
+- **A missing worktree under the disk floor is a wait in three more places.**
+  The review entry's check request, a blocking before-work hook and a launch
+  after its claim no longer fail (or recreate the worktree under the floor):
+  the Task shows the disk capacity wait and continues by itself when the disk
+  recovers. A launch deferred this way ends its execution with the error
+  prefix `waiting for free disk before launch:` and `resume_policy = auto`.
+- **A Task that needs a second machine slot is no longer starved by queued
+  checks.** A wait for a run slot ages after three capacity releases or two
+  minutes; an aged waiter goes ahead of checks queued after it began to wait,
+  and such a check stands back for at most 90 seconds. Checks queued earlier
+  still go first, and the machine cap is unchanged.
+- **Review re-runs and held Tasks.** A review re-run is refused on a held Task
+  for every requester (409), including recovery; it runs after the release. A
+  failed review entry whose workflow does not define the state it would be
+  sent back to parks `blocked` (`review_gate_failed`, "review failed and the
+  workflow has no remediation state") instead of failing its cascade. A gate
+  without `reject_target` still sends the Task to `in_progress`.
+- **Tasks that still name `review.auditor_agent_id` say so to their owner.**
+  At start, each open Task with the retired key gets one non-blocking
+  Attention item (`review_risk`); it resolves when the key is removed.
+- **`forge-ctl operations status`** is new (see Added).
+
 - **A freed machine slot goes to a queued review check before a new run.**
   A queued check reserved nothing, so under sustained load the dispatcher
   could give every freed slot to a new execution and a Task in `review` waited
