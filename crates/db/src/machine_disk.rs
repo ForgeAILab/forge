@@ -34,6 +34,7 @@ struct State {
     reader: Option<DiskReader>,
     reading: Option<(Instant, Option<MachineDiskFacts>)>,
     unreadable_logged: bool,
+    check_run_timeout_seconds: Option<u64>,
 }
 
 /// The server's disk-admission state, shared through [`crate::SqliteDb`]
@@ -52,6 +53,23 @@ impl std::fmt::Debug for DiskAdmission {
 }
 
 impl DiskAdmission {
+    /// The configured wall limit of one check run. Sent to every daemon in
+    /// the reply to its report, beside the floor, so each machine's
+    /// collector keeps a check checkout exactly as long as the server's.
+    pub fn set_check_run_timeout_seconds(&self, seconds: u64) {
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .check_run_timeout_seconds = Some(seconds);
+    }
+
+    pub fn check_run_timeout_seconds(&self) -> Option<u64> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .check_run_timeout_seconds
+    }
+
     /// Turn admission on: the floor every machine is held to and how the
     /// server reads its own workspace root. Called by the running server.
     pub fn configure(&self, floor: DiskFloor, reader: DiskReader) {
@@ -180,6 +198,36 @@ pub async fn record_daemon_disk(
         .execute(db.pool())
         .await?;
     Ok(())
+}
+
+/// Store the sizes a daemon measured for its Task roots on their workspace
+/// rows. A handle that is not a live placement of this daemon is ignored:
+/// a daemon can only ever size the workspaces it owns. The time recorded is
+/// the server's, as for the daemon's disk facts.
+pub async fn record_daemon_workspace_disk(
+    db: &crate::SqliteDb,
+    daemon_id: &str,
+    sizes: &[api_types::DaemonWorkspaceDisk],
+) -> Result<u64> {
+    let now = crate::now_rfc3339();
+    let mut stored = 0;
+    for size in sizes.iter().take(api_types::DAEMON_WORKSPACE_DISK_LIMIT) {
+        stored += sqlx::query(
+            "UPDATE workspace SET disk_bytes = ?, disk_measured_at = ?
+             WHERE status NOT IN ('cleaned', 'cleaning')
+               AND id = (SELECT workspace_id FROM workspace_placement
+                         WHERE owner_kind = 'daemon' AND daemon_id = ?
+                           AND workspace_handle = ?)",
+        )
+        .bind(i64::try_from(size.disk_bytes).unwrap_or(i64::MAX))
+        .bind(&now)
+        .bind(daemon_id)
+        .bind(&size.workspace_handle)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+    }
+    Ok(stored)
 }
 
 /// What a daemon is short of by its last reported reading, while that

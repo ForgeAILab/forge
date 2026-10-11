@@ -103,6 +103,10 @@ impl WorkspaceCleanupScheduler {
 
     /// The configured wall limit of one check run, in seconds.
     pub fn set_check_timeout(&self, seconds: u64) {
+        // Every daemon is told the same limit in the reply to its report.
+        self.db
+            .disk_admission
+            .set_check_run_timeout_seconds(seconds);
         self.update_gc_settings(|settings| {
             settings.check_checkout_age = gc::check_checkout_age(seconds);
         });

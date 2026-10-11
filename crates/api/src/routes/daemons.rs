@@ -91,6 +91,10 @@ pub async fn report_daemon(
     if let Some(disk) = request.disk.as_ref() {
         db::machine_disk::record_daemon_disk(&state.db, &id, disk).await?;
     }
+    if !request.workspace_disk.is_empty() {
+        db::machine_disk::record_daemon_workspace_disk(&state.db, &id, &request.workspace_disk)
+            .await?;
+    }
     let daemon = state
         .daemon_service
         .ingest_report(

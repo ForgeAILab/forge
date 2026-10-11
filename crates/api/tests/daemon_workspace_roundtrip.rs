@@ -2668,6 +2668,57 @@ async fn remote_lost_run_result_reconciles_from_the_real_daemon_journal() {
     fixture.assert_server_cannot_resolve_workspace();
 }
 
+/// A daemon's report carries the sizes its collector measured for its Task
+/// roots; the server stores them on the workspace rows (only for handles
+/// that daemon owns) and the reply carries the server's check-run limit
+/// beside the floor.
+#[tokio::test]
+async fn remote_daemon_report_stores_task_root_sizes_and_returns_the_check_limit() {
+    let fixture = Fixture::new("forge-owner-disk-sizes").await;
+    let placement = &fixture.resolved.placement;
+    let db = &fixture.harness.state.db;
+    let row = || async {
+        WorkspaceRepo::get_by_id(&**db, &placement.workspace_id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(row().await.disk_bytes, None, "a daemon's root was never sized");
+    db.disk_admission.set_check_run_timeout_seconds(5400);
+    let report_url = format!("/api/v1/daemons/{}/report", fixture.daemon_id);
+    let size = |handle: &str, bytes: u64| json!({"workspace_handle": handle, "disk_bytes": bytes, "measured_at": "2026-10-10T00:00:00Z"});
+    let reply: DaemonResponse = common::json_request_with_bearer(
+        &fixture.harness.app,
+        Method::POST,
+        &report_url,
+        &fixture.token,
+        json!({
+            "detected_clis": [],
+            "workspace_disk": [
+                size(placement.workspace_handle.as_deref().unwrap(), 4096),
+                size("workspace-00000000-0000-4000-8000-000000000000", 1),
+            ],
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(reply.check_run_timeout_seconds, Some(5400));
+    let sized = row().await;
+    assert_eq!(sized.disk_bytes, Some(4096));
+    assert!(sized.disk_measured_at.is_some());
+    // A report without sizes (an older daemon) leaves the row as it is.
+    let _: DaemonResponse = common::json_request_with_bearer(
+        &fixture.harness.app,
+        Method::POST,
+        &report_url,
+        &fixture.token,
+        json!({"detected_clis": []}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(row().await.disk_bytes, Some(4096));
+}
+
 #[tokio::test]
 async fn remote_plan_owner_publication_restore_and_discard_are_fenced() {
     let fixture = Fixture::new("forge-owner-plan-publication").await;

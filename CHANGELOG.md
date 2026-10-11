@@ -2125,6 +2125,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Daemon-owned workspaces report their disk usage.** A daemon's garbage
+  collector now measures the Task roots of its live handles (bounded, like
+  the server's) and sends the sizes in its report (`workspace_disk`, an
+  optional array in the unreleased protocol revision 7 payload); the server
+  stores them in `workspace.disk_bytes` / `disk_measured_at`, which were
+  always `null` for a daemon-owned workspace.
+- **Daemons take the check-checkout age from the server.** The reply to a
+  daemon report carries `check_run_timeout_seconds` beside `workspace_floor`,
+  and the daemon's collector keeps an unheld check checkout exactly as long
+  as the server's does. A daemon has no built-in value of its own for either.
+- **Compiler-cache stores of deleted repositories are removed.** The
+  collector removes the store of a repository the owner no longer has, 24
+  hours after its last run start and never while a run holds it; its
+  `sccache` server is stopped first.
+
 - **`forge --migrate-workspace-root [<new root>]` moves the server's
   workspace root and keeps every file (3.4 D1).** Run with the server
   stopped; the default target is the configured root, else
@@ -2370,6 +2385,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A slow compiler-cache server start no longer stalls other work.** An
+  `sccache` server start (up to ten seconds) ran on the async worker that
+  started the run; it now runs on the blocking pool, and a sandbox
+  constructor never waits for one.
+- **Collector deletes could be redirected through a planted link.** A Task
+  with write access could replace a directory by a link between the
+  collector's walk and its delete. Cache eviction, tree removal and
+  build-output eviction now walk by file descriptor and never follow a link.
+- **A worktree is no longer recreated under the disk floor for review, hook,
+  check, integrate or reset.** `WorkspaceManager::ensure_valid` returns a
+  typed disk outcome for a recreate (never for a worktree that is there and
+  valid), which is the same `disk_pressure` placement refusal a claim takes.
 
 - **Garbage collection could take a build directory from a run that had just
   started, and other collector safety gaps (3.4 stage E).** Build eviction is

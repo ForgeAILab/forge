@@ -3707,8 +3707,26 @@ is still returned but its `pressure` is `null` and it refuses nothing. `gc_state
 collector runs on that root: `owned`, or `unclaimed`, `claimed_by_other`,
 `refused`. A report without `disk` keeps the last reading.
 
+The report also accepts an optional `workspace_disk` array, the sizes the
+daemon's garbage collector measured for the Task roots it owns (a bounded
+walk per root, the least recently measured first, at most 256 entries a
+report):
+
+```json
+{ "workspace_disk": [
+  { "workspace_handle": "workspace-0b9f…", "disk_bytes": 734003200,
+    "measured_at": "2026-10-10T12:00:00Z" } ] }
+```
+
+The server stores each on the workspace row of that daemon's live placement
+with that handle (`disk_bytes`, and `disk_measured_at` set to the server's
+clock), which is what `GET /api/v1/workspaces` and the Task workspace reads
+return; before, `disk_bytes` was always `null` for a daemon-owned workspace.
+A handle that is not a live placement of the reporting daemon is ignored. A
+report without `workspace_disk` (an older daemon) changes no row.
+
 Every daemon read (`POST .../report` reply, `GET /api/v1/daemons`,
-`GET /api/v1/daemons/{id}`, `PATCH /api/v1/daemons/{id}`) adds two nullable
+`GET /api/v1/daemons/{id}`, `PATCH /api/v1/daemons/{id}`) adds three nullable
 fields:
 
 - `disk`: the last reading with the floor applied: the fields above plus
@@ -3720,6 +3738,11 @@ fields:
   "gc_free_bytes", "gc_free_percent" }` (the last two `null` when unset: the
   collector mark is then twice the floor). A daemon applies it to its own
   collector.
+- `check_run_timeout_seconds`: the server's `server.check_run_timeout_seconds`.
+  A daemon's collector derives from it the age after which a check checkout
+  nobody holds is removed (twice the limit plus an hour, at least two hours),
+  as the server's collector does. `null` from a server that has not started
+  its collector.
 
 Each Operations `daemon_pressure` entry adds the same nullable `disk`; an entry
 whose `disk.pressure` is set is a machine under its floor.
