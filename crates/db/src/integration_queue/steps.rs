@@ -218,6 +218,62 @@ pub enum TaskIntegrationCancel {
     /// One of those four states with no protected step (a shadow or imported
     /// row nothing drives): the Cancel proceeds and nothing is written.
     Undriven,
+    /// The attempt held no slot and no owner effect was outstanding: it is
+    /// cancelled in the Cancel's own transaction.
+    Cancelled,
+}
+
+/// The Task's cancel transition (and the board move into the cancellation
+/// state). An attempt that holds no slot of its queue and has no owner effect
+/// outstanding is ended here, in the transition's own transaction, instead of
+/// at the worker's next sweep: a server start in between would find a live
+/// attempt behind a terminal Task and import the old merge intent a second
+/// time. It carries no cancel request, so the worker's release-step sweep
+/// reads it and asks for the `clear` no worker asked for.
+///
+/// Everything else is [`request_task_integration_cancel_in_tx`]: an attempt
+/// in the slot stays its head driver's (it is flagged), and so does one with
+/// an admitted effect, which only its owner's receipt settles.
+pub async fn cancel_task_integration_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    requested_at: &str,
+) -> Result<TaskIntegrationCancel> {
+    integration_time(requested_at)?;
+    if let Ok(Some(mut a)) = current_integration_attempt_in_tx(tx, task_id).await {
+        let holds_slot: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM integration_queue WHERE head_attempt_id=?)",
+        )
+        .bind(&a.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !holds_slot
+            && a.cancel_requested_at.is_none()
+            && a.effect_intent_json.is_none()
+            // The states of a member that waits its turn or its time. Every
+            // other cancellable state is a head's, whatever the queue row
+            // says at this instant.
+            && matches!(
+                a.state,
+                IntegrationAttemptState::Queued | IntegrationAttemptState::Parked
+            )
+            && !matches!(
+                a.current_operation_state,
+                Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+            )
+        {
+            a.state = IntegrationAttemptState::Cancelled;
+            a.permit_json = None;
+            a.available_at = None;
+            a.deadline = None;
+            a.current = false;
+            a.updated_at = requested_at.to_owned();
+            a.completed_at = Some(requested_at.to_owned());
+            super::update_attempt(tx, &a).await?;
+            return Ok(TaskIntegrationCancel::Cancelled);
+        }
+    }
+    request_task_integration_cancel_in_tx(tx, task_id, requested_at).await
 }
 
 /// Called by the Task's cancel transition inside its own transaction. Never

@@ -498,6 +498,12 @@ impl IntegrationQueueWorker {
         };
         let request = Self::step_request(attempt, action);
         let state = self.steps.step_state(&request).await?;
+        // The Task's own Cancel ended an attempt that held no slot in its
+        // transaction (`db::cancel_task_integration_in_tx`): no worker
+        // released it, so its `clear` was never asked. Asked here, once.
+        if attempt.state == S::Cancelled && state == IntegrationStepState::Missing {
+            return self.steps.enqueue_step(&request).await;
+        }
         if !matches!(
             state,
             IntegrationStepState::Dead | IntegrationStepState::TaskLeft

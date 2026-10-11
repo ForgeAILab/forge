@@ -212,17 +212,13 @@ impl TaskBoardRepo for SqliteDb {
             });
         }
         // The same single writer the cancel transition uses: a board move
-        // into the cancellation state flags the Task's attempt here, or
-        // waits behind the protected result step. Nothing is written when
-        // the Task has no attempt.
+        // into the cancellation state ends or flags the Task's attempt
+        // here, or waits behind the protected result step. Nothing is
+        // written when the Task has no attempt.
         if input.integration_cancel
             && task.status != input.target_status
-            && crate::request_task_integration_cancel_in_tx(
-                &mut tx,
-                &input.task_id,
-                &input.updated_at,
-            )
-            .await?
+            && crate::cancel_task_integration_in_tx(&mut tx, &input.task_id, &input.updated_at)
+                .await?
                 == crate::TaskIntegrationCancel::Protected
         {
             let pending_steps: i64 = sqlx::query_scalar(

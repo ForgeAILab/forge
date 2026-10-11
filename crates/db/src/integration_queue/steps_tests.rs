@@ -655,7 +655,7 @@ async fn a_board_move_into_the_cancellation_state_flags_the_attempt_or_waits() {
     let task = TaskRepo::get_by_id(&db, "b", false).await.unwrap().unwrap();
     assert_eq!(task.status, "merging");
 
-    // Cancellable: the flag commits with the move.
+    // A queued member holds no slot: it is cancelled with the move.
     let mut moved = input("a", true);
     moved.task_version = TaskRepo::get_by_id(&db, "a", false)
         .await
@@ -668,8 +668,60 @@ async fn a_board_move_into_the_cancellation_state_flags_the_attempt_or_waits() {
         .unwrap();
     let task = TaskRepo::get_by_id(&db, "a", false).await.unwrap().unwrap();
     assert_eq!(task.status, "cancelled");
-    assert_eq!(
-        reread(&db, &a.id).await.cancel_requested_at.as_deref(),
-        Some(NOW)
+    let ended = reread(&db, &a.id).await;
+    assert_eq!(ended.state, IntegrationAttemptState::Cancelled);
+    assert!(!ended.current && ended.cancel_requested_at.is_none());
+}
+
+/// The cancel transition ends an attempt that holds no slot in its own
+/// transaction; one in the slot is only flagged (its head driver releases
+/// it), and so is one with an admitted effect.
+#[tokio::test]
+async fn the_cancel_transition_ends_an_attempt_that_holds_no_slot_in_its_own_transaction() {
+    let db = fixture().await;
+    let a = attempt(&db, "a").await;
+    let queue = a.queue_id.clone().expect("in a queue");
+    let cancel = || {
+        let db = db.clone();
+        async move {
+            let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+            let outcome = cancel_task_integration_in_tx(&mut tx, "a", NOW)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            outcome
+        }
+    };
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=? WHERE id=?")
+        .bind(&a.id)
+        .bind(&queue)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(cancel().await, TaskIntegrationCancel::Requested);
+    let flagged = reread(&db, &a.id).await;
+    assert!(flagged.current && flagged.state == IntegrationAttemptState::Queued);
+    assert_eq!(flagged.cancel_requested_at.as_deref(), Some(NOW));
+
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL WHERE id=?")
+        .bind(&queue)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_attempt SET state='parked',cancel_requested_at=NULL,available_at=? WHERE id=?")
+        .bind(NOW)
+        .bind(&a.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(cancel().await, TaskIntegrationCancel::Cancelled);
+    let ended = reread(&db, &a.id).await;
+    assert_eq!(ended.state, IntegrationAttemptState::Cancelled);
+    assert!(!ended.current && ended.available_at.is_none());
+    assert!(
+        ended.cancel_requested_at.is_none(),
+        "read by the release-step sweep"
     );
+    assert_eq!(ended.completed_at.as_deref(), Some(NOW));
+    assert_eq!(cancel().await, TaskIntegrationCancel::NoAttempt);
 }

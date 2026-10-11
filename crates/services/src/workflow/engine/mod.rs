@@ -1588,13 +1588,15 @@ impl WorkflowExecution<'_> {
                     if update.rows_affected() != 1 {
                         return Err(db::DbError::VersionConflict.into());
                     }
-                    // A Cancel of a Task the integration queue holds asks the
-                    // queue to release its attempt, in this transaction. Once a
-                    // fast-forward may have started, the Cancel waits behind
-                    // the protected result step instead (nothing is written).
+                    // A Cancel of a Task the integration queue holds ends its
+                    // attempt in this transaction when the attempt holds no
+                    // slot and no owner effect is outstanding, and otherwise
+                    // asks the queue to release it. Once a fast-forward may
+                    // have started, the Cancel waits behind the protected
+                    // result step instead (nothing is written).
                     if current_status != target_state
                         && workflow.cancellation_state.as_deref() == Some(target_state.as_str())
-                        && db::request_task_integration_cancel_in_tx(&mut transaction, &task_id, &updated_at).await?
+                        && db::cancel_task_integration_in_tx(&mut transaction, &task_id, &updated_at).await?
                             == db::TaskIntegrationCancel::Protected
                     {
                         let pending_steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE task_id=? AND status IN ('pending','claimed')")

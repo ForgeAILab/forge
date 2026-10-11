@@ -2662,6 +2662,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Cancelling a Task that waits its turn or its retry time in the merge queue
+  ends its queue entry with the Cancel itself. A server restart right after
+  the Cancel no longer records a second, stale merge intent for the
+  cancelled Task (3.2 stage D2b).
 - Tasks that merge into one branch no longer race: one merges at a time and
   the others wait in order, instead of failing with "target moved" and
   re-running review for every lost race (3.2 stage D2b).

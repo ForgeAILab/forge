@@ -790,6 +790,47 @@ async fn park_states_the_wait_once_and_waiting_is_restored_when_the_queue_reopen
     .await;
 }
 
+/// A parked member holds no slot and has no owner effect outstanding: the
+/// Task's Cancel ends its attempt in the Cancel's own transaction (a start
+/// before the worker's next sweep finds no live attempt behind the terminal
+/// Task), and the worker's release-step sweep asks for the `clear` that no
+/// worker asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_cancel_ends_a_parked_attempt_in_its_own_transaction_and_the_sweep_asks_the_clear() {
+    let world = World::new().await;
+    let a = world.add_task("t", "f", "one\n").await;
+    let asked = world.place(&a.id, "parked", 1).await;
+    world
+        .set(
+            &a.id,
+            "failure_kind='owner_required',failure_message='transfer_too_large: 300 MiB'",
+        )
+        .await;
+    world.ask(&asked, IntegrationStepAction::Park).await;
+    settled(&world, "t", IntegrationStepAction::Park, "done").await;
+    assert_eq!(integration(&world.task("t").await)["kind"], "deferred");
+
+    let cancelled = world.service.cancel_task("t").await.unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    let ended = world.attempt(&a.id).await;
+    assert_eq!(ended.state, S::Cancelled, "ended with the Task write");
+    assert!(!ended.current && ended.cancel_requested_at.is_none());
+    assert!(world
+        .step("t", IntegrationStepAction::Clear)
+        .await
+        .is_empty());
+
+    let (worker, _daemons, _config) = production_ports(&world);
+    assert!(worker.sweep_once().await.unwrap().is_empty());
+    settled(&world, "t", IntegrationStepAction::Clear, "done").await;
+    let task = world.task("t").await;
+    assert_eq!(task.status, "cancelled");
+    assert!(task.condition.integration_wait().is_none());
+    // Asked once: a second sweep adds no step.
+    worker.sweep_once().await.unwrap();
+    assert_eq!(world.step("t", IntegrationStepAction::Clear).await.len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn task_cancel_flags_the_attempt_in_its_own_transaction_and_clear_drops_the_statement() {
     let world = World::new().await;
