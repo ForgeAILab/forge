@@ -817,121 +817,43 @@ pub(crate) fn remove_tree(path: &Path) {
     remove_tree_until(path, None);
 }
 
-/// Entries removed between two looks at the deadline. A tree smaller than
-/// this always goes in one call, so every pass makes progress.
-const REMOVE_STRIDE: usize = 256;
-
 /// [`remove_tree`] that stops between entries once `deadline` has passed.
 /// `false` when it stopped early: what is left is still a tree under `path`
 /// and the next call carries on. `true` otherwise, whether or not every
 /// entry could be removed.
+///
+/// Nothing is followed, also not a directory that a process with write
+/// access to the tree replaces by a link while this runs: the walk goes
+/// down by file descriptor ([`crate::fd_tree`]).
 pub(crate) fn remove_tree_until(path: &Path, deadline: Option<Instant>) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return true;
-    };
-    if !metadata.file_type().is_dir() {
-        let _ = fs::remove_file(path);
+    if fs::symlink_metadata(path).is_err() {
         return true;
     }
-    let Some(deadline) = deadline else {
-        if fs::remove_dir_all(path).is_ok() {
-            return true;
-        }
-        #[cfg(unix)]
-        make_dirs_owner_writable(path);
-        if let Err(error) = fs::remove_dir_all(path) {
-            if error.kind() != io::ErrorKind::NotFound {
+    #[cfg(unix)]
+    {
+        match crate::fd_tree::remove_tree(path, deadline) {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "directory tree could not be removed");
+                return true;
             }
         }
-        return true;
-    };
-    // Depth first, children before their directory. An entry that cannot be
-    // removed is remembered so the walk goes past it and ends.
-    let mut stuck: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut stack = vec![path.to_path_buf()];
-    let mut removed = 0_usize;
-    while let Some(dir) = stack.last().cloned() {
-        make_owner_writable(&dir);
-        let mut descended = false;
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let child = entry.path();
-                if stuck.contains(&child) {
-                    continue;
-                }
-                // `file_type` does not follow a link: a link is a file here.
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    stack.push(child);
-                    descended = true;
-                    break;
-                }
-                if fs::remove_file(&child).is_err() {
-                    stuck.insert(child);
-                }
-                removed += 1;
-                if removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline {
-                    return false;
-                }
-            }
-        }
-        if descended {
-            continue;
-        }
-        stack.pop();
-        if fs::remove_dir(&dir).is_err() && fs::symlink_metadata(&dir).is_ok() {
-            stuck.insert(dir);
-        }
-        removed += 1;
-        if !stack.is_empty() && removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline
-        {
-            return false;
-        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = deadline;
+        let _ = if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
     }
     if fs::symlink_metadata(path).is_ok() {
         tracing::warn!(path = %path.display(), "directory tree could not be removed");
     }
     true
-}
-
-#[cfg(unix)]
-fn make_owner_writable(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(metadata) = fs::symlink_metadata(dir) {
-        let mode = metadata.permissions().mode();
-        if metadata.file_type().is_dir() && mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700));
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn make_owner_writable(_dir: &Path) {}
-
-#[cfg(unix)]
-fn make_dirs_owner_writable(root: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(metadata) = fs::symlink_metadata(&dir) else {
-            continue;
-        };
-        let mode = metadata.permissions().mode();
-        if mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(mode | 0o700));
-        }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-            {
-                pending.push(entry.path());
-            }
-        }
-    }
 }
 
 #[cfg(test)]

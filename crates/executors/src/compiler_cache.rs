@@ -1143,6 +1143,25 @@ fn stop_sccache_server(wrapper: Option<&Path>, store: &Path, socket: &Path) {
     }
 }
 
+/// Delete one cache entry of `store`.
+///
+/// A run has write access to its store and can replace a directory in it by
+/// a link between the walk and this delete; by path the delete would then
+/// land outside the store. So the file is reached from the store by file
+/// descriptor, no component followed, and only a regular file is deleted.
+fn remove_entry_file(store: &Path, entry: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        entry
+            .strip_prefix(store)
+            .is_ok_and(|relative| crate::fd_tree::remove_file_under(store, relative).is_ok())
+    }
+    #[cfg(not(unix))]
+    {
+        entry.starts_with(store) && fs::remove_file(entry).is_ok()
+    }
+}
+
 /// What one eviction did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Eviction {
@@ -1246,7 +1265,7 @@ pub fn evict(
             }
         }
         let (store, kind) = &stores[entry.store];
-        let remove = || fs::remove_file(&entry.path).is_ok();
+        let remove = || remove_entry_file(store, &entry.path);
         let removed = if kind.evictable_under_a_live_build() {
             remove()
         } else if live_elsewhere {
@@ -1797,5 +1816,41 @@ pub(crate) mod tests {
             Eviction::default()
         );
         assert_eq!(measure(&linked, deadline), Some(0));
+    }
+    /// A run with write access to its store replaces a directory in it by a
+    /// link to somewhere else after the walk and before the delete. Nothing
+    /// behind the link is deleted.
+    #[test]
+    fn eviction_never_deletes_through_a_directory_swapped_for_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let a = store(&cache_dir, "repo-a", WrapperKind::Sccache);
+        let entry_in_store = entry(&a, "0/1/entry", 1000, 4000);
+        let kept = entry(&a, "9/1/entry", 1000, 10);
+        // The same relative path outside the store.
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(outside.join("1")).unwrap();
+        fs::write(outside.join("1").join("entry"), "precious").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let swapped = std::cell::Cell::new(false);
+
+        // `enough` is asked after the walk, before the first delete.
+        let done = evict(&cache_dir, 1000, false, deadline, || {
+            if !swapped.replace(true) {
+                fs::rename(a.join("0"), a.join("moved-away")).unwrap();
+                std::os::unix::fs::symlink(&outside, a.join("0")).unwrap();
+            }
+            false
+        });
+        assert!(swapped.get());
+        assert_eq!(
+            fs::read_to_string(outside.join("1").join("entry")).unwrap(),
+            "precious",
+            "the file outside the store is untouched"
+        );
+        assert!(a.join("moved-away").join("1").join("entry").exists());
+        assert!(!entry_in_store.exists() || entry_in_store.is_file());
+        // The eviction went on to the next entry instead.
+        assert_eq!((done.files_removed, kept.exists()), (1, false));
     }
 }

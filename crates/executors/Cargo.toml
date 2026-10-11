@@ -26,7 +26,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Only run_process's audited pre_exec callback permits unsafe OS syscalls.
+# Only audited OS syscalls permit unsafe: run_process's pre_exec callback, the
+# statvfs reading in gc and the descriptor-relative walk in fd_tree.
 # The workspace lint table forbids unsafe code, which cannot be overridden
 # locally, so this crate does not inherit it: copy any new workspace lint here.
 [lints.rust]

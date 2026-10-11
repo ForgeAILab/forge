@@ -737,7 +737,17 @@ impl Sweep {
         if !sandbox::is_real_dir(&task_root.join(TASK_DIR_NAME)) || !sandbox::is_real_dir(&build) {
             return false;
         }
-        let moved = sandbox::unless_live_run_in(&task_root, || self.trash(&build, report));
+        // Reached from the Task-root directory by file descriptor: the
+        // Task can write its root and could put a link where `.forge-task`
+        // was just seen, and a rename by path would then take the `build`
+        // of some directory outside the root.
+        let moved = sandbox::unless_live_run_in(&task_root, || {
+            self.trash_from(
+                &build,
+                Some((&self.task_roots, &Path::new(name).join(TASK_DIR_NAME).join("build"))),
+                report,
+            )
+        });
         if moved == Some(true) {
             report.builds_evicted += 1;
             tracing::warn!(path = %build.display(), "disk is under its free-space floor: evicted the build output of an idle Task");
@@ -782,6 +792,19 @@ impl Sweep {
     /// rename, so a caller may do it under a lock it must not hold for the
     /// length of a delete. `false` when it could not be moved; it then stays.
     pub fn trash(&self, path: &Path, report: &mut GcReport) -> bool {
+        self.trash_from(path, None, report)
+    }
+
+    /// [`Self::trash`], with `path` given a second time as `(base,
+    /// relative)` when directories between `base` and the entry are
+    /// writable by a Task: the entry is then moved without following any of
+    /// them, and stays when one has become a link.
+    fn trash_from(
+        &self,
+        path: &Path,
+        anchored: Option<(&Path, &Path)>,
+        report: &mut GcReport,
+    ) -> bool {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if fs::symlink_metadata(path).is_err() {
             return false;
@@ -807,7 +830,12 @@ impl Sweep {
                 .as_nanos(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        if fs::symlink_metadata(&target).is_ok() || fs::rename(path, &target).is_err() {
+        let rename = || match anchored {
+            #[cfg(unix)]
+            Some((base, relative)) => crate::fd_tree::rename_under(base, relative, &target),
+            _ => fs::rename(path, &target),
+        };
+        if fs::symlink_metadata(&target).is_ok() || rename().is_err() {
             report.errors += 1;
             return false;
         }
