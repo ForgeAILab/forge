@@ -128,6 +128,16 @@ pub(crate) fn capacity_codes_only(codes: &[PlacementFilterCode]) -> bool {
         })
 }
 
+/// Every candidate was refused for free disk and nothing else: what a
+/// worktree that must be made again on a machine under its floor gets.
+pub(crate) fn is_disk_pressure_only(refusal: &PlacementUnavailable) -> bool {
+    !refusal.rejected_candidates.is_empty()
+        && refusal
+            .rejected_candidates
+            .iter()
+            .all(|candidate| candidate.filter_codes == [PlacementFilterCode::DiskPressure])
+}
+
 impl CapacityWait {
     /// A machine whose disk has room but whose slots are full is the nearer
     /// exit, so the wait is for disk only when every machine that could take

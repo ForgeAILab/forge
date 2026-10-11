@@ -3760,7 +3760,18 @@ Under the floor a machine starts no new disk-consuming work:
   there (its own, or the root's a subtask shares) is never refused: finishing
   work is how space comes back. A ready placement whose directory is gone
   would be made again at claim, which is new disk: that recreate is refused
-  with the same code. A running execution is never stopped for disk.
+  with the same code. The same holds for every other step that validates a
+  worktree before it uses it (review, check, hook, integrate, reset):
+  `WorkspaceManager::ensure_valid` returns the typed outcome
+  `WorkspaceUnavailable::DiskPressure` when the worktree would have to be
+  made again under the floor (directory gone, or there and unusable so that
+  it would be moved aside and checked out again), and changes nothing. It
+  converts to the `disk_pressure` placement refusal a claim gets
+  (`placement::capacity_wait_of` reads it as the disk wait), so a `?` caller
+  needs no new mapping. A worktree that is there and valid is never refused,
+  and neither is the in-place relink of one whose Git link broke (`git
+  worktree repair`: two pointer files). A running execution is never stopped
+  for disk.
 - **The wait.** When every machine that could take the Task is short of disk,
   the Task takes the machine-capacity path: a recorded `machine_capacity`
   dispatch disposition carrying `capacity_scope: "disk"`, no annotation, no

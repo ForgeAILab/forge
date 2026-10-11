@@ -147,9 +147,7 @@ impl HookAction for RunBeforeWorkHooks {
                                 };
                             }
                             Err(error) => {
-                                return HookResult::Failed {
-                                    reason: error.to_string(),
-                                };
+                                return disk_wait_or_failed(ctx, &task, error).await;
                             }
                         }
                     }
@@ -178,9 +176,7 @@ impl HookAction for RunBeforeWorkHooks {
             {
                 Ok(workspace) => workspace,
                 Err(error) => {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return disk_wait_or_failed(ctx, &task, error).await;
                 }
             },
         };
@@ -262,6 +258,26 @@ impl HookAction for RunBeforeWorkHooks {
                 reason: error.to_string(),
             },
         }
+    }
+}
+
+/// The hook's worktree could not be made valid. When that is only because
+/// it would have to be made again on a disk under its free-space floor, the
+/// Task takes the disk capacity wait a claim takes for the same reason
+/// (`Capacity{disk}`, looked at again every 30 s) before the hook reports
+/// that it did not run; every other error is the hook failure it was.
+async fn disk_wait_or_failed(
+    ctx: &HookContext,
+    task: &db::Task,
+    error: crate::ServiceError,
+) -> HookResult {
+    if crate::placement::capacity_wait_of(&error) == Some(crate::placement::CapacityWait::Disk) {
+        if let Err(defer_error) = ctx.task_service.defer_placement_refusal(task, &error).await {
+            tracing::warn!(task_id = %task.id, error = %defer_error, "the disk wait of a hook whose worktree must be recreated could not be recorded");
+        }
+    }
+    HookResult::Failed {
+        reason: error.to_string(),
     }
 }
 
