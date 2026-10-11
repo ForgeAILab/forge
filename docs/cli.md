@@ -845,12 +845,15 @@ Checks:
   running               1  oldest 10 min
   waiting for slot      3  oldest 2 h
   waiting for disk      0
+  holding a slot: 1 (0 on their Task's own slot); reusable results: 4
   last 24 h: 12 run(s), 7 answered from a stored result
   last worker error: none
 ```
 
 `queued`, `running`, `waiting for slot` and `waiting for disk` are the
 `checks` backlogs of the status, each with the age of its oldest entry.
+"Holding a slot" is `checks.admitted_runs` (with `borrowed_runs`) and
+"reusable results" is `checks.reusable_results`.
 "Answered from a stored result" counts requests that reused a green result and
 ran nothing. A worker error is printed with its time.
 

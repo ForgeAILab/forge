@@ -1327,8 +1327,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   runs the check. No existing check uses it yet: review CI, merge CI and every
   other check run exactly as before, and with no check requested the worker
   makes five indexed reads a second and writes nothing. `GET /api/v1/operations`
-  gains `check_runs.admitted_runs`, `check_runs.waiting_for_capacity`,
-  `check_runs.borrowed_runs` and, per machine, `check_runs` and
+  gains `checks.admitted_runs`, `checks.borrowed_runs` and, per machine, `check_runs` and
   `borrowed_check_runs`; a machine's `active_runs` includes checks that hold a
   slot of their own. The fields are additive and zero until a check uses the
   runner.
@@ -1588,7 +1587,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   positive integer; `--check-run-timeout-seconds`, then
   `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`, then `forge.yaml`). It defines the
   future whole-bundle wall limit and is read by nothing yet.
-- **`GET /api/v1/operations/status` adds `check_runs`**: `by_state` (all eight
+- **`GET /api/v1/operations/status` adds `checks`**: `by_state` (all eight
   run states, zeros included) and `reusable_results`. Additive; both are zero
   until a later stage runs checks through the new storage.
 - **Merge, rebase, CI and daemon RPC effects split from their persistence
@@ -2266,7 +2265,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   its oldest entry; `runs_24h` against `reuse_hits_24h` (requests a stored
   green result answered with no run); and `last_worker_error`. `forge-ctl
   operations status` prints it, and the Operations page shows it as one line.
-  The existing `check_runs` counts are unchanged.
+  It is the one section about checks: the run counts of earlier unreleased
+  builds (`check_runs.by_state`, `reusable_results`, `admitted_runs`,
+  `borrowed_runs`) are fields of `checks`, there is no `check_runs` section,
+  and `check_runs.waiting_for_capacity` is `checks.waiting_for_slot.count`.
 
 - **Daemon-owned workspaces report their disk usage.** A daemon's garbage
   collector now measures the Task roots of its live handles (bounded, like

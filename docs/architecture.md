@@ -8662,8 +8662,8 @@ advance the audited execution revision rather than duplicating that identity.
 Consumer authority and current attestation must be revalidated by the future
 Task-step consumer before applying any hit; these tables confer no authority.
 
-Operator status adds `check_runs.by_state` (all eight states, zeros included)
-and `check_runs.reusable_results`. These are read-only observations, separate
+Operator status adds `checks.by_state` (all eight states, zeros included)
+and `checks.reusable_results`. These are read-only observations, separate
 from machine occupancy and severity; no worker or capacity behavior is enabled.
 
 Stage B implements the persistence-free owner execution/transport seam below.
@@ -8955,10 +8955,13 @@ change.
    The age belongs to the wait, not to the row: a dispatch attempt drops the
    wait row before its start transaction decides, so the age survives a gap
    of up to 30 seconds (`lapsed_at`) and a wait that ended longer ago starts
-   afresh. It ends when the Task starts a run. The release count is the
-   number of external dirty marks the waiter received; a mark for another
-   reason counts too, which only ages the wait sooner and never moves it
-   ahead of a check older than the wait.
+   afresh. It ends when the Task starts a run. The release count is of
+   slots really given back while the Task waited: a run of another Task
+   that left `running`, and an admitted check that ended and was not asked
+   for by this Task (triggers on `execution` and `check_run`). The dirty
+   marks that wake a waiter are not counted: a Task receives those for its
+   own placement, comments and Project edits too, so it cannot age its own
+   wait.
 
    A check stands back for aged waiters for at most 90 seconds in total
    (`check_run.yielded_since`, `CHECK_YIELD_SECONDS`): one dispatcher wake

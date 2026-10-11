@@ -83,7 +83,6 @@ pub struct OperatorStatusResponse {
     pub periodic_workers: Vec<PeriodicWorkerStatus>,
     pub task_steps: TaskStepQueueStatus,
     pub integration_queues: IntegrationQueueStatus,
-    pub check_runs: CheckRunStatus,
     pub checks: ChecksStatus,
     #[ts(type = "number")]
     pub pending_remote_cancels: i64,
@@ -466,12 +465,28 @@ impl std::fmt::Display for DeadLetterState {
     }
 }
 
-/// What the check runner is doing now, for an operator: how much waits where
-/// and for how long, how much work reuse saved in the last day, and whether
-/// the worker is failing.
+/// The check runner, for an operator: its runs by state, what holds a
+/// machine slot, how much waits where and for how long, how much work reuse
+/// saved in the last day, and whether the worker is failing. The one section
+/// about checks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ChecksStatus {
+    /// Check runs by state; all eight states are present, zeros included.
+    /// History older than `server.check_retention_days` is deleted.
+    #[ts(type = "Record<string, number>")]
+    pub by_state: std::collections::BTreeMap<String, i64>,
+    /// Certified passing results a later request with the same identity
+    /// would be answered from.
+    #[ts(type = "number")]
+    pub reusable_results: i64,
+    /// Runs that hold a machine slot (a run admitted past its queue deadline
+    /// holds none and is counted in `running` only).
+    #[ts(type = "number")]
+    pub admitted_runs: i64,
+    /// Of those, runs that share the slot of their own Task's run.
+    #[ts(type = "number")]
+    pub borrowed_runs: i64,
     /// Queued runs the worker has not refused a slot: about to be admitted.
     pub queued: CheckBacklog,
     /// Admitted runs: running, being cancelled, cleaning up, or uncertain
@@ -508,20 +523,4 @@ pub struct CheckBacklog {
 pub struct CheckWorkerError {
     pub error: String,
     pub occurred_at: String,
-}
-
-/// Durable check worker evidence and machine admission counts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct CheckRunStatus {
-    #[ts(type = "Record<string, number>")]
-    pub by_state: std::collections::BTreeMap<String, i64>,
-    #[ts(type = "number")]
-    pub reusable_results: i64,
-    #[ts(type = "number")]
-    pub admitted_runs: i64,
-    #[ts(type = "number")]
-    pub waiting_for_capacity: i64,
-    #[ts(type = "number")]
-    pub borrowed_runs: i64,
 }

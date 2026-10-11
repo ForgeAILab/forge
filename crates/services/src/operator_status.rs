@@ -491,19 +491,16 @@ impl OperatorStatusService {
             quarantined_imports: integration_counts.quarantined_imports,
         };
         let check_counts = self.db.check_run_counts().await?;
-        let check_runs = api_types::CheckRunStatus {
-            by_state: check_counts.by_state,
-            reusable_results: check_counts.reusable_results,
-            admitted_runs: check_counts.admitted_runs,
-            waiting_for_capacity: check_counts.waiting_for_capacity,
-            borrowed_runs: check_counts.borrowed_runs,
-        };
         let check_summary = self.db.check_operator_summary().await?;
         let backlog = |(count, oldest_age_seconds): db::CheckBacklogRow| api_types::CheckBacklog {
             count,
             oldest_age_seconds,
         };
         let checks = api_types::ChecksStatus {
+            by_state: check_counts.by_state,
+            reusable_results: check_counts.reusable_results,
+            admitted_runs: check_counts.admitted_runs,
+            borrowed_runs: check_counts.borrowed_runs,
             queued: backlog(check_summary.queued),
             running: backlog(check_summary.running),
             waiting_for_slot: backlog(check_summary.waiting_for_slot),
@@ -536,7 +533,6 @@ impl OperatorStatusService {
             periodic_workers,
             task_steps,
             integration_queues,
-            check_runs,
             checks,
             pending_remote_cancels,
             event_relay,

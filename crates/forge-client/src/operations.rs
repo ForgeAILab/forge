@@ -163,6 +163,10 @@ fn checks_table(checks: &ChecksStatus) -> String {
     text.push_str(&backlog("waiting for slot", &checks.waiting_for_slot));
     text.push_str(&backlog("waiting for disk", &checks.waiting_for_disk));
     text.push_str(&format!(
+        "  holding a slot: {} ({} on their Task's own slot); reusable results: {}\n",
+        checks.admitted_runs, checks.borrowed_runs, checks.reusable_results
+    ));
+    text.push_str(&format!(
         "  last 24 h: {} run(s), {} answered from a stored result\n",
         checks.runs_24h, checks.reuse_hits_24h
     ));
@@ -319,6 +323,10 @@ mod tests {
                 oldest_age_seconds: Some(9000),
             },
             waiting_for_disk: CheckBacklog::default(),
+            admitted_runs: 1,
+            borrowed_runs: 0,
+            reusable_results: 4,
+            by_state: Default::default(),
             reuse_hits_24h: 7,
             runs_24h: 12,
             last_worker_error: Some(api_types::CheckWorkerError {
@@ -328,7 +336,7 @@ mod tests {
         };
         assert_eq!(
             checks_table(&checks),
-            "Checks:\n  queued                2  oldest 45 s\n  running               1  oldest 10 min\n  waiting for slot      3  oldest 2 h\n  waiting for disk      0\n  last 24 h: 12 run(s), 7 answered from a stored result\n  last worker error (2026-10-11T00:00:00Z): database is locked\n"
+            "Checks:\n  queued                2  oldest 45 s\n  running               1  oldest 10 min\n  waiting for slot      3  oldest 2 h\n  waiting for disk      0\n  holding a slot: 1 (0 on their Task's own slot); reusable results: 4\n  last 24 h: 12 run(s), 7 answered from a stored result\n  last worker error (2026-10-11T00:00:00Z): database is locked\n"
         );
         assert!(checks_table(&ChecksStatus::default()).ends_with("last worker error: none\n"));
     }

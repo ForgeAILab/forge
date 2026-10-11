@@ -3,11 +3,31 @@ import type { CheckBacklog } from "./CheckBacklog";
 import type { CheckWorkerError } from "./CheckWorkerError";
 
 /**
- * What the check runner is doing now, for an operator: how much waits where
- * and for how long, how much work reuse saved in the last day, and whether
- * the worker is failing.
+ * The check runner, for an operator: its runs by state, what holds a
+ * machine slot, how much waits where and for how long, how much work reuse
+ * saved in the last day, and whether the worker is failing. The one section
+ * about checks.
  */
 export type ChecksStatus = { 
+/**
+ * Check runs by state; all eight states are present, zeros included.
+ * History older than `server.check_retention_days` is deleted.
+ */
+by_state: Record<string, number>, 
+/**
+ * Certified passing results a later request with the same identity
+ * would be answered from.
+ */
+reusable_results: number, 
+/**
+ * Runs that hold a machine slot (a run admitted past its queue deadline
+ * holds none and is counted in `running` only).
+ */
+admitted_runs: number, 
+/**
+ * Of those, runs that share the slot of their own Task's run.
+ */
+borrowed_runs: number, 
 /**
  * Queued runs the worker has not refused a slot: about to be admitted.
  */
