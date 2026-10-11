@@ -124,6 +124,12 @@ pub(crate) struct MergeRoles {
     /// States a failed merge is sent to for repair (the state that carries
     /// the conflict-marker exit guard, or a merge state's `reject` target).
     pub repair: Vec<String>,
+    /// States a landed merge ends in (a merge state's `accept` target).
+    pub done: Vec<String>,
+    /// Terminal states that are not a landed merge (the cancellation state).
+    pub cancelled: Vec<String>,
+    /// States whose entry runs the review checks (`run_ci_steps`).
+    pub review: Vec<String>,
 }
 /// The merge roles of a Project's stored workflow definition. A Project
 /// without one of its own (`{}`), or with one that cannot be read, uses the
@@ -132,6 +138,9 @@ pub(crate) fn merge_roles(workflow_definition: Option<&str>) -> MergeRoles {
     let defaults = || MergeRoles {
         merge: vec!["merging".into()],
         repair: vec!["merge_failed".into()],
+        done: vec!["done".into()],
+        cancelled: vec!["cancelled".into()],
+        review: vec!["review".into()],
     };
     let Some(workflow) = workflow_definition
         .and_then(|raw| serde_json::from_str::<api_types::WorkflowDefinition>(raw).ok())
@@ -184,7 +193,51 @@ pub(crate) fn merge_roles(workflow_definition: Option<&str>) -> MergeRoles {
     }
     repair.sort();
     repair.dedup();
-    MergeRoles { merge, repair }
+    // Where a landed merge goes: the merge state's `accept` target. Every
+    // other terminal state is a cancellation. A workflow that keeps the
+    // default names keeps them in their roles.
+    let named = |name: &str| workflow.states.iter().any(|state| state.name == name);
+    let mut done: Vec<String> = merge
+        .iter()
+        .flat_map(|name| workflow.outgoing_trigger_targets(name))
+        .filter(|(trigger, _)| *trigger == api_types::WorkflowTrigger::Accept)
+        .map(|(_, target)| target)
+        .chain(named("done").then(|| "done".to_owned()))
+        .collect();
+    done.sort();
+    done.dedup();
+    let mut cancelled: Vec<String> = workflow
+        .states
+        .iter()
+        .filter(|state| state.kind == api_types::StateKind::Terminal && !done.contains(&state.name))
+        .map(|state| state.name.clone())
+        .chain(named("cancelled").then(|| "cancelled".to_owned()))
+        .collect();
+    cancelled.sort();
+    cancelled.dedup();
+    let mut review: Vec<String> = workflow
+        .states
+        .iter()
+        .filter(|state| {
+            state
+                .hooks
+                .on_enter
+                .iter()
+                .chain(&state.hooks.before_enter)
+                .any(|hook| hook.action == "run_ci_steps")
+        })
+        .map(|state| state.name.clone())
+        .chain(named("review").then(|| "review".to_owned()))
+        .collect();
+    review.sort();
+    review.dedup();
+    MergeRoles {
+        merge,
+        repair,
+        done,
+        cancelled,
+        review,
+    }
 }
 
 /// Total, conservative priority classifier. Only typed bridges and receipts
@@ -254,6 +307,12 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
         "merging"
     } else if roles.repair.iter().any(|name| name == status) {
         "merge_failed"
+    } else if roles.done.iter().any(|name| name == status) {
+        "done"
+    } else if roles.cancelled.iter().any(|name| name == status) {
+        "cancelled"
+    } else if roles.review.iter().any(|name| name == status) {
+        "review"
     } else {
         status
     };
@@ -447,7 +506,7 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
     if let Some(proof) = done_proofs.last() {
         let mut d = decision(
             1,
-            if status == "done" {
+            if role == "done" {
                 State::Completed
             } else {
                 State::Applied
@@ -462,9 +521,7 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
             .or_else(|| field(proof, "candidate_sha").map(str::to_owned));
         d.target_branch = field(proof, "branch").map(validate_branch).transpose()?;
         d.integrated_before_sha = field(proof, "before_sha").map(str::to_owned);
-        if status == "cancelled"
-            || present(&s.task, "deleted_at")
-            || present(&s.task, "archived_at")
+        if role == "cancelled" || present(&s.task, "deleted_at") || present(&s.task, "archived_at")
         {
             d = needs_fact(d, IntegrationNeededFact::RemoteOperationResult);
             d.state = State::Reconciling;
@@ -495,7 +552,7 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
             IntegrationNeededFact::RemoteOperationResult,
         ));
     }
-    let terminal = matches!(status, "done" | "cancelled")
+    let terminal = matches!(role, "done" | "cancelled")
         || present(&s.task, "deleted_at")
         || present(&s.task, "archived_at");
     if terminal {
@@ -511,9 +568,9 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
         }
         let mut d = decision(
             3,
-            if status == "done" {
+            if role == "done" {
                 State::Completed
-            } else if status == "cancelled" {
+            } else if role == "cancelled" {
                 State::Cancelled
             } else {
                 State::Superseded
@@ -907,7 +964,9 @@ pub struct IntegrationImportPass {
 ///   old way, nothing can run for it, and an install has one per merge it
 ///   ever made: copying each one's evidence at the first start after the
 ///   upgrade would hold every worker back for the length of the history.
-///   A `cancelled` Task is still read (a merge that was in flight when it
+///   A cancelled Task (a terminal state of its workflow that is not the
+///   merge state's `accept` target, under whatever name) is still read (a
+///   merge that was in flight when it
 ///   was cancelled may have an unknown result), unless the queue itself
 ///   cancelled the attempt of the entry the Task was cancelled out of: that
 ///   attempt (a passive-stage `shadow:` row included) is the record of that
@@ -925,6 +984,8 @@ impl SqliteDb {
         // map uses the default names. The selection is by role, never by the
         // names `merging` / `merge_failed`.
         let mut role_names = serde_json::Map::new();
+        let mut left_names = serde_json::Map::new();
+        let mut cancelled_names = serde_json::Map::new();
         for (project_id, workflow) in sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT id,workflow_definition FROM project WHERE workflow_definition IS NOT NULL AND workflow_definition NOT IN ('','{}')",
         )
@@ -933,12 +994,22 @@ impl SqliteDb {
         {
             let roles = merge_roles(workflow.as_deref());
             let names: Vec<String> = roles.merge.into_iter().chain(roles.repair).collect();
+            // The states a merge that was in flight may have left for: the
+            // cancellation and the review roles, under the Project's names.
+            let left: Vec<String> = roles.cancelled.iter().cloned().chain(roles.review).collect();
+            left_names.insert(project_id.clone(), serde_json::json!(left));
+            cancelled_names.insert(project_id.clone(), serde_json::json!(roles.cancelled));
             role_names.insert(project_id, serde_json::json!(names));
         }
         let role_names = serde_json::Value::Object(role_names).to_string();
-        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR (t.status IN ('cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR l.to_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%' OR (t.status='cancelled' AND a.effect_intent_json IS NULL AND a.id=(SELECT l.id FROM integration_attempt l WHERE l.task_ref=t.id ORDER BY l.expected_epoch DESC,l.created_at DESC,l.id DESC LIMIT 1) AND a.state IN ('completed','cancelled','superseded')))) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?2")
+        let left_names = serde_json::Value::Object(left_names).to_string();
+        let cancelled_names = serde_json::Value::Object(cancelled_names).to_string();
+        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?3,'$.\"'||t.project_id||'\"'),'[\"cancelled\",\"review\"]'))) AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR l.to_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%' OR (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?4,'$.\"'||t.project_id||'\"'),'[\"cancelled\"]'))) AND a.effect_intent_json IS NULL AND a.id=(SELECT l.id FROM integration_attempt l WHERE l.task_ref=t.id ORDER BY l.expected_epoch DESC,l.created_at DESC,l.id DESC LIMIT 1) AND a.state IN ('completed','cancelled','superseded')))) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?2")
             .bind(&role_names)
-            .bind(limit+1).fetch_all(&mut *tx).await?;
+            .bind(limit+1)
+            .bind(&left_names)
+            .bind(&cancelled_names)
+            .fetch_all(&mut *tx).await?;
         let mut pass = IntegrationImportPass {
             remaining: tasks.len() > limit as usize,
             ..Default::default()

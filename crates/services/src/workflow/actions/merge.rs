@@ -49,7 +49,7 @@ impl HookAction for RunMerge {
                     return failed(ctx, error);
                 }
                 return HookResult::Cascade {
-                    to: default_states::DONE.to_string(),
+                    to: merge_role_target(ctx, default_states::DONE),
                     reason: "merge succeeded".to_string(),
                     bridge: Default::default(),
                 };
@@ -432,7 +432,7 @@ pub(crate) async fn conflict_handoff_result(
         },
     });
     HookResult::Cascade {
-        to: default_states::MERGE_FAILED.to_string(),
+        to: merge_role_target(ctx, default_states::MERGE_FAILED),
         reason: details,
 
         bridge: api_types::TransitionBridge::conflict_handoff(paths),
@@ -555,7 +555,7 @@ pub(crate) async fn merge_failure_result(
         HookResult::Ok
     } else {
         HookResult::Cascade {
-            to: default_states::MERGE_FAILED.to_string(),
+            to: merge_role_target(ctx, default_states::MERGE_FAILED),
             reason,
 
             bridge: Default::default(),
@@ -639,7 +639,9 @@ pub struct RequireConflictMarkersResolved;
 #[async_trait]
 impl HookAction for RequireConflictMarkersResolved {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        if ctx.to_state != default_states::REVIEW {
+        // The review state by its role: a workflow may call it anything.
+        let review = crate::workflow::review_refresh_target(&ctx.workflow, &ctx.from_state);
+        if ctx.to_state != default_states::REVIEW && review.as_deref() != Some(&ctx.to_state) {
             return HookResult::Skipped {
                 reason: "only the repair-to-review exit is checked".to_string(),
             };
@@ -700,4 +702,12 @@ pub(crate) mod test_faults {
             .get_mut(task_id)
             .and_then(VecDeque::pop_front)
     }
+}
+
+/// Where an outcome of the merge state this hook runs in goes, by the role
+/// the target plays in the Task's workflow (`reconcile::role_target`): a
+/// workflow that renamed `done` or its repair state is followed, one that
+/// kept the default names keeps them.
+fn merge_role_target(ctx: &HookContext, default_name: &str) -> String {
+    crate::integration_steps::reconcile::role_target(&ctx.workflow, &ctx.to_state, default_name)
 }

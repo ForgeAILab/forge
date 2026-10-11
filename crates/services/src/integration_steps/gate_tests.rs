@@ -1125,10 +1125,18 @@ impl World {
     /// merge, repair and done states renamed, and one more hook in front of
     /// `run_merge` on the merge state's entry.
     async fn rename_merge_states(&self) {
+        self.rename_states(false).await
+    }
+    /// The same, and with `every_role` the done, cancellation and review
+    /// states renamed too (`shipped`, `dropped`, `inspection`).
+    async fn rename_states(&self, every_role: bool) {
         let mut workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
         let rename = |name: &mut String| match name.as_str() {
             "merging" => *name = "landing".into(),
             "merge_failed" => *name = "fixing".into(),
+            "done" if every_role => *name = "shipped".into(),
+            "cancelled" if every_role => *name = "dropped".into(),
+            "review" if every_role => *name = "inspection".into(),
             _ => {}
         };
         for state in &mut workflow.states {
@@ -1485,4 +1493,68 @@ async fn a_drain_ends_the_slot_of_a_task_that_left_its_entry() {
             .await
             .unwrap();
     assert_eq!(head, None, "the slot is free");
+}
+
+/// Every merge role renamed, at runtime: a Task in the renamed merge state
+/// merges through the queue and ends in the renamed done state; a Task
+/// cancelled out of the renamed merge state the old way is read by the
+/// start-time import by role (its state is called `dropped`) and gets its
+/// history row; a second start imports nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn renamed_done_cancelled_and_review_states_are_followed_by_role() {
+    let world = World::new().await;
+    world.rename_states(true).await;
+    world.legacy_task("t", "t.txt", "landing").await;
+    world.seed_execution("t", "executor", None).await;
+    world.touch("t").await;
+    // Cancelled out of the merge state before the queue existed.
+    world.legacy_task("c", "c.txt", "dropped").await;
+    world.seed_execution("c", "executor", None).await;
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('c-left','c','landing','dropped','user:api','cancelled',?)")
+        .bind(db::now_rfc3339())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.touch("c").await;
+    let report = super::super::import::import_at_start(&world.db)
+        .await
+        .unwrap();
+    assert!(
+        report.imported >= 2,
+        "both Tasks are read by role: {report:?}"
+    );
+    let history = world
+        .db
+        .integration_attempt(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT id FROM integration_attempt WHERE task_ref='c' ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.state, S::Cancelled, "a history row: {history:?}");
+    assert!(!history.current);
+    let again = super::super::import::import_at_start(&world.db)
+        .await
+        .unwrap();
+    assert_eq!(again.imported, 0, "{again:?}");
+
+    let production = Production::new(&world);
+    let running = production.run();
+    let dispatcher = dispatcher(&world).await;
+    world
+        .until("t", "the Task ends in the renamed done state", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            world.task("t").await.status == "shipped"
+        })
+        .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert!(world.on_main("t.txt").await);
+    assert!(!world.on_main("c.txt").await);
+    assert_eq!(world.task("c").await.status, "dropped");
 }
