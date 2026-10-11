@@ -4748,7 +4748,9 @@ this and no other code merges.
 | Result: execution evidence, "Changes merged" comment | protected `integration/result` step | `merging` → `done` | `applied`, then settled |
 | Rebase conflict (committed with markers), or a red head check | `integration/send_back` step | `merging` → `merge_failed` (coder), typed `conflict_handoff` bridge for a conflict | `repair` / `candidate_check_failed`, handed off |
 | The rebased commit is not covered by the passed review | `integration/send_back` step | `merging` → `merge_failed` → `review` (`review_refresh` bridge) | `review_required`, handed off |
-| Infrastructure, an offline owner, a dirty default checkout, a paused Project, a suspended queue | `integration/park` step | `merging` | `deferred` with its cause (retried by the worker's sweep, or the owner's) |
+| Infrastructure, a dirty default checkout, a paused Project, a suspended queue | `integration/park` step | `merging` | `deferred` with its cause (retried by the worker's sweep, or the owner's) |
+| The machine that holds the Task's checkout is unreachable, or its placement is not `ready` again | `integration/park` step | `merging` | `deferred` / `owner_offline`, `owner_id` the machine; no retry is counted, the sweep asks again (back-off to `soon_retry_max`), and the reconnect makes the attempt due at once |
+| The Task's worktree would have to be recreated under the disk floor at admission | the entry's hooks step (suspended on the disk wait), or the reconciler | `merging` | the Task's disk capacity wait (`machine_capacity` / `disk`), 30 s recheck; no attempt exists yet |
 | The Task leaves `merging` by an owner command (Cancel, Hold, a board move) | that command; then `integration/clear` | the command's target | cleared |
 
 `merge_failed` therefore only means "a coder is repairing a conflict, a red
@@ -4809,18 +4811,65 @@ recorded `rebase_target` without an outcome is finished by the
 interrupted-rebase rule it was started under (a conflict is handed to the
 Worker); anything else is admitted.
 
+**Head check identity.** The check of a rebased head is asked for under the
+identity review entry asks under (`workflow/actions/review.rs`
+`request_entry_check`): the spec built by `build_check_spec` with the canonical
+policy, the review state's effective configuration, the Task's workspace id
+and placement generation, digested by `check_runner::policy::digest_input`.
+The purpose (`queue_head_ci`) is a property of the consumer, not of the
+result. A commit that passed these commands in this worktree at review entry
+is a hit and runs nothing; a commit the queue rebased is another commit and
+runs once; a daemon-owned checkout keeps its owner's frozen policy and always
+runs, as at entry. A head is only checked on a clean worktree (validation
+parks a dirty one), which is the entry's dirty-tree rule. Measured by
+`head_check_runs_are_zero_on_an_unchanged_target_and_one_per_rebased_task`:
+Tasks that reach the head with the target where their review left it run no
+head check; Tasks that had to be rebased run exactly one each.
+
+**Owner reconnect.** When a reconnected daemon's placement turns `ready`
+(`recovery::reconcile_workspace_placement`) the Task's merge is woken
+(`TaskService::integration_owner_ready`): a parked attempt with a retry time
+is made due and the worker notified; a Task whose merge was waiting for that
+machine before the queue existed (importer row P15, an attempt that names no
+candidate) is admitted there. The worker's sweep never re-queues an imported
+row that names no candidate: only admission (its continuation step, the
+reconciler, the reconnect, the owner's Retry) continues it, by superseding it.
+
+**Roles, not names.** The importer selects and classifies by the role a state
+plays in the Project's workflow (`integration_queue::importer::merge_roles`:
+merge, repair, done = the merge state's `accept` target, cancellation = any
+other terminal state, review = the `run_ci_steps` entry), and the Task-side
+targets of a merge outcome are resolved by `integration_steps::reconcile::
+role_target`, including the legacy effects the admitting `run_merge` reports.
+
+**Deletion guards.** `integration_queue::refuse_unresolved_integration` runs
+inside the transaction that deletes a repository, a repo location or a
+Project, and before a location's `is_default` changes. It refuses with
+`DbError::IntegrationUnresolved` (HTTP `409 integration_unresolved`, naming
+the Task and the machine) while an attempt of a queue in that scope has an
+effect intent, a running or uncertain owner operation, or is `reconciling` /
+`ff_inflight`. Removing the machine is the operation that settles an effect
+nobody can answer for (`settle_removed_integration_owner`).
+
+**Write-transaction rule.** No database write transaction is held across a
+Git subprocess, an owner RPC or a write on another pooled connection anywhere
+under `integration_steps`, `integration_worker`, `integration_ports` or
+`db::integration_queue`. The exception that remains is on code the queue does
+not reach: `lock_review_integration` (`db/src/review_conformance.rs`) wraps
+the Git merge of the old chain below.
+
 Left from the old path, with no production caller: `MergeService::merge`
 and `merge_workspace`, the workspace backends' `merge` operation
 (`WorkspaceBackend::merge`, embedded and daemon) and `MergeSpec`. Only tests
 call them (`merge_service::tests`, `workspace_backend_characterization`,
-`daemon_workspace_roundtrip`). The queue's fast-forward goes through the
-integration owners (`ServerIntegrationOwner::merge`, the daemon's
-`workspace.merge` with a claim binding), not through these.
+`daemon_workspace_roundtrip`, `workflow::engine::tests`). The queue's
+fast-forward goes through the integration owners
+(`ServerIntegrationOwner::merge`, the daemon's `workspace.merge` with a claim
+binding), not through these. Their removal is still to do.
 
-Not built in this stage (stage D3): public queue reads (REST, MCP,
-`forge-ctl`), web labels, the `integration.updated` event, operator timing
-percentiles, the retention job, and the `409 integration_unresolved` deletion
-guards.
+Not built yet: the retention job for receipts and daemon journals; the public
+queue reads, web labels and the `integration.updated` event are built by the
+public-reads change.
 
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same

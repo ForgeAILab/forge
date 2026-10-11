@@ -1634,3 +1634,50 @@ async fn admission_under_the_disk_floor_waits_for_disk_and_merges_when_it_recove
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     assert_eq!(world.merges("t").await, 1);
 }
+
+/// Manual approve authority in the merge state. The owner approves a Task
+/// that is held in `merging`: where the Task offers `approve`, performing it
+/// declares the Task done with nothing merged (the owner's override, as
+/// before the queue), and the Task's attempt is settled: it ends terminal
+/// and is not left parked or current behind a done Task. Where `approve` is
+/// not offered the Task stays put with its attempt parked under the Hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn approving_a_held_merging_task_settles_its_attempt() {
+    let world = World::new().await;
+    let attempt = world.reconciled("t", "t.txt").await;
+    world.act("t", TaskAction::Hold { reason: None }).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the held Task left the slot", || async {
+        world.attempt(&attempt.id).await.state == S::Parked
+    })
+    .await;
+    let offers = world.offers("t").await;
+    println!("held merging Task offers: {offers:?}");
+    if offers.iter().any(|(verb, _)| verb == "approve") {
+        let approved = world
+            .act(
+                "t",
+                TaskAction::Approve {
+                    reason: Some("landed by hand".into()),
+                    override_checks: None,
+                },
+            )
+            .await;
+        assert_eq!(approved.status, "done", "the owner's override");
+        assert_eq!(world.merges("t").await, 0, "nothing was merged");
+        assert!(!world.on_main("t.txt").await);
+        world
+            .until("t", "the attempt is settled", || async {
+                let settled = world.attempt(&attempt.id).await;
+                settled.state.terminal() && !settled.current
+            })
+            .await;
+        assert_eq!(world.attempt(&attempt.id).await.state, S::Cancelled);
+    } else {
+        assert_eq!(world.task("t").await.status, "merging");
+        assert_eq!(world.attempt(&attempt.id).await.state, S::Parked);
+    }
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}

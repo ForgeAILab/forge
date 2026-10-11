@@ -8,6 +8,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Deleting a repository, a repo location or a Project, and changing a
+  repository's default location, is refused while a merge into it is
+  unresolved (`409 integration_unresolved`).** "Unresolved" is a merge whose
+  result is unknown or whose effect on an owner machine has not been answered
+  for. The error's `details` name the Task (`task_id`) and the machine
+  (`machine`); `?force=true` does not override it. Reconnect that machine, or
+  remove the machine (which settles the effect as failed), then retry.
+  Deleting a repo location used to settle an in-flight merge effect as a
+  permanent loss; it is now refused instead, so a merge that landed is never
+  recorded as failed by a deletion.
+- **A merge that waits for an offline machine says so and resumes by itself.**
+  A Task in the merge queue whose checkout's machine is unreachable (or whose
+  placement is not `ready` again after a reconnect) now reports
+  `integration` / `deferred` with cause `owner_offline` and the machine in
+  `owner_id`, instead of `infrastructure`. It no longer spends the three
+  counted infrastructure retries and then asks its owner to Retry: it waits,
+  is asked again on a back-off of at most ten minutes, and goes on at once
+  when the machine reconnects.
+- **Admission to the merge queue under the disk floor is a disk wait.** When a
+  Task's worktree is gone and the disk is under its floor, entering `merging`
+  no longer recreates the worktree anyway (and no longer fails the merge as a
+  `workspace_error`): the Task reports its disk capacity wait
+  (`machine_capacity` / `disk`), is not blocked and is asked again at the
+  30 second recheck. Nothing is charged to a retry budget.
+- **The merge-queue check and the review-entry check are one result.** The
+  check a queue head runs on a rebased commit is asked for under the same
+  identity as review entry's check (same commands, policy, workspace and
+  placement generation; the purpose is not part of it). `check_run` rows of a
+  queue head therefore carry the review-entry specification
+  (`purpose` `entry_ci` in the stored spec) rather than a separate
+  `queue_head_ci` specification; a commit that already passed these commands
+  in the same worktree is not run again.
 - **`merging` now means "in the merge queue" (3.2 stage D2b).** A Task
   entering `merging` is queued for its repository's target branch and stays
   in `merging` while Forge rebases it (only if the target moved), checks the
@@ -2662,6 +2694,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Task that was merging on a daemon when the daemon dropped off, on an
+  install upgraded to the merge queue, merges when the daemon reconnects with
+  no owner action. Its stored retry time no longer puts a row the queue
+  cannot drive back in line.
+- A start no longer writes a history row for a cancelled Task whose merge
+  entry lies more than one status entry back (a Task cancelled out of
+  `merge_failed`).
+- Projects whose workflow renames the done, cancellation or review state: the
+  start-time import reads Tasks in those states by their role, and a merge the
+  old path had finished, a merge failure and the conflict-marker guard go to
+  the workflow's own states instead of `done` / `merge_failed` / `review`.
+- Draining a Task's steps no longer waits without limit for a stopped merge
+  head driver (30 seconds, then it is aborted).
 - Cancelling a Task that waits its turn or its retry time in the merge queue
   ends its queue entry with the Cancel itself. A server restart right after
   the Cancel no longer records a second, stale merge intent for the

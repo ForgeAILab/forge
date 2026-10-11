@@ -1410,7 +1410,11 @@ mod tests {
                 ),
                 "{refused:?}"
             );
-            assert!(db.integration_effect_receipt(&request).await.unwrap().is_none());
+            assert!(db
+                .integration_effect_receipt(&request)
+                .await
+                .unwrap()
+                .is_none());
             let attempt = db
                 .integration_attempt(&f.attempt_id)
                 .await

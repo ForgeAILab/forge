@@ -901,9 +901,10 @@ pub(crate) async fn refuse_unresolved_integration(
         IntegrationGuardScope::Location(id) => {
             ("(q.target_location_id=?1 OR a.repo_location_id=?1)", id)
         }
-        IntegrationGuardScope::RepoOfLocation(id) => {
-            ("q.repo_id=(SELECT repo_id FROM repo_location WHERE id=?1)", id)
-        }
+        IntegrationGuardScope::RepoOfLocation(id) => (
+            "q.repo_id=(SELECT repo_id FROM repo_location WHERE id=?1)",
+            id,
+        ),
         IntegrationGuardScope::Project(id) => {
             ("q.repo_id IN (SELECT id FROM repo WHERE project_id=?1)", id)
         }

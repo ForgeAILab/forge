@@ -667,7 +667,10 @@ async fn deletion_and_default_change_are_refused_while_a_merge_is_unresolved() {
         refused(RepoRepo::delete(&db, "r").await);
         refused(RepoLocationRepo::delete(&db, "l").await);
         refused(ProjectRepo::delete(&db, "p").await);
-        let location = RepoLocationRepo::get_by_id(&db, "l").await.unwrap().unwrap();
+        let location = RepoLocationRepo::get_by_id(&db, "l")
+            .await
+            .unwrap()
+            .unwrap();
         refused(
             RepoLocationRepo::update(
                 &db,
