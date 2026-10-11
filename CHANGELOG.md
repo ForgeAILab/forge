@@ -49,8 +49,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - **A merge-fix budget of 0 still stops a conflict at the merge gate**,
     but the branch is now already rebased with the conflict committed with
     markers when it stops.
-  - **Hold, block, failure, a wait for a person, a paused Project and a
-    paused assigned Agent stop a Task in the merge queue.** Such a Task is
+  - **Hold, block, failure, a wait for a person and a paused Project stop a
+    Task in the merge queue.** A paused Agent does not: merging needs no
+    Agent turn, so a Task whose Agent is paused still merges, as before (a
+    conflict or a fresh review it needs then waits for the Agent). Such a
+    stopped Task is
     not rebased, checked or merged; it leaves the head of the queue at once
     and the Tasks behind it go on. It is back in line as soon as the stop is
     lifted (Release, unblock, retry, resume). A Hold on a Task in the queue

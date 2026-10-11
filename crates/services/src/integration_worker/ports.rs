@@ -229,8 +229,6 @@ pub enum GateCause {
     /// It waits for a person's decision.
     AwaitingHuman,
     ProjectPaused,
-    /// The Agent the Task is assigned to is paused.
-    AgentPaused,
 }
 impl GateCause {
     /// Leads the attempt's `failure_message` (see `ParkReason::code`).
@@ -242,7 +240,6 @@ impl GateCause {
             Self::EntryBlocked => "task_entry_blocked",
             Self::AwaitingHuman => "task_awaiting_human",
             Self::ProjectPaused => "project_paused",
-            Self::AgentPaused => "agent_paused",
         }
     }
     /// What the owner reads, with the action that lifts the gate.
@@ -256,7 +253,6 @@ impl GateCause {
             }
             Self::AwaitingHuman => "the Task waits for a person's decision",
             Self::ProjectPaused => "the Project is paused",
-            Self::AgentPaused => "the Task's Agent is paused; resume it to continue the merge",
         }
     }
 }

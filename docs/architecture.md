@@ -6485,12 +6485,15 @@ per attempt.
 
 **Facts.** The gate is `left` when the Task is no longer in the status entry
 the attempt was admitted in (nothing else is read for a Task that left: its
-checkout may be gone), `gated(cause)` when it is still there and its owner,
-its Project or its Agent stopped it, and `live` otherwise. The causes are one
+checkout may be gone), `gated(cause)` when it is still there and its owner
+or its Project stopped it, and `live` otherwise. The causes are one
 rule (`integration_steps::gate`), read from the Task's own columns: `task_held`
 (the owner's Hold), `task_blocked`, `task_failed`, `task_entry_blocked`,
-`task_awaiting_human`, `project_paused`, `agent_paused` (the Agent the Task is
-assigned to). The head reads the gate from storage alone before a round is
+`task_awaiting_human`, `project_paused`. A paused Agent is not a cause: a
+merge needs no Agent turn (rebase, check and fast-forward are machine work),
+so a Task whose Agent is paused still merges; a head that needs an Agent (a
+conflict for its coder, a fresh review) is sent back and waits for the paused
+Agent at dispatch, like any other Task. The head reads the gate from storage alone before a round is
 counted, before the rebase, while it waits for a check and before it asks for
 a permit; `settle` reads it before it writes one. A gated head leaves the
 slot at once: the attempt is `parked` with the cause's code leading

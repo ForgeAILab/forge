@@ -647,7 +647,7 @@ impl IntegrationSteps {
         };
 
         // A Task its owner stopped (on hold, blocked, failed, waiting for a
-        // person, its Project or Agent paused) keeps its status entry, so
+        // person, its Project paused) keeps its status entry, so
         // the entry fence alone would let the queue merge it. No permit is
         // written for it. The worker reads the same gate (`gate::task_gate`)
         // and parks the head under it, uncounted, until it lifts.

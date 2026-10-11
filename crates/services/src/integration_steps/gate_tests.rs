@@ -448,7 +448,7 @@ async fn a_head_held_before_the_permit_gets_none_and_merges_as_reviewed_after_re
 /// lifted. One merge, no check, no counted retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_gate_parks_typed_and_the_sweep_alone_requeues_when_it_lifts() {
-    let cases: [(&str, &str, &str); 6] = [
+    let cases: [(&str, &str, &str); 5] = [
         (
             "task_blocked",
             "UPDATE task SET blocked_json='{\"reason\":\"stopped by the owner\"}' WHERE id='t'",
@@ -474,23 +474,10 @@ async fn every_gate_parks_typed_and_the_sweep_alone_requeues_when_it_lifts() {
             "UPDATE project SET paused_at='2026-10-10T00:00:00Z' WHERE id='p'",
             "UPDATE project SET paused_at=NULL WHERE id='p'",
         ),
-        (
-            "agent_paused",
-            "UPDATE agent_identity SET paused=1 WHERE id='reviewer-agent-home'",
-            "UPDATE agent_identity SET paused=0 WHERE id='reviewer-agent-home'",
-        ),
     ];
     for (code, set, lift) in cases {
         let world = World::new().await;
         let attempt = world.reconciled("t", "t.txt").await;
-        // The Agent the Task is assigned to (it holds no review role).
-        world.legacy_task("agent-home", "home.txt", "done").await;
-        let agent = world.seed_reviewer("agent-home").await;
-        sqlx::query("UPDATE task SET assignee_type='agent',assignee_id=? WHERE id='t'")
-            .bind(&agent)
-            .execute(world.db.pool())
-            .await
-            .unwrap();
         sqlx::query(set).execute(world.db.pool()).await.unwrap();
         let tip = world.main_tip().await;
         let production = Production::new(&world);
@@ -536,6 +523,56 @@ async fn every_gate_parks_typed_and_the_sweep_alone_requeues_when_it_lifts() {
         assert_eq!(world.rebases("t").await, 0, "{code}");
         assert!(world.on_main("t.txt").await, "{code}");
     }
+}
+
+/// A paused Agent does not gate a merge: the Task its paused Agent is assigned
+/// to is rebased, checked and fast-forwarded like any other (machine work, no
+/// Agent turn), the attempt is never parked for it, and it merges once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_task_whose_agent_is_paused_still_merges() {
+    let world = World::new().await;
+    let attempt = world.reconciled("t", "t.txt").await;
+    world.legacy_task("agent-home", "home.txt", "done").await;
+    let agent = world.seed_reviewer("agent-home").await;
+    sqlx::query("UPDATE task SET assignee_type='agent',assignee_id=? WHERE id='t'")
+        .bind(&agent)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let paused = sqlx::query("UPDATE agent_identity SET paused=1 WHERE id=?")
+        .bind(&agent)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(paused.rows_affected(), 1, "the assigned Agent is paused");
+    assert_eq!(
+        crate::integration_steps::gate::task_gate(&world.db, "t")
+            .await
+            .unwrap(),
+        None,
+        "a paused Agent is no gate"
+    );
+    // The target moved: the queue has to rebase and check, all under the pause.
+    world.move_target("other.txt").await;
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .until("t", "the Task merges under its paused Agent", || async {
+            world.task("t").await.status == "done"
+        })
+        .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let journal: String = world
+        .scalar(
+            "SELECT operation_receipts_json FROM integration_attempt WHERE id=?",
+            &attempt.id,
+        )
+        .await;
+    assert!(!journal.contains("agent_paused"), "{journal}");
+    assert_eq!(world.merges("t").await, 1);
+    assert_eq!(world.rebases("t").await, 1);
+    assert!(world.on_main("t.txt").await);
 }
 
 /// Project pause and resume through the service call the resume route

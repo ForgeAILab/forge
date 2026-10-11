@@ -46,8 +46,11 @@ pub(crate) fn task_row_gate(task: &db::Task) -> Option<GateCause> {
     None
 }
 
-/// The whole gate: the Task's row, then its Project, then the Agent it is
-/// assigned to. `None`: the Task is gone or nothing stops it.
+/// The whole gate: the Task's row, then its Project. `None`: the Task is gone
+/// or nothing stops it. A paused Agent is not a gate: rebase, check and
+/// fast-forward are machine work that needs no Agent turn, and a head that
+/// does need one (a conflict for its coder, a fresh review) is sent back and
+/// waits where every other Task waits for a paused Agent, at dispatch.
 pub(crate) async fn task_gate(db: &SqliteDb, task_id: &str) -> Result<Option<GateCause>> {
     let Some(task) = db::TaskRepo::get_by_id(db, task_id, false).await? else {
         return Ok(None);
@@ -64,16 +67,6 @@ pub(crate) async fn task_gate(db: &SqliteDb, task_id: &str) -> Result<Option<Gat
     .map_err(db::DbError::from)?;
     if project_paused {
         return Ok(Some(GateCause::ProjectPaused));
-    }
-    if let (Some("agent"), Some(agent_id)) =
-        (task.assignee_type.as_deref(), task.assignee_id.as_deref())
-    {
-        if db::AgentRepo::get_by_id(db, agent_id)
-            .await?
-            .is_some_and(|agent| agent.paused)
-        {
-            return Ok(Some(GateCause::AgentPaused));
-        }
     }
     Ok(None)
 }
