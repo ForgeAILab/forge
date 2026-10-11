@@ -20,6 +20,9 @@ pub struct LifecycleEventEmitter {
     db: Arc<db::SqliteDb>,
     plugin_registry: Arc<PluginRegistry>,
     workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    /// The server's workspace root, as the start settled it: where a
+    /// server-owned worktree is inspected and where hook logs go.
+    workspace_root: PathBuf,
 }
 
 impl LifecycleEventEmitter {
@@ -27,11 +30,13 @@ impl LifecycleEventEmitter {
         db: Arc<db::SqliteDb>,
         plugin_registry: Arc<PluginRegistry>,
         workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+        workspace_root: PathBuf,
     ) -> Self {
         Self {
             db,
             plugin_registry,
             workspace_backend_router,
+            workspace_root,
         }
     }
 
@@ -42,16 +47,18 @@ impl LifecycleEventEmitter {
 
     /// Embedded-only fixture constructor.
     pub fn new_for_test(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+        let workspace_root = crate::workspace_root::fixture_root();
         let workspace_backend_router =
             crate::lifecycle::context::embedded_workspace_router_for_test(
                 Arc::clone(&db),
-                crate::task_service::workspace::default_workspace_root(),
+                workspace_root.clone(),
                 None,
             );
         Self {
             db,
             plugin_registry,
             workspace_backend_router,
+            workspace_root,
         }
     }
 
@@ -339,7 +346,7 @@ impl LifecycleEventEmitter {
                     &self.workspace_backend_router,
                     &self.db,
                     workspace,
-                    &crate::task_service::workspace::default_workspace_root(),
+                    &self.workspace_root,
                 )
                 .await
                 .map_err(|error| error.to_string())?,
@@ -424,6 +431,7 @@ impl LifecycleEventEmitter {
             ),
         };
         let log_dir = resolve_log_dir(
+            &self.workspace_root,
             execution.as_ref(),
             resolved_execution_id.as_deref(),
             &project.id,
@@ -491,10 +499,9 @@ impl LifecycleEventEmitter {
             return Ok((!workspace_exists(resolved).await?)
                 .then(|| "workspace does not exist on its owner".to_owned()));
         }
-        let root = crate::task_service::workspace::default_workspace_root();
         match crate::workspace_manager::WorkspaceManager::new(
             &self.db,
-            &root,
+            &self.workspace_root,
             None,
             &self.workspace_backend_router,
         )
@@ -732,6 +739,7 @@ fn resolve_workflow(workflow_definition: &str) -> WorkflowDefinition {
 }
 
 fn resolve_log_dir(
+    workspace_root: &Path,
     execution: Option<&Execution>,
     execution_id: Option<&str>,
     project_id: &str,
@@ -741,13 +749,8 @@ fn resolve_log_dir(
         return Path::new(logs_path).parent().map(Path::to_path_buf);
     }
     // An execution with no log to sit beside: the Task's own log directory.
-    execution_id.map(|_| {
-        crate::task_service::logs::task_hook_logs_dir(
-            &crate::task_service::workspace::default_workspace_root(),
-            project_id,
-            task_id,
-        )
-    })
+    execution_id
+        .map(|_| crate::task_service::logs::task_hook_logs_dir(workspace_root, project_id, task_id))
 }
 
 #[cfg(test)]

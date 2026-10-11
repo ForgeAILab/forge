@@ -602,3 +602,27 @@ pub(super) async fn seed_running_execution(db: &SqliteDb, workspace: &db::Worksp
     .expect("execution creates");
     id
 }
+
+/// Code that holds only a database reads the root the start recorded; a
+/// database no server started on gets the fixture root, which is no
+/// install's root and not an environment variable.
+#[tokio::test]
+async fn the_recorded_root_is_the_one_source_for_code_without_a_root() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let fixture = fixture_root();
+    assert_eq!(root_of(&db).await.unwrap(), fixture);
+    assert_eq!(fixture, fixture_root(), "one value per process");
+    assert!(!fixture.ends_with("forge/worktrees"));
+    assert!(fixture
+        .to_string_lossy()
+        .contains(&format!("forge-fixture-{}", std::process::id())));
+    let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert_eq!(root_of(&db).await.unwrap(), settled.root);
+    // Every fixture constructor uses that same value.
+    let service = crate::task_service::TaskService::new_for_test(
+        std::sync::Arc::new(sqlite_db().await),
+        std::sync::Arc::new(events::EventBus::new(4)),
+    );
+    assert_eq!(service.workspace_root(), fixture);
+}

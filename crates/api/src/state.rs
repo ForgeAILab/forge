@@ -112,7 +112,8 @@ impl AppState {
         adapter_registry: Arc<AdapterRegistry>,
         shutdown_signal: ShutdownSignal,
     ) -> Self {
-        let workspace_root = default_workspace_root();
+        // A state built without a server start is a fixture.
+        let workspace_root = services::workspace_root::fixture_root();
         let workflows_dir = test_workflows_dir();
         let merge_service = Arc::new(MergeService::new_for_test(
             Arc::clone(&db),
@@ -320,12 +321,6 @@ impl AppState {
         self.effective_config = Arc::new(config);
         self
     }
-}
-
-fn default_workspace_root() -> PathBuf {
-    std::env::var("FORGE_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("forge").join("worktrees"))
 }
 
 pub fn test_workflows_dir() -> PathBuf {

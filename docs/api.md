@@ -3533,7 +3533,10 @@ While the server's workspace root is inside the system temp directory (an
 install of a release that kept the default there), `recent_errors` carries
 one entry with `entity_type` `workspace_root`, `entity_id` the root path and
 severity `attention`; it goes away once the root is moved
-(`forge --migrate-workspace-root`). No response field changed.
+(`forge --migrate-workspace-root`). Further `workspace_root` entries report
+what the last start found and went on with: stored paths outside the root, a
+recorded root that was missing and was made again, a root another database
+adopted. No response field changed.
 
 The existing execution,
 capacity, cleanup, retry, usage, and error summaries now also include:

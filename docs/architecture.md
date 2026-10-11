@@ -3458,59 +3458,125 @@ Solo) calls after migrations and before anything is told where the root is:
 
 | Recorded | Configured | Result |
 |---|---|---|
-| none | default | `<data dir>/worktrees`, recorded. Exception: an install of a release that kept the default in the system temp directory keeps that directory and records it. The evidence is in this database only (a workspace row that is not `cleaned`, a server `repo_location.path` or an `execution.logs_path` under `<system temp>/forge/worktrees`): every data directory on a machine used to share that directory, so what is on disk there says nothing about this one. |
-| none | chosen | the chosen root, recorded |
+| none | default | The root this database's own server-owned rows name (`workspace_root::stored_roots`), else `<data dir>/worktrees`; recorded. A stored path has one shape per kind: a Task worktree is `<root>/<task id>/<repository>` (workspace rows that are not `cleaned`), a clone is `<root>/.repos/<repository id>` (`repo_location.path`), a log is `<root>/.forge/logs/...` (`execution.logs_path`). The root is derived from those, never from the temp directory of this launch (a service manager and a shell disagree about it, and so do `/tmp` and macOS's `/var/folders/...`), and never from directories on disk (every data directory on a machine used to share `<system temp>/forge/worktrees`). Rows under several roots: the one holding the most workspaces that are not `cleaned` (then clones, then logs) is used and the others are named in a warning. |
+| none | chosen | the chosen root, recorded; stored paths under another root are named in a warning and never refuse |
 | R | default | R, whatever today's default is |
 | R | chosen, same directory (any spelling, links resolved) | R |
-| R | chosen, another directory | allowed and recorded only when no workspace row that is not `cleaned`, no directory under `R/.repos` and no `running` execution is under R; otherwise the start is refused with a message naming `forge --migrate-workspace-root` |
-| any, and `<data dir>/workspace-root-migration.json` exists | any | refused: a move did not finish |
+| R | chosen, another directory | allowed and recorded only when no workspace row that is not `cleaned`, no directory under `R/.repos` and no `running` execution is under R; otherwise the start is refused with a message naming the move command |
+| any, and `<data dir>/workspace-root-migration.json` exists | any | refused with `migration in progress`: a move did not finish |
 
-A root inside the system temp directory is reported: one warning at start,
+After the root is chosen: if it does not exist it is created (a temp
+directory the system emptied; the stored workspaces that lost their files
+are counted in a warning, and each worktree is recreated from its branch
+when its Task next runs). If it cannot be created (an unmounted volume, a
+data directory from another machine) the start is refused, naming the move
+command, which then has nothing to move and only points the database at the
+new root. A root whose `.forge/gc/owner` names another database is used as
+before and reported. A refusal is the last resort, always names the exact
+command (`RootChoice::migrate_command`: with `--data-dir` when the data
+directory is not the default one), and never happens to an install that
+started before roots were recorded.
+
+A root inside a system temp directory is reported: one warning at start,
 and a `workspace_root` entry under `recent_errors` in operator status
-(`system_setting.workspace_root_status`) until the root is moved.
+(`system_setting.workspace_root_status`, which also carries the warnings
+above) until the root is moved. A root taken from the rows of an install
+that never chose one is such a root wherever today's temp directory is, and
+stays reported on later starts.
+
+**One source of the root.** `settle` returns the root; the caller hands it
+to `ForgeRuntimeBuilder::with_workspace_root`, which hands it to the Task
+service, the lifecycle emitter, the cleanup scheduler and the workspace
+backends. Code that holds only a database (Genesis repository provisioning)
+reads the record through `workspace_root::root_of`. Nothing reads
+`FORGE_WORKSPACE_ROOT` except configuration loading, and the server does not
+export it. A service built without a server start (tests, fixtures) uses
+`workspace_root::fixture_root()`, a per-process directory that is no
+install's root.
 
 `forge --migrate-workspace-root [<new root>]`
 (`services::workspace_root::migrate`) is the only way a root with data in it
 changes. It runs under the data directory's runtime lock, so never beside a
 server, and in this order:
 
-1. **Refusals, before anything changes**: an execution `running`, a check
-   run `running` / `cancelling` / `cleaning`, or a `hooks` step `claimed`;
-   a target that is not empty, not a directory, inside the old root or
-   around it, or refused by the garbage collector's `refuse_root`; for a
-   copy, less free space than the old root's size plus
-   `workspace.min_free_bytes`.
+1. **Refusals, before anything changes**: work recorded in flight (an
+   execution `running`; a check run `running` / `cancelling` / `cleaning`;
+   a task step `claimed` or `suspended`; an integration attempt in any state
+   but `completed`, `cancelled`, `superseded` or `parked`; a workspace lease
+   `active` and not expired); a target that is not empty (unless the old
+   root no longer exists), not a directory, inside the old root or around
+   it, or refused by the garbage collector's `refuse_root`; a `.git` file
+   below a worktree's top level (a submodule, a nested worktree) that names
+   the old root by absolute path; for a copy, less free space than the old
+   root's size (each hard link counted in full) plus
+   `workspace.min_free_bytes`. A refusal removes the directories it made.
+   There is no daemon lock file to test: a daemon that shares the root is
+   recognised by what it owns there, which stays (step 3).
 2. **Journal**: `<data dir>/workspace-root-migration.json` lists the old
    root (in every spelling a stored path may use), the new root, whether
-   entries are renamed or copied, the entries, and what is finished. It is
-   written whole (temp file, `fsync`, rename) before the next step.
-3. **Entries**: every top-level entry of the old root, with `.forge` and
-   `.forge/gc` opened one level, except what a daemon sharing the root owns
-   (`.forge/workspaces`, `.forge/gc/daemon-owner`), which stays. On one filesystem each is renamed. Across filesystems each is
-   copied (links as links, permissions and modification times kept),
-   compared byte for byte with the original, journalled, and only then
-   removed from the old root; a copy a crash left half-made is removed and
-   made again.
+   entries are renamed or copied, the entries, what stays, and what is
+   finished. It is written whole (temp file, `fsync`, rename) before the
+   next step.
+3. **Entries**: only what Forge made. A top-level entry of the old root
+   moves when it has a name Forge uses (`.repos`, `repos`, `main-agents`,
+   `.forge-tmp`, a Task id), or any text column names it or a path inside
+   it; `.forge` and `.forge/gc` are opened one level, and what a daemon
+   sharing the root owns (`.forge/workspaces`, `.forge/gc/daemon-owner`)
+   stays. Everything else stays and is listed in the summary. On one
+   filesystem each entry is renamed. Across filesystems each is copied
+   (links as links, never followed; permissions and modification times
+   kept; two names of one file inside an entry stay one file; extended
+   attributes are not kept), compared byte for byte with the original,
+   journalled, and only then removed from the old root. Sockets, pipes and
+   devices are not copied and not removed: they stay in the old root with
+   the directories above them and are listed. A copy a crash left half-made
+   is removed and made again from the untouched original.
 4. **Git**: for each clone under `.repos` and each repository the database
-   knows by a local path, every registered worktree that moved gets both
-   links rewritten (the worktree's `.git` file and
-   `<repository>/worktrees/<name>/gitdir`), then `git worktree repair` runs
-   from the repository, then both links are checked and `git status` must
-   succeed in the worktree. A user's own repository does not move; only its
-   registration of the moved worktree changes.
+   knows by a local path, every registered worktree that moved is linked
+   again. Where both ends are Forge's and moved, both link files are
+   rewritten (the worktree's `.git` file and
+   `<clone>/worktrees/<name>/gitdir`). A user's own repository is never
+   written by hand: `git worktree repair <moved worktrees>` is run in it,
+   which rewrites its registration of exactly those worktrees, and the
+   repository is named in the summary. Then both links are checked and
+   `git status` must succeed in each worktree. Each clone is checked with
+   `git fsck --connectivity-only`, and a worktree with `.gitmodules` with
+   `git submodule status`; a problem there is reported and does not block,
+   so a clone that was damaged before the move cannot make it unfinishable.
 5. **Database**, one transaction: `workspace.worktree_path`,
    `repo_location.path` and `workspace_placement.workspace_handle` of
-   server-owned rows (each with `version + 1`), `repo.local_path`,
-   `repo.remote_url`, `execution.logs_path`,
-   `agent_context_scope.workspace_path`, `agent_inquiry.workspace_path` and
-   `findings_path`, `runtime.workspace_root`,
+   server-owned rows (each with `version + 1`; a daemon's rows and its
+   copies of them are not touched, and no `expected_version` holder
+   survives the stopped server), `repo.local_path`, `repo.remote_url`,
+   `execution.logs_path`, `agent_context_scope.workspace_path`,
+   `agent_inquiry.workspace_path` and `findings_path`,
+   `runtime.workspace_root` of the daemon inside the server process only
+   (another daemon's row is its own statement and stays),
    `integration_attempt.repo_location_ref`, the paths inside
    `task_step.payload_json` and `result_json`, and the `workspace_root`
-   record. Other text columns that still mention the old root (comments,
-   event payloads) are history; the summary counts them.
+   record. A whole-value path is rewritten when it is the old root or
+   starts with it and a `/`. Inside JSON the JSON-escaped old root is
+   replaced only where a `/` or the closing `"` follows it, so a root that
+   is a prefix of another path (`/data/wt`, `/data/wt2`) is never touched
+   and the document stays valid. Before the commit the same columns are
+   counted again: if any still names the old root, the transaction is
+   rolled back and the command fails with `db pending` (files moved,
+   journal kept, start refused until a rerun). Other text columns that
+   still mention the old root (comments, event payloads) are history; the
+   summary counts them.
 6. **Finish**: the root is adopted for garbage collection (the marker in
-   `.forge/gc` moved with it), a `MOVED` file is written in the old root,
-   and the journal is removed.
+   `.forge/gc` moved with it, so the old root is unclaimed and another
+   Forge may adopt it), a `MOVED` file is written in the old root, and the
+   journal is removed.
+
+The move only rolls forward. There is no abort: entries already renamed and
+Git links already rewritten cannot be put back safely by a tool that was
+just interrupted, while finishing is always safe because every step is
+idempotent. A stop names its cause (the entry and the error for a full disk
+or a permission problem; an entry present in both roots or in neither).
+When the old root no longer exists, nothing is moved: the Git links of what
+is at the new root are repaired and the database is pointed at it, which is
+also how a data directory that was moved with its worktrees is adopted.
 
 The database is rewritten only after every entry is in place, and a server
 refuses to start while the journal exists, so no running server ever reads a

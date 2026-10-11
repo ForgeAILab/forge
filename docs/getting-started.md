@@ -650,12 +650,29 @@ paths into it. From then on:
   start, names both directories and tells you to move the data. Forge never
   runs on two roots.
 
-Releases before this one kept the default root in the system temp directory
-(`<system temp>/forge/worktrees`), where the operating system deletes files:
-worktrees vanished and uncommitted work was lost. An install whose database
-recorded workspaces, clones or logs there keeps using that directory (nothing moves by itself),
-logs one warning at start and shows a `workspace_root` entry on the
-Operations page until you move it:
+##### Upgrading from a release that kept the root in the temp directory
+
+**Nothing moves by itself.** Upgrading changes where *new* installs keep
+their workspaces, never where yours are. Releases before this one kept the
+default root in the system temp directory (`<system temp>/forge/worktrees`),
+where the operating system deletes files: worktrees vanished and uncommitted
+work was lost. What the first start after the upgrade does:
+
+| Your install | What the start does |
+|---|---|
+| Never set a root; the database has workspaces, clones or logs | Keeps the root those rows were written under, records it, warns at start and on the Operations page (`workspace_root`) until you move it. The root is read from the stored paths, not from today's temp directory, so a service manager and a shell with different `TMPDIR`s agree. |
+| Root set by `workspace.root`, `FORGE_WORKSPACE_ROOT` or a flag | Records that root. Rows an older configuration left elsewhere keep working and are listed in a warning. |
+| Rows under two roots and no root set | Starts on the root holding the most workspaces that are not `cleaned`, and warns naming the other; nothing is guessed away or moved. |
+| Empty database, or only `cleaned` history | Uses `<data dir>/worktrees`. Directories left in the temp directory are not this install's and are not touched. |
+| The recorded root is gone (the system emptied its temp directory) | Makes the directory again, warns how many workspaces lost their files, and goes on: a Task's worktree is recreated from its branch when the Task next runs. |
+| The recorded root cannot exist here (data directory copied from another machine, volume not mounted) | Refuses to start and prints the exact command. Mount the volume, or run the command: with nothing left to move it only points the database at the new root. |
+| The data directory was moved with its `worktrees` inside | Same refusal; the command finds the files already at the new root, repairs Git's links and rewrites the stored paths without moving anything. |
+| A move was interrupted | Refuses with `migration in progress` until the same command finishes it. |
+
+A start is refused only in the last three cases and when a configured root
+differs from a recorded one that still holds live data; every refusal prints
+the command to run, with `--data-dir` when your data directory is not the
+default one. To leave the temp directory:
 
 ```bash
 # Stop Forge first.
@@ -664,32 +681,66 @@ forge --migrate-workspace-root /srv/forge/worktrees
 forge --data-dir ./test --migrate-workspace-root  # a non-default data dir
 ```
 
-The command needs the server stopped (it takes the lock a running server
-holds and refuses otherwise) and no execution, check run or hook recorded as
-running. The new root must be absent or empty, outside the old root, not the
-home directory, a Git repository or a top-level directory, and, when it is on
-another filesystem, have room for the old root plus the free-space floor.
-Any refusal changes nothing and exits non-zero.
+Without a path the command moves to the configured root when
+`workspace.root` or `FORGE_WORKSPACE_ROOT` is set, else to
+`<data dir>/worktrees`.
 
-It moves every entry of the old root (renamed on one filesystem; otherwise
-copied, compared byte for byte and only then removed), repairs the Git
-worktree links in both directions, including worktrees of your own
-repositories, checks each with `git status`, and rewrites every stored path
-in one database transaction. Uncommitted changes and untracked files move
-with their worktree. The old root keeps a `MOVED` file and nothing in it is
-deleted that was not moved. Daemon-owned workspaces are not touched: a daemon
-keeps its own root, and one that was configured to share the server's root
-keeps its `.forge/workspaces` in the old one.
+The command needs the server stopped (it takes the lock a running server
+holds and refuses otherwise) and nothing recorded as in flight: no running
+execution or check run, no claimed or suspended task step, no integration
+attempt that is neither finished nor parked, no active workspace lease. The
+new root must be absent or empty (unless the old root no longer exists),
+outside the old root, not the home directory, a Git repository or a
+top-level directory, and, when it is on another filesystem, have room for
+the old root (every hard link counted as a full file) plus the free-space
+floor. A submodule or nested worktree whose link names the old root by
+absolute path is refused by name. Any refusal changes nothing and exits
+non-zero.
+
+What moves is what Forge made: Task roots, `.repos/`, `repos/`,
+`main-agents/`, `.forge-tmp/`, the entries of `.forge/`, and any other entry
+a stored path names. Anything else in the old root stays and is listed in
+the summary. Entries are renamed on one filesystem; otherwise copied,
+compared byte for byte and only then removed. A copy keeps contents,
+permissions, modification times, links (as links, never followed) and hard
+links within an entry; it does not keep extended attributes, and it never
+removes a socket, pipe or device (those stay in the old root and are
+listed). Read-only directories move.
+
+Git's worktree links are repaired in both directions and each worktree is
+checked with `git status`; every clone is checked with
+`git fsck --connectivity-only` (a problem is reported, it does not undo the
+move). In a repository of your own that has Forge worktrees, the only thing
+done is `git worktree repair <the moved worktrees>`, run in that repository
+and named in the summary. Uncommitted changes and untracked files move with
+their worktree.
+
+Every stored path is rewritten in one database transaction, and the command
+checks inside that transaction that no path column still names the old
+root: if one does, nothing is committed and the command fails with
+`db pending`. The old root keeps a `MOVED` file, its garbage-collection
+marker moves with the root (another Forge may adopt the old directory), and
+nothing in it is deleted that was not moved. Daemon-owned workspaces are not
+touched: a daemon keeps its own root, and one that was configured to share
+the server's root keeps its `.forge/workspaces` and its recorded runtime
+root in the old one.
 
 Each finished step is written to `<data dir>/workspace-root-migration.json`.
-If the command is interrupted, the server refuses to start while that file
-exists; run the same command again and it finishes the move. If
-`workspace.root` or `FORGE_WORKSPACE_ROOT` is set, point it at the new root
-(or remove it) before starting Forge.
+The move only rolls forward; there is no abort, because entries that were
+already renamed and Git links that were already rewritten cannot be put back
+safely by a tool that was just interrupted. If the command stops (a full
+disk, a permission error, a crash), it says what stopped it, the server
+refuses to start with `migration in progress` while the journal exists, and
+running the same command again goes on from the last finished step: a
+half-made copy is made again from the untouched original.
 
 Forge Solo always keeps its root at `<Solo data root>/worktrees` and records
-it the same way; it was never in the temp directory, so there is nothing to
-move.
+it the same way; it was never in the temp directory. Solo has no move
+command of its own: when its start is refused (its data root was moved, or
+copied from another machine), the message prints the `forge --data-dir
+<Solo data root> --migrate-workspace-root` command to run. A Solo data root
+*copied* beside an original that still exists is not supported: both
+databases name the original's worktrees, so remove the copy or the original.
 
 `workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
 placement, or a server-owned workspace executed on a remote daemon, waits for

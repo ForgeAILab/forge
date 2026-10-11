@@ -2612,12 +2612,6 @@ pub(super) async fn reset_workspace(
     Ok(workspace)
 }
 
-pub(crate) fn default_workspace_root() -> PathBuf {
-    std::env::var("FORGE_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("forge").join("worktrees"))
-}
-
 /// The account-owned scratch root, holding one directory per Main Agent
 /// account. It sits beside the Project Agent workspaces rather than inside
 /// any of them: nothing here belongs to a Project.

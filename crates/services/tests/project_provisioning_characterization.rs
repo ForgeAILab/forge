@@ -134,10 +134,9 @@ async fn database() -> Arc<SqliteDb> {
     Arc::new(SqliteDb::new(pool))
 }
 
+/// No server started on these databases: provisioning uses the fixture root.
 fn workspace_root() -> PathBuf {
-    std::env::var_os("FORGE_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("forge").join("worktrees"))
+    services::workspace_root::fixture_root()
 }
 
 fn project_slug(name: &str) -> String {

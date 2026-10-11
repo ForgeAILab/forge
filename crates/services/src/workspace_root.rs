@@ -104,6 +104,45 @@ pub fn system_temp_warning(root: &Path, migrate_command: &str) -> String {
     )
 }
 
+/// The root of a service that is built without a server start: a test, or
+/// an embedded fixture. One directory per process under the temp directory,
+/// never a root any install uses (not the old `<temp>/forge/worktrees`
+/// default, not an environment variable), so a fixture cannot write into a
+/// real install's worktrees.
+#[must_use]
+pub fn fixture_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::temp_dir()
+            .join(format!("forge-fixture-{}", std::process::id()))
+            .join("worktrees")
+    })
+    .clone()
+}
+
+/// The workspace root of the server on `db`, for code that is handed a
+/// database and no root: the root the start settled and recorded. There is
+/// no other source: not the environment, not a default.
+///
+/// A database no server ever started on has no record. That is an error,
+/// except in a test build, where it is the [`fixture_root`].
+pub async fn root_of(db: &SqliteDb) -> Result<PathBuf, WorkspaceRootError> {
+    if let Some(recorded) = recorded_root(db).await? {
+        return Ok(recorded);
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Ok(fixture_root())
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        Err(WorkspaceRootError::Refused(
+            "this database has no recorded workspace root: the server records one when it starts"
+                .to_owned(),
+        ))
+    }
+}
+
 /// The recorded root, if a server ever started on this database.
 pub async fn recorded_root(db: &SqliteDb) -> Result<Option<PathBuf>, WorkspaceRootError> {
     Ok(

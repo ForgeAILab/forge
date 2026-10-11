@@ -196,10 +196,9 @@ async fn run() {
             "web UI assets not found; API routes will still run, but browser navigation may return 404"
         );
     }
-    // Components that cannot be handed the resolved root explicitly (e.g.
-    // Genesis repo provisioning inside the services crate) fall back to this
-    // env var; export the configured value so every path agrees.
-    std::env::set_var("FORGE_WORKSPACE_ROOT", &workspace_root);
+    // The settled root is handed to the runtime builder below; code that
+    // holds only the database reads the record `settle` wrote
+    // (`services::workspace_root::root_of`). Nothing reads the environment.
     // Opt-in: nothing is installed while `workspace.compiler_cache.wrapper`
     // is unset.
     executors::compiler_cache::install_configured(

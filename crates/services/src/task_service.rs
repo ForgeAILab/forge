@@ -233,7 +233,7 @@ use self::{
     logs::execution_logs_path,
     review_config::review_config_from_json,
     validation::{serialize_config, validate_required},
-    workspace::{default_workspace_root, prepare_workspace, reset_workspace},
+    workspace::{prepare_workspace, reset_workspace},
 };
 
 pub(super) const DISPATCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -623,16 +623,17 @@ impl TaskService {
         self.check_consumers.get().cloned()
     }
 
-    /// Production services receive the runtime's shared owner router.
+    /// Production services receive the runtime's shared owner router and
+    /// the workspace root the start settled.
     pub fn new_with_router(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
         workspace_backend_router: Arc<WorkspaceBackendRouter>,
+        workspace_root: PathBuf,
     ) -> Self {
         db.server_run_cap
             .initialize_identity(&::config::embedded_machine_id());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
-        let workspace_root = default_workspace_root();
         let workflow_engine =
             Arc::new(WorkflowEngine::new(Arc::clone(&db), Arc::clone(&event_bus)));
         Self {
@@ -671,12 +672,13 @@ impl TaskService {
     /// Embedded-only fixture constructor for tests outside this crate.
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_test(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let workspace_root = crate::workspace_root::fixture_root();
         let router = crate::lifecycle::context::embedded_workspace_router_for_test(
             Arc::clone(&db),
-            default_workspace_root(),
+            workspace_root.clone(),
             None,
         );
-        let mut service = Self::new_with_router(db, event_bus, router);
+        let mut service = Self::new_with_router(db, event_bus, router, workspace_root);
         service.placement_adapter_registry =
             Some(Arc::new(cli_adapters::test_support::test_registry()));
         service.test_workspace_backend = true;

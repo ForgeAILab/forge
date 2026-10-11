@@ -38,15 +38,6 @@ pub fn default_workspace_root(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("worktrees")
 }
 
-/// The default workspace root of releases before the root moved into the
-/// data directory. Only ever read: a server that finds its data there keeps
-/// using it (and says so) until the operator runs
-/// `forge --migrate-workspace-root`.
-#[must_use]
-pub fn legacy_temp_workspace_root() -> PathBuf {
-    env::temp_dir().join("forge").join("worktrees")
-}
-
 pub(crate) fn expand_path(value: &str) -> PathBuf {
     let with_home = if value == "~" {
         home_dir()
