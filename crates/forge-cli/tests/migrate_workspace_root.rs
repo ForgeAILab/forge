@@ -72,6 +72,12 @@ impl Host {
     /// The same, in any root.
     fn seed_root(&self, root: &Path) -> PathBuf {
         let database = self.path("data").join("forge.db");
+        let named = [
+            root.join("3f0c2b0e-6d53-4b7e-9d0c-0d5a4f3f8a11/repo"),
+            root.join(".forge/logs/project/task/run.jsonl"),
+            root.join(".repos/repository"),
+            root.join("7b0c9f6e-1234-4c57-9d4e-1f2a3b4c5d6e/repository"),
+        ];
         let recorded = root.to_string_lossy().into_owned();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -90,10 +96,34 @@ impl Host {
                 .execute(&pool)
                 .await
                 .expect("root is recorded");
+                // The database names what it keeps in the root (only that
+                // is moved): rows written directly, constraints off.
+                let mut connection = pool.acquire().await.expect("connection");
+                for statement in [
+                    "PRAGMA foreign_keys = OFF".to_owned(),
+                    "PRAGMA ignore_check_constraints = ON".to_owned(),
+                ]
+                .into_iter()
+                .chain(named.iter().enumerate().map(|(index, path)| {
+                    format!(
+                        "INSERT INTO integration_attempt (id, task_ref, project_ref, queue_seq, current, admission_key, expected_status, expected_epoch, observed_task_version, enqueued_at, repo_location_ref, state, created_at, updated_at)
+                         VALUES ('attempt-{index}', 'task', 'project', 1, 0, 'admission-{index}', 'merging', 0, 1, '2026-01-01T00:00:00Z', '{}', 'completed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                        path.display()
+                    )
+                })) {
+                    sqlx::query(&statement)
+                        .execute(&mut *connection)
+                        .await
+                        .expect("fixture row");
+                }
+                drop(connection);
                 pool.close().await;
             });
         let task_root = root.join("3f0c2b0e-6d53-4b7e-9d0c-0d5a4f3f8a11");
-        std::fs::create_dir_all(task_root.join("repo")).expect("task root creates");
+        if std::fs::create_dir_all(task_root.join("repo")).is_err() {
+            // A root that cannot exist on this machine: the record only.
+            return task_root;
+        }
         std::fs::write(task_root.join("repo/work.txt"), "uncommitted work\n").expect("file writes");
         std::fs::create_dir_all(root.join(".repos")).expect("clone directory creates");
         std::fs::create_dir_all(root.join(".forge/logs/project/task")).expect("logs create");
@@ -122,7 +152,6 @@ fn moves_a_temp_directory_root_into_the_data_directory_and_says_what_it_did() {
         "uncommitted work\n"
     );
     assert!(target.join(".forge/logs/project/task/run.jsonl").is_file());
-    assert!(target.join(".repos").is_dir());
     assert!(!task_root.exists());
     assert!(host.legacy_root().join("MOVED").is_file());
     assert!(!host
@@ -434,11 +463,89 @@ fn moves_between_two_real_filesystems() {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     left.sort();
-    assert_eq!(left, [".forge", "MOVED"]);
-    assert_eq!(
-        std::fs::read_dir(root.join(".forge"))
-            .expect("old .forge")
-            .count(),
-        0
+    assert_eq!(left, ["MOVED"]);
+}
+
+impl Host {
+    /// Start the server and wait for it to exit: every case here must be
+    /// refused before a port is bound. A server that starts is killed and
+    /// reported as `None`.
+    fn start(&self) -> (Option<i32>, String) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
+        command
+            .env_clear()
+            .env("HOME", self.path("home"))
+            .env("TMPDIR", self.path("tmp"))
+            .args(["--no-embedded-daemon", "--no-mcp", "--data-dir"])
+            .arg(self.path("data"))
+            .current_dir(self.dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        let mut child = command.spawn().expect("forge starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().expect("child is waited for") {
+                let output = child.wait_with_output().expect("output");
+                return (status.code(), text(&output.stderr));
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (None, "the server started".to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// A start on a half-moved install is refused before anything is bound,
+/// says the migration is in progress and names the command as typed.
+#[test]
+fn a_start_during_an_unfinished_move_is_refused_with_the_command() {
+    let host = Host::new();
+    host.seed_legacy_root();
+    std::fs::write(
+        host.path("data").join("workspace-root-migration.json"),
+        "{}",
+    )
+    .expect("journal writes");
+    let (code, stderr) = host.start();
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("migration in progress"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "forge --data-dir {} --migrate-workspace-root",
+            host.path("data").display()
+        )),
+        "{stderr}"
     );
+    assert!(!host.path("data").join("server.json").exists());
+}
+
+/// A data directory from another machine: its recorded root cannot exist
+/// here. The start is refused with the command, and the command (nothing to
+/// move) makes the next start possible.
+#[test]
+fn a_start_on_a_root_that_cannot_exist_here_is_refused_and_the_command_fixes_it() {
+    let host = Host::new();
+    let blocker = host.path("not-a-directory");
+    std::fs::write(&blocker, "file").expect("file writes");
+    host.seed_root(&blocker.join("forge/worktrees-elsewhere"));
+    let (code, stderr) = host.start();
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("cannot be created"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "forge --data-dir {} --migrate-workspace-root",
+            host.path("data").display()
+        )),
+        "{stderr}"
+    );
+    let output = host.migrate(&[]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("Workspace root moved"));
+    assert!(host.path("data").join("worktrees").is_dir());
 }

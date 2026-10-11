@@ -717,8 +717,15 @@ async fn a_move_on_one_filesystem_keeps_every_file_git_state_and_database_path()
     assert!(!report.copied && !report.resumed);
     assert_eq!(report.worktrees.len(), 3);
     assert_eq!(report.gc_state, "owned");
-    assert!(report.moved.contains(&".repos".to_owned()));
-    assert!(report.moved.contains(&".forge/logs".to_owned()));
+    assert!(report
+        .moved
+        .contains(&format!(".repos/{}", install.repo_id)));
+    assert!(report
+        .moved
+        .iter()
+        .any(|unit| unit.starts_with(".forge/logs/")));
+    assert!(report.moved.contains(&"repos/provisioned".to_owned()));
+    assert!(report.moved.contains(&"main-agents/account".to_owned()));
     assert!(report.moved.contains(&".forge/gc/owner".to_owned()));
     assert!(!report
         .moved
@@ -761,7 +768,7 @@ async fn a_move_on_one_filesystem_keeps_every_file_git_state_and_database_path()
     assert_eq!(report.user_repositories, [install.user_repo.clone()]);
     assert_eq!(tree(&install.user_repo), user_repo_before);
     let summary = report.to_string();
-    assert!(summary.contains("left in the old root (not Forge's): someone-elses"));
+    assert!(summary.contains("left in the old root (not this database's): someone-elses"));
     assert!(summary.contains("`git worktree repair` was run in your repository"));
     assert!(
         summary.contains("Daemon-owned workspaces were not touched"),
@@ -1298,4 +1305,69 @@ async fn a_nested_repository_linked_by_absolute_path_refuses_the_move() {
     // Without it the move goes through.
     std::fs::remove_dir_all(nested.parent().unwrap()).unwrap();
     assert!(migrate(&install.db, &install.request()).await.is_ok());
+}
+
+/// Every data directory on a machine used to share the temp-directory
+/// default. What another database keeps in the shared root stays there:
+/// its Task roots, its clones, its logs, and its garbage-collection claim.
+#[tokio::test]
+async fn what_another_database_keeps_in_a_shared_root_stays() {
+    let install = Install::new().await;
+    let root = &install.root;
+    let theirs = [
+        "9a1b2c3d-0000-4000-8000-00000000abcd/repo/work.txt",
+        ".repos/their-repository/HEAD",
+        ".forge/logs/their-project/their-task/run.jsonl",
+        ".forge/build/their-cache/object",
+        ".forge-tmp/their-run/scratch",
+        "repos/their-provisioned/file",
+    ];
+    for path in theirs {
+        std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        std::fs::write(root.join(path), "theirs\n").unwrap();
+    }
+    // The other database adopted the root for garbage collection.
+    let marker = root.join(gc::GC_DIR).join(gc::OWNER_FILE);
+    std::fs::write(&marker, "another-database").unwrap();
+    let statuses = install.statuses().await;
+
+    let report = migrate(&install.db, &install.request()).await.unwrap();
+    let target = install.target();
+    for path in theirs {
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            "theirs\n",
+            "{path}"
+        );
+        assert!(!target.join(path).exists(), "{path}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "another-database"
+    );
+    for entry in [
+        "9a1b2c3d-0000-4000-8000-00000000abcd",
+        ".repos/their-repository",
+        ".forge/logs/their-project",
+        ".forge/build",
+        ".forge-tmp",
+        ".forge/gc/owner",
+        "repos/their-provisioned",
+        "someone-elses",
+    ] {
+        assert!(
+            report.left_behind.contains(&entry.to_owned()),
+            "{entry}: {:?}",
+            report.left_behind
+        );
+    }
+    // This database's own things moved and work; the new root is its own.
+    assert_eq!(report.gc_state, "owned");
+    assert_eq!(install.statuses().await, statuses);
+    for index in 0..install.tasks.len() {
+        assert!(install.worktree(index).await.starts_with(&target));
+    }
+    assert!(target.join(".repos").join(&install.repo_id).is_dir());
+    let log = install.log_path.strip_prefix(root).unwrap();
+    assert!(target.join(log).is_file());
 }

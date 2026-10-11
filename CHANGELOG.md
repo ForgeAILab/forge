@@ -2128,8 +2128,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **`forge --migrate-workspace-root [<new root>]` moves the server's
   workspace root and keeps every file (3.4 D1).** Run with the server
   stopped; the default target is the configured root, else
-  `<data dir>/worktrees`. Only what Forge made moves; anything else in the
-  old root stays and is listed. Entries are renamed on one filesystem,
+  `<data dir>/worktrees`. Only what this database's Forge made moves;
+  anything else in the old root, including another data directory's
+  worktrees in the temp-directory root they used to share, stays and is
+  listed. Entries are renamed on one filesystem,
   otherwise copied (hard links kept; sockets, pipes and devices left where
   they are), compared byte for byte and only then removed; Git worktree
   links are repaired and checked with `git status` and `git fsck`, in your

@@ -426,8 +426,10 @@ Moves the server's workspace root (Task worktrees, repository clones under
 `.repos/`, execution logs under `.forge/logs/`, garbage-collection state) to
 `<NEW_ROOT>`; without a path, to the configured root (`workspace.root`,
 `FORGE_WORKSPACE_ROOT`) when one is set, else to `<data dir>/worktrees`; then
-exits. Only what Forge made moves; anything else in the old root stays and
-is listed.
+exits. Only what this data directory's database made moves (its Tasks'
+roots, its repositories' clones, its Projects' logs, what its stored paths
+name); anything else in the old root, including another data directory's
+worktrees in a root they shared, stays and is listed.
 It cannot be combined with `--demo`, `--no-mcp`, `--no-embedded-daemon`,
 `--reclaim-workspace-gc` or `--convert-db-to-incremental-vacuum`.
 

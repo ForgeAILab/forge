@@ -277,8 +277,8 @@ pub struct MigrateReport {
     /// Text columns that still mention the old root (history, not paths
     /// Forge opens): `table.column` and how many rows.
     pub remaining_mentions: Vec<(String, i64)>,
-    /// Entries of the old root that are not Forge's (no stored path names
-    /// them, not a Task root, not a directory Forge makes): left there.
+    /// Entries of the old root that are not this database's (no Task,
+    /// repository or Project of it, no stored path names them): left there.
     pub left_behind: Vec<String>,
     /// Sockets, pipes and devices a copy cannot carry: left in the old root.
     pub not_copied: Vec<PathBuf>,
@@ -340,7 +340,10 @@ impl std::fmt::Display for MigrateReport {
             )?;
         }
         for entry in &self.left_behind {
-            writeln!(formatter, "  left in the old root (not Forge's): {entry}")?;
+            writeln!(
+                formatter,
+                "  left in the old root (not this database's): {entry}"
+            )?;
         }
         for path in &self.not_copied {
             writeln!(
@@ -577,6 +580,18 @@ pub async fn migrate(
             ),
         )?;
     }
+    // The containers this move emptied (never one that still holds
+    // something: `remove_dir` only removes an empty directory).
+    for container in [
+        ".forge/logs",
+        ".forge/gc",
+        ".forge",
+        ".repos",
+        "main-agents",
+        "repos",
+    ] {
+        let _ = fs::remove_dir(source.join(container));
+    }
     run.step("marker".to_owned())?;
     fs::remove_file(&run.journal_path)?;
 
@@ -784,11 +799,13 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
                 ))
             }
         };
-        // Only what Forge made moves: anything else in the old root (a
-        // directory somebody else put in a shared temp directory) stays.
+        // Only what this database's Forge made moves: anything else in
+        // the old root (another data directory's worktrees in the shared
+        // temp default, a directory somebody else put there) stays.
+        let adopted_by_another = super::foreign_owner(db, &source).await?.is_some();
         let (mut units, mut left_behind) = (Vec::new(), Vec::new());
         for unit in listed {
-            if forge_made(&unit) || named_by_database(db, &source_spellings, &unit).await? {
+            if is_this_databases(db, &source_spellings, &unit, adopted_by_another).await? {
                 units.push(unit);
             } else {
                 left_behind.push(unit);
@@ -820,14 +837,6 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
         not_copied: Vec::new(),
         source_missing: !source_exists,
     })))
-}
-
-/// A top-level entry Forge makes by a fixed name, or a Task root.
-fn forge_made(unit: &str) -> bool {
-    const KNOWN: [&str; 4] = [".repos", "repos", ".forge-tmp", "main-agents"];
-    unit.starts_with(".forge/")
-        || KNOWN.contains(&unit)
-        || (unit.len() == 36 && uuid::Uuid::parse_str(unit).is_ok())
 }
 
 /// Whether any text column names `<old root>/<unit>` or a path inside it.
@@ -892,7 +901,7 @@ fn nested_repository_with_absolute_link(
         None
     }
     let name = unit.file_name()?.to_string_lossy().into_owned();
-    (name.len() == 36 && uuid::Uuid::parse_str(&name).is_ok())
+    is_uuid(&name)
         .then(|| walk(unit, 1, source_spellings))
         .flatten()
 }
@@ -983,10 +992,23 @@ fn same_filesystem(_left: &Path, _right: &Path) -> bool {
 /// server's to move.
 const DAEMON_WORKSPACES: &str = "workspaces";
 
-/// What the old root holds that the server owns, as paths relative to it:
-/// each top-level entry, with `.forge` and `.forge/gc` opened one level
-/// (logs, build directories and each piece of garbage-collection state move
-/// one by one) so that what a daemon keeps there stays where it is.
+/// Directories of the old root that hold one entry per repository,
+/// Project, account or kind of state. They are opened, so each entry inside
+/// is judged and moved on its own: a root that two databases shared (every
+/// data directory on a machine used the old temp-directory default) holds
+/// both databases' entries side by side.
+const CONTAINERS: [&str; 6] = [
+    ".forge",
+    ".forge/gc",
+    ".forge/logs",
+    ".repos",
+    "main-agents",
+    "repos",
+];
+
+/// What the old root holds, as paths relative to it: each top-level entry,
+/// with the [`CONTAINERS`] opened. What a daemon sharing the root owns is
+/// left out: it stays where it is.
 fn list_units(source: &Path) -> std::io::Result<Vec<String>> {
     fn names(directory: &Path) -> std::io::Result<Vec<String>> {
         let mut names = Vec::new();
@@ -1001,32 +1023,77 @@ fn list_units(source: &Path) -> std::io::Result<Vec<String>> {
         }
         Ok(names)
     }
-    let mut units = Vec::new();
-    for name in names(source)? {
-        if name == MOVED_MARKER {
-            continue;
-        }
-        if name != ".forge" || !real_dir(&source.join(&name)) {
-            units.push(name);
-            continue;
-        }
-        for inner in names(&source.join(".forge"))? {
-            if inner == DAEMON_WORKSPACES {
+    fn collect(source: &Path, inside: &str, units: &mut Vec<String>) -> std::io::Result<()> {
+        let directory = if inside.is_empty() {
+            source.to_path_buf()
+        } else {
+            source.join(inside)
+        };
+        for name in names(&directory)? {
+            let unit = if inside.is_empty() {
+                name
+            } else {
+                format!("{inside}/{name}")
+            };
+            if unit == MOVED_MARKER
+                || unit == format!(".forge/{DAEMON_WORKSPACES}")
+                || unit == format!("{}/{}", gc::GC_DIR, gc::DAEMON_OWNER_FILE)
+            {
                 continue;
             }
-            if inner != "gc" || !real_dir(&source.join(gc::GC_DIR)) {
-                units.push(format!(".forge/{inner}"));
-                continue;
-            }
-            for state in names(&source.join(gc::GC_DIR))? {
-                if state != gc::DAEMON_OWNER_FILE {
-                    units.push(format!("{}/{state}", gc::GC_DIR));
-                }
+            if CONTAINERS.contains(&unit.as_str()) && real_dir(&source.join(&unit)) {
+                collect(source, &unit, units)?;
+            } else {
+                units.push(unit);
             }
         }
+        Ok(())
     }
+    let mut units = Vec::new();
+    collect(source, "", &mut units)?;
     units.sort();
     Ok(units)
+}
+
+fn is_uuid(name: &str) -> bool {
+    name.len() == 36 && uuid::Uuid::parse_str(name).is_ok()
+}
+
+/// Whether an entry of the old root is this database's to move.
+///
+/// - A Task root, a clone, a Project's log directory: when the Task, the
+///   repository or the Project is in this database, or a stored path names
+///   the entry.
+/// - Garbage-collection state, build directories and run temp directories:
+///   unless the root's marker says another database adopted it (then they
+///   are that database's).
+/// - Anything else: only when a stored path names it.
+async fn is_this_databases(
+    db: &SqliteDb,
+    source_spellings: &[String],
+    unit: &str,
+    adopted_by_another: bool,
+) -> Result<bool, sqlx::Error> {
+    let (inside, name) = unit.rsplit_once('/').unwrap_or(("", unit));
+    let table = match inside {
+        "" if is_uuid(name) => Some("task"),
+        ".repos" => Some("repo"),
+        ".forge/logs" => Some("project"),
+        ".forge" | ".forge/gc" => return Ok(!adopted_by_another),
+        "" if name == ".forge-tmp" => return Ok(!adopted_by_another),
+        _ => None,
+    };
+    if let Some(table) = table {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE id = ?");
+        let rows: i64 = sqlx::query_scalar(&sql)
+            .bind(name)
+            .fetch_one(db.pool())
+            .await?;
+        if rows > 0 {
+            return Ok(true);
+        }
+    }
+    named_by_database(db, source_spellings, unit).await
 }
 
 fn incomplete(message: String) -> WorkspaceRootError {

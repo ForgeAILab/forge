@@ -697,10 +697,17 @@ floor. A submodule or nested worktree whose link names the old root by
 absolute path is refused by name. Any refusal changes nothing and exits
 non-zero.
 
-What moves is what Forge made: Task roots, `.repos/`, `repos/`,
-`main-agents/`, `.forge-tmp/`, the entries of `.forge/`, and any other entry
-a stored path names. Anything else in the old root stays and is listed in
-the summary. Entries are renamed on one filesystem; otherwise copied,
+What moves is what this database's Forge made: the Task roots of its Tasks,
+the clones of its repositories under `.repos/`, the logs of its Projects
+under `.forge/logs/`, and every other entry one of its stored paths names
+(`repos/`, `main-agents/`). Build directories, run temp directories and
+garbage-collection state move too, unless the root's marker says another
+database adopted it. Anything else stays and is listed in the summary. This
+matters after an upgrade: every data directory on a machine (`~/.forge`, a
+`./test` directory for `make dev`) used to share the one temp-directory
+root, and moving one of them leaves the others' worktrees, clones and
+garbage-collection claim exactly where they are. Move each data directory
+with its own `--data-dir`. Entries are renamed on one filesystem; otherwise copied,
 compared byte for byte and only then removed. A copy keeps contents,
 permissions, modification times, links (as links, never followed) and hard
 links within an entry; it does not keep extended attributes, and it never
