@@ -411,3 +411,56 @@ async fn the_live_queue_list_covers_targets_and_outstanding_intents() {
     // as announced, so the effect that needed it is never begun.
     assert!(fences.announce("d-1", "rt-1", &f.fence).await.is_err());
 }
+
+/// Disk pressure at the head (round 4 item 6), closed: nothing on the head
+/// side can recreate a worktree, so there is no recreate that could be
+/// refused under the disk floor while the slot is held. The only recreation
+/// on the merge path is `MergeService::ensure_delivery_workspace`, reached
+/// through admission (`integration_admission_facts`: the entry hook, the
+/// reconciler, the import continuation, the owner's Retry), where a refusal
+/// under the disk floor is the Task's typed disk wait and no slot is held.
+/// The head reads and writes an existing checkout only: a missing one is an
+/// error of its read, never a reason to make it again.
+#[test]
+fn nothing_on_the_head_side_can_recreate_a_worktree() {
+    for (name, source) in [
+        ("integration_worker/mod", include_str!("../integration_worker/mod.rs")),
+        ("integration_worker/driver", include_str!("../integration_worker/driver.rs")),
+        ("integration_worker/ports", include_str!("../integration_worker/ports.rs")),
+        ("integration_ports/mod", include_str!("mod.rs")),
+        ("integration_ports/facts", include_str!("facts.rs")),
+        ("integration_ports/owner", include_str!("owner.rs")),
+        ("integration_ports/transfer", include_str!("transfer.rs")),
+        ("integration_owner", include_str!("../integration_owner.rs")),
+        ("integration_effects/merge", include_str!("../integration_effects/merge.rs")),
+        ("integration_effects/rebase", include_str!("../integration_effects/rebase.rs")),
+        ("integration_effects/check", include_str!("../integration_effects/check.rs")),
+        ("integration_effects/rpc", include_str!("../integration_effects/rpc.rs")),
+    ] {
+        // Production code only: each file's own test module is below it.
+        let code = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for recreates in [
+            "ensure_delivery_workspace",
+            "integration_admission_facts",
+            "WorkspaceManager",
+            "waiting_for_disk",
+            "ensure_worktree",
+            "create_worktree",
+            "recreate_worktree",
+            "\"worktree\", \"add\"",
+            "worktree add",
+        ] {
+            assert!(
+                !code.contains(recreates),
+                "{name} references `{recreates}`: the head must not recreate a worktree"
+            );
+        }
+    }
+}
