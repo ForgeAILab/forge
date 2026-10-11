@@ -9496,7 +9496,33 @@ A Task whose `task_state_config` still names an auditor
 reviewer Agent assigned is refused with a conflict before step 2: the re-run
 would otherwise pass on its checks where the old one refused. The key is
 refused at Task create and update, and operator status reports open Tasks
-that still carry it (`retired_review_auditor_config`).
+that still carry it (`retired_review_auditor_config`). The Task's owner is
+told on the Task as well: at start, `state_retired_auditor_notices` opens one
+Attention item per such Task (category `review_risk`, dedupe key
+`retired-auditor:<task id>`, the Task named in its details), which blocks
+nothing and changes no Task. It is stated once and resolved when the owner
+removes the key (Task update) or the Task closes.
+
+**A held Task is not re-entered.** `rerun_review` refuses a Task on hold
+(`ParkReason::Held`) with a conflict, whoever asks: the owner is not offered
+the re-run while the hold stands, and a system re-entry (recovery settling a
+retired inline re-run, a queued `rerun_review` command, a budget reset) does
+nothing: no attempt is superseded and no status entry, hooks step, check or
+review attempt is created. `settle_retired_review_rerun` leaves a held Task
+as it is (the stopped execution says why it ended; the hold, not a failure,
+is what the Task shows). After the release the same request runs the entry.
+
+**Where a failed entry goes.** `review_failure_target` sends a red entry with
+budget left to the review gate's `reject_target`, and to `in_progress` when
+the gate names none. That fallback is why a workflow whose gate has no
+`reject_target` still sends the Task back to work: "red CI and no remediation
+target" cannot be built by nulling the field. A workflow has no remediation
+target only when the state the failed review would go to does not exist in it
+(the gate names a state the workflow lacks, or a custom workflow has no
+`in_progress`). That transition cannot be made, so the failed entry parks
+typed in `review`: `blocked` with kind `review_gate_failed`, reason `review
+failed and the workflow has no remediation state`, an annotation naming the
+missing state, and the blocked Task's owner actions (never a failed cascade).
 
 **Budget.** `rerun_review` takes the requesting actor. The Task action passes
 the owner (only the owner is offered the action); the budget-reset retry of a

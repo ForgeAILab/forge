@@ -2472,6 +2472,70 @@ impl TaskService {
                 .and_then(|state| state.gate_config.as_ref())
                 .and_then(|gate| gate.reject_target.clone())
                 .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
+            // The remediation target is the review gate's `reject_target`,
+            // and `in_progress` when the gate names none: that fallback is
+            // why a workflow whose gate has no `reject_target` still sends
+            // a red entry back to work. A workflow has no remediation
+            // target only when that state does not exist in it (a gate that
+            // names a state the workflow lacks, or a custom workflow with
+            // no `in_progress`). A transition there cannot be made, so the
+            // failed entry parks typed in `review` for its owner instead of
+            // failing its cascade.
+            if !workflow.states.iter().any(|state| state.name == target) {
+                let reason = "review failed and the workflow has no remediation state";
+                tracing::warn!(
+                    task_id = %task.id,
+                    target = %target,
+                    "review failure has no remediation target, blocking task"
+                );
+                let blocked_meta = json!({
+                    "reason": reason,
+                    "created_at": now_rfc3339(),
+                    "kind": api_types::FailureKind::ReviewGateFailed,
+                    "source": null,
+                    "execution_id": execution_id,
+                });
+                let annotation = json!({
+                    "type": api_types::FailureKind::ReviewGateFailed,
+                    "blocking_reason": reason,
+                    "message": format!(
+                        "{reason}: the review gate sends a failed review to `{target}`, which this workflow does not define"
+                    ),
+                    "detected_at": now_rfc3339(),
+                });
+                let task = TaskRepo::update(
+                    &*self.db,
+                    UpdateTask {
+                        id: task.id.clone(),
+                        expected_version: task.version,
+                        title: None,
+                        description: None,
+                        priority: None,
+                        merge_config: None,
+                        plan: None,
+                        error_annotation: Some(Some(annotation.to_string())),
+                        blocked_json: Some(Some(blocked_meta.to_string())),
+                        failed_json: Some(None),
+                        task_state_config: None,
+                        parent_task_id: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+                self.publish(ForgeEvent {
+                    event_type: "task.blocked".to_owned(),
+                    entity_id: task.id.clone(),
+                    timestamp: event_timestamp(),
+                    context: EventContext::TaskBlocked {
+                        project_id: task.project_id.clone(),
+                        reason: reason.to_owned(),
+                        kind: Some(api_types::FailureKind::ReviewGateFailed),
+                        source: None,
+                        execution_id: execution_id.map(str::to_owned),
+                    },
+                });
+                return Ok((task, None, reason.to_owned()));
+            }
             tracing::debug!(
                 task_id = %task.id,
                 rejections = existing_count,

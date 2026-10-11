@@ -59,6 +59,16 @@ impl TaskService {
         {
             return Ok(());
         }
+        // A held Task waits for its owner: the stopped execution says why it
+        // ended, and the hold (not a failure) is what the Task shows. The
+        // review is not re-entered behind the hold.
+        if task
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            return Ok(());
+        }
         let id = Uuid::parse_str(&task.id)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let requested_by = Actor::system(api_types::SystemComponent::CrashRecovery);
@@ -255,6 +265,19 @@ impl TaskService {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status
+            )));
+        }
+        // A held Task is its owner's decision to stop. Nothing re-enters its
+        // review while the hold stands, whoever asks: recovery, a queued
+        // command, a budget reset. (The owner is not offered the re-run on a
+        // held Task.) After the release the request runs as usual.
+        if task
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            return Err(ServiceError::conflict(format!(
+                "task {task_id} is on hold; its review runs again once it is released"
             )));
         }
         // A review needs something to review.

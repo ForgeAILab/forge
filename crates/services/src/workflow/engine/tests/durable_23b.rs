@@ -2277,6 +2277,180 @@ async fn a_before_work_hook_whose_worktree_cannot_be_recreated_waits_for_disk_an
     assert_eq!(reviews[0].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
 }
 
+// A held Task is its owner's decision to stop. A system re-entry of its
+// review (recovery settling a retired inline re-run, a queued `rerun_review`
+// command) does nothing while the hold stands: no attempt is superseded, no
+// status entry, hooks step, check or review attempt is created. Once the
+// Task is released the same request runs the review entry.
+#[tokio::test]
+async fn a_system_review_re_entry_on_a_held_task_does_nothing_until_release() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    // Held while its entry check is queued: the wait is abandoned.
+    suspend_on_entry_check(&fixture).await;
+    let entered = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let held = fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Hold { reason: None },
+            entered.version,
+        )
+        .await
+        .expect("the Task is held")
+        .task;
+    assert_eq!(held.status, "review");
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    let snapshot = || async {
+        let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+            .bind(&fixture.task.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        (
+            epoch,
+            review_summaries(&fixture).await,
+            count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+            count(
+                &fixture,
+                "SELECT COUNT(*) FROM task_step WHERE kind='hooks'",
+            )
+            .await,
+            count(&fixture, "SELECT COUNT(*) FROM transition_log").await,
+        )
+    };
+    let before = snapshot().await;
+    let id = uuid::Uuid::parse_str(&fixture.task.id).unwrap();
+    let recovery = api_types::Actor::system(api_types::SystemComponent::CrashRecovery);
+    let refused = fixture.engine.rerun_review(id, recovery.clone()).await;
+    assert!(
+        matches!(&refused, Err(ServiceError::Conflict(_))),
+        "a system re-entry ran on a held Task: {:?}",
+        refused.map(|task| task.status)
+    );
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(
+        snapshot().await,
+        before,
+        "the refused re-entry changed the Task"
+    );
+    // The owner is not offered the re-run either while the hold stands.
+    assert!(matches!(
+        fixture
+            .engine
+            .perform_task_action(
+                &fixture.task.id,
+                api_types::TaskAction::retry(),
+                held.version
+            )
+            .await,
+        Err(ServiceError::TaskActionUnavailable { .. })
+    ));
+
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .engine
+        .perform_task_action(
+            &fixture.task.id,
+            api_types::TaskAction::Release { reason: None },
+            current.version,
+        )
+        .await
+        .expect("the Task is released");
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    let released = snapshot().await;
+    eprintln!("after release: {released:?}");
+    match fixture.engine.rerun_review(id, recovery).await {
+        Ok(_) | Err(ServiceError::TaskBusy { .. }) => {}
+        Err(error) => panic!("the review does not run after release: {error}"),
+    }
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(task.status, "review");
+    let after = snapshot().await;
+    assert!(after.0 > before.0, "a new review entry ran after release");
+    assert!(after
+        .1
+        .iter()
+        .any(|review| review.0 == db::ReviewStatus::AwaitingHuman
+            && review.1.contains("entry-commands")));
+}
+
+// Red CI with no remediation target. A review gate without a
+// `reject_target` is not that case: the target falls back to `in_progress`
+// (`review_failure_target`), which is why nulling it still sent the Task
+// back to work. The case exists only when the state the failed review would
+// go to is not in the workflow. Then the transition cannot be made, and the
+// failed entry parks typed in `review` with its owner's actions.
+#[tokio::test]
+async fn red_review_ci_with_no_remediation_state_parks_typed_with_an_offered_action() {
+    let mut fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    // No `reject_target`: the fallback is `in_progress`, as documented.
+    fixture
+        .workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .reject_target = Some("nowhere".to_owned());
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&fixture.workflow).unwrap())
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let entered = enter_review(&fixture, "CI entry").await;
+    let settled = drain_result(fixture.engine.clone(), entered).await.task;
+    assert_eq!(settled.status, "review", "{:?}", settled.error_annotation);
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].0, db::ReviewStatus::Failed, "{reviews:?}");
+    let blocked: serde_json::Value = serde_json::from_str(
+        settled
+            .blocked_json
+            .as_deref()
+            .expect("the Task is blocked"),
+    )
+    .unwrap();
+    assert_eq!(
+        blocked["reason"],
+        "review failed and the workflow has no remediation state"
+    );
+    assert_eq!(blocked["kind"], "review_gate_failed");
+    assert!(settled
+        .error_annotation
+        .as_deref()
+        .is_some_and(
+            |annotation| annotation.contains("nowhere") && !annotation.contains("cascade_failed")
+        ));
+    match fixture
+        .engine
+        .perform_task_action(&settled.id, api_types::TaskAction::Start, settled.version)
+        .await
+    {
+        Err(ServiceError::TaskActionUnavailable {
+            available_actions, ..
+        }) => {
+            let offered: Vec<String> = available_actions
+                .iter()
+                .map(|offer| offer.label.clone())
+                .collect();
+            assert!(
+                offered.iter().any(|label| label == "Cancel Task") && offered.len() > 1,
+                "a blocked review entry offers its owner a way on: {offered:?}"
+            );
+        }
+        other => panic!("start on a blocked review entry: {:?}", other.map(|_| ())),
+    }
+}
+
 // The Project environment changes while the entry check is pending (with
 // the pause, the rename or the limit change that moves the Project version).
 // The run that ran is the run that was asked for: its verdict is applied.

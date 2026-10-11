@@ -323,6 +323,12 @@ impl CrashRecovery {
 
         recovered += sweep_stale_recovery_annotations(&self.db).await?;
 
+        // A Task configured before v0.14 may still name a review auditor,
+        // which nothing runs any more: its owner is told on the Task.
+        if let Err(error) = crate::task_service::state_retired_auditor_notices(&self.db).await {
+            tracing::warn!(%error, "retired auditor notices could not be stated");
+        }
+
         tracing::info!(recovered_tasks = recovered, "crash recovery completed");
         Ok(recovered)
     }

@@ -1673,6 +1673,47 @@ mod tests {
             assert!(!reported[0].error.contains(id), "{}", reported[0].error);
         }
 
+        // The same Tasks state it to their owner: one open, non-blocking
+        // notice each in the Project's Attention feed, stated once.
+        let notices = || async {
+            sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT dedupe_key, attention_type, status, json_extract(details_json,'$.task.id') FROM attention_projection WHERE dedupe_key LIKE 'retired-auditor:%' ORDER BY dedupe_key",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            crate::task_service::state_retired_auditor_notices(&db)
+                .await
+                .unwrap(),
+            2
+        );
+        let stated = notices().await;
+        assert_eq!(
+            stated,
+            ["names-auditor", "names-auditor-flat"].map(|id| (
+                crate::task_service::retired_auditor_notice_key(id),
+                "review_risk".to_owned(),
+                "open".to_owned(),
+                id.to_owned()
+            ))
+        );
+        assert_eq!(
+            crate::task_service::state_retired_auditor_notices(&db)
+                .await
+                .unwrap(),
+            0,
+            "a notice is stated once"
+        );
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task WHERE blocked_json IS NOT NULL OR error_annotation IS NOT NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(blocked, 0, "the notice blocks nothing");
+
         sqlx::query("UPDATE task SET task_state_config = NULL")
             .execute(db.pool())
             .await
@@ -1682,6 +1723,16 @@ mod tests {
             .recent_errors
             .iter()
             .all(|issue| issue.entity_type != "retired_review_auditor_config"));
+        assert_eq!(
+            crate::task_service::state_retired_auditor_notices(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(notices()
+            .await
+            .iter()
+            .all(|(_, _, status, _)| status == "resolved"));
     }
 
     #[tokio::test]
