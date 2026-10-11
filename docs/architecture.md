@@ -4923,6 +4923,53 @@ Project deletion; shared retries/dead letters and existing wake budgets apply.
 The Project Agent proposes one splitting Task; the user resolves the incident
 in Mission Control.
 
+### Merge queue reads and `integration.updated` (3.2 stage D3a)
+
+Everything a person or an agent reads of the queue is a projection of rows
+other components own. Nothing in this section writes a queue, an attempt or a
+Task.
+
+| Read | Built from | Where |
+|---|---|---|
+| `GET /api/v1/repos/{id}/integration-queues`, `forge-ctl repo queue`, native `repo.integration_queue` | a keyset page of `integration_queue` by `(repo_id, target_branch)`, the members in progress of those queues in one statement, their Task rows in one, the Project's pause in one | `db::integration_queue::reads`, `services::integration_reads::repo_integration_queues` |
+| `integration` on Task detail, Task list items, MCP `forge_get_task` / `forge_list_tasks`, `forge-ctl task show` | the Task's current attempt joined to its queue (`integration_attempt_current_task`), with the members ahead counted on `integration_attempt_current_seq` | `db::integration_members_of_tasks`, `services::integration_reads::task_integration_summary` |
+
+One function derives the summary for every surface. The attempt's state gives
+`state`, `phase` and `position`; the Task's condition (reason `integration`,
+same `attempt_id`) refines what only a Task step knows: which decision a head
+in `awaiting_task_step` waits for, a failed candidate check, and the cause of
+a deferral. A Task stopped by its owner or by a paused Project reads `waiting`
+with that cause, from the same `task_row_gate` the worker and the `settle`
+step apply, so the summary never offers a merge Retry for a stop that only a
+Release or a Resume lifts. An attempt is "in progress" while it is `current`;
+the table's CHECK makes a finished attempt non-current, so no read filters on
+state.
+
+The Task list reads the summaries of a page inside its existing read snapshot,
+in one statement. Its `ETag` could not see the queue: the list-revision
+triggers cover the tables a Task write touches, and the queue worker writes
+none of them. Adding a trigger on `integration_attempt` would make the worker
+write the Project row and break "the worker writes nothing outside queue,
+attempt and Task step". The validator instead hashes an `integration_revision`
+read with the snapshot: count, revision sum and newest write of the Project's
+members in progress (index `integration_attempt_project_live`, migration
+`V202610111630`) plus each of their queues' state and head. A lease renewal
+changes none of these.
+
+`integration.updated {repo_id, queue_id, task_id}` is published by
+`services::queue_invalidation::IntegrationUpdateProjector`, a periodic worker
+(`integration-read-projection`) of the runtime supervisor. Each tick is one
+SELECT of every queue with its members in progress; the projector keeps the
+previous read in memory and publishes one bus event per member whose state,
+revision or number of members ahead changed, per member that left, and per
+queue whose own state or head changed. The first read after a start publishes
+nothing. It waits at least 100 ms and at most 1 s between reads and is woken
+by the domain-event notifier, which every integration Task step already
+signals when it settles: a step's change is published at once, a change with
+no Task step (the line moved, the head changed phase) within a second. The
+event is bus-only: no ledger row, no Attention category, no notification, no
+wake. The integration steps were not edited for it.
+
 ### Task condition dual-write foundation
 
 `V202610060030__task_condition` adds one private, non-null `condition_json`

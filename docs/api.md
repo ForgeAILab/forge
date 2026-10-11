@@ -5146,6 +5146,26 @@ identified by the Task's status epoch: every status change starts a new one, as
 does a workflow self-transition (planning to planning on a gate reject). Edits,
 annotation changes, same-column reorders and same-state recovery markers do not.
 
+`integration.updated` says that a merge queue, or one member of it, changed:
+
+```json
+{ "event_type": "integration.updated", "entity_id": "<queue_id>", "timestamp": "...",
+  "repo_id": "<repo_id>", "queue_id": "<queue_id>", "task_id": "<task_id or null>" }
+```
+
+It is a cache invalidation and nothing else: refetch the Task (`task_id`) and
+the repository's queues, and treat a `null` `task_id` as "the queue's own
+state or head changed". It is published on the event bus only. It is not in
+the durable ledger (no `id`, not replayed on resume: a client that reconnects
+refetches), it has no Attention category, raises no notification and wakes no
+Agent. One event is published per member whose state, phase, position or
+attempt changed and per member that left the queue; a queue that is idle
+publishes nothing, however long its head runs. The events come from a
+read-only projector in the server process that compares two reads of the
+queues (at most ten a second, at least one a second, and at once when an
+integration Task step settles); the queue worker itself still writes nothing
+but queue, attempt and Task-step rows.
+
 Agent Chat events already committed to the durable outbox (message admission,
 response completion, awaiting-input, failure, cancellation, retry, and control
 transfer) are delivered by the existing post-commit relay as

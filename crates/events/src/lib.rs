@@ -6,6 +6,9 @@ use tokio::sync::broadcast;
 pub const PROJECT_HOOK_RUN_CHANGED_EVENT: &str = "project_hook.run_changed";
 pub const OPERATIONS_STATUS_CHANGED_EVENT: &str = "operations.status_changed";
 pub const TASK_MOVED_EVENT: &str = "task.moved";
+/// Cache invalidation only: a merge queue, or one member of it, changed.
+/// Never recorded in the domain-event ledger and never an Attention input.
+pub const INTEGRATION_UPDATED_EVENT: &str = "integration.updated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeEvent {
@@ -328,6 +331,12 @@ pub enum EventContext {
     },
     OperationsStatusChanged {
         trigger: String,
+    },
+    /// `task_id` is the member that changed; `null` when only the queue did.
+    IntegrationUpdated {
+        repo_id: String,
+        queue_id: String,
+        task_id: Option<String>,
     },
     ProjectHookRunChanged {
         project_id: String,

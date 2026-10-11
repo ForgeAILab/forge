@@ -2411,6 +2411,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `repo.integration_queue` (`{limit?, target_branch?}`) of the Project
   orchestration read tool; the Project and `project_verify_solo` tool prefix
   ceilings grow by 77 bytes for it.
+- **SSE `integration.updated {repo_id, queue_id, task_id}` (3.2 stage D3a).**
+  A cache invalidation for the merge queue reads: published when a member's
+  state, phase, position or attempt changes, when a member leaves, and (with
+  `task_id` `null`) when a queue's own state or head changes. Bus-only: it is
+  not in the durable event ledger, is not replayed on resume, and has no
+  Attention category. An idle queue publishes nothing. New periodic worker
+  `integration-read-projection` (read-only).
 
 - **Operations status has a `checks` section.** `GET /api/v1/operations/status`
   reports what the check runner is doing now: `queued`, `running`,

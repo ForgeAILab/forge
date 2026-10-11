@@ -86,6 +86,7 @@ pub mod project_settings;
 pub mod prompt_preview;
 pub mod provider_authorization;
 pub mod provider_health;
+pub mod queue_invalidation;
 pub mod recovery;
 pub mod repo_location;
 pub mod runtime;
