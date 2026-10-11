@@ -9460,7 +9460,7 @@ asked for, so no pause stops it:
 |---|---|---|
 | Project pause | runs to its end; the result is delivered and applied, the review attempt settles | the reviewer run is held by the pause; resume dispatches it. The check is not run again |
 | Agent pause (coder, reviewer) | as above | the Task waits in `review` for its paused reviewer (`agent`); resume dispatches it |
-| Task `hold` | not offered while the Task waits for its entry check: the Task offers `cancel` only, which abandons the wait as described above | - |
+| Task `hold` | abandoned: `hold` is offered and accepted while the check is queued or runs. The hooks step is superseded, its consumer and its review attempt are cancelled, and a run nobody else waits for is stopped and gives its slot back; no verdict is applied | the Task is held in `review` (not cancelled) and no longer shows the check wait |
 
 A Project pause or resume (like any Project edit) moves the Project version,
 which is the fence a hooks step was admitted under. A step that waited for a
