@@ -374,6 +374,7 @@ pub const MCP_OPERATIONS: &[(&str, McpScopeRule)] = &[
     ("forge_project_escalate", McpScopeRule::BoundProject),
     ("forge_get_project_agent", McpScopeRule::BoundProject),
     ("forge_set_project_agent", McpScopeRule::BoundProject),
+    ("forge_get_integration_queue", McpScopeRule::BoundProject),
     ("forge_list_agent_chats", McpScopeRule::BoundProject),
     ("forge_get_agent_chat", McpScopeRule::BoundProject),
     ("forge_list_agent_chat_messages", McpScopeRule::BoundProject),

@@ -106,6 +106,7 @@ fn contract_lines_are_generated_from_the_spec() {
             "project.charter: no arguments",
             "project.current_state: {limit?}",
             "project.observations: {limit?, task_id?}",
+            "repo.integration_queue: {limit?, target_branch?}",
             "skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
         ]
     );
@@ -218,6 +219,12 @@ impl project_reads::ProjectReadContext<&'static str> for RecordingContext {
         input: project_reads::ObservationsArguments,
     ) -> Result<Value, &'static str> {
         self.record_decoded("project.observations", input.limit)
+    }
+    async fn integration_queue(
+        &self,
+        input: project_reads::IntegrationQueueArguments,
+    ) -> Result<Value, &'static str> {
+        self.record_decoded("repo.integration_queue", input.limit)
     }
     async fn project_charter(&self, _: NoArguments) -> Result<Value, &'static str> {
         self.record("project.charter")
@@ -402,6 +409,7 @@ async fn integer_fields_decode_integer_valued_strings_and_floats_as_the_integer(
             ("portfolio.read", "limit"),
             ("project.current_state", "limit"),
             ("project.observations", "limit"),
+            ("repo.integration_queue", "limit"),
         ]
     );
     let catalog = read_catalog();

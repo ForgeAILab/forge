@@ -521,10 +521,30 @@ impl OperatorStatusService {
         }
 
         let integration_counts = self.db.integration_queue_counts().await?;
+        let integration_now = Utc::now();
+        let integration_ages = db::IntegrationActivationRepo::integration_queue_ages(
+            &*self.db,
+            &integration_now.to_rfc3339(),
+        )
+        .await?;
+        let integration_samples = db::IntegrationActivationRepo::integration_timing_samples(
+            &*self.db,
+            &(integration_now - Duration::seconds(INTEGRATION_TIMING_WINDOW_SECONDS)).to_rfc3339(),
+            INTEGRATION_TIMING_SAMPLE_LIMIT,
+        )
+        .await?;
+        let integration_backlog = |age: db::IntegrationAge| api_types::IntegrationBacklog {
+            count: age.count,
+            oldest_age_seconds: age.oldest_seconds,
+        };
         let integration_queues = api_types::IntegrationQueueStatus {
             queues_by_state: integration_counts.queues_by_state,
             current_attempts_by_state: integration_counts.current_attempts_by_state,
             quarantined_imports: integration_counts.quarantined_imports,
+            waiting: integration_backlog(integration_ages.queued),
+            heads: integration_backlog(integration_ages.heads),
+            parked: integration_backlog(integration_ages.parked),
+            timings: integration_timing_status(&integration_samples),
         };
         let check_counts = self.db.check_run_counts().await?;
         let check_summary = self.db.check_operator_summary().await?;
@@ -1255,6 +1275,49 @@ async fn plan_progress(
     }
 }
 
+/// The window and the bound of the merge timings in the operator status.
+const INTEGRATION_TIMING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const INTEGRATION_TIMING_SAMPLE_LIMIT: u32 = 500;
+
+/// Nearest-rank percentiles of the values that are present.
+fn integration_percentiles(
+    values: impl Iterator<Item = Option<i64>>,
+) -> api_types::IntegrationPercentiles {
+    let mut values = values.flatten().collect::<Vec<_>>();
+    values.sort_unstable();
+    let rank = |percent: usize| {
+        (!values.is_empty()).then(|| values[(values.len() * percent).div_ceil(100).max(1) - 1])
+    };
+    api_types::IntegrationPercentiles {
+        samples: values.len() as i64,
+        p50_ms: rank(50),
+        p95_ms: rank(95),
+        max_ms: values.last().copied(),
+    }
+}
+
+/// Where the sampled merges spent their time: the wait in line, the time at
+/// the head, and the head's split into rebase, check and fast-forward. A
+/// merge whose target had not moved has no rebase and no check; it counts in
+/// the wait and the head time only.
+fn integration_timing_status(
+    samples: &[db::IntegrationPhaseTimings],
+) -> api_types::IntegrationTimingStatus {
+    api_types::IntegrationTimingStatus {
+        window_seconds: INTEGRATION_TIMING_WINDOW_SECONDS,
+        completed: samples.len() as i64,
+        sample_limit: i64::from(INTEGRATION_TIMING_SAMPLE_LIMIT),
+        queue_wait: integration_percentiles(samples.iter().map(|sample| sample.queued_ms)),
+        head_time: integration_percentiles(samples.iter().map(|sample| sample.head_total_ms)),
+        rebase: integration_percentiles(samples.iter().map(|sample| sample.rebase_ms)),
+        check: integration_percentiles(samples.iter().map(|sample| match &sample.check {
+            Some(db::IntegrationCheckTiming::Ran { run_ms, .. }) => Some(*run_ms),
+            _ => None,
+        })),
+        fast_forward: integration_percentiles(samples.iter().map(|sample| sample.ff_ms)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     async fn sync_fixtures(service: &super::OperatorStatusService) {
@@ -1271,6 +1334,7 @@ mod tests {
     // and assert the fields you care about. Tests are independent (in-memory SQLite per test).
 
     use super::*;
+    use serde_json::json;
     use std::fs;
 
     use db::{create_sqlite_pool, new_uuid_v4, run_migrations};
@@ -1310,6 +1374,143 @@ mod tests {
         let service = OperatorStatusService::new(Arc::clone(&db));
         service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         (db, service)
+    }
+
+    #[tokio::test]
+    async fn integration_status_reports_ages_and_the_timings_of_completed_merges() {
+        let (db, service) = test_service().await;
+        let now = Utc::now();
+        let at = |seconds_ago: i64| (now - Duration::seconds(seconds_ago)).to_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('timing-project','timing-project',?,?)").bind(at(0)).bind(at(0)).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('timing-repo','timing-project','timing-repo','main',?,?)").bind(at(0)).bind(at(0)).execute(db.pool()).await.unwrap();
+        let queue = db
+            .create_or_get_integration_queue("timing-repo", "main")
+            .await
+            .unwrap();
+        let mut attempts = Vec::new();
+        for index in 0..24 {
+            let task = format!("timing-task-{index}");
+            sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'timing-project',?,'merging',?,?)").bind(&task).bind(&task).bind(at(0)).bind(at(0)).execute(db.pool()).await.unwrap();
+            attempts.push(
+                db.admit_integration_attempt(db::IntegrationAttempt::new(
+                    Some(queue.id.clone()),
+                    task,
+                    "timing-project".into(),
+                    format!("admission-{index}"),
+                    "merging".into(),
+                    0,
+                    1,
+                ))
+                .await
+                .unwrap()
+                .id,
+            );
+        }
+        // Twenty merges completed in the window: merge n waited n seconds in
+        // line and spent 10 n seconds at the head. The even ones rebased and
+        // ran a check; the odd ones found the target unmoved.
+        for (index, attempt) in attempts.iter().take(20).enumerate() {
+            let n = index as i64 + 1;
+            let mut timings =
+                json!({"rounds":1,"queued_ms":n*1000,"head_total_ms":n*10_000,"ff_ms":n*100});
+            if n % 2 == 0 {
+                timings["rebase_ms"] = json!(n * 200);
+                timings["check"] = json!({"kind":"ran","slot_wait_ms":5,"run_ms":n*5000});
+            } else {
+                timings["check"] = json!({"kind":"skipped","reason":"target_unchanged"});
+            }
+            sqlx::query("UPDATE integration_attempt SET state='completed',current=0,completed_at=?,phase_timings_json=? WHERE id=?")
+                .bind(at(60))
+                .bind(timings.to_string())
+                .bind(attempt)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        // One merge from before the window is not a sample.
+        sqlx::query("UPDATE integration_attempt SET state='completed',current=0,completed_at=?,phase_timings_json=? WHERE id=?")
+            .bind(at(2 * 24 * 60 * 60))
+            .bind(json!({"rounds":1,"queued_ms":9_999_999,"head_total_ms":9_999_999}).to_string())
+            .bind(&attempts[20])
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // Now: one head for two minutes, one waiter for five, one parked for ten.
+        sqlx::query("UPDATE integration_queue SET head_attempt_id=? WHERE id=?")
+            .bind(&attempts[21])
+            .bind(&queue.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET state='checking',started_at=? WHERE id=?")
+            .bind(at(120))
+            .bind(&attempts[21])
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET enqueued_at=? WHERE id=?")
+            .bind(at(300))
+            .bind(&attempts[22])
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET state='parked',updated_at=? WHERE id=?")
+            .bind(at(600))
+            .bind(&attempts[23])
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let status = service.compute_status().await.unwrap().integration_queues;
+        let near = |age: Option<i64>, expected: i64| {
+            assert!(
+                age.is_some_and(|age| (expected..expected + 30).contains(&age)),
+                "{age:?} is not about {expected} s"
+            );
+        };
+        assert_eq!(status.heads.count, 1);
+        near(status.heads.oldest_age_seconds, 120);
+        assert_eq!(status.waiting.count, 1);
+        near(status.waiting.oldest_age_seconds, 300);
+        assert_eq!(status.parked.count, 1);
+        near(status.parked.oldest_age_seconds, 600);
+
+        let timings = status.timings;
+        assert_eq!(timings.window_seconds, 86_400);
+        assert_eq!(timings.completed, 20);
+        let percentiles = |samples, p50_ms, p95_ms, max_ms| api_types::IntegrationPercentiles {
+            samples,
+            p50_ms: Some(p50_ms),
+            p95_ms: Some(p95_ms),
+            max_ms: Some(max_ms),
+        };
+        // Nearest rank over 1..=20: the 10th, the 19th and the last.
+        assert_eq!(timings.queue_wait, percentiles(20, 10_000, 19_000, 20_000));
+        assert_eq!(
+            timings.head_time,
+            percentiles(20, 100_000, 190_000, 200_000)
+        );
+        assert_eq!(timings.fast_forward, percentiles(20, 1000, 1900, 2000));
+        // The ten merges that rebased (n = 2, 4, .. 20): the 5th, the 10th.
+        assert_eq!(timings.rebase, percentiles(10, 2000, 4000, 4000));
+        assert_eq!(timings.check, percentiles(10, 50_000, 100_000, 100_000));
+
+        // Nothing completed: every percentile is absent, not zero.
+        sqlx::query("DELETE FROM integration_attempt WHERE state='completed'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let empty = service
+            .compute_status()
+            .await
+            .unwrap()
+            .integration_queues
+            .timings;
+        assert_eq!(empty.completed, 0);
+        assert_eq!(
+            empty.queue_wait,
+            api_types::IntegrationPercentiles::default()
+        );
     }
 
     #[tokio::test]

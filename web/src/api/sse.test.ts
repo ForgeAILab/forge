@@ -124,6 +124,67 @@ describe('routeSsePayload', () => {
     )
   })
 
+  it('refetches on integration.updated only what shows that queue', () => {
+    const client = new QueryClient()
+    client.setQueryData(qk.task('task-1'), {})
+    client.setQueryData(qk.task('task-2'), { integration: { queue_id: 'queue-1' } })
+    client.setQueryData(qk.task('task-3'), { integration: { queue_id: 'queue-2' } })
+    client.setQueryData(qk.task('task-4'), { integration: null })
+    client.setQueryData(qk.projectTasks('proj-1'), { items: [] })
+    client.setQueryData(qk.projectTasks('proj-2'), { items: [] })
+    client.setQueryData(qk.agents, [])
+    routeSsePayload(
+      {
+        event_type: 'integration.updated',
+        entity_id: 'queue-1',
+        repo_id: 'repo-1',
+        queue_id: 'queue-1',
+        task_id: 'task-1',
+        project_ids: ['proj-1'],
+        timestamp: '2026-10-11T00:00:00Z',
+      } as Parameters<typeof routeSsePayload>[0],
+      client,
+      { dispatch: vi.fn() },
+    )
+    // The Task the event names, and the open detail of another member of
+    // the same queue: its place in line may have moved.
+    expect(client.getQueryState(qk.task('task-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.task('task-3'))?.isInvalidated).toBe(false)
+    expect(client.getQueryState(qk.task('task-4'))?.isInvalidated).toBe(false)
+    // The lists of the Project concerned, and of no other.
+    expect(client.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.projectTasks('proj-2'))?.isInvalidated).toBe(false)
+    expect(client.getQueryState(qk.agents)?.isInvalidated).toBe(false)
+    client.clear()
+  })
+
+  it('refetches the members of the queue when integration.updated names no Task', () => {
+    const client = new QueryClient()
+    client.setQueryData(qk.task('task-1'), { integration: { queue_id: 'queue-1' } })
+    client.setQueryData(qk.task('task-2'), {})
+    client.setQueryData(qk.projectTasks('proj-1'), { items: [] })
+    client.setQueryData(qk.projectTasks('proj-2'), { items: [] })
+    routeSsePayload(
+      {
+        event_type: 'integration.updated',
+        entity_id: 'queue-1',
+        repo_id: 'repo-1',
+        queue_id: 'queue-1',
+        task_id: null,
+        project_ids: ['proj-1'],
+        timestamp: '2026-10-11T00:00:00Z',
+      } as unknown as Parameters<typeof routeSsePayload>[0],
+      client,
+      { dispatch: vi.fn() },
+    )
+    expect(client.getQueryState(qk.task('task-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(false)
+    expect(client.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.projectTasks('proj-2'))?.isInvalidated).toBe(false)
+    client.clear()
+  })
+
   it('invalidates task and project task list on task.status_changed', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(

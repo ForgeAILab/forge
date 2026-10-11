@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
+import { integrationLabel, integrationTone } from '@/lib/integration-queue'
 import {
   blockedInterruption,
   getBlockingAnnotation,
@@ -134,6 +135,19 @@ export function KanbanTaskCard({
                     {subStateLabel ?? task.status.replace(/_/g, ' ')}
                   </span>
                 )}
+                {task.integration ? (
+                  <span
+                    data-testid="integration-label"
+                    className={cn(
+                      'rounded px-1.5 py-0.5 text-micro font-medium',
+                      integrationTone(task.integration) === 'attention'
+                        ? 'bg-amber-50 text-amber-800 dark:bg-amber-500/10 dark:text-amber-200'
+                        : 'bg-muted text-muted-foreground',
+                    )}
+                  >
+                    {integrationLabel(task.integration)}
+                  </span>
+                ) : null}
                 {isPaused ? (
                   <span className="rounded bg-red-50 px-1.5 py-0.5 text-micro font-medium text-red-700 dark:bg-red-500/10 dark:text-red-300">
                     {blockedReason ? formatBlockingReason(blockedReason) : 'Blocked'}

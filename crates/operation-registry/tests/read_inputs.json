@@ -49,5 +49,9 @@
   "project.observations": {
     "limit": 20,
     "task_id": null
+  },
+  "repo.integration_queue": {
+    "target_branch": "main",
+    "limit": 20
   }
 }

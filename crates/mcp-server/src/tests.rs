@@ -982,6 +982,7 @@ fn tools_list_returns_descriptors() {
             "forge_get_agent_session",
             "forge_get_agent_chat",
             "forge_get_agent_handoff",
+            "forge_get_integration_queue",
             "forge_get_main_agent",
             "forge_get_project_agent",
             "forge_get_task",
@@ -2785,6 +2786,205 @@ fn task_lists_omit_offers_but_single_task_reads_keep_them() {
         }
         let single = call_tool(&state, "forge_get_task", json!({"task_id":root.id})).await;
         assert!(single["available_actions"].is_array());
+    });
+}
+
+#[test]
+fn task_reads_carry_the_merge_queue_summary() {
+    use db::IntegrationQueueRepo;
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, repo_id) = seed_project_repo(&state).await;
+        let head = seed_task_in_project(&state, project_id.clone()).await;
+        let waiter = seed_task_in_project(&state, project_id.clone()).await;
+        let outside = seed_task_in_project(&state, project_id.clone()).await;
+        let queue = state
+            .db
+            .create_or_get_integration_queue(&repo_id, "main")
+            .await
+            .unwrap();
+        let mut attempts = Vec::new();
+        for task in [&head, &waiter] {
+            attempts.push(
+                state
+                    .db
+                    .admit_integration_attempt(db::IntegrationAttempt::new(
+                        Some(queue.id.clone()),
+                        task.id.clone(),
+                        project_id.clone(),
+                        format!("admission-{}", task.id),
+                        "merging".into(),
+                        0,
+                        1,
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+        // What the queue worker writes when it takes the head and rebases.
+        sqlx::query("UPDATE integration_queue SET state='open',last_error_kind=NULL,last_error=NULL,head_attempt_id=? WHERE id=?")
+            .bind(&attempts[0].id)
+            .bind(&queue.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET state='rebasing',started_at=? WHERE id=?")
+            .bind(now_rfc3339())
+            .bind(&attempts[0].id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let single = call_tool(&state, "forge_get_task", json!({"task_id":head.id})).await;
+        assert_eq!(single["integration"]["attempt_id"], attempts[0].id);
+        assert_eq!(single["integration"]["target_branch"], "main");
+        assert_eq!(single["integration"]["state"], "owned");
+        assert_eq!(single["integration"]["phase"], "rebasing");
+        assert_eq!(single["integration"]["position"], 0);
+        let single = call_tool(&state, "forge_get_task", json!({"task_id":outside.id})).await;
+        assert_eq!(single["integration"], Value::Null);
+
+        let listed = call_tool(&state, "forge_list_tasks", json!({"project_id":project_id})).await;
+        let item = |id: &str| {
+            listed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(item(&head.id)["integration"]["state"], "owned");
+        assert_eq!(item(&waiter.id)["integration"]["state"], "waiting");
+        assert_eq!(item(&waiter.id)["integration"]["position"], 1);
+        assert_eq!(item(&waiter.id)["integration"]["wait"]["code"], "queue");
+        assert_eq!(item(&outside.id)["integration"], Value::Null);
+    });
+}
+
+#[test]
+fn forge_get_integration_queue_reads_the_projects_own_queue_and_nothing_of_another() {
+    use db::IntegrationQueueRepo;
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, repo_id) = seed_project_repo(&state).await;
+        sqlx::query("UPDATE project SET primary_repo_id=? WHERE id=?")
+            .bind(&repo_id)
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let empty = call_tool(
+            &state,
+            "forge_get_integration_queue",
+            json!({"project_id":project_id}),
+        )
+        .await;
+        assert_eq!(empty["repo_id"], repo_id);
+        assert_eq!(empty["items"], json!([]));
+        let head = seed_task_in_project(&state, project_id.clone()).await;
+        let waiter = seed_task_in_project(&state, project_id.clone()).await;
+        let mut queues = Vec::new();
+        for branch in ["main", "release"] {
+            queues.push(
+                state
+                    .db
+                    .create_or_get_integration_queue(&repo_id, branch)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for task in [&head, &waiter] {
+            state
+                .db
+                .admit_integration_attempt(db::IntegrationAttempt::new(
+                    Some(queues[0].id.clone()),
+                    task.id.clone(),
+                    project_id.clone(),
+                    format!("admission-{}", task.id),
+                    "merging".into(),
+                    0,
+                    1,
+                ))
+                .await
+                .unwrap();
+        }
+        let arguments = json!({"project_id":project_id});
+        let read = call_tool(&state, "forge_get_integration_queue", arguments.clone()).await;
+        assert_eq!(read["project_id"], project_id);
+        assert_eq!(read["has_more"], false);
+        let items = read["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["target_branch"], "main");
+        assert_eq!(items[0]["member_count"], 2);
+        let members = items[0]["members"].as_array().unwrap();
+        assert_eq!(members[0]["task_id"], head.id);
+        assert_eq!(members[1]["task_id"], waiter.id);
+        assert_eq!(members[1]["integration"]["position"], 1);
+        // The same arguments as the native read: one branch, a page size.
+        let one = call_tool(
+            &state,
+            "forge_get_integration_queue",
+            json!({"project_id":project_id,"target_branch":"release"}),
+        )
+        .await;
+        assert_eq!(one["items"].as_array().unwrap().len(), 1);
+        assert_eq!(one["items"][0]["target_branch"], "release");
+        let paged = call_tool(
+            &state,
+            "forge_get_integration_queue",
+            json!({"project_id":project_id,"limit":1}),
+        )
+        .await;
+        assert_eq!(paged["items"].as_array().unwrap().len(), 1);
+        assert_eq!(paged["has_more"], true);
+        // A Project-constrained session reads its own Project without naming
+        // it, and may not name another.
+        let scoped = call_tool_scoped(
+            &state,
+            &project_id,
+            "forge_get_integration_queue",
+            json!({}),
+        )
+        .await;
+        assert_eq!(scoped, read);
+        let (other_project, _) = seed_project_repo(&state).await;
+        let error = dispatch_with_context(
+            &state,
+            &McpContext {
+                project_id: Some(other_project.clone()),
+                user_id: Some("mcp-test-user".to_owned()),
+            },
+            "tools/call",
+            json!({"name":"forge_get_integration_queue","arguments":arguments}),
+        )
+        .await
+        .expect_err("another Project's queue is outside the session");
+        assert_eq!(error.code, -32602);
+        // A Project that names another Project's repository as its checkout
+        // learns how long that line is, and nothing of who is in it.
+        sqlx::query("UPDATE project SET primary_repo_id=? WHERE id=?")
+            .bind(&repo_id)
+            .bind(&other_project)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let foreign = dispatch(
+            &state,
+            "tools/call",
+            json!({"name":"forge_get_integration_queue","arguments":{"project_id":other_project}}),
+        )
+        .await
+        .expect("tool succeeds");
+        let text = foreign["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains(&head.id) && !text.contains(&waiter.id),
+            "{text}"
+        );
+        let foreign: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(foreign["items"][0]["member_count"], 2);
+        assert_eq!(foreign["items"][0]["members"], json!([]));
+        assert_eq!(foreign["items"][0]["head_task_id"], Value::Null);
     });
 }
 

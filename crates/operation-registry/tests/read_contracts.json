@@ -282,5 +282,27 @@
     },
     "required": [],
     "additionalProperties": false
+  },
+  "repo.integration_queue": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "target_branch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "description": "Returns the merge queue of each target branch of the bound Project's repository: the queue's state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position (members ahead), typed wait reason, action hint and timings. A Task in its merge state is in this queue; read it before retrying, holding or cancelling a Task that waits to merge. Read-only and scope-bound: it never accepts a Project or repository selector."
   }
 }

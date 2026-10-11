@@ -74,6 +74,14 @@ impl operation_registry::project_reads::ProjectReadContext<AgentHostError> for C
             )
             .await
     }
+    async fn integration_queue(
+        &self,
+        input: operation_registry::project_reads::IntegrationQueueArguments,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .repo_integration_queue_read(self.project_target()?, input)
+            .await
+    }
     async fn project_charter(&self, _input: NoArguments) -> Result<Value, AgentHostError> {
         self.provider
             .project_charter_read(self.actor_identity_id, self.scope, self.project_target()?)

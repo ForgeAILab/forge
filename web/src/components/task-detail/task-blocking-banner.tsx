@@ -7,6 +7,7 @@ import {
   getTaskWorkflowWarning,
 } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
+import { integrationNotice } from '@/lib/integration-queue'
 
 // Informational fallback for interruption states that carry no recovery
 // actions. Actionable failures are rendered by WorkflowExceptionPanel, which
@@ -98,6 +99,27 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
         <div className="space-y-1.5">
           <p className="text-sm font-semibold">{checkNotice.title}</p>
           <p className="text-sm">{checkNotice.message}</p>
+        </div>
+      </section>
+    )
+  }
+
+  // Where the Task is in the merge queue and why it waits, from the server's
+  // summary: no state name is read here.
+  if (task.integration) {
+    const notice = integrationNotice(task.integration)
+    return (
+      <section
+        data-testid="integration-notice"
+        className={
+          notice.tone === 'attention'
+            ? 'rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'
+            : 'rounded-lg border border-border bg-muted/40 p-4 text-foreground'
+        }
+      >
+        <div className="space-y-1.5">
+          <p className="text-sm font-semibold">{notice.title}</p>
+          {notice.message ? <p className="text-sm">{notice.message}</p> : null}
         </div>
       </section>
     )

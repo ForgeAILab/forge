@@ -276,6 +276,9 @@ pub(crate) async fn dispatch(
         McpInput::BindProjectAgent(params) => {
             handlers::forge_set_project_agent(state, params, context).await
         }
+        McpInput::GetIntegrationQueue(params) => {
+            handlers::forge_get_integration_queue(state, params, context).await
+        }
         McpInput::ListAgentChats(params) => {
             handlers::forge_list_agent_chats(state, params, context).await
         }

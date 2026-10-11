@@ -14,6 +14,7 @@ import { TaskPlacementDiagnostics } from '@/components/task-detail/task-placemen
 import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
+import { integrationLabel } from '@/lib/integration-queue'
 import type { Task, TaskStatus } from '@/types/generated'
 import { stripRunSuffix } from './utils'
 
@@ -119,6 +120,11 @@ export function TaskDetailSidebar({
               {statusBadge(task.status)}
               {task.task_type ? <Badge variant="secondary">{task.task_type}</Badge> : null}
             </div>
+            {task.integration ? (
+              <p className="mt-1.5 text-xs text-muted-foreground" data-testid="integration-label">
+                {integrationLabel(task.integration)}
+              </p>
+            ) : null}
           </>
         ) : null}
       </div>

@@ -103,6 +103,7 @@ pub(super) fn task_list_response(
     workflow: &api_types::WorkflowDefinition,
     rows: TaskDiagnosticRows<'_>,
     external_link: Option<&db::TaskExternalLink>,
+    integration: Option<api_types::TaskIntegrationSummary>,
 ) -> api_types::TaskListItemResponse {
     let role_assignments = rows
         .role_assignments
@@ -132,6 +133,7 @@ pub(super) fn task_list_response(
         remaining_retries: projection.remaining_retries,
         retry_limits: projection.retry_limits,
         condition: projection.condition,
+        integration,
         workflow_health: projection.workflow_health,
         workflow_exception: projection.workflow_exception,
         review_passed_at: task.review_passed_at,

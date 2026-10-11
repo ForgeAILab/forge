@@ -220,6 +220,9 @@ pub struct TaskResponse {
     #[serde(default)]
     pub available_actions: Vec<Offer>,
     pub condition: crate::TaskCondition,
+    /// The Task's place in the merge queue; `null` without an attempt in progress.
+    #[serde(default)]
+    pub integration: Option<crate::TaskIntegrationSummary>,
     pub workflow_health: Option<WorkflowHealthSummary>,
     pub workflow_exception: Option<WorkflowExceptionSummary>,
     pub execution_observability: TaskExecutionObservability,
@@ -276,6 +279,9 @@ pub struct TaskListItemResponse {
     #[ts(type = "Record<string, number>")]
     pub retry_limits: std::collections::HashMap<String, i64>,
     pub condition: crate::TaskCondition,
+    /// The Task's place in the merge queue; `null` without an attempt in progress.
+    #[serde(default)]
+    pub integration: Option<crate::TaskIntegrationSummary>,
     pub workflow_health: Option<WorkflowHealthSummary>,
     pub workflow_exception: Option<WorkflowExceptionSummary>,
     pub review_passed_at: Option<String>,
@@ -314,6 +320,7 @@ impl From<TaskResponse> for TaskListItemResponse {
             remaining_retries: task.remaining_retries,
             retry_limits: task.retry_limits,
             condition: task.condition,
+            integration: task.integration,
             workflow_health: task.workflow_health,
             workflow_exception: task.workflow_exception,
             review_passed_at: task.review_passed_at,

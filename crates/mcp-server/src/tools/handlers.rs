@@ -195,6 +195,12 @@ async fn tasks_with_role_assignments(
             .push(assignment);
     }
     let mut budget_spent = db::budget::load_many(state.db.pool(), &ids).await?;
+    // The merge-queue attempts of the page, in one statement.
+    let integration = db::integration_members_of_tasks(state.db.pool(), &ids).await?;
+    let integration = integration
+        .iter()
+        .map(|row| (row.task_ref.as_str(), row))
+        .collect::<HashMap<_, _>>();
     let mut projects = HashMap::<String, db::Project>::new();
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
@@ -216,7 +222,11 @@ async fn tasks_with_role_assignments(
         let remaining = db::budget::projection(&task, &workflow, &counts, recovery_limit)?;
         let limits = db::budget::projection(&task, &workflow, &Default::default(), recovery_limit)?;
         let assignments = assignments_by_task.remove(&task.id).unwrap_or_default();
+        let summary = integration.get(task.id.as_str()).and_then(|row| {
+            services::integration_reads::task_integration_summary(row, Some(&task))
+        });
         let mut value = task_value(task);
+        value["integration"] = json!(summary);
         value["remaining_retries"] = json!(remaining);
         value["retry_limits"] = json!(limits);
         if let Some(object) = value.as_object_mut() {
@@ -460,7 +470,11 @@ pub(super) async fn forge_get_task(
         .task_service
         .task_action_snapshot(&params.task_id, &actor)
         .await?;
-    task_snapshot_value(snapshot)
+    let integration =
+        services::integration_reads::task_integration(&state.db, &snapshot.task).await?;
+    let mut value = task_snapshot_value(snapshot)?;
+    value["integration"] = json!(integration);
+    Ok(value)
 }
 
 fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {
@@ -1458,6 +1472,29 @@ pub(super) async fn forge_get_project_agent(
     Ok(serialize_public(project_binding_response(
         binding, chat_id,
     )?))
+}
+
+/// The merge queues of the Project's repository, as the native
+/// `repo.integration_queue` read answers them (one service function). The
+/// registry admitted the caller as a member of `project_id`; the Project is
+/// read again here, by the rule of the REST route: a Project the caller
+/// cannot see answers like one that does not exist.
+pub(super) async fn forge_get_integration_queue(
+    state: &AppState,
+    params: operation_registry::mcp::GetIntegrationQueueParams,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    db::ProjectRepo::get_visible_by_id(&*state.db, &params.project_id, user_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("project", params.project_id.clone()))?;
+    Ok(services::integration_reads::project_integration_queues(
+        &state.db,
+        &params.project_id,
+        params.target_branch.as_deref(),
+        params.limit,
+    )
+    .await?)
 }
 
 pub(super) async fn forge_set_project_agent(
