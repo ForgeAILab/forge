@@ -272,17 +272,14 @@ impl SqliteDb {
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-        // The registration mark is written before the wait row: it is not a
-        // capacity release, and the wait's age (`task_slot_wait_age`, kept
-        // by triggers) must not count it as one.
+        sqlx::query("INSERT INTO task_schedule_wait(task_id,project_id,agent_id,daemon_id,deadline,project_capacity) VALUES (?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET project_id=excluded.project_id,agent_id=excluded.agent_id,daemon_id=excluded.daemon_id,deadline=excluded.deadline,project_capacity=excluded.project_capacity WHERE project_capacity IS NOT excluded.project_capacity OR project_id IS NOT excluded.project_id OR agent_id IS NOT excluded.agent_id OR daemon_id IS NOT excluded.daemon_id OR deadline IS NOT excluded.deadline")
+            .bind(id).bind(project.0).bind(agent).bind(daemon).bind(deadline).bind(project.1).execute(&mut *tx).await?;
         if registers_slot_wait {
             sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE id=? ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query("INSERT INTO task_schedule_wait(task_id,project_id,agent_id,daemon_id,deadline,project_capacity) VALUES (?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET project_id=excluded.project_id,agent_id=excluded.agent_id,daemon_id=excluded.daemon_id,deadline=excluded.deadline,project_capacity=excluded.project_capacity WHERE project_capacity IS NOT excluded.project_capacity OR project_id IS NOT excluded.project_id OR agent_id IS NOT excluded.agent_id OR daemon_id IS NOT excluded.daemon_id OR deadline IS NOT excluded.deadline")
-            .bind(id).bind(project.0).bind(agent).bind(daemon).bind(deadline).bind(project.1).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

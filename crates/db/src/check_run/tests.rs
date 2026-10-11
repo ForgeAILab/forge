@@ -1886,6 +1886,155 @@ mod retention {
         assert_eq!(ids(&db, "check_run").await, ["fresh"]);
     }
 
+    async fn hooks_step(db: &SqliteDb, id: &str, status: &str, ci_consumer: &str) {
+        sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at) VALUES(?,'t',(SELECT COALESCE(MAX(seq),0)+1 FROM task_step),'hooks','{}',?,?,1,'todo',1,?,?,?,?)")
+            .bind(id).bind(id).bind(id).bind(status).bind(OLD).bind(OLD).bind(OLD)
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES(?,0,?,json_object('ci_consumer',?,'ci_rerequests',1))")
+            .bind(id).bind(OLD).bind(ci_consumer).execute(db.pool()).await.unwrap();
+    }
+    async fn attempt(db: &SqliteDb, id: &str, task: Option<&str>, state: &str) {
+        sqlx::query("INSERT OR IGNORE INTO integration_queue(id,repo_id,target_branch,state,updated_at,created_at) VALUES('q','r','main','open',?,?)")
+            .bind(OLD).bind(OLD).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO integration_attempt(id,queue_id,task_id,task_ref,project_ref,queue_seq,current,admission_key,expected_status,expected_epoch,observed_task_version,enqueued_at,state,updated_at,created_at) VALUES(?,'q',?,'t','p',(SELECT COUNT(*)+1 FROM integration_attempt),0,?,'merging',0,1,?,?,?,?)")
+            .bind(id).bind(task).bind(id).bind(OLD).bind(state).bind(OLD).bind(OLD)
+            .execute(db.pool()).await.unwrap();
+    }
+
+    /// References that are not columns of their own. A consumer a hook
+    /// checkpoint of an unfinished step names (the step was woken and then
+    /// parked, so it no longer awaits the consumer and its owner can still
+    /// drive it again), an integration
+    /// consumer whose attempt is not final, and a run or result that such an
+    /// attempt names by operation id or inside its JSON: all are kept until
+    /// their reader is finished, and go afterwards.
+    #[tokio::test]
+    async fn retention_keeps_what_a_checkpoint_or_an_unfinished_integration_attempt_names() {
+        let db = fixture().await;
+        // The entry's hook recorded this consumer; its step is pending again.
+        run(&db, "hook-run", "cancelled", OLD).await;
+        consumer(&db, "hook-c", Some("hook-run"), None, 0, "cancelled", OLD).await;
+        hooks_step(&db, "woken", "parked", "hook-c").await;
+        // An integration consumer (applied) of an attempt still `checking`.
+        run(&db, "queue-run", "succeeded", OLD).await;
+        result(&db, "queue-result", "queue-run", OLD).await;
+        consumer(
+            &db,
+            "queue-c",
+            Some("queue-run"),
+            Some("queue-result"),
+            0,
+            "applied",
+            OLD,
+        )
+        .await;
+        sqlx::query("UPDATE check_consumer SET origin='integration', request_key='v1|integration|t|0|attempt-checking' WHERE id='queue-c'").execute(db.pool()).await.unwrap();
+        attempt(&db, "attempt-checking", Some("t"), "checking").await;
+        // Runs nobody consumes that an unfinished attempt names: by its
+        // operation, by run id and by result id in its JSON.
+        attempt(&db, "attempt-names", None, "awaiting_task_step").await;
+        for id in ["by-operation", "by-run-id", "by-result-id", "unnamed"] {
+            run(&db, id, "succeeded", OLD).await;
+            result(&db, &format!("{id}-result"), id, OLD).await;
+        }
+        sqlx::query("UPDATE integration_attempt SET operation_id='op-by-operation', checks_json=json_object('run','by-run-id'), operation_receipts_json=json_array(json_object('result','by-result-id-result')) WHERE id='attempt-names'").execute(db.pool()).await.unwrap();
+
+        let mut passes = 0;
+        while db.prune_check_history(CUTOFF, 100).await.unwrap() != CheckHistoryPruned::default() {
+            passes += 1;
+            assert!(passes < 5);
+        }
+        assert_eq!(ids(&db, "check_consumer").await, ["hook-c", "queue-c"]);
+        assert_eq!(
+            ids(&db, "check_run").await,
+            [
+                "by-operation",
+                "by-result-id",
+                "by-run-id",
+                "hook-run",
+                "queue-run"
+            ]
+        );
+        assert_eq!(ids(&db, "check_result").await.len(), 4);
+
+        // Their readers finish: everything goes.
+        sqlx::query("UPDATE task_step SET status='done'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET state='completed'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        while db.prune_check_history(CUTOFF, 100).await.unwrap() != CheckHistoryPruned::default() {
+            passes += 1;
+            assert!(passes < 10);
+        }
+        assert!(ids(&db, "check_consumer").await.is_empty());
+        assert!(ids(&db, "check_run").await.is_empty());
+        assert!(ids(&db, "check_result").await.is_empty());
+    }
+
+    /// The first pass after an upgrade, on a database with months of check
+    /// history: 20,000 old runs with their results and consumers and 2,000
+    /// that must stay. Every batch is one short write (nothing here may hold
+    /// the write lock for long: other writers wait behind it), the whole
+    /// history goes in a bounded number of batches, and what must stay stays.
+    #[tokio::test]
+    async fn retention_clears_months_of_history_in_short_batches() {
+        let db = fixture().await;
+        sqlx::raw_sql(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<22000)
+             INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at,finished_at)
+             SELECT 'run-'||i,'p','r','c','d','identity-'||i,'{{}}',1,'succeeded','op-'||i,
+                    CASE WHEN i<=20000 THEN '{OLD}' ELSE '{RECENT}' END,CASE WHEN i<=20000 THEN '{OLD}' ELSE '{RECENT}' END,CASE WHEN i<=20000 THEN '{OLD}' ELSE '{RECENT}' END FROM n;
+             INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at)
+             SELECT 'result-'||substr(id,5),id,identity_key,'pass','success',1,1,json_array(json_object('tail',printf('%.*c',2000,'x'))),0,created_at FROM check_run;
+             INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,request_key,identity_key,run_id,result_id,created_at,applied_at,delivery_step_id)
+             SELECT 'consumer-'||substr(id,5),'p','r','t',7,'entry','7|'||id,identity_key,id,'result-'||substr(id,5),created_at,created_at,'delivery-'||id FROM check_run;"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        let (mut batches, mut slowest, mut total) =
+            (0, std::time::Duration::ZERO, CheckHistoryPruned::default());
+        loop {
+            let batch = std::time::Instant::now();
+            let pruned = db.prune_check_history(CUTOFF, 100).await.unwrap();
+            slowest = slowest.max(batch.elapsed());
+            batches += 1;
+            total.consumers += pruned.consumers;
+            total.runs += pruned.runs;
+            if pruned == CheckHistoryPruned::default() {
+                break;
+            }
+            assert!(batches <= 201, "retention did not finish in 200 batches");
+        }
+        eprintln!(
+            "retention of 20000 runs: {batches} batches, {:?} in all, slowest batch {slowest:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            total,
+            CheckHistoryPruned {
+                consumers: 20_000,
+                runs: 20_000
+            }
+        );
+        assert!(
+            slowest < std::time::Duration::from_secs(1),
+            "one retention batch held the write lock for {slowest:?}"
+        );
+        for table in ["check_run", "check_result", "check_consumer"] {
+            let left: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(left, 2_000, "{table}");
+        }
+    }
+
     /// Every column that points at a check table must be accounted for by
     /// the retention predicate. This enumerates them from the schema: every
     /// foreign key into `check_run`, `check_result` or `check_consumer`, and
@@ -1955,6 +2104,31 @@ mod retention {
         assert_eq!(
             found, known,
             "a column points at a check row that `prune_check_history` does not know: make the predicate keep what it can still read, then list it in CHECK_REFERENCES (or in NOT_A_CHECK_REFERENCE when it holds something else)"
+        );
+
+        // Ids inside JSON or free text have no column to enumerate. The
+        // tables that consume checks are the ones that can carry one: every
+        // JSON or payload column they have is classified in
+        // CHECK_JSON_COLUMNS, so a new one fails here until somebody decides
+        // whether it can name a check row and the predicate honours it.
+        let mut json_columns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT m.name, c.name FROM sqlite_master m, pragma_table_info(m.name) c
+             WHERE m.type='table'
+               AND (m.name IN ('task_step','task_hook_checkpoint','review') OR m.name LIKE 'integration\\_attempt%' ESCAPE '\\')
+               AND (c.name LIKE '%json%' OR c.name LIKE '%payload%' OR c.name LIKE '%receipt%' OR c.name LIKE '%effects%')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        json_columns.sort();
+        let mut classified: Vec<(String, String)> = CHECK_JSON_COLUMNS
+            .iter()
+            .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
+            .collect();
+        classified.sort();
+        assert_eq!(
+            json_columns, classified,
+            "a JSON column of a table that consumes checks is not classified in CHECK_JSON_COLUMNS"
         );
     }
 }
