@@ -556,6 +556,20 @@ impl SqliteDb {
             .fetch_all(self.pool())
             .await?)
     }
+    /// Whether the run of a consumer that was cancelled in the last
+    /// `within_seconds` is still being stopped. A request for the same check
+    /// would join that run and receive its cancellation.
+    pub async fn cancelled_consumer_run_is_stopping(
+        &self,
+        consumer_id: &str,
+        within_seconds: i64,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c JOIN check_run r ON r.id=c.run_id WHERE c.id=? AND c.cancelled_at IS NOT NULL AND (julianday('now')-julianday(c.cancelled_at))*86400.0<? AND r.state IN ('cancelling','cleaning','uncertain'))")
+            .bind(consumer_id)
+            .bind(within_seconds)
+            .fetch_one(self.pool())
+            .await?)
+    }
     /// Project deletion: nobody waits for this Project's unfinished check
     /// runs any more. The check worker stops a run without consumers (a
     /// queued one is cancelled, a running one is cancelled on its owner).

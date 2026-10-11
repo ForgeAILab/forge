@@ -260,6 +260,38 @@ impl HookAction for RunCiSteps {
                 // attempt is cancelled and the hook fails as an unfinished
                 // check does.
                 Ok(CheckWaitState::Lost) => {
+                    // The run this consumer waited for is still being
+                    // stopped (the forced deletion that cancelled it was
+                    // refused because the run had not settled). A request
+                    // now would join that run and get its cancellation, so
+                    // the step looks again shortly, for two minutes at most.
+                    match ctx
+                        .db
+                        .cancelled_consumer_run_is_stopping(
+                            &consumer_id,
+                            WITHDRAWN_RUN_STOPPING_SECONDS,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            let until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(WITHDRAWN_RUN_RECHECK_SECONDS))
+                            .to_rfc3339();
+                            if crate::workflow::engine::durable::suspend_hook(
+                                &ctx.task_id,
+                                &consumer_id,
+                                until,
+                            ) {
+                                return HookResult::Ok;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return HookResult::Failed {
+                                reason: error.to_string(),
+                            }
+                        }
+                    }
                     // A consumer withdrawn under a live step (a forced
                     // Project deletion that was then refused cancels them)
                     // is asked for again, like a changed configuration.
@@ -526,6 +558,11 @@ const CI_CONSUMER: &str = "ci_consumer";
 /// how often this entry dropped a stale check and asked again.
 pub(crate) const ENTRY_CHECK_CONFIG_EFFECT: &str = "ci_config";
 pub(crate) const ENTRY_CHECK_REREQUESTS_EFFECT: &str = "ci_rerequests";
+/// A withdrawn consumer whose run is still being stopped: the entry waits
+/// for the run to end before it asks again, looking this often and for this
+/// long after the consumer was cancelled.
+const WITHDRAWN_RUN_RECHECK_SECONDS: i64 = if cfg!(test) { 1 } else { 5 };
+const WITHDRAWN_RUN_STOPPING_SECONDS: i64 = 120;
 /// An entry asks again at most this often (a configuration that keeps
 /// changing, or a check that keeps being withdrawn); then it parks typed.
 pub(crate) const ENTRY_CHECK_REREQUEST_LIMIT: u32 = 3;

@@ -2053,6 +2053,103 @@ async fn a_refused_project_deletion_re_requests_the_entry_checks_it_cancelled() 
     );
 }
 
+// The usual refusal: the forced delete cancelled the consumers, the run did
+// not stop within the bound, and the run is still being stopped when the
+// entries are woken. A request made now would join that run and be handed
+// its cancellation (a second re-request for one refusal, and after two
+// refused deletes a parked Task). The entry waits for the run to end and
+// asks once: one new consumer, one new run, one re-request counted.
+#[tokio::test]
+async fn a_refused_deletion_whose_run_is_still_stopping_asks_once_when_the_run_has_ended() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let first = awaited_consumer(&fixture).await.unwrap();
+    assert_eq!(
+        fixture
+            .db
+            .cancel_project_check_consumers(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("UPDATE check_run SET state='cancelling'")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .engine
+            .resume_project_check_waits(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    // Three rechecks pass while the run is being stopped: nothing is asked.
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        1,
+        "the entry joined a run that is being stopped"
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 1);
+    assert_eq!(awaited_consumer(&fixture).await.as_deref(), Some(&*first));
+    let steps = count(&fixture, "SELECT COUNT(*) FROM task_step").await;
+    // The run ends: the next recheck asks again.
+    sqlx::query("UPDATE check_run SET state='cancelled', finished_at=updated_at, lease_owner=NULL, lease_until=NULL")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let awaited = awaited_consumer(&fixture).await;
+            if awaited.as_deref().is_some_and(|id| id != first) {
+                break awaited.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the entry asks again once the run has ended");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        2
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 2);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_run r JOIN check_consumer c ON c.run_id=r.id WHERE c.id<>'' AND r.state='queued' AND c.cancelled_at IS NULL"
+        )
+        .await,
+        1,
+        "{second}"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT CAST(json_extract(effects_json,'$.ci_rerequests') AS INTEGER) FROM task_hook_checkpoint WHERE json_extract(effects_json,'$.ci_rerequests') IS NOT NULL"
+        )
+        .await,
+        1,
+        "one refusal used one re-request"
+    );
+    // Waiting wrote no new step: the same step was suspended again.
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM task_step").await,
+        steps
+    );
+    assert_eq!(
+        db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 // A check that keeps being withdrawn does not make the entry ask forever:
 // after three re-requests the hook fails as an unanswered check always did.
 #[tokio::test]

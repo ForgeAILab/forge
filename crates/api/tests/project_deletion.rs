@@ -1155,3 +1155,156 @@ async fn project_delete_counts_live_check_runs_and_force_settles_them_first() {
         .expect("check run count");
     assert_eq!(left, 0);
 }
+
+/// The route, through cancel-then-refuse. A review entry waits (suspended)
+/// for a check that is running somewhere and does not stop within the
+/// bound: the forced delete cancels its consumer and is refused. The refusal
+/// itself wakes the entry's step so that it asks again (what the woken step
+/// then does is proven on the hook: one new consumer, one run). After the
+/// run has ended the same request deletes the Project and leaves nothing: no
+/// step, no consumer, no run, and waking a Project that is gone is a no-op.
+#[tokio::test]
+async fn a_refused_forced_delete_wakes_the_review_entries_it_cancelled_and_a_successful_one_leaves_nothing(
+) {
+    use db::{CheckRunRepo, CheckRunState};
+    let workspace = common::TestDir::new("project-delete-refused-wakes");
+    let harness = common::test_app(workspace.path(), "project-delete-refused-wakes").await;
+    // This test owns the run and the step: no worker takes either.
+    harness.step_worker.stop_checks().await;
+    harness.step_worker.stop();
+    let repo_path = common::setup_git_repo(workspace.path());
+    let (project_id, repo_id) =
+        common::create_project_and_repo(&harness.app, "Refused forced delete", &repo_path).await;
+    let task: TaskResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "in review" }),
+        StatusCode::OK,
+    )
+    .await;
+    let db = harness.state.db.clone();
+    let run = queue_entry_check(&harness, &project_id, &repo_id, &task.id, "entry").await;
+    let until = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let run = match db::CheckWorkerRepo::admit_check_run(
+        &*db,
+        &run,
+        "another-worker",
+        &now_rfc3339(),
+        &until,
+    )
+    .await
+    .expect("admission")
+    {
+        db::CheckAdmission::Admitted(run) => *run,
+        db::CheckAdmission::Waiting => panic!("the run was not admitted"),
+    };
+    let consumer: String = sqlx::query_scalar("SELECT id FROM check_consumer WHERE run_id = ?")
+        .bind(&run.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("consumer");
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,awaited_consumer_id,suspended_until) VALUES('entry-step',?1,(SELECT COALESCE(MAX(seq),0)+1 FROM task_step WHERE task_id=?1),'hooks','{}','entry','entry',1,'todo',1,'suspended',?2,?2,?2,?3,?4)")
+        .bind(&task.id).bind(&now).bind(&consumer).bind(&until)
+        .execute(db.pool()).await.expect("the entry's suspended hooks step");
+    let step_status = || async {
+        sqlx::query_scalar::<_, String>("SELECT status FROM task_step WHERE id='entry-step'")
+            .fetch_optional(db.pool())
+            .await
+            .expect("step status")
+    };
+
+    let forced = common::raw_empty_request(
+        &harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}?force=true"),
+    )
+    .await;
+    let body: Value = common::parse_response(forced, StatusCode::CONFLICT).await;
+    assert_eq!(body["details"]["force_cancellation_incomplete"], true);
+    assert_eq!(body["details"]["cancelled"], true);
+    assert_eq!(body["details"]["live_check_runs"], 1);
+    assert!(project_exists(&harness, &project_id).await);
+    let cancelled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM check_consumer WHERE id = ? AND cancelled_at IS NOT NULL",
+    )
+    .bind(&consumer)
+    .fetch_one(db.pool())
+    .await
+    .expect("consumer state");
+    assert_eq!(cancelled, 1, "phase two cancelled the entry's consumer");
+    assert_eq!(
+        step_status().await.as_deref(),
+        Some("pending"),
+        "the refusal woke the entry whose check it cancelled"
+    );
+    // Asking again is the woken step's; the route asked for nothing itself.
+    let consumers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_consumer")
+        .fetch_one(db.pool())
+        .await
+        .expect("consumers");
+    assert_eq!(consumers, 1);
+    assert_eq!(
+        harness
+            .state
+            .task_service
+            .resume_project_check_waits(&project_id)
+            .await
+            .expect("a second wake"),
+        0,
+        "an entry is woken once"
+    );
+
+    // The run ends; the forced delete goes through and leaves nothing.
+    let fence = |run: &db::StoredCheckRun| db::CheckRunFence {
+        run_id: run.id.clone(),
+        version: run.version,
+        lease_owner: run.lease_owner.clone(),
+        lease_generation: run.lease_generation,
+    };
+    let current = db.check_run(&run.id).await.unwrap().unwrap();
+    let cleaning = db
+        .transition_check_run(&fence(&current), CheckRunState::Cleaning, &now_rfc3339())
+        .await
+        .expect("cleaning");
+    db.finish_check_run(
+        &fence(&cleaning),
+        db::CheckResultEvidence {
+            outcome: db::CheckResultOutcome::Cancelled,
+            cleanup: db::CheckCleanup::Success,
+            commands: vec![],
+            output_truncated: false,
+            redaction_values: vec![],
+            reusable: false,
+        },
+        &now_rfc3339(),
+    )
+    .await
+    .expect("settled");
+    let forced = common::raw_empty_request(
+        &harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}?force=true"),
+    )
+    .await;
+    assert_eq!(forced.status(), StatusCode::NO_CONTENT);
+    assert!(!project_exists(&harness, &project_id).await);
+    assert_eq!(step_status().await, None);
+    for table in ["check_run", "check_consumer", "check_result", "task_step"] {
+        let left: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .expect("rows left");
+        assert_eq!(left, 0, "{table}");
+    }
+    assert_eq!(
+        harness
+            .state
+            .task_service
+            .resume_project_check_waits(&project_id)
+            .await
+            .expect("waking a Project that is gone"),
+        0
+    );
+}
