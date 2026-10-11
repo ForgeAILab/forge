@@ -429,6 +429,30 @@ Forge only after the command exits. Already-incremental databases are left in
 that mode without another full rebuild. Existing databases are never fully
 vacuumed automatically.
 
+### Disk and cleanup
+
+Everything Forge keeps on a machine's disk outside the database lives under
+one directory, the workspace root, and one collector per root keeps it
+bounded. This page is the map; each line links the full rule.
+
+| Topic | What it is | Where |
+|---|---|---|
+| Workspace root | The directory holding every Task root, repository clone, log and cache. New installs use `<data dir>/worktrees`; the root in use is recorded and a start that would strand live data is refused. | [Where the server keeps workspaces](#where-the-server-keeps-workspaces-and-how-to-move-them) below, [architecture: Server workspace root](architecture.md#server-workspace-root) |
+| Moving the root | `forge --migrate-workspace-root [<new root>]`, with the server stopped. It waits for work in flight: running executions and checks, claimed steps, active leases, and integration attempts that are not at rest (`needs_review` and `ejected` attempts do not block; the refusal names each Task that does). | [cli: Moving the server workspace root](cli.md#moving-the-server-workspace-root) |
+| Task root layout | Per Task: the worktree, `.forge-task/build` (its own `CARGO_TARGET_DIR`), per-run temp directories. | [architecture: Task-root layout and run environment](architecture.md#task-root-layout-and-run-environment) |
+| Garbage collection | What is removed, when, and what is never touched (running work, a root another database owns). The settings below. | [architecture: Workspace garbage collection](architecture.md#workspace-garbage-collection) |
+| Disk admission | Under the free-space floor a machine starts no new worktree and recreates none; Tasks wait ("Waiting for Disk Space") and resume by themselves. | [architecture: Disk-pressure admission](architecture.md#disk-pressure-admission), [api: Machine disk facts](api.md#machine-disk-facts-and-disk-pressure-admission) |
+| Compiler cache | Opt-in shared `sccache` / `kache` store per repository, trimmed first under the floor; the store of a deleted repository is removed after a day. | [Shared compiler cache](#shared-compiler-cache-opt-in) below |
+| Daemons | A daemon collects its own root with the server's floor and check limit (both sent in the reply to its report) and reports its disk, its cache size and the size of each Task root. | [api: Machine disk facts](api.md#machine-disk-facts-and-disk-pressure-admission) |
+
+Logs of a terminal Task are kept in these cases, whatever their age:
+`log_retention_days: 0`; the Task was reopened (it is not terminal); it has
+an open review or an unresolved attention item, or that cannot be read right
+now; something was written to the log directory inside the retention; the
+Task's record has no readable timestamp; the root is not owned by this
+database or cannot be resolved (nothing is deleted on a root Forge does not
+own). A daemon's execution logs are not under this rule.
+
 Workspace garbage collection is configured under `workspace` in `forge.yaml`:
 
 ```yaml
@@ -688,7 +712,7 @@ Without a path the command moves to the configured root when
 The command needs the server stopped (it takes the lock a running server
 holds and refuses otherwise) and nothing recorded as in flight: no running
 execution or check run, no claimed or suspended task step, no integration
-attempt that is neither finished nor parked, no active workspace lease. The
+attempt that is not at rest (`needs_review` and `ejected` are at rest), no active workspace lease. The
 new root must be absent or empty (unless the old root no longer exists),
 outside the old root, not the home directory, a Git repository or a
 top-level directory, and, when it is on another filesystem, have room for
