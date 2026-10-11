@@ -288,6 +288,63 @@ pub async fn request_integration_cancel_in_tx(
     Ok(a)
 }
 
+impl crate::SqliteDb {
+    /// Make the Task's current parked attempt due now, so the worker's next
+    /// sweep re-queues it. Called by the write that lifts what the attempt
+    /// waits for (the owner's Release, an unblock, a Project resume).
+    ///
+    /// Without `owner_retry` only an attempt that already waits for a
+    /// deadline is touched: a park that ended automation stays the owner's.
+    /// With it (the owner's Retry) any parked attempt without an unsettled
+    /// effect is made due, and the worker's journal notes the retry, which
+    /// starts the counted infrastructure retries again.
+    /// `Ok(false)`: the Task has no such attempt.
+    pub async fn expedite_parked_integration_attempt(
+        &self,
+        task_id: &str,
+        now: &str,
+        owner_retry: bool,
+    ) -> Result<bool> {
+        integration_time(now)?;
+        let entry = serde_json::json!({"kind":"owner_retry","at":now}).to_string();
+        let n = sqlx::query(
+            "UPDATE integration_attempt SET available_at=?1,updated_at=?1,revision=revision+1,\
+               operation_receipts_json=CASE WHEN ?3 THEN json_insert(CASE WHEN json_valid(operation_receipts_json) AND json_type(operation_receipts_json)='array' THEN operation_receipts_json ELSE '[]' END,'$[#]',json(?4)) ELSE operation_receipts_json END \
+             WHERE task_ref=?2 AND current=1 AND state='parked' AND effect_intent_json IS NULL \
+               AND cancel_requested_at IS NULL AND (?3 OR available_at IS NOT NULL)",
+        )
+        .bind(now)
+        .bind(task_id)
+        .bind(owner_retry)
+        .bind(entry)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Make every waiting parked attempt of the Project's Tasks due now (the
+    /// Project was resumed).
+    pub async fn expedite_parked_integration_attempts_of_project(
+        &self,
+        project_id: &str,
+        now: &str,
+    ) -> Result<u64> {
+        integration_time(now)?;
+        Ok(sqlx::query(
+            "UPDATE integration_attempt SET available_at=?1,updated_at=?1,revision=revision+1 \
+             WHERE current=1 AND state='parked' AND effect_intent_json IS NULL \
+               AND cancel_requested_at IS NULL AND available_at IS NOT NULL \
+               AND task_ref IN (SELECT id FROM task WHERE project_id=?2 AND deleted_at IS NULL)",
+        )
+        .bind(now)
+        .bind(project_id)
+        .execute(self.pool())
+        .await?
+        .rows_affected())
+    }
+}
+
 fn age(row: &sqlx::sqlite::SqliteRow) -> Result<IntegrationAge> {
     let count: i64 = row.try_get("n")?;
     let oldest: Option<f64> = row.try_get("age")?;

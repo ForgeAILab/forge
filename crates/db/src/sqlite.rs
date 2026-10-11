@@ -128,7 +128,7 @@ mod shared_media;
 mod skill;
 mod system_setting;
 mod task;
-pub use schedule::ScheduleRead;
+pub use schedule::{ScheduleRead, INTEGRATION_OWNED_SQL};
 mod task_adaptive;
 mod task_comment;
 mod task_dependency;

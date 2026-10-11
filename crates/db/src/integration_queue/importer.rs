@@ -117,6 +117,76 @@ fn paths(v: &Value) -> Result<Vec<String>> {
         .map_err(|_| DbError::Check("unsupported path encoding".into()))
 }
 
+/// The states of a workflow that play the two merge roles.
+pub(crate) struct MergeRoles {
+    /// States whose entry admits to the integration queue (`run_merge`).
+    pub merge: Vec<String>,
+    /// States a failed merge is sent to for repair (the state that carries
+    /// the conflict-marker exit guard, or a merge state's `reject` target).
+    pub repair: Vec<String>,
+}
+/// The merge roles of a Project's stored workflow definition. A Project
+/// without one of its own (`{}`), or with one that cannot be read, uses the
+/// default workflow, whose names are `merging` and `merge_failed`.
+pub(crate) fn merge_roles(workflow_definition: Option<&str>) -> MergeRoles {
+    let defaults = || MergeRoles {
+        merge: vec!["merging".into()],
+        repair: vec!["merge_failed".into()],
+    };
+    let Some(workflow) = workflow_definition
+        .and_then(|raw| serde_json::from_str::<api_types::WorkflowDefinition>(raw).ok())
+        .filter(|workflow| !workflow.states.is_empty())
+    else {
+        return defaults();
+    };
+    let merge: Vec<String> = workflow
+        .states
+        .iter()
+        .filter(|state| {
+            state
+                .hooks
+                .on_enter
+                .iter()
+                .any(|hook| hook.action == "run_merge")
+        })
+        .map(|state| state.name.clone())
+        .collect();
+    if merge.is_empty() {
+        return defaults();
+    }
+    // The repair role's own exit guard marks its state; a workflow without
+    // that hook names it as the merge state's `reject` target.
+    let mut repair: Vec<String> = workflow
+        .states
+        .iter()
+        .filter(|state| {
+            state
+                .hooks
+                .before_exit
+                .iter()
+                .any(|hook| hook.action == "require_conflict_markers_resolved")
+        })
+        .map(|state| state.name.clone())
+        .chain(
+            merge
+                .iter()
+                .flat_map(|name| workflow.outgoing_trigger_targets(name))
+                .filter(|(trigger, _)| *trigger == api_types::WorkflowTrigger::Reject)
+                .map(|(_, target)| target),
+        )
+        .collect();
+    if workflow
+        .states
+        .iter()
+        .any(|state| state.name == "merge_failed")
+    {
+        repair.push("merge_failed".into());
+    }
+    repair.sort();
+    repair.dedup();
+    MergeRoles { merge, repair }
+}
+
 /// Total, conservative priority classifier. Only typed bridges and receipts
 /// count as proof; marker-looking prose never grants approval or lineage.
 pub fn classify_integration_import(
@@ -176,6 +246,17 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
     let now_time = integration_time(now)?;
     let status =
         field(&s.task, "status").ok_or_else(|| DbError::Check("missing Task status".into()))?;
+    // The role the Task's state plays in its Project's workflow, under the
+    // name the default workflow gives that role. The rows below are about
+    // roles: a Project may call its merge state anything.
+    let roles = merge_roles(field(&s.project, "workflow_definition"));
+    let role = if roles.merge.iter().any(|name| name == status) {
+        "merging"
+    } else if roles.repair.iter().any(|name| name == status) {
+        "merge_failed"
+    } else {
+        status
+    };
     let metadata = json_column(&s.task, "metadata")?.unwrap_or_else(|| serde_json::json!({}));
     if !metadata.is_object() {
         return Ok(quarantine("Task metadata is not an object"));
@@ -561,7 +642,7 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
             decision(6, State::Checking, "clean mechanical rebase lineage"),
             IntegrationNeededFact::RebasedCandidateChecks,
         )
-    } else if status == "merge_failed"
+    } else if role == "merge_failed"
         && (rebase_outcome
             .as_ref()
             .is_some_and(|v| field(v, "kind") == Some("conflict"))
@@ -734,7 +815,7 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
             ),
             IntegrationNeededFact::LegacyHookContinuation,
         )
-    } else if status == "merging" && present(&s.task, "review_passed_at") {
+    } else if role == "merging" && present(&s.task, "review_passed_at") {
         needs_fact(
             decision(
                 18,
@@ -743,7 +824,7 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
             ),
             IntegrationNeededFact::CandidateHeadReviewAuthority,
         )
-    } else if status == "merge_failed"
+    } else if role == "merge_failed"
         && error.as_ref().is_some_and(|v| {
             matches!(
                 field(v, "type"),
@@ -801,12 +882,18 @@ pub struct IntegrationImportPass {
     pub imported: u32,
     pub quarantined: u32,
     pub needs_fact: u32,
+    /// Tasks whose legacy rows could not be read or classified at all. Each
+    /// has a quarantined history row saying why (counted in `quarantined`
+    /// too) and is not selected again.
+    pub unreadable: u32,
     pub remaining: bool,
 }
 /// Progress is the unique `import:<Task>:<entry epoch>` admission identity.
 /// Selection excludes committed rows.
 ///
-/// What is selected is bounded by the work in flight, not by history:
+/// What is selected is bounded by the work in flight, not by history, and it
+/// is selected by the role a state plays in its Project's workflow
+/// ([`merge_roles`]), not by the default workflow's state names:
 ///
 /// - a Task is imported at most once, and never once it has an attempt for
 ///   its present status entry or one the queue admitted (`admit:`): from
@@ -825,7 +912,24 @@ impl SqliteDb {
     pub async fn import_integration_pass(&self, limit: u32) -> Result<IntegrationImportPass> {
         let mut tx = begin_immediate(self.pool()).await?;
         let limit = limit.clamp(1, INTEGRATION_IMPORT_PAGE);
-        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN ('merging','merge_failed') OR (t.status IN ('cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN ('merging','merge_failed') OR l.to_state IN ('merging','merge_failed'))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%')) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?")
+        // The merge and repair state names of every Project that has a
+        // workflow of its own, by Project id. A Project that is not in the
+        // map uses the default names. The selection is by role, never by the
+        // names `merging` / `merge_failed`.
+        let mut role_names = serde_json::Map::new();
+        for (project_id, workflow) in sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT id,workflow_definition FROM project WHERE workflow_definition IS NOT NULL AND workflow_definition NOT IN ('','{}')",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            let roles = merge_roles(workflow.as_deref());
+            let names: Vec<String> = roles.merge.into_iter().chain(roles.repair).collect();
+            role_names.insert(project_id, serde_json::json!(names));
+        }
+        let role_names = serde_json::Value::Object(role_names).to_string();
+        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR (t.status IN ('cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR l.to_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%')) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?2")
+            .bind(&role_names)
             .bind(limit+1).fetch_all(&mut *tx).await?;
         let mut pass = IntegrationImportPass {
             remaining: tasks.len() > limit as usize,
@@ -835,6 +939,13 @@ impl SqliteDb {
         let now = now_rfc3339();
         for task_id in tasks {
             pass.examined += 1;
+            // One Task is one savepoint: a Task whose legacy rows cannot be
+            // read or classified is quarantined, typed, and the pass goes on
+            // with the others.
+            sqlx::query("SAVEPOINT integration_import_task")
+                .execute(&mut *tx)
+                .await?;
+            let one: Result<()> = async {
             let snapshot = load_snapshot(&mut tx, &task_id).await?;
             let mut d = classify_integration_import(&snapshot, &now);
             let epoch = snapshot.task["status_epoch"]
@@ -1004,6 +1115,28 @@ impl SqliteDb {
             if d.disposition == IntegrationImportDisposition::NeedsFact {
                 pass.needs_fact += 1;
             }
+            Ok(())
+            }
+            .await;
+            match one {
+                Ok(()) => {
+                    sqlx::query("RELEASE integration_import_task")
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                Err(error) => {
+                    sqlx::query("ROLLBACK TO integration_import_task")
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("RELEASE integration_import_task")
+                        .execute(&mut *tx)
+                        .await?;
+                    quarantine_unreadable(&mut tx, &task_id, &error.to_string(), &now).await?;
+                    pass.imported += 1;
+                    pass.quarantined += 1;
+                    pass.unreadable += 1;
+                }
+            }
         }
         tx.commit().await?;
         Ok(pass)
@@ -1073,6 +1206,57 @@ async fn json_rows(
         .map(parse_json)
         .collect()
 }
+/// The row of a Task the import could not read: quarantined, not current
+/// (nothing was learned that the queue could act on), with the error. It is
+/// the Task's import identity, so the Task is not read again; the reconciler
+/// admits a Task that is still in a merge state through ordinary admission,
+/// which reads the Task's present rows and reports what it cannot use.
+async fn quarantine_unreadable(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    error: &str,
+    now: &str,
+) -> Result<()> {
+    let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT COALESCE(project_id,''),status,status_epoch,version FROM task WHERE id=?",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((project_id, status, epoch, version)) = row else {
+        return Ok(());
+    };
+    let mut message = format!("unreadable legacy merge state: {error}");
+    let mut end = message.len().min(1024);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    let mut a = IntegrationAttempt::new(
+        None,
+        task_id.to_owned(),
+        project_id,
+        format!("import:{task_id}:{epoch}"),
+        status,
+        epoch,
+        version,
+    );
+    a.current = false;
+    a.state = IntegrationAttemptState::Quarantined;
+    a.failure_kind = Some(IntegrationFailureKind::CorruptImport);
+    a.failure_message = Some(message.clone());
+    a.import_source_json = Some(serde_json::json!({
+        "version": 1,
+        "priority": 20,
+        "disposition": IntegrationImportDisposition::Quarantined,
+        "needed_facts": [],
+        "unreadable": message,
+    }));
+    let _ = now;
+    admit_in_tx(tx, a).await?;
+    Ok(())
+}
+
 async fn load_snapshot(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
