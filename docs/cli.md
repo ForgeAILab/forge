@@ -413,6 +413,60 @@ or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
 floor, or `-` before the first reading. `--output json` carries the same as
 `disk` and `workspace_floor`.
 
+### Moving the server workspace root
+
+This is a flag of the server binary (`forge`), not of `forge-ctl`: it works
+on the data directory with the server stopped.
+
+```text
+forge [--data-dir <DIR>] --migrate-workspace-root [<NEW_ROOT>]
+```
+
+Moves the server's workspace root (Task worktrees, repository clones under
+`.repos/`, execution logs under `.forge/logs/`, garbage-collection state) to
+`<NEW_ROOT>`; without a path, to the configured root (`workspace.root`,
+`FORGE_WORKSPACE_ROOT`) when one is set, else to `<data dir>/worktrees`; then
+exits. Only what this data directory's database made moves (its Tasks'
+roots, its repositories' clones, its Projects' logs, what its stored paths
+name); anything else in the old root, including another data directory's
+worktrees in a root they shared, stays and is listed.
+It cannot be combined with `--demo`, `--no-mcp`, `--no-embedded-daemon`,
+`--reclaim-workspace-gc` or `--convert-db-to-incremental-vacuum`.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Moved, or nothing to move (no root in use yet, or already there). A summary is printed. |
+| `1` | Refused (nothing changed), interrupted, or `db pending` (files moved, database unchanged): run the same command again. The reason is on stderr. |
+
+It refuses while a Forge server or another maintenance command holds the
+data directory, while work is recorded in flight (a running execution or
+check run, a claimed or suspended task step, an integration attempt that is
+neither finished nor parked, an active workspace lease), when a submodule or
+nested worktree names the old root by absolute path, when `<NEW_ROOT>` is
+not empty (unless the old root is gone), is a file, is inside the old root or
+contains it, cannot be a workspace root (the home directory or a parent of
+it, a Git repository, a top-level directory), or, for a move across
+filesystems, has less free space than the old root's size (hard links
+counted in full) plus `workspace.min_free_bytes`.
+
+Every file is kept, Git worktree links are repaired and checked, and every
+stored path is rewritten in one transaction. The old root keeps a `MOVED`
+file. Daemon-owned workspaces are not touched. A copy never removes a
+socket, pipe or device and does not keep extended attributes. In your own
+repository the only change is `git worktree repair`, run there. An
+interrupted run leaves `<data dir>/workspace-root-migration.json`; the
+server refuses to start (`migration in progress`) until the command is run
+again and finishes. The move rolls forward only; there is no `--abort`. See
+[getting started](getting-started.md#where-the-server-keeps-workspaces-and-how-to-move-them)
+for when a move is needed and what a start does after an upgrade. Forge Solo
+has no such flag: its root always follows its data root, and a refused Solo
+start prints the command to run, `forge --data-dir <Solo data root>
+--migrate-workspace-root <Solo data root>/worktrees`. The configured-root
+default is the configuration `forge` itself loads (`forge.yaml`,
+`FORGE_WORKSPACE_ROOT`), so name the target when moving another data
+directory. An unfinished move is finished by the command without a path
+whatever root is configured.
+
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge

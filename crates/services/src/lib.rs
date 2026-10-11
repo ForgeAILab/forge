@@ -112,6 +112,7 @@ pub mod workspace_backend;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
 pub(crate) mod workspace_manager;
+pub mod workspace_root;
 
 // Test-only failpoints used by the Gate A characterization suite.  These are
 // compiled out of normal library builds; they let the suite model a process

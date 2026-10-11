@@ -672,6 +672,7 @@ impl ForgeRuntimeBuilder {
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
                 Arc::clone(&workspace_backend_router),
+                workspace_root.clone(),
             )
             .with_placement_adapter_registry(Arc::clone(&self.adapter_registry))
             .with_merge_service(Arc::clone(&merge_service))
@@ -829,6 +830,7 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&self.db),
             plugin_registry,
             Arc::clone(&workspace_backend_router),
+            workspace_root.clone(),
         ));
 
         let runtime = ForgeRuntime {
