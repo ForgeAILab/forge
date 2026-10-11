@@ -456,6 +456,7 @@ const KNOWN_EVENT_TYPE_EXACT = new Set([
   'operations.refreshed',
   'events.resync_required',
   'operations.status_changed',
+  'integration.updated',
   'follow_up.dispatched',
   'comment.created',
   'notification.created',
@@ -577,6 +578,16 @@ export function routeSsePayload(
 
   if (eventType === 'operations.status_changed') {
     void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+  }
+
+  // Cache invalidation only: a merge queue, or one member of it, changed. The
+  // queue advances without a Task write, so no `task.*` event says so.
+  if (eventType === 'integration.updated') {
+    if (payload.task_id) {
+      void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
+    }
+    invalidateProjectTaskLists(queryClient)
+    return
   }
 
   if (eventType === 'project_hook.run_changed' && payload.project_id) {

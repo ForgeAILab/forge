@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { render, screen } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { TaskListItem } from '@/types/generated'
 import { KanbanTaskCard } from './kanban-task-card'
@@ -45,6 +45,7 @@ function queuedTask(reason = 'project_at_capacity'): TaskListItem {
     remaining_retries: {},
   retry_limits: {},
     condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
+    integration: null,
     workflow_exception: null,
     review_passed_at: null,
     archived_at: null,
@@ -72,6 +73,100 @@ function queuedTask(reason = 'project_at_capacity'): TaskListItem {
     },
   }
 }
+
+function inQueue(overrides: Partial<NonNullable<TaskListItem['integration']>>): TaskListItem {
+  return {
+    ...queuedTask(),
+    workflow_health: null,
+    // A custom workflow's merge state: the label must not depend on the name.
+    status: 'landing',
+    integration: {
+      attempt_id: 'attempt-1',
+      queue_id: 'queue-1',
+      repo_id: 'repo-1',
+      target_branch: 'main',
+      queue_state: 'open',
+      state: 'waiting',
+      phase: null,
+      position: 2,
+      wait: { code: 'queue', message: null, machine_id: null, machine_name: null, retry_at: null },
+      action_hint: null,
+      timings: {
+        enqueued_at: '2026-10-11T00:00:00Z',
+        head_since: null,
+        rounds: 0,
+        queued_ms: null,
+        rebase_ms: null,
+        check_ms: null,
+        fast_forward_ms: null,
+      },
+      ...overrides,
+    },
+  }
+}
+
+describe('Merge queue labels on task surfaces', () => {
+  function card(task: TaskListItem) {
+    render(
+      <KanbanTaskCard
+        task={task}
+        index={0}
+        showSubStateBadge={false}
+        dragDisabled={false}
+        movePending={false}
+        agents={[]}
+        agentNamesById={new Map()}
+        claimPending={false}
+        menuItems={null}
+        onAssignAgent={vi.fn()}
+        onClick={vi.fn()}
+        onContextMenu={vi.fn()}
+      />,
+    )
+    return screen.queryByTestId('integration-label')?.textContent ?? null
+  }
+
+  it('labels a waiting, a merging and a repairing Task on its board card', () => {
+    expect(card(inQueue({}))).toBe('In merge queue (2 ahead)')
+    cleanup()
+    expect(card(inQueue({ state: 'owned', phase: 'rebasing', position: 0, wait: null }))).toBe(
+      'Merging: rebasing',
+    )
+    cleanup()
+    expect(card(inQueue({ state: 'repair', position: null, wait: null }))).toBe('Fix merge')
+    cleanup()
+    expect(card({ ...queuedTask(), integration: null })).toBeNull()
+  })
+
+  it('explains the wait in the Task detail banner', () => {
+    render(
+      <TaskBlockingBanner
+        task={{
+          ...inQueue({
+            state: 'waiting',
+            position: null,
+            wait: {
+              code: 'project_paused',
+              message: 'the Project is paused',
+              machine_id: null,
+              machine_name: null,
+              retry_at: null,
+            },
+            action_hint: 'resume_project',
+          }),
+          execution_observability: undefined,
+          placement: null,
+          effective_coder: null,
+          effective_coder_source: null,
+        }}
+      />,
+    )
+    const notice = screen.getByTestId('integration-notice')
+    expect(notice.textContent).toContain('Waiting: project paused')
+    expect(notice.textContent).toContain('Resume the Project to continue the merge.')
+    expect(notice.textContent).not.toContain('Fix merge')
+  })
+})
 
 describe('Project capacity waits on task surfaces', () => {
   it('labels owner review findings on fallback failure details', () => {

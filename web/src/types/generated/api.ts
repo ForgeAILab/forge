@@ -623,7 +623,7 @@ export interface TaskListItem {
   retry_limits: Record<string, number>
   condition: TaskCondition
   /** The Task's place in the merge queue; null without an attempt in progress. */
-  integration?: TaskIntegrationSummary | null
+  integration: TaskIntegrationSummary | null
   workflow_health: WorkflowHealthSummary | null
   workflow_exception: WorkflowExceptionSummary | null
   review_passed_at: string | null

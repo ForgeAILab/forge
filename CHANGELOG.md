@@ -1209,6 +1209,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   wait, the time at the head, and its split into rebase, check and
   fast-forward. `forge-ctl operations status` prints them as a "Merge queue"
   section. Additive: the existing counts are unchanged.
+- **The web says where a Task is in the merge queue (3.2 stage D3b).** Board
+  cards and Task detail label a Task from its `integration` summary: "In merge
+  queue (n ahead)", "Merging: rebasing / checking / fast-forwarding",
+  "Waiting for <machine>", "Waiting: project paused / held", "Merge stopped:
+  <cause>". "Fix merge" is shown only while the change is back with its coder
+  for a repair. Task detail adds what is known and the action that moves a
+  waiting merge. The labels read the summary, not the state's name, so a
+  custom workflow's merge states read the same. SSE `integration.updated`
+  refetches the Task and the Task lists.
 
 - **A review entry asks for its checks again by itself.** When the review
   commands of a Task or its Project change while the entry's checks run, the
