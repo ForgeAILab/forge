@@ -581,12 +581,27 @@ export function routeSsePayload(
   }
 
   // Cache invalidation only: a merge queue, or one member of it, changed. The
-  // queue advances without a Task write, so no `task.*` event says so.
+  // queue advances without a Task write, so no `task.*` event says so. Only
+  // what shows that queue is refetched: the Task the event names, the Task
+  // details open on a member of that queue (their place may have moved), and
+  // the Task lists of the Projects the event names.
   if (eventType === 'integration.updated') {
+    const event = payload as typeof payload & { queue_id?: string; project_ids?: string[] }
     if (payload.task_id) {
       void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
     }
-    invalidateProjectTaskLists(queryClient)
+    if (event.queue_id) {
+      void queryClient.invalidateQueries({
+        predicate: (query) =>
+          query.queryKey[0] === 'tasks' &&
+          query.queryKey.length === 2 &&
+          (query.state.data as { integration?: { queue_id?: string | null } | null } | undefined)
+            ?.integration?.queue_id === event.queue_id,
+      })
+    }
+    for (const projectId of event.project_ids ?? []) {
+      invalidateProjectTaskLists(queryClient, projectId)
+    }
     return
   }
 

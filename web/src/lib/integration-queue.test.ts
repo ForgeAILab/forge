@@ -180,3 +180,52 @@ describe('integrationTone and integrationNotice', () => {
     ).toBe('Target branch main. Resume the Project to continue the merge.')
   })
 })
+
+describe('values a newer server sends', () => {
+  // The enums are open: the web must read a state, phase, wait code or hint
+  // it has no words for without throwing and without printing `undefined`.
+  const unknown = <T,>(value: string) => value as unknown as T
+  it('labels an unknown state, phase, cause and hint neutrally', () => {
+    const state = summary({ state: unknown('speculating'), position: 2 })
+    expect(integrationLabel(state)).toBe('In merge queue')
+    expect(integrationTone(state)).toBe('waiting')
+    expect(integrationNotice(state)).toEqual({
+      title: 'In merge queue',
+      message: 'Target branch main.',
+      tone: 'waiting',
+    })
+    expect(integrationLabel(summary({ state: 'owned', phase: unknown('bisecting') }))).toBe(
+      'Merging: in progress',
+    )
+    const cause = wait(unknown('merge_train'), { message: 'the merge train is forming' })
+    expect(integrationWaitText(cause)).toBe('the merge train is forming')
+    expect(integrationWaitText(wait(unknown('merge_train')))).toBe('see the Task for details')
+    const waiting = summary({ wait: cause, action_hint: unknown('reorder') })
+    expect(integrationLabel(waiting)).toBe('Waiting: the merge train is forming')
+    const notice = integrationNotice(waiting)
+    expect(notice).toEqual({
+      title: 'Waiting: the merge train is forming',
+      message: 'Target branch main.',
+      tone: 'attention',
+    })
+    expect(JSON.stringify(notice)).not.toContain('undefined')
+    expect(
+      integrationLabel(summary({ state: 'deferred', wait: wait(unknown('merge_train')) })),
+    ).toBe('Merge stopped: see the Task for details')
+  })
+
+  it('has words for every state, phase and cause this build knows', () => {
+    const states = ['waiting', 'owned', 'repair', 'review_required', 'candidate_check_failed', 'deferred', 'applied'] as const
+    for (const state of states) {
+      expect(integrationLabel(summary({ state }))).not.toMatch(/undefined|^In merge queue$/)
+    }
+    const codes = [
+      'queue', 'queue_suspended', 'queue_quarantined', 'task_held', 'task_blocked', 'task_failed',
+      'task_entry_blocked', 'task_awaiting_human', 'project_paused', 'owner_offline', 'target_dirty',
+      'infrastructure', 'budget_exhausted', 'owner_required', 'unresolved_result', 'cancel_requested',
+    ] as const
+    for (const code of codes) {
+      expect(integrationWaitText(wait(code))).not.toMatch(/undefined|see the Task/)
+    }
+  })
+})

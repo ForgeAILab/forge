@@ -8,9 +8,14 @@ import type {
  * Words for a Task's place in the merge queue. Everything here reads the
  * server's `integration` summary: no workflow state name is consulted, so a
  * custom workflow's merge and repair states read the same.
+ *
+ * The summary's enums are open: a newer server sends states, phases, wait
+ * codes and hints this build has no words for. Each of them reads neutrally
+ * ("In merge queue", the server's own message) and none throws or prints
+ * `undefined`.
  */
 
-const PHASE_TEXT: Record<IntegrationPhase, string> = {
+const PHASE_TEXT: Partial<Record<string, string>> & Record<IntegrationPhase, string> = {
   validating: 'validating',
   rebasing: 'rebasing',
   checking: 'checking',
@@ -59,6 +64,9 @@ export function integrationWaitText(wait: IntegrationWait): string {
       return `merge result unknown on ${machineName(wait)}`
     case 'cancel_requested':
       return 'cancelling'
+    default:
+      // A cause this build does not know: the server's message says it.
+      return wait.message?.trim() || 'see the Task for details'
   }
 }
 
@@ -75,7 +83,7 @@ export function integrationLabel(summary: TaskIntegrationSummary): string {
       return summary.position === 0 || !wait ? 'In merge queue (next)' : 'In merge queue'
     }
     case 'owned':
-      return `Merging: ${summary.phase ? PHASE_TEXT[summary.phase] : 'starting'}`
+      return `Merging: ${summary.phase ? (PHASE_TEXT[summary.phase] ?? 'in progress') : 'starting'}`
     case 'repair':
       return 'Fix merge'
     case 'review_required':
@@ -89,6 +97,8 @@ export function integrationLabel(summary: TaskIntegrationSummary): string {
     }
     case 'applied':
       return 'Merged'
+    default:
+      return 'In merge queue'
   }
 }
 
@@ -107,10 +117,12 @@ export function integrationTone(summary: TaskIntegrationSummary): IntegrationTon
     case 'candidate_check_failed':
     case 'deferred':
       return 'attention'
+    default:
+      return summary.action_hint ? 'attention' : 'waiting'
   }
 }
 
-const ACTION_TEXT: Record<NonNullable<TaskIntegrationSummary['action_hint']>, string> = {
+const ACTION_TEXT: Partial<Record<string, string>> = {
   retry: 'Retry the merge to put the Task back in line.',
   release: 'Release the Task to continue the merge.',
   resume_project: 'Resume the Project to continue the merge.',
@@ -152,14 +164,18 @@ export function integrationNotice(
     case 'candidate_check_failed':
       parts.push('The checks of the rebased change failed. It was sent back to its coder.')
       break
-    case 'deferred':
-    case 'applied':
+    default:
       break
   }
-  if (summary.wait?.message) parts.push(sentence(summary.wait.message))
+  // An unknown wait code already reads as the server's message in the title.
+  const titled = integrationLabel(summary)
+  if (summary.wait?.message && !titled.includes(summary.wait.message.trim())) {
+    parts.push(sentence(summary.wait.message))
+  }
   if (summary.wait?.retry_at) {
     parts.push(`Forge retries at ${new Date(summary.wait.retry_at).toLocaleTimeString()}.`)
   }
-  if (summary.action_hint) parts.push(ACTION_TEXT[summary.action_hint])
-  return { title: integrationLabel(summary), message: parts.join(' '), tone: integrationTone(summary) }
+  const action = summary.action_hint ? ACTION_TEXT[summary.action_hint] : undefined
+  if (action) parts.push(action)
+  return { title: titled, message: parts.join(' '), tone: integrationTone(summary) }
 }
