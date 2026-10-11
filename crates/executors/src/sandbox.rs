@@ -678,8 +678,49 @@ pub fn settle_run(worktree: &Path, run_id: &str) {
 /// removed through.
 fn remove_run_tmp(tmp: &Path) {
     if tmp.parent().is_some_and(is_real_dir) {
-        remove_tree(tmp);
+        remove_run_tree(tmp);
     }
+}
+
+/// Remove the per-run directory `tmp` with everything in it.
+///
+/// A Task can write its root, so `.forge-task` and `.forge-task/tmp` can
+/// become links between any check and the removal. The directory is
+/// therefore reached by file descriptor from the directory that holds the
+/// Task roots (which no Task can write), and nothing is removed when a
+/// directory on the way is a link.
+fn remove_run_tree(tmp: &Path) {
+    match run_tmp_anchor(tmp) {
+        Some((task_roots, relative)) => {
+            remove_tree_under_until(&task_roots, &relative, None);
+        }
+        None => remove_tree(tmp),
+    }
+}
+
+/// `tmp` (as [`TaskRoot::run_tmp`] lays it out) as the resolved directory
+/// that holds the Task roots and the plain names from there.
+fn run_tmp_anchor(tmp: &Path) -> Option<(PathBuf, PathBuf)> {
+    let key = tmp.file_name()?;
+    let parent = tmp.parent()?;
+    let (task_roots, relative) = if parent.file_name()? == SHORT_TMP_DIR_NAME {
+        (parent.parent()?, Path::new(SHORT_TMP_DIR_NAME).join(key))
+    } else {
+        let task_dir = parent.parent()?;
+        if parent.file_name()? != "tmp" || task_dir.file_name()? != TASK_DIR_NAME {
+            return None;
+        }
+        let task_root = task_dir.parent()?;
+        (
+            task_root.parent()?,
+            Path::new(task_root.file_name()?)
+                .join(TASK_DIR_NAME)
+                .join("tmp")
+                .join(key),
+        )
+    };
+    // The operator's own path may go through links; a Task's may not.
+    Some((fs::canonicalize(task_roots).ok()?, relative))
 }
 
 /// Remove the temp directories of runs that are dead.
@@ -753,7 +794,7 @@ fn sweep_dead_runs_older_than<'a>(
             {
                 continue;
             }
-            remove_tree(&path);
+            remove_run_tree(&path);
             removed += 1;
         }
     }
@@ -819,7 +860,7 @@ fn prepare_run_tmp(tmp: &Path) -> io::Result<()> {
         ));
     }
     // A leftover of an earlier run with the same key is not this run's.
-    remove_tree(tmp);
+    remove_run_tree(tmp);
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -1293,6 +1334,41 @@ mod tests {
         assert!(real_root.join(".forge-task/tmp/runabc").exists());
     }
 
+    /// A Task swaps its `.forge-task/tmp` (or `.forge-task`) for a link to
+    /// another Task root's after Forge looked: the run directory is reached
+    /// from the Task-roots directory by descriptor, so the other Task's
+    /// directory of the same name stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_directory_is_never_removed_through_a_swapped_task_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().canonicalize().unwrap().join("tasks");
+        let victim = tasks.join("victim");
+        fs::create_dir_all(victim.join(".forge-task/tmp/runabc")).unwrap();
+        fs::write(victim.join(".forge-task/tmp/runabc/keep"), "x").unwrap();
+        let attacker = tasks.join("attacker");
+        fs::create_dir_all(attacker.join(".forge-task")).unwrap();
+
+        // `tmp` is a link.
+        symlink(victim.join(".forge-task/tmp"), attacker.join(".forge-task/tmp")).unwrap();
+        remove_run_tree(&attacker.join(".forge-task/tmp/runabc"));
+        assert!(victim.join(".forge-task/tmp/runabc/keep").exists());
+        // `.forge-task` is a link.
+        fs::remove_dir_all(attacker.join(".forge-task")).unwrap();
+        symlink(victim.join(".forge-task"), attacker.join(".forge-task")).unwrap();
+        remove_run_tree(&attacker.join(".forge-task/tmp/runabc"));
+        assert!(victim.join(".forge-task/tmp/runabc/keep").exists());
+
+        // The real thing goes, in the Task root and in the short directory.
+        remove_run_tree(&victim.join(".forge-task/tmp/runabc"));
+        assert!(!victim.join(".forge-task/tmp/runabc").exists());
+        let short = tasks.join(SHORT_TMP_DIR_NAME).join("runabc");
+        fs::create_dir_all(short.join("sub")).unwrap();
+        remove_run_tree(&short);
+        assert!(!short.exists() && tasks.join(SHORT_TMP_DIR_NAME).exists());
+    }
+
     use crate::compiler_cache::{self, tests as cache_tests, CACHE_DIR, WRAPPER_KEY};
 
     fn value(vars: &[(&'static str, Option<OsString>)], key: &str) -> Option<Option<OsString>> {
@@ -1522,12 +1598,16 @@ mod tests {
             Some(root.join(CACHE_DIR).join("repo-a").into_os_string())
         );
 
-        // The Project's value and the command's own still win.
+        // The Project's value and the command's own still win. Nothing
+        // else hands a cleared child the Project's value, so it is set.
         let project = BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/project".to_owned())]);
         let mut cleared = Command::new("true");
         cleared.env_clear().env(WRAPPER_KEY, "/command/wrapper");
         crate::run_process::apply_sandboxed_cleared(&mut cleared, &project, &env);
-        assert_eq!(set(&cleared, "CARGO_TARGET_DIR"), None);
+        assert_eq!(
+            set(&cleared, "CARGO_TARGET_DIR"),
+            Some(OsString::from("/project"))
+        );
         assert_eq!(
             set(&cleared, WRAPPER_KEY),
             Some(OsString::from("/command/wrapper"))
