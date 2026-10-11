@@ -620,7 +620,7 @@ async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE integration_attempt SET admission_key='shadow:a:1',expected_epoch=1 WHERE task_ref='a'")
+    sqlx::query("UPDATE integration_attempt SET admission_key='shadow:a:1',expected_epoch=(SELECT status_epoch FROM task WHERE id='a') WHERE task_ref='a'")
         .execute(db.pool())
         .await
         .unwrap();

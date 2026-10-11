@@ -1220,7 +1220,9 @@ mod tests {
             status.integration_queues.current_attempts_by_state["queued"],
             1
         );
-        assert_eq!(status.integration_queues.quarantined_imports, 2);
+        // Only the Task without an attempt is imported (and quarantined: it
+        // has no execution). The admitted Task's attempt is its record.
+        assert_eq!(status.integration_queues.quarantined_imports, 1);
     }
 
     #[tokio::test]
