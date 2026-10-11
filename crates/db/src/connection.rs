@@ -10,9 +10,98 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock, Weak,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::Notify;
+
+/// One open write transaction: where it began and when it got the lock.
+struct WriteHold {
+    site: &'static std::panic::Location<'static>,
+    database: String,
+    since: Instant,
+}
+/// A write transaction held longer than this is reported when it ends.
+const WRITE_HOLD_WARN: Duration = Duration::from_secs(5);
+/// Open `begin_immediate` transactions of this process by connection handle.
+/// SQLite has one writer per database, so more than one entry for a database
+/// is a second transaction waiting behind the first.
+fn write_holds() -> MutexGuard<'static, HashMap<usize, WriteHold>> {
+    static HOLDS: OnceLock<Mutex<HashMap<usize, WriteHold>>> = OnceLock::new();
+    match HOLDS.get_or_init(Mutex::default).lock() {
+        Ok(guard) => guard,
+        Err(poison) => poison.into_inner(),
+    }
+}
+/// Called from the connection's commit and rollback hooks.
+fn end_write_hold(key: usize, outcome: &'static str) {
+    let Some(hold) = write_holds().remove(&key) else {
+        return;
+    };
+    let held = hold.since.elapsed();
+    if held >= WRITE_HOLD_WARN {
+        tracing::warn!(
+            site = %hold.site,
+            database = %hold.database,
+            held_ms = held.as_millis() as u64,
+            outcome,
+            "a write transaction held the database write lock for a long time"
+        );
+    }
+}
+/// Callers inside `begin_immediate`: waiting for a connection or the write
+/// lock, or holding the lock and not yet recorded as its holder.
+fn write_waits() -> MutexGuard<'static, HashMap<u64, WriteHold>> {
+    static WAITS: OnceLock<Mutex<HashMap<u64, WriteHold>>> = OnceLock::new();
+    match WAITS.get_or_init(Mutex::default).lock() {
+        Ok(guard) => guard,
+        Err(poison) => poison.into_inner(),
+    }
+}
+/// Removes its entry when `begin_immediate` returns or is dropped mid-wait.
+struct WriteWait(u64);
+impl WriteWait {
+    fn new(site: &'static std::panic::Location<'static>, database: String) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        write_waits().insert(
+            id,
+            WriteHold {
+                site,
+                database,
+                since: Instant::now(),
+            },
+        );
+        Self(id)
+    }
+}
+impl Drop for WriteWait {
+    fn drop(&mut self) {
+        write_waits().remove(&self.0);
+    }
+}
+/// The write transactions of this process right now, oldest first: where each
+/// began, on which database, and for how long it has held the write lock or
+/// has been beginning. What a caller that found the database busy was waiting
+/// for.
+pub fn open_write_transactions() -> Vec<String> {
+    let describe = |state: &str, holds: &mut dyn Iterator<Item = &WriteHold>| {
+        let mut open: Vec<_> = holds.collect();
+        open.sort_by_key(|hold| hold.since);
+        open.iter()
+            .map(|hold| {
+                format!(
+                    "{state} {} on {} for {} ms",
+                    hold.site,
+                    hold.database,
+                    hold.since.elapsed().as_millis()
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut open = describe("holds", &mut write_holds().values());
+    open.extend(describe("begins", &mut write_waits().values()));
+    open
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct EventHooks {
@@ -130,7 +219,15 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 sqlx::query("PRAGMA synchronous = NORMAL")
                     .execute(&mut *connection)
                     .await?;
-                sqlx::query("PRAGMA busy_timeout = 30000")
+                // `FORGE_DB_BUSY_TIMEOUT_MS` is a diagnostic knob: with a
+                // short timeout a write lock held too long, or one the
+                // waiter itself keeps from being released, fails a test in
+                // seconds and the busy log names the holder.
+                let busy_timeout = std::env::var("FORGE_DB_BUSY_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(30_000);
+                sqlx::query(&format!("PRAGMA busy_timeout = {busy_timeout}"))
                     .execute(&mut *connection)
                     .await?;
                 let dirty = Arc::new(AtomicBool::new(false));
@@ -145,12 +242,14 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 });
                 let rollback_dirty = Arc::clone(&dirty);
                 handle.set_rollback_hook(move || {
+                    end_write_hold(key, "rolled back");
                     rollback_dirty.store(false, Ordering::Relaxed);
                     // Preserve an earlier committed append on a connection
                     // retained across transactions. A failed COMMIT can cause
                     // a harmless extra wake, never a lost committed append.
                 });
                 handle.set_commit_hook(move || {
+                    end_write_hold(key, "committed");
                     if dirty.swap(false, Ordering::Relaxed) {
                         hooks.mark(key);
                     }
@@ -195,9 +294,50 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
 /// Returns `sqlx::Result` (not `crate::Result`) so it is a drop-in
 /// replacement for `pool.begin()` at every call site, including outside the
 /// `db` crate, without changing error-conversion paths.
-pub async fn begin_immediate(pool: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
-    tracing::debug!(target: "forge_db::write_transaction", "begin immediate");
-    pool.begin_with("BEGIN IMMEDIATE").await
+///
+/// Every transaction begun here is recorded until its connection commits or
+/// rolls back: [`open_write_transactions`] names the holders, and one held
+/// longer than five seconds is logged with the place that began it.
+#[track_caller]
+pub fn begin_immediate(
+    pool: &SqlitePool,
+) -> impl std::future::Future<Output = sqlx::Result<Transaction<'static, Sqlite>>> + Send + '_ {
+    // The caller is the label of this transaction in the write-hold record.
+    let site = std::panic::Location::caller();
+    async move {
+        tracing::debug!(target: "forge_db::write_transaction", %site, "begin immediate");
+        let database = pool
+            .connect_options()
+            .get_filename()
+            .to_string_lossy()
+            .into_owned();
+        let wait = WriteWait::new(site, database.clone());
+        let started = Instant::now();
+        let begun = pool.begin_with("BEGIN IMMEDIATE").await;
+        let waited = started.elapsed();
+        if waited >= WRITE_HOLD_WARN {
+            tracing::warn!(
+                %site,
+                %database,
+                waited_ms = waited.as_millis() as u64,
+                acquired = begun.is_ok(),
+                writers = ?open_write_transactions(),
+                "a write transaction waited a long time for a connection and the database write lock"
+            );
+        }
+        let mut transaction = begun?;
+        let key = transaction.lock_handle().await?.as_raw_handle().as_ptr() as usize;
+        write_holds().insert(
+            key,
+            WriteHold {
+                site,
+                database,
+                since: Instant::now(),
+            },
+        );
+        drop(wait);
+        Ok(transaction)
+    }
 }
 
 /// Operator diagnostics for the database's persistent vacuum mode and freelist.

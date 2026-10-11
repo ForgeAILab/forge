@@ -18,7 +18,7 @@ pub enum DbError {
     TestTemplate(String),
 
     #[error("database error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Sqlx(#[source] sqlx::Error),
 
     #[error("not found")]
     NotFound,
@@ -163,6 +163,18 @@ pub enum DbError {
         applied: String,
         bundled: String,
     },
+}
+
+impl From<sqlx::Error> for DbError {
+    fn from(error: sqlx::Error) -> Self {
+        let error = Self::Sqlx(error);
+        if error.is_busy() {
+            // Name what the refused statement was waiting for.
+            let writers = crate::open_write_transactions();
+            tracing::warn!(%error, ?writers, "the database was busy; the write transactions open in this process are listed");
+        }
+        error
+    }
 }
 
 impl DbError {

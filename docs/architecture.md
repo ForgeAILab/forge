@@ -7611,7 +7611,19 @@ To recover a refused host, compare `SELECT version, name FROM _migration` with
 missing, then update that row's `name` to the build's file name.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
-`busy_timeout=5000` per connection.
+`busy_timeout=30000` per connection.
+
+SQLite has one writer. Every transaction that writes begins with
+`db::begin_immediate`, which records where it began until it commits or rolls
+back. A write transaction held for more than five seconds, and one that waited
+that long for a connection and the lock, is logged at `warn` with its call
+site; a statement refused as busy (`database is locked`) is logged with the
+write transactions open at that moment (`db::open_write_transactions`). Code
+that waits for a future which may be inside a write transaction must keep
+polling it: a store call awaited in the body of a `select!` branch stops the
+other branches, and a stopped transaction keeps the write lock that call then
+waits for until the busy timeout. `FORGE_DB_BUSY_TIMEOUT_MS` shortens the
+timeout for diagnosis.
 
 The revised schema adds `account_main_agent_binding`,
 `project_agent_binding`, immutable `project_admission_receipt`, `agent_chat`,

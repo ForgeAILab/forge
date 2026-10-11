@@ -113,7 +113,7 @@ forge-cli → api → services → db
 
 SQLite with WAL mode. Schema in `crates/db/migrations/V001__initial_schema.sql`. Migrations are named `V{version}__{name}.sql` (sequential up to V149, UTC timestamps `VYYYYMMDDHHMM` after that) and tracked by version and name in the `_migration` table. All primary keys are app-generated UUID v4; all timestamps are app-generated RFC3339.
 
-Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=5000` per connection.
+Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=30000` per connection.
 
 Enum serialization uses `Display`/`FromStr` (in `db::models`) for SQLite TEXT columns. Row mapping is manual via `sqlx::Row::get()`, not compile-time checked macros — so a renamed column will fail at runtime, not at `cargo check`. Update both the migration and the row-mapper together.
 
