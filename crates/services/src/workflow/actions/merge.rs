@@ -176,10 +176,22 @@ async fn legacy_merge_result(
     if let Some(recorded) = hook_effect(&ctx.task_id, "merge_intent").await? {
         let intent: crate::merge_service::MergeIntent = serde_json::from_str(&recorded)
             .map_err(|error| crate::ServiceError::invalid_operation(error.to_string()))?;
-        return Ok(merge_service
-            .completed_hook_merge(&intent)
-            .await?
-            .and_then(done));
+        let Some(outcome) = merge_service.completed_hook_merge(&intent).await? else {
+            return Ok(None);
+        };
+        // The outcome the step died before recording. With it on the step,
+        // its `done` cascade is the cascade of a landed merge: it goes ahead
+        // of a waiting owner command and of the queue's own steps for the
+        // same merge, as it does for a step that recorded the outcome itself.
+        if matches!(outcome, MergeOutcome::Done { .. }) {
+            crate::workflow::engine::durable::record_hook_effect(
+                &ctx.task_id,
+                "merge_outcome",
+                &serde_json::to_value(&outcome).expect("merge outcome serializes"),
+            )
+            .await?;
+        }
+        return Ok(done(outcome));
     }
     Ok(None)
 }

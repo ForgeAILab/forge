@@ -1396,6 +1396,13 @@ mod tests {
             ],
         )
         .await;
+        // A clone does not copy the source's local identity.
+        for (key, value) in [
+            ("user.email", "test@forge.dev"),
+            ("user.name", "Forge Test"),
+        ] {
+            git_at(&clone, &["config", key, value]).await;
+        }
         let now = db::now_rfc3339();
         sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l2','r','server',?,'managed_clone',0,'ready',?,?)").bind(clone.to_str()).bind(&now).bind(&now).execute(f.db.pool()).await.unwrap();
         clone
