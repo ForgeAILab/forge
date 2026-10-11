@@ -463,15 +463,31 @@ impl TaskStepWorker {
                 return Err(ServiceError::invalid_operation("task step drain timed out"));
             }
             let owner = db::new_uuid_v4();
-            if let Some(step) = self
-                .db
-                .claim_step(&owner, Some(task_id), &lease_deadline())
-                .await?
-            {
-                let _activity = self.db.hold_task_step(&step);
-                self.execute(step).await?;
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            // A busy database is not a failed drain. The claim wrote nothing;
+            // a step whose bookkeeping gave up keeps its lease and is claimed
+            // again when that lapses, as the production worker does it. Both
+            // are waited out within the drain's own deadline.
+            let round = async {
+                if let Some(step) = self
+                    .db
+                    .claim_step(&owner, Some(task_id), &lease_deadline())
+                    .await?
+                {
+                    let _activity = self.db.hold_task_step(&step);
+                    self.execute(step).await?;
+                    return Ok(true);
+                }
+                Ok::<_, ServiceError>(false)
+            }
+            .await;
+            match round {
+                Ok(true) => {}
+                Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) if database_busy(&error) => {
+                    tracing::warn!(task_id, %error, "task step drain found the database busy; trying again");
+                    tokio::time::sleep(BUSY_BACKOFF_START).await;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -575,33 +591,10 @@ impl TaskStepWorker {
             tracing::warn!(%error,"task step renewal task stopped");
         }
         if let Err(error) = result {
-            let current = self
-                .db
-                .task_steps(&step.task_id)
-                .await?
-                .into_iter()
-                .find(|s| s.id == step.id);
-            if current
-                .as_ref()
-                .is_some_and(|s| s.status == "claimed" && s.claimed_by == step.claimed_by)
-            {
-                if !self.db.step_entry_matches(&step).await? {
-                    self.settle(&step, "superseded", Some(&error.to_string()), false)
-                        .await?;
-                } else if step.kind == "hooks" {
-                    self.fail_committed_hook_phase(&step, &error.to_string())
-                        .await?;
-                } else if retryable(&error) && step.attempts < MAX_STEP_ATTEMPTS {
-                    self.db
-                        .retry_step(&step, &error.to_string(), &retry_due(step.attempts))
-                        .await?;
-                } else {
-                    self.settle(&step, "failed", Some(&error.to_string()), true)
-                        .await?;
-                }
-            } else {
-                tracing::warn!(step_id = %step.id, %error, "task step attempt lost ownership or was already settled");
-            }
+            // The work is over; what is left records how it ended. A busy
+            // database there is waited out: giving up would leave the step
+            // claimed until its lease lapses and cost it an attempt.
+            wait_out_busy(|| self.settle_failed_attempt(&step, &error)).await?;
             if step.kind == "command" {
                 if let Some(reply) = self
                     .task_service
@@ -614,8 +607,51 @@ impl TaskStepWorker {
                 }
             }
         }
-        self.db.release_step(&step.id, owner).await?;
+        wait_out_busy(|| async {
+            self.db
+                .release_step(&step.id, owner)
+                .await
+                .map_err(ServiceError::from)
+        })
+        .await?;
         Ok(())
+    }
+    /// Record a failed attempt of a step this worker still owns. Every write
+    /// is fenced by the claim, so repeating the whole of it is safe.
+    async fn settle_failed_attempt(&self, step: &TaskStep, error: &ServiceError) -> Result<()> {
+        let current = self
+            .db
+            .task_steps(&step.task_id)
+            .await?
+            .into_iter()
+            .find(|s| s.id == step.id);
+        if !current
+            .as_ref()
+            .is_some_and(|s| s.status == "claimed" && s.claimed_by == step.claimed_by)
+        {
+            tracing::warn!(step_id = %step.id, %error, "task step attempt lost ownership or was already settled");
+            return Ok(());
+        }
+        if !self.db.step_entry_matches(step).await? {
+            self.settle(step, "superseded", Some(&error.to_string()), false)
+                .await
+        } else if step.attempts < MAX_STEP_ATTEMPTS
+            && (database_busy(error) || (step.kind != "hooks" && retryable(error)))
+        {
+            // A hook that found the database busy wrote nothing in that
+            // statement: it runs again from its checkpoints, as it does
+            // after a lapsed lease, instead of failing its phase.
+            self.db
+                .retry_step(step, &error.to_string(), &retry_due(step.attempts))
+                .await
+                .map_err(ServiceError::from)
+        } else if step.kind == "hooks" {
+            self.fail_committed_hook_phase(step, &error.to_string())
+                .await
+        } else {
+            self.settle(step, "failed", Some(&error.to_string()), true)
+                .await
+        }
     }
     async fn preempt_step(&self, step: &TaskStep) -> Result<()> {
         let operations = self.db.running_remote_task_operations(&step.id).await?;
@@ -1294,6 +1330,37 @@ const MAX_STEP_ATTEMPTS: i64 = 8;
 fn retry_due(attempts: i64) -> String {
     let delay = 1_i64 << (attempts - 1).clamp(0, 6);
     (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
+}
+
+/// SQLite refused or gave up on a lock: nothing was written.
+fn database_busy(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::Db(error) if error.is_busy())
+}
+
+const BUSY_BACKOFF_START: Duration = Duration::from_millis(50);
+const BUSY_BACKOFF_CAP: Duration = Duration::from_secs(2);
+/// Tries after the first: about ten seconds of waiting on top of each
+/// statement's own busy timeout.
+const BUSY_RETRIES: usize = 8;
+
+/// Run `operation` again, with backoff, while the database is busy.
+async fn wait_out_busy<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delay = BUSY_BACKOFF_START;
+    for _ in 0..BUSY_RETRIES {
+        match operation().await {
+            Err(error) if database_busy(&error) => {
+                tracing::warn!(%error, "task step bookkeeping found the database busy; trying again");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(BUSY_BACKOFF_CAP);
+            }
+            result => return result,
+        }
+    }
+    operation().await
 }
 
 pub(crate) fn retryable(error: &ServiceError) -> bool {
