@@ -49,6 +49,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - **A merge-fix budget of 0 still stops a conflict at the merge gate**,
     but the branch is now already rebased with the conflict committed with
     markers when it stops.
+  - **Hold, block, failure, a wait for a person, a paused Project and a
+    paused assigned Agent stop a Task in the merge queue.** Such a Task is
+    not rebased, checked or merged; it leaves the head of the queue at once
+    and the Tasks behind it go on. It is back in line as soon as the stop is
+    lifted (Release, unblock, retry, resume). A Hold on a Task in the queue
+    is now recorded (it used to change nothing). A merge that stopped for
+    its owner (`deferred`) offers **Retry** (`integration_retry`).
+  - **A Task in a merge state that nothing drives is admitted by the
+    dispatcher.** The merge state is identified by its `run_merge` entry
+    hook, not by the name `merging`; the states a merge outcome moves the
+    Task to are found by role in a workflow that renamed them.
   - **Workflow hook `auto_cascade_on_merge_result` is removed; `run_merge`
     only admits to the queue.** Stored Project workflows and retained step
     workflow snapshots are rewritten by migration `V202610110247`, which

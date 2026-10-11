@@ -4584,7 +4584,7 @@ nothing new.
 |---|---|
 | `applied` (the merge landed and was recorded), Task still in `merging` | the step reports it as `result` does (evidence, comment, `done`) and completes the attempt |
 | `reconciling` (unknown result) | the worker's reconciliation of the head. The old operation has no fenced intent, so Git decides once the checkouts can be read (every owner was restarted for the upgrade): the target contains the candidate → `applied` and reported once, never merged again; it does not → a normal round. While the checkouts cannot be read the head is `quarantined` (`deferred` / `unresolved_result`) and asked again on the reconcile timer; it is never moved to `queued` or `parked` with the result unknown. The step states `owned` / `reconciling` |
-| `parked` waiting only for a fact of the candidate (missing-hooks entry, resumed or obsolete pause marker, stored carry, a rebase the old path started or finished) | the step admits the Task again: the imported row is superseded by one bound to the Task's placement and present candidate; the legacy `paused_integration` marker of a merging Task is cleared. A candidate the old path had already rebased is admitted against the commit its review passed, so the head checks the rebased commit and `settle` carries the review (one check, no new review). A stored carry merges as it is. A rebase stopped in the checkout parks the head typed (`infrastructure`, then the owner) |
+| `parked` waiting only for a fact of the candidate (missing-hooks entry, resumed or obsolete pause marker, stored carry, a rebase the old path started or finished) | the step admits the Task again: the imported row is superseded by one bound to the Task's placement and present candidate; the legacy `paused_integration` marker of a merging Task is cleared. A candidate the old path had already rebased is admitted against the commit its review passed, so the head checks the rebased commit and `settle` carries the review (one check, no new review). A stored carry merges as it is. A rebase stopped in the checkout is finished by the owner's rebase under the interrupted-rebase rule (continued; a conflict it stopped on is handed to the Worker). It is read before the landed witness: a rebase stopped on the target tip is not a landed merge |
 | `parked` under a Project pause | the same; the worker then holds the Task while the Project is paused and re-queues it on resume |
 | a clean-rebase bridge with the Task in `merge_failed` / `review` | nothing is written: the Task's own flow continues as before the upgrade (the dispatcher's one mechanical hop from `merge_failed` to `review`, whose entry checks the rebased commit and carries the review), and the entry of `merging` then supersedes the imported row |
 | `parked` with a stored deadline | the worker's sweep re-queues it at the deadline; the step states `deferred` / `infrastructure` |
@@ -6326,10 +6326,25 @@ another checkout than its queue's target (at most 4096). A daemon that is
 not connected then is asked on a later sweep (`sweep_owners`), three tries
 per attempt.
 
-**Facts.** The gate is `live` while the Task is in the status entry the
-attempt was admitted in, `project_paused` when its Project is paused, `left`
-otherwise (nothing else is read for a Task that left: its checkout may be
-gone). HEAD, target tip, ancestry, dirtiness and a stopped rebase are read
+**Facts.** The gate is `left` when the Task is no longer in the status entry
+the attempt was admitted in (nothing else is read for a Task that left: its
+checkout may be gone), `gated(cause)` when it is still there and its owner,
+its Project or its Agent stopped it, and `live` otherwise. The causes are one
+rule (`integration_steps::gate`), read from the Task's own columns: `task_held`
+(the owner's Hold), `task_blocked`, `task_failed`, `task_entry_blocked`,
+`task_awaiting_human`, `project_paused`, `agent_paused` (the Agent the Task is
+assigned to). The head reads the gate from storage alone before a round is
+counted, before the rebase, while it waits for a check and before it asks for
+a permit; `settle` reads it before it writes one. A gated head leaves the
+slot at once: the attempt is `parked` with the cause's code leading
+`failure_message`, no Git effect runs, no counted retry and no round is spent,
+and the next member is claimed. The worker's sweep looks again every sweep
+interval; the owner action that lifts the gate (Release, an unblock, a retry,
+a Project resume) makes the attempt due at once
+(`expedite_parked_integration_attempt`). A check that was running when the
+gate landed finds the attempt parked and is applied to nothing; after the
+gate the rebase is not repeated (a candidate already on the target tip goes
+straight to its check). HEAD, target tip, ancestry, dirtiness and a stopped rebase are read
 through the workspace placement, so a daemon-placed Task is read on its
 daemon. A daemon-owned default checkout's dirtiness is read on the daemon
 (`workspace.read` Git query `target_status_porcelain`: `git status
@@ -7076,10 +7091,24 @@ because those steps hold the worktree and Workspace they captured. Paused
 integration resume does nothing while the Task has a pending or claimed step;
 the queued attempt's success consumes the marker.
 
-A `merging` Task whose entry has no hooks row (the wedge a pre-upgrade binary
-left when it lost an inline merge) is not replayed: the start-time importer
-takes it into the integration queue and its continuation step admits it (see
-"`merging` is the integration queue"). Other states were never swept: they
+A Task in a merge state (the state whose entry runs `run_merge`, whatever a
+Project's workflow calls it) that has no integration attempt anything owns is
+admitted by the dispatcher's sweep: `Step::AdmitIntegration`, executed by
+`TaskService::reconcile_integration_admission` under the Task's step lease,
+through the admission function the entry hook calls. No entry is replayed.
+"Owned" is read from the attempt row (`ScheduleRead::integration_owned`): a
+current attempt of the Task's present status entry that the queue worker
+drives, or that waits for its owner parked or quarantined with a typed
+reason. Not owned: no attempt, an ended one, one that was sent back while the
+Task stayed in the entry, and an imported row that carries no admission
+binding or that the importer parked for the Task's owner. The step admits
+nothing under the Task gate, behind a pending step or an accepted owner
+command, for a subtask, or while the start-time import is still pending. An
+admission that cannot name a candidate blocks the Task
+(`integration_admission_failed`) instead of leaving it unowned. The rule this
+keeps: a Task in a merge state has a live attempt, or a typed owner-visible
+condition with an offered action (`deferred` offers Retry,
+`integration_retry`). Other states were never swept: they
 have no durable completion witness, and a missing hooks row there is the
 normal shape of an upgraded Task whose inline hooks finished.
 

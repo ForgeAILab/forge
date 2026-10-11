@@ -3089,7 +3089,9 @@ async fn second_review_entry_after_a_rebase() {
             let applied = world.apply(&action).await?;
             world.quiesce().await?;
             let state = world.check_quiescent().await?;
-            world.trace.push(format!("{action:?} -> {applied}: {state}"));
+            world
+                .trace
+                .push(format!("{action:?} -> {applied}: {state}"));
         }
         world.drive_to_settlement().await?;
         let pool = world.live().pool.clone();
@@ -3140,14 +3142,17 @@ async fn second_review_entry_after_a_rebase() {
                 "no check ran on the rebased commit {landed} before it merged: {checks:?}"
             ));
         }
-        let reviews: Vec<String> =
-            sqlx::query_scalar("SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number")
-                .bind(task_id)
-                .fetch_all(&pool)
-                .await
-                .map_err(sql)?;
+        let reviews: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number",
+        )
+        .bind(task_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(sql)?;
         if reviews.is_empty() || reviews.iter().any(|status| status != "passed") {
-            return Err(format!("review attempts {reviews:?}; expected every one passed"));
+            return Err(format!(
+                "review attempts {reviews:?}; expected every one passed"
+            ));
         }
         Ok(())
     }
