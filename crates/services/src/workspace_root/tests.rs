@@ -224,7 +224,13 @@ async fn a_configured_root_that_would_strand_live_data_refuses_the_start() {
     let recorded = dirs.default_root();
     settle(&db, &dirs.default_choice()).await.unwrap();
     let workspace = seed_workspace_under(&db, &dirs, &recorded).await;
-    std::fs::create_dir_all(recorded.join(".repos").join("clone")).unwrap();
+    // This database's clone, and beside it what another database (or a
+    // person) keeps under the same `.repos`: only the first is counted.
+    let clone = recorded.join(".repos").join(&workspace.repo_id);
+    std::fs::create_dir_all(&clone).unwrap();
+    for foreign in ["3f0c2b0e-6d53-4b7e-9d0c-0d5a4f3f8a11", "someone-elses"] {
+        std::fs::create_dir_all(recorded.join(".repos").join(foreign)).unwrap();
+    }
     let other = dirs.data.path().join("other-root");
 
     let refused = settle(&db, &dirs.explicit_choice(&other))
@@ -259,8 +265,10 @@ async fn a_configured_root_that_would_strand_live_data_refuses_the_start() {
         .unwrap();
     assert!(settle(&db, &dirs.explicit_choice(&other)).await.is_err());
 
-    // Only cleaned rows left: the operator's change is taken and recorded.
-    std::fs::remove_dir_all(recorded.join(".repos")).unwrap();
+    // Only cleaned rows left, and under `.repos` only what is not this
+    // database's: the operator's change is taken and recorded.
+    std::fs::remove_dir_all(&clone).unwrap();
+    assert_eq!(std::fs::read_dir(recorded.join(".repos")).unwrap().count(), 2);
     let settled = settle(&db, &dirs.explicit_choice(&other)).await.unwrap();
     assert_eq!((settled.root, settled.recorded_now), (other.clone(), true));
     assert_eq!(recorded_root(&db).await.unwrap(), Some(other));

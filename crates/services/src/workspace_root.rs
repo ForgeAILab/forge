@@ -536,14 +536,28 @@ impl LiveData {
             .fetch_one(db.pool())
             .await?;
         }
-        let clones = std::fs::read_dir(root.join(".repos"))
+        // Only this database's clones: a directory under `.repos` named
+        // after one of its repository rows, which is what the move takes.
+        // A root can be shared (a temp root used by several installs, a
+        // test beside a server), and another database's clones are not
+        // this one's to strand or to wait for.
+        let names: Vec<String> = std::fs::read_dir(root.join(".repos"))
             .map(|entries| {
                 entries
                     .flatten()
                     .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                    .count()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
             })
-            .unwrap_or(0);
+            .unwrap_or_default();
+        let mut clones = 0;
+        for name in names {
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id = ?")
+                .bind(&name)
+                .fetch_one(db.pool())
+                .await?;
+            clones += usize::from(rows > 0);
+        }
         Ok(Self {
             workspaces,
             clones,
