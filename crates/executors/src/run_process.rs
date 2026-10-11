@@ -126,7 +126,10 @@ pub fn apply_sandboxed_cleared(
             .as_std()
             .get_envs()
             .any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_some());
-        if let Some(value) = project.get(key).filter(|value| !value.is_empty() && !preset) {
+        if let Some(value) = project
+            .get(key)
+            .filter(|value| !value.is_empty() && !preset)
+        {
             command.env(key, value);
         }
     }

@@ -1375,7 +1375,10 @@ mod tests {
         let mut report = GcReport::default();
         assert!(!pass.trash(&through, &mut report));
         assert_eq!(report.errors, 1);
-        assert_eq!(fs::read_to_string(victim.join("repo").join("work")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(victim.join("repo").join("work")).unwrap(),
+            "keep"
+        );
 
         // The link itself, and a real entry, still go.
         let mut report = GcReport::default();
@@ -1975,7 +1978,9 @@ mod tests {
             cache_dir.join(".forge-removed-").display()
         );
         assert!(
-            stopped.starts_with(&prefix) && stopped.ends_with("/s\n") && stopped.lines().count() == 1,
+            stopped.starts_with(&prefix)
+                && stopped.ends_with("/s\n")
+                && stopped.lines().count() == 1,
             "{stopped}"
         );
         drop(server);

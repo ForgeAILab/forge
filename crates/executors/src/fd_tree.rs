@@ -83,12 +83,7 @@ fn unlink_at(parent: BorrowedFd<'_>, name: &CStr, flags: libc::c_int) -> io::Res
     retry(|| unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) }).map(drop)
 }
 
-fn rename_at(
-    from: BorrowedFd<'_>,
-    name: &CStr,
-    to: libc::c_int,
-    target: &CStr,
-) -> io::Result<()> {
+fn rename_at(from: BorrowedFd<'_>, name: &CStr, to: libc::c_int, target: &CStr) -> io::Result<()> {
     // SAFETY: `from` is an open descriptor, `to` an open descriptor or
     // `AT_FDCWD`, both names valid NUL-terminated strings that outlive the
     // call.
@@ -317,12 +312,7 @@ enum Entry {
 /// when it is one. What the listing said (`kind`) only picks what is tried
 /// first: a file is never opened and a link never followed, whatever the
 /// entry has become since.
-fn remove_or_open(
-    parent: BorrowedFd<'_>,
-    name: &CStr,
-    kind: Kind,
-    device: libc::dev_t,
-) -> Entry {
+fn remove_or_open(parent: BorrowedFd<'_>, name: &CStr, kind: Kind, device: libc::dev_t) -> Entry {
     let mut directory = match kind {
         Kind::Directory => true,
         Kind::Other => false,
@@ -626,10 +616,7 @@ pub(crate) fn unix_socket_answers(path: &Path) -> bool {
     match connected {
         Ok(_) => true,
         // The listener's queue is full.
-        Err(error) => matches!(
-            error.raw_os_error(),
-            Some(libc::EAGAIN | libc::EINPROGRESS)
-        ),
+        Err(error) => matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINPROGRESS)),
     }
 }
 
@@ -888,7 +875,10 @@ mod tests {
             remove_or_open(top.as_fd(), c"mounted", Kind::Directory, elsewhere),
             Entry::Left(_)
         ));
-        let mode = fs::symlink_metadata(tree.join("mounted")).unwrap().permissions().mode();
+        let mode = fs::symlink_metadata(tree.join("mounted"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o000, "its mode was not changed");
         fs::set_permissions(tree.join("mounted"), fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
@@ -909,7 +899,8 @@ mod tests {
         fs::write(tree.join("n".repeat(255)).join("f".repeat(255)), "x").unwrap();
         // APFS refuses such a name; Linux filesystems keep it.
         let raw = tree.join(OsStr::from_bytes(b"\xff\xfe-not-utf8"));
-        let made = fs::create_dir(&raw).is_ok() && fs::write(raw.join(OsStr::from_bytes(b"\xc3")), "x").is_ok();
+        let made = fs::create_dir(&raw).is_ok()
+            && fs::write(raw.join(OsStr::from_bytes(b"\xc3")), "x").is_ok();
         assert!(made || cfg!(target_os = "macos"));
 
         let walked = walk(&tree, None);
@@ -939,7 +930,10 @@ mod tests {
         assert_eq!((walked.finished, walked.left), (true, 0));
         assert!(fs::symlink_metadata(&tree).is_err());
         let kept = fs::metadata(outside.join("precious")).unwrap();
-        assert_eq!((kept.nlink(), kept.permissions().mode() & 0o777), (1, 0o644));
+        assert_eq!(
+            (kept.nlink(), kept.permissions().mode() & 0o777),
+            (1, 0o644)
+        );
         assert_eq!(
             fs::read_to_string(outside.join("precious")).unwrap(),
             "keep"
@@ -961,7 +955,10 @@ mod tests {
         }
         let pinned = c_name(tree.join("a/stuck/pinned").as_os_str()).unwrap();
         // SAFETY: `pinned` is a valid NUL-terminated string.
-        assert_eq!(unsafe { libc::chflags(pinned.as_ptr(), libc::UF_IMMUTABLE) }, 0);
+        assert_eq!(
+            unsafe { libc::chflags(pinned.as_ptr(), libc::UF_IMMUTABLE) },
+            0
+        );
 
         let walked = walk(&tree, None);
         // SAFETY: as above.
@@ -995,13 +992,23 @@ mod tests {
         assert!(remove_tree(&base.join("link").join("sub"), None).is_err());
         assert!(remove_tree_under(&base, Path::new("link/sub"), None).is_err());
         assert!(remove_tree_under(&base.join("link"), Path::new("sub"), None).is_err());
-        for refused in ["..", "real/..", "../outside", "real/../../outside/sub", "/", "."] {
+        for refused in [
+            "..",
+            "real/..",
+            "../outside",
+            "real/../../outside/sub",
+            "/",
+            ".",
+        ] {
             assert!(
                 remove_tree_under(&base, Path::new(refused), None).is_err(),
                 "{refused}"
             );
         }
-        assert!(remove_tree_under(&base, &outside.join("sub"), None).is_err(), "absolute");
+        assert!(
+            remove_tree_under(&base, &outside.join("sub"), None).is_err(),
+            "absolute"
+        );
         assert!(remove_tree(Path::new("/"), None).is_err());
         assert!(remove_tree(&base.join("real").join(".."), None).is_err());
         assert!(outside.join("sub").join("precious").exists() && base.join("real/tree").exists());
@@ -1074,7 +1081,10 @@ mod tests {
         assert!(!unix_socket_answers(&path), "missing");
         fs::write(short.join("file"), "x").unwrap();
         assert!(!unix_socket_answers(&short.join("file")), "a file");
-        assert!(!unix_socket_answers(&short.join("n".repeat(200))), "too long");
+        assert!(
+            !unix_socket_answers(&short.join("n".repeat(200))),
+            "too long"
+        );
 
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         assert!(unix_socket_answers(&path));

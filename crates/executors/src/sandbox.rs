@@ -1351,7 +1351,11 @@ mod tests {
         fs::create_dir_all(attacker.join(".forge-task")).unwrap();
 
         // `tmp` is a link.
-        symlink(victim.join(".forge-task/tmp"), attacker.join(".forge-task/tmp")).unwrap();
+        symlink(
+            victim.join(".forge-task/tmp"),
+            attacker.join(".forge-task/tmp"),
+        )
+        .unwrap();
         remove_run_tree(&attacker.join(".forge-task/tmp/runabc"));
         assert!(victim.join(".forge-task/tmp/runabc/keep").exists());
         // `.forge-task` is a link.
