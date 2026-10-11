@@ -972,6 +972,11 @@ async fn upgrade_preserves_old_rows_and_never_seeds_cache() {
                 .file_name()
                 .to_string_lossy()
                 .ends_with("__check_runner.sql")
+            // Triggers on `check_run`: it cannot precede the table either.
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("__check_slot_release.sql")
         {
             continue;
         }

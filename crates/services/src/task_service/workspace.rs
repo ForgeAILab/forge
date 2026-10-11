@@ -3007,6 +3007,7 @@ pub(crate) mod tests {
                         | 202610070507
                         | 202610100137
                         | 202610100820
+                        | 202610101906
                 ))
                 .then_some((version, path))
             })
@@ -3030,6 +3031,13 @@ pub(crate) mod tests {
         // in version order.
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610070507__task_condition_readers.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The check slot-release triggers write the scheduler's tables.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610101906__check_slot_release.sql"
         ))
         .execute(&pool)
         .await
@@ -4383,6 +4391,129 @@ pub(crate) mod tests {
             assert_eq!(reserved, total_reserved);
             assert!(reserved <= i64::from(cap), "cap {cap} exceeded: {reserved}");
         }
+    }
+
+    /// The slot rules through the real reserve transaction, raced: sixteen
+    /// Tasks ask at once on a file-backed database, with checks queued on the
+    /// machine. A reservation leaves the queued checks their share, never
+    /// more, and the machine never holds more than its cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn machine_capacity_reserve_race_leaves_queued_checks_their_slots() {
+        let data = TempDir::new().unwrap();
+        let url = format!("sqlite:{}", data.path().join("forge.db").display());
+        let pool = create_sqlite_pool(&url).await.expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let repo_dir = TempDir::new().unwrap();
+        let workspace_root = TempDir::new().unwrap();
+        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 100 WHERE id = ?")
+            .bind(&agent.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let agent = AgentRepo::get_by_id(&*db, &agent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let service = Arc::new(
+            TaskService::new(db.clone(), Arc::new(EventBus::default()))
+                .with_workspace_root(workspace_root.path().to_path_buf()),
+        );
+        db.server_run_cap
+            .set(Some(4), 4, &::config::embedded_machine_id());
+        // Three Tasks in review, each with a queued entry check on the server.
+        let now = db::now_rfc3339();
+        let mut reviewed = Vec::new();
+        for i in 0..3 {
+            let task = seed_task(&db, &project_id, None).await;
+            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at) VALUES(?,?,?,?,'digest',?,'{}',0,'queued',?,?,?)")
+                .bind(format!("run-{i}")).bind(&project_id).bind(&repo_id).bind("a".repeat(40)).bind(format!("key-{i}")).bind(format!("op-{i}")).bind(&now).bind(&now)
+                .execute(db.pool()).await.unwrap();
+            sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,request_key,identity_key,run_id,created_at) SELECT ?,?,?,id,status_epoch,'entry',?,?,?,? FROM task WHERE id=?")
+                .bind(format!("consumer-{i}")).bind(&project_id).bind(&repo_id).bind(format!("request-{i}")).bind(format!("key-{i}")).bind(format!("run-{i}")).bind(&now).bind(&task.id)
+                .execute(db.pool()).await.unwrap();
+            reviewed.push(task);
+        }
+        let reserved = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM workspace_placement WHERE state IN ('reserved','preparing')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+        };
+        let race = || async {
+            let mut tasks = Vec::new();
+            for _ in 0..16 {
+                tasks.push(seed_task(&db, &project_id, None).await);
+            }
+            let mut handles = Vec::new();
+            for task in tasks {
+                let service = Arc::clone(&service);
+                let agent = agent.clone();
+                handles.push(tokio::spawn(async move {
+                    service
+                        .reserve_claim_workspace(&task, Some(&agent), "coder")
+                        .await
+                        .map(|_| ())
+                }));
+            }
+            let mut refusals = Vec::new();
+            for handle in handles {
+                if let Err(error) = handle.await.unwrap() {
+                    assert!(
+                        crate::placement::is_machine_capacity_refusal(&error),
+                        "{error:?}"
+                    );
+                    refusals.push(error);
+                }
+            }
+            refusals.len()
+        };
+        // Cap 4, share 3, three queued: one slot is an execution's.
+        assert_eq!(race().await, 15);
+        assert_eq!(reserved().await, 1);
+        // One check is admitted to its own slot: two stay reserved, the
+        // machine is full for executions (1 + 1 + 2 kept).
+        sqlx::query("UPDATE check_run SET state='running',admitted_at=?,lease_owner='w',lease_until='2099-01-01T00:00:00Z' WHERE id='run-0'")
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(race().await, 16);
+        assert_eq!(reserved().await, 1);
+        // A queued check's Task leaves review: its reservation is gone and
+        // exactly one more execution gets in (1 + 1 running check + 1 kept).
+        sqlx::query("UPDATE task SET status_epoch=status_epoch+1 WHERE id=?")
+            .bind(&reviewed[1].id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(race().await, 15);
+        assert_eq!(reserved().await, 2);
+        // The last queued check is cancelled: the last slot is taken, and no
+        // more than the cap is ever held.
+        sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE id='consumer-2'")
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(race().await, 15);
+        assert_eq!(reserved().await, 3);
+        assert_eq!(race().await, 16);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        let machine = db::machine_capacity::count_machine_capacity(
+            &mut tx,
+            None,
+            Some(4),
+            &::config::embedded_machine_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(machine.active_runs(), 4);
+        assert_eq!((machine.reservations, machine.check_runs), (3, 1));
     }
 
     #[tokio::test]

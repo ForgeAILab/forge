@@ -1653,3 +1653,160 @@ async fn log_policy_effect_failure_settles_step_failed_without_blocking_task() {
         result.task.error_annotation
     );
 }
+
+/// Suspend the hooks step on its queued check, with no check worker running.
+async fn suspend_on_entry_check(fixture: &FailedCiFixture) {
+    let result = enter_review(fixture, "CI entry").await;
+    assert_eq!(result.pending_steps, 1);
+    let _ = fixture.engine.check_worker_or_embedded();
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let suspended = fixture
+                .db
+                .task_steps(&fixture.task.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|step| step.kind == "hooks" && step.status == "suspended");
+            if suspended {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hooks step suspends on its check");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+async fn review_summaries(fixture: &FailedCiFixture) -> Vec<(db::ReviewStatus, String)> {
+    db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|review| (review.status, review.step_results_json))
+        .collect()
+}
+
+async fn set_project_review_commands(fixture: &FailedCiFixture, command: &str) {
+    sqlx::query("UPDATE project SET settings=json_set(CASE WHEN json_valid(settings) THEN settings ELSE '{}' END,'$.default_review_config',json(?)), version=version+1 WHERE id=?")
+        .bind(json!({"ci_steps":[command]}).to_string())
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+}
+
+// The Project's review commands change while the entry check of the old
+// commands is pending. The finished check answers a question nobody asks any
+// more: its verdict is applied to nothing, the attempt is closed, and the
+// Task parks for its owner. (It does not ask again by itself: see the pause
+// decisions in docs/architecture.md.)
+#[tokio::test]
+async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verdict() {
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"retry_budgets":{"review":3}}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    set_project_review_commands(&fixture, "echo first-commands").await;
+    suspend_on_entry_check(&fixture).await;
+    set_project_review_commands(&fixture, "echo other-commands").await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(
+        !reviews[0].1.contains("first-commands"),
+        "the old commands' verdict was written to the attempt: {reviews:?}"
+    );
+    assert_eq!(task.status, "review");
+    assert!(task.review_passed_at.is_none());
+
+    assert!(task
+        .error_annotation
+        .as_deref()
+        .is_some_and(|annotation| annotation.contains("cascade_failed")));
+    // The owner is not left without an action: the Task can be restarted,
+    // sent back, advanced by override or cancelled.
+    match fixture
+        .engine
+        .perform_task_action(&task.id, api_types::TaskAction::retry(), task.version)
+        .await
+    {
+        Err(ServiceError::TaskActionUnavailable {
+            available_actions, ..
+        }) => {
+            let offered: Vec<String> = available_actions
+                .iter()
+                .map(|offer| offer.label.clone())
+                .collect();
+            for label in ["Restart Task", "Request changes", "Cancel Task"] {
+                assert!(offered.iter().any(|o| o == label), "{label}: {offered:?}");
+            }
+        }
+        other => panic!("retry on a parked review entry: {:?}", other.map(|_| ())),
+    }
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
+}
+
+// The Task's own review commands change while the entry check is pending. No
+// Project version moves, so nothing but the comparison of what the entry was
+// admitted under notices: the verdict of the old commands is applied to
+// nothing, as for a Project edit.
+#[tokio::test]
+async fn a_task_review_config_change_while_the_entry_check_is_pending_applies_no_verdict() {
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(
+            json!({"retry_budgets":{"review":3},"review":{"ci_steps":["echo other-commands"]}})
+                .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(!reviews[0].1.contains("first-commands"), "{reviews:?}");
+}
+
+// The Project environment changes while the entry check is pending (with
+// the pause, the rename or the limit change that moves the Project version).
+// The run that ran is the run that was asked for: its verdict is applied.
+// Its result answers the old environment only: the next entry runs again.
+#[tokio::test]
+async fn a_project_environment_change_while_the_entry_check_is_pending_applies_the_verdict_once() {
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    sqlx::query("UPDATE project SET settings=json_set(CASE WHEN json_valid(settings) THEN settings ELSE '{}' END,'$.environment',json('{\"env\":{\"REVIEW_ENTRY_FLAG\":\"changed\"}}')), version=version+1 WHERE id=?")
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(
+        reviews[0].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[0].1.contains("first-commands"));
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
+    re_enter_review(&fixture, "after the environment change").await;
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_run").await,
+        2,
+        "the old environment's result was reused for the new one"
+    );
+}

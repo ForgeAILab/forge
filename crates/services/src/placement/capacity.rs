@@ -43,8 +43,8 @@ mod tests {
                  execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
              CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
              CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
-             CREATE TABLE check_run (id TEXT, machine_id TEXT, state TEXT, admitted_at TEXT);
-             CREATE TABLE check_consumer (task_id TEXT, status_epoch INTEGER, run_id TEXT, cancelled_at TEXT);
+             CREATE TABLE check_run (id TEXT, machine_id TEXT, state TEXT, admitted_at TEXT, created_at TEXT);
+             CREATE TABLE check_consumer (task_id TEXT, status_epoch INTEGER, run_id TEXT, cancelled_at TEXT, origin TEXT);
              CREATE TABLE task (id TEXT, status_epoch INTEGER, deleted_at TEXT);",
         )
         .execute(&pool)

@@ -22,6 +22,8 @@ pub use lifecycle::{
 pub(crate) use merge::test_faults as merge_test_faults;
 pub(crate) use merge::{conflict_handoff_result, merge_failure_result, record_integration_failure};
 pub use merge::{CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge};
+#[doc(hidden)]
+pub use review::halt as review_entry_halt;
 pub use review::{
     run_ci_steps_in_step, set_entry_check_wall_seconds_for_test, AutoCascadeOnReviewPass,
     AutoCascadeOnUnconfiguredReview, RunCiSteps,

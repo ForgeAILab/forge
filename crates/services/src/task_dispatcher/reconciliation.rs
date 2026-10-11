@@ -19,17 +19,29 @@ use std::{
 
 /// Every Task that is not settled is re-examined once per period.
 pub(super) const SWEEP_PERIOD: Duration = Duration::from_secs(120);
-/// How often a Task that waits for a machine is read again while any
-/// machine is under its free-space floor. A run slot comes back with a
-/// commit (an execution ends) and that commit kicks the waiters; free disk
-/// comes back with no commit at all (an operator deletes something, the
-/// collector finishes, a daemon reports a better reading), so a disk wait
-/// is a timer or it is for ever. The timer is a durable deadline on the
-/// Task's wait row: it survives a restart and fires at once after one.
+/// How often a Task that waits for a machine is read again, whatever else
+/// happens. The timer is a durable deadline on the Task's wait row: it
+/// survives a restart and fires at once after one.
+///
+/// Free disk comes back with no commit at all (an operator deletes
+/// something, the collector finishes, a daemon reports a better reading), so
+/// a disk wait is a timer or it is for ever: `DISK_WAIT_RECHECK` while the
+/// Task waits for disk or any machine is under its floor.
+///
+/// A run slot comes back with a commit that marks the waiters, and a new
+/// waiter is read once more after its row exists (`SqliteDb::schedule_wait`).
+/// `SLOT_WAIT_RECHECK` is the backstop under both: no ordering of a release
+/// and a wait, and no release that marks nobody, parks a Task on an idle
+/// machine for longer than one period.
 pub(super) const DISK_WAIT_RECHECK: Duration = if cfg!(test) {
     Duration::from_secs(1)
 } else {
     Duration::from_secs(30)
+};
+pub(super) const SLOT_WAIT_RECHECK: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
 };
 /// What one tick spends on the sweep before it yields to dispatch.
 pub(super) const SWEEP_SLICE: Duration = Duration::from_millis(100);
@@ -859,19 +871,35 @@ impl TaskDispatcher {
         let daemon = machine("environment_wait", &["machine", "daemon_id"])
             .or_else(|| machine("owner_wait", &["daemon_id"]))
             .or_else(|| machine_wait.then(|| "*".to_owned()));
-        // Level-triggered disk wait: see `DISK_WAIT_RECHECK`. Also for a
-        // Task that says it waits for a run slot while another machine is
-        // short of disk: that machine recovering is its exit too.
-        // A settled Task never dispatches: a wait it was left with is not
-        // worth a timer.
+        // Level-triggered machine wait: every wait for a machine carries a
+        // recheck deadline (see `DISK_WAIT_RECHECK`). The shorter period
+        // also applies to a Task that says it waits for a run slot while
+        // another machine is short of disk: that machine recovering is its
+        // exit too. A settled Task never dispatches: a wait it was left with
+        // is not worth a timer.
         let dispatchable = p.workflow.state_kind(&p.read.task.status) != Some(StateKind::Terminal);
-        let disk_recheck = if machine_wait && dispatchable && self.waits_on_disk(&p.read.task).await
-        {
-            Some((chrono::Utc::now() + DISK_WAIT_RECHECK).to_rfc3339())
+        let machine_recheck = if machine_wait && dispatchable {
+            let period = if self.waits_on_disk(&p.read.task).await {
+                DISK_WAIT_RECHECK
+            } else {
+                SLOT_WAIT_RECHECK
+            };
+            // An armed timer that is still ahead is kept: a Task read again
+            // before it fires does not write its wait row again.
+            let now = chrono::Utc::now();
+            let armed = self
+                .db
+                .schedule_wait_deadline(&p.read.task.id)
+                .await?
+                .filter(|stored| {
+                    chrono::DateTime::parse_from_rfc3339(stored)
+                        .is_ok_and(|at| at > now && at <= now + period)
+                });
+            Some(armed.unwrap_or_else(|| (now + period).to_rfc3339()))
         } else {
             None
         };
-        let deadline = match (p.deadline.as_deref(), disk_recheck.as_deref()) {
+        let deadline = match (p.deadline.as_deref(), machine_recheck.as_deref()) {
             (Some(own), Some(disk)) => {
                 let at = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
                 Some(if at(own) <= at(disk) { own } else { disk })

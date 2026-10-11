@@ -1622,7 +1622,7 @@ impl SqliteDb {
             &self.server_run_cap.embedded_machine_id(),
         )
         .await?
-        .has_capacity()
+        .admits_execution()
         {
             return Err(DbError::MachineAtCapacity);
         }

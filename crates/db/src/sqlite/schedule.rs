@@ -235,6 +235,14 @@ impl SqliteDb {
 impl SqliteDb {
     /// `daemon` names the machine the Task waits on (`"*"`: a run slot on
     /// any machine); `project.1` is set only while it waits on the Project limit.
+    ///
+    /// A Task that starts waiting for a run slot is marked for one more look
+    /// in the same commit. Whoever decided that it waits read the machines
+    /// before this row existed, and a slot released in between found no
+    /// waiter to mark. The next look reads the machines with the row in
+    /// place: a release either committed before it and is seen, or commits
+    /// after it and marks the row. A row that already says `"*"` marks
+    /// nothing, so a Task that keeps waiting is not read in a loop.
     pub async fn schedule_wait(
         &self,
         id: &str,
@@ -250,9 +258,40 @@ impl SqliteDb {
                 .await?;
             return Ok(());
         }
+        // A wait that already says all of this costs no write.
+        let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_schedule_wait WHERE task_id=?1 AND project_id IS ?2 AND agent_id IS ?3 AND daemon_id IS ?4 AND deadline IS ?5 AND project_capacity IS ?6)")
+            .bind(id).bind(project.0).bind(agent).bind(daemon).bind(deadline).bind(project.1).fetch_one(self.pool()).await?;
+        if unchanged {
+            return Ok(());
+        }
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let registers_slot_wait = daemon == Some("*")
+            && !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM task_schedule_wait WHERE task_id=? AND daemon_id='*')",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
         sqlx::query("INSERT INTO task_schedule_wait(task_id,project_id,agent_id,daemon_id,deadline,project_capacity) VALUES (?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET project_id=excluded.project_id,agent_id=excluded.agent_id,daemon_id=excluded.daemon_id,deadline=excluded.deadline,project_capacity=excluded.project_capacity WHERE project_capacity IS NOT excluded.project_capacity OR project_id IS NOT excluded.project_id OR agent_id IS NOT excluded.agent_id OR daemon_id IS NOT excluded.daemon_id OR deadline IS NOT excluded.deadline")
-            .bind(id).bind(project.0).bind(agent).bind(daemon).bind(deadline).bind(project.1).execute(self.pool()).await?;
+            .bind(id).bind(project.0).bind(agent).bind(daemon).bind(deadline).bind(project.1).execute(&mut *tx).await?;
+        if registers_slot_wait {
+            sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE id=? ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
+    }
+    /// The recheck deadline a Task's wait row carries, if it has one.
+    pub async fn schedule_wait_deadline(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT deadline FROM task_schedule_wait WHERE task_id=?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?
+                .flatten(),
+        )
     }
     pub async fn due_schedule_tasks(&self, now: &str) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar(
@@ -476,5 +515,74 @@ mod fanout_tests {
         let mut ids = db.dirty_schedule_tasks(100).await.unwrap();
         ids.sort();
         assert_eq!(ids, ["wait", "work"]);
+    }
+
+    /// The reader that decided a Task waits for a run slot read the machines
+    /// before the wait row existed. Writing the row marks the Task for one
+    /// more look, in the same commit; a row that already says so marks
+    /// nothing, and neither does any other kind of wait.
+    #[tokio::test]
+    async fn a_new_run_slot_wait_is_read_once_more_and_an_unchanged_one_is_not() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        crate::run_migrations(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES ('p','p','{}','{}','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); INSERT INTO task(id,project_id,title,task_type,status,created_at,updated_at) VALUES ('wait','p','wait','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'),('other','p','other','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); DELETE FROM task_schedule_dirty;").execute(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let dirty = || async { db.dirty_schedule_tasks(100).await.unwrap() };
+        let clear = || async {
+            sqlx::query("DELETE FROM task_schedule_dirty")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        };
+        // The release this Task should have seen committed before this row.
+        db.schedule_wait(
+            "wait",
+            ("p", false),
+            None,
+            Some("*"),
+            Some("2099-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dirty().await, ["wait"]);
+        clear().await;
+        // Unchanged, and a changed deadline on the same wait: no mark.
+        db.schedule_wait(
+            "wait",
+            ("p", false),
+            None,
+            Some("*"),
+            Some("2099-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        db.schedule_wait(
+            "wait",
+            ("p", false),
+            None,
+            Some("*"),
+            Some("2099-01-02T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(dirty().await.is_empty());
+        assert_eq!(
+            db.schedule_wait_deadline("wait").await.unwrap().as_deref(),
+            Some("2099-01-02T00:00:00Z")
+        );
+        // A wait on a named machine, an Agent or the Project limit: no mark.
+        db.schedule_wait("other", ("p", true), Some("a"), Some("machine"), None)
+            .await
+            .unwrap();
+        assert!(dirty().await.is_empty());
+        // It stops waiting for a slot and starts again: one mark each time.
+        db.schedule_wait("wait", ("p", false), Some("a"), None, None)
+            .await
+            .unwrap();
+        assert!(dirty().await.is_empty());
+        db.schedule_wait("wait", ("p", false), Some("a"), Some("*"), None)
+            .await
+            .unwrap();
+        assert_eq!(dirty().await, ["wait"]);
     }
 }

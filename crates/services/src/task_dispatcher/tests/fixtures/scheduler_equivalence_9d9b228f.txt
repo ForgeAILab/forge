@@ -1045,3 +1045,27 @@ wake refusal_none_todo (after): dv=0 status=todo ann=- B=- F=- E=- meta=[dispatc
 @IntegrationQueueOwned steady paused_integration (events): {}
 @IntegrationQueueOwned startup paused_integration T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[paused_integration] disp=[-] execs=[] hooks=0
 @IntegrationQueueOwned startup paused_integration (events): {}
+@OwnSlotIsNoWait load/startup round0 S02: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round0 S05: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round0 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round0 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round2 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round2 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S02: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S05: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round2 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round2 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait startup machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@OwnSlotIsNoWait startup queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@OwnSlotIsNoWait steady machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@OwnSlotIsNoWait steady queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0

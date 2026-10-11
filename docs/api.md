@@ -33,7 +33,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
-| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution or Workspace lease is live, while `?force=true` requests cancellation before retrying the guard |
+| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution, a Workspace lease or a check run is live; `?force=true` refuses without cancelling anything when a check run is on an unreachable machine, and otherwise requests cancellation before retrying the guard |
 | GET    | `/api/v1/projects/{id}/analytics` | Read authorized Project analytics for a half-open window (CI steps, review summary, typed usage/cost breakdown, and released-milestone outcome economics) |
 | POST   | `/api/v1/projects/{id}/cost-estimation-previews` | Preview exact retrospective estimates for eligible legacy Project usage against one immutable catalog snapshot |
 | POST   | `/api/v1/projects/{id}/cost-estimation-runs` | Commit one preview's retrospective estimates idempotently |
@@ -2331,14 +2331,41 @@ failure leaves no Project or handoff and keeps Genesis ready for retry.
 `DELETE /api/v1/projects/{id}` requires an authenticated Project owner/admin;
 unauthorized members cannot observe in-use counts or filesystem state. It
 refuses with `409 project_in_use` while the
-Project still holds a running Execution or an active Workspace lease, and its
-`details` report `running_executions` and `active_leases`. With
+Project still holds a running Execution, an active Workspace lease or an
+unfinished check run (a review-entry or integration check that is queued,
+running, being cancelled or cleaned up, or whose result is not known yet), and
+its `details` report `running_executions`, `active_leases` and
+`live_check_runs`. With
 `?force=true`, Forge requests provider-acknowledged cancellation for every
 running Execution, terminalizes those rows, revokes active Workspace leases,
-and retries the same guarded deletion. A provider or database failure stops
-the request before authoritative deletion; if any execution or lease is still
-live, the request remains a `409` and the Project is left intact. Force does
-not mean "delete anyway".
+stops the Project's check runs (a queued run is cancelled at once; a running
+one is cancelled on the machine that runs it and Forge waits a few seconds for
+it to settle), and retries the same guarded deletion. A provider or database
+failure stops the request before authoritative deletion; if any execution,
+lease or check run is still live, the request remains a `409` (`details.
+force_cancellation_incomplete: true`) and the Project is left intact.
+
+A forced delete works in two phases, so that a request that is going to be
+refused changes nothing it does not have to:
+
+1. **Nothing is touched.** If a check run was dispatched to a daemon that is
+   not connected, its stop cannot be sent or confirmed and the record that
+   fences its process must stay. The request is refused at once:
+   `details.unreachable_machines` lists the hostnames, `details.cancelled` is
+   `false`, and no execution, lease or check was cancelled: the Tasks keep
+   their review entries. Reconnect the machine and delete again; if it is gone
+   for good, remove it (`DELETE /api/v1/daemons/{id}`): the runs of a removed
+   machine are settled and the delete then goes through.
+2. **Cancel and settle.** Otherwise executions are stopped, leases revoked and
+   check runs stopped. The request waits at most four seconds in all for
+   running checks to settle. If one has not (a reachable machine was slow to
+   confirm), the answer is the `409` above with `details.cancelled: true` and
+   `unreachable_machines: []`: executions it stopped stay stopped, and the
+   Tasks whose check runs it cancelled fail that review entry (`review check
+   did not finish`). The stop continues in the background; repeat the request.
+
+Either refusal answers within about five seconds. Force does not mean "delete
+anyway".
 
 Once admitted, it performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project, including

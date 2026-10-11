@@ -85,11 +85,14 @@ pub enum DbError {
     #[error("repo {repo_id} has active executions or workspace leases")]
     RepoInUse { repo_id: String },
 
-    #[error("project {project_id} has {running_executions} running execution(s) and {active_leases} active workspace lease(s)")]
+    #[error("project {project_id} has {running_executions} running execution(s), {active_leases} active workspace lease(s) and {live_check_runs} unfinished check run(s)")]
     ProjectInUse {
         project_id: String,
         running_executions: i64,
         active_leases: i64,
+        /// Check runs that are queued, running, being cancelled or cleaned,
+        /// or whose result is not known yet.
+        live_check_runs: i64,
     },
 
     #[error("{resource} is in use: {reason}")]
@@ -172,6 +175,17 @@ impl DbError {
         matches!(self, Self::Sqlx(sqlx::Error::Database(error))
             if error.kind() == sqlx::error::ErrorKind::ForeignKeyViolation
                 || error.message().contains("FOREIGN KEY constraint failed"))
+    }
+
+    /// SQLite refused or gave up on a lock (`SQLITE_BUSY`, `SQLITE_LOCKED`
+    /// and their extended codes): nothing was written, and the same
+    /// statement succeeds once the other writer has committed.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Sqlx(sqlx::Error::Database(error))
+            if error
+                .code()
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6)))
     }
 
     /// Worker retry classification, deliberately narrower than "any DB error".

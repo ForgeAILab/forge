@@ -576,17 +576,20 @@ impl From<DbError> for ApiError {
                 project_id,
                 running_executions,
                 active_leases,
+                live_check_runs,
             } => Self::conflict_with_code_and_details(
                 "project_in_use",
                 format!(
-                    "project {project_id} has {running_executions} running execution(s) and \
-                     {active_leases} active workspace lease(s); retry with ?force=true to \
-                     request cancellation before deletion"
+                    "project {project_id} has {running_executions} running execution(s), \
+                     {active_leases} active workspace lease(s) and {live_check_runs} \
+                     unfinished check run(s); retry with ?force=true to request \
+                     cancellation before deletion"
                 ),
                 json!({
                     "project_id": project_id,
                     "running_executions": running_executions,
                     "active_leases": active_leases,
+                    "live_check_runs": live_check_runs,
                 }),
             ),
             DbError::ResourceInUse { resource, reason } => Self::conflict_with_code_and_details(
