@@ -22,7 +22,8 @@ impl TaskCommand {
             "maybe_cascade_executor_completion"
             | "block_cancelled_dependencies"
             | "advance_coordination_root"
-            | "settle_removed_machine" => db::task_writer::EffectFence::Identity,
+            | "settle_removed_machine"
+            | "settle_retired_review_rerun" => db::task_writer::EffectFence::Identity,
             _ => db::task_writer::EffectFence::Entry,
         }
     }
@@ -621,13 +622,28 @@ impl TaskService {
                     encode(Box::pin(self.update_task(task_id, request)).await?)
                 }
                 "rerun_review" => {
-                    let (id,): (String,) = serde_json::from_value(command.arguments.clone())
-                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    // A step queued before v0.14 names only the Task. Those
+                    // re-runs were the owner's and spent no budget, so that
+                    // is what a step without a requester still means.
+                    let (id, requested_by): (String, Option<Actor>) = match serde_json::from_value::<
+                        (String, Actor),
+                    >(
+                        command.arguments.clone(),
+                    ) {
+                        Ok((id, actor)) => (id, Some(actor)),
+                        Err(_) => {
+                            let (id,): (String,) =
+                                serde_json::from_value(command.arguments.clone())
+                                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                            (id, None)
+                        }
+                    };
                     encode(
                         Box::pin(
                             self.rerun_review(
                                 Uuid::parse_str(&id)
                                     .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+                                requested_by.unwrap_or_else(|| Actor::user(UserActionSource::Api)),
                             ),
                         )
                         .await?,
@@ -704,6 +720,11 @@ impl TaskService {
                         });
                     }
                     encode(())
+                }
+                "settle_retired_review_rerun" => {
+                    let (id,): (String,) = serde_json::from_value(command.arguments.clone())
+                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    encode(Box::pin(self.stop_retired_review_reruns(&id)).await?)
                 }
                 "block_cancelled_dependencies" => {
                     let (task_id, cancelled): (String, Vec<String>) =

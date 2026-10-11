@@ -190,6 +190,7 @@ impl TaskService {
                 "task_type must be task, planning_task, sub_task, or discovery",
             ));
         }
+        super::update::reject_retired_auditor_config(task_state_config.as_deref())?;
         let review_requirement_ids =
             super::update::review_requirement_ids_from_config(task_state_config.as_deref())?
                 .unwrap_or_default();

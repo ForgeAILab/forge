@@ -834,6 +834,39 @@ impl WorkflowExecution<'_> {
         .await
     }
 
+    /// Re-enter the Task's current state because a review re-run was asked
+    /// for. The entry is the workflow's own (`actor`); `bridge` records who
+    /// asked ([`api_types::TransitionBridge::review_rerun`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn review_rerun_entry_with_authority(
+        &self,
+        task: &db::Task,
+        workflow: &WorkflowDefinition,
+        actor: Actor,
+        reason: &str,
+        authority: WorkflowAuthority,
+        bridge: api_types::TransitionBridge,
+    ) -> crate::Result<TransitionResult> {
+        crate::task_service::execution::ensure_plan_publication_transition_authority(task, None)?;
+        self.transition_inner(
+            task.id.clone(),
+            task.status.clone(),
+            task.version,
+            workflow,
+            actor,
+            reason.to_string(),
+            false,
+            true,
+            None,
+            None,
+            None,
+            Some(authority),
+            false,
+            bridge,
+        )
+        .await
+    }
+
     pub async fn retry_entry_barrier_with_authority(
         &self,
         task_id: &str,
@@ -873,6 +906,23 @@ impl WorkflowExecution<'_> {
                 target_state, task.status
             )));
         }
+        // The retry is the same entry run again: a review re-run keeps who
+        // asked for it, and with that its budget exemption.
+        let entered: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, bridge_kind, bridge_payload FROM transition_log WHERE task_id = ? AND to_state = ? AND status_epoch = (SELECT status_epoch FROM task WHERE id = ?) ORDER BY created_at, rowid LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(&target_state)
+        .bind(task_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        let bridge = entered
+            .and_then(|(id, kind, payload)| {
+                db::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref()).ok()
+            })
+            .filter(|bridge| bridge.review_rerun_requester().is_some())
+            .unwrap_or_default();
         self.transition_inner(
             task_id.to_owned(),
             target_state,
@@ -887,7 +937,7 @@ impl WorkflowExecution<'_> {
             None,
             Some(authority),
             true,
-            Default::default(),
+            bridge,
         )
         .await
     }
@@ -1211,7 +1261,6 @@ impl WorkflowExecution<'_> {
                     .as_ref()
                     .map(|authority| authority.workflow_definition.clone()),
                 triggered_by: actor.clone(),
-                review_runner: self.task_service.review_runner.clone(),
                 merge_service: self.task_service.merge_service.clone(),
                 cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
                 task_service: self.task_service.clone(),
@@ -1244,7 +1293,6 @@ impl WorkflowExecution<'_> {
                     .as_ref()
                     .map(|authority| authority.workflow_definition.clone()),
                 triggered_by: actor.clone(),
-                review_runner: self.task_service.review_runner.clone(),
                 merge_service: self.task_service.merge_service.clone(),
                 cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
                 task_service: self.task_service.clone(),

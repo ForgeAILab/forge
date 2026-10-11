@@ -617,7 +617,47 @@ impl Fixture {
             .daemon_connections
             .get(&self.daemon_id)
             .unwrap();
-        ReviewRepo::create_attempt_with_execution_and_lease(
+        // The fixture states the rows a dispatched reviewer leaves (a running
+        // reviewer execution leased to this daemon connection, and the
+        // attempt bound to it); dispatch admission is not its subject.
+        sqlx::query(
+            "INSERT INTO execution (id, task_id, agent_id, role, status, parent_execution_id, workspace_id, created_at, updated_at)
+             VALUES (?, ?, ?, 'reviewer', 'running', ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(input.agent_id.as_deref())
+        .bind(input.parent_execution_id.as_deref())
+        .bind(input.workspace_id.as_deref())
+        .bind(&now)
+        .bind(&now)
+        .execute(self.harness.state.db.pool())
+        .await
+        .expect("the reviewer execution row inserts");
+        let created = ExecutionRepo::get_by_id(&*self.harness.state.db, &reviewer_id)
+            .await
+            .expect("reviewer reads")
+            .expect("reviewer exists");
+        let leased = ExecutionRepo::claim_lease(
+            &*self.harness.state.db,
+            db::ClaimExecutionLease {
+                execution_id: reviewer_id.clone(),
+                expected_version: created.execution_version,
+                owner: services::daemon_transport::execution_lease_owner(
+                    &self.daemon_id,
+                    connection.id(),
+                ),
+                lease_expires_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+                hard_deadline_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+                ),
+                now: now.clone(),
+            },
+        )
+        .await
+        .expect("the owner lease is claimed");
+        assert!(matches!(leased, db::ExecutionLeaseMutation::Updated(_)));
+        let review = ReviewRepo::create(
             &*self.harness.state.db,
             CreateReview {
                 id: db::new_uuid_v4(),
@@ -628,26 +668,27 @@ impl Fixture {
                 step_results_json: "{}".into(),
                 started_at: now.clone(),
                 created_at: now.clone(),
-                updated_at: now.clone(),
+                updated_at: now,
             },
-            input,
-            db::ClaimExecutionLease {
-                execution_id: reviewer_id,
-                expected_version: 1,
-                owner: services::daemon_transport::execution_lease_owner(
-                    &self.daemon_id,
-                    connection.id(),
-                ),
-                lease_expires_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
-                hard_deadline_at: Some(
-                    (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
-                ),
-                now,
-            },
-            None,
         )
         .await
-        .expect("review attempt and owner lease admit together")
+        .expect("review attempt opens");
+
+        sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+            .bind(&reviewer_id)
+            .bind(&review.id)
+            .execute(self.harness.state.db.pool())
+            .await
+            .expect("the attempt binds its reviewer");
+        let review = ReviewRepo::get_by_id(&*self.harness.state.db, &review.id)
+            .await
+            .expect("review reads")
+            .expect("review exists");
+        let reviewer = ExecutionRepo::get_by_id(&*self.harness.state.db, &reviewer_id)
+            .await
+            .expect("reviewer reads")
+            .expect("reviewer exists");
+        (review, reviewer)
     }
 
     async fn approve_candidate(&self) -> ReviewContract {
@@ -1253,7 +1294,6 @@ async fn remote_plan_checklist_gate_matches_server_placement() {
         project_version: None,
         project_workflow_definition: None,
         triggered_by: Actor::system(SystemComponent::Test),
-        review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
         task_service: fixture.harness.state.task_service.as_ref().clone(),
@@ -1760,7 +1800,6 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
             project_version: Some(project.version),
             project_workflow_definition: Some(project.workflow_definition),
             triggered_by: Actor::system(SystemComponent::Test),
-            review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
             task_service: state.task_service.as_ref().clone(),
@@ -3013,6 +3052,93 @@ async fn connected_cancel_kills_remote_ci_and_supersedes_its_hook_step() {
             &task_id,
             TaskAction::Cancel {
                 reason: Some("owner cancelled remote CI".into()),
+            },
+            task.version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.task.status, "cancelled");
+    assert!(!completed.exists());
+    assert!(db
+        .pending_remote_cancels(None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .task_steps(&task_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.kind == "hooks" && s.expected_status == "review" && s.status == "superseded"));
+    assert_eq!(
+        fixture
+            .link
+            .as_ref()
+            .unwrap()
+            .requests(METHOD_WORKSPACE_CANCEL)
+            .len(),
+        1
+    );
+    running.await.unwrap().unwrap();
+    assert_remote_ci_abandoned(db, &task_id).await;
+    assert!(!completed.exists());
+    assert_eq!(
+        TaskRepo::get_by_id(&**db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}
+
+// A manual review re-run of a daemon-placed Task is an ordinary review entry:
+// its CI runs on the owner daemon, and cancelling the Task while it runs
+// stops the remote command and leaves no cancellation pending, exactly as
+// for an automatic entry.
+#[tokio::test]
+async fn a_review_rerun_on_a_daemon_owned_task_runs_remote_ci_under_the_cancel_fence() {
+    use db::TaskStepRepo;
+    let fixture = Fixture::new("forge-remote-ci-rerun").await;
+    let db = &fixture.harness.state.db;
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let started = fixture._daemon_root.path().join("rerun-ci-started");
+    let completed = fixture._daemon_root.path().join("rerun-ci-completed");
+    sqlx::query("UPDATE task SET task_state_config=?,status='review' WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 120; touch {}",quote(&started.to_string_lossy()),quote(&completed.to_string_lossy()))]}}).to_string()).bind(&task_id).execute(db.pool()).await.unwrap();
+    let service = fixture.harness.state.task_service.clone();
+    // The owner's review re-run: the Task re-enters `review` and its CI is
+    // asked of the check runner, which runs it on the daemon that owns the
+    // worktree.
+    let entered = service
+        .rerun_review(
+            task_id.parse().expect("the Task id is a UUID"),
+            api_types::Actor::user(api_types::UserActionSource::Api),
+        )
+        .await
+        .unwrap();
+    assert_eq!(entered.status, "review");
+    assert!(db.entry_hooks_pending(&task_id).await.unwrap());
+    let running = {
+        let service = service.clone();
+        let id = task_id.clone();
+        tokio::spawn(async move { service.drain(&id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let task = TaskRepo::get_by_id(&**db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let cancelled = service
+        .perform_task_action(
+            &task_id,
+            TaskAction::Cancel {
+                reason: Some("owner cancelled the re-run's remote CI".into()),
             },
             task.version,
         )

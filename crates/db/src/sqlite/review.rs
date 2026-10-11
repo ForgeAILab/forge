@@ -300,7 +300,7 @@ async fn update_status_inner(
     Ok((updated_review, updated_task))
 }
 
-/// ReviewRunner's status boundary. Unlike the historical `update_status`
+/// The review settlement boundary. Unlike the historical `update_status`
 /// method, this always rechecks the Task/Project/workflow/candidate and the
 /// exact prior Review row under the writer lock. A Task projection is optional
 /// because CI-only failures/awaiting-human states do not change
@@ -966,124 +966,6 @@ impl ReviewRepo for SqliteDb {
         let outcome = (review, task);
         self.record_mutation_reply_in_tx(transaction, &outcome)
             .await?;
-        Ok(outcome)
-    }
-
-    async fn create_attempt_with_execution_and_lease(
-        &self,
-        mut review: CreateReview,
-        execution: CreateExecution,
-        lease: ClaimExecutionLease,
-        admission: Option<ExecutionAdmission>,
-    ) -> Result<(Review, Execution)> {
-        if !crate::task_writer::owns_task(&review.task_id) {
-            return self
-                .run_task_mutation(
-                    &review.task_id,
-                    crate::TaskMutation::ReviewCreateAttemptWithExecution {
-                        review: Box::new(review.clone()),
-                        execution: Box::new(execution),
-                        lease,
-                        admission,
-                    },
-                )
-                .await;
-        }
-        let invalid_deadline = lease
-            .hard_deadline_at
-            .as_deref()
-            .is_some_and(|deadline| lease.lease_expires_at.as_str() > deadline);
-        if execution.status != ExecutionStatus::Running
-            || lease.execution_id != execution.id
-            || lease.expected_version != 1
-            || lease.owner.trim().is_empty()
-            || invalid_deadline
-            || review.task_id != execution.task_id
-            // A Review identifies the candidate execution being reviewed.
-            // The newly-created reviewer execution is its child, so the two
-            // rows must share the exact candidate lineage.
-            || execution.parent_execution_id.as_deref() != Some(review.execution_id.as_str())
-        {
-            return Err(DbError::Check(
-                "review attempt must match a running child execution, candidate, and valid owner claim"
-                    .to_owned(),
-            ));
-        }
-
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        validate_review_candidate_in_tx(&mut transaction, &review.task_id, &review.execution_id)
-            .await?;
-        self.create_execution_in_tx(&mut transaction, &execution, admission.as_ref())
-            .await?;
-        let lease_result = sqlx::query(
-            "UPDATE execution
-             SET lease_owner = ?,
-                 lease_expires_at = MIN(?, COALESCE(?, ?)),
-                 hard_deadline_at = ?,
-                 last_heartbeat_at = ?,
-                 execution_version = execution_version + 1,
-                 updated_at = ?
-             WHERE id = ? AND status = 'running'
-               AND execution_version = 1 AND lease_owner IS NULL",
-        )
-        .bind(&lease.owner)
-        .bind(&lease.lease_expires_at)
-        .bind(lease.hard_deadline_at.as_deref())
-        .bind(&lease.lease_expires_at)
-        .bind(lease.hard_deadline_at.as_deref())
-        .bind(&lease.now)
-        .bind(&lease.now)
-        .bind(&lease.execution_id)
-        .execute(&mut *transaction)
-        .await?;
-        if lease_result.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-
-        let next_attempt = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT MAX(attempt_number) FROM review WHERE task_id = ?",
-        )
-        .bind(&review.task_id)
-        .fetch_one(&mut *transaction)
-        .await?
-        .unwrap_or(0)
-            + 1;
-        review.attempt_number = next_attempt;
-        sqlx::query("INSERT INTO review (id, task_id, execution_id, reviewer_execution_id, attempt_number, status, step_results_json, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&review.id)
-            .bind(&review.task_id)
-            .bind(&review.execution_id)
-            .bind(&execution.id)
-            .bind(review.attempt_number)
-            .bind(review.status.to_string())
-            .bind(&review.step_results_json)
-            .bind(&review.started_at)
-            .bind(&review.created_at)
-            .bind(&review.updated_at)
-            .execute(&mut *transaction)
-            .await?;
-        let persisted_review = map_review(
-            sqlx::query("SELECT * FROM review WHERE id=?")
-                .bind(&review.id)
-                .fetch_one(&mut *transaction)
-                .await?,
-        )?;
-        let persisted_execution = map_execution(
-            sqlx::query("SELECT * FROM execution WHERE id=?")
-                .bind(&execution.id)
-                .fetch_one(&mut *transaction)
-                .await?,
-        )?;
-        let outcome = (persisted_review, persisted_execution);
-        self.record_mutation_reply_in_tx(&mut transaction, &outcome)
-            .await?;
-        crate::task_condition::produce(
-            &mut transaction,
-            &review.task_id,
-            crate::ConditionChange::Human,
-        )
-        .await?;
-        transaction.commit().await?;
         Ok(outcome)
     }
 

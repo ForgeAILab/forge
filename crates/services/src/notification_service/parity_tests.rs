@@ -133,7 +133,6 @@ fn ci_context(
         project_version: Some(project.version),
         project_workflow_definition: Some(project.workflow_definition.clone()),
         triggered_by: Actor::system(api_types::SystemComponent::Test),
-        review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
         task_service: service,

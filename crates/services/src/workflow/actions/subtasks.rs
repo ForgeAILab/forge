@@ -298,7 +298,6 @@ mod subtask_hook_test_support {
                 project_version: Some(project.version),
                 project_workflow_definition: Some(project.workflow_definition),
                 triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
-                review_runner: None,
                 merge_service: None,
                 cleanup_scheduler: None,
                 task_service,

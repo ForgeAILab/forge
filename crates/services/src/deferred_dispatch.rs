@@ -32,6 +32,13 @@ pub(crate) struct QueuedRecovery {
     pub blocked_json: Option<String>,
     #[serde(default)]
     pub failed_json: Option<String>,
+    /// The role launch that continues an action which just re-entered
+    /// `target_state` (the reviewer after a review re-run, the role after a
+    /// budget reset). It belongs to that entry: when the entry's own hooks
+    /// move the Task on (its checks failed and sent it to remediation), there
+    /// is nothing left to launch and the intent is dropped, not failed.
+    #[serde(default)]
+    pub continuation: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -5588,40 +5588,31 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         .await
         .expect("failed candidate binding lookup succeeds")
         .is_none());
-    let failed_reviewer_id = new_uuid_v4();
-    let mut failed_reviewer =
-        make_execution(failed_reviewer_id.clone(), ExecutionStatus::Running, None);
-    failed_reviewer.parent_execution_id = Some(failed_candidate_id.clone());
-    let failed_attempt = ReviewRepo::create_attempt_with_execution_and_lease(
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task lookup succeeds")
+        .expect("task exists");
+    let failed_attempt = ReviewRepo::create_with_task_authority(
         &db,
         crate::CreateReview {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
-            execution_id: failed_candidate_id,
+            execution_id: failed_candidate_id.clone(),
             attempt_number: 0,
             status: ReviewStatus::Running,
             step_results_json: "[]".to_owned(),
             started_at: now.clone(),
             created_at: now.clone(),
-            updated_at: now.clone(),
+            updated_at: now,
         },
-        failed_reviewer,
-        ClaimExecutionLease {
-            execution_id: failed_reviewer_id.clone(),
-            expected_version: 1,
-            owner: "embedded:failed-candidate-review".to_owned(),
-            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
-            now,
-        },
+        current.version,
+        &current.status,
         None,
+        None,
+        Some(&failed_candidate_id),
     )
     .await;
     assert!(matches!(failed_attempt, Err(DbError::VersionConflict)));
-    assert!(ExecutionRepo::get_by_id(&db, &failed_reviewer_id)
-        .await
-        .expect("failed candidate reviewer lookup succeeds")
-        .is_none());
     assert!(ReviewRepo::get_by_id(&db, &failed_review_id)
         .await
         .expect("failed candidate Review lookup succeeds")
@@ -5698,39 +5689,6 @@ async fn review_attempt_accepts_completed_direct_child_candidate_but_rejects_unr
         created_at: now.clone(),
         updated_at: now.clone(),
     };
-    let make_reviewer = |id: String, candidate_id: &str| CreateExecution {
-        id,
-        task_id: root_id.clone(),
-        agent_id: None,
-        role: "reviewer".to_owned(),
-        status: ExecutionStatus::Running,
-        stop_reason: None,
-        stopped_by: None,
-        resume_policy: None,
-        stopped_at: None,
-        parent_execution_id: Some(candidate_id.to_owned()),
-        agent_session_id: None,
-        agent_message_id: None,
-        last_activity_at: None,
-        summary: None,
-        logs_path: None,
-        before_sha: None,
-        after_sha: None,
-        error: None,
-        executor_config_snapshot_json: None,
-        workspace_id: None,
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    let make_lease = |execution_id: String| ClaimExecutionLease {
-        execution_id,
-        expected_version: 1,
-        owner: "embedded:root-review-candidate".to_owned(),
-        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
-        now: now.clone(),
-    };
-
     // A coordination root can retain an older implementation execution, but
     // once non-deleted direct children exist the child execution set is the
     // authoritative candidate scope.
@@ -5742,29 +5700,34 @@ async fn review_attempt_accepts_completed_direct_child_candidate_but_rejects_unr
     ExecutionRepo::create(&db, make_candidate(child_candidate_id.clone(), &child_id))
         .await
         .expect("completed child candidate creates");
-    let reviewer_id = new_uuid_v4();
-    let (review, reviewer) = ReviewRepo::create_attempt_with_execution_and_lease(
+    let root = TaskRepo::get_by_id(&db, &root_id, false)
+        .await
+        .expect("root lookup succeeds")
+        .expect("root exists");
+    let attempt = |candidate: &str| CreateReview {
+        id: new_uuid_v4(),
+        task_id: root_id.clone(),
+        execution_id: candidate.to_owned(),
+        attempt_number: 0,
+        status: ReviewStatus::Running,
+        step_results_json: "[]".to_owned(),
+        started_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let review = ReviewRepo::create_with_task_authority(
         &db,
-        CreateReview {
-            id: new_uuid_v4(),
-            task_id: root_id.clone(),
-            execution_id: child_candidate_id.clone(),
-            attempt_number: 0,
-            status: ReviewStatus::Running,
-            step_results_json: "[]".to_owned(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-        make_reviewer(reviewer_id.clone(), &child_candidate_id),
-        make_lease(reviewer_id),
+        attempt(&child_candidate_id),
+        root.version,
+        &root.status,
         None,
+        None,
+        Some(&child_candidate_id),
     )
     .await
     .expect("root review accepts direct child candidate");
     assert_eq!(review.task_id, root_id);
     assert_eq!(review.execution_id, child_candidate_id);
-    assert_eq!(reviewer.parent_execution_id, Some(child_candidate_id));
 
     let unrelated_candidate_id = new_uuid_v4();
     ExecutionRepo::create(
@@ -5773,30 +5736,21 @@ async fn review_attempt_accepts_completed_direct_child_candidate_but_rejects_unr
     )
     .await
     .expect("unrelated completed candidate creates");
-    let orphan_reviewer_id = new_uuid_v4();
-    let unrelated_result = ReviewRepo::create_attempt_with_execution_and_lease(
+    let root = TaskRepo::get_by_id(&db, &root_id, false)
+        .await
+        .expect("root lookup succeeds")
+        .expect("root exists");
+    let unrelated_result = ReviewRepo::create_with_task_authority(
         &db,
-        CreateReview {
-            id: new_uuid_v4(),
-            task_id: root_id.clone(),
-            execution_id: unrelated_candidate_id.clone(),
-            attempt_number: 0,
-            status: ReviewStatus::Running,
-            step_results_json: "[]".to_owned(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-        make_reviewer(orphan_reviewer_id.clone(), &unrelated_candidate_id),
-        make_lease(orphan_reviewer_id.clone()),
+        attempt(&unrelated_candidate_id),
+        root.version,
+        &root.status,
         None,
+        None,
+        Some(&unrelated_candidate_id),
     )
     .await;
     assert!(matches!(unrelated_result, Err(DbError::VersionConflict)));
-    assert!(ExecutionRepo::get_by_id(&db, &orphan_reviewer_id)
-        .await
-        .expect("unrelated reviewer lookup succeeds")
-        .is_none());
     assert_eq!(
         ReviewRepo::list_by_task(&db, &root_id).await.unwrap().len(),
         1

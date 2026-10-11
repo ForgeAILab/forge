@@ -4,12 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskMutation {
-    ReviewCreateAttemptWithExecution {
-        review: Box<CreateReview>,
-        execution: Box<CreateExecution>,
-        lease: ClaimExecutionLease,
-        admission: Option<ExecutionAdmission>,
-    },
     ReviewCreateManualPass {
         input: CreateManualReviewPass,
     },
@@ -257,9 +251,6 @@ fn encode<T: Serialize>(value: T) -> Result<Value> {
 impl TaskMutation {
     pub fn expected_task_version(&self) -> Option<i64> {
         match self {
-            Self::ReviewCreateAttemptWithExecution { admission, .. } => {
-                admission.as_ref().map(|a| a.expected_task_version)
-            }
             Self::ReviewCreateManualPass { input } => Some(input.expected_task_version),
             Self::ReviewUpdateStatusWithTaskAuthority {
                 expected_task_version,
@@ -403,17 +394,6 @@ impl TaskMutation {
             mutation.rebase_task_version(version);
         }
         match mutation {
-            Self::ReviewCreateAttemptWithExecution {
-                review,
-                execution,
-                lease,
-                admission,
-            } => encode(
-                Box::pin(ReviewRepo::create_attempt_with_execution_and_lease(
-                    db, *review, *execution, lease, admission,
-                ))
-                .await?,
-            ),
             Self::ReviewCreateManualPass { input } => encode(
                 Box::pin(ReviewRepo::create_manual_pass_with_task_authority(
                     db, input,

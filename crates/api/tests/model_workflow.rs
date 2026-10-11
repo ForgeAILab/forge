@@ -579,11 +579,6 @@ impl World {
                 Arc::clone(&event_bus),
                 workspaces,
             )))
-            .with_review_runner(Arc::new(review::ReviewRunner::new(
-                Arc::clone(&db),
-                Arc::clone(&event_bus),
-                Arc::clone(&registry),
-            )))
             .with_workflows_dir(api::state::test_workflows_dir())
             .with_jwt_secret(api::state::test_jwt_secret())
             .with_bcrypt_cost(api::state::test_bcrypt_cost())
@@ -913,7 +908,6 @@ impl World {
         if !state_config["review"].is_object() {
             state_config["review"] = json!({ "review_prompt": "Review the model deliverable." });
         }
-        state_config["review"]["auditor_agent_id"] = json!(self.reviewer_id);
         sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
             .bind(state_config.to_string())
             .bind(&id)

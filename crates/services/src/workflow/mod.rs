@@ -32,7 +32,6 @@ pub struct HookContext {
     pub project_version: Option<i64>,
     pub project_workflow_definition: Option<String>,
     pub triggered_by: Actor,
-    pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
     /// Originating service clone for nested dispatch; preserves the provider,

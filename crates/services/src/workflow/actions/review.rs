@@ -834,6 +834,15 @@ impl HookAction for AutoCascadeOnReviewPass {
             Ok(review) => review,
             Err(reason) => return HookResult::Failed { reason },
         };
+        let rerun_entered_at =
+            match db::budget::review_rerun_entry(ctx.db.pool(), &ctx.task_id, None).await {
+                Ok(entry) => entry.map(|(_, entered_at)| entered_at),
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            };
         let review_id = latest_review.as_ref().map(|r| r.id.clone());
         let input = match crate::workflow::engine::durable::hook_effect(
             &ctx.task_id,
@@ -926,7 +935,12 @@ impl HookAction for AutoCascadeOnReviewPass {
             }
             Some(review)
                 if review.status == ReviewStatus::Failed
-                    && Some(review.execution_id.as_str()) == ctx.execution_id.as_deref() =>
+                    && Some(review.execution_id.as_str()) == ctx.execution_id.as_deref()
+                    // A review re-run reviews the same candidate again: the
+                    // failure it was asked to replace is not its verdict.
+                    && !rerun_entered_at
+                        .as_deref()
+                        .is_some_and(|entered_at| review.created_at.as_str() < entered_at) =>
             {
                 if had_review_passed && !review_has_auditor_verdict(&review) {
                     if let Err(error) = TaskRepo::set_review_passed_at_cas(
@@ -1093,6 +1107,13 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
             };
         }
 
+        // A review re-run with nothing to run still answers the request: it
+        // records the attempt it made (no checks, passed), so the Task's
+        // latest Review is this entry's and not the one it replaced.
+        if let Err(reason) = record_empty_rerun_attempt(ctx, &task).await {
+            return HookResult::Failed { reason };
+        }
+
         HookResult::Cascade {
             to: default_states::MERGING.to_string(),
             reason: "review skipped: no checks or reviewer assigned".to_string(),
@@ -1100,6 +1121,41 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
             bridge: Default::default(),
         }
     }
+}
+
+/// See [`AutoCascadeOnUnconfiguredReview`]. Idempotent per entry: a
+/// redelivered hook finds the attempt this entry already recorded.
+async fn record_empty_rerun_attempt(ctx: &HookContext, task: &db::Task) -> Result<(), String> {
+    let Some((_, entered_at)) = db::budget::review_rerun_entry(ctx.db.pool(), &ctx.task_id, None)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    if latest_review(ctx)
+        .await?
+        .is_some_and(|review| review.created_at.as_str() >= entered_at.as_str())
+    {
+        return Ok(());
+    }
+    let Some(candidate) = latest_executor_execution(ctx).await else {
+        return Ok(());
+    };
+    let review =
+        create_review_attempt_with_authority(ctx, &candidate.id, task.version, &candidate.id)
+            .await?;
+    let now = now_rfc3339();
+    ReviewRepo::update_status(
+        &*ctx.db,
+        &review.id,
+        ReviewStatus::Passed,
+        json!({ "ci_steps": [] }).to_string(),
+        Some(now.clone()),
+        &now,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn gate_requires_user_approval(ctx: &HookContext) -> bool {
