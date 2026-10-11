@@ -1730,12 +1730,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(listed, 2);
-        let wake_sources: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM attention_projection WHERE status = 'open'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let wake_sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE status = 'open'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(wake_sources, 0);
         assert_eq!(
             crate::task_service::state_retired_auditor_notices(&db)

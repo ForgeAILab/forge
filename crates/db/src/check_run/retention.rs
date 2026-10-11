@@ -57,8 +57,16 @@ pub const CHECK_JSON_COLUMNS: &[(&str, &str, Option<&str>)] = &[
     ("integration_attempt", "checks_json", ATTEMPT_EVIDENCE),
     ("integration_attempt", "conflict_paths_json", None),
     ("integration_attempt", "effect_ack_json", ATTEMPT_EVIDENCE),
-    ("integration_attempt", "effect_intent_json", ATTEMPT_EVIDENCE),
-    ("integration_attempt", "effect_receipts_json", ATTEMPT_EVIDENCE),
+    (
+        "integration_attempt",
+        "effect_intent_json",
+        ATTEMPT_EVIDENCE,
+    ),
+    (
+        "integration_attempt",
+        "effect_receipts_json",
+        ATTEMPT_EVIDENCE,
+    ),
     ("integration_attempt", "guard_paths_json", None),
     ("integration_attempt", "import_source_json", None),
     ("integration_attempt", "observations_json", ATTEMPT_EVIDENCE),

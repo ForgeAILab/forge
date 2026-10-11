@@ -3,7 +3,8 @@ use ::review::ReviewWorkspace;
 use api_types::Actor;
 /// What a stopped execution of the retired inline review re-run says while
 /// its Task is on hold. The release looks for it and runs the review entry.
-pub(crate) const RETIRED_REVIEW_RERUN_HELD: &str = "this execution belonged to the inline review re-run, \
+pub(crate) const RETIRED_REVIEW_RERUN_HELD: &str =
+    "this execution belonged to the inline review re-run, \
      which this Forge version no longer has; it was stopped at upgrade. The Task is on hold: \
      its review entry runs again when it is released";
 

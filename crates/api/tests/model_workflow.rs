@@ -2469,10 +2469,9 @@ async fn a_task_whose_entry_check_runs_offers_cancel_and_no_hold() {
                 ));
             }
             let _ = steps.await;
-            match pause {
-                Some(PauseKind::Agents) => world.pause_agents(false).await?,
-                // `drive_to_settlement` resumes the Project.
-                _ => {}
+            // `drive_to_settlement` resumes the Project.
+            if pause == Some(PauseKind::Agents) {
+                world.pause_agents(false).await?;
             }
             world.drive_to_settlement().await
         }

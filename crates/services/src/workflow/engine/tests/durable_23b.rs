@@ -2681,7 +2681,11 @@ async fn a_task_whose_entry_waits_for_disk_offers_cancel_and_no_hold() {
     assert_eq!(cancelled.task.status, "cancelled");
     let task = drain(fixture.engine.clone(), &fixture.task.id).await;
     assert_eq!(task.status, "cancelled");
-    assert!(task.error_annotation.is_none(), "{:?}", task.error_annotation);
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
     assert_eq!(
         count(
             &fixture,
@@ -2780,12 +2784,14 @@ async fn a_workflow_edit_that_leaves_the_entered_state_alone_keeps_the_entry_che
         let (pool, id) = (fixture.db.pool().clone(), fixture.task.project_id.clone());
         let workflow = serde_json::to_string(workflow).unwrap();
         async move {
-            sqlx::query("UPDATE project SET workflow_definition = ?, version = version + 1 WHERE id = ?")
-                .bind(workflow)
-                .bind(id)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE project SET workflow_definition = ?, version = version + 1 WHERE id = ?",
+            )
+            .bind(workflow)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
     };
 
