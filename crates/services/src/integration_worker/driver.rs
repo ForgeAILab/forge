@@ -3,11 +3,11 @@
 //! followed by a re-read, so a pass can stop anywhere and the next claim
 //! continues from the stored rows.
 use super::{
-    is_conflict, later, parse_time, stamp, CrashPoint, HeadAction, HeadFacts, HeadTimeout,
-    IntegrationQueueWorker, IntegrationStepAck, IntegrationStepAction, IntegrationStepOutcome,
-    IntegrationStepState, ObjectTransferDirection, ObjectTransferEndpoint, ObjectTransferOutcome,
-    ObjectTransferRelease, ObjectTransferRequest, OwnerFastForwardRequest, OwnerRebaseRequest,
-    TaskGate,
+    is_conflict, later, parse_time, stamp, CrashPoint, GateCause, HeadAction, HeadFacts,
+    HeadTimeout, IntegrationQueueWorker, IntegrationStepAck, IntegrationStepAction,
+    IntegrationStepOutcome, IntegrationStepState, ObjectTransferDirection, ObjectTransferEndpoint,
+    ObjectTransferOutcome, ObjectTransferRelease, ObjectTransferRequest, OwnerFastForwardRequest,
+    OwnerRebaseRequest, TaskGate,
 };
 use crate::{
     integration_effects::EffectOwner,
@@ -44,7 +44,8 @@ pub enum Pass {
 pub enum ParkReason {
     Infrastructure,
     Timeout,
-    ProjectPaused,
+    /// The Task's owner, Project or Agent stopped it (`TaskGate::Gated`).
+    Gate(GateCause),
     TargetNotReady,
     TargetDirty,
     WorktreeDirty,
@@ -69,7 +70,7 @@ impl ParkReason {
         match self {
             Self::Infrastructure => "infrastructure",
             Self::Timeout => "timeout",
-            Self::ProjectPaused => "project_paused",
+            Self::Gate(cause) => cause.code(),
             Self::TargetNotReady => "target_not_ready",
             Self::TargetDirty => "target_dirty",
             Self::WorktreeDirty => "worktree_dirty",
@@ -91,7 +92,7 @@ impl ParkReason {
     fn retry(self) -> Retry {
         match self {
             Self::Infrastructure | Self::Timeout | Self::StepFailed => Retry::Counted,
-            Self::ProjectPaused | Self::TargetNotReady => Retry::Soon,
+            Self::Gate(_) | Self::TargetNotReady => Retry::Soon,
             _ => Retry::Owner,
         }
     }
@@ -511,6 +512,19 @@ impl HeadDriver {
 
     // ----- releases -----------------------------------------------------
 
+    /// The Task gate, read from storage alone. `Some`: the head left the
+    /// slot (the Task left its entry, or its owner stopped it).
+    async fn gated(&mut self, a: &IntegrationAttempt) -> Result<Option<Pass>> {
+        match self.w.facts.task_gate(a).await? {
+            TaskGate::Live => Ok(None),
+            TaskGate::Left => self.release_cancelled(a).await.map(Some),
+            TaskGate::Gated(cause) => self
+                .park(a, ParkReason::Gate(cause), cause.message())
+                .await
+                .map(Some),
+        }
+    }
+
     async fn release_cancelled(&mut self, a: &IntegrationAttempt) -> Result<Pass> {
         if a.effect_intent_json.is_some() {
             self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
@@ -545,7 +559,13 @@ impl HeadDriver {
             .cloned()
             .unwrap_or_default();
         let parks = |entry: &&serde_json::Value| entry["kind"] == "worker_park";
-        let counted = journal
+        // Counted retries since the owner last retried (`owner_retry` is
+        // written by the owner's Retry and starts them again).
+        let since_retry = journal
+            .iter()
+            .rposition(|entry| entry["kind"] == "owner_retry")
+            .map_or(0, |at| at + 1);
+        let counted = journal[since_retry..]
             .iter()
             .filter(parks)
             .filter(|entry| entry["counted"] == true)
@@ -605,9 +625,18 @@ impl HeadDriver {
         }
         self.close_timings(a).await?;
         let entry = json!({"kind":"worker_park","reason":reason.code(),"counted":reason.retry()==Retry::Counted,"effect_seq":a.effect_seq,"at":stamp(now)});
+        // The same wait found again by the sweep (a gate that has not
+        // lifted): the journal already says so, and it is bounded.
+        let again = journal.last().is_some_and(|last| {
+            last["kind"] == "worker_park"
+                && last["reason"] == reason.code()
+                && last["effect_seq"] == a.effect_seq
+        });
         self.w
             .advance(&a.id, S::Parked, move |a| {
-                super::journal_push(a, entry);
+                if !again {
+                    super::journal_push(a, entry);
+                }
                 a.failure_kind = Some(kind);
                 a.failure_message = Some(bounded(&message));
                 a.available_at = available_at;
@@ -890,6 +919,12 @@ impl HeadDriver {
         if a.cancel_requested_at.is_some() {
             return self.release_cancelled(&a).await;
         }
+        // A member whose Task its owner stopped is skipped here: it leaves
+        // the slot before a round is counted or anything is read from Git,
+        // and the next member is claimed.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
         let now = self.w.clock.now();
         let enqueued = parse_time(Some(&a.enqueued_at));
         let mut rounds = 0;
@@ -934,6 +969,11 @@ impl HeadDriver {
         if a.cancel_requested_at.is_some() {
             return self.release_cancelled(&a).await;
         }
+        // The Task gate first, from storage: a Task its owner stopped leaves
+        // the slot before any Git is read or written, and spends no retry.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
         let started = self.w.clock.now();
         let facts = match self.facts(&a, queue).await {
             Ok(facts) => facts,
@@ -949,9 +989,9 @@ impl HeadDriver {
         match facts.gate {
             TaskGate::Live => {}
             TaskGate::Left => return self.release_cancelled(&a).await,
-            TaskGate::ProjectPaused => {
+            TaskGate::Gated(cause) => {
                 return self
-                    .park(&a, ParkReason::ProjectPaused, "the Project is paused")
+                    .park(&a, ParkReason::Gate(cause), cause.message())
                     .await
             }
         }
@@ -959,6 +999,27 @@ impl HeadDriver {
             .candidate_sha
             .clone()
             .or_else(|| a.original_candidate_sha.clone());
+        if facts.rebase_in_progress {
+            // A rebase is stopped in the Task's checkout (a merge the old
+            // path started and never reported, or an owner that died in the
+            // middle of one). Nobody else will finish it: the owner's rebase
+            // does, by the interrupted-rebase rule (`git::integration::
+            // rebase` continues it and hands a conflict to the Worker, or
+            // reports the conflict it cannot hand off). HEAD is the commit
+            // the stopped rebase stands on, which is what the owner's
+            // witness names. This is read before the landed witness below: a
+            // rebase that stopped on its first commit leaves HEAD on the
+            // target tip, which is not "the candidate has landed".
+            let head = facts.candidate_head.clone();
+            let tip = facts.target_tip.clone();
+            self.w
+                .advance(&a.id, S::Rebasing, |a| {
+                    a.candidate_sha = Some(head);
+                    a.target_tip_sha = Some(tip);
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
         if facts.candidate_in_target {
             // Landed witness: the candidate is already in the target.
             let head = facts.candidate_head.clone();
@@ -981,15 +1042,6 @@ impl HeadDriver {
                     a.failure_message =
                         Some("the candidate commit changed after it was admitted".into());
                 })
-                .await;
-        }
-        if facts.rebase_in_progress {
-            return self
-                .park(
-                    &a,
-                    ParkReason::Infrastructure,
-                    "a rebase is stopped in the Task checkout",
-                )
                 .await;
         }
         if facts.worktree_dirty {
@@ -1076,6 +1128,11 @@ impl HeadDriver {
         if a.cancel_requested_at.is_some() {
             return self.release_cancelled(&a).await;
         }
+        // No intent exists: a gate that landed since validation stops the
+        // rebase before it is asked for.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
         let facts = match self.facts(&a, queue).await {
             Ok(facts) => facts,
             Err(error) => {
@@ -1128,6 +1185,35 @@ impl HeadDriver {
                 .new_round(&a, Some(IntegrationLostRaceKind::External), true)
                 .await?
                 .unwrap_or(Pass::Progress));
+        }
+        if facts.target_in_candidate && !facts.rebase_in_progress {
+            // The candidate is already on this tip: an earlier round of this
+            // attempt rebased it and left the slot before its check came
+            // back (the Task's owner stopped it meanwhile, or the check found
+            // no verdict). There is nothing to rebase: no Git effect is asked
+            // for, only the check of the commit that is there.
+            if !facts.placement_ready {
+                if self.timed_out(HeadTimeout::Step) {
+                    return self
+                        .park(
+                            &a,
+                            ParkReason::Infrastructure,
+                            "the Task's checkout is not ready on its machine",
+                        )
+                        .await;
+                }
+                return Ok(Pass::Wait(self.w.config.poll));
+            }
+            let a = self
+                .fresh_step(&a, IntegrationStepAction::RequestCheck)
+                .await?;
+            self.w
+                .advance(&a.id, S::Checking, |a| {
+                    a.checks_json = None;
+                    a.checks_commit_sha = None;
+                })
+                .await?;
+            return Ok(Pass::Progress);
         }
         // In another clone the rebase witness is the ref this generation's
         // inbound transfer binds. Validation transferred under the generation
@@ -1356,6 +1442,13 @@ impl HeadDriver {
         if a.cancel_requested_at.is_some() {
             return self.release_cancelled(&a).await;
         }
+        // A gate that lands while the check runs: the head leaves the slot
+        // and stops waiting. The verdict, when it arrives, finds the attempt
+        // parked and is applied to nothing; the check is asked again once the
+        // gate has lifted.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
         if self
             .ensure_step(&a, IntegrationStepAction::RequestCheck)
             .await?
@@ -1399,6 +1492,11 @@ impl HeadDriver {
         match ack.outcome {
             IntegrationStepOutcome::CandidateCheckFailed => self.check_failed(&a, &ack).await,
             IntegrationStepOutcome::Infrastructure => {
+                // No verdict because the Task's owner stopped it meanwhile:
+                // that is the gate's wait, not an infrastructure retry.
+                if let Some(pass) = self.gated(&a).await? {
+                    return Ok(pass);
+                }
                 self.park(
                     &a,
                     ParkReason::Infrastructure,
@@ -1445,6 +1543,16 @@ impl HeadDriver {
             // No fast-forward intent exists yet, so the cancel wins even over
             // a permit that was already written.
             return self.release_cancelled(&a).await;
+        }
+        // Before the decision is asked for or while it is awaited. A permit
+        // that is already written was decided before the gate landed: the
+        // `settle` step reads the same gate in the transaction of the permit.
+        let permitted = IntegrationStepAck::current(&a, IntegrationStepAction::Settle)
+            .is_some_and(|ack| ack.outcome == IntegrationStepOutcome::Permit);
+        if !permitted {
+            if let Some(pass) = self.gated(&a).await? {
+                return Ok(pass);
+            }
         }
         if self.ensure_step(&a, IntegrationStepAction::Settle).await? {
             return Ok(Pass::Progress);
@@ -1503,6 +1611,10 @@ impl HeadDriver {
             IntegrationStepOutcome::CandidateCheckFailed => self.check_failed(&a, &ack).await,
             IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
             IntegrationStepOutcome::Infrastructure | IntegrationStepOutcome::Done => {
+                // The step refused the permit under the Task gate.
+                if let Some(pass) = self.gated(&a).await? {
+                    return Ok(pass);
+                }
                 self.park(
                     &a,
                     ParkReason::Infrastructure,

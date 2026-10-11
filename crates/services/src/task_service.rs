@@ -448,6 +448,11 @@ pub struct TaskService {
     /// runtime composes one over the same production ports.
     pub(crate) integration_worker:
         Arc<std::sync::OnceLock<Arc<crate::integration_worker::IntegrationQueueWorker>>>,
+    /// Set while the start-time import of merges that were in flight before
+    /// the queue has not completed (it failed and is being retried). The
+    /// reconciler admits nothing meanwhile: a Task the importer has not
+    /// classified may have a merge whose result is unknown.
+    pub(crate) integration_import_pending: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) db: Arc<SqliteDb>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
@@ -677,6 +682,11 @@ impl TaskService {
             })
             .clone()
     }
+    /// See the field. The runtime sets it when the import fails at start and
+    /// clears it when a retry completes.
+    pub fn integration_import_pending(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.integration_import_pending)
+    }
     pub fn integration_worker(
         &self,
     ) -> Option<Arc<crate::integration_worker::IntegrationQueueWorker>> {
@@ -724,6 +734,7 @@ impl TaskService {
             check_owners: Arc::default(),
             check_worker: Arc::default(),
             integration_worker: Arc::default(),
+            integration_import_pending: Arc::default(),
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,

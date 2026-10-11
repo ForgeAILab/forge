@@ -270,6 +270,9 @@ impl IntegrationSteps {
         let follow_up = match cascade {
             Some((to, reason, bridge)) => {
                 let workflow = ctx.workflow.as_ref();
+                // By role: a workflow that renamed its states is sent to the
+                // state that plays this one's part.
+                let to = super::reconcile::role_target(workflow, &attempt.expected_status, &to);
                 // The rejection rule of a hook cascade out of a gate.
                 let gate = workflow.state_kind(&attempt.expected_status) == Some(StateKind::Gate);
                 let rejection = gate

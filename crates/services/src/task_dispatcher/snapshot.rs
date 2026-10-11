@@ -290,8 +290,7 @@ impl TaskDispatcher {
         // A state whose entry admits the Task to the integration queue. The
         // queue worker parks and re-queues such a Task across a Project
         // pause; the pause marker continues other states only.
-        let merge_state =
-            state.is_some_and(|s| s.hooks.on_enter.iter().any(|h| h.action == "run_merge"));
+        let merge_state = crate::integration_steps::reconcile::merge_state(&w, &t.status);
         f.integrate = !merge_state && deferred_dispatch::paused_integration(t).is_some();
         // The key is the fact, as the base scan listed it. An intent that no
         // longer parses still reaches the replay, which blocks the Task with
@@ -574,7 +573,7 @@ impl TaskDispatcher {
             deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
         );
         if let Some(last) = r.transitions.last() {
-            if last.from_state == "merging"
+            if crate::integration_steps::reconcile::merge_state(&w, &last.from_state)
                 && last.to_state == t.status
                 && last.bridge.is_review_refresh()
                 && last.triggered_by == Actor::system(SystemComponent::Workflow).display()
@@ -584,10 +583,15 @@ impl TaskDispatcher {
         }
         // The entry of such a state admits the Task to the integration
         // queue, and the attempt states itself on the Task's condition.
+        // Read from the attempt row, not from the condition: an imported
+        // row whose statement was refused has a row and no witness, and a
+        // superseded attempt leaves a witness and no row.
         f.missing_merge_entry = t.parent_task_id.is_none()
-            && !r.entry_hooks_seen
             && merge_state
-            && t.condition.integration_attempt().is_none();
+            && !r.integration_owned
+            && !f.blocking
+            && !f.paused
+            && crate::integration_steps::gate::task_row_gate(t).is_none();
         Prepared {
             read: r,
             workflow: w,

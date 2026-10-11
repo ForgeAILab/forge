@@ -186,23 +186,6 @@ impl HeadCheckSource for ReviewCiHeadCheck {
 /// The authority under which a head's check is asked and applied. It names
 /// the attempt and the exact commit, not the `effect_seq`: a worker that
 /// asks again after a takeover joins the same consumer and the same run.
-/// Why the Task's owner has stopped it, when they have: nothing merges for
-/// such a Task although it is still in its merge state.
-fn held(task: &db::Task) -> Option<&'static str> {
-    if task.blocked_json.is_some() {
-        return Some("the Task is blocked; integration waits for its owner");
-    }
-    if task.failed_json.is_some() {
-        return Some("the Task has failed; integration waits for its owner");
-    }
-    let manual_stop = task
-        .error_annotation
-        .as_deref()
-        .and_then(|annotation| serde_json::from_str::<serde_json::Value>(annotation).ok())
-        .is_some_and(|annotation| annotation["type"] == "manual_stop");
-    manual_stop.then_some("the Task is on hold; integration waits for its owner")
-}
-
 pub(crate) fn check_authority(attempt: &IntegrationAttempt) -> Option<String> {
     attempt
         .candidate_sha
@@ -663,15 +646,16 @@ impl IntegrationSteps {
             }
         };
 
-        // A Task its owner stopped (blocked, failed, on hold) keeps its
-        // status entry, so the entry fence alone would let the queue merge
-        // it. No permit is written for it: the head parks with counted
-        // retries and then waits for the owner, as for any other wait that
-        // is not the candidate's fault.
-        let decision = match held(&task) {
-            Some(reason) if matches!(decision, Decision::Permit(_)) => {
-                Decision::Refuse(IntegrationStepOutcome::Infrastructure, reason.into())
-            }
+        // A Task its owner stopped (on hold, blocked, failed, waiting for a
+        // person, its Project or Agent paused) keeps its status entry, so
+        // the entry fence alone would let the queue merge it. No permit is
+        // written for it. The worker reads the same gate (`gate::task_gate`)
+        // and parks the head under it, uncounted, until it lifts.
+        let decision = match super::gate::task_gate(&self.db, &task.id).await? {
+            Some(cause) if matches!(decision, Decision::Permit(_)) => Decision::Refuse(
+                IntegrationStepOutcome::Infrastructure,
+                format!("{}: {}", cause.code(), cause.message()),
+            ),
             _ => decision,
         };
 

@@ -993,6 +993,11 @@ pub async fn resume_project(
     }
 
     ProjectRepo::set_paused_at(&*state.db, &id, None).await?;
+    // The Project's Tasks that waited in the merge queue under the pause go
+    // back in line now; the queue worker's sweep finds them without this.
+    if let Err(error) = state.task_service.integration_project_resumed(&id).await {
+        tracing::warn!(project_id = %id, %error, "merge queue wake after the Project resume failed; the worker's sweep covers it");
+    }
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;

@@ -11,6 +11,9 @@ pub enum Step {
     QueuedRecovery,
     ExpireOwnerWait,
     Integrate,
+    /// Admit a Task that is in a merge state, and that nothing owns there,
+    /// to the integration queue (`TaskService::reconcile_integration_admission`).
+    AdmitIntegration,
     RetryReviewCi,
     ReviewRefresh {
         target: String,
@@ -169,7 +172,10 @@ pub struct Facts {
     /// The state has a role and nobody holds it.
     pub role_open: bool,
     /// A root Task in a state whose entry admits to the integration queue,
-    /// with no entry hooks row and no integration attempt stated on it.
+    /// with no integration attempt anything owns for its present entry (none,
+    /// an ended one, or an imported row that waited for a block its owner
+    /// has since lifted), and that neither its owner nor a pending step
+    /// stops: the reconciler admits it.
     pub missing_merge_entry: bool,
 }
 pub struct Snapshot<'a> {
@@ -318,7 +324,12 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // park names the primary's owner. It is never an execution, entry-hooks
     // lease or paused-integration retry. A self-clearing primary falls
     // through to its normal step (see `integration_decides`).
-    if integration_decides(s.condition, f) || check_decides(s.condition, f) {
+    // A merge state whose Task has no attempt anything owns is the
+    // reconciler's (below, behind every self-clearing wait): a reason a
+    // superseded or imported attempt left on the Task does not decide it.
+    if !f.missing_merge_entry
+        && (integration_decides(s.condition, f) || check_decides(s.condition, f))
+    {
         return condition_park(s.condition);
     }
     if f.queue_owned {
@@ -362,6 +373,15 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     }
     if f.integrate && !f.blocking {
         return Next::Step(Step::Integrate);
+    }
+    // Level-triggered admission. It replaces the entry replay
+    // (`Step::MergeEntry`) the queue cutover removed: whatever left the Task
+    // in its merge state without an attempt, the sweep admits it through
+    // the function the `run_merge` hook calls. An accepted owner command
+    // (above) runs first; a Task its owner stopped is not admitted
+    // (`missing_merge_entry` is false under the Task gate).
+    if f.missing_merge_entry {
+        return Next::Step(Step::AdmitIntegration);
     }
     if let Some(target) = &f.review_refresh {
         return Next::Step(Step::ReviewRefresh {
@@ -521,19 +541,6 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
                     role: role.clone(),
                     agent_id: agent_id.clone(),
                 });
-            }
-            if f.missing_merge_entry {
-                // Nothing replays an entry: admission to the integration
-                // queue is the entry hooks step's, and a Task that was
-                // merging before the queue was active is taken up by the
-                // start-time importer.
-                return park(
-                    Reason::UnknownCondition {
-                        owner: ENTRY_HOOKS_OWNER.into(),
-                    },
-                    Owner::Workflow,
-                    Action::ReconcileEntry,
-                );
             }
             // Nothing automatic continues from here, and that is not a
             // defect: a person holds the role, nobody was given it yet, or the
@@ -735,7 +742,6 @@ mod tests {
                     integrate: true,
                     queued_recovery: true,
                     review_ci_retry: true,
-                    missing_merge_entry: true,
                     role_target: Some(("coder".into(), "agent".into())),
                     refresh_placement: true,
                     owner_expired: true,
@@ -830,7 +836,6 @@ mod tests {
                     let f = Facts {
                         integrate: true,
                         queued_recovery: true,
-                        missing_merge_entry: true,
                         role_target: Some(("coder".into(), "agent".into())),
                         refresh_placement: true,
                         owner_expired: true,
@@ -1085,32 +1090,62 @@ mod tests {
         );
     }
 
+    /// A merge state with no attempt anything owns is admitted by the
+    /// reconciler's step. No entry is replayed (custom hooks never run
+    /// twice), and a reason a dead attempt left on the Task does not hide it.
     #[test]
-    fn missing_merge_owner_parks_without_replaying_custom_hooks() {
+    fn a_merge_state_nothing_owns_is_admitted_without_replaying_its_entry() {
         let workflow = WorkflowEngine::resolve_workflow("{}");
-        let condition = TaskCondition::Clear {
+        let clear = TaskCondition::Clear {
             evidence: ConditionEvidence::default(),
         };
-        let f = Facts {
-            missing_merge_entry: true,
-            child_ready: true,
-            root_role_allowed: true,
-            reviewer_ready: true,
-            ..Default::default()
-        };
-        assert!(matches!(
-            next_step(&Snapshot {
-                state: "merging",
-                condition: &condition,
-                workflow: &workflow,
-                facts: &f
-            }),
-            Next::Park(Park {
-                reason: Reason::UnknownCondition { .. },
-                owner: Owner::Workflow,
-                recovery: Action::ReconcileEntry
-            })
-        ));
+        let mut conditions = crate::task_actions::tests::integration_conditions();
+        conditions.push(clear);
+        for condition in conditions {
+            let f = Facts {
+                missing_merge_entry: true,
+                child_ready: true,
+                root_role_allowed: true,
+                reviewer_ready: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                next_step(&Snapshot {
+                    state: "merging",
+                    condition: &condition,
+                    workflow: &workflow,
+                    facts: &f
+                }),
+                Next::Step(Step::AdmitIntegration),
+                "{condition:?}"
+            );
+            // A paused Project, a queued step of the Task and an accepted
+            // owner command all come first.
+            for stopped in [
+                Facts {
+                    paused: true,
+                    ..f.clone()
+                },
+                Facts {
+                    queue_owned: true,
+                    ..f.clone()
+                },
+                Facts {
+                    queued_recovery: true,
+                    ..f.clone()
+                },
+            ] {
+                assert_ne!(
+                    next_step(&Snapshot {
+                        state: "merging",
+                        condition: &condition,
+                        workflow: &workflow,
+                        facts: &stopped
+                    }),
+                    Next::Step(Step::AdmitIntegration)
+                );
+            }
+        }
     }
     #[test]
     fn backlog_root_stays_parked_after_a_manual_move() {

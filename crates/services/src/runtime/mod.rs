@@ -1035,12 +1035,22 @@ impl RuntimeSupervisor {
             Ok(report) if report.imported > 0 || report.continuations > 0 => tracing::info!(
                 imported = report.imported,
                 quarantined = report.quarantined,
+                unreadable = report.unreadable,
                 continuations = report.continuations,
                 "integration import continued in-flight merges"
             ),
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(%error, "integration import failed; the next start continues it")
+                // Nothing may drive a merge the importer has not classified:
+                // the queue worker waits for the import (it retries it, see
+                // below) and the reconciler admits nothing meanwhile. The
+                // failure is the `integration-queue` worker's reported error
+                // in operator status until a retry completes.
+                self.runtime
+                    .task_service
+                    .integration_import_pending()
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(%error, "integration import failed at start; the merge queue waits and retries it")
             }
         }
         // Reconcile what was committed before the restart. Everything else,
@@ -1094,9 +1104,54 @@ impl RuntimeSupervisor {
         // After owner reconciliation (crash recovery, above), the importer
         // and the Task-step worker: the queue worker's first sweep claims
         // every queue with work, and every head whose lease ran out.
+        // An import that failed above is retried here, before the first
+        // sweep: every failed try is this worker's reported tick error.
+        let import_pending = self.runtime.task_service.integration_import_pending();
+        let import_db = Arc::clone(&self.runtime.db);
+        let integration_worker = Arc::clone(&self.runtime.integration_worker);
         self.handles.push((
             RuntimeWorker::IntegrationQueue,
-            Arc::clone(&self.runtime.integration_worker).start(&periodic_workers, shutdown.clone()),
+            periodic_workers.worker("integration-queue").start(
+                shutdown.clone(),
+                || false,
+                move |periodic, mut shutdown| {
+                    let (worker, db, pending) = (
+                        Arc::clone(&integration_worker),
+                        Arc::clone(&import_db),
+                        Arc::clone(&import_pending),
+                    );
+                    async move {
+                        use std::sync::atomic::Ordering;
+                        while pending.load(Ordering::Acquire) {
+                            let imported = periodic
+                                .tick(async {
+                                    crate::integration_steps::import::import_at_start(&db)
+                                        .await
+                                        .map(|_| ())
+                                })
+                                .await;
+                            match imported {
+                                Ok(()) => {
+                                    pending.store(false, Ordering::Release);
+                                    tracing::info!("integration import completed; the merge queue starts");
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "integration import failed; the merge queue waits and retries");
+                                    tokio::select! {
+                                        changed = shutdown.changed() => {
+                                            if changed.is_err() || *shutdown.borrow() {
+                                                return Ok(());
+                                            }
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                                    }
+                                }
+                            }
+                        }
+                        worker.run(shutdown).await
+                    }
+                },
+            ),
         ));
         self.handles.push((
             RuntimeWorker::TaskDispatcher,

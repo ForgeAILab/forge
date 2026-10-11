@@ -1095,6 +1095,11 @@ impl TaskDispatcher {
                 .retry_paused_integration(task)
                 .await
                 .map(u64::from),
+            Step::AdmitIntegration => self
+                .task_service
+                .reconcile_integration_admission(task)
+                .await
+                .map(u64::from),
             Step::ExpireOwnerWait => {
                 self.task_service.expire_owner_wait(task).await?;
                 Ok(0)
@@ -1594,5 +1599,34 @@ impl TaskDispatcher {
             tracing::warn!(task_id = %task.id, %error, "task dispatcher recovery failed");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl TaskDispatcher {
+    /// What the scheduler resolves for one Task now, with the facts it
+    /// resolved from (tests of other modules read their Task's next step).
+    pub(crate) async fn resolved_for_test(&self, task_id: &str) -> Result<String> {
+        let (mut reads, unreadable) = self
+            .db
+            .schedule_reads_isolated(&[task_id.to_owned()])
+            .await?;
+        let Some(read) = reads.pop() else {
+            return Ok(format!("unreadable ({})", unreadable.len()));
+        };
+        let project = ProjectRepo::get_by_id(&*self.db, &read.task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", read.task.project_id.clone()))?;
+        let p = self.prepare_schedule(read, &project, chrono::Utc::now());
+        let next = next_step::next_step(&Snapshot {
+            state: &p.read.task.status,
+            condition: &p.read.condition,
+            workflow: &p.workflow,
+            facts: &p.facts,
+        });
+        Ok(format!(
+            "{next:?} integration_owned={} queue_owned={} park={:?} facts={:?}",
+            p.read.integration_owned, p.read.queue_owned, p.read.park_json, p.facts
+        ))
     }
 }

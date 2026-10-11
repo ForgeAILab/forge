@@ -352,8 +352,20 @@ impl TaskService {
                                 )
                                 .await?
                         }
-                        TaskAction::Hold { reason } if offer.reason == "dispatch_wait" => {
+                        // A Task in the merge queue runs nothing a Hold could
+                        // pause: the Hold is recorded on the Task (the same
+                        // typed hold as a dispatch wait), which is what the
+                        // queue worker's gate reads.
+                        TaskAction::Hold { reason }
+                            if matches!(
+                                offer.reason.as_str(),
+                                "dispatch_wait" | "integration_wait"
+                            ) =>
+                        {
                             self.hold_waiting_task(&snapshot, reason.as_deref()).await?
+                        }
+                        TaskAction::Retry { .. } if offer.reason == "integration_retry" => {
+                            self.retry_integration(&task).await?
                         }
                         TaskAction::Release { reason } if offer.reason == "held_waiting" => {
                             self.release_to_dispatch_queue(&snapshot, reason.as_deref())
@@ -705,6 +717,11 @@ impl TaskService {
             .await?;
         // The Task version/metadata write commits before the in-process wake.
         self.dispatch_wake.notify_one();
+        // The action may have lifted what the Task's merge waited behind (a
+        // Release, an unblock, a retry): its attempt goes back in line now.
+        if let Err(error) = self.integration_gate_lifted(&task_id).await {
+            tracing::warn!(%task_id, %error, "integration gate wake failed; the worker's sweep covers it");
+        }
         Ok(TaskActionResult {
             task: updated,
             action,

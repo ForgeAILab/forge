@@ -429,16 +429,13 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "Cancel Task",
         );
     }
-    if matches!(
-        &task.condition,
-        db::TaskCondition::Parked {
-            primary: db::ParkReason::Integration { .. },
-            ..
-        }
-    ) {
+    if let db::TaskCondition::Parked {
+        primary: db::ParkReason::Integration { reason },
+        ..
+    } = &task.condition
+    {
         // A queue/phase wait is owned work, never an agent retry or a manual
-        // decision. Genuine owner blockers expose typed recovery guidance;
-        // their consumer arrives with the integration worker in stage D.
+        // decision.
         offer(
             TaskAction::Hold { reason: None },
             &[],
@@ -446,6 +443,24 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "integration_wait",
             "Hold Task",
         );
+        // A merge that stopped (`deferred`) always offers the action that
+        // puts the Task back in line: the queue worker retries what it can
+        // by itself, and this is the exit of every wait it cannot end.
+        if matches!(reason, api_types::IntegrationReason::Deferred { .. }) {
+            offer(
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                &[],
+                &[Owner, ProjectAgent],
+                "integration_retry",
+                "Retry Merge",
+            );
+        }
         return offers;
     }
     if let db::TaskCondition::Parked {
@@ -2010,7 +2025,21 @@ pub(crate) mod tests {
             snapshot.task.condition = condition.clone();
             let offers = available_actions(&snapshot);
             let verbs: Vec<_> = offers.iter().map(|offer| offer.action.verb()).collect();
-            assert_eq!(verbs, vec!["cancel", "hold"], "{condition:?}");
+            // A stopped merge (`deferred`) also offers the Retry that puts
+            // the Task back in line; a wait the worker owns does not.
+            let deferred = matches!(
+                condition.integration_reason(),
+                Some(api_types::IntegrationReason::Deferred { .. })
+            );
+            assert_eq!(
+                verbs,
+                if deferred {
+                    vec!["cancel", "hold", "retry"]
+                } else {
+                    vec!["cancel", "hold"]
+                },
+                "{condition:?}"
+            );
             assert_eq!(
                 condition.read().failure_kind.is_some(),
                 condition
@@ -2931,7 +2960,13 @@ mod condition_reader_parity {
                         .iter()
                         .map(|offer| offer.action.verb())
                         .collect::<Vec<_>>(),
-                    vec!["cancel", "hold"]
+                    if kind == "integration_owner" {
+                        // A stopped merge offers the Retry that puts the
+                        // Task back in line.
+                        vec!["cancel", "hold", "retry"]
+                    } else {
+                        vec!["cancel", "hold"]
+                    }
                 );
                 assert_eq!(s.condition().is_some(), kind == "integration_owner");
             }

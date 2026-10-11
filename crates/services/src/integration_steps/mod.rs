@@ -42,8 +42,10 @@ use db::{
 use std::sync::Arc;
 
 pub(crate) mod admission;
+pub(crate) mod gate;
 pub mod import;
 mod port;
+pub(crate) mod reconcile;
 mod send_back;
 mod settle;
 #[cfg(test)]
@@ -299,6 +301,26 @@ impl IntegrationSteps {
         }
     }
 
+    /// Raise the incident of an integration wait that needs its owner, with
+    /// the statement. A Task that already has an interruption event for its
+    /// present version (the owner's Hold, a block: the reason integration
+    /// waits behind) has its incident; a second one is not an error.
+    pub(crate) async fn raise_interruption_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task: &db::Task,
+    ) -> Result<()> {
+        let event = db::CreateDomainEvent::task_interruption_changed(task);
+        match db::DomainEventRepo::append_event_in_tx(&*self.db, tx, &event).await {
+            Ok(_) => Ok(()),
+            Err(db::DbError::Check(reason)) => {
+                tracing::debug!(target: "services::integration_steps", task_id = %task.id, %reason, "the Task already has its interruption event");
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     // ----- park ----------------------------------------------------------
 
     /// Level-triggered: states what the attempt waits on *now*. It may arrive
@@ -410,8 +432,7 @@ impl IntegrationSteps {
                     .get_task_in_tx(&mut tx, &attempt.task_ref)
                     .await?
                     .ok_or(db::DbError::NotFound)?;
-                let event = db::CreateDomainEvent::task_interruption_changed(&task);
-                db::DomainEventRepo::append_event_in_tx(&*self.db, &mut tx, &event).await?;
+                self.raise_interruption_in_tx(&mut tx, &task).await?;
             }
         }
         db::acknowledge_integration_step_in_tx(
@@ -720,7 +741,13 @@ impl IntegrationSteps {
             .cascade_step_input(
                 &task,
                 &workflow,
-                crate::workflow::default_states::DONE.to_owned(),
+                // The state the merge state's `accept` leads to: `done`, or
+                // whatever a workflow of the Project's own calls it.
+                reconcile::role_target(
+                    &workflow,
+                    &attempt.expected_status,
+                    crate::workflow::default_states::DONE,
+                ),
                 "merge succeeded".to_owned(),
                 Default::default(),
                 false,

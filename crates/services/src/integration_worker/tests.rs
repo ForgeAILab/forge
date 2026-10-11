@@ -352,7 +352,7 @@ impl IntegrationFactsPort for GitFactsFake {
             gate: if status != "merging" {
                 TaskGate::Left
             } else if self.paused.load(Ordering::SeqCst) {
-                TaskGate::ProjectPaused
+                TaskGate::Gated(crate::integration_worker::GateCause::ProjectPaused)
             } else {
                 TaskGate::Live
             },

@@ -9797,8 +9797,9 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
     // The wedge an older binary left: the review passed, the Task entered
     // `merging`, and the merge's hooks row was lost.
     review_passed(&fixture).await;
-    // Nothing replays the entry: the dispatcher leaves it to the importer.
-    assert_eq!(fixture.dispatcher.startup_reconcile().await.unwrap(), 0);
+    // The runtime imports before the dispatcher's first lap
+    // (`RuntimeWorkers::start`): the importer takes the Task, and the
+    // dispatcher's reconciler then finds it owned.
     let first = crate::integration_steps::import::import_at_start(&fixture.db)
         .await
         .unwrap();
@@ -9872,18 +9873,9 @@ async fn a_paused_integration_marker_on_a_merging_task_is_continued_by_the_impor
     crate::deferred_dispatch::defer_integration_for_pause(&fixture.db, &task)
         .await
         .unwrap();
-    fixture.dispatcher.check_once_and_drain().await.unwrap();
-    fixture.dispatcher.check_once_and_drain().await.unwrap();
-    let logs = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        logs.iter()
-            .filter(|l| l.trigger_reason == "resuming integration after project pause")
-            .count(),
-        0,
-        "the dispatcher no longer resumes a merging Task"
-    );
+    // The runtime imports before the dispatcher's first lap; the marker is
+    // the importer's to continue (the dispatcher's own resume step is for
+    // states that do not admit to the queue).
     let marked = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
         .unwrap()

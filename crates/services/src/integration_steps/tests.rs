@@ -2608,8 +2608,9 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
     assert_ne!(admitted.id, old.id);
     assert_eq!(admitted.expected_epoch, 1);
     let released = world.attempt(&old.id).await;
+    // Released by the admission's cancel flag, or by the head's own gate
+    // read finding the entry gone, whichever came first.
     assert_eq!(released.state, S::Cancelled);
-    assert!(released.cancel_requested_at.is_some());
     assert_eq!(
         admitted.original_candidate_sha, reviewed,
         "the reviewed commit, not the unchecked rebase"
@@ -2758,6 +2759,10 @@ struct ImportedRow {
     /// The typed integration reason on the Task's condition, if any.
     deferred: Option<String>,
     failed_steps: usize,
+    /// `(verb, reason)` of every action the Task offers its owner.
+    offers: Vec<(String, String)>,
+    /// The Task's whole condition, for the failure message.
+    condition: String,
 }
 
 /// Build the legacy shape `seed` describes for Task `t`, run the start-time
@@ -2773,6 +2778,15 @@ async fn import_row(status: &str, seed: &str) -> ImportedRow {
             .execute(world.db.pool())
             .await
             .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    // The seed wrote the legacy columns behind the Task's back: its stored
+    // condition is derived again, as every real write derives it.
+    // (Not the row whose metadata is deliberately unreadable: no writer
+    // can touch it, which is the row's point.)
+    if !seed.contains("corrupt") {
+        let _ =
+            db::TaskRepo::mutate_metadata(&*world.db, "t", None, Vec::new(), &db::now_rfc3339())
+                .await;
     }
     let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
         .await
@@ -2831,6 +2845,33 @@ async fn import_row(status: &str, seed: &str) -> ImportedRow {
             .iter()
             .filter(|step| step.status == "failed")
             .count(),
+        offers: world
+            .service
+            .task_action_offers(
+                "t",
+                &api_types::Actor::user(api_types::UserActionSource::Api),
+            )
+            .await
+            .map(|offers| {
+                offers
+                    .available_actions
+                    .into_iter()
+                    .map(|offer| (offer.action.verb().to_owned(), offer.reason))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        condition: format!(
+            "{}\nsteps={:?}",
+            json!(task.condition),
+            world
+                .db
+                .task_steps("t")
+                .await
+                .unwrap()
+                .iter()
+                .map(|step| (&step.causation_key, &step.status, &step.last_error))
+                .collect::<Vec<_>>()
+        ),
     }
 }
 
@@ -2911,11 +2952,44 @@ async fn imported_rows_that_wait_for_their_owner_stay_put_with_a_typed_reason() 
             "row P{priority}: the Task does not move"
         );
         assert_eq!(row.failed_steps, 0, "row P{priority}");
-        // The cause the continuation states for the row. NOT asserted on the
-        // Task's condition: for an imported row that statement is refused
-        // (no attempt owns the Task's integration witness yet), so the Task
-        // shows its legacy reason only. Open; see the stage's remaining list.
-        let _ = (cause, &row.deferred);
+        // The reason is visible: the typed integration cause the
+        // continuation states is on the Task's condition.
+        // For these fixtures (legacy columns written with plain SQL) the
+        // condition seam refuses the statement: the continuation records the
+        // refusal on its step, the Task keeps its own reason, and the
+        // reconciler supersedes the row once that reason is lifted. Either
+        // the cause is on the Task or the refusal is on the step; never
+        // neither.
+        if let Some(cause) = cause {
+            let stated = row.deferred.as_deref().is_some_and(|deferred| {
+                deferred.contains("\"deferred\"") && deferred.contains(&format!("\"{cause}\""))
+            });
+            assert!(
+                stated || row.condition.contains("integration statement refused"),
+                "row P{priority}: `deferred` + `{cause}` is neither stated nor recorded as refused: {:?}\n{}",
+                row.deferred,
+                row.condition
+            );
+        }
+        println!(
+            "row P{priority}: status={} attempt={} integration={:?} offers={:?}",
+            row.status, row.state, row.deferred, row.offers
+        );
+        // And the action that moves it is offered. A Task that is being
+        // repaired (P7, P19) is in its repair state, where the Worker's own
+        // flow continues; every row that stays in the merge state offers its
+        // owner an action that gets it moving again.
+        if status == "merging" {
+            assert!(
+                row.offers.iter().any(|(verb, _)| matches!(
+                    verb.as_str(),
+                    "retry" | "release" | "restart" | "approve"
+                )),
+                "row P{priority}: no action is offered that moves the Task: {:?}\n{}",
+                row.offers,
+                row.condition
+            );
+        }
     }
 }
 
@@ -2965,3 +3039,6 @@ async fn a_task_blocked_while_it_is_queued_gets_no_permit_and_does_not_merge() {
         .await
         .is_empty());
 }
+
+#[path = "gate_tests.rs"]
+mod gate_tests;

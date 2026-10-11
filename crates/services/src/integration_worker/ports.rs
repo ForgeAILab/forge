@@ -212,13 +212,64 @@ pub enum IntegrationStepState {
     TaskLeft,
 }
 
+/// Why a Task that is still in its merge state may not be integrated now.
+/// Each cause is a state its owner put it in (or its Project or Agent is in)
+/// and lifts by the owner's own action; integration performs no Git effect
+/// for the Task meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GateCause {
+    /// The owner's Hold.
+    Held,
+    /// Blocked (a recorded block other than a Hold).
+    Blocked,
+    /// The Task has failed and waits for its owner.
+    Failed,
+    /// The entry of its present state is blocked.
+    EntryBlocked,
+    /// It waits for a person's decision.
+    AwaitingHuman,
+    ProjectPaused,
+    /// The Agent the Task is assigned to is paused.
+    AgentPaused,
+}
+impl GateCause {
+    /// Leads the attempt's `failure_message` (see `ParkReason::code`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Held => "task_held",
+            Self::Blocked => "task_blocked",
+            Self::Failed => "task_failed",
+            Self::EntryBlocked => "task_entry_blocked",
+            Self::AwaitingHuman => "task_awaiting_human",
+            Self::ProjectPaused => "project_paused",
+            Self::AgentPaused => "agent_paused",
+        }
+    }
+    /// What the owner reads, with the action that lifts the gate.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Held => "the Task is on hold; release it to continue the merge",
+            Self::Blocked => "the Task is blocked; unblock it to continue the merge",
+            Self::Failed => "the Task has failed; retry or restart it to continue the merge",
+            Self::EntryBlocked => {
+                "the entry of the Task's state is blocked; retry it to continue the merge"
+            }
+            Self::AwaitingHuman => "the Task waits for a person's decision",
+            Self::ProjectPaused => "the Project is paused",
+            Self::AgentPaused => "the Task's Agent is paused; resume it to continue the merge",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskGate {
     /// Still `merging` at the attempt's `expected_epoch`.
     Live,
     /// Left that status entry (cancelled, moved, done, deleted).
     Left,
-    ProjectPaused,
+    /// Still in that entry, and stopped by its owner, its Project or its
+    /// Agent: no rebase, check or fast-forward until the gate lifts.
+    Gated(GateCause),
 }
 
 /// Read-only facts about the head, taken in one call.
@@ -262,6 +313,12 @@ pub trait IntegrationFactsPort: Send + Sync {
         attempt: &IntegrationAttempt,
         queue: &IntegrationQueue,
     ) -> Result<HeadFacts>;
+    /// The Task gate alone, from storage: no Git is read. The head asks this
+    /// before every effect and before it waits on a check or a decision, so
+    /// a Task its owner stopped leaves the slot without one.
+    async fn task_gate(&self, _attempt: &IntegrationAttempt) -> Result<TaskGate> {
+        Ok(TaskGate::Live)
+    }
 }
 
 /// One checkout an object transfer reads from or writes to.

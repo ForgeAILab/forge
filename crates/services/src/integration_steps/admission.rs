@@ -45,10 +45,16 @@ pub(crate) fn unbound(attempt: &IntegrationAttempt) -> bool {
 /// `VersionConflict`: the earlier attempt still holds its queue slot (it has
 /// been told to release; see [`admit_released`]), or another writer got in
 /// between.
+///
+/// This is the one admission function: the `run_merge` entry hook, the
+/// import continuation, the reconciler (`reconcile`) and the owner's Retry
+/// all call it, so each of them is idempotent and identity-fenced the same
+/// way (`admit:<task>:<epoch>[:<n>]`).
 pub(crate) async fn admit(
     db: &Arc<SqliteDb>,
     merge_service: &MergeService,
     task: &db::Task,
+    replace_released: bool,
 ) -> Result<IntegrationAttempt> {
     let facts = merge_service.integration_admission_facts(task).await?;
     let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
@@ -121,7 +127,15 @@ pub(crate) async fn admit(
                 || (current.import_source_json.is_none()
                     && current.candidate_sha.as_deref() == Some(facts.candidate_sha.as_str())
                     && current.state == S::Queued));
-        if same_entry && bound(&current) {
+        // `replace_released` (the reconciler, the owner's Retry): an attempt
+        // that left the queue for good while the Task stayed in this entry
+        // (quarantined with nothing unsettled; sent back, with the Task then
+        // blocked for its owner instead of moved) gets a successor, which
+        // keeps the Task's place in line.
+        let replaced = replace_released
+            && matches!(current.state, S::Quarantined | S::Ejected | S::NeedsReview)
+            && current.effect_intent_json.is_none();
+        if same_entry && bound(&current) && !replaced {
             return Ok(current);
         }
         // The same status entry, but the row does not carry what this
@@ -208,9 +222,21 @@ pub(crate) async fn admit_released(
     task: &db::Task,
     worker: Option<&crate::integration_worker::IntegrationQueueWorker>,
 ) -> Result<IntegrationAttempt> {
+    admit_released_or_replaced(db, merge_service, task, worker, false).await
+}
+
+/// [`admit_released`]; with `replace_released` a quarantined attempt with
+/// nothing unsettled is superseded (the owner's Retry).
+pub(crate) async fn admit_released_or_replaced(
+    db: &Arc<SqliteDb>,
+    merge_service: &MergeService,
+    task: &db::Task,
+    worker: Option<&crate::integration_worker::IntegrationQueueWorker>,
+    replace_released: bool,
+) -> Result<IntegrationAttempt> {
     let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
     loop {
-        match admit(db, merge_service, task).await {
+        match admit(db, merge_service, task, replace_released).await {
             Err(ServiceError::Db(DbError::VersionConflict))
                 if tokio::time::Instant::now() < deadline =>
             {

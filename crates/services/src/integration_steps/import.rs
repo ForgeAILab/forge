@@ -52,6 +52,9 @@ pub struct ImportReport {
     pub imported: u32,
     pub quarantined: u32,
     pub needs_fact: u32,
+    /// Tasks the importer could not read at all; each is quarantined with
+    /// the error and the pass continued.
+    pub unreadable: u32,
     /// `import_continue` steps enqueued by this call.
     pub continuations: u32,
 }
@@ -65,20 +68,7 @@ const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
                      AND s.causation_key='integration-import:'||a.id) \
     ORDER BY a.id";
 
-/// The state of `workflow` whose entry admits to the integration queue.
-fn merge_state(workflow: &api_types::WorkflowDefinition, name: &str) -> bool {
-    workflow
-        .states
-        .iter()
-        .find(|state| state.name == name)
-        .is_some_and(|state| {
-            state
-                .hooks
-                .on_enter
-                .iter()
-                .any(|hook| hook.action == "run_merge")
-        })
-}
+use super::reconcile::merge_state;
 
 fn import_priority(attempt: &IntegrationAttempt) -> Option<u64> {
     attempt
@@ -115,6 +105,7 @@ pub async fn import_at_start(db: &Arc<SqliteDb>) -> Result<ImportReport> {
         report.imported += pass.imported;
         report.quarantined += pass.quarantined;
         report.needs_fact += pass.needs_fact;
+        report.unreadable += pass.unreadable;
         if !pass.remaining || pass.examined == 0 {
             break;
         }
@@ -347,27 +338,39 @@ impl IntegrationSteps {
                 "Task left the entry the attempt was imported in".into(),
             ));
         }
+        let mut refusal = None;
         if let Some(reason) = reason {
             let intervention = reason.requires_intervention();
-            let stated = self
-                .state_in_tx(
+            let stated = match self
+                .db
+                .state_integration_condition_in_tx(
                     &mut tx,
                     &attempt.task_ref,
                     &ConditionStatement::Integration { reason },
                 )
-                .await?;
+                .await
+            {
+                Ok(()) => true,
+                // Kept on the step: a wait the Task could not be told is
+                // read there, and the Task's own reason stands meanwhile.
+                Err(db::DbError::Check(reason)) => {
+                    tracing::warn!(target: "services::integration_steps", task_id = %attempt.task_ref, %reason, "integration statement refused for an imported attempt");
+                    refusal = Some(format!("integration statement refused: {reason}"));
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
             if stated && intervention {
                 let task = self
                     .db
                     .get_task_in_tx(&mut tx, &attempt.task_ref)
                     .await?
                     .ok_or(db::DbError::NotFound)?;
-                let event = db::CreateDomainEvent::task_interruption_changed(&task);
-                db::DomainEventRepo::append_event_in_tx(&*self.db, &mut tx, &event).await?;
+                self.raise_interruption_in_tx(&mut tx, &task).await?;
             }
         }
         self.db
-            .finish_step_in_tx(&mut tx, step, "done", None)
+            .finish_step_in_tx(&mut tx, step, "done", refusal.as_deref())
             .await?;
         tx.commit().await?;
         Ok(StepOutcome::Settled)

@@ -16,7 +16,9 @@ use std::{path::PathBuf, sync::Arc};
 /// The production [`IntegrationFactsPort`].
 ///
 /// - Gate: the Task is still in the status entry the attempt was admitted in
-///   (`db::STEP_FENCE`), and its Project is not paused.
+///   (`db::STEP_FENCE`), and nothing stops it there: no Hold, block, failure
+///   or wait for a person, and neither its Project nor its Agent is paused
+///   (`integration_steps::gate`).
 /// - Git: read through the Task's workspace placement, so a daemon-placed
 ///   Task is read on its daemon. The Task's checkout is a worktree of its
 ///   repo location, so when that location is the queue's target the target
@@ -83,6 +85,25 @@ fn unreadable(what: &str) -> ServiceError {
 
 #[async_trait]
 impl IntegrationFactsPort for WorkspaceHeadFacts {
+    async fn task_gate(&self, attempt: &IntegrationAttempt) -> Result<TaskGate> {
+        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
+            .bind(&attempt.task_ref)
+            .bind(&attempt.expected_status)
+            .bind(attempt.expected_epoch)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db::DbError::from)?;
+        if !live {
+            return Ok(TaskGate::Left);
+        }
+        Ok(
+            match crate::integration_steps::gate::task_gate(&self.db, &attempt.task_ref).await? {
+                Some(cause) => TaskGate::Gated(cause),
+                None => TaskGate::Live,
+            },
+        )
+    }
+
     async fn head_facts(
         &self,
         attempt: &IntegrationAttempt,
@@ -98,13 +119,11 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
         if !live {
             return Ok(Self::left(queue));
         }
-        let paused: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=? AND p.paused_at IS NOT NULL)",
-        )
-        .bind(&attempt.task_ref)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let gate =
+            match crate::integration_steps::gate::task_gate(&self.db, &attempt.task_ref).await? {
+                Some(cause) => TaskGate::Gated(cause),
+                None => TaskGate::Live,
+            };
 
         let workspace = match attempt.workspace_id.as_deref() {
             Some(id) => WorkspaceRepo::get_by_id(&*self.db, id).await?,
@@ -259,11 +278,7 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
         };
         let workspace_witness = effect_workspace(placement);
         Ok(HeadFacts {
-            gate: if paused {
-                TaskGate::ProjectPaused
-            } else {
-                TaskGate::Live
-            },
+            gate,
             task_location: ObjectTransferEndpoint {
                 repo_location_id: placement.repo_location_id.clone(),
                 owner: workspace_witness.owner.clone(),
