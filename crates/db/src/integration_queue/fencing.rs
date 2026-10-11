@@ -1377,8 +1377,15 @@ mod tests {
         );
         assert_eq!(refused.fence_generation, q.fence_generation);
     }
+    /// Deleting the target location while an effect is in flight is refused
+    /// (`integration_unresolved`): the effect, the attempt and the queue are
+    /// left as they are, and the owner's receipt still settles the effect.
+    /// (Before the guard the deletion settled the effect as a permanent
+    /// loss; a landed merge could be recorded as failed that way. Removing
+    /// the machine is the operation that settles an effect nobody can
+    /// answer for: `machine_removal_settles_attempt_and_preserves_quarantine`.)
     #[tokio::test]
-    async fn location_removal_settles_inflight_effect_and_preserves_quarantine() {
+    async fn location_removal_is_refused_while_an_effect_is_in_flight() {
         for quarantined in [false, true] {
             let (db, f) = claimed().await;
             let request = request(f.clone());
@@ -1395,45 +1402,31 @@ mod tests {
                     .await
                     .unwrap();
             }
-            crate::RepoLocationRepo::delete(&db, "l").await.unwrap();
-            let receipt = db
-                .integration_effect_receipt(&request)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(receipt.result["kind"], "infrastructure");
-            assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
+            let refused = crate::RepoLocationRepo::delete(&db, "l").await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(crate::DbError::IntegrationUnresolved { task_id, .. }) if task_id == "a"
+                ),
+                "{refused:?}"
+            );
+            assert!(db.integration_effect_receipt(&request).await.unwrap().is_none());
             let attempt = db
                 .integration_attempt(&f.attempt_id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(attempt.effect_intent_json.is_none());
-            assert_eq!(
-                attempt.failure_kind,
-                Some(IntegrationFailureKind::Infrastructure)
-            );
+            assert!(attempt.effect_intent_json.is_some(), "the intent stands");
             let queue = db.integration_queue(&f.queue_id).await.unwrap().unwrap();
-            assert_eq!(
-                queue.state,
-                if quarantined {
-                    IntegrationQueueState::Quarantined
-                } else {
-                    IntegrationQueueState::Suspended
-                }
-            );
-            assert_eq!(
-                queue.last_error_kind,
-                Some(IntegrationFailureKind::TargetUnconfigured)
-            );
-            // A late original owner cannot overwrite the permanent-loss receipt.
-            assert!(guard
+            assert!(queue.target_location_id.is_some(), "the target stands");
+            // The owner's receipt settles the effect; then the deletion works.
+            guard
                 .record(
                     serde_json::json!({"kind":"rebased"}),
-                    IntegrationOperationState::Succeeded
+                    IntegrationOperationState::Succeeded,
                 )
                 .await
-                .is_err());
+                .unwrap();
         }
     }
 

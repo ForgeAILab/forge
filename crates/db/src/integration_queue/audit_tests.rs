@@ -627,6 +627,79 @@ async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
     assert_eq!(db.import_integration_pass(100).await.unwrap().examined, 0);
 }
 
+/// The `integration_unresolved` guard. While a merge into a repository has an
+/// unknown result or an owner effect outstanding, deleting the repository,
+/// the target location or the Project, and changing the repository's default
+/// location, are refused with a typed error naming the Task and the machine.
+/// Once the effect is settled each of them works again.
+#[tokio::test]
+async fn deletion_and_default_change_are_refused_while_a_merge_is_unresolved() {
+    use crate::{ProjectRepo, RepoLocationRepo, RepoRepo};
+    for unresolved in [
+        "effect_intent_json='{\"kind\":\"fast_forward\"}'",
+        "current_operation_state='uncertain'",
+        "state='reconciling'",
+    ] {
+        let db = fixture().await;
+        seed_delivery(&db, "a").await;
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let attempt = db
+            .admit_integration_attempt(admission(&q, "a", "admit:a:0"))
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE integration_attempt SET {unresolved} WHERE id=?"
+        ))
+        .bind(&attempt.id)
+        .execute(db.pool())
+        .await
+        .unwrap_or_else(|error| panic!("{unresolved}: {error}"));
+        let refused = |result: Result<()>| match result {
+            Err(DbError::IntegrationUnresolved { task_id, machine }) => {
+                assert_eq!(task_id, "a", "{unresolved}");
+                assert_eq!(machine, "the server", "{unresolved}");
+            }
+            other => panic!("{unresolved}: not refused: {other:?}"),
+        };
+        refused(RepoRepo::delete(&db, "r").await);
+        refused(RepoLocationRepo::delete(&db, "l").await);
+        refused(ProjectRepo::delete(&db, "p").await);
+        let location = RepoLocationRepo::get_by_id(&db, "l").await.unwrap().unwrap();
+        refused(
+            RepoLocationRepo::update(
+                &db,
+                crate::UpdateRepoLocation {
+                    id: "l".into(),
+                    expected_version: location.version,
+                    path: None,
+                    kind: None,
+                    is_default: Some(false),
+                    status: None,
+                    last_verified_at: None,
+                    last_error: None,
+                    updated_at: FIXED_TIME.into(),
+                },
+            )
+            .await
+            .map(|_| ()),
+        );
+        // Settled: nothing is refused any more.
+        sqlx::query("UPDATE integration_attempt SET effect_intent_json=NULL,current_operation_state=NULL,state='parked' WHERE id=?")
+            .bind(&attempt.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        ProjectRepo::delete(&db, "p").await.unwrap();
+    }
+}
+
 /// A cancelled Task whose merge entry is behind it, at any distance, is not
 /// imported again: its newest attempt is the record of that entry once it is
 /// terminal, whatever epoch it was admitted in (an attempt that never joined

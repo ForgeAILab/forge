@@ -871,6 +871,59 @@ async fn resolve_integration_target_in_tx(
 /// A queue whose target location is being deleted keeps its members and
 /// history but names no location: `suspended` with `target_unconfigured`.
 /// The foreign key alone would only null the column (`ON DELETE SET NULL`).
+/// What a deletion or a default-location change would take away from a merge.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IntegrationGuardScope<'a> {
+    Repo(&'a str),
+    /// A repo location: the target of a queue, or where a candidate lives.
+    Location(&'a str),
+    /// The repository a location belongs to (its default is changing).
+    RepoOfLocation(&'a str),
+    Project(&'a str),
+}
+
+/// Refuse (`DbError::IntegrationUnresolved`, HTTP 409
+/// `integration_unresolved`) while a merge in `scope` has an unknown result
+/// or an owner effect still outstanding: an attempt with a recorded effect
+/// intent, a running or uncertain owner operation, or one in `reconciling` /
+/// `ff_inflight`. Deleting the repository, the location or the Project, or
+/// moving the repository's default location, would drop the only record
+/// that can still say whether the commit landed. The error names the Task
+/// and the machine whose answer is missing; the way out is that machine's
+/// reconnect, or removing the machine (which settles the effect as failed).
+/// Called inside the transaction of the write it guards.
+pub(crate) async fn refuse_unresolved_integration(
+    tx: &mut Transaction<'_, Sqlite>,
+    scope: IntegrationGuardScope<'_>,
+) -> Result<()> {
+    let (filter, id) = match scope {
+        IntegrationGuardScope::Repo(id) => ("q.repo_id=?1", id),
+        IntegrationGuardScope::Location(id) => {
+            ("(q.target_location_id=?1 OR a.repo_location_id=?1)", id)
+        }
+        IntegrationGuardScope::RepoOfLocation(id) => {
+            ("q.repo_id=(SELECT repo_id FROM repo_location WHERE id=?1)", id)
+        }
+        IntegrationGuardScope::Project(id) => {
+            ("q.repo_id IN (SELECT id FROM repo WHERE project_id=?1)", id)
+        }
+    };
+    let unresolved: Option<(String, String)> = sqlx::query_as(&format!(
+        "SELECT a.task_ref,COALESCE((SELECT d.hostname FROM daemon d WHERE d.id=COALESCE(json_extract(q.target_owner_json,'$.daemon_id'),a.daemon_id)),'the server') \
+         FROM integration_attempt a JOIN integration_queue q ON q.id=a.queue_id \
+         WHERE a.state NOT IN ('completed','cancelled','superseded') \
+           AND (a.effect_intent_json IS NOT NULL OR COALESCE(a.current_operation_state,'') IN ('running','uncertain') OR a.state IN ('reconciling','ff_inflight')) \
+           AND {filter} ORDER BY a.id LIMIT 1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match unresolved {
+        Some((task_id, machine)) => Err(DbError::IntegrationUnresolved { task_id, machine }),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn suspend_queues_for_deleted_location(
     tx: &mut Transaction<'_, Sqlite>,
     location_id: &str,

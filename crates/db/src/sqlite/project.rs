@@ -856,6 +856,14 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
+        // A merge whose result is unknown, or whose owner effect is still
+        // outstanding, is the only record that can say whether its commit
+        // landed: no force deletes it.
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut tx,
+            crate::integration_queue::IntegrationGuardScope::Project(id),
+        )
+        .await?;
         let (running_executions, active_leases, live_check_runs) =
             project_in_use_counts(&mut tx, id).await?;
         if running_executions > 0 || active_leases > 0 || live_check_runs > 0 {
@@ -893,6 +901,14 @@ impl ProjectRepo for SqliteDb {
         // boundary remains guarded as the final admission check. Keeping the
         // guard here prevents any lower-level caller from bypassing the
         // stop protocol accidentally.
+        // A merge whose result is unknown, or whose owner effect is still
+        // outstanding, is the only record that can say whether its commit
+        // landed: no force deletes it.
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut tx,
+            crate::integration_queue::IntegrationGuardScope::Project(id),
+        )
+        .await?;
         let (running_executions, active_leases, live_check_runs) =
             project_in_use_counts(&mut tx, id).await?;
         if running_executions > 0 || active_leases > 0 || live_check_runs > 0 {
