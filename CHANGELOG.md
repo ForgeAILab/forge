@@ -31,25 +31,58 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     review entry, under the ordinary read-only policy: a reviewer that changes
     the worktree fails. The re-run no longer restores the worktree to the
     pre-auditor commit and carries on.
-  - **A failed re-run spends review retry budget** like an automatic entry
-    (the inline re-run was budget-exempt as an owner action).
+  - **An owner's re-run still spends no review retry budget.** The re-entry
+    is routed as the workflow's own (failed checks go to remediation, a Task
+    without a reviewer passes on its checks), but it records who asked for it
+    (`transition_log.bridge_kind = "recovery"`, `bridge_payload = {"verb":
+    "review_rerun", "requested_by": ...}`). Nothing an entry the owner asked
+    for causes is charged: red checks, a failing reviewer, the bounce to
+    remediation. Any number of failed owner re-runs leaves the budget where
+    it was. A re-entry Forge asks for itself (settling an upgraded install)
+    spends as an automatic entry does.
   - **One attempt per entry.** The open attempt a re-run replaces is closed as
-    `cancelled` (`execution_retry.status = "superseded_by_rerun"`). A Task
-    with neither checks nor a reviewer leaves review without a Review attempt
-    (the inline re-run recorded an empty passed one).
+    `cancelled` (`execution_retry.status = "superseded_by_rerun"`), and the
+    new attempt reviews the Task's current candidate. A failed attempt the
+    re-run was asked to replace is never taken for the re-run's own verdict.
+    A Task with neither checks nor a reviewer still records the re-run as an
+    empty passed attempt (`{"ci_steps": []}`) before it goes on to merging.
   - **Busy Tasks are refused.** While a review entry or a reviewer is still
     running no review `retry` is offered (`409 action_unavailable`); the
     internal `rerun_review` command answers `409 task_busy`.
-  - `review.auditor_agent_id` in a Task's state configuration is no longer
-    read (only the inline re-run read it). The reviewer is the Agent assigned
-    to the Task's `reviewer` role.
+  - **`review.auditor_agent_id` is refused.** The key (in a Task's
+    `task_state_config`, under `review` or at the top level) asked the inline
+    re-run for a second, "auditor" pass run by the Task's reviewer Agent.
+    There is no auditor pass any more: the review is the one done by the
+    Agent assigned to the Task's `reviewer` role. Creating or updating a Task
+    with a configuration that names an auditor now fails with
+    `invalid_operation`. A Task that still carries the key from an earlier
+    version keeps working, with two differences so the review it expects is
+    not dropped silently: operator status lists such open Tasks
+    (`recent_errors`, `entity_type = "retired_review_auditor_config"`), and a
+    review re-run on one that has no reviewer Agent assigned is refused with
+    `409 conflict` (as the inline re-run refused it) instead of passing on its
+    checks alone. **What to do:** assign the reviewing Agent to the Task's
+    `reviewer` role and remove the key from `task_state_config`.
+  - **After an upgrade.** A re-run the previous version left in flight is
+    settled when the server starts, without waiting for its lease to expire:
+    its reviewer execution, and its auditor child if it had one, are stopped
+    with an error that names them, and the Task's review entry runs again
+    once. If the entry cannot run at all, the Task is blocked on the stopped
+    execution with its recovery actions. A `rerun_review` step queued by the
+    previous version still runs, as the owner's re-run it was. A queued
+    reservation of the inline re-run that nothing can apply any more is
+    closed (`superseded`) by migration `V202610110112`; its row is kept.
   - Review details of a re-run without a reviewer are now the object every
     entry writes (`{"ci_steps": [...]}`), not a bare step array.
   - Rust API: `review::ReviewRunner`, `review::ReviewRequest`,
     `TaskService::with_review_runner`, `ForgeRuntimeBuilder::with_review_runner`
     and the `review_runner` fields of `AppState`, `ForgeRuntime` and
-    `HookContext` are removed; `TaskService::rerun_review` returns the
-    re-entered `Task`.
+    `HookContext` are removed; `TaskService::rerun_review` takes the
+    requesting `Actor` and returns the re-entered `Task`;
+    `ReviewRepo::create_attempt_with_execution_and_lease` and
+    `TaskMutation::ReviewCreateAttemptWithExecution` are removed, and an
+    execution admission no longer accepts a `reviewer` execution without an
+    Agent.
 - **A machine under its free-space floor starts no new work (3.4 stage E).**
   With the default floor (10 GiB or 5 % of the workspace filesystem,
   whichever is larger, or 5 % of its inodes; on a filesystem under 20 GiB

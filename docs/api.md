@@ -3529,6 +3529,13 @@ root), `recent_errors` carries one entry with `entity_type` `workspace_gc`,
 `entity_id` the root path and severity `attention`; it goes away when the
 root is owned (`forge --reclaim-workspace-gc`). No response field changed.
 
+While open Tasks still carry the retired `review.auditor_agent_id` key in
+their `task_state_config`, `recent_errors` carries one entry with
+`entity_type` `retired_review_auditor_config`, severity `attention`, `entity_id`
+the first such Task and an `error` that lists up to ten of them and says what
+to do (assign the Agent to the `reviewer` role and remove the key). It goes
+away when no open Task names an auditor.
+
 The existing execution,
 capacity, cleanup, retry, usage, and error summaries now also include:
 
@@ -5498,10 +5505,26 @@ automatic entry.
   open (`running` or `awaiting_human`), is closed as `cancelled` with
   `execution_retry.status = "superseded_by_rerun"` before the new one opens.
 - **Outcome.** A pass enters merging; failed checks or a failed review return to
-  remediation, charging the review retry budget as any automatic entry does, or
-  record the exhausted-budget blocker; a passing gate configured for user
-  approval remains in review. A Task with neither checks nor a reviewer leaves
-  review as an unconfigured review does, without a Review attempt.
+  remediation (or, when the budget was already spent, record the
+  exhausted-budget blocker); a passing gate configured for user approval
+  remains in review. A failed attempt the retry was asked to replace is never
+  taken for the retry's own verdict. A Task with neither checks nor a reviewer
+  records the retry as an empty passed attempt (`{"ci_steps": []}`) and goes on
+  to merging.
+- **It spends no review retry budget.** Only the owner is offered this action,
+  and an owner's action spends no retry budget: red checks, a failing reviewer
+  and the bounce to remediation of an entry the owner asked for are not
+  charged, so any number of failed retries leaves `retry_budgets.review` where
+  it was. The transition row of the re-entry records who asked
+  (`bridge_kind: "recovery"`, `bridge_payload: {"verb": "review_rerun",
+  "requested_by": ...}`). The next automatic entry spends as usual.
+- **`review.auditor_agent_id` is not supported.** Earlier versions ran a second,
+  auditor pass on a retry when a Task's `task_state_config` named one. There is
+  no auditor pass: the review is done by the Agent assigned to the Task's
+  `reviewer` role. Writing a `task_state_config` that names an auditor is
+  refused (`invalid_operation`). A Task that still carries the key and has no
+  reviewer Agent assigned is refused the retry with `409 conflict` rather than
+  passing on its checks alone; assign the reviewer and remove the key.
 - **A reviewer must not change the worktree.** The ordinary read-only policy
   applies: authored changes by the reviewer are detected and fail its
   execution.
@@ -5515,10 +5538,12 @@ Forge creates no reviewer execution of its own for a retry: every reviewer
 execution in the Task's history was run by an assigned Agent, and a retry holds
 no Agent slot while its checks run (the check run holds a machine run slot).
 Reviewer executions that earlier versions created for a retry (no Agent, parent
-set to the candidate, logs in `review-<execution>.jsonl`) stay readable. One
-that an upgrade finds still `running` is stopped by recovery with an error that
-names it, and the Task's review entry runs again; if the entry cannot run, the
-Task is parked on that execution with the ordinary recovery actions.
+set to the candidate, logs in `review-<execution>.jsonl`) and their `auditor`
+children stay readable. Any that an upgrade finds still `running` are stopped
+when the server starts (and, for one found later, when its lease expires) with
+an error that names them, and the Task's review entry runs again once; if the
+entry cannot run, the Task is blocked on that execution with the ordinary
+recovery actions.
 
 The candidate must be a completed implementation execution. Failed or cancelled
 remediation executions do not displace the last completed candidate. For a

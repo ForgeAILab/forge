@@ -30,7 +30,7 @@ crates/
 ├── git/           # Low-level git operations
 ├── process-supervisor/ # Process-group ownership, kill sequence, drained bounded output
 ├── check-executor/ # Persistence-free owner execution of a CheckSpec, typed receipt
-├── review/        # CI runner, auditor orchestration
+├── review/        # review contract, conformance checks, review workspace
 ├── events/        # In-memory event bus (tokio broadcast)
 ├── mcp-server/    # MCP JSON-RPC tools for agent integration
 └── config/        # Configuration loading, defaults
@@ -4021,7 +4021,7 @@ launch (`claimed_path`: a filesystem-only confirmation that the worktree the
 claim just checked is still there and confined, no Git process, falling back
 to `Execute` when it is not), the native executor at the start of a turn (`Execute`, with the
 Task service's workspace root and repository-cache locks), reassignment reset
-(`Reset`), review entry CI (`Check`), review rerun (`Review`), blocking
+(`Reset`), review entry CI (`Check`, which a review re-run also is), blocking
 `before_work` hooks (`Hook`), merge delivery and target-moved rebase
 (`Integrate`), and two read-only users (`Inspect`): the lifecycle emitter and evidence
 capture from a worktree file. The terminal does not go through the manager: it
@@ -4032,7 +4032,7 @@ with one coding execution and one review makes about seven to ten manager
 calls, each one Git process on a healthy worktree: claim (1, replacing the
 three Git processes of the backend `describe` it used before), runner launch
 (0), native turn start (1 per turn, native executors only), a blocking
-`before_work` hook (1), entry CI (1), review rerun or reviewer cascade (1),
+`before_work` hook (1), entry CI (1), the reviewer cascade (1),
 delivery (1), a rebase when the target moved (1), and one `Inspect` per
 lifecycle event that has script hooks.
 
@@ -7557,6 +7557,7 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   action's review `retry`) is that same entry again: it re-enters `review` for
   the current candidate under the workflow's authority, closing the attempt it
   replaces, and is refused `task_busy` while an entry or reviewer still runs.
+  The entry records who asked; one the owner asked for spends no review budget.
   There is no second review pipeline. Task configuration
   overrides the Project's `default_review_config`; otherwise the Project
   defaults are inherited. A ready Project Agent can replace both
@@ -7901,11 +7902,11 @@ all earlier carries automatically. A stored workflow change (such as migration
 `V148`) forces a fresh v1 review; for v2, only a change to review authority
 invalidates the source digest.
 
-The manual review-rerun endpoint consumes the same result categories as automatic
-review completion. Passed reruns cascade into merging, failed reruns use the
-review-remediation budget and target, and human-required passes remain in review
-as `awaiting_human`; the endpoint returns the Task after that workflow work has
-settled.
+The manual review re-run is a review entry and settles as one: a pass cascades
+into merging, a failure goes to the review-remediation target without spending
+the review budget (the owner asked for it), and a human-required pass remains
+in review as `awaiting_human`. The action returns the re-entered Task; the
+entry's work settles afterwards in the Task's own steps.
 
 Review outcome and conformance are separate projections. Old PASS/done records
 are retained with `not_assessed`; CI-only and manual reviews also lack automated
@@ -9159,10 +9160,46 @@ not run anything itself:
    `execution_retry.status = "superseded_by_rerun"`, so a human gate or a late
    reviewer cannot settle an attempt the owner asked to run again.
 3. It re-enters `review` with a same-state transition
-   (`manual_override_transition_with_authority`, exit hooks skipped) under
+   (`review_rerun_entry_with_authority`, exit hooks skipped) under
    `Actor::system(Workflow)` and the current Project workflow snapshot. This is
    a new status entry: a new hooks step, so a new review attempt and a new
-   check request key (`status epoch | review id`).
+   check request key (`status epoch | review id`). The entry's transition row
+   and hooks payload carry `TransitionBridge::review_rerun(requested_by)`
+   (`bridge_kind = recovery`, `bridge_payload = {"verb": "review_rerun",
+   "requested_by": <Actor>}`): the workflow routes the entry, the bridge says
+   who asked.
+
+A Task whose `task_state_config` still names an auditor
+(`review.auditor_agent_id`, read only by the retired pipeline) and has no
+reviewer Agent assigned is refused with a conflict before step 2: the re-run
+would otherwise pass on its checks where the old one refused. The key is
+refused at Task create and update, and operator status reports open Tasks
+that still carry it (`retired_review_auditor_config`).
+
+**Budget.** `rerun_review` takes the requesting actor. The Task action passes
+the owner (only the owner is offered the action); the budget-reset retry of a
+coordination root passes its action actor; recovery passes
+`system(CrashRecovery)`; a `rerun_review` command queued before v0.14 names no
+requester and is the owner's. An entry the owner asked for spends no review
+retry budget: `db::budget::review_rerun_entry` reads the latest entry into
+`review` (the transition row with a status epoch; a recovery marker has none)
+and the three charge points ask it. `failed_review_entry` (a failed entry
+hook) charges nothing and decides the bounce from the budget as it stands;
+`budget::transition` (the move out of `review` with `rejection`) admits neither
+the review debit nor the `gate:review` debit, excluding its own row;
+`review_verdict` (a failing reviewer) skips a Review that the entry opened
+(created at or after the entry). An entry retry
+(`retry_entry_barrier_with_authority`) is the same entry run again and keeps
+the bridge. Every other requester's entry, and every later automatic entry,
+spends as before.
+
+**Stale verdicts.** A re-run reviews the same candidate again, so the failed
+attempt it was asked to replace still names the current candidate.
+`auto_cascade_on_review_pass` does not take a failed Review created before a
+re-run entry for that entry's verdict. When the entry has nothing to run (no
+checks, no reviewer, no user-approval gate), `auto_cascade_on_unconfigured_review`
+first records the re-run as an empty passed attempt (`{"ci_steps": []}`), once
+per entry, so the Task's latest Review is the re-run's.
 
 From there the entry is the ordinary one: `run_before_work_hooks`,
 `run_ci_steps` through the check runner (reuse of a certified green result for
@@ -9171,9 +9208,9 @@ an unchanged commit, worktree and environment; never of a red one; the
 `carry_review_authority` (always skipped: a same-state entry is not a
 merge-contention bridge), `dispatch_role_agent` for an assigned reviewer, and
 the `after_enter` cascades. Because the entry runs under the workflow's
-authority and not the user's, it behaves as an automatic entry: failed CI
-settles through `review_failure_target` (remediation, charging the review
-budget, or the exhausted-budget blocker) instead of parking a user-managed
+authority and not the user's, it is routed as an automatic entry: failed CI
+settles through `review_failure_target` (remediation, or the exhausted-budget
+blocker when the budget was already spent) instead of parking a user-managed
 entry barrier, a Task without a reviewer passes on its checks instead of
 waiting for a manual review, and a gate that requires user approval still
 waits. Cancel, hold, a paused Project and a paused Agent act on it as on any
@@ -9183,11 +9220,25 @@ The retired pipeline (`review::ReviewRunner`) created a `reviewer` execution
 with no Agent and a `review-owner:<uuid>` lease, ran CI under it without a
 time limit, optionally ran an `auditor` child and wrote Review and Task
 authority itself. Nothing creates such executions now. One left `running` by
-an upgrade is recognised by that lease owner (or, once the lease is released,
-by its `review-<candidate>.jsonl` log name and missing executor snapshot):
-`HeartbeatMonitor` terminalizes it when its lease expires, and instead of the
-reviewer failure cascade `TaskService::settle_retired_review_rerun` writes an
-error on it that says what it was and calls `rerun_review`. If that is refused,
-the Task is parked on the stopped execution (`executor_failed`) with the
-ordinary recovery actions. The `review_runner` actor type on historical review
-events is kept for reading.
+an upgrade is recognised by that lease owner, which the reviewer execution and
+its `auditor` child both carry (or, once the lease is released, by the
+reviewer's `review-<candidate>.jsonl` log name and missing executor snapshot).
+They are settled at start: `CrashRecovery::run_recovery` queues one
+`settle_retired_review_rerun` command per Task that has any (identity-fenced,
+not stacked by a second start), whatever the leases say, and the command stops
+them (`stop_retired_review_reruns`) and settles the Task. One found later is
+terminalized by `HeartbeatMonitor` when its lease expires. Either way, instead
+of the reviewer failure cascade, `TaskService::settle_retired_review_rerun`
+writes an error on the execution that says what it was and, once no other
+leftover of the Task is still running, calls `rerun_review` (requested by
+recovery, so it spends as an automatic entry). A Task whose entry is already
+running needs nothing more (`task_busy` is not a failure here). If the entry
+cannot run at all (no candidate), the Task is blocked on the stopped execution
+(`internal_command_failed`, with the reason) and offers its recovery actions.
+
+The reservation that pipeline made, `ReviewRepo::create_attempt_with_execution_and_lease`
+(Task mutation `ReviewCreateAttemptWithExecution`), and the admission
+exception for a `reviewer` execution without an Agent are deleted. A queued
+mutation step of that kind left by an upgrade is closed as `superseded` by
+`V202610110112`. The `review_runner` actor type on historical review events is
+kept for reading.
