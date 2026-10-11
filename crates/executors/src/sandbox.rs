@@ -826,12 +826,37 @@ pub(crate) fn remove_tree(path: &Path) {
 /// access to the tree replaces by a link while this runs: the walk goes
 /// down by file descriptor ([`crate::fd_tree`]).
 pub(crate) fn remove_tree_until(path: &Path, deadline: Option<Instant>) -> bool {
+    remove_tree_anchored(path, None, deadline)
+}
+
+/// [`remove_tree_until`] for `base.join(relative)` when a Task can write
+/// directories between `base` and the entry: every one of them is opened by
+/// descriptor and must be a real directory, so the entry removed is the one
+/// under `base`, wherever a path through a swapped directory would lead.
+/// Nothing is removed when one of them is a link.
+pub(crate) fn remove_tree_under_until(
+    base: &Path,
+    relative: &Path,
+    deadline: Option<Instant>,
+) -> bool {
+    remove_tree_anchored(&base.join(relative), Some((base, relative)), deadline)
+}
+
+fn remove_tree_anchored(
+    path: &Path,
+    anchored: Option<(&Path, &Path)>,
+    deadline: Option<Instant>,
+) -> bool {
     if fs::symlink_metadata(path).is_err() {
         return true;
     }
     #[cfg(unix)]
     {
-        match crate::fd_tree::remove_tree(path, deadline) {
+        let removed = match anchored {
+            Some((base, relative)) => crate::fd_tree::remove_tree_under(base, relative, deadline),
+            None => crate::fd_tree::remove_tree(path, deadline),
+        };
+        match removed {
             Ok(false) => return false,
             Ok(true) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -843,7 +868,7 @@ pub(crate) fn remove_tree_until(path: &Path, deadline: Option<Instant>) -> bool 
     }
     #[cfg(not(unix))]
     {
-        let _ = deadline;
+        let _ = (deadline, anchored);
         let _ = if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
             fs::remove_dir_all(path)
         } else {

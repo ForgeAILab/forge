@@ -833,9 +833,18 @@ impl Sweep {
                 .as_nanos(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        // Every entry is moved from the root by file descriptor, so no
+        // directory on the way is followed when a Task made it a link.
+        let from_root = self.anchored(path);
+        let anchored = anchored.or(from_root
+            .as_ref()
+            .map(|(root, relative)| (root.as_path(), relative.as_path())));
         let rename = || match anchored {
             #[cfg(unix)]
             Some((base, relative)) => crate::fd_tree::rename_under(base, relative, &target),
+            #[cfg(unix)]
+            None => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            #[cfg(not(unix))]
             _ => fs::rename(path, &target),
         };
         if fs::symlink_metadata(&target).is_ok() || rename().is_err() {
@@ -877,7 +886,28 @@ impl Sweep {
             report.errors += 1;
             return;
         }
-        remove_entry(path, report, Some(self.deadline));
+        // Reached from the root by file descriptor: `confined` looked at
+        // where the parent resolves, and a Task that can write a directory
+        // on the way could have put a link there since.
+        match self.anchored(path) {
+            Some((root, relative)) => {
+                remove_entry_under(&root, &relative, report, Some(self.deadline));
+            }
+            None => report.errors += 1,
+        }
+    }
+
+    /// `path` as the resolved managed root and the plain names from there
+    /// to the entry.
+    fn anchored(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let plain = relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+        (plain && relative.file_name().is_some())
+            .then(|| fs::canonicalize(&self.root).ok())
+            .flatten()
+            .map(|root| (root, relative.to_path_buf()))
     }
 
     /// `path` is strictly inside the managed root and its parent resolves
@@ -950,7 +980,24 @@ fn forge_made(task_root: &Path) -> bool {
 /// the pass is out of time: what is left stays where it is (in the trash, in
 /// quarantine, in its Task root) and the next pass carries on with it.
 fn remove_entry(path: &Path, report: &mut GcReport, deadline: Option<Instant>) {
-    if !sandbox::remove_tree_until(path, deadline) {
+    let finished = sandbox::remove_tree_until(path, deadline);
+    removal_outcome(path, finished, report);
+}
+
+/// [`remove_entry`] for `base.join(relative)`, with no directory between
+/// the two followed when it is a link.
+fn remove_entry_under(
+    base: &Path,
+    relative: &Path,
+    report: &mut GcReport,
+    deadline: Option<Instant>,
+) {
+    let finished = sandbox::remove_tree_under_until(base, relative, deadline);
+    removal_outcome(&base.join(relative), finished, report);
+}
+
+fn removal_outcome(path: &Path, finished: bool, report: &mut GcReport) {
+    if !finished {
         report.out_of_time = true;
         return;
     }
@@ -1283,6 +1330,40 @@ mod tests {
         assert_eq!(report, GcReport::default());
         assert!(root.join("notes").exists() && root.join(".repos").exists());
         assert!(root.join(GC_DIR).join("notes-1000").exists());
+    }
+
+    /// A link inside the managed root to another directory inside it: the
+    /// parent "resolves inside the root", so a removal or a move by path
+    /// would take the entry of the directory the link points at (another
+    /// Task's). Both go down from the root by descriptor and refuse.
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_removed_or_trashed_through_a_link_to_another_directory_of_the_root() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        let victim = task_root(&root, "victim");
+        fs::write(victim.join("repo").join("work"), "keep").unwrap();
+        fs::create_dir_all(root.join("attacker")).unwrap();
+        symlink(&victim, root.join("attacker").join("swapped")).unwrap();
+        let through = root.join("attacker").join("swapped").join("repo");
+        let pass = sweep(&root);
+        assert!(pass.confined(&through), "the check by path is satisfied");
+
+        let mut report = GcReport::default();
+        pass.remove(&through, &mut report);
+        assert_eq!((report.removed, report.errors), (0, 1));
+        let mut report = GcReport::default();
+        assert!(!pass.trash(&through, &mut report));
+        assert_eq!(report.errors, 1);
+        assert_eq!(fs::read_to_string(victim.join("repo").join("work")).unwrap(), "keep");
+
+        // The link itself, and a real entry, still go.
+        let mut report = GcReport::default();
+        pass.remove(&root.join("attacker").join("swapped"), &mut report);
+        assert!(pass.trash(&root.join("attacker"), &mut report));
+        assert_eq!((report.removed, report.errors), (1, 0));
+        assert!(!root.join("attacker").exists() && victim.join("repo").join("work").exists());
     }
 
     #[cfg(unix)]
