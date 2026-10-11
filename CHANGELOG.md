@@ -1142,7 +1142,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   At start, each open Task with the retired key gets one non-blocking
   Attention item (`review_risk`); it resolves when the key is removed.
 - **`forge-ctl operations status`** is new (see Added).
-
 - **CI runs the Rust gates as parallel jobs.** The single `Rust` job is split
   into `Rust lint` (fmt, clippy, the `make types` drift check, the script
   tests) and four test jobs by crate (`services`, `api`, `db`, and every other
