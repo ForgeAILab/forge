@@ -3,7 +3,7 @@
 -- fairness at every release while checks keep queuing. Its wait now has an
 -- age: when it began and how many capacity releases it was woken for. An
 -- aged waiter is admitted ahead of checks queued after it began to wait
--- (`db::machine_capacity`). Additive: one table, one nullable column, six
+-- (`db::machine_capacity`). Additive: one table, one nullable column, eight
 -- triggers; no existing row is rewritten.
 CREATE TABLE task_slot_wait_age (
     task_id TEXT PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
@@ -40,16 +40,24 @@ CREATE TRIGGER task_slot_wait_age_lapse_delete AFTER DELETE ON task_schedule_wai
 WHEN OLD.daemon_id='*' BEGIN
  UPDATE task_slot_wait_age SET lapsed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE task_id=OLD.task_id AND lapsed_at IS NULL;
 END;
--- Every capacity release marks its waiters dirty (`external`); that mark is
--- the count. A mark for another reason counts too: the age only errs towards
--- the waiter, and the order it buys is by time, never ahead of older checks.
-CREATE TRIGGER task_slot_wait_age_release_insert AFTER INSERT ON task_schedule_dirty
-WHEN NEW.external=1 BEGIN
- UPDATE task_slot_wait_age SET releases=releases+1 WHERE task_id=NEW.task_id AND lapsed_at IS NULL;
+-- The count is of slots really given back while the Task waited: a run of
+-- ANOTHER Task that ended, and an admitted check that ended and was not this
+-- Task's own. The dirty marks that wake a waiter are not counted: a Task
+-- receives those for its own placement, comments and Project edits too, and
+-- could age its own wait with them.
+CREATE TRIGGER task_slot_wait_age_execution_release AFTER UPDATE OF status ON execution
+WHEN OLD.status='running' AND NEW.status IS NOT 'running' BEGIN
+ UPDATE task_slot_wait_age SET releases=releases+1 WHERE lapsed_at IS NULL AND task_id IS NOT OLD.task_id;
 END;
-CREATE TRIGGER task_slot_wait_age_release_update AFTER UPDATE OF generation ON task_schedule_dirty
-WHEN NEW.external=1 AND NEW.generation<>OLD.generation BEGIN
- UPDATE task_slot_wait_age SET releases=releases+1 WHERE task_id=NEW.task_id AND lapsed_at IS NULL;
+CREATE TRIGGER task_slot_wait_age_execution_delete AFTER DELETE ON execution
+WHEN OLD.status='running' BEGIN
+ UPDATE task_slot_wait_age SET releases=releases+1 WHERE lapsed_at IS NULL AND task_id IS NOT OLD.task_id;
+END;
+CREATE TRIGGER task_slot_wait_age_check_release AFTER UPDATE OF state ON check_run
+WHEN OLD.admitted_at IS NOT NULL AND OLD.state IN ('running','cancelling','cleaning','uncertain')
+ AND NEW.state NOT IN ('running','cancelling','cleaning','uncertain') BEGIN
+ UPDATE task_slot_wait_age SET releases=releases+1 WHERE lapsed_at IS NULL
+  AND task_id NOT IN (SELECT task_id FROM check_consumer WHERE run_id=OLD.id AND task_id IS NOT NULL);
 END;
 -- The wait is over once the Task starts a run.
 CREATE TRIGGER task_slot_wait_age_end AFTER INSERT ON execution

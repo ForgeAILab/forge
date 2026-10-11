@@ -5809,7 +5809,7 @@ async fn task_step_suspended_migration_preserves_populated_steps_indexes_and_tri
 /// `V202610110650` adds the age of a run-slot wait and nothing else: wait
 /// rows, dirty marks and check runs are exactly as they were, a Task that
 /// already waited for a run slot gets an age that starts at the upgrade, and
-/// from then on the triggers keep the age (begin, release count, lapse, end).
+/// from then on the triggers keep the age (begin, real releases, lapse, end).
 #[tokio::test]
 async fn slot_wait_age_migration_preserves_waits_and_checks_and_ages_existing_waiters() {
     let migration_dir = unique_temp_path("slot-age-migrations");
@@ -5877,20 +5877,41 @@ async fn slot_wait_age_migration_preserves_waits_and_checks_and_ages_existing_wa
     assert_eq!(age(pool.clone(), "slot").await, Some((0, false)));
     assert_eq!(age(pool.clone(), "named").await, None);
 
-    // A release mark counts for the waiter; a wait that begins later starts
-    // its own age; the end of the wait lapses it and a run ends it.
+    // A dirty mark wakes a waiter and is not a release: a Task receives
+    // those for its own writes too and must not age its own wait with them.
     let mark = "INSERT INTO task_schedule_dirty(task_id,external) VALUES(?,1) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1";
-    for _ in 0..2 {
+    for _ in 0..5 {
         sqlx::query(mark).bind("slot").execute(&pool).await.unwrap();
     }
-    assert_eq!(age(pool.clone(), "slot").await, Some((2, false)));
-    sqlx::query(
-        "INSERT INTO task_schedule_wait(task_id,project_id,daemon_id) VALUES('later','p','*')",
+    assert_eq!(age(pool.clone(), "slot").await, Some((0, false)));
+    // A wait that begins later starts its own age. A run of another Task
+    // that ends is a release for every waiter but that Task itself.
+    sqlx::raw_sql(
+        "INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES
+           ('other','named','coder','running','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z'),
+           ('own','later','interactive','running','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z');
+         INSERT INTO task_schedule_wait(task_id,project_id,daemon_id) VALUES('later','p','*');",
     )
     .execute(&pool)
     .await
     .unwrap();
     assert_eq!(age(pool.clone(), "later").await, Some((0, false)));
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='other'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "slot").await, Some((1, false)));
+    assert_eq!(age(pool.clone(), "later").await, Some((1, false)));
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='own'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(age(pool.clone(), "slot").await, Some((2, false)));
+    assert_eq!(
+        age(pool.clone(), "later").await,
+        Some((1, false)),
+        "a Task aged its own wait by ending its own run"
+    );
     sqlx::query("UPDATE task_schedule_wait SET daemon_id='*' WHERE task_id='named'")
         .execute(&pool)
         .await

@@ -1236,6 +1236,13 @@ async fn a_task_waiting_for_a_second_slot_is_admitted_ahead_of_newer_checks_once
     )
     .await;
     assert!(!holder.dispatch().await, "the machine is full");
+    // The Task cannot age its own wait: marks it receives for its own
+    // writes are not releases, and neither is a refused attempt.
+    for _ in 0..5 {
+        sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) VALUES('holder',1) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1").execute(store.pool()).await.unwrap();
+        assert!(!holder.dispatch().await);
+    }
+    assert!(!holder.aged().await, "a Task aged its own wait");
     // Releases 1 and 2: a check queued meanwhile takes the freed slot.
     for round in 1..=2 {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
