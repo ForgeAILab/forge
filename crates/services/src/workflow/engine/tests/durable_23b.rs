@@ -2227,6 +2227,56 @@ async fn a_review_entry_whose_worktree_cannot_be_recreated_under_the_disk_floor_
     );
 }
 
+// A blocking before-work hook needs the worktree too. It used to record the
+// disk wait and then report the hook as failed, which parked the Task as a
+// failed transition hook for its owner. Now the hook waits: nothing ran,
+// nothing failed, and the script runs once the disk recovers.
+#[tokio::test]
+async fn a_before_work_hook_whose_worktree_cannot_be_recreated_waits_for_disk_and_does_not_fail() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    let marker = TempDir::new().unwrap();
+    let ran = marker.path().join("ran");
+    let scripts = json!([{"type":"script","command":format!("echo run >> '{}'", ran.display()),"timeout_seconds":30,"blocking":true}]);
+    sqlx::query("UPDATE project SET settings=? WHERE id=?")
+        .bind(json!({"lifecycle_hooks":{"before_work":scripts}}).to_string())
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let free = worktree_gone_under_the_disk_floor(&fixture).await;
+    enter_review(&fixture, "entry with a before-work hook").await;
+    let _ = fixture.engine.check_worker_or_embedded();
+    suspend_on_disk(&fixture).await;
+    assert!(!ran.exists(), "the script ran without its worktree");
+    assert!(
+        waits_for_disk(&fixture).await,
+        "the Task states the disk wait"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json IS NOT NULL"
+        )
+        .await,
+        0,
+        "no hook result (and no failure) was recorded"
+    );
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    resume_after_the_disk_recheck(&fixture).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "run\n");
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+}
+
 // The Project environment changes while the entry check is pending (with
 // the pause, the rename or the limit change that moves the Project version).
 // The run that ran is the run that was asked for: its verdict is applied.
