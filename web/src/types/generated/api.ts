@@ -11,6 +11,18 @@ export type { IntegrationReason } from './bindings/IntegrationReason'
 export type { IntegrationPaths } from './bindings/IntegrationPaths'
 export type { IntegrationPhase } from './bindings/IntegrationPhase'
 export type { IntegrationDeferralCause } from './bindings/IntegrationDeferralCause'
+import type { TaskIntegrationSummary } from './bindings/TaskIntegrationSummary'
+export type { IntegrationActionHint } from './bindings/IntegrationActionHint'
+export type { IntegrationMemberState } from './bindings/IntegrationMemberState'
+export type { IntegrationQueueMemberResponse } from './bindings/IntegrationQueueMemberResponse'
+export type { IntegrationQueueResponse } from './bindings/IntegrationQueueResponse'
+export type { IntegrationQueueState } from './bindings/IntegrationQueueState'
+export type { IntegrationQueueStateReason } from './bindings/IntegrationQueueStateReason'
+export type { IntegrationQueuesResponse } from './bindings/IntegrationQueuesResponse'
+export type { IntegrationTimings } from './bindings/IntegrationTimings'
+export type { IntegrationWait } from './bindings/IntegrationWait'
+export type { IntegrationWaitCode } from './bindings/IntegrationWaitCode'
+export type { TaskIntegrationSummary } from './bindings/TaskIntegrationSummary'
 export type { CheckWait } from './bindings/CheckWait'
 export type { CheckWaitPhase } from './bindings/CheckWaitPhase'
 import type { ReviewConformance } from './bindings/ReviewConformance'
@@ -558,6 +570,8 @@ export interface Task {
   available_actions?: Offer[]
   awaiting_human?: boolean
   condition: TaskCondition
+  /** The Task's place in the merge queue; null without an attempt in progress. */
+  integration?: TaskIntegrationSummary | null
   workflow_health?: WorkflowHealthSummary | null
   workflow_exception?: WorkflowExceptionSummary | null
   external_issue_number?: number | null
@@ -605,6 +619,8 @@ export interface TaskListItem {
   remaining_retries: Record<string, number>
   retry_limits: Record<string, number>
   condition: TaskCondition
+  /** The Task's place in the merge queue; null without an attempt in progress. */
+  integration?: TaskIntegrationSummary | null
   workflow_health: WorkflowHealthSummary | null
   workflow_exception: WorkflowExceptionSummary | null
   review_passed_at: string | null

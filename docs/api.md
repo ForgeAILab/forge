@@ -108,6 +108,7 @@ database for historical provenance.
 | GET    | `/api/v1/repos/{id}` | Get repo |
 | PATCH  | `/api/v1/repos/{id}` | Update repo |
 | DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it |
+| GET    | `/api/v1/repos/{id}/integration-queues` | The repository's merge queues, one per target branch, with their members in queue order (see [Merge queue reads](#merge-queue-reads)) |
 | GET    | `/api/v1/repos/{id}/locations` | Owner/admin lists visible repository locations with opaque cursor pagination |
 | POST   | `/api/v1/repos/{id}/locations` | Owner/admin registers and verifies a machine-local checkout |
 | PATCH  | `/api/v1/repos/{id}/locations/{location_id}` | Owner/admin changes the default location with a version check |
@@ -2763,6 +2764,64 @@ removing a coordination root's `coder` also wakes children without an own
 selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
 separate `release` command.
+
+### Merge queue reads
+
+A Task in its merge state is in the merge queue of its repository's target
+branch. Two reads show where it is and why it waits. Both are projections of
+the queue's own rows and of the Task's `condition`; neither is a command, and
+neither takes a write transaction.
+
+**`integration` on Task reads.** `TaskResponse` (`GET /api/v1/tasks/{id}`,
+Task detail) and every Task list item (`GET /api/v1/projects/{id}/tasks`) carry
+`integration`: a `TaskIntegrationSummary`, or `null` when the Task has no
+attempt in progress (it was never queued, its change merged, or it was
+cancelled). MCP `forge_get_task` and `forge_list_tasks` return the same field.
+
+| Field | Meaning |
+|---|---|
+| `attempt_id` | The attempt in progress; the same id the Task `condition`'s integration reason names |
+| `queue_id`, `repo_id`, `target_branch`, `queue_state` | The queue the attempt is in. `queue_state` is `open`, `suspended` (the target checkout is not ready), `quarantined` (another merge into the target has an unknown result) or `closed` |
+| `state` | `waiting` (in line, or stopped in line by its owner or its Project), `owned` (at the head: Forge is merging it), `repair` (sent back to its coder for a conflict or a dirty worktree), `review_required` (sent back for a fresh review), `candidate_check_failed` (the check of the rebased commit failed), `deferred` (the merge stopped and waits), `applied` (the commit is on the target; the Task is being closed) |
+| `phase` | Set while `state` is `owned`: `validating`, `rebasing`, `checking`, `awaiting_carry`, `awaiting_authorization`, `fast_forwarding`, `reconciling` |
+| `position` | Members ahead of this one: `0` at the head, `n` for a waiter with `n` ahead, `null` when the Task is not in line (sent back, deferred) |
+| `wait` | Why the merge is not moving, or `null`: `{ code, message, machine_id, machine_name, retry_at }` |
+| `action_hint` | `retry` (Task action `retry`, offered as `integration_retry`), `release` (Task action `release`), `resume_project`, or `null`. A hint only: `available_actions` on Task detail is the authority |
+| `timings` | `{ enqueued_at, head_since, rounds, queued_ms, rebase_ms, check_ms, fast_forward_ms }`. `head_since` is `null` while the Task waits; durations are cumulative over the attempt's rounds and `null` until the phase has run |
+
+`wait.code` is one of `queue` (others are ahead), `queue_suspended`,
+`queue_quarantined`, `task_held`, `task_blocked`, `task_failed`,
+`task_entry_blocked`, `task_awaiting_human`, `project_paused`, `owner_offline`
+(the machine that owns the checkout is not connected: `machine_id` /
+`machine_name` name it), `target_dirty`, `infrastructure` (Forge retries by
+itself at `retry_at`), `budget_exhausted`, `owner_required`,
+`unresolved_result` and `cancel_requested`. A Task stopped by its owner (a
+Hold, a block, a failure) or by a paused Project reads `waiting` with that
+cause: the Task's own stop is the reason and carries the action that lifts
+it.
+
+The Task list reads the summaries of a page in one statement, whatever the
+page holds. The list's `ETag` covers the queue: a queue that advances changes
+the validator although it writes no Task and no Project row, and a lease
+renewal does not.
+
+**`GET /api/v1/repos/{id}/integration-queues`** lists the repository's queues
+by target branch. Query: `limit` (default 20, at most 100) and the opaque
+`cursor` of the page before. The response is `{ items, next_cursor, has_more }`.
+A caller who cannot see the repository's Project gets `404`, the same answer
+as for a repository that does not exist; an invalid cursor is `400`.
+
+Each item:
+
+| Field | Meaning |
+|---|---|
+| `id`, `repo_id`, `target_branch` | The queue |
+| `state` | `open`, `suspended`, `quarantined`, `closed` |
+| `state_reason` | `{ code, message }` when `state` is not `open` (`target_unconfigured`, `target_unavailable`, ...), else `null` |
+| `head_task_id`, `head_attempt_id`, `head_since` | The member being merged now, or `null` |
+| `member_count` | Members with an attempt in progress, including those sent back or deferred |
+| `members` | The head first, then queue order; at most 100. Each is `{ task_id, task_title, task_status, integration }` with the same `TaskIntegrationSummary` as the Task reads |
+| `members_truncated` | `true` when `member_count` exceeds `members` |
 
 ### Transition responses and queued cascades
 

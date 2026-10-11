@@ -2390,6 +2390,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Merge queue reads (3.2 stage D3a).** `GET
+  /api/v1/repos/{id}/integration-queues` lists a repository's merge queues,
+  one per target branch (`items`, opaque `cursor`, `has_more`): the queue's
+  state and why it is not open, the Task being merged, and the members in
+  queue order with their state, phase, position, typed wait reason and
+  timings. Task detail and every Task list item carry `integration`, a
+  `TaskIntegrationSummary` (`attempt_id`, queue and target branch, `state`,
+  `phase`, `position`, `wait`, `action_hint`, `timings`), or `null` when the
+  Task has no attempt in progress; MCP `forge_get_task` and `forge_list_tasks`
+  return the same field. The Task list reads a page's summaries in one
+  statement, and its `ETag` now changes when the queue advances. New index
+  migration `V202610111630` (additive).
+
 - **Operations status has a `checks` section.** `GET /api/v1/operations/status`
   reports what the check runner is doing now: `queued`, `running`,
   `waiting_for_slot` and `waiting_for_disk`, each with a count and the age of
