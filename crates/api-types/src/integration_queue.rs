@@ -228,11 +228,9 @@ mod tests {
     /// to the type, and no enum value is one the type does not name).
     #[test]
     fn the_documented_examples_are_the_types() {
-        let docs = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../docs/api.md"
-        ))
-        .unwrap();
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/api.md"))
+                .unwrap();
         let example = |name: &str| -> serde_json::Value {
             let marker = format!("<!-- example: {name} -->\n```json\n");
             let start = docs.find(&marker).unwrap_or_else(|| panic!("{name}")) + marker.len();
