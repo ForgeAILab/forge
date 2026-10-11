@@ -15,9 +15,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust
+  # The Rust gates run as five parallel jobs: lint, and one test job per shard.
+  # Each job has its own dependency cache; a shared key would be saved by
+  # whichever job finishes first and miss for the others.
+  rust-lint:
+    name: Rust lint
     runs-on: ubuntu-latest
+    # Every cargo invocation of the job builds with the same debug-info level,
+    # so `make types` reuses the cached dependencies instead of rebuilding them
+    # under a second profile. scripts/ci-rust.sh explains the setting.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -30,13 +39,19 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust
+          shared-key: rust-lint
           # Branch and PR copies crowd out the default-branch cache.
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           cache-on-failure: true
 
-      - name: Run Rust CI
-        run: ./scripts/ci-rust.sh
+      # A workspace package no test shard covers would stop being tested
+      # without any job turning red.
+      - name: Check test shard coverage
+        run: python3 scripts/ci_rust_shards.py check
+
+      - name: Run fmt and clippy
+        if: ${{ !cancelled() }}
+        run: ./scripts/ci-rust.sh lint
 
       - name: Check TypeScript binding drift
         if: ${{ !cancelled() }}
@@ -54,6 +69,67 @@ jobs:
       - name: Test performance tooling
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+  rust-test:
+    name: Rust test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One red shard must not cancel the others: a run reports every failure.
+      fail-fast: false
+      matrix:
+        # The packages of each shard are defined in scripts/ci_rust_shards.py;
+        # its `check` (in the lint job) fails if this list differs from it.
+        shard: [services, api, db, rest]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # One-off: time the test build of each shard. Remove this variable and
+      # the upload step once the shard sizes have been read off a few runs.
+      CI_RUST_TIMINGS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test-${{ matrix.shard }}
+          # Branch and PR copies crowd out the default-branch cache.
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          cache-on-failure: true
+
+      - name: Run tests
+        run: ./scripts/ci-rust.sh test ${{ matrix.shard }}
+
+      - name: Upload build timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-${{ matrix.shard }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # One stable check for branch protection and for the workflow conclusion:
+  # green only when lint and every test shard are green. `always()` makes it
+  # run, and fail, when a job it needs failed, was cancelled or was skipped.
+  rust:
+    name: Rust
+    if: ${{ always() }}
+    needs: [rust-lint, rust-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require lint and every test shard
+        env:
+          LINT_RESULT: ${{ needs.rust-lint.result }}
+          TEST_RESULT: ${{ needs.rust-test.result }}
+        run: |
+          echo "Rust lint: $LINT_RESULT"
+          echo "Rust test shards: $TEST_RESULT"
+          [[ "$LINT_RESULT" == success && "$TEST_RESULT" == success ]]
 
   audit:
     name: Security Audit

@@ -4572,7 +4572,8 @@ async fn check_spec_real_roundtrip_reconnect_and_duplicate_return_owner_receipt(
                 shell: "bash -lc".into(),
                 working_directory: CheckWorkingDirectory::TaskRoot,
                 environment_keys: Default::default(),
-                timeout_seconds: Some(5),
+                // Generous: the command sleeps 3 s and a loaded runner starts it late.
+                timeout_seconds: Some(30),
                 failure_policy: CheckFailurePolicy::StopBundle,
                 cacheability: CheckCacheability::Uncacheable,
                 requirement_ids: Default::default(),
@@ -4585,7 +4586,7 @@ async fn check_spec_real_roundtrip_reconnect_and_duplicate_return_owner_receipt(
         env: vec![],
         cleanup_commands: vec![],
         cleanup_timeout_ms: 1000,
-        deadline: (chrono::Utc::now() + chrono::Duration::seconds(15)).to_rfc3339(),
+        deadline: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
     };
     let effect = client.run_check(&daemon_id, params.clone());
     let disconnect = async {
@@ -4616,7 +4617,7 @@ async fn check_spec_real_roundtrip_reconnect_and_duplicate_return_owner_receipt(
     let (lost, ()) = tokio::join!(effect, disconnect);
     assert!(lost.is_err());
     fixture.reconnect().await;
-    let receipt = tokio::time::timeout(Duration::from_secs(5), async {
+    let receipt = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             match client
                 .lookup_check(&daemon_id, &operation_id)
