@@ -270,6 +270,14 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             .git_query(WorkspaceGitQuery::RebaseInProgress, false)
             .await?
             .is_some_and(|value| value.trim() == "true");
+        // The reads above are separate Git commands. A writer that moved the
+        // checkout between them (a rebase passes through the target tip and
+        // has no state directory before it starts or after it ends) would
+        // leave facts of two different commits: HEAD read again after the
+        // rebase flag must be the HEAD the ancestry was computed for.
+        if read(WorkspaceGitQuery::Head, "the Task checkout has no HEAD").await? != candidate_head {
+            return Err(unreadable("the Task checkout moved while it was read"));
+        }
         // A daemon-owned default checkout is read on its daemon: through the
         // Task's placement when the Task is placed in it, by the owner's
         // target facts otherwise.

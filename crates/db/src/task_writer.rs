@@ -449,10 +449,22 @@ impl SqliteDb {
     pub async fn request_task_preemption(&self, task_id: &str) -> Result<()> {
         sqlx::query("UPDATE task_step SET preempt_requested_at=? WHERE task_id=? AND status='claimed' AND kind IN ('hooks','command') AND priority=0")
             .bind(crate::now_rfc3339()).bind(task_id).execute(self.pool()).await?;
+        // Only a step the owner command goes ahead of. A step that was put
+        // ahead of a waiting owner command (`priority` 2: the `done` cascade
+        // of a merge that has landed) runs to its end, as the claim order
+        // says: preempting it here would let the Cancel that lost to the
+        // merge cancel a Task whose change is already on the target.
+        let outranked: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM task_step WHERE task_id=? AND status='claimed' AND priority=0",
+        )
+        .bind(task_id)
+        .fetch_all(self.pool())
+        .await?;
         let steps = self.task_steps(task_id).await?;
         let controls = self.task_step_controls.lock().expect("step controls");
         for step in steps.iter().filter(|step| {
             step.status == "claimed"
+                && outranked.contains(&step.id)
                 && !serde_json::from_str::<Value>(&step.payload_json)
                     .ok()
                     .is_some_and(|p| p["preempt"] == true)

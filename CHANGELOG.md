@@ -2708,6 +2708,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the workflow's own states instead of `done` / `merge_failed` / `review`.
 - Draining a Task's steps no longer waits without limit for a stopped merge
   head driver (30 seconds, then it is aborted).
+- **Merge queue: a Task is not reported merged, or cancelled, against what
+  Git says.** Three faults of the queue cutover, found by CI:
+  - The queue read "already merged" from the Task checkout's HEAD alone. A
+    checkout standing on a commit of the target that is not the reviewed
+    commit (another writer rebasing it at that moment, a checkout reset to
+    the target) settled the Task `done` with nothing merged. The landed
+    witness now requires the checkout to stand on the commit the attempt
+    names, with no rebase stopped there, and a checkout that moves while it
+    is read is read again later.
+  - A Cancel that lost the race to the merge could stop the `done` step of
+    the merge that had just landed and cancel the Task, with its change
+    already on the target branch. The landed merge's step now always runs
+    first.
+  - After an upgrade, a Task whose old merge had landed without its outcome
+    recorded could stay in `merging` for ever (three of its steps waited on
+    each other).
+  Also: rebases and merges Forge runs no longer fail with "Committer
+  identity unknown" on a host whose Git has no identity; their commits are
+  then written as `Forge Agent <agent@forge.local>`.
+
 - Cancelling a Task that waits its turn or its retry time in the merge queue
   ends its queue entry with the Cancel itself. A server restart right after
   the Cancel no longer records a second, stale merge intent for the
