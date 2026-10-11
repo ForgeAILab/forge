@@ -792,6 +792,47 @@ async fn a_preempting_cancel_does_not_stop_the_cascade_of_a_landed_merge() {
     }
 }
 
+/// An earlier pending step, then a protected integration step, then a
+/// priority-2 step: the first is claimed. (Without the rule the first waits
+/// for the higher priority, which waits for the protected step, which waits
+/// for the first.)
+#[tokio::test]
+async fn a_step_behind_a_protected_step_does_not_wedge_the_steps_before_it() {
+    let (db, _worker) = fixture().await;
+    let mut ids = Vec::new();
+    for (key, priority, protected) in [
+        ("first", 0, false),
+        ("result", 0, true),
+        ("landed", 2, false),
+    ] {
+        let mut input = step("done");
+        input.causation_key = key.into();
+        let id = db.enqueue_step(&input).await.unwrap();
+        sqlx::query("UPDATE task_step SET priority=?,integration_started_at=? WHERE id=?")
+            .bind(priority)
+            .bind(protected.then(db::now_rfc3339))
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    for expected in &ids {
+        let claimed = db
+            .claim_step("worker", Some("t"), &lease_deadline())
+            .await
+            .unwrap()
+            .expect("a step of the Task is claimable");
+        assert_eq!(&claimed.id, expected);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        db.finish_step_in_tx(&mut tx, &claimed, "done", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        db.release_step(&claimed.id, "worker").await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn protected_merge_finishes_before_preempting_cancel_can_claim() {
     let (db, worker) = fixture().await;

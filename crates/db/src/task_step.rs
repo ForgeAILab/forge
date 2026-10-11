@@ -877,7 +877,14 @@ impl SqliteDb {
                 return Ok(None);
             }
         }
-        let candidate = "SELECT s.* FROM task_step s WHERE s.status IN ('pending','claimed') AND (? IS NULL OR s.lane=?) AND s.task_id NOT IN (SELECT value FROM json_each(?)) AND (? IS NULL OR s.task_id = ?) AND ((s.status = 'pending' AND s.available_at <= ?) OR (s.status = 'claimed' AND s.lease_until <= ?)) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND ((p.integration_started_at IS NOT NULL AND p.seq<s.seq) OR (s.integration_started_at IS NULL AND p.priority>s.priority) OR (p.priority=s.priority AND p.seq<s.seq)) AND p.status IN ('pending','claimed')) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.id != s.id AND p.lease_until > ?) ORDER BY s.priority DESC,s.created_at,s.seq LIMIT 1";
+        // Order within a Task: a protected integration step goes before
+        // every later step; a higher priority goes first; otherwise `seq`.
+        // A higher-priority step that itself waits behind a protected step
+        // does not hold back an earlier step that protected step waits for
+        // (same priority, earlier `seq`): the three would wait on each other
+        // for ever (seen on an upgraded install: a pending cascade, then the
+        // worker's protected `result`, then the import's priority-2 cascade).
+        let candidate = "SELECT s.* FROM task_step s WHERE s.status IN ('pending','claimed') AND (? IS NULL OR s.lane=?) AND s.task_id NOT IN (SELECT value FROM json_each(?)) AND (? IS NULL OR s.task_id = ?) AND ((s.status = 'pending' AND s.available_at <= ?) OR (s.status = 'claimed' AND s.lease_until <= ?)) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND ((p.integration_started_at IS NOT NULL AND p.seq<s.seq) OR (s.integration_started_at IS NULL AND p.priority>s.priority AND NOT EXISTS (SELECT 1 FROM task_step q WHERE q.task_id = s.task_id AND q.status IN ('pending','claimed') AND q.integration_started_at IS NOT NULL AND q.priority=s.priority AND q.seq>s.seq AND q.seq<p.seq)) OR (p.priority=s.priority AND p.seq<s.seq)) AND p.status IN ('pending','claimed')) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.id != s.id AND p.lease_until > ?) ORDER BY s.priority DESC,s.created_at,s.seq LIMIT 1";
         if sqlx::query(candidate)
             .bind(lane)
             .bind(lane)
