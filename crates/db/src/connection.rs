@@ -509,4 +509,97 @@ mod tests {
         pool.close().await;
         other_pool.close().await;
     }
+
+    /// Why a transaction that writes opens with `begin_immediate`. While
+    /// another connection holds the write lock, a transaction that began
+    /// with a read is refused the lock at once (`SQLITE_BUSY`, code 5, no
+    /// busy wait: waiting could deadlock the two), and an immediate one
+    /// waits its turn. `DbError::is_busy` names the refusal for the workers
+    /// that wait it out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_after_a_read_is_refused_at_once_and_an_immediate_transaction_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("busy.db").display());
+        let pool = create_sqlite_pool(&url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL); INSERT INTO counter VALUES (1, 0);")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The holder commits when told, or after this at the latest.
+        const HELD: Duration = Duration::from_secs(10);
+        let hold = |pool: SqlitePool| async move {
+            let mut writer = begin_immediate(&pool).await.unwrap();
+            sqlx::query("UPDATE counter SET n = n + 1")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            let (locked, release) = (
+                tokio::sync::oneshot::channel::<()>(),
+                tokio::sync::oneshot::channel::<()>(),
+            );
+            let holder = tokio::spawn(async move {
+                locked.0.send(()).unwrap();
+                let _ = tokio::time::timeout(HELD, release.1).await;
+                writer.commit().await.unwrap();
+            });
+            locked.1.await.unwrap();
+            (holder, release.0)
+        };
+
+        // Deferred: the read opens the snapshot, the write cannot upgrade it.
+        let (holder, release) = hold(pool.clone()).await;
+        let mut deferred = pool.begin().await.unwrap();
+        let _: i64 = sqlx::query_scalar("SELECT n FROM counter")
+            .fetch_one(&mut *deferred)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let refused = DbError::from(
+            sqlx::query("UPDATE counter SET n = n + 1")
+                .execute(&mut *deferred)
+                .await
+                .unwrap_err(),
+        );
+        assert!(started.elapsed() < HELD, "refused without a busy wait");
+        assert!(refused.is_busy() && refused.is_transient(), "{refused}");
+        assert!(
+            refused.to_string().contains("database is locked"),
+            "{refused}"
+        );
+        deferred.rollback().await.unwrap();
+        drop(release);
+        holder.await.unwrap();
+
+        // Immediate: the same statements wait for the writer and commit.
+        let (holder, release) = hold(pool.clone()).await;
+        let waiter = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let mut immediate = begin_immediate(&pool).await?;
+                let _: i64 = sqlx::query_scalar("SELECT n FROM counter")
+                    .fetch_one(&mut *immediate)
+                    .await?;
+                sqlx::query("UPDATE counter SET n = n + 1")
+                    .execute(&mut *immediate)
+                    .await?;
+                immediate.commit().await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waits while the writer holds the lock"
+        );
+        release.send(()).unwrap();
+        holder.await.unwrap();
+        waiter.await.unwrap().unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT n FROM counter")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(!DbError::NotFound.is_busy());
+    }
 }

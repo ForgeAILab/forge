@@ -1377,13 +1377,47 @@ async fn two_tasks_enter_the_queue_and_merge_in_order_through_the_real_worker() 
             ),
             ("merging", "done", "merge succeeded")
         );
-        assert!(world
-            .db
-            .task_steps(task)
-            .await
-            .unwrap()
-            .iter()
-            .all(|step| matches!(step.status.as_str(), "done" | "superseded")));
+        // `done` is visible from the commit of the transition, and that
+        // commit queues the cascade's step for the entry into `done` (the
+        // completion passes `cascade_step_input`). A step of the Task may
+        // therefore still be live at that instant. It has to settle: the
+        // wait is bounded, and the rows that do not settle are printed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let mut waited = false;
+        loop {
+            let live: Vec<String> = world
+                .db
+                .task_steps(task)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|step| !matches!(step.status.as_str(), "done" | "superseded"))
+                .map(|step| {
+                    format!(
+                        "#{} {} {} attempts={} lease_until={:?} last_error={:?} payload={}",
+                        step.seq,
+                        step.kind,
+                        step.status,
+                        step.attempts,
+                        step.lease_until,
+                        step.last_error,
+                        step.payload_json
+                    )
+                })
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            if !waited {
+                println!("Task {task} is done with steps still settling: {live:#?}");
+                waited = true;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "steps of Task {task} still live after it is done: {live:#?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     // The first asked for no check; the second was rebased and had none configured.
     assert!(world
