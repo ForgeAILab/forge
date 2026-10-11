@@ -335,59 +335,8 @@ pub enum McpScopeRule {
     AccountInspection,
     BoundProject,
 }
-pub const MCP_OPERATIONS: &[(&str, McpScopeRule)] = &[
-    ("forge_create_task", McpScopeRule::BoundProject),
-    ("forge_create_sub_tasks", McpScopeRule::BoundProject),
-    ("forge_add_task_dependency", McpScopeRule::BoundProject),
-    ("forge_remove_task_dependency", McpScopeRule::BoundProject),
-    ("forge_list_task_dependencies", McpScopeRule::BoundProject),
-    ("forge_list_task_dependents", McpScopeRule::BoundProject),
-    ("forge_list_sub_tasks", McpScopeRule::BoundProject),
-    ("forge_reorder_sub_tasks", McpScopeRule::BoundProject),
-    ("forge_list_tasks", McpScopeRule::BoundProject),
-    ("forge_get_task", McpScopeRule::BoundProject),
-    ("forge_preview_prompt", McpScopeRule::BoundProject),
-    ("forge_memory_search", McpScopeRule::BoundProject),
-    ("forge_memory_get", McpScopeRule::BoundProject),
-    ("forge_assign_agent", McpScopeRule::BoundProject),
-    ("forge_task_action", McpScopeRule::BoundProject),
-    ("forge_get_task_diff", McpScopeRule::BoundProject),
-    ("forge_list_executions", McpScopeRule::BoundProject),
-    ("forge_update_task", McpScopeRule::BoundProject),
-    ("forge_transition_task", McpScopeRule::BoundProject),
-    ("forge_register_agent", McpScopeRule::AccountInspection),
-    ("forge_list_agents", McpScopeRule::AccountInspection),
-    ("forge_list_projects", McpScopeRule::BoundProject),
-    ("forge_get_project", McpScopeRule::BoundProject),
-    ("forge_create_project", McpScopeRule::AccountInspection),
-    ("forge_update_project", McpScopeRule::BoundProject),
-    (
-        "forge_update_project_lifecycle_hooks",
-        McpScopeRule::BoundProject,
-    ),
-    ("forge_follow_up_execution", McpScopeRule::BoundProject),
-    ("forge_list_agent_profiles", McpScopeRule::AccountInspection),
-    ("forge_list_agent_sessions", McpScopeRule::AccountInspection),
-    ("forge_get_agent_session", McpScopeRule::AccountInspection),
-    ("forge_get_main_agent", McpScopeRule::AccountInspection),
-    ("forge_set_main_agent", McpScopeRule::AccountInspection),
-    ("forge_project_escalate", McpScopeRule::BoundProject),
-    ("forge_get_project_agent", McpScopeRule::BoundProject),
-    ("forge_set_project_agent", McpScopeRule::BoundProject),
-    ("forge_get_integration_queue", McpScopeRule::BoundProject),
-    ("forge_list_agent_chats", McpScopeRule::BoundProject),
-    ("forge_get_agent_chat", McpScopeRule::BoundProject),
-    ("forge_list_agent_chat_messages", McpScopeRule::BoundProject),
-    ("forge_send_agent_chat_message", McpScopeRule::BoundProject),
-    ("forge_list_agent_handoffs", McpScopeRule::BoundProject),
-    ("forge_get_agent_handoff", McpScopeRule::BoundProject),
-    ("forge_create_agent_handoff", McpScopeRule::BoundProject),
-];
 pub fn mcp_scope_rule(name: &str) -> Option<McpScopeRule> {
-    MCP_OPERATIONS
-        .iter()
-        .find(|(id, _)| *id == name)
-        .map(|(_, rule)| *rule)
+    crate::mcp::lookup(name).map(|spec| spec.scope)
 }
 pub fn mcp_authority(user_id: &str, constrained_project: Option<&str>) -> EffectiveAuthority {
     EffectiveAuthority::resolve(AuthorityFacts {

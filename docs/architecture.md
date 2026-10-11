@@ -729,9 +729,8 @@ plan-artifact delivery instructions still require owned repository-relative
 paths and scope reporting. Scaffolded `AGENTS.md` carries it for implementation
 and follow-up proposals, retaining the worker's existing scope discipline.
 Native Task proposal/adaptive payload guidance carries one short reminder when
-either operation is admitted. MCP Task creation and sub-task descriptors share
-that same reminder: split along module boundaries, name each Task's owned files,
-and avoid Tasks that all edit one shared file. The full doctrine stays at the
+either operation is admitted. MCP Task creation descriptors carry compact hierarchy/workspace guidance;
+Task creation callers follow the ownership and split rules documented here. The full doctrine stays at the
 layout/planning surfaces above. Transport-only plan
 artifact instructions and argument field help retain their existing ownership
 requirements without another copy of the rule.
@@ -1843,40 +1842,56 @@ and preparation-time structural checks are derived from that contract; service
 adapters look up the same operation and permission metadata and retain only
 domain/lifecycle validation in the command service. The MCP registry
 contains no migrated dotted orchestration operation IDs. Its existing `forge_*`
-direct APIs remain separate contracts with unchanged effects and result shapes.
-`operation-registry::mcp` owns 18 account, identity, binding, Chat and handoff
-contracts, their required roles and resource classifications. Schemas and typed
-decoders derive from the same Serde/JsonSchema input structs. The MCP handlers
-accept those concrete types; they no longer duplicate parameter declarations or
-role predicates. Two effect-time re-checks stay in handlers, next to the write:
-identity ownership in `forge_set_main_agent` and the administrator flag for
-daemon pinning in `forge_register_agent`. Referenced-resource authorization
-reads named fields of a JSON object, so the decoder refuses any other argument
-shape. Task/Project MCP tools, including owner escalation, retain
-their existing descriptor/handler paths pending their separate migration.
+direct APIs remain separate contracts with unchanged names and result shapes.
+`operation-registry::mcp` owns all 43 direct MCP contracts (the 42 existing
+names plus the previously registered integration-queue read), their scope,
+required roles, resource-reference rules, schemas, and typed decoders. The Task
+and Project inputs live in `mcp/task.rs`; the registry remains independent of
+services, DB, and API types. Handlers take those concrete input types. Exhaustive
+conversions bind the eight Task condition commands, workflow triggers, and
+lifecycle hooks to the existing API/domain types. No handwritten descriptor or
+RPC scope-name list remains. Catalog order is stable.
 
-All 42 MCP names have one scope classification in the registry. A Project grant
-omits/refuses the same eight account-wide tools. MCP always resolves a
-`Principal::DelegatedUser`; Project binding never implies an Agent principal.
-RPC generates the moved part of `tools/list` for each connection using the same
-`EffectiveAuthority::evaluate` requirements as call admission. Project grants
-resolve visibility and member/admin facts for the bound Project; account grants
-retain all names and resolve role/ownership against each supplied reference.
-Conditional daemon pinning is declared on the registration contract and passed
-through that evaluator for both field advertisement and admission. Unmoved
-Task calls retain the original database admission path.
+MCP resolves `Principal::DelegatedUser`; a Project binding does not imply an
+Agent principal. The catalog and `EffectiveAuthority::evaluate` generate the
+entire `tools/list` per connection and govern known-name call admission. Project
+grants omit the eight account-wide tools, load current visibility/member/admin
+facts, and allow escalation only for the exact `project.owner_id`. Memory reads
+and escalation require a bound Project and are omitted/refused for account
+grants. Other Task/Project APIs retain their existing Project-visibility rule,
+including ownerless visible Projects; this migration adds no member-only write
+policy. Account grants resolve ownership and roles against supplied references.
+Conditional daemon pinning uses the same evaluator for field advertisement and
+admission.
 
 Call order is known-name lookup, delegated scope/role admission, Project scope
-binding, referenced-resource authorization, then strict typed contract decode
-and the original handler effect. Denial precedes contract diagnostics and
-owned-identity failures preserve missing/inaccessible equivalence. Each moved
-input is closed; a contract violation maps to MCP `-32602` with
-`mcp_contract_invalid`, operation and expected fields. The projection emits only
-portable base schema keywords and one description line. Optional nulls,
-opaque JSON policies, reserved ignored pagination, and strict integer spelling
-preserve handler acceptance. Domain services retain their transaction-time
-rechecks, CAS, content guards and permission-document validation. No native
-orchestration, Task effect, Agent credential or workflow policy is introduced.
+binding, referenced-resource authorization, strict typed contract decode, and
+handler effect. Reference rules in the catalog select Task, parent, dependency,
+child, and Execution binding checks. Denial precedes contract diagnostics;
+missing/inaccessible resources remain indistinguishable. All inputs are closed,
+including child inputs, follow-up overrides, condition-command variants, and
+lifecycle-hook variants. Contract errors use MCP `-32602` with the bounded
+`mcp_contract_invalid` correction. Strict JSON integer spelling is preserved.
+
+Each advertised descriptor has one generated summary line and its fields.
+Provider schemas use the portable base keywords. Tagged command/hook contracts
+remain exact in Serde; their advertised field union gives the discriminator
+values and fields, while current `available_actions` supplies meaningful Task
+parameters. Nullability, custom workflow state strings, comma-separated/list
+status filters, opaque policy/settings JSON, numeric bounds, and the accepted
+`board_position` sort now reflect handler acceptance. Handler/domain checks
+retain state, CAS, graph, content, and transaction-time authority invariants.
+
+Task transitions attribute the authenticated user as delegated rather than as
+`SystemComponent::Mcp`; delegated actions keep user action authority, stop
+running executions displaced by state moves, and spend retry budgets. Both
+Project settings paths pass that user into shared validation,
+including assigned-agent usability checks. Task reads continue consuming the
+existing typed integration summary and `available_actions`; merge states,
+queue-owned eligibility, integration commands, and Task-step writing are
+unchanged. Effect-time identity ownership and daemon-admin rechecks remain
+next to the corresponding writes; escalation's exact owner check remains in
+its service transaction.
 
 Native and MCP orchestration adapters expose those command results through one
 typed `OrchestrationOutcome` envelope. It carries `code`, `status`,

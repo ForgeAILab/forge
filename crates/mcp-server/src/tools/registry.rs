@@ -7,8 +7,7 @@ use db::{
 };
 use operation_registry::{
     authority::{
-        mcp_authority, mcp_scope_rule, AuthorityRequirement, EffectiveAuthority, PrincipalRule,
-        RequiredPermission,
+        mcp_authority, AuthorityRequirement, EffectiveAuthority, PrincipalRule, RequiredPermission,
     },
     mcp::{McpInput, McpInputError, McpOperation, ResourceRule},
     AvailabilityRule,
@@ -31,6 +30,12 @@ fn without_echoed_value(detail: &str) -> String {
             return format!("{prefix}{kind}{expected}");
         }
     }
+    if let Some(rest) = detail.strip_prefix("unknown variant `") {
+        return rest.split_once('`').map_or_else(
+            || "unknown variant".into(),
+            |(_, expected)| format!("unknown variant{expected}"),
+        );
+    }
     detail.to_owned()
 }
 
@@ -43,9 +48,52 @@ pub(crate) fn input_error(error: McpInputError) -> McpToolError {
         "{}: {}; expected {}",
         error.operation, detail, error.expected
     );
-    McpToolError::new(-32602, "invalid params").with_data(
-        json!({"code":"mcp_contract_invalid", "operation":error.operation, "details":correction}),
-    )
+    let field = error
+        .detail
+        .split_once("argument `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(field, _)| field)
+        .or_else(|| {
+            error
+                .detail
+                .strip_prefix("missing field `")
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(field, _)| field)
+        });
+    let field = field.filter(|field| field.len() <= 128);
+    let mut data =
+        json!({"code":"mcp_contract_invalid", "operation":error.operation, "details":correction});
+    if let Some(field) = field {
+        data["field"] = json!(field);
+        if let Some(property) = operation_registry::mcp::lookup(error.operation)
+            .and_then(|spec| spec.input.schema["properties"].get(field))
+        {
+            let accepted = property
+                .as_object()
+                .map(|property| {
+                    property
+                        .iter()
+                        .filter(|(key, _)| {
+                            [
+                                "type",
+                                "enum",
+                                "minimum",
+                                "maximum",
+                                "minLength",
+                                "maxLength",
+                            ]
+                            .contains(&key.as_str())
+                        })
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<serde_json::Map<_, _>>()
+                })
+                .unwrap_or_default();
+            if !accepted.is_empty() {
+                data["accepted"] = json!(accepted);
+            }
+        }
+    }
+    McpToolError::new(-32602, "invalid params").with_data(data)
 }
 
 fn denied() -> McpToolError {
@@ -59,9 +107,11 @@ pub(crate) async fn authority(
 ) -> Result<EffectiveAuthority, McpToolError> {
     let user_id = context.user_id.as_deref().unwrap_or_default();
     let mut authority = mcp_authority(user_id, context.project_id.as_deref());
-    if let Some(user) = UserRepo::get_user_by_id(&*state.db, user_id).await? {
-        if user.is_admin {
-            authority.ceiling.insert("mcp_account_admin".into());
+    if context.project_id.is_none() {
+        if let Some(user) = UserRepo::get_user_by_id(&*state.db, user_id).await? {
+            if user.is_admin {
+                authority.ceiling.insert("mcp_account_admin".into());
+            }
         }
     }
     if let Some(project_id) = context.project_id.as_deref() {
@@ -81,6 +131,9 @@ async fn load_project_facts(
     };
     authority.ceiling.insert("mcp_project_visible".into());
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
+    if project.owner_id.as_deref() == Some(user_id) {
+        authority.ceiling.insert("mcp_project_owner".into());
+    }
     if project.owner_id.as_deref() == Some(user_id) || member.is_some() {
         authority.ceiling.insert("mcp_project_member".into());
     }
@@ -92,16 +145,9 @@ async fn load_project_facts(
     Ok(())
 }
 pub(crate) fn authorize(authority: &EffectiveAuthority, name: &str) -> Result<(), McpToolError> {
-    if let Some(spec) = operation_registry::mcp::lookup(name) {
-        authority.evaluate(spec).map_err(|_| denied())
-    } else {
-        authority
-            .evaluate(
-                mcp_scope_rule(name)
-                    .ok_or_else(|| McpToolError::protocol(-32601, "method not found"))?,
-            )
-            .map_err(|_| denied())
-    }
+    let spec = operation_registry::mcp::lookup(name)
+        .ok_or_else(|| McpToolError::protocol(-32601, "method not found"))?;
+    authority.evaluate(spec).map_err(|_| denied())
 }
 struct ResourcePermission(&'static str);
 impl AuthorityRequirement for ResourcePermission {
@@ -234,7 +280,17 @@ pub(crate) async fn authorize_resource(
                 ));
             }
         }
-        ResourceRule::None => {}
+        // Task/Execution references have been resolved and bound by RPC.
+        ResourceRule::None
+        | ResourceRule::Task
+        | ResourceRule::ParentTask
+        | ResourceRule::CreateTask
+        | ResourceRule::DependencyMutation
+        | ResourceRule::Dependencies
+        | ResourceRule::Dependents
+        | ResourceRule::SubTasks
+        | ResourceRule::ReorderSubTasks
+        | ResourceRule::Execution => {}
     }
     Ok(())
 }
@@ -245,6 +301,50 @@ pub(crate) async fn dispatch(
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     match input {
+        McpInput::ProjectEscalate(params) => {
+            handlers::forge_project_escalate(state, params, context).await
+        }
+        McpInput::UpdateProjectLifecycleHooks(params) => {
+            handlers::forge_update_project_lifecycle_hooks(state, params, context).await
+        }
+        McpInput::UpdateProject(params) => {
+            handlers::forge_update_project(state, params, context).await
+        }
+        McpInput::GetProject(params) => handlers::forge_get_project(state, params).await,
+        McpInput::FollowUpExecution(params) => {
+            handlers::forge_follow_up_execution(state, params).await
+        }
+        McpInput::ReorderSubTasks(params) => handlers::forge_reorder_sub_tasks(state, params).await,
+        McpInput::CreateSubTasks(params) => handlers::forge_create_sub_tasks(state, params).await,
+        McpInput::RemoveTaskDependency(params) => {
+            handlers::forge_remove_task_dependency(state, params).await
+        }
+        McpInput::AddTaskDependency(params) => {
+            handlers::forge_add_task_dependency(state, params).await
+        }
+        McpInput::TransitionTask(params) => {
+            handlers::forge_transition_task(state, params, context).await
+        }
+        McpInput::UpdateTask(params) => handlers::forge_update_task(state, params).await,
+        McpInput::TaskAction(params) => handlers::task_action(state, params, context).await,
+        McpInput::AssignAgent(params) => handlers::forge_assign_agent(state, params).await,
+        McpInput::CreateTask(params) => handlers::forge_create_task(state, params).await,
+        McpInput::ListSubTasks(params) => handlers::forge_list_sub_tasks(state, params).await,
+        McpInput::ListTaskDependents(params) => {
+            handlers::forge_list_task_dependents(state, params).await
+        }
+        McpInput::ListTaskDependencies(params) => {
+            handlers::forge_list_task_dependencies(state, params).await
+        }
+        McpInput::ListExecutions(params) => handlers::forge_list_executions(state, params).await,
+        McpInput::GetTaskDiff(params) => handlers::forge_get_task_diff(state, params).await,
+        McpInput::MemoryGet(params) => handlers::forge_memory_get(state, params, context).await,
+        McpInput::MemorySearch(params) => {
+            handlers::forge_memory_search(state, params, context).await
+        }
+        McpInput::PreviewPrompt(params) => handlers::forge_preview_prompt(state, params).await,
+        McpInput::GetTask(params) => handlers::forge_get_task(state, params, context).await,
+        McpInput::ListTasks(params) => handlers::forge_list_tasks(state, params).await,
         McpInput::RegisterAgent(params) => {
             handlers::forge_register_agent(state, params, context).await
         }

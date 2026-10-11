@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-fn round_trip(name: &str, input: Value) {
+pub(super) fn round_trip(name: &str, input: Value) {
     let spec = lookup(name).unwrap();
     let fields = spec.input.schema["properties"].as_object().unwrap();
     assert_eq!(
@@ -190,7 +190,7 @@ fn complete_catalog_uses_only_portable_keywords_and_has_bounded_descriptions() {
         .map(|spec| spec.name)
         .collect::<BTreeSet<_>>();
     // 18 moved tools and `forge_get_integration_queue`, born in the registry.
-    assert_eq!(names.len(), 19);
+    assert_eq!(names.len(), 19 + super::task_tests::MOVED);
     assert_eq!(names.len(), CATALOG.len());
     fn portable(schema: &Value) {
         let object = schema.as_object().expect("portable schema object");
@@ -209,7 +209,8 @@ fn complete_catalog_uses_only_portable_keywords_and_has_bounded_descriptions() {
                     "maxLength",
                     "minItems",
                     "maxItems",
-                    "description"
+                    "description",
+                    "uniqueItems"
                 ]
                 .contains(&key.as_str()),
                 "nonportable keyword {key}"
@@ -225,10 +226,15 @@ fn complete_catalog_uses_only_portable_keywords_and_has_bounded_descriptions() {
         if let Some(items) = schema.get("items") {
             portable(items);
         }
+        if schema["additionalProperties"].is_object() {
+            portable(&schema["additionalProperties"]);
+        }
     }
     for spec in CATALOG.iter() {
-        portable(&spec.input.schema);
+        portable(&spec.descriptor(false, true)["inputSchema"]);
         let descriptor = spec.descriptor(false, true);
+        jsonschema::validator_for(&descriptor["inputSchema"])
+            .unwrap_or_else(|error| panic!("valid portable schema for {}: {error}", spec.name));
         let description = descriptor["description"].as_str().unwrap();
         assert!(!description.contains('\n'));
         assert!(description.len() <= 200, "{} prefix", spec.name);

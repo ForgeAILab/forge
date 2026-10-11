@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod descriptors;
 mod handlers;
 pub(crate) mod registry;
@@ -5,8 +6,6 @@ pub(crate) mod registry;
 use serde_json::Value;
 
 use crate::{error::McpToolError, protocol::McpContext, state::AppState};
-
-pub(crate) use descriptors::tool_descriptors;
 
 // MCP exposes only assignment of an Agent to the Task's effective implementation
 // role. Arbitrary role selection and Agent↔human routing remain REST/user actions.
@@ -30,46 +29,9 @@ pub(crate) async fn dispatch_tool(
     arguments: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    if let Some(spec) = operation_registry::mcp::lookup(name) {
-        registry::authorize_resource(state, spec, &arguments, context).await?;
-        let input = spec.decode(arguments).map_err(registry::input_error)?;
-        return registry::dispatch(state, input, context).await;
-    }
-    match name {
-        "forge_create_task" => handlers::forge_create_task(state, arguments).await,
-        "forge_create_sub_tasks" => handlers::forge_create_sub_tasks(state, arguments).await,
-        "forge_add_task_dependency" => handlers::forge_add_task_dependency(state, arguments).await,
-        "forge_remove_task_dependency" => {
-            handlers::forge_remove_task_dependency(state, arguments).await
-        }
-        "forge_list_task_dependencies" => {
-            handlers::forge_list_task_dependencies(state, arguments).await
-        }
-        "forge_list_task_dependents" => {
-            handlers::forge_list_task_dependents(state, arguments).await
-        }
-        "forge_list_sub_tasks" => handlers::forge_list_sub_tasks(state, arguments).await,
-        "forge_reorder_sub_tasks" => handlers::forge_reorder_sub_tasks(state, arguments).await,
-        "forge_list_tasks" => handlers::forge_list_tasks(state, arguments).await,
-        "forge_get_task" => handlers::forge_get_task(state, arguments, context).await,
-        "forge_preview_prompt" => handlers::forge_preview_prompt(state, arguments).await,
-        "forge_memory_search" => handlers::forge_memory_search(state, arguments, context).await,
-        "forge_memory_get" => handlers::forge_memory_get(state, arguments, context).await,
-        "forge_assign_agent" => handlers::forge_assign_agent(state, arguments).await,
-        "forge_task_action" => handlers::task_action(state, arguments, context).await,
-        "forge_get_task_diff" => handlers::forge_get_task_diff(state, arguments).await,
-        "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
-        "forge_update_task" => handlers::forge_update_task(state, arguments).await,
-        "forge_transition_task" => handlers::forge_transition_task(state, arguments).await,
-        "forge_get_project" => handlers::forge_get_project(state, arguments).await,
-        "forge_update_project" => handlers::forge_update_project(state, arguments).await,
-        "forge_update_project_lifecycle_hooks" => {
-            handlers::forge_update_project_lifecycle_hooks(state, arguments).await
-        }
-        "forge_follow_up_execution" => handlers::forge_follow_up_execution(state, arguments).await,
-        "forge_project_escalate" => {
-            handlers::forge_project_escalate(state, arguments, context).await
-        }
-        _ => Err(McpToolError::new(-32601, "method not found")),
-    }
+    let spec = operation_registry::mcp::lookup(name)
+        .ok_or_else(|| McpToolError::protocol(-32601, "method not found"))?;
+    registry::authorize_resource(state, spec, &arguments, context).await?;
+    let input = spec.decode(arguments).map_err(registry::input_error)?;
+    registry::dispatch(state, input, context).await
 }

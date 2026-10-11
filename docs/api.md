@@ -5185,9 +5185,8 @@ tool error the model can correct in the same turn, naming the operation, the
 field and the expected contract, for example ``skill.section: argument
 `section` is required; expected skill.section: {section: one of ...}``. The
 remaining read operations retain their current schemas and validation.
-Provider-wrapped `parameters` calls still normalize before validation. MCP
-Task/Project schemas remain unchanged; the account, identity and Chat MCP
-projection below derives schemas and strict typed decoding from the registry.
+Provider-wrapped `parameters` calls still normalize before validation. All MCP
+descriptors below derive schemas and strict typed decoding from the registry.
 
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
@@ -5369,30 +5368,29 @@ Project/Chat/handoff/Task references remain restricted to that same bound
 Project. The credential acts as the authenticated delegated user, not the
 bound Project Agent.
 
-The account, identity, Agent binding, Chat and handoff tools use typed contracts
-in `operation-registry::mcp`. Each description is one generated summary line
+All 43 MCP tools use typed contracts in `operation-registry::mcp`. Each description is one generated summary line
 with the admitted fields. Names and result shapes are unchanged. Unknown fields
-on these 18 tools map to one `-32602` contract error. The in-band result has
+on any tool map to one `-32602` contract error. The in-band result has
 `structuredContent.code = "validation_error"` and bounded `details` carrying
 `code = "mcp_contract_invalid"`, the operation name and the expected contract. A
 mistyped value is described by its JSON type and never quoted back. Arguments
-must be a JSON object. The
-registry checks delegated authority before reporting contract details. Required
+must be a JSON object. The registry checks delegated authority before reporting contract details. Required
 integer arguments retain MCP's strict JSON integer spelling; native integer
 coercions do not apply.
 
-The same evaluator determines the moved tools' connection-level advertisement
+The same evaluator determines every tool's connection-level advertisement
 and call admission. For a Project-constrained grant it loads the bound Project's
 current role on each list/call; a global administrator does not acquire a Project
 role through that status alone:
 
-| Grant / role | Moved tools offered |
+| Grant / role | Tools offered |
 |---|---|
-| Account grant | All 18 names; each referenced identity, Project, Chat and handoff is authorized on call |
-| Project owner or Project `owner` / `admin` member | All ten Project-classified moved tools |
-| Project ordinary member | Those ten except `forge_set_project_agent` |
-| Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
-| Project not visible to the user | No moved tools |
+| Account grant | 40 names; memory reads and escalation require a bound Project; references are authorized on call |
+| Exact Project owner | All 35 Project-classified names |
+| Project `owner` / `admin` member, without exact ownership | 34 names; escalation requires `project.owner_id` |
+| Project ordinary member | 33 names; no binding setter or escalation |
+| Visible Project without owner/member authority | 26 names: the 24 Task/Project visibility APIs (including memory and integration queue), `forge_list_projects`, and `forge_list_agent_chats`; no escalation or member-only identity/Chat/handoff tools |
+| Project not visible to the user | No tools |
 
 `forge_get_integration_queue` is a nineteenth registry-built tool, added with
 the merge-queue reads rather than moved: Project-classified, and offered to
@@ -5409,10 +5407,14 @@ account administrators and only the existing null no-op to other users.
 Its conditional field authority is also evaluated before
 contract decoding; a non-null value from a non-admin still returns `-32003`
 `admin_required`. A null or omitted daemon field retains its former meaning.
-The 24 unmoved Task/Project descriptors and their grant filtering retain the
-base behavior, including `forge_project_escalate`'s separate owner check.
+All 24 Task/Project tools now use the same projection. Memory tools and
+`forge_project_escalate` are omitted/refused for account grants. Escalation is
+also omitted/refused for any user other than the exact Project owner, even an
+`owner` or `admin` member. The service rechecks ownership in its transaction.
+Other Task/Project tools retain the existing Project-visibility admission rule;
+this change does not add a member-only write policy.
 
-A role denial on a moved tool is `-32001` with `data.code = "mcp_scope_denied"`
+A role denial on a catalog tool is `-32001` with `data.code = "mcp_scope_denied"`
 for both grant kinds. A reference the user may not use answers exactly like a
 missing one: an identity or session of another account is `-32004`
 (`agent_identity not found` / `agent_session not found`, naming only the id
@@ -5438,6 +5440,37 @@ refuse protected embedded registration and malformed permission documents.
 non-negative constraint. `forge_list_agent_chats` and
 `forge_list_agent_handoffs` retain their reserved, ignored `cursor` / `limit`
 fields and return all authorized records, with their existing result shapes.
+
+Task/Project contracts also refuse unknown root fields, unknown child fields,
+unknown execution override fields, and unknown lifecycle-hook fields. Optional
+nulls retain their existing omission meaning except `forge_create_task`'s
+`parent_task_id`, `priority`, and `type`, which still require non-null values if
+present. `forge_list_tasks.status` accepts a comma-separated string, an array
+of strings, or null; workflow state names are open strings on both Task listing
+and transition. `sort_by` includes the already accepted `board_position`.
+Memory `layer` advertises 1, 2, or 3; unsigned memory limits/budgets and positive
+follow-up deadlines advertise their decoder bounds. `settings` remains opaque
+JSON at the wire boundary; shared settings validation still requires a valid
+Project settings document.
+
+Task `action` and lifecycle-hook schemas advertise portable discriminator/field
+unions rather than conditional schemas. Exact variant fields are enforced by
+typed decoding: `send_back` requires `guidance`; only `retry` accepts
+`fresh_session`, `refresh_workspace`, and `reset_budget`, along with optional
+`guidance`; only
+`approve` accepts `override`. Optional action parameters accept null. Always
+copy a currently offered `available_actions` command and its meaningful
+parameters. Hook discriminators remain `script` and `plugin`, and lifecycle
+event names remain the five existing names.
+
+`forge_transition_task` now records the authenticated delegated user rather
+than the MCP system component. It retains user action authority and spends retry
+budgets, without an interactive-owner exemption. A state move stops displaced
+running executions through the existing user-transition path. Both Project
+settings tools pass the authenticated user to shared validation, so assigned agents must be
+usable by that user in the Project, just as on REST. Task reads retain their
+typed integration summaries and current `available_actions`; queue and offer
+eligibility are unchanged.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and
