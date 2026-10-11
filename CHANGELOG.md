@@ -51,7 +51,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     markers when it stops.
   - **Workflow hook `auto_cascade_on_merge_result` is removed; `run_merge`
     only admits to the queue.** Stored Project workflows and retained step
-    workflow snapshots are rewritten by migration `V202610110040`, which
+    workflow snapshots are rewritten by migration `V202610110247`, which
     drops the removed hook name and keeps everything else. A workflow
     template file in the data directory's `workflows/` folder that names the
     hook gets the same rewrite when it is first read: the hook is dropped,

@@ -586,6 +586,11 @@ fn classify_inner(s: &IntegrationImportSnapshot, now: &str) -> Result<Integratio
             }
         }
     }
+    // A `recovery` row ends the bridge window whatever its verb: the owner's
+    // manual review re-run (`{"verb":"review_rerun"}`) re-enters the review
+    // state, so the merge-path bridges before it describe an entry that is
+    // over. The row itself is never read as a bridge (the window starts
+    // after it).
     let boundary = s
         .transitions
         .iter()
