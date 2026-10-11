@@ -2435,6 +2435,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   enter a filesystem mounted inside a tree.** Removals and trash moves now
   go down from the workspace root by file descriptor, hold at most 32
   directory levels open, and never enter a directory on another device.
+- **A native command with a Project `CARGO_TARGET_DIR` (or wrapper, cache
+  or temp variable) got neither value.** The tool clears the child's
+  environment and Forge stands back for a key the Project declares, but
+  nothing delivered the Project's value. It is now set on the command.
+- **A daemon re-sent every Task-root size with every report, and a root too
+  large to measure blocked the ones after it.** Each measurement is sent
+  until the server has taken it and not again; an attempt that could not
+  finish moves the root to the back of the rotation.
 - **A compiler-cache server start could wait without end.** The start lock
   (a file a run can hold) now has the start timeout, a wrapper that returns
   without a server answering counts as a failed start on every path, run

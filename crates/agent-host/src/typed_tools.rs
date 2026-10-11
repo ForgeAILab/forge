@@ -3776,13 +3776,14 @@ mod tests {
             std::path::PathBuf::from(run(std::collections::BTreeMap::new()).await),
             build
         );
-        // A key the Project declares is the Project's: Forge's directory
-        // never replaces it.
+        // A key the Project declares is the Project's: the command gets
+        // that value (not Forge's directory, and not nothing, which would
+        // build inside the worktree).
         let project = std::collections::BTreeMap::from([(
             "CARGO_TARGET_DIR".to_owned(),
             "/project/target".to_owned(),
         )]);
-        assert_ne!(std::path::PathBuf::from(run(project).await), build);
+        assert_eq!(run(project).await, "/project/target");
     }
 
     /// The native command tool clears the child's environment, so without the

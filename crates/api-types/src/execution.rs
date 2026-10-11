@@ -555,8 +555,9 @@ pub struct DaemonWorkspaceDisk {
     pub measured_at: String,
 }
 
-/// Most Task roots one report carries sizes for; the rest follow in later
-/// reports (least recently reported first).
+/// Most Task roots one report carries sizes for. A daemon sends each
+/// measurement until the server has taken it, oldest first, so the rest
+/// follow in later reports.
 pub const DAEMON_WORKSPACE_DISK_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

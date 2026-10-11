@@ -532,6 +532,7 @@ async fn report_once(
         .await?;
     // The server holds every machine to one floor; the collector here
     // evicts to the same one.
+    crate::daemon_workspace::gc::workspace_disk_reported(workspace_root, &request.workspace_disk);
     crate::daemon_workspace::gc::accept_floor(workspace_root, daemon.workspace_floor);
     crate::daemon_workspace::gc::accept_check_run_timeout(
         workspace_root,

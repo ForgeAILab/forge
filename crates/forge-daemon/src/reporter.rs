@@ -66,6 +66,10 @@ pub async fn report_once(
     let daemon = report_with_retry(client, &request).await?;
     // The server holds every machine to one floor; the collector of this
     // root evicts to it, and new worktrees are refused under it.
+    forge_client::daemon_workspace::gc::workspace_disk_reported(
+        workspace_root,
+        &request.workspace_disk,
+    );
     forge_client::daemon_workspace::gc::accept_floor(workspace_root, daemon.workspace_floor);
     forge_client::daemon_workspace::gc::accept_check_run_timeout(
         workspace_root,

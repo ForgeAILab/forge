@@ -362,6 +362,18 @@ async fn sweep_measures_live_task_roots_for_the_report() {
     assert_eq!(sizes[0].workspace_handle, handle);
     assert!(sizes[0].disk_bytes >= 256 * 1024, "{}", sizes[0].disk_bytes);
     assert!(chrono::DateTime::parse_from_rfc3339(&sizes[0].measured_at).is_ok());
+    // A report the server did not take is sent again; one it took is not,
+    // until the root is measured anew.
+    assert_eq!(gc::workspace_disk_report(root).len(), 1);
+    gc::workspace_disk_reported(root, &sizes);
+    assert!(gc::workspace_disk_report(root).is_empty(), "sent once");
+    sweep_at(&fixture.backend, &[], Duration::ZERO).await;
+    let again = gc::workspace_disk_report(root);
+    assert_eq!(again.len(), 1, "measured anew");
+    assert!(again[0].measured_at > sizes[0].measured_at);
+    // An acknowledgement of the older measurement does not cover this one.
+    gc::workspace_disk_reported(root, &sizes);
+    assert_eq!(gc::workspace_disk_report(root).len(), 1);
     let wire = serde_json::to_value(api_types::DaemonReportRequest {
         max_concurrent_runs: None,
         disk: None,

@@ -215,9 +215,9 @@ pub async fn record_daemon_workspace_disk(
         stored += sqlx::query(
             "UPDATE workspace SET disk_bytes = ?, disk_measured_at = ?
              WHERE status NOT IN ('cleaned', 'cleaning')
-               AND id = (SELECT workspace_id FROM workspace_placement
-                         WHERE owner_kind = 'daemon' AND daemon_id = ?
-                           AND workspace_handle = ?)",
+               AND id IN (SELECT workspace_id FROM workspace_placement
+                          WHERE owner_kind = 'daemon' AND daemon_id = ?
+                            AND workspace_handle = ?)",
         )
         .bind(i64::try_from(size.disk_bytes).unwrap_or(i64::MAX))
         .bind(&now)
