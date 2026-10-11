@@ -4783,6 +4783,55 @@ one set of timers. A Task step that writes an answer on an attempt wakes that
 head's driver (`IntegrationQueueWorker::notify_answered`); a driver that
 misses the wake reads the answer at its poll.
 
+**Settle-time proof: `done` means the target contains the commit.** The
+attempt's `integrated_sha` is a claim the worker wrote (from a fast-forward
+receipt, or from a landed witness it read earlier). The `integration/result`
+step does not report on it. Before it writes the evidence, the comment or the
+`done` cascade it asks the owner of the queue's default checkout whether the
+target branch contains the commit (`integration_steps::proof`): one
+`git merge-base --is-ancestor` in a server-owned checkout, the read-only
+`integration.target_facts` of the daemon that owns a daemon-owned one. The
+read runs outside of any database transaction. A receipt never replaces it;
+a fast-forward receipt on the attempt that is another attempt's, of a later
+claim generation, of another owner, or that names another commit refuses the
+report before Git is read. When the integrated commit is not the Task's own
+commit (a merge commit of before the queue) both are asked for.
+
+| Proof | Task | `result` step | Attempt |
+|---|---|---|---|
+| The target contains the commit | evidence, comment, `merging` → `done` | answers `done` | `applied` → `completed` |
+| The owner answers "not contained" (the target was rewound after the fast-forward, or the row was wrong) | stays in its merge state, `deferred` / `unresolved_result` with an interruption | answers `not_landed` and ends | the worker drops the recorded result and takes the attempt off the slot (`applied` → `parked`, `target_missing_commit`, kind `needs_fact`); the counted retry timer queues it again and validation merges it against the target as it is (after the counted retries: `owner_required` with the Retry offer) |
+| No answer (the owner is not connected, the checkout cannot be read) | stays, `deferred` / `unresolved_result` | stays pending, asks again at `result_park` (30 s); the worker re-arms it on every sweep | stays `applied` and keeps the slot |
+| An imported landed row (no worker holds a slot for it) is not proven | stays, `deferred` / `unresolved_result` | the import continuation asks again on the same timer | stays `applied` |
+
+**One writer per merge during an upgrade.** Three things could act on a merge
+that was in flight the old way: the old merge's own hooks step, the import
+continuation step, and the queue worker. The two Task steps exclude each
+other (one step per Task). The worker is kept out by the claim predicate
+(`integration_queue`, the head pick and the claimable-queues listing): an
+attempt admission made is claimable; an attempt from before the queue (an
+imported row or a `shadow:` row) only once its `integration-import:<id>`
+continuation step has settled and no live hooks step of the Task's present
+entry carries an effect of the old merge path (`merge_intent`,
+`merge_outcome`, `rebase_target`). A reserved imported head (an unknown
+result) is held the same way while that step is live. The hand-over is
+admission, in both steps: the `run_merge` hook finishes the rebase the old
+step started and then admits; a merge the old step had finished is admitted
+too, the head finds its commit in the target and the proven `result` step
+reports it (only if the candidate can no longer be named does the hook report
+it itself, after the same proof). The continuation waits for an earlier,
+suspended hooks step of the entry instead of admitting beside it. Residue: a
+`shadow:` row of a deleted Task gets no continuation and is never claimed; it
+holds no slot.
+
+**Unknown results from before the queue.** An imported merge whose old
+operation never reported is recorded `uncertain` against the machine that ran
+it, without a fenced intent, so no owner receipt settles it. It is settled by
+removing that machine (`settle_removed_integration_owner`) or, explicitly, by
+its owner's Retry (`settle_imported_integration_operation`): the operation
+becomes `failed`, a `reconciling` attempt becomes `quarantined`, and Git
+decides from there. Until then it refuses the deletions below.
+
 **Importer continuation.** At every start the storage importer runs until
 nothing is left, then each *current* imported attempt (and each attempt the
 passive shadow recording left) without a continuation gets one
@@ -4842,6 +4891,12 @@ other terminal state, review = the `run_ci_steps` entry), and the Task-side
 targets of a merge outcome are resolved by `integration_steps::reconcile::
 role_target`, including the legacy effects the admitting `run_merge` reports.
 
+A workflow with two merge states gives each its own outcome targets: a landed
+merge goes to the `accept` target of the merge state the Task was in, a
+repair to that state's own `reject` target when it carries the repair role's
+exit guard. A workflow in which no state has the `run_merge` entry hook has
+no merge role and nothing of it is imported.
+
 **Deletion guards.** `integration_queue::refuse_unresolved_integration` runs
 inside the transaction that deletes a repository, a repo location or a
 Project, and before a location's `is_default` changes. It refuses with
@@ -4850,6 +4905,13 @@ the Task and the machine) while an attempt of a queue in that scope has an
 effect intent, a running or uncertain owner operation, or is `reconciling` /
 `ff_inflight`. Removing the machine is the operation that settles an effect
 nobody can answer for (`settle_removed_integration_owner`).
+
+The default-location change is guarded in `RepoLocationService::update`, in
+the transaction of the write the `PATCH` route makes
+(`refuse_default_change_while_integration_unresolved`). A forced Project
+delete checks the guard before it cancels anything. The owner's override
+(`approve`) on a Task in its merge state is offered as "Mark done without
+merging": it ends the Task as done, merges nothing and cancels the attempt.
 
 **Write-transaction rule.** No database write transaction is held across a
 Git subprocess, an owner RPC or a write on another pooled connection anywhere

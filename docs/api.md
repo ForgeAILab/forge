@@ -2687,7 +2687,19 @@ being reconciled. `details` is `{"task_id", "machine"}`: the Task whose merge
 it is and the machine whose answer is missing (`the server` for the server's
 own checkout). `?force=true` does not override it. Reconnect that machine (its
 receipt settles the merge) or remove the machine (the effect is settled as
-failed and the Task goes back to review); then retry the request.
+failed and the Task goes back to review); then retry the request. A merge that
+was in flight before the merge queue existed and never reported is settled the
+same way by removing its machine, or by the Task owner's `retry` action on
+that Task (it closes the old operation and lets Git decide). A forced Project
+delete is refused before anything is cancelled.
+
+**Reporting a merge.** A Task is moved to `done` by the merge queue only after
+the owner of the repository's default checkout has confirmed that the target
+branch contains the merged commit. If it does not (the target was rewound),
+the Task stays in its merge state with condition reason `integration`, kind
+`deferred`, cause `unresolved_result`, and is queued again on the retry timer.
+In a merge state the owner's `approve` override is offered with the label
+"Mark done without merging".
 
 The response also includes `availability` for each dimension. `current` means
 the authoritative rows were read; `unavailable` (with a `refresh_and_retry`
