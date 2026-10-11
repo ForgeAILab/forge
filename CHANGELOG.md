@@ -8,6 +8,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Check history is deleted after 30 days.** Finished check runs, their
+  results (with the output tails of their commands) and the requests that
+  waited for them used to be kept forever. An hourly job now deletes them
+  once they are older than `server.check_retention_days` (new setting,
+  default `30`; `FORGE_SERVER_CHECK_RETENTION_DAYS` overrides the file). Set
+  it to `0` to keep them forever, as before. Nothing something can still read
+  is deleted: a check a Task waits for, a check of a review that is still
+  open, or a reusable green result that a request used within the retention
+  period. Reviews keep their own copy of the verdict and command output. A
+  green result whose history was deleted is simply not reused: the next
+  review of that commit runs its checks again.
+- **A forced Project deletion refuses before cancelling anything when a
+  running execution is on a machine that cannot be reached.** It used to
+  cancel the executions it could reach and then answer `503`. It now answers
+  `409 project_in_use` with `cancelled: false` and the machine in
+  `unreachable_machines`, as it already did for a check run on such a
+  machine.
+
 - **A manual review re-run goes through the ordinary review entry; the
   separate review runner is gone (3.3 stage E).** The review `retry` Task
   action ("Re-run Review" / "Recheck Review") keeps its verb and payload, but

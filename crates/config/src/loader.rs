@@ -61,6 +61,9 @@ impl ForgeConfig {
             if let Some(seconds) = server.check_run_timeout_seconds {
                 self.server.check_run_timeout_seconds = seconds;
             }
+            if let Some(days) = server.check_retention_days {
+                self.server.check_retention_days = days;
+            }
             if let Some(value) = server.main_working_set_target_tokens {
                 self.server.main_working_set_target_tokens = value;
             }
@@ -276,6 +279,11 @@ impl ForgeConfig {
         if let Some(value) = env_value("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS") {
             self.server.check_run_timeout_seconds =
                 parse_env_u32("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_CHECK_RETENTION_DAYS") {
+            // Zero is a value here: keep check history forever.
+            self.server.check_retention_days =
+                parse_env_u32("FORGE_SERVER_CHECK_RETENTION_DAYS", &value)?;
         }
         if let Some(value) = env_value("FORGE_SERVER_USAGE_INDEX_BUDGET_MB") {
             self.server.usage_index_budget_mb =

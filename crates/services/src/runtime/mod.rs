@@ -805,7 +805,10 @@ impl ForgeRuntimeBuilder {
             None,
         ));
         operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
-        let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
+        let storage_maintenance = Arc::new(
+            StorageMaintenanceWorker::new(Arc::clone(&self.db))
+                .with_check_retention_days(effective_config.server.check_retention_days),
+        );
         // One constructor composes the runner, both consumer families
         // (review entry and the merge path) and the worker; tests build the
         // same set through it.

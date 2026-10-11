@@ -113,6 +113,10 @@ pub struct ServerConfig {
     /// Passive stage-A setting; no execution reads this deadline yet.
     #[serde(default = "default_check_run_timeout_seconds")]
     pub check_run_timeout_seconds: u32,
+    /// Days a finished check run is kept with its result, output tails and
+    /// consumers before the retention job deletes it. `0` keeps them forever.
+    #[serde(default = "default_check_retention_days")]
+    pub check_retention_days: u32,
     #[serde(default = "default_main_working_set_target_tokens")]
     pub main_working_set_target_tokens: u32,
     #[serde(default = "default_main_working_set_hard_tokens")]
@@ -485,6 +489,7 @@ impl ForgeConfig {
             },
             server: ServerConfig {
                 check_run_timeout_seconds: default_check_run_timeout_seconds(),
+                check_retention_days: default_check_retention_days(),
                 main_working_set_target_tokens: 48000,
                 main_working_set_hard_tokens: 64000,
                 project_working_set_target_tokens: 96000,
@@ -742,4 +747,8 @@ fn default_project_working_set_hard_tokens() -> u32 {
 
 fn default_check_run_timeout_seconds() -> u32 {
     crate::DEFAULT_CHECK_RUN_TIMEOUT_SECONDS
+}
+
+fn default_check_retention_days() -> u32 {
+    crate::DEFAULT_CHECK_RETENTION_DAYS
 }

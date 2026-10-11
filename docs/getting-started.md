@@ -1838,3 +1838,24 @@ This stage only defines the setting and the canonical spec field. No execution
 reads it yet: existing CI and per-command `review.check_timeout_seconds` behavior
 is unchanged. The durable runner will start wall timing at actual admission and
 clamp each separate command limit to the remaining wall time.
+
+### Check history retention
+
+`server.check_retention_days` is how long Forge keeps a finished check run
+with its result, the output tails of its commands and the requests that
+waited for it. Default **30** days; `0` keeps them forever. Precedence is
+`FORGE_SERVER_CHECK_RETENTION_DAYS`, then `server.check_retention_days` in
+`forge.yaml`, then the default.
+
+```yaml
+server:
+  check_retention_days: 30
+```
+
+An hourly job deletes older rows in small batches. It never deletes a check
+that something can still read: a check a Task still waits for, one that
+belongs to a review that is still open, or a reusable green result that a
+request used within the retention period. The verdict and command output
+recorded on a Review are part of the Review and are not deleted. Deleting the
+history of a green result only means the next review of that same commit runs
+its checks again.

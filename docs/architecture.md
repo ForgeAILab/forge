@@ -8996,6 +8996,51 @@ consumer/result/run identities, exact commit and spec digest. The consumer's
 retention, so restart and pruning cannot enqueue a second notification. Already
 stale epochs are enqueued as superseded and leave the Task untouched.
 
+#### Retention of check history
+
+`check_run`, `check_result` (with the output tails in `steps_json` and the
+owner receipt on the run) and `check_consumer` are history once a run is
+terminal and its consumers are answered. The `storage-maintenance` periodic
+worker deletes them hourly, after its Task-step retention pass:
+`StorageMaintenanceWorker::prune_check_history` calls
+`SqliteDb::prune_check_history(cutoff, 100)` at most 20 times per hour. Each
+call is two statements, each its own short write (at most 100 consumers, then
+at most 100 runs); no write transaction spans a batch. The cutoff is
+`server.check_retention_days` ago (default 30; `0` disables the job;
+`FORGE_SERVER_CHECK_RETENTION_DAYS` overrides the file).
+
+The predicate is deny-by-default (`crates/db/src/check_run/retention.rs`):
+
+| Row | Deleted only when |
+|---|---|
+| consumer | older than the cutoff; **and** finished (cancelled, applied, its Task gone, or its Task no longer in the status entry it asked from); **and** it holds no undelivered result; **and** no Task step that is `pending`, `claimed` or `suspended` awaits it (`task_step.awaited_consumer_id`); **and** its delivery step is not `pending`, `claimed` or `suspended`; **and** the Review attempt named in its request key is not `running` or `awaiting_human`; **and** its run is terminal |
+| run (its results go with it, `ON DELETE CASCADE`) | terminal (`succeeded`, `failed`, `cancelled`); finished before the cutoff and more than 26 hours ago (the owner acknowledgement window is 25); **and no consumer row at all** still names the run or one of its results |
+
+The last condition is what makes it deny-by-default: a consumer this job did
+not delete, for whatever reason, keeps its run and its result. A reusable
+green result therefore lives as long as some request used it within the
+retention period (a `Hit` writes a consumer that names the result), and for
+the retention period after its last use. "A reusable result has no expiry"
+now reads: none but retention. After it is deleted the same request is
+`Scheduled` and runs again.
+
+Delivery steps (`apply_check_result`, `apply_check_progress`) are Task steps
+and are pruned by Task-step retention (7 days settled, 30 unresolved); a
+consumer's `delivery_step_id` marker outlives its step and goes with the
+consumer. A Review keeps its own copy of the verdict and tails
+(`review.step_results_json`), which no retention touches.
+
+Every column that points at one of the three tables is listed in
+`db::CHECK_REFERENCES`: the foreign keys `check_result(run_id, identity_key)`,
+`check_consumer.run_id` and `check_consumer.result_id`, and the id column
+`task_step.awaited_consumer_id`. The test
+`every_reference_to_a_check_row_is_known_to_the_retention_predicate`
+enumerates them from the migrated schema (`pragma_foreign_key_list` over
+every table, plus every column whose name says it holds a check run, result
+or consumer id, and every `run_id`/`result_id` column of an `integration_*`
+table). A reference added later, as the merge queue will add, fails that test
+until the predicate keeps the rows the new reader can still read.
+
 #### Task-step consumer contract
 
 `check_runner::consumer::TaskCheckConsumers` is the only way a Task step uses
@@ -9098,8 +9143,10 @@ retain their current inline orchestration, limits and verdicts. The 3.2 integrat
 the merge-queue cutover and managed-checkout activation. The
 owners execute the frozen legacy policies and the canonical CI policy below;
 only the canonical one attests its inputs and may be reused. A reusable result
-has no expiry: reuse ends only when the commit, spec digest, owner environment
-identity or audited execution revision differs. No historical review or legacy
+has no expiry of its own: reuse ends when the commit, spec digest, owner
+environment identity or audited execution revision differs, or when retention
+deletes a result nobody used for `server.check_retention_days` (see "Retention
+of check history"). No historical review or legacy
 CI row is promoted to cache.
 
 #### Reusable results: the canonical CI policy (3.3 stage D part 2, scope 1)
