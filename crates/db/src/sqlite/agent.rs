@@ -221,7 +221,10 @@ impl AgentRepo for SqliteDb {
         .bind(if identity.paused { 1 } else { 0 })
         .bind(identity.owner_id.as_deref())
         .bind(&identity.visibility)
-        .bind(&identity.account_permission_ceiling)
+        .bind({
+            operation_registry::authority::parse_permissions(&identity.account_permission_ceiling)?;
+            &identity.account_permission_ceiling
+        })
         .bind(&identity.created_at)
         .bind(&identity.updated_at)
         .execute(&mut *transaction)
@@ -675,6 +678,7 @@ async fn insert_profile(
     transaction: &mut Transaction<'_, Sqlite>,
     input: &CreateAgentProfile,
 ) -> Result<()> {
+    operation_registry::authority::parse_permissions(&input.tool_policy_json)?;
     let revision = sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(MAX(version), 0) + 1
          FROM agent_profile
@@ -733,4 +737,62 @@ async fn clear_default_for_executor(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+impl SqliteDb {
+    /// Live assignment/turn counts; terminal execution statistics are supplied
+    /// by the shared read index on collection routes.
+    pub async fn agent_list_active_assignments(
+        &self,
+        agent_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let ids_json = serde_json::to_string(agent_ids).map_err(|_| DbError::InvalidTransition)?;
+        let rows = sqlx::query(
+            "WITH requested AS (SELECT DISTINCT value AS agent_id FROM json_each(?)),
+             assignments AS MATERIALIZED (
+                 SELECT DISTINCT assignee_id, task_id FROM task_role_assignment
+                 WHERE assignee_type = 'agent' AND assignee_id IN requested
+             ), workflow_states AS MATERIALIZED (
+                 SELECT project.id AS project_id,
+                        json_extract(workflow_state.value, '$.name') AS state_name,
+                        MAX(CASE WHEN json_extract(workflow_state.value, '$.kind') IN ('active', 'gate')
+                            THEN 1 ELSE 0 END) AS active
+                 FROM project, json_each(
+                     CASE WHEN json_valid(project.workflow_definition)
+                         THEN project.workflow_definition ELSE '{\"states\":[]}' END,
+                     '$.states') AS workflow_state
+                 WHERE project.id IN (SELECT project_id FROM task WHERE id IN (SELECT task_id FROM assignments))
+                 GROUP BY project.id, state_name
+             ), active_tasks AS MATERIALIZED (
+                 SELECT task.id FROM task JOIN project ON project.id = task.project_id
+                 LEFT JOIN workflow_states ON workflow_states.project_id = task.project_id
+                     AND workflow_states.state_name = task.status
+                 WHERE task.deleted_at IS NULL AND task.id IN (SELECT task_id FROM assignments)
+                   AND CASE WHEN workflow_states.state_name IS NOT NULL THEN workflow_states.active
+                       ELSE task.status IN ('in_progress', 'review', 'merging') END
+             ), task_counts AS (
+                 SELECT assignee_id AS agent_id, COUNT(*) AS active_tasks
+                 FROM assignments WHERE task_id IN active_tasks GROUP BY assignee_id
+             ), turn_counts AS (
+                 SELECT responder_identity_id AS agent_id, COUNT(*) AS active_turns
+                 FROM agent_chat_turn_job WHERE responder_identity_id IN requested
+                   AND status IN ('leased', 'running') GROUP BY responder_identity_id
+             )
+             SELECT requested.agent_id,
+                    COALESCE(task_counts.active_tasks, 0) + COALESCE(turn_counts.active_turns, 0) AS active_assigned_task_count
+             FROM requested LEFT JOIN task_counts USING(agent_id)
+               LEFT JOIN turn_counts USING(agent_id)",
+        )
+        .bind(ids_json)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("agent_id")?,
+                    row.try_get("active_assigned_task_count")?,
+                ))
+            })
+            .collect()
+    }
 }

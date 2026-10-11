@@ -3,12 +3,11 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionBlockerProjection,
-    ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary, RecoveryAction, ResumePolicy, StopReason,
-    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate,
-    UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
-    WorkspaceResponse,
+    AgentStatus, CanonicalPhase, ExecutionBehavior, ExecutionBlockerProjection,
+    ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, PlanArtifactDetail,
+    PlanProgressSummary, ResumePolicy, StopReason, TaskRoleAssignmentResponse, TaskStatus,
+    TaskType, UsageAggregate, UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary,
+    WorkflowHealthSummary, WorkspacePlacementResponse, WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -39,29 +38,159 @@ pub struct ExecutionInterruptionResponse {
     pub created_at: String,
 }
 
+/// The closed set of Task condition commands. Session launches use the session API.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(export, tag = "verb", rename_all = "snake_case")]
+pub enum TaskAction {
+    Start,
+    Hold {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Release {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Retry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        fresh_session: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        refresh_workspace: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reset_budget: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        guidance: Option<String>,
+    },
+    SendBack {
+        guidance: String,
+    },
+    Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+        #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, rename = "override")]
+        override_checks: Option<bool>,
+    },
+    Restart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Cancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+}
+
+impl TaskAction {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Hold { .. } => "hold",
+            Self::Release { .. } => "release",
+            Self::Retry { .. } => "retry",
+            Self::SendBack { .. } => "send_back",
+            Self::Approve { .. } => "approve",
+            Self::Restart { .. } => "restart",
+            Self::Cancel { .. } => "cancel",
+        }
+    }
+
+    pub fn retry() -> Self {
+        Self::Retry {
+            reason: None,
+            fresh_session: None,
+            refresh_workspace: None,
+            reset_budget: None,
+            guidance: None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.verb())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum TaskAction {
-    Start,
-    Pause,
-    Resume,
-    Submit,
-    RequestChanges,
-    Approve,
-    Cancel,
+pub enum ActionAuthority {
+    Owner,
+    AssignedAgent,
+    ProjectAgent,
+    Reviewer,
+}
+
+/// A parameter is required when another offered boolean has this value.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ActionParameterRequirement {
+    pub parameter: String,
+    pub value: bool,
+}
+
+/// One executable offer. Parameters name the inputs meaningful in this snapshot;
+/// `action` supplies defaults. Authority is filtered before this value is exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ActionParameter {
+    pub name: String,
+    pub required: bool,
+    pub boolean_values: Option<Vec<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub required_when: Option<ActionParameterRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct Offer {
+    pub action: TaskAction,
+    pub parameters: Vec<ActionParameter>,
+    pub authority: Vec<ActionAuthority>,
+    pub reason: String,
+    pub label: String,
+    pub target_execution_id: Option<String>,
+    #[serde(default)]
+    pub propagates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskActionsResponse {
-    pub available_actions: Vec<TaskAction>,
-    pub recovery_actions: Vec<RecoveryAction>,
+    pub available_actions: Vec<Offer>,
+    #[ts(type = "number")]
+    pub version: i64,
+}
+
+/// Identifies where a Task's effective coder assignment is stored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EffectiveCoderSource {
+    Own,
+    InheritedFromRoot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskResponse {
+    #[serde(default)]
+    pub placement_diagnostics: Vec<TaskPlacementDiagnostic>,
     pub id: String,
     pub project_id: String,
     pub parent_task_id: Option<String>,
@@ -79,14 +208,18 @@ pub struct TaskResponse {
     pub subtask_order: Option<i64>,
     #[serde(default)]
     pub role_assignments: Vec<TaskRoleAssignmentResponse>,
+    pub effective_coder: Option<TaskRoleAssignmentResponse>,
+    pub effective_coder_source: Option<EffectiveCoderSource>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
+    /// Gate state keys plus non-gate budget kinds; all values are authoritative remaining allowances.
     pub remaining_retries: std::collections::HashMap<String, i64>,
     #[serde(default)]
-    pub execution_actions: Vec<ExecutionAction>,
-    pub error_annotation: Option<TaskAnnotation>,
-    pub blocked: Option<InterruptionMetadata>,
-    pub failed: Option<InterruptionMetadata>,
+    #[ts(type = "Record<string, number>")]
+    pub retry_limits: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pub available_actions: Vec<Offer>,
+    pub condition: crate::TaskCondition,
     pub workflow_health: Option<WorkflowHealthSummary>,
     pub workflow_exception: Option<WorkflowExceptionSummary>,
     pub execution_observability: TaskExecutionObservability,
@@ -95,6 +228,7 @@ pub struct TaskResponse {
     pub review_passed_at: Option<String>,
     pub archived_at: Option<String>,
     pub workspace: Option<WorkspaceResponse>,
+    pub placement: Option<WorkspacePlacementResponse>,
     pub plan_progress: Option<PlanProgressSummary>,
     pub plan_artifact: Option<PlanArtifactDetail>,
     pub external_issue_number: Option<i64>,
@@ -113,6 +247,8 @@ pub struct TaskResponse {
 }
 
 /// Board/list projection. Full content and accounting are loaded from task detail.
+/// The collection supports ETag/If-None-Match with Cache-Control: private, no-cache.
+/// A 304 has no JSON body; list validators are independent of board_revision.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskListItemResponse {
@@ -134,10 +270,12 @@ pub struct TaskListItemResponse {
     pub role_assignments: Vec<TaskRoleAssignmentResponse>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
+    /// Gate state keys plus non-gate budget kinds; all values are authoritative remaining allowances.
     pub remaining_retries: std::collections::HashMap<String, i64>,
-    pub error_annotation: Option<TaskAnnotation>,
-    pub blocked: Option<InterruptionMetadata>,
-    pub failed: Option<InterruptionMetadata>,
+    #[serde(default)]
+    #[ts(type = "Record<string, number>")]
+    pub retry_limits: std::collections::HashMap<String, i64>,
+    pub condition: crate::TaskCondition,
     pub workflow_health: Option<WorkflowHealthSummary>,
     pub workflow_exception: Option<WorkflowExceptionSummary>,
     pub review_passed_at: Option<String>,
@@ -174,9 +312,8 @@ impl From<TaskResponse> for TaskListItemResponse {
             subtask_order: task.subtask_order,
             role_assignments: task.role_assignments,
             remaining_retries: task.remaining_retries,
-            error_annotation: task.error_annotation,
-            blocked: task.blocked,
-            failed: task.failed,
+            retry_limits: task.retry_limits,
+            condition: task.condition,
             workflow_health: task.workflow_health,
             workflow_exception: task.workflow_exception,
             review_passed_at: task.review_passed_at,
@@ -273,6 +410,16 @@ pub struct TaskExecutionObservability {
     pub total_runtime_seconds: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
+#[ts(export)]
+pub struct AgentRunnableOn {
+    pub count: u32,
+    /// Present only for admins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub machines: Option<Vec<crate::MachineIdentity>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct AgentResponse {
@@ -292,6 +439,8 @@ pub struct AgentResponse {
     pub config_json: Value,
     pub credential_handle_id: Option<String>,
     pub daemon_id: Option<String>,
+    #[serde(default)]
+    pub runnable_on: AgentRunnableOn,
     pub max_concurrent_tasks: i64,
     pub status: AgentStatus,
     /// Assigned workload; see `Agent::active_assigned_task_count`.
@@ -313,6 +462,17 @@ pub struct AgentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonResponse {
+    pub max_concurrent_runs: Option<i64>,
+    pub run_limit: Option<u32>,
+    pub effective_max_concurrent_runs: Option<i64>,
+    /// The machine's last disk reading with the floor applied. `None` until
+    /// the machine has reported one.
+    #[serde(default)]
+    pub disk: Option<crate::MachineDisk>,
+    /// The free-space floor the server applies to this machine. A daemon
+    /// uses it for its own garbage collector, so eviction and refusal agree.
+    #[serde(default)]
+    pub workspace_floor: Option<crate::DiskFloor>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -341,6 +501,8 @@ pub struct DetectedCli {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonRegisterRequest {
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
     pub machine_id: String,
     pub hostname: String,
     pub os: String,
@@ -358,6 +520,12 @@ pub struct DaemonRegisterResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonReportRequest {
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
+    /// Free bytes and inodes of the filesystem holding the workspace root,
+    /// read for this report.
+    #[serde(default)]
+    pub disk: Option<crate::MachineDiskFacts>,
     pub detected_clis: Vec<DetectedCli>,
     pub runtimes: Option<Vec<RuntimeReport>>,
     pub labels: Option<Value>,
@@ -458,4 +626,80 @@ pub struct PromptPreviewResponse {
     pub system: String,
     pub user: String,
     pub tools: Option<Vec<String>>,
+}
+
+/// Transport schemas share this closed command shape (REST serde, MCP, typed tools).
+pub fn task_action_schema() -> serde_json::Value {
+    use serde_json::json;
+    let mut variants = Vec::new();
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"start"}}, "required":["verb"], "additionalProperties":false}));
+    for verb in ["hold", "release", "restart"] {
+        variants.push(json!({"type":"object", "properties":{"verb":{"const":verb},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    }
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"cancel"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"retry"},"reason":{"type":"string","minLength":1}, "fresh_session":{"type":"boolean"}, "refresh_workspace":{"type":"boolean"}, "reset_budget":{"type":"boolean"}, "guidance":{"type":"string"}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"send_back"}, "guidance":{"type":"string","minLength":1}}, "required":["verb","guidance"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    json!({"oneOf":variants})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct UpdateDaemonRequest {
+    #[ts(type = "number")]
+    pub version: i64,
+    #[serde(deserialize_with = "deserialize_nullable_run_limit")]
+    pub run_limit: Option<u32>,
+}
+
+fn deserialize_nullable_run_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    Option::<u32>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskPlacementDiagnostic {
+    pub machine: Option<crate::MachineIdentity>,
+    pub filter_codes: Vec<String>,
+    pub failing_checks: Vec<String>,
+}
+
+/// Removal commits revocation and queues Task settlement; observe Tasks for completion.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoveDaemonResponse {
+    pub id: String,
+    pub hostname: String,
+    #[ts(type = "number")]
+    pub pending_remote_cancels_cleared: u64,
+    #[ts(type = "number")]
+    pub cleanup_records_cleared: u64,
+    #[ts(type = "number")]
+    pub provisioning_attempts_cleared: u64,
+    #[ts(type = "number")]
+    pub readiness_records_cleared: u64,
+    /// Workspaces the machine owned, released as lost.
+    #[ts(type = "number")]
+    pub placements_failed: u64,
+    /// Tasks whose workspace was on the machine; each re-places on another one.
+    #[ts(type = "number")]
+    pub tasks_to_replace: u64,
+    /// Agents pinned to the machine, now archived.
+    #[ts(type = "number")]
+    pub agents_retired: u64,
+    #[ts(type = "number")]
+    pub tasks_queued: u64,
+}
+
+/// What removing a machine would change. Read before confirming removal.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoveDaemonPreview {
+    pub id: String,
+    #[ts(type = "number")]
+    pub tasks_to_replace: u64,
+    #[ts(type = "number")]
+    pub agents_to_retire: u64,
 }

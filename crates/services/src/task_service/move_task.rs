@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    workflow::engine::{BoardMoveOutcome, BoardMoveRequest},
-    DomainEventService,
-};
+use crate::workflow::engine::{BoardMoveOutcome, BoardMoveRequest};
 use api_types::{Actor, MoveTaskRequest, TaskMovedEventPayload, UserActionSource};
 use db::{
     CompareAndMoveTask, MoveTaskIdentity, MoveTaskPersistence, MoveTaskResult, TaskBoardRepo,
@@ -21,7 +18,23 @@ impl TaskService {
         task_id: impl Into<String>,
         request: MoveTaskRequest,
     ) -> Result<MoveTaskResult> {
-        let task_id = task_id.into();
+        let task_id: String = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+            if task.status != request.target_status {
+                return self
+                    .request_task_command(
+                        &task_id,
+                        "move_task",
+                        serde_json::json!([task_id, request]),
+                        false,
+                    )
+                    .await;
+            }
+        }
+
         validate_required("task_id", &task_id)?;
         validate_required("operation_id", &request.operation_id)?;
         Uuid::parse_str(&request.operation_id)
@@ -72,7 +85,10 @@ impl TaskService {
 
         super::execution::ensure_plan_publication_transition_authority(&source_task, None)?;
 
-        if source_task.version != request.task_version {
+        let accepted_version = db::task_writer::current_task_step().is_some_and(|step| {
+            step.task_id == source_task.id && step.expected_version == request.task_version
+        });
+        if source_task.version != request.task_version && !accepted_version {
             return Err(DbError::TaskVersionConflict {
                 expected: request.task_version,
                 actual: source_task.version,
@@ -167,19 +183,7 @@ impl TaskService {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
+        let engine = self.workflow_execution();
         let engine_result = engine
             .move_task_with_authority(
                 &task_id,
@@ -266,11 +270,6 @@ impl TaskService {
             .await
             {
                 Ok(updated) => task = updated,
-                Err(DbError::VersionConflict) => {
-                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -293,6 +292,9 @@ impl TaskService {
         )
         .await?;
         self.reconcile_terminal_subtask(&result.task).await;
+        if let Some(id) = &engine_result.queued_step_id {
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
+        }
         Ok(result)
     }
 
@@ -314,6 +316,8 @@ impl TaskService {
         let persistence = TaskBoardRepo::compare_and_move_task(
             &*self.db,
             CompareAndMoveTask {
+                post_commit_step: None,
+                integration_cancel: false,
                 operation_id: request.operation_id.clone(),
                 project_id: task.project_id.clone(),
                 task_id: task.id.clone(),
@@ -327,7 +331,8 @@ impl TaskService {
                 transition_log_id: new_uuid_v4(),
                 workflow_snapshot,
                 trigger_name: None,
-                triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
+                triggered_by: Actor::user(UserActionSource::BoardDrag),
+                bridge: Default::default(),
                 trigger_reason: "board reorder".to_owned(),
                 rejection: false,
                 expected_project_version: Some(expected_project_version),
@@ -340,14 +345,8 @@ impl TaskService {
             MoveTaskPersistence::Replayed(result) => Ok(*result),
             MoveTaskPersistence::Committed {
                 result,
-                transition_log,
+                transition_log: _,
             } => {
-                if let Some(event) =
-                    db::DomainEventRepo::get_event(&*self.db, &transition_log.id).await?
-                {
-                    DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                        .publish_committed(&event);
-                }
                 self.publish_move_event(&result);
                 TaskBoardRepo::complete_move_operation(
                     &*self.db,

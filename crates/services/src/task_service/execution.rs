@@ -27,7 +27,6 @@ pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc333
 pub(crate) use cascade::should_block_task_for_failed_execution;
 pub(crate) use cascade::{
     exact_review_for_execution, reviewer_execution_lacks_exact_review_binding,
-    terminal_review_is_bound_to_execution,
 };
 
 #[derive(Debug, Clone)]
@@ -156,6 +155,7 @@ pub(crate) fn pending_plan_publication_cleanup_owner(task: &Task) -> Result<Opti
 /// failure remains recoverable by the dispatcher.
 pub(crate) async fn cleanup_execution_plan_private_files(
     db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
     task: &Task,
     execution_id: &str,
 ) -> Result<()> {
@@ -177,33 +177,23 @@ pub(crate) async fn cleanup_execution_plan_private_files(
         // retired without inventing an untrusted filesystem path.
         return Ok(());
     };
-    crate::plan_artifact::discard_staged_execution_plan(
-        std::path::Path::new(&workspace.worktree_path),
-        execution_id,
-    )
-    .map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "failed to remove settled execution plan stage: {error}"
-        ))
-    })?;
-    if let Some(outbox) = executors::execution_outbox_path(
-        std::path::Path::new(&workspace.worktree_path),
-        execution_id,
-    ) {
-        match std::fs::remove_dir_all(&outbox) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "failed to remove settled execution plan outbox: {error}"
-                )));
-            }
-        }
-    }
+    let resolved = router.resolve(db, &workspace).await?;
+    crate::plan_artifact::ExecutionPlan::new(db, &resolved)
+        .discard(execution_id)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to remove settled execution plan stage: {error}"
+            ))
+        })?;
     Ok(())
 }
 
-pub(crate) async fn clear_stale_plan_publication_claim(db: &SqliteDb, task: &Task) -> Result<Task> {
+pub(crate) async fn clear_stale_plan_publication_claim(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
+    task: &Task,
+) -> Result<Task> {
     let Some(claim) = parse_plan_publication_claim(task)? else {
         return Ok(task.clone());
     };
@@ -215,7 +205,7 @@ pub(crate) async fn clear_stale_plan_publication_claim(db: &SqliteDb, task: &Tas
     // published for the state that created them. Remove them before the
     // marker: a crash between these steps leaves a harmless marker that the
     // next dispatcher pass can finish clearing, never an unowned candidate.
-    cleanup_execution_plan_private_files(db, task, &claim.execution_id).await?;
+    cleanup_execution_plan_private_files(db, router, task, &claim.execution_id).await?;
 
     TaskRepo::mutate_metadata(
         db,
@@ -765,13 +755,24 @@ impl TaskService {
         ) else {
             return Ok(crate::native_tools::ExecutionOutboxReport::default());
         };
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        // Daemon-owned outboxes are carried in the retained terminal report;
+        // their handles do not name files on the Forge host.
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            return Ok(crate::native_tools::ExecutionOutboxReport::default());
+        }
+        // The outbox sits in the Task root, beside the worktree.
+        let path = crate::workspace_manager::task_root_anchor(&resolved)?;
         let report = embedded
             .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
                 task_id: &task.id,
                 execution_id: &execution.id,
                 agent_id,
                 role: Some(execution.role.as_str()),
-                worktree_path: &workspace.worktree_path,
+                worktree_path: &path.to_string_lossy(),
             })
             .await;
         if report.worklog_entries > 0 || report.evidence_items > 0 {
@@ -805,7 +806,7 @@ async fn clear_execution_retry_metadata_inner(
     Ok(())
 }
 
-fn execution_retry_clear_mutations(
+pub(super) fn execution_retry_clear_mutations(
     task: &Task,
     clear_deferred_dispatch: bool,
 ) -> Result<Vec<db::TaskMetadataMutation>> {
@@ -813,32 +814,21 @@ fn execution_retry_clear_mutations(
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let mut mutations = Vec::new();
-    if let Some(expected_count) = metadata.extra.get("execution_retry_count").cloned() {
-        let mut nested = vec![
-            db::TaskMetadataMutation::Remove {
-                key: "execution_retry_count".to_owned(),
-            },
-            db::TaskMetadataMutation::Remove {
-                key: "last_execution_failure_at".to_owned(),
-            },
-            db::TaskMetadataMutation::Remove {
-                key: "last_execution_failure_execution_id".to_owned(),
-            },
-        ];
-        if clear_deferred_dispatch {
-            nested.push(db::TaskMetadataMutation::Remove {
-                key: "deferred_dispatch".to_owned(),
+    for key in [
+        "last_execution_failure_at",
+        "last_execution_failure_execution_id",
+    ] {
+        if let Some(expected) = metadata.extra.get(key).cloned() {
+            mutations.push(db::TaskMetadataMutation::RemoveIf {
+                key: key.into(),
+                expected,
             });
         }
-        mutations.push(db::TaskMetadataMutation::CompareAndMutate {
-            key: "execution_retry_count".to_owned(),
-            expected: expected_count,
-            mutations: nested,
-        });
-    } else if clear_deferred_dispatch {
+    }
+    if clear_deferred_dispatch {
         if let Some(expected) = metadata.extra.get("deferred_dispatch").cloned() {
             mutations.push(db::TaskMetadataMutation::RemoveIf {
-                key: "deferred_dispatch".to_owned(),
+                key: "deferred_dispatch".into(),
                 expected,
             });
         }
@@ -961,6 +951,7 @@ pub(super) async fn set_planning_awaiting_review_metadata(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) async fn planning_review_matches_current_state_entry(
     db: &SqliteDb,
     task: &Task,

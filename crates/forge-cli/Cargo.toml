@@ -9,18 +9,24 @@ name = "forge"
 path = "src/main.rs"
 
 [dependencies]
+executors = { path = "../executors" }
 api = { path = "../api" }
 cli-adapters = { path = "../cli-adapters" }
 clap = { version = "4", features = ["derive"] }
 config = { path = "../config" }
 db = { path = "../db" }
 events = { path = "../events" }
+fs2 = "0.4"
 review = { path = "../review" }
 services = { path = "../services" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+tempfile = "3"
 
 [lints]
 workspace = true

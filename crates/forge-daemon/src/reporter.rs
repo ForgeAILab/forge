@@ -12,6 +12,7 @@ pub async fn run(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
     labels: BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     interval_seconds: u64,
     active_executions: ActiveExecutionTracker,
     mut shutdown: watch::Receiver<bool>,
@@ -27,7 +28,7 @@ pub async fn run(
                 }
             }
             _ = ticker.tick() => {
-                match report_once(&client, &workspace_root, &labels, &active_executions).await {
+                match report_once(&client, &workspace_root, &labels, max_concurrent_runs, &active_executions).await {
                     Ok(daemon) => {
                         tracing::info!(
                             daemon_id = %daemon.id,
@@ -52,18 +53,32 @@ pub async fn report_once(
     client: &DaemonClient,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     active_executions: &ActiveExecutionTracker,
 ) -> Result<DaemonResponse> {
-    let request = report_request(workspace_root, labels, active_executions).await;
-    report_with_retry(client, &request).await
+    let request = report_request(
+        workspace_root,
+        labels,
+        max_concurrent_runs,
+        active_executions,
+    )
+    .await;
+    let daemon = report_with_retry(client, &request).await?;
+    // The server holds every machine to one floor; the collector of this
+    // root evicts to it, and new worktrees are refused under it.
+    forge_client::daemon_workspace::gc::accept_floor(workspace_root, daemon.workspace_floor);
+    Ok(daemon)
 }
 
 pub async fn report_request(
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     active_executions: &ActiveExecutionTracker,
 ) -> DaemonReportRequest {
     DaemonReportRequest {
+        max_concurrent_runs: Some(max_concurrent_runs),
+        disk: forge_client::daemon_workspace::gc::disk_report(workspace_root),
         detected_clis: detect::detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),

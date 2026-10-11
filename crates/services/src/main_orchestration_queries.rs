@@ -13,10 +13,12 @@ use db::{
 };
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
-    MAIN_CHARTER_DIFF_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
+    MAIN_CHARTER_DIFF_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
 };
-use serde::Deserialize;
+use operation_registry::main_reads::{
+    CharterDiffQuery, CharterProjectionQuery, CharterReadQuery, GenesisProjectAgentsQuery,
+};
 use serde_json::{json, Value};
 use sqlx::Row;
 
@@ -32,6 +34,7 @@ use crate::{
 pub struct MainOrchestrationQueryService {
     db: Arc<SqliteDb>,
     authorization: OrchestrationAuthorizationService,
+    admitted: Option<operation_registry::authority::EffectiveAuthority>,
 }
 
 impl MainOrchestrationQueryService {
@@ -39,50 +42,65 @@ impl MainOrchestrationQueryService {
         Self {
             authorization: OrchestrationAuthorizationService::new(Arc::clone(&db)),
             db,
+            admitted: None,
         }
     }
 
-    /// Execute one server-bound Main Charter query.
-    pub async fn execute(
+    pub(crate) fn for_admission(
         &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-        operation: &str,
-        arguments: Value,
-    ) -> Result<Value> {
-        match operation {
-            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => {
-                self.project_agents(actor_identity_id, scope, arguments)
-                    .await
-            }
-            MAIN_CHARTER_READ_OPERATION => {
-                self.charter_read(actor_identity_id, scope, arguments).await
-            }
-            MAIN_CHARTER_READINESS_OPERATION => {
-                self.charter_readiness(actor_identity_id, scope, arguments)
-                    .await
-            }
-            MAIN_CHARTER_DIFF_OPERATION => {
-                self.charter_diff(actor_identity_id, scope, arguments).await
-            }
-            MAIN_CHARTER_APPROVAL_TARGET_OPERATION => {
-                self.charter_approval_target(actor_identity_id, scope, arguments)
-                    .await
-            }
-            _ => Err(ServiceError::invalid_operation(
-                "Main Charter query operation is not implemented",
-            )),
+        admitted: Option<&operation_registry::authority::EffectiveAuthority>,
+    ) -> Self {
+        let mut service = self.clone();
+        service.admitted = admitted.cloned();
+        service
+    }
+    async fn main_target(&self, actor: &str, scope: &CanonicalScope) -> Result<String> {
+        if !matches!(
+            scope.scope_type,
+            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+        ) {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "global Main Agent operation is unavailable in this scope".into(),
+            });
         }
+        let resolved;
+        let authority = if let Some(admitted) = &self.admitted {
+            admitted
+        } else {
+            resolved = self
+                .db
+                .resolve_effective_authority(
+                    actor,
+                    None,
+                    if scope.scope_type == CanonicalScopeType::Account {
+                        "account"
+                    } else {
+                        "agent_chat"
+                    },
+                    &scope.scope_id,
+                    "deny",
+                )
+                .await?;
+            &resolved
+        };
+        authority
+            .evaluate(
+                operation_registry::READ_CATALOG
+                    .lookup("charter.read")
+                    .unwrap(),
+            )
+            .map_err(|_| ServiceError::AuthorizationDenied {
+                message: "Main query authority is unavailable in this scope".into(),
+            })?;
+        self.authorization.main_account_target(scope).await
     }
 
-    async fn project_agents(
+    pub async fn project_agents(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        query: GenesisProjectAgentsQuery,
     ) -> Result<Value> {
-        let query: GenesisProjectAgentsQuery =
-            parse_query(&arguments, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION)?;
         let (_account_id, session) = self
             .main_genesis(
                 actor_identity_id,
@@ -103,18 +121,14 @@ impl MainOrchestrationQueryService {
         }))
     }
 
-    async fn charter_read(
+    pub async fn charter_read(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        query: CharterReadQuery,
     ) -> Result<Value> {
-        let query: CharterReadQuery = parse_query(&arguments, MAIN_CHARTER_READ_OPERATION)?;
-        let account_id = self
-            .authorization
-            .main_account_id(actor_identity_id, scope)
-            .await?;
-        let limit = query.limit.unwrap_or(20).clamp(1, 50) as i64;
+        let account_id = self.main_target(actor_identity_id, scope).await?;
+        let limit = 20_i64;
         let rows = sqlx::query(
             "SELECT id, genesis_session_id, current_draft_revision_id,
                     current_approved_revision_id, project_mode, maturity,
@@ -154,13 +168,12 @@ impl MainOrchestrationQueryService {
         }))
     }
 
-    async fn charter_readiness(
+    pub async fn charter_readiness(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        projection: CharterProjectionQuery,
     ) -> Result<Value> {
-        let projection: CharterProjectionQuery = parse_query(&arguments, "charter.readiness")?;
         let (_account_id, session) = self
             .main_genesis(
                 actor_identity_id,
@@ -201,13 +214,12 @@ impl MainOrchestrationQueryService {
         }))
     }
 
-    async fn charter_diff(
+    pub async fn charter_diff(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        projection: CharterDiffQuery,
     ) -> Result<Value> {
-        let projection: CharterDiffQuery = parse_query(&arguments, "charter.diff")?;
         let (_account_id, session) = self
             .main_genesis(
                 actor_identity_id,
@@ -253,14 +265,12 @@ impl MainOrchestrationQueryService {
         }))
     }
 
-    async fn charter_approval_target(
+    pub async fn charter_approval_target(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        projection: CharterProjectionQuery,
     ) -> Result<Value> {
-        let projection: CharterProjectionQuery =
-            parse_query(&arguments, "charter.approval_target")?;
         let (_account_id, session) = self
             .main_genesis(
                 actor_identity_id,
@@ -327,10 +337,7 @@ impl MainOrchestrationQueryService {
         session_id: Option<&str>,
         charter_id: Option<&str>,
     ) -> Result<(String, api_types::ProductGenesisSession)> {
-        let account_id = self
-            .authorization
-            .main_account_id(actor_identity_id, scope)
-            .await?;
+        let account_id = self.main_target(actor_identity_id, scope).await?;
         let session_id = match session_id {
             Some(session_id) if !session_id.trim().is_empty() => session_id.to_owned(),
             _ => {
@@ -410,37 +417,6 @@ impl MainOrchestrationQueryService {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CharterProjectionQuery {
-    #[serde(default)]
-    genesis_session_id: Option<String>,
-    charter_id: String,
-    revision_id: String,
-    content_digest: String,
-    render_digest: String,
-    expected_charter_version: i64,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct CharterReadQuery {
-    #[serde(default)]
-    charter_id: Option<String>,
-    #[serde(default)]
-    revision_id: Option<String>,
-    #[serde(default)]
-    genesis_session_id: Option<String>,
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct GenesisProjectAgentsQuery {
-    #[serde(default)]
-    genesis_session_id: Option<String>,
-}
-
 fn selection_json(selection: crate::GenesisAgentSelection) -> Value {
     json!({
         "identity_id": selection.identity_id,
@@ -448,22 +424,6 @@ fn selection_json(selection: crate::GenesisAgentSelection) -> Value {
         "profile_revision_id": selection.profile_revision_id,
         "operating_skill_revision": selection.operating_skill_revision,
         "policy_digest": selection.policy_digest,
-    })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CharterDiffQuery {
-    #[serde(default)]
-    genesis_session_id: Option<String>,
-    charter_id: String,
-    base_revision_id: String,
-    candidate_revision_id: String,
-}
-
-fn parse_query<T: for<'de> Deserialize<'de>>(arguments: &Value, operation: &str) -> Result<T> {
-    serde_json::from_value(arguments.clone()).map_err(|error| {
-        ServiceError::invalid_operation(format!("{operation} query arguments are invalid: {error}"))
     })
 }
 

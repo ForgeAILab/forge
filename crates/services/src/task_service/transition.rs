@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::engine::WorkflowAuthority;
-use api_types::{Actor, SystemComponent, UserActionSource};
+use api_types::{Actor, SystemComponent};
 use db::UpdateTask;
 
 impl TaskService {
@@ -10,7 +10,20 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
-        self.transition_inner(task_id.into(), new_status, options.into(), None)
+        let task_id: String = task_id.into();
+        let options: TransitionOptions = options.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "transition",
+                    serde_json::json!([task_id, new_status, options]),
+                    new_status == "cancelled",
+                )
+                .await;
+        }
+
+        self.transition_inner(task_id, new_status, options, None)
             .await
     }
 
@@ -21,22 +34,33 @@ impl TaskService {
         options: impl Into<TransitionOptions>,
         execution_id: &str,
     ) -> Result<TransitionResult> {
-        self.transition_inner(
-            task_id.into(),
-            new_status,
-            options.into(),
-            Some(execution_id),
-        )
-        .await
+        let task_id: String = task_id.into();
+        let options: TransitionOptions = options.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "transition_with_plan_publication",
+                    serde_json::json!([task_id, new_status, options, execution_id]),
+                    new_status == "cancelled",
+                )
+                .await;
+        }
+
+        self.transition_inner(task_id, new_status, options, Some(execution_id))
+            .await
     }
 
     async fn transition_inner(
         &self,
         task_id: String,
         new_status: TaskStatus,
-        options: TransitionOptions,
+        mut options: TransitionOptions,
         plan_publication_execution_id: Option<&str>,
     ) -> Result<TransitionResult> {
+        if Self::task_action_command_active() {
+            options.defer_dispatch_seconds = Some(0);
+        }
         let trigger_reason = options.reason.unwrap_or_else(|| "user action".to_owned());
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -118,19 +142,7 @@ impl TaskService {
             .as_deref()
             .and_then(|json| serde_json::from_str::<Value>(json).ok())
             .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_owned));
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
+        let engine = self.workflow_execution();
         let defer_dispatch_until = options
             .defer_dispatch_seconds
             .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
@@ -153,15 +165,12 @@ impl TaskService {
                     workflow_definition: project.workflow_definition.clone(),
                     clear_review_passed_at_on_commit,
                 }),
+                options.bridge,
             )
             .await?;
-        // Entry/after-enter hooks can update metadata without changing the
-        // Task version (for example, a manual review marker). Reload the
-        // committed row so the returned Task snapshot and its version carry
-        // the same state used by API readiness calculations.
-        let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        // The engine returns the requested transition's committed CAS
+        // snapshot. A concurrent writer cannot replace it in this response.
+        let mut task = result.task;
         if was_blocked {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
@@ -231,13 +240,6 @@ impl TaskService {
             .await
             {
                 Ok(updated) => task = updated,
-                Err(DbError::VersionConflict) => {
-                    // An on_enter hook (e.g. dispatch_role_follow_up) may have already
-                    // cleared the annotation and incremented the version; re-fetch.
-                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -267,8 +269,18 @@ impl TaskService {
         }
         self.reconcile_terminal_subtask(&task).await;
 
+        if let Some(persisted) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? {
+            if persisted.status == task.status && persisted.version == task.version {
+                task = persisted;
+            }
+        }
+        let pending_steps = db::TaskStepRepo::pending_steps(&*self.db, &task_id).await?;
+        if let Some(id) = &result.queued_step_id {
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
+        }
         Ok(TransitionResult {
             task,
+            pending_steps,
             review: result.review,
         })
     }
@@ -287,6 +299,12 @@ impl TaskService {
         if deferred.state != task.status {
             crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, &deferred)
                 .await?;
+            return Ok(false);
+        }
+        // A previous resume's hook step (or any other step) is still queued
+        // or running. Re-entering now would supersede it mid-merge; its
+        // settlement consumes the marker on success.
+        if db::TaskStepRepo::pending_steps(&*self.db, &task.id).await? > 0 {
             return Ok(false);
         }
 
@@ -327,18 +345,30 @@ impl TaskService {
             .iter()
             .any(|hook| hook.action == "run_merge")
         {
-            self.retry_merge_state_entry(
-                task,
-                &project,
-                &workflow,
-                "resuming integration after project pause",
-            )
-            .await
+            let engine = self.workflow_execution();
+            engine
+                .manual_override_transition_with_authority(
+                    &task.id,
+                    &task.status,
+                    task.version,
+                    &workflow,
+                    actor.clone(),
+                    "resuming integration after project pause",
+                    false,
+                    Some(WorkflowAuthority {
+                        project_version: project.version,
+                        workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
+                    }),
+                )
+                .await
+                .map(|_| ())
         } else if let Some(target) = workflow.auto_transition_target(&task.status) {
             self.transition(
                 task.id.clone(),
                 target.to_owned(),
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some("resuming integration after project pause".to_owned()),
                     triggered_by: actor,
@@ -370,6 +400,10 @@ impl TaskService {
             return Err(error);
         }
 
+        if db::TaskStepRepo::pending_steps(&*self.db, &task.id).await? > 0 {
+            return Ok(true);
+        }
+
         if paused_integration_transition_failed(&self.db, &task.id, &prior_transition_ids).await? {
             // The transition may have advanced `review -> merging` before its
             // `run_merge` hook failed. Move the marker to the committed state
@@ -383,54 +417,6 @@ impl TaskService {
         // retry is harmlessly idempotent.
         crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, &deferred).await?;
         Ok(true)
-    }
-
-    /// Re-enter an integration gate through the engine's ordinary entry hooks
-    /// and cascades. The same-state transition claims the observed Task version
-    /// before any merge side effect and records a fresh entry for the grace.
-    pub(crate) async fn retry_merge_state_entry(
-        &self,
-        task: &Task,
-        project: &db::Project,
-        workflow: &api_types::WorkflowDefinition,
-        reason: &str,
-    ) -> Result<()> {
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
-        engine
-            .manual_override_transition_with_authority(
-                &task.id,
-                &task.status,
-                task.version,
-                workflow,
-                Actor::system(SystemComponent::TaskDispatcher),
-                reason,
-                false,
-                Some(WorkflowAuthority {
-                    project_version: project.version,
-                    workflow_definition: project.workflow_definition.clone(),
-                    clear_review_passed_at_on_commit: false,
-                }),
-            )
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) fn merge_hook_available(&self, task_id: &str) -> bool {
-        self.merge_service
-            .as_ref()
-            .is_some_and(|service| !service.merge_hook_running(task_id))
     }
 
     async fn retain_paused_integration_marker(&self, task_id: &str) -> Result<()> {
@@ -487,12 +473,21 @@ impl TaskService {
             ));
         };
 
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
+        let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            &workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        let bytes = match resolved
+            .backend
+            .read(&resolved.placement, "../plan.md", 1_048_576)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(&*error, ServiceError::InvalidOperation { message } if message == "plan artifact not found") =>
+            {
                 return Err(ServiceError::invalid_operation(
                     "planning cannot be approved before a plan artifact exists",
                 ));
@@ -503,6 +498,12 @@ impl TaskService {
                 )));
             }
         };
+        let content = String::from_utf8(bytes).map_err(|_| {
+            ServiceError::invalid_operation(
+                "planning plan artifact is unreadable: failed to read plan artifact: stream did not contain valid UTF-8",
+            )
+        })?;
+        let artifact = crate::plan_artifact::parse_plan_markdown(&content);
         let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
         if summary.total == 0 {
             return Err(ServiceError::invalid_operation(
@@ -525,140 +526,7 @@ impl TaskService {
     /// Resolve human-readiness from the same Task snapshot whose version will
     /// be returned to the caller.
     pub async fn is_task_awaiting_human(&self, task: &Task) -> Result<bool> {
-        if task.blocked_json.is_some() {
-            return Ok(true);
-        }
-        if task.entry_barrier_is_running() {
-            // The state's blocking before_enter hooks are still running. The
-            // status change is visible but the transition has not settled: the
-            // engine clears the barrier (bumping the task version) once they
-            // finish, so a gate decision taken now would race that write.
-            return Ok(false);
-        }
-        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!("invalid task metadata: {error}"))
-        })?;
-        if metadata
-            .extra
-            .get("awaiting_human")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(true);
-        }
-        if task.status == crate::workflow::default_states::REVIEW {
-            let latest_review = ReviewRepo::list_by_task(&*self.db, &task.id)
-                .await?
-                .into_iter()
-                .max_by_key(|review| review.attempt_number);
-            if latest_review
-                .as_ref()
-                .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-            {
-                return Ok(true);
-            }
-            // A *failed* review parked in `review` is also waiting on a
-            // person, and nothing said so. The dispatcher cannot re-dispatch
-            // a reviewer while the latest review is `Failed`
-            // (`reviewer_dispatch_ready` requires a `Running` review), so the
-            // Task sits reporting "Waiting for reviewer dispatch" at `info`
-            // severity with `awaiting_human: false` while only a human
-            // `retry_hook` can move it.
-            if latest_review
-                .as_ref()
-                .is_some_and(|review| review.status == ReviewStatus::Failed)
-                && sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
-                )
-                .bind(&task.id)
-                .fetch_one(self.db.pool())
-                .await?
-                    == 0
-            {
-                return Ok(true);
-            }
-        }
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        let Some(state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(false);
-        };
-        if task.status == crate::workflow::default_states::PLANNING {
-            let Some(role_name) = state.role.as_deref() else {
-                return Ok(false);
-            };
-            let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                    .await?;
-            return Ok(assignment.as_ref().is_some_and(|assignment| {
-                assignment.assignee_type == Some(AssigneeKind::User)
-                    && assignment.assignee_id.is_some()
-            }));
-        }
-        if state.kind != api_types::StateKind::Gate {
-            return Ok(false);
-        }
-        let transition_log = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
-        let entered_at = transition_log
-            .iter()
-            .rev()
-            .find(|entry| entry.to_state == task.status)
-            .map(|entry| entry.created_at.as_str())
-            .unwrap_or(task.created_at.as_str());
-        let has_decision_since_entry = transition_log.iter().any(|entry| {
-            entry.from_state == task.status
-                && entry.created_at.as_str() >= entered_at
-                && (entry.trigger_reason.starts_with("gate approved")
-                    || entry.trigger_reason.starts_with("gate rejected"))
-        });
-        if let Some(gate_config) = state
-            .gate_config
-            .as_ref()
-            .filter(|gate_config| gate_config.requires_user_approval())
-        {
-            if gate_config.optional_when_unassigned() {
-                let Some(role_name) = state.role.as_deref() else {
-                    return Ok(false);
-                };
-                let assignment =
-                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                        .await?;
-                let assigned = assignment.as_ref().is_some_and(|assignment| {
-                    assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
-                });
-                if !assigned {
-                    return Ok(false);
-                }
-            }
-            return Ok(!has_decision_since_entry);
-        }
-
-        let Some(role_name) = state.role.as_deref() else {
-            return Ok(false);
-        };
-
-        let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?;
-        let Some(assignment) = role_assignments
-            .iter()
-            .find(|assignment| assignment.role_name == role_name)
-        else {
-            return Ok(false);
-        };
-        if assignment.assignee_type != Some(AssigneeKind::User) {
-            return Ok(false);
-        }
-
-        Ok(!has_decision_since_entry)
+        Ok(task.condition.read().human_wait)
     }
 
     pub async fn executor_attempt_count(&self, task_id: &str) -> Result<i64> {
@@ -691,21 +559,16 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == default_states::REVIEW);
-        let max_retries = super::config::runtime_retry_budget(
+        let max_retries = db::budget::limit(
             &task,
-            super::config::RetryBudgetKind::Review,
+            db::budget::Kind::Review,
             review_state.map(|state| &state.config),
             review_state.and_then(|state| state.gate_config.as_ref()),
         )?;
 
-        let used = crate::task_diagnostics::count_gate_rejections_for_task(
-            &self.db,
-            task_id,
-            default_states::REVIEW,
-        )
-        .await?;
-        let remaining = i64::from(max_retries) - used;
-        Ok(remaining.clamp(0, i64::from(i32::MAX)) as i32)
+        let used =
+            db::budget::spent(self.db.pool(), task_id, db::budget::Kind::Review.key()).await?;
+        Ok(db::budget::remaining(i64::from(max_retries), used).min(i64::from(i32::MAX)) as i32)
     }
 
     pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -729,18 +592,27 @@ impl TaskService {
             .await
     }
 
-    async fn cancel_task_with_options(
+    pub(crate) async fn cancel_task_with_options(
         &self,
         task_id: String,
         expected_version: Option<i64>,
         reason: String,
         actor: Actor,
     ) -> Result<Task> {
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "cancel_task_with_options",
+                    serde_json::json!([task_id, expected_version, reason, actor]),
+                    true,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         if let Some(expected_version) = expected_version {
             if expected_version != task.version {
                 return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
@@ -749,6 +621,13 @@ impl TaskService {
                 }));
             }
         }
+        // Cancel is the owner's exit and wins over a plan artifact that is
+        // still settling: the claim is abandoned (prior plan restored,
+        // staged files removed) and the cancel continues at the version that
+        // abandoning produced.
+        let task = self.abandon_plan_publication_for_cancel(task).await?;
+        let expected_version = expected_version.map(|_| task.version);
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -776,6 +655,7 @@ impl TaskService {
                 tracing::warn!(task_id = %task.id, %error, "failed to re-project cancelled prerequisite onto dependents");
             }
             self.reconcile_terminal_subtask(&task).await;
+            crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
             return TaskRepo::get_by_id(&*self.db, &task.id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task.id));
@@ -792,6 +672,7 @@ impl TaskService {
                 task_id,
                 cancel_target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: expected_version.unwrap_or(task.version),
                     reason: Some(reason.clone()),
                     triggered_by: actor.clone(),
@@ -801,6 +682,7 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
         // Re-read after the root transition hooks and cancel once more. Any
         // child execution that committed between the pre-cancel snapshot and
         // the root transition is now visible, while the transactional parent
@@ -821,6 +703,70 @@ impl TaskService {
         Ok(task)
     }
 
+    /// Give up a completed execution's unsettled plan publication so the
+    /// Task can be cancelled. A plan that cannot be restored does not keep
+    /// the Task alive: the claim is released anyway and the cancel proceeds.
+    pub(crate) async fn abandon_plan_publication_for_cancel(&self, task: Task) -> Result<Task> {
+        // A claim whose transition already committed (its state is no
+        // longer the Task's) authorizes nothing, but the transition guard
+        // refuses any claim it finds: clear it here instead of making the
+        // cancel wait for the scheduler to do so.
+        let task = super::execution::clear_stale_plan_publication_claim(
+            &self.db,
+            &self.workspace_backend_router,
+            &task,
+        )
+        .await?;
+        let Some(execution_id) = super::execution::active_plan_publication_claim_owner(&task)?
+        else {
+            return Ok(task);
+        };
+        if let Err(error) = self
+            .abandon_plan_publication_claim(&task, &execution_id)
+            .await
+        {
+            tracing::warn!(task_id = %task.id, %execution_id, %error, "plan publication could not be rolled back for a cancel; releasing its claim");
+            let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            if super::execution::active_plan_publication_claim_owner(&current)?.as_deref()
+                == Some(execution_id.as_str())
+            {
+                // The staged candidate must not outlive its claim: with no
+                // claim nothing would own (or ever remove) those files. A
+                // failure here is logged, not fatal: the Task is being
+                // cancelled and its workspace is cleaned up with it.
+                if let Err(error) = super::execution::cleanup_execution_plan_private_files(
+                    &self.db,
+                    &self.workspace_backend_router,
+                    &current,
+                    &execution_id,
+                )
+                .await
+                {
+                    tracing::warn!(task_id = %task.id, %execution_id, %error, "staged plan files could not be removed for a cancel");
+                }
+                super::execution::release_plan_publication_for_execution_id(
+                    &self.db,
+                    &current,
+                    &execution_id,
+                )
+                .await?;
+            }
+        }
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id))?;
+        // The settle may have committed its transition while the claim was
+        // being abandoned; what is left of the claim is then stale.
+        super::execution::clear_stale_plan_publication_claim(
+            &self.db,
+            &self.workspace_backend_router,
+            &current,
+        )
+        .await
+    }
+
     async fn repair_cancelled_coordination_children(
         &self,
         root: &Task,
@@ -832,83 +778,87 @@ impl TaskService {
         for child in children {
             self.cancel_running_executions_for_task(&child, reason, actor.clone())
                 .await?;
-            if !crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
-                Box::pin(self.cancel_task_as(child.id, actor.clone())).await?;
+            if crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
+                continue;
+            }
+            // The root's cancel has committed under the root lease. Each
+            // child's cancel is its own preempting step on the child's queue;
+            // the root never waits on a child's lease, so a busy child cannot
+            // turn the committed root cancel into an error or skip a sibling.
+            // A repeat root Cancel re-enqueues any child still not terminal.
+            if let Err(error) = self
+                .enqueue_task_command(
+                    &child.id,
+                    "cancel_task_with_options",
+                    serde_json::json!([child.id, Option::<i64>::None, "cancel task", actor]),
+                    true,
+                )
+                .await
+            {
+                tracing::warn!(root_id = %root.id, child_id = %child.id, %error, "failed to enqueue coordination child cancel");
             }
         }
         Ok(())
     }
 
-    pub async fn advance_to_next_state(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        validate_required("task_id", &task_id)?;
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
+    pub(crate) async fn advance_task_condition(
+        &self,
+        task: &Task,
+        workflow: &api_types::WorkflowDefinition,
+        target: String,
+        reason: String,
+        actor: Actor,
+    ) -> Result<Task> {
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "advance_task_condition",
+                    serde_json::json!([task.id, workflow, target, reason, actor]),
+                    false,
+                )
+                .await;
+        }
+        super::execution::ensure_plan_publication_transition_authority(task, None)?;
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
+            &self.db, task, workflow, &target,
+        )
+        .await?;
+        if workflow.state_kind(&target) != Some(api_types::StateKind::Terminal) {
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, task).await?;
+        }
+        self.cancel_running_executions_for_task(task, "cancelled by manual advance", actor.clone())
+            .await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::user(UserActionSource::ManualAdvance),
-        );
-        let target = next_workflow_state(&workflow, &task.status)?;
-        crate::task_hierarchy::ensure_coordination_root_target_ready(
-            &self.db, &task, &workflow, &target,
-        )
-        .await?;
-        if !matches!(
-            workflow.state_kind(&target),
-            Some(api_types::StateKind::Terminal)
-        ) {
-            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &task).await?;
-        }
-
-        self.cancel_running_executions_for_manual_advance(&task)
-            .await?;
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
+        let engine = self.workflow_execution();
         let result = engine
             .manual_override_transition_with_authority(
-                &task_id,
+                &task.id,
                 &target,
                 task.version,
-                &workflow,
-                Actor::user(UserActionSource::ManualAdvance),
-                "manual advance",
+                workflow,
+                actor,
+                &reason,
                 false,
-                Some(crate::workflow::engine::WorkflowAuthority {
+                Some(WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
                     clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?;
-        let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
-            && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+        let updated = clear_manual_advance_error_annotation(&self.db, task, result.task).await?;
+        if workflow.state_kind(&updated.status) == Some(api_types::StateKind::Terminal)
+            && workflow.cancellation_state.as_deref() != Some(updated.status.as_str())
         {
-            // Manual advance bypasses `transition()` entirely, so it needs
-            // its own success-path wake, mirroring the one added above.
-            if let Err(error) = self.wake_dependents_of_completed_task(&task).await {
-                tracing::warn!(task_id = %task.id, %error, "failed to wake dependents of completed task");
+            if let Err(error) = self.wake_dependents_of_completed_task(&updated).await {
+                tracing::warn!(task_id = %updated.id, %error, "failed to wake dependents of completed task");
             }
         }
-        self.reconcile_terminal_subtask(&task).await;
-        Ok(task)
+        self.reconcile_terminal_subtask(&updated).await;
+        Ok(updated)
     }
 
     pub async fn soft_delete(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -945,6 +895,20 @@ impl TaskService {
             },
         )
         .await?;
+        // A deleted Task never runs again: its directories are reclaimed on
+        // the next cleanup tick, after anything still running has stopped.
+        if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+            if let Some(workspace) =
+                db::WorkspaceRepo::get_by_task_id(&*self.db, &deleted.id).await?
+            {
+                if let Err(error) = scheduler
+                    .schedule(&workspace.id, std::time::Duration::ZERO)
+                    .await
+                {
+                    tracing::warn!(task_id = %deleted.id, %error, "cleanup of a deleted Task not scheduled");
+                }
+            }
+        }
 
         self.publish(ForgeEvent {
             event_type: "task.deleted".to_owned(),
@@ -1058,15 +1022,6 @@ impl TaskService {
         Ok(())
     }
 
-    async fn cancel_running_executions_for_manual_advance(&self, task: &Task) -> Result<()> {
-        self.cancel_running_executions_for_task(
-            task,
-            "cancelled by manual advance",
-            Actor::user(UserActionSource::ManualAdvance),
-        )
-        .await
-    }
-
     async fn cancel_running_executions_for_task(
         &self,
         task: &Task,
@@ -1101,7 +1056,7 @@ impl TaskService {
     }
 }
 
-fn next_workflow_state(
+pub(crate) fn next_workflow_state(
     workflow: &api_types::WorkflowDefinition,
     current_status: &str,
 ) -> Result<String> {
@@ -1157,26 +1112,23 @@ async fn clear_manual_advance_error_annotation(
         return Ok(advanced_task);
     }
 
-    TaskRepo::update(
-        db,
-        UpdateTask {
-            id: advanced_task.id.clone(),
-            expected_version: advanced_task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(None),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .map_err(Into::into)
+    // Compare the annotation, not the version: the Advance's own queued step
+    // may already have moved the Task. A replaced annotation is a no-op,
+    // never a post-commit 409. The event shares the clear's transaction.
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    let cleared = db::task_writer::TaskQuery::new(db,&advanced_task.id,"UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
+        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
+        .execute_in_tx(&mut tx).await?.require_applied()?;
+    let current = db
+        .get_task_in_tx(&mut tx, &advanced_task.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", advanced_task.id.clone()))?;
+    if cleared == 1 {
+        let event = db::CreateDomainEvent::task_interruption_changed(&current);
+        db::DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
+    }
+    tx.commit().await?;
+    Ok(current)
 }
 
 pub(super) async fn clear_manual_review_awaiting_metadata(
@@ -1349,6 +1301,7 @@ mod tests {
         // a Task stuck in `merging` advertising no way out at all.
         let now = db::now_rfc3339();
         let mut task = Task {
+            condition: Default::default(),
             id: "task".into(),
             project_id: "project".into(),
             parent_task_id: None,
@@ -1431,6 +1384,7 @@ mod tests {
     fn blocked_free_task(status: &str) -> Task {
         let now = db::now_rfc3339();
         Task {
+            condition: Default::default(),
             id: "task".into(),
             project_id: "project".into(),
             parent_task_id: None,
@@ -1458,6 +1412,140 @@ mod tests {
             version: 1,
             created_at: now.clone(),
             updated_at: now,
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn advance_annotation_clear_accepts_both_step_orderings() {
+        for step_wins in [false, true] {
+            let db = SqliteDb::new(db::create_sqlite_pool("sqlite::memory:").await.unwrap());
+            db::run_migrations(db.pool()).await.unwrap();
+            let now = now_rfc3339();
+            sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
+                .bind(&now)
+                .bind(&now)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task(id,project_id,title,status,error_annotation,created_at,updated_at) VALUES('t','p','t','todo','old annotation',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            let source = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            sqlx::query("UPDATE task SET status='planning',version=version+1 WHERE id='t'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let advanced = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            if step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            use db::TaskStepRepo;
+            let current = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            db.enqueue_task_mutation(
+                "t",
+                db::TaskMutation::TaskSetEntryBarrier {
+                    id: "t".into(),
+                    expected_version: current.version,
+                    entry_barrier_json: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            let lease = db
+                .claim_step(
+                    "advance-clear",
+                    Some("t"),
+                    &db::task_writer::lease_deadline(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let result = db::task_writer::in_task_step(
+                lease.clone(),
+                clear_manual_advance_error_annotation(&db, &source, advanced),
+            )
+            .await
+            .unwrap();
+            let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+            db.finish_step_in_tx(&mut tx, &lease, "done", None)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            db.release_step(&lease.id, "advance-clear").await.unwrap();
+            assert!(result.error_annotation.is_none());
+            if !step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let final_task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            assert_eq!(final_task.status, "in_progress");
+            assert!(final_task.error_annotation.is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+fn gate_decision_since_entry(entries: &[db::TransitionLog], state: &str, entered_at: &str) -> bool {
+    entries.iter().any(|entry| {
+        entry.from_state == state
+            && entry.created_at.as_str() >= entered_at
+            && matches!(
+                entry.bridge.bridge_kind,
+                Some(
+                    api_types::TransitionBridgeKind::GateApproved
+                        | api_types::TransitionBridgeKind::GateRejected
+                )
+            )
+    })
+}
+
+#[cfg(test)]
+mod typed_gate_tests {
+    use super::*;
+    #[test]
+    fn gate_decision_reader_uses_kind_with_custom_guidance_and_ignores_prefixes() {
+        let mut row = db::TransitionLog {
+            id: "decision".into(),
+            task_id: "task".into(),
+            from_state: "review".into(),
+            to_state: "review".into(),
+            trigger_name: None,
+            triggered_by: "user:api".into(),
+            bridge: Default::default(),
+            trigger_reason: "gate approved; gate rejected".into(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: "2026-10-05".into(),
+        };
+        assert!(!gate_decision_since_entry(
+            &[row.clone()],
+            "review",
+            "2026-10-05"
+        ));
+        for kind in [
+            api_types::TransitionBridgeKind::GateApproved,
+            api_types::TransitionBridgeKind::GateRejected,
+        ] {
+            row.bridge = api_types::TransitionBridge::new(kind);
+            row.trigger_reason = "Owner supplied custom guidance".into();
+            assert!(gate_decision_since_entry(
+                &[row.clone()],
+                "review",
+                "2026-10-05"
+            ));
+            assert!(!gate_decision_since_entry(
+                &[row.clone()],
+                "review",
+                "2026-10-06"
+            ));
         }
     }
 }

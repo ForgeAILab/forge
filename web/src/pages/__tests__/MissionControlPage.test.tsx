@@ -1,8 +1,13 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { MissionControlPage } from '@/pages/MissionControlPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { MissionControlResponse } from '@/features/federation/types'
+
+const retryTurn = vi.hoisted(() => vi.fn())
+const resolveAttention = vi.hoisted(() => vi.fn())
+const answerEscalation = vi.hoisted(() => vi.fn())
+const turnState = vi.hoisted(() => ({ live: false }))
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children, ...props }: { children: React.ReactNode } & Record<string, unknown>) => (
@@ -18,8 +23,31 @@ vi.mock('@/features/federation/hooks', () => ({
     dataUpdatedAt: Date.now(),
     refetch: vi.fn(),
   }),
+  useResolveAttentionMutation: () => ({
+    mutate: resolveAttention,
+    isPending: false,
+    isSuccess: false,
+    error: null,
+  }),
+  useAnswerEscalationMutation: () => ({
+    mutate: answerEscalation,
+    isPending: false,
+    isSuccess: false,
+    error: null,
+  }),
 }))
 vi.mock('@/features/agent-chat/hooks', () => ({
+  useAgentChatTurnsQuery: () => ({
+    data: turnState.live ? [{ status: 'leased' }] : [],
+    isLoading: false,
+    isError: false,
+  }),
+  useRetryAgentChatTurnMutation: () => ({
+    mutate: retryTurn,
+    isPending: false,
+    isSuccess: false,
+    error: null,
+  }),
   useAgentChatsQuery: () => ({
     data: { items: chatEntries },
     isLoading: false,
@@ -159,6 +187,34 @@ const data: MissionControlResponse = {
 }
 
 describe('MissionControlPage', () => {
+  it('renders conflict hot spots with the existing attention warning treatment', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'conflict_hotspot',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        summary: 'src/shared.rs conflicted in 3 Tasks this week',
+        recommended_action: 'split_hotspot',
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.getByText('Conflict Hotspot')).toBeTruthy()
+      expect(screen.getByText('src/shared.rs conflicted in 3 Tasks this week')).toBeTruthy()
+      expect(screen.getByText('Split Hotspot')).toBeTruthy()
+      expect(
+        screen
+          .getByText('Conflict Hotspot')
+          .closest('article')
+          ?.classList.contains('border-warning/30'),
+      ).toBe(true)
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
   it('prioritizes attention and review-ready work', () => {
     render(<MissionControlPage />)
     expect(screen.getByText('What needs your attention?')).toBeTruthy()
@@ -256,5 +312,148 @@ describe('MissionControlPage', () => {
     } finally {
       data.needs_attention = previous
     }
+  })
+
+  it('resolves an attention item with its version', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [{ ...previous[0], id: 'attention-hotspot', version: 7 }]
+    try {
+      render(<MissionControlPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+      expect(resolveAttention).toHaveBeenCalledWith({ id: 'attention-hotspot', expectedVersion: 7 })
+    } finally {
+      data.needs_attention = previous
+      resolveAttention.mockClear()
+    }
+  })
+
+  it('shows an escalation need and answers it from the card', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        id: 'attention-escalation',
+        category: 'human_input_required',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        summary: 'Blocker cannot-fix',
+        recommended_action: 'answer_escalation',
+        details: {
+          escalation_id: 'escalation-1',
+          need: '- Blocker cannot-fix (Task "Build login"; reason: disk full)',
+          task_ids: [],
+        },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(
+        screen.getByText('- Blocker cannot-fix (Task "Build login"; reason: disk full)'),
+      ).toBeTruthy()
+      const answer = screen.getByRole('button', { name: 'Answer' })
+      expect(answer.hasAttribute('disabled')).toBe(true)
+      fireEvent.change(screen.getByLabelText('Answer'), {
+        target: { value: 'Freed 20 GB on the host' },
+      })
+      fireEvent.click(answer)
+      expect(answerEscalation).toHaveBeenCalledWith({
+        projectId: 'project-1',
+        escalationId: 'escalation-1',
+        answer: 'Freed 20 GB on the host',
+      })
+    } finally {
+      data.needs_attention = previous
+      answerEscalation.mockClear()
+    }
+  })
+
+  it('re-drives the typed turn action from Attention with its version', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'retry_exhausted',
+        summary: 'Agent Chat turn failed: configuration_invalid',
+        recommended_action: 'retry_turn',
+        details: {
+          retry_action: {
+            kind: 'retry_turn',
+            chat_id: 'main-chat',
+            turn_id: 'turn-1',
+            expected_version: 4,
+          },
+        },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'Retry turn' }))
+      expect(retryTurn).toHaveBeenCalledWith({
+        turnId: 'turn-1',
+        input: {
+          expected_version: 4,
+          idempotency_key: 'agent-chat-turn-retry:turn-1:4',
+        },
+      })
+    } finally {
+      data.needs_attention = previous
+      retryTurn.mockClear()
+    }
+  })
+
+  it('disables the typed retry action while another turn is live', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'retry_exhausted',
+        summary: 'Agent Chat turn failed: configuration_invalid',
+        recommended_action: 'retry_turn',
+        details: {
+          retry_action: {
+            kind: 'retry_turn',
+            chat_id: 'main-chat',
+            turn_id: 'turn-1',
+            expected_version: 4,
+          },
+        },
+      },
+    ]
+    try {
+      turnState.live = true
+      render(<MissionControlPage />)
+      expect(screen.getByRole('button', { name: 'Retry turn' }).hasAttribute('disabled')).toBe(true)
+    } finally {
+      data.needs_attention = previous
+      retryTurn.mockClear()
+      turnState.live = false
+    }
+  })
+
+  it('does not enable retry from an untyped Attention recommendation', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [{ ...previous[0], recommended_action: 'retry_turn' }]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.queryByRole('button', { name: 'Retry turn' })).toBeNull()
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+  it('renders worker error kind and message without a processed-event counter', () => {
+    data.consumer_health = {
+      consumer_name: 'attention_projection',
+      last_sequence: 12,
+      last_success_at: null,
+      last_error_code: 'terminal',
+      last_error_message: 'Commitment transition rejected',
+      stale: false,
+      updated_at: '2026-10-02T00:00:00Z',
+    }
+    render(<MissionControlPage />)
+    expect(screen.getByText('Commitment transition rejected')).toBeTruthy()
+    expect(screen.queryByText('Processed events')).toBeNull()
+    expect(screen.queryByText('Stale')).toBeNull()
+    data.consumer_health = null
   })
 })

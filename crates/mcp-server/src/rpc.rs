@@ -38,7 +38,7 @@ pub(crate) async fn dispatch_with_context(
     match method {
         "initialize" => handle_initialize(),
         "notifications/initialized" => Ok(Value::Null),
-        "tools/list" => handle_tools_list(context),
+        "tools/list" => handle_tools_list(state, context).await,
         "tools/call" => {
             let params: ToolCallParams = parse_params(params).map_err(|error| {
                 error.with_call_context(
@@ -49,6 +49,43 @@ pub(crate) async fn dispatch_with_context(
             })?;
             if !known_tool(&params.name, context.project_id.is_some()) {
                 return Err(McpToolError::protocol(-32601, "method not found"));
+            }
+            // Scope first, without loading domain facts or decoding arguments.
+            let grant = operation_registry::authority::mcp_authority(
+                context.user_id.as_deref().unwrap_or_default(),
+                context.project_id.as_deref(),
+            );
+            let rule = operation_registry::authority::mcp_scope_rule(&params.name)
+                .ok_or_else(|| McpToolError::protocol(-32601, "method not found"))?;
+            grant
+                .evaluate(rule)
+                .map_err(|_| {
+                    McpToolError::new(-32001, "tool is outside the delegated MCP grant")
+                        .with_data(json!({"code":"mcp_scope_denied"}))
+                })
+                .map_err(|error| {
+                    error.with_call_context(
+                        &params.name,
+                        context.project_id.as_deref(),
+                        context.user_id.as_deref(),
+                    )
+                })?;
+            // Unmoved tools retain the base's admission path. Role facts are
+            // needed only for the moved Project-scoped projections.
+            if operation_registry::mcp::lookup(&params.name).is_some()
+                && context.project_id.is_some()
+            {
+                let admission = async {
+                    let authority = super::tools::registry::authority(state, context).await?;
+                    super::tools::registry::authorize(&authority, &params.name)
+                };
+                admission.await.map_err(|error| {
+                    error.with_call_context(
+                        &params.name,
+                        context.project_id.as_deref(),
+                        context.user_id.as_deref(),
+                    )
+                })?;
             }
             let arguments = match params.arguments {
                 Value::Null => json!({}),
@@ -367,6 +404,9 @@ async fn apply_project_scope(
 }
 
 fn tool_accepts_project_id(tool_name: &str) -> bool {
+    if let Some(spec) = operation_registry::mcp::lookup(tool_name) {
+        return spec.input.schema["properties"].get("project_id").is_some();
+    }
     matches!(
         tool_name,
         "forge_create_task"
@@ -375,11 +415,6 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
             | "forge_update_project"
             | "forge_update_project_lifecycle_hooks"
             | "forge_memory_search"
-            | "forge_get_project_agent"
-            | "forge_set_project_agent"
-            | "forge_list_agent_handoffs"
-            | "forge_get_agent_handoff"
-            | "forge_create_agent_handoff"
     )
 }
 
@@ -388,7 +423,7 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         "forge_get_task"
         | "forge_preview_prompt"
         | "forge_assign_agent"
-        | "forge_cancel_task"
+        | "forge_task_action"
         | "forge_get_task_diff"
         | "forge_list_executions"
         | "forge_update_task"
@@ -510,8 +545,31 @@ fn handle_initialize() -> Result<Value, McpToolError> {
     }))
 }
 
-fn handle_tools_list(context: &McpContext) -> Result<Value, McpToolError> {
-    Ok(json!({ "tools": descriptor_catalog(context.project_id.is_some()).clone() }))
+async fn handle_tools_list(state: &AppState, context: &McpContext) -> Result<Value, McpToolError> {
+    let authority = super::tools::registry::authority(state, context).await?;
+    let tools = descriptor_catalog(context.project_id.is_some())
+        .as_array()
+        .expect("tool catalog")
+        .iter()
+        .filter(|tool| {
+            super::tools::registry::authorize(&authority, tool["name"].as_str().expect("tool name"))
+                .is_ok()
+        })
+        .map(|tool| {
+            operation_registry::mcp::lookup(tool["name"].as_str().unwrap()).map_or_else(
+                || tool.clone(),
+                |spec| {
+                    spec.descriptor(
+                        context.project_id.is_some(),
+                        spec.field_authority
+                            .as_ref()
+                            .is_none_or(|rule| authority.evaluate(rule).is_ok()),
+                    )
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "tools": tools }))
 }
 
 fn tool_call_result(result: Value) -> Value {

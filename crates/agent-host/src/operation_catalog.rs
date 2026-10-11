@@ -45,17 +45,10 @@ pub const PROJECT_CHARTER_READ_OPERATION: &str = "project.charter";
 /// operating skill keeps only an index of these sections so the detailed
 /// doctrine stops occupying every turn's fixed prompt budget.
 pub const PROJECT_SKILL_SECTION_OPERATION: &str = "skill.section";
-/// The canonical doctrine section names. The read schema exposes this enum
-/// and the services provider must serve exactly these names; a drift between
-/// the two is caught by a services-side test.
-pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = &[
-    "research",
-    "documents",
-    "scope_change",
-    "tasks",
-    "milestones",
-    "release",
-];
+/// The canonical doctrine section names, owned by the `skill.section`
+/// operation spec. The services provider must serve exactly these names; a
+/// drift between the two is caught by a services-side test.
+pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = operation_registry::project_reads::SECTION_NAMES;
 pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
 /// Replace the Project's default independent review commands while
 /// preserving every other Project review-policy field.
@@ -65,16 +58,11 @@ pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
 pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
 pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
 pub const PROJECT_VALIDATION_OPERATION: &str = "project.validation";
+pub const PROJECT_ESCALATE_OPERATION: &str = "project.escalate";
 pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
 pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
 pub const TASK_ADAPTIVE_OPERATION: &str = "task.adaptive";
-pub const TASK_REVIEW_OPERATION: &str = "task.review";
-/// Cancel a non-terminal Task in the bound Project at an exact Task version.
-/// This is a normal lifecycle command, including for a healthy queued or
-/// running Task; `task.recover` remains reserved for work that has stopped.
-pub const TASK_CANCEL_OPERATION: &str = "task.cancel";
-
 /// Add or remove one prerequisite edge between two Tasks in the bound
 /// Project.
 ///
@@ -87,7 +75,7 @@ pub const TASK_DEPENDENCY_OPERATION: &str = "task.dependency";
 /// an expired lease, a lost runtime, a dispatch race -- leaves a perfectly good
 /// Task stranded; recovering it is what the Project Agent's own protocol asks
 /// for, and without this the only reachable remedy is a duplicate Task.
-pub const TASK_RECOVER_OPERATION: &str = "task.recover";
+pub const TASK_ACTION_OPERATION: &str = "task.action";
 /// Write the current execution's plan candidate. Forge publishes the
 /// candidate only after the execution completes successfully; this operation
 /// never edits the Task's canonical plan directly.
@@ -419,7 +407,7 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
         input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::SetupOnly,
+        setup: OperationSetupExposure::Always,
         supported_scopes: PROJECT_SCOPES,
         classification: OperationClassification::DirectCommand,
         permission: OperationPermission::ProposeProject,
@@ -492,6 +480,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
+        operation: PROJECT_ESCALATE_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeProject,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
         operation: PROJECT_READINESS_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
@@ -536,28 +535,6 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
-        operation: TASK_REVIEW_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_CANCEL_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
         operation: TASK_DEPENDENCY_OPERATION,
         surface: OperationSurface::Coordination,
         exposure: OperationExposure::GenericProposal,
@@ -569,7 +546,7 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
-        operation: TASK_RECOVER_OPERATION,
+        operation: TASK_ACTION_OPERATION,
         surface: OperationSurface::Coordination,
         // Coordination composes GenericProposal operations into
         // `forge_scope_propose`; a TypedProposal here would leave the
@@ -928,6 +905,7 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // revision and carries its own receipt. The `manual` source kind stays
         // outside this path -- a user attestation is only ever a user's.
         PROJECT_VALIDATION_OPERATION => action == Some("record"),
+        PROJECT_ESCALATE_OPERATION => payload.get("need").and_then(Value::as_str).is_some(),
         PROJECT_READINESS_OPERATION => action == Some("evaluate"),
         // Capturing an artifact the run produced is append-only and carries no
         // authority beyond the Task it is bound to.
@@ -937,14 +915,10 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // envelope: the doctrine directs the Agent to absorb a
         // verification-shaped Task by cancelling it and settling its checks
         // itself.
-        TASK_RECOVER_OPERATION => matches!(
-            action,
-            Some("resume_session")
-                | Some("reexecute")
-                | Some("reset_to_initial")
-                | Some("reset_retry_window")
-                | Some("cancel_task")
-        ),
+        TASK_ACTION_OPERATION => payload
+            .get("action")
+            .and_then(|action| serde_json::from_value::<api_types::TaskAction>(action.clone()).ok())
+            .is_some(),
         // A release candidate is a consequential approval/audit proposal even
         // though it does not perform the final immutable release itself.  It
         // must retain an AgentAction until the user-facing approval contract
@@ -954,30 +928,36 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
     }
 }
 
+/// Field names whose values Forge derives from the authenticated binding.
+/// Every authority guard starts from this one list: the dispatch guard below
+/// adds `project_id`, and native preparation adds its prompt-injection names
+/// (`typed_tools::reject_authority_overrides`).
+pub(crate) const SERVER_DERIVED_FIELDS: &[&str] = &[
+    "actor_identity_id",
+    "identity_id",
+    "scope_type",
+    "scope_id",
+    "authority",
+    "permission",
+    "workspace",
+    "workspace_path",
+    "workspace_lease",
+    "repository_path",
+    "repository_url",
+    "credential",
+    "target_type",
+    "target_id",
+];
+
 /// Return whether a payload attempts to supply authority or scope that Forge
 /// must derive from the authenticated binding.
 #[must_use]
 pub fn contains_authority_override(value: &Value) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor_identity_id",
-        "identity_id",
-        "scope_type",
-        "scope_id",
-        "project_id",
-        "authority",
-        "permission",
-        "workspace",
-        "workspace_path",
-        "workspace_lease",
-        "repository_path",
-        "repository_url",
-        "credential",
-        "target_type",
-        "target_id",
-    ];
     match value {
         Value::Object(object) => object.iter().any(|(key, nested)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_authority_override(nested)
+            key == "project_id"
+                || SERVER_DERIVED_FIELDS.contains(&key.as_str())
+                || contains_authority_override(nested)
         }),
         Value::Array(values) => values.iter().any(contains_authority_override),
         _ => false,
@@ -1058,7 +1038,6 @@ fn leaked_operation_name(operation: &str) -> &'static str {
         "delivery.read" => "delivery.read",
         "web.search" => "web.search",
         TASK_PROPOSE_OPERATION => TASK_PROPOSE_OPERATION,
-        TASK_REVIEW_OPERATION => TASK_REVIEW_OPERATION,
         "message.propose" => "message.propose",
         "message.send" => "message.send",
         "commitment.propose" => "commitment.propose",
@@ -1101,10 +1080,8 @@ mod tests {
             vec![
                 TASK_PROPOSE_OPERATION,
                 TASK_ADAPTIVE_OPERATION,
-                TASK_REVIEW_OPERATION,
-                TASK_CANCEL_OPERATION,
                 TASK_DEPENDENCY_OPERATION,
-                TASK_RECOVER_OPERATION,
+                TASK_ACTION_OPERATION,
             ]
         );
 
@@ -1122,7 +1099,7 @@ mod tests {
 
         // The permission is part of the decision, not decoration.
         assert!(!is_coordination_direct_command(
-            TASK_CANCEL_OPERATION,
+            TASK_ACTION_OPERATION,
             "read_project"
         ));
         assert!(!is_coordination_direct_command(

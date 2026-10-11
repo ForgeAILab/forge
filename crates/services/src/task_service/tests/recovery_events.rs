@@ -2,7 +2,7 @@ use super::helpers::*;
 use super::*;
 
 #[tokio::test]
-async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
+async fn test_retry_budget_reset_publishes_recovery_and_resume_events() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
@@ -34,9 +34,15 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
     let mut rx = event_bus.subscribe();
 
     service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
             Some("reason".to_owned()),
             None,
         )
@@ -60,7 +66,7 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
         .find(|event| {
             matches!(
                 &event.context,
-                EventContext::RecoveryApplied { action, .. } if action == "reset_retry_window"
+                EventContext::RecoveryApplied { action, .. } if action == "retry"
             )
         })
         .expect("reset retry window recovery event");
@@ -75,7 +81,7 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
         } => {
             assert_eq!(event_project_id, &project_id);
             assert_eq!(task_id, &task.id);
-            assert_eq!(action, "reset_retry_window");
+            assert_eq!(action, "retry");
             assert_eq!(
                 state.as_deref(),
                 Some(crate::workflow::default_states::REVIEW)
@@ -89,7 +95,7 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
         events.iter().any(|event| {
             matches!(
                 &event.context,
-                EventContext::RecoveryApplied { action, .. } if action == "resume_process"
+                EventContext::RecoveryApplied { action, .. } if action == "retry"
             )
         }),
         "reset_retry_window should resume process and publish resume_process recovery event"
@@ -131,7 +137,7 @@ async fn seed_assigned_task(db: &SqliteDb, project_id: &str, agent_id: &str) -> 
 }
 
 #[tokio::test]
-async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
+async fn test_restart_clears_assignee_after_workspace_failure() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -153,9 +159,9 @@ async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
         .expect("task fails");
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetToInitial,
+            api_types::TaskAction::Restart { reason: None },
             None,
             None,
         )
@@ -169,7 +175,7 @@ async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
 }
 
 #[tokio::test]
-async fn test_reset_to_initial_keeps_assignee_for_non_workspace_failure() {
+async fn test_restart_keeps_assignee_for_non_workspace_failure() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -189,9 +195,9 @@ async fn test_reset_to_initial_keeps_assignee_for_non_workspace_failure() {
         .expect("task fails");
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetToInitial,
+            api_types::TaskAction::Restart { reason: None },
             None,
             None,
         )

@@ -2,9 +2,11 @@ use serde_json::{json, Value};
 
 pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
     json!([
+        tool_descriptor("forge_project_escalate", services::project_escalation::ESCALATE_DESCRIPTION,
+            json!({"need":{"type":"string","minLength":1,"maxLength":4096},"task_ids":{"type":"array","maxItems":100,"items":{"type":"string"}},"dedupe_key":{"type":"string","minLength":1}}), &["need","dedupe_key"]),
         tool_descriptor(
             "forge_create_task",
-            "Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency.",
+            &format!("Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency. Name owned repository-relative paths in the description; keep parallel Task files disjoint and use depends_on_ids to order shared-file edits. {}", services::operating_skills::merge_friendly_task_guidance()),
             json!({
                 "project_id": { "type": "string" },
                 "title": { "type": "string" },
@@ -95,12 +97,10 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             &["task_id", "agent_id"],
         ),
         tool_descriptor(
-            "forge_cancel_task",
-            "Cancel a task.",
-            json!({
-                "task_id": { "type": "string" }
-            }),
-            &["task_id"],
+            "forge_task_action",
+            "Apply one of the Task's current available_actions at an exact version.",
+            json!({ "task_id": { "type": "string" }, "action": api_types::task_action_schema(), "version": { "type": "integer" } }),
+            &["task_id", "action", "version"],
         ),
         tool_descriptor(
             "forge_get_task_diff",
@@ -135,7 +135,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_transition_task",
-            "Transition a task to another status.",
+            "Transition a task to another status. Returns the committed Task; pending_steps counts follow-ups that run asynchronously.",
             json!({
                 "task_id": { "type": "string" },
                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "merging", "merge_failed", "done", "cancelled", "blocked"] },
@@ -143,43 +143,10 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             }),
             &["task_id", "status", "version"],
         ),
-        tool_descriptor(
-            "forge_register_agent",
-            "Register an account-owned agent executor from account-scoped MCP. Pinning a daemon requires an administrator.",
-            json!({
-                "name": { "type": "string" },
-                "executor_type": { "type": "string", "enum": ["shell", "codex", "claude_code", "cursor", "gemini", "opencode", "smith"] },
-                "daemon_id": { "type": "string" }
-            }),
-            &["name", "executor_type"],
-        ),
-        tool_descriptor(
-            "forge_list_agents",
-            "List the authenticated account's agents plus global agents from account-scoped MCP.",
-            json!({
-                "status": { "type": "string", "enum": ["idle", "busy", "error", "offline"] },
-                "cursor": { "type": "string" },
-                "limit": { "type": "integer" }
-            }),
-            &[],
-        ),
-        tool_descriptor(
-            "forge_list_projects",
-            "List projects.",
-            json!({
-                "cursor": { "type": "string" },
-                "limit": { "type": "integer" }
-            }),
-            &[],
-        ),
-        tool_descriptor(
-            "forge_create_project",
-            "Create a project owned by the authenticated MCP user. The creator is atomically added as the Project owner and can immediately manage Project-local resources.",
-            json!({
-                "name": { "type": "string" }
-            }),
-            &["name"],
-        ),
+        operation_registry::mcp::lookup("forge_register_agent").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_list_agents").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_list_projects").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_create_project").unwrap().descriptor(scoped_project, true),
         tool_descriptor(
             "forge_get_project",
             "Get a project by id, including settings and lifecycle hooks.",
@@ -304,12 +271,12 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_create_sub_tasks",
-            "Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; children share its workspace, run serially in array order, and can be assigned to different agents. Responses include each child's role_assignments. Array order is not a dependency graph.",
+            &format!("Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; its coder is retained as the default worker, while children may override it. Children share the root workspace and run serially in array order. Responses include each child's stored role_assignments. Array order is not a dependency graph. {}", services::operating_skills::merge_friendly_task_guidance()),
             json!({
                 "parent_task_id": { "type": "string", "description": "Root coordination task; nested subtasks are not supported" },
                 "subtasks": {
                     "type": "array",
-                    "description": "Children in execution order. Assign implementation agents per child, not to the coordination root.",
+                    "description": "Children in execution order. A child assignee overrides the coordination root's coder default worker.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -345,131 +312,20 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             }),
             &["parent_task_id", "ordered_ids"],
         ),
-        tool_descriptor(
-            "forge_list_agent_profiles",
-            "List immutable executable profiles for an account-owned agent identity. Protected credentials are never returned.",
-            json!({ "identity_id": { "type": "string" } }),
-            &["identity_id"],
-        ),
-        tool_descriptor(
-            "forge_list_agent_sessions",
-            "List scope-bound sessions for an account-owned agent identity without exposing protected session state.",
-            json!({ "identity_id": { "type": "string" } }),
-            &["identity_id"],
-        ),
-        tool_descriptor(
-            "forge_get_agent_session",
-            "Get one scope-bound agent session without exposing protected runtime state or credentials.",
-            json!({ "session_id": { "type": "string" } }),
-            &["session_id"],
-        ),
-        tool_descriptor(
-            "forge_get_main_agent",
-            "Inspect the account's singular Main Agent binding and setup state. The authenticated MCP account supplies authority.",
-            json!({}),
-            &[],
-        ),
-        tool_descriptor(
-            "forge_set_main_agent",
-            "Propose replacement of the account's singular Main Agent binding using optimistic concurrency.",
-            json!({
-                "identity_id": { "type": "string" },
-                "expected_version": { "type": "integer" },
-                "autonomy_policy": { "type": "object" }
-            }),
-            &["identity_id", "expected_version"],
-        ),
-        tool_descriptor(
-            "forge_get_project_agent",
-            "Inspect the singular Project Agent binding for an authorized Project.",
-            json!({ "project_id": { "type": "string" } }),
-            required(scoped_project, &["project_id"], &[]),
-        ),
-        tool_descriptor(
-            "forge_set_project_agent",
-            "Propose replacement of a Project's singular Project Agent binding using optimistic concurrency.",
-            json!({
-                "project_id": { "type": "string" },
-                "identity_id": { "type": "string" },
-                "expected_version": { "type": "integer" },
-                "permission_ceiling": { "type": "object" },
-                "autonomy_policy": { "type": "object" },
-                "subscriptions": { "type": "array", "items": { "type": "string" } },
-                "wake_budget": { "type": "integer" }
-            }),
-            required(
-                scoped_project,
-                &["project_id", "identity_id", "expected_version"],
-                &["identity_id", "expected_version"],
-            ),
-        ),
-        tool_descriptor(
-            "forge_list_agent_chats",
-            "List the authenticated account's Main chat and authorized Project Agent chats; no Room or arbitrary thread is exposed.",
-            json!({
-                "cursor": { "type": "string" },
-                "limit": { "type": "integer" }
-            }),
-            &[],
-        ),
-        tool_descriptor(
-            "forge_get_agent_chat",
-            "Inspect one authorized Agent Chat and redaction-safe turn state.",
-            json!({ "chat_id": { "type": "string" } }),
-            &["chat_id"],
-        ),
-        tool_descriptor(
-            "forge_list_agent_chat_messages",
-            "List immutable messages for one authorized Agent Chat, including bounded provenance and handoff references.",
-            json!({
-                "chat_id": { "type": "string" },
-                "before_sequence": { "type": "integer" },
-                "cursor": { "type": "string" },
-                "limit": { "type": "integer" }
-            }),
-            &["chat_id"],
-        ),
-        tool_descriptor(
-            "forge_send_agent_chat_message",
-            "Send one user message to an authorized singular Agent Chat. Forge admits the responder and turn from the bound scope.",
-            json!({
-                "chat_id": { "type": "string" },
-                "content": { "type": "string" },
-                "dedupe_key": { "type": "string" }
-            }),
-            &["chat_id", "content"],
-        ),
-        tool_descriptor(
-            "forge_list_agent_handoffs",
-            "List immutable Main-to-Project handoff records for an authorized Project.",
-            json!({
-                "project_id": { "type": "string" },
-                "cursor": { "type": "string" },
-                "limit": { "type": "integer" }
-            }),
-            required(scoped_project, &["project_id"], &[]),
-        ),
-        tool_descriptor(
-            "forge_get_agent_handoff",
-            "Inspect one authorized handoff's bounded content, provenance, and delivery outcome.",
-            json!({
-                "project_id": { "type": "string" },
-                "handoff_id": { "type": "string" }
-            }),
-            required(scoped_project, &["project_id", "handoff_id"], &["handoff_id"]),
-        ),
-        tool_descriptor(
-            "forge_create_agent_handoff",
-            "Publish a bounded, deduplicated Main-to-Project handoff. Forge guards content and derives target authority from the authenticated scope.",
-            json!({
-                "project_id": { "type": "string" },
-                "content": { "type": "string" },
-                "source_message_id": { "type": "string" },
-                "source_turn_job_id": { "type": "string" },
-                "dedupe_key": { "type": "string" }
-            }),
-            required(scoped_project, &["project_id", "content", "dedupe_key"], &["content", "dedupe_key"]),
-        ),
+        operation_registry::mcp::lookup("forge_list_agent_profiles").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_list_agent_sessions").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_get_agent_session").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_get_main_agent").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_set_main_agent").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_get_project_agent").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_set_project_agent").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_list_agent_chats").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_get_agent_chat").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_list_agent_chat_messages").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_send_agent_chat_message").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_list_agent_handoffs").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_get_agent_handoff").unwrap().descriptor(scoped_project, true),
+        operation_registry::mcp::lookup("forge_create_agent_handoff").unwrap().descriptor(scoped_project, true),
     ])
 }
 
@@ -495,4 +351,108 @@ fn tool_descriptor(name: &str, description: &str, properties: Value, required: &
             "required": required,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialized_mcp_tool_definitions() {
+        for (name, scoped) in [("mcp_account", false), ("mcp_project", true)] {
+            let definitions = tool_descriptors(scoped);
+            let baseline: Value = serde_json::from_str(include_str!(
+                "../../tests/fixtures/mcp_tool_definitions.json"
+            ))
+            .unwrap();
+            let expected = baseline[name].as_array().unwrap();
+            let actual = definitions.as_array().unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (before, after) in expected.iter().zip(actual) {
+                assert_eq!(before["name"], after["name"], "base names/order");
+                let tool_name = after["name"].as_str().unwrap();
+                if operation_registry::mcp::lookup(tool_name).is_none() {
+                    assert_eq!(before, after, "unmoved descriptor {tool_name}");
+                    continue;
+                }
+                let mut schema = before["inputSchema"].clone();
+                schema["additionalProperties"] = json!(false);
+                schema["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+                let nullable: &[&str] = match tool_name {
+                    "forge_register_agent" => &["daemon_id"],
+                    "forge_list_agents" => &["cursor", "limit", "status"],
+                    "forge_list_projects"
+                    | "forge_list_agent_chats"
+                    | "forge_list_agent_handoffs" => &["cursor", "limit"],
+                    "forge_list_agent_chat_messages" => &["before_sequence", "cursor", "limit"],
+                    "forge_send_agent_chat_message" => &["dedupe_key"],
+                    "forge_create_agent_handoff" => &["source_message_id", "source_turn_job_id"],
+                    _ => &[],
+                };
+                for field in nullable {
+                    let kind = schema["properties"][*field]["type"].clone();
+                    schema["properties"][*field]["type"] = json!([kind, "null"]);
+                }
+                match tool_name {
+                    "forge_register_agent" => {
+                        schema["properties"]["executor_type"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("enum");
+                    }
+                    "forge_list_agents" => {
+                        schema["properties"]["status"]["enum"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(Value::Null);
+                    }
+                    "forge_set_main_agent" => {
+                        schema["properties"]["autonomy_policy"] = json!({});
+                    }
+                    "forge_set_project_agent" => {
+                        schema["properties"]["autonomy_policy"] = json!({});
+                        schema["properties"]["permission_ceiling"] = json!({});
+                        schema["properties"]["wake_budget"]["minimum"] = json!(0);
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    schema, after["inputSchema"],
+                    "only declared schema fixes: {tool_name}"
+                );
+                assert!(after["description"].as_str().unwrap().len() <= 200);
+            }
+            let base_visible = expected
+                .iter()
+                .filter(|tool| {
+                    !scoped
+                        || operation_registry::authority::mcp_scope_rule(
+                            tool["name"].as_str().unwrap(),
+                        ) == Some(operation_registry::authority::McpScopeRule::BoundProject)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let after_visible = actual
+                .iter()
+                .filter(|tool| {
+                    !scoped
+                        || operation_registry::authority::mcp_scope_rule(
+                            tool["name"].as_str().unwrap(),
+                        ) == Some(operation_registry::authority::McpScopeRule::BoundProject)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let before_bytes = serde_json::to_vec(&base_visible).unwrap().len();
+            let after_bytes = serde_json::to_vec(&after_visible).unwrap().len();
+            assert!(after_bytes < before_bytes, "smaller {name} prefix");
+            println!("MCP_PREFIX {name} before_bytes={before_bytes} after_bytes={after_bytes} before_token_estimate={} after_token_estimate={} (ceil bytes/4)", before_bytes.div_ceil(4), after_bytes.div_ceil(4));
+            println!(
+                "TOOL_DEFINITIONS {name} {}",
+                serde_json::to_string(&definitions).unwrap()
+            );
+        }
+    }
 }

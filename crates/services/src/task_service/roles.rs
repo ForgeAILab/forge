@@ -7,16 +7,14 @@ impl TaskService {
     pub async fn on_agent_deleted(&self, agent_id: &str) -> Result<()> {
         validate_required("agent_id", agent_id)?;
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let events = self
-            .on_agent_deleted_in_tx(&mut transaction, agent_id)
-            .await?;
+        let events = Self::on_agent_deleted_in_tx(&self.db, &mut transaction, agent_id).await?;
         transaction.commit().await?;
-        self.publish_role_sweep_events(events);
+        Self::publish_role_sweep_events(&self.event_bus, events);
         Ok(())
     }
 
     pub(crate) async fn on_agent_deleted_in_tx(
-        &self,
+        db: &SqliteDb,
         transaction: &mut Transaction<'_, Sqlite>,
         agent_id: &str,
     ) -> Result<Vec<RoleSweepEvent>> {
@@ -49,20 +47,16 @@ impl TaskService {
             });
         }
 
-        sqlx::query(
-            "UPDATE task_role_assignment SET assignee_id = NULL, updated_at = ? WHERE assignee_type = 'agent' AND assignee_id = ?",
-        )
-        .bind(now_rfc3339())
-        .bind(agent_id)
-        .execute(&mut **transaction)
-        .await?;
-        sqlx::query(
-            "UPDATE task SET assignee_id = NULL, updated_at = ? WHERE assignee_type = 'agent' AND assignee_id = ?",
-        )
-        .bind(now_rfc3339())
-        .bind(agent_id)
-        .execute(&mut **transaction)
-        .await?;
+        let task_ids:Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (assignee_id=? OR id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?))")
+            .bind(agent_id).bind(agent_id).fetch_all(&mut **transaction).await?;
+        for task_id in task_ids {
+            // Role clears for a deleted Agent must never be lost: each is
+            // identity-fenced by its own predicate when queued.
+            let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?")
+                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).identity_fenced().execute_in_tx(transaction).await?;
+            let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?")
+                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).identity_fenced().execute_in_tx(transaction).await?;
+        }
 
         // Agent archival changes the effective authority of every affected
         // Task.  Keep that invalidation and dispatch wake in the same write
@@ -71,7 +65,7 @@ impl TaskService {
         let affected_task_ids: HashSet<&str> =
             events.iter().map(|event| event.task_id.as_str()).collect();
         for task_id in affected_task_ids {
-            sqlx::query(
+            let _queued_or_applied = db::task_writer::TaskQuery::new(db,task_id,
                 "UPDATE task
                  SET review_passed_at = NULL,
                      version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
@@ -94,22 +88,31 @@ impl TaskService {
             )
             .bind(now_rfc3339())
             .bind(task_id)
-            .execute(&mut **transaction)
+            .identity_fenced()
+            .execute_in_tx(transaction)
             .await?;
         }
 
         Ok(events)
     }
 
-    pub(crate) fn publish_role_sweep_events(&self, events: Vec<RoleSweepEvent>) {
+    pub(crate) fn publish_role_sweep_events(event_bus: &EventBus, events: Vec<RoleSweepEvent>) {
         for event in events {
-            self.publish_role_reassigned(
-                &event.task_id,
-                &event.role_name,
-                Some(&event.previous_assignment),
-                Some(&event.new_assignment),
-                RoleReassignmentEventFlags::default(),
-            );
+            event_bus.publish(ForgeEvent {
+                event_type: "task.role_reassigned".to_owned(),
+                entity_id: event.task_id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskRoleReassigned {
+                    task_id: event.task_id,
+                    role_name: event.role_name,
+                    previous_assignment: Some(snapshot(&event.previous_assignment)),
+                    new_assignment: Some(snapshot(&event.new_assignment)),
+                    triggered_cancellation: false,
+                    reset_workspace: false,
+                    reset_worktree: false,
+                    transitioned_to_todo: false,
+                },
+            });
         }
     }
 
@@ -121,9 +124,9 @@ impl TaskService {
         let Some(role_name) = self.active_work_role(&task).await? else {
             return Ok(None);
         };
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, &role_name)
+        crate::task_hierarchy::effective_role_assignment(&self.db, &task, &role_name)
             .await
-            .map_err(Into::into)
+            .map(|resolved| resolved.map(|resolved| resolved.assignment))
     }
 
     /// Assign an Agent to the Task's implementation role without claiming or
@@ -134,6 +137,16 @@ impl TaskService {
         task_id: &str,
         agent_id: &str,
     ) -> Result<TaskRoleAssignment> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "assign_agent_to_task",
+                    serde_json::json!([task_id, agent_id]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
@@ -169,6 +182,17 @@ impl TaskService {
         reset_workspace: bool,
         reset_worktree: bool,
     ) -> Result<TaskRoleAssignment> {
+        if !db::task_writer::owns_task(&input.task_id) {
+            return self
+                .request_task_command(
+                    &input.task_id,
+                    "reassign_role",
+                    serde_json::json!([input, reset_workspace, reset_worktree]),
+                    false,
+                )
+                .await;
+        }
+
         self.reassign_role_with_active_execution_policy(
             input,
             reset_workspace,
@@ -230,9 +254,9 @@ impl TaskService {
                     RoleReassignmentEventFlags::default(),
                 );
             }
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 if changed {
                     "task role assignment changed"
                 } else {
@@ -250,9 +274,9 @@ impl TaskService {
             let assignment =
                 TaskRoleAssignmentRepo::assign_if_unchanged(&*self.db, input, Some(previous))
                     .await?;
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 "task role assignment confirmed",
             )
             .await?;
@@ -277,9 +301,9 @@ impl TaskService {
                 Some(&assignment),
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 "task role assignment changed",
             )
             .await?;
@@ -307,9 +331,9 @@ impl TaskService {
                 Some(&assignment),
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 "task role assignment changed",
             )
             .await?;
@@ -345,8 +369,8 @@ impl TaskService {
 
         let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
-            .reset_to_initial_with_authority(
+        self.workflow_execution()
+            .restart_with_authority(
                 &task.id,
                 &initial_state,
                 task.version,
@@ -373,9 +397,9 @@ impl TaskService {
                 transitioned_to_todo: true,
             },
         );
-        crate::wake_task_dispatch(
-            &self.db,
+        self.wake_role_dispatch(
             &assignment.task_id,
+            &assignment.role_name,
             "task role assignment changed",
         )
         .await?;
@@ -389,6 +413,17 @@ impl TaskService {
         reset_workspace: bool,
         reset_worktree: bool,
     ) -> Result<()> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "remove_role",
+                    serde_json::json!([task_id, role_name, reset_workspace, reset_worktree]),
+                    false,
+                )
+                .await;
+        }
+
         let mut task = self.validate_reassignable_task(task_id).await?;
         super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let previous =
@@ -413,7 +448,8 @@ impl TaskService {
                 None,
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
+            self.wake_role_dispatch(task_id, role_name, "task role assignment removed")
+                .await?;
             return Ok(());
         }
 
@@ -433,7 +469,8 @@ impl TaskService {
                 None,
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
+            self.wake_role_dispatch(task_id, role_name, "task role assignment removed")
+                .await?;
             return Ok(());
         };
 
@@ -455,8 +492,8 @@ impl TaskService {
 
         let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
-            .reset_to_initial_with_authority(
+        self.workflow_execution()
+            .restart_with_authority(
                 &task.id,
                 &initial_state,
                 task.version,
@@ -483,7 +520,41 @@ impl TaskService {
                 transitioned_to_todo: true,
             },
         );
-        crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
+        self.wake_role_dispatch(task_id, role_name, "task role assignment removed")
+            .await?;
+        Ok(())
+    }
+
+    /// Wake the Task whose assignment changed and every child whose effective
+    /// coder depends on that row. Children with an own coder are independent
+    /// overrides and keep any parked disposition they own.
+    async fn wake_role_dispatch(&self, task_id: &str, role_name: &str, reason: &str) -> Result<()> {
+        crate::wake_task_dispatch(&self.db, task_id, reason).await?;
+        if role_name != crate::workflow::default_roles::CODER {
+            return Ok(());
+        }
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        if task.parent_task_id.is_some() {
+            return Ok(());
+        }
+        for child in crate::task_hierarchy::ordered_children(&self.db, task_id).await? {
+            let own_coder = TaskRoleAssignmentRepo::get_by_task_and_role(
+                &*self.db,
+                &child.id,
+                crate::workflow::default_roles::CODER,
+            )
+            .await?;
+            if own_coder.is_none() {
+                crate::wake_task_dispatch(
+                    &self.db,
+                    &child.id,
+                    "root default worker assignment changed",
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -975,12 +1046,44 @@ impl TaskService {
         }
 
         if reset_worktree {
+            if task.parent_task_id.is_some() {
+                tracing::info!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    "skipping shared worktree reset for subtask reassignment"
+                );
+                return Ok((false, false));
+            }
             let workspace = if let Some(workspace_id) = execution.workspace_id.as_deref() {
                 WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?
             } else {
                 WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?
             }
             .ok_or_else(|| ServiceError::not_found("workspace", task.id.clone()))?;
+            let resolved = self.resolve_task_workspace(&workspace).await?;
+            if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+                // The reassigned worker launches here next. `Reset` repairs
+                // a missing or unusable worktree and accepts one whose HEAD
+                // is off the Task branch: discarding the previous worker's
+                // uncommitted work at the current HEAD is this path's job.
+                let valid = crate::workspace_manager::WorkspaceManager::new(
+                    &self.db,
+                    &self.workspace_root,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                )
+                .ensure_valid(task, workspace, crate::workspace_manager::Purpose::Reset)
+                .await?;
+                let worktree_path = valid.path().ok_or_else(|| {
+                    ServiceError::invalid_operation("server workspace has no validated path")
+                })?;
+                let head = git::get_current_sha(worktree_path).await?;
+                git::restore_worktree(worktree_path, &head).await?;
+                return Ok((false, true));
+            }
+
+            // Daemon-owned reassignment keeps its existing behavior. Repair
+            // and owner-local reset are deliberately outside this change.
             let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
@@ -1008,20 +1111,12 @@ impl TaskService {
         Ok((false, false))
     }
 
-    fn workflow_engine(&self) -> WorkflowEngine {
-        WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        }
+    pub fn workflow_engine(&self) -> Arc<WorkflowEngine> {
+        Arc::clone(&self.workflow_engine)
+    }
+
+    pub fn workflow_execution(&self) -> crate::workflow::engine::WorkflowExecution<'_> {
+        self.workflow_engine.bind(self)
     }
 
     fn publish_role_reassigned(

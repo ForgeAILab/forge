@@ -1,14 +1,9 @@
 use async_trait::async_trait;
-use db::TransitionLogRepo;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
     merge_service::MergeOutcome,
-    task_service::config::{runtime_retry_budget, RetryBudgetKind},
-    workflow::{
-        default_states, HookAction, HookContext, HookResult, CONFLICT_HANDOFF_MARKER,
-        REVIEW_REFRESH_MARKER, TARGET_MOVED_MARKER,
-    },
+    workflow::{default_states, HookAction, HookContext, HookResult},
 };
 
 use super::common::{
@@ -26,18 +21,68 @@ impl HookAction for RunMerge {
                 reason: "merge service not configured".to_string(),
             };
         };
-        let Some(_merge_slot) = merge_service.claim_merge_hook(&ctx.task_id) else {
-            return HookResult::Skipped {
-                reason: "merge hook already running".to_string(),
-            };
-        };
         if workspace_id(ctx).await.is_none() {
             return HookResult::Skipped {
                 reason: "no worktree".to_string(),
             };
         }
+        #[cfg(test)]
+        if let Some(error) = test_faults::take(&ctx.task_id) {
+            return failed(ctx, error);
+        }
 
-        let outcome = merge_service.merge(ctx.task_id.clone()).await;
+        let outcome = match crate::workflow::engine::durable::hook_effect(
+            &ctx.task_id,
+            "merge_outcome",
+        )
+        .await
+        {
+            Ok(Some(recorded)) => serde_json::from_str::<MergeOutcome>(&recorded)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string())),
+            Ok(None) => {
+                let result = async {
+                    use crate::workflow::engine::durable::{
+                        current_hook, hook_effect, record_hook_effect,
+                    };
+                    if current_hook(&ctx.task_id).is_some() {
+                        if let Some(value) = hook_effect(&ctx.task_id, "merge_intent").await? {
+                            let intent: crate::merge_service::MergeIntent =
+                                serde_json::from_str(&value).map_err(|e| {
+                                    crate::ServiceError::invalid_operation(e.to_string())
+                                })?;
+                            if let Some(done) = merge_service.completed_hook_merge(&intent).await? {
+                                return Ok(done);
+                            }
+                        } else {
+                            let intent = merge_service.hook_merge_intent(&ctx.task_id).await?;
+                            record_hook_effect(
+                                &ctx.task_id,
+                                "merge_intent",
+                                &serde_json::to_value(intent).map_err(|e| {
+                                    crate::ServiceError::invalid_operation(e.to_string())
+                                })?,
+                            )
+                            .await?;
+                        }
+                    }
+                    merge_service.merge(ctx.task_id.clone()).await
+                }
+                .await;
+                if let Ok(outcome) = &result {
+                    if let Err(error) = crate::workflow::engine::durable::record_hook_effect(
+                        &ctx.task_id,
+                        "merge_outcome",
+                        &serde_json::to_value(outcome).expect("merge outcome serializes"),
+                    )
+                    .await
+                    {
+                        return failed(ctx, error);
+                    }
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
         // The merge writes through the workspace and execution ledgers, so a
         // Task snapshot read before it is already stale. Every compare-and-set
         // below has to carry the version the merge left behind: with the
@@ -63,14 +108,14 @@ impl HookAction for RunMerge {
                 .map(|updated| {
                     task = updated;
                 }) {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 HookResult::Cascade {
                     to: default_states::MERGE_FAILED.to_string(),
-                    reason: format!(
-                        "{REVIEW_REFRESH_MARKER} conformance review required: {reason}"
+                    reason: format!("conformance review required: {reason}"),
+
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewRefresh,
                     ),
                 }
             }
@@ -83,32 +128,14 @@ impl HookAction for RunMerge {
                 )
                 .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 HookResult::Cascade {
                     to: default_states::DONE.to_string(),
                     reason: "merge succeeded".to_string(),
+
+                    bridge: Default::default(),
                 }
-            }
-            Ok(MergeOutcome::PullRequest {
-                pr_url,
-                branch,
-                target_branch,
-            }) => {
-                let location = pr_url.unwrap_or_else(|| "provider URL pending".to_string());
-                if let Err(error) = create_system_comment(
-                    ctx,
-                    format!("Pull request published from {branch} to {target_branch}: {location}"),
-                )
-                .await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-                HookResult::Ok
             }
             Ok(MergeOutcome::TargetMoved {
                 reason,
@@ -125,9 +152,7 @@ impl HookAction for RunMerge {
                 .map(|updated| {
                     task = updated;
                 }) {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 target_moved_result(ctx, &task, &reason, &target_branch).await
             }
@@ -151,9 +176,7 @@ impl HookAction for RunMerge {
                 )
                 .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 match persist_merge_error(
                     ctx,
@@ -164,11 +187,7 @@ impl HookAction for RunMerge {
                 .await
                 {
                     Ok(updated) => task = updated,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        }
-                    }
+                    Err(error) => return failed(ctx, error),
                 }
                 ctx.event_bus.publish(ForgeEvent {
                     event_type: "merge.failed".to_string(),
@@ -184,9 +203,9 @@ impl HookAction for RunMerge {
                 // committed with markers and handed back, exactly as when the
                 // target moves under an agent-reviewed candidate. A merge-fix
                 // budget of 0 opts the Project out of automatic merge repair.
-                match runtime_retry_budget(
+                match db::budget::limit(
                     &task,
-                    RetryBudgetKind::MergeFix,
+                    db::budget::Kind::MergeFix,
                     Some(&ctx.state_config),
                     ctx.gate_config.as_ref(),
                 ) {
@@ -201,9 +220,7 @@ impl HookAction for RunMerge {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
+                        return failed(ctx, error);
                     }
                 }
                 if let Err(error) = db::TaskRepo::set_review_passed_at_cas(
@@ -217,9 +234,7 @@ impl HookAction for RunMerge {
                 .map(|updated| {
                     task = updated;
                 }) {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 target_moved_result(
                     ctx,
@@ -244,11 +259,7 @@ impl HookAction for RunMerge {
                 .await
                 {
                     Ok(updated) => task = updated,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        }
-                    }
+                    Err(error) => return failed(ctx, error),
                 }
                 // The merging gate's only defined reject edge is merge_failed;
                 // cascading to review wedges the task in merging forever.
@@ -270,17 +281,11 @@ impl HookAction for RunMerge {
                 )
                 .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 match persist_target_repo_dirty_error(ctx, &task, &details, &files).await {
                     Ok(updated) => task = updated,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        }
-                    }
+                    Err(error) => return failed(ctx, error),
                 }
                 ctx.event_bus.publish(ForgeEvent {
                     event_type: "merge.failed".to_string(),
@@ -300,9 +305,7 @@ impl HookAction for RunMerge {
                 )
                 .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 HookResult::Ok
             }
@@ -328,9 +331,7 @@ impl HookAction for RunMerge {
                 )
                 .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 HookResult::Ok
             }
@@ -338,17 +339,21 @@ impl HookAction for RunMerge {
                 if let Err(error) =
                     crate::deferred_dispatch::defer_integration_for_pause(&ctx.db, &task).await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    return failed(ctx, error);
                 }
                 HookResult::Skipped {
                     reason: "project paused; integration deferred".to_owned(),
                 }
             }
-            Err(error) => HookResult::Failed {
-                reason: error.to_string(),
-            },
+            Err(error) => {
+                merge_failure_result(
+                    ctx,
+                    &task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await
+            }
         }
     }
 }
@@ -371,11 +376,6 @@ fn merge_budget_annotation(reason: &str) -> String {
         "blocking_reason": reason,
         "message": reason,
         "detected_at": db::now_rfc3339(),
-        "recovery_actions": [
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ],
     })
     .to_string()
 }
@@ -386,19 +386,7 @@ fn merge_budget_annotation(reason: &str) -> String {
 /// can legitimately lose several in a row. Five is well above realistic
 /// contention for a single repository while still bounding a livelock where
 /// the target branch is being written faster than this Task can be reviewed.
-const MAX_TARGET_MOVED_REBASES: i64 = 5;
-
-fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
-    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
-    let entries = crate::task_diagnostics::entries_since_retry_window_boundary(entries, None);
-    entries
-        .iter()
-        .filter(|entry| {
-            entry.trigger_reason.contains(TARGET_MOVED_MARKER)
-                && entry.triggered_by == workflow_actor
-        })
-        .count() as i64
-}
+const MAX_TARGET_MOVED_REBASES: i64 = db::budget::Kind::TargetMovedRebase.default_limit() as i64;
 
 /// The integration target moved while this Task was in review.
 ///
@@ -410,21 +398,23 @@ fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
 /// merge. A rebase conflict is a genuine failure and falls through to the
 /// manual-repair path. Managed Task agents cannot rebase or write the linked
 /// Git metadata, so Forge must not dispatch a follow-up they cannot complete.
-pub(super) async fn target_moved_result(
+pub(crate) async fn target_moved_result(
     ctx: &HookContext,
     task: &db::Task,
     reason: &str,
     target_branch: &str,
 ) -> HookResult {
-    let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
+    let count = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::TargetMovedRebase.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(error) => return failed(ctx, error),
     };
-    if target_moved_rebases_since_boundary(&entries) >= MAX_TARGET_MOVED_REBASES {
+    if !db::budget::allows_retry(MAX_TARGET_MOVED_REBASES, count) {
         let block_reason = format!(
             "{target_branch} kept advancing during review; stopped after {MAX_TARGET_MOVED_REBASES} rebase attempts"
         );
@@ -438,9 +428,7 @@ pub(super) async fn target_moved_result(
         )
         .await
         {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
         return HookResult::Ok;
     }
@@ -457,100 +445,179 @@ pub(super) async fn target_moved_result(
             .await;
         }
         Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
     };
-    let worktree_path = std::path::Path::new(&workspace.worktree_path);
-
-    match git::is_worktree_clean(worktree_path).await {
-        Ok(true) => {}
-        Ok(false) => {
-            // Uncommitted work in the worktree is the Worker's to resolve; a
-            // rebase would refuse anyway.
-            return merge_failure_result(
-                ctx,
-                task,
-                format!("{reason}; worktree has uncommitted changes and cannot be rebased"),
-                api_types::FailureKind::DirtyWorktree,
-            )
-            .await;
+    let daemon_owned =
+        match db::WorkspacePlacementRepo::get_by_workspace_id(&*ctx.db, &workspace.id).await {
+            Ok(placement) => placement
+                .is_some_and(|placement| placement.owner_kind == db::PlacementOwnerKind::Daemon),
+            Err(error) => return failed(ctx, error),
+        };
+    let workspace = if daemon_owned {
+        workspace
+    } else {
+        match crate::task_service::workspace::ensure_valid(
+            &ctx.db,
+            &ctx.workspace_root,
+            task,
+            workspace,
+            ctx.repo_cache_locks.clone(),
+            false,
+            &ctx.workspace_backend_router,
+        )
+        .await
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return merge_failure_result(
+                    ctx,
+                    task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await;
+            }
         }
-        Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+    };
+    let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+        &ctx.workspace_backend_router,
+        &ctx.db,
+        &workspace,
+        &ctx.workspace_root,
+    )
+    .await
+    .map_err(crate::ServiceError::from);
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => return failed(ctx, error),
+    };
+    let handoff_conflicts =
+        match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, task).await {
+            Ok(coordination_root) => !coordination_root,
+            Err(error) => return failed(ctx, error),
+        };
+    let durable = async {
+        use crate::workflow::engine::durable::{hook_effect, record_hook_effect};
+        if let Some(recorded) = hook_effect(&ctx.task_id, "rebase_outcome").await? {
+            return serde_json::from_str::<api_types::WorkspaceOwnerOperationOutcome>(&recorded)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()));
         }
-    }
-
-    match git::rebase(worktree_path, target_branch).await {
-        Ok(()) => {
-            if let Err(error) = create_system_comment(
-                ctx,
-                format!("Rebased onto {target_branch} after it advanced during review: {reason}"),
-            )
-            .await
-            {
-                return HookResult::Failed {
-                    reason: error.to_string(),
+        let previous = hook_effect(&ctx.task_id, "rebase_target").await?;
+        let target = match previous.as_deref() {
+            Some(value) => serde_json::from_str::<String>(value)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))?,
+            None => {
+                let target = resolved
+                    .git_query(
+                        api_types::WorkspaceGitQuery::ResolveRef {
+                            reference: target_branch.to_owned(),
+                        },
+                        false,
+                    )
+                    .await?
+                    .ok_or_else(|| crate::ServiceError::invalid_operation("rebase target missing"))?
+                    .trim()
+                    .to_owned();
+                record_hook_effect(&ctx.task_id, "rebase_target", &serde_json::json!(target))
+                    .await?;
+                target
+            }
+        };
+        let recovery = crate::integration_effects::rebase::recover_rebase(
+            &resolved,
+            &crate::integration_effects::rebase::RebaseRecoveryInput {
+                previous_target: previous.as_deref(),
+                recorded_target: &target,
+                handoff_conflicts,
+            },
+        )
+        .await?;
+        let outcome = match recovery {
+            crate::integration_effects::rebase::RebaseRecoveryOutcome::Recorded(outcome) => outcome,
+            crate::integration_effects::rebase::RebaseRecoveryOutcome::Perform { in_progress } => {
+                let outcome = if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+                    let workspace = crate::workspace_backend::effect_workspace(&resolved.placement);
+                    let head = resolved.git_query(api_types::WorkspaceGitQuery::Head, false).await?.unwrap_or_default().trim().to_owned();
+                    let owner = crate::integration_owner::ServerIntegrationOwner::new(ctx.db.clone());
+                    match owner.admit_task_step(&workspace, db::IntegrationOperationKind::Rebase,
+                        serde_json::json!({"workspace":workspace,"target_branch":target_branch,"expected_head_sha":head,"expected_target_sha":target,"handoff_conflicts":handoff_conflicts})).await? {
+                        Some(db::IntegrationEffectAdmission::Replay(receipt)) => {
+                            match serde_json::from_value::<crate::integration_owner::OwnerRebaseReceipt>(receipt.result).map_err(|error| crate::ServiceError::invalid_operation(error.to_string()))? {
+                                crate::integration_owner::OwnerRebaseReceipt::Completed { outcome } => outcome,
+                                _ => return Err(crate::ServiceError::invalid_operation("prior rebase did not complete")),
+                            }
+                        }
+                        Some(db::IntegrationEffectAdmission::Refused(reason)) => return Err(crate::ServiceError::invalid_operation(format!("integration owner refused {reason:?}"))),
+                        admission => {
+                            let result = resolved.rebase_target(target_branch, handoff_conflicts).await;
+                            if let Some(db::IntegrationEffectAdmission::Started(guard)) = admission {
+                                let (receipt, state) = match &result {
+                                    Ok(outcome) => (crate::integration_owner::OwnerRebaseReceipt::Completed { outcome: outcome.clone() }, db::IntegrationOperationState::Succeeded),
+                                    Err(error) => (crate::integration_owner::OwnerRebaseReceipt::Infrastructure { message: crate::integration_effects::check::tail_bytes(&error.to_string(), 4096), head_sha: None, rebase_in_progress: true }, db::IntegrationOperationState::Failed),
+                                };
+                                // A record of the effect, never its result. A
+                                // failed rebase settles terminally: interrupted
+                                // rebase recovery decides the repeat.
+                                if let Err(error) = guard.record(serde_json::json!(receipt), state).await {
+                                    tracing::warn!(target: "services::workflow::merge", task_id = %ctx.task_id, %error, "rebase attempt receipt was not recorded");
+                                }
+                            }
+                            result?
+                        }
+                    }
+                } else {
+                    resolved.rebase_target(target_branch, handoff_conflicts).await?
                 };
+                crate::integration_effects::rebase::finish_rebase_recovery(
+                    &resolved,
+                    &target,
+                    in_progress,
+                    handoff_conflicts,
+                    outcome,
+                )
+                .await?
+            }
+        };
+        record_hook_effect(
+            &ctx.task_id,
+            "rebase_outcome",
+            &serde_json::to_value(&outcome).expect("rebase outcome serializes"),
+        )
+        .await?;
+        Ok::<_, crate::ServiceError>(outcome)
+    }
+    .await;
+    match durable {
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Rebased) => {
+            resolved.record_head_best_effort(&ctx.db).await;
+            if let Err(error) = create_system_comment(ctx,
+                format!("Rebased onto {target_branch} after it advanced during review: {reason}"))
+                .await
+            {
+                return failed(ctx, error);
             }
             HookResult::Cascade {
                 to: default_states::MERGE_FAILED.to_string(),
-                reason: format!("{REVIEW_REFRESH_MARKER} {TARGET_MOVED_MARKER} {reason}; rebased onto {target_branch}, re-review required"),
+                reason: format!("{reason}; rebased onto {target_branch}, re-review required"),
+
+bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::TargetMovedRebase),
+}
+        }
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Dirty { .. }) => merge_failure_result(ctx, task,
+            format!("{reason}; worktree has uncommitted changes and cannot be rebased"), api_types::FailureKind::DirtyWorktree).await,
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Conflict { details, conflict_paths }) => {
+            if handoff_conflicts && !conflict_paths.is_empty() {
+                resolved.record_head_best_effort(&ctx.db).await;
+                conflict_handoff_result(ctx, task, target_branch, &conflict_paths).await
+            } else {
+                merge_failure_result(ctx, task, format!("rebase onto {target_branch} conflicted: {details}"), api_types::FailureKind::MergeConflict).await
             }
         }
-        Err(git::GitError::MergeConflict { stderr, .. }) => {
-            // Coordination roots aggregate subtask branches and keep the
-            // manual-repair path; everything else goes back to its Worker.
-            match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, task).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    let _ = git::abort_rebase(worktree_path).await;
-                    return merge_failure_result(
-                        ctx,
-                        task,
-                        format!("rebase onto {target_branch} conflicted: {stderr}"),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    let _ = git::abort_rebase(worktree_path).await;
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-            }
-            match git::continue_rebase_keeping_conflicts(worktree_path).await {
-                Ok(paths) => conflict_handoff_result(ctx, task, target_branch, &paths).await,
-                // The helper aborted the rebase, so the branch is as it was.
-                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                    merge_failure_result(
-                        ctx,
-                        task,
-                        format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    merge_failure_result(
-                        ctx,
-                        task,
-                        format!(
-                            "rebase onto {target_branch} conflicted: {stderr}; committing the conflict for the Worker failed: {error}"
-                        ),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await
-                }
-            }
-        }
-        Err(error) => HookResult::Failed {
-            reason: error.to_string(),
-        },
+        Ok(api_types::WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }) => merge_failure_result(ctx, task,
+            format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"), api_types::FailureKind::MergeConflict).await,
+        Ok(_) => HookResult::Failed { reason: "workspace owner returned an invalid rebase outcome".into() },
+        Err(error) => failed(ctx, error),
     }
 }
 
@@ -558,39 +625,30 @@ pub(super) async fn target_moved_result(
 /// Forge escalates. Each handoff is a *new* conflict — a sibling landed first
 /// again — not a failed repair; a repair that leaves markers behind escalates
 /// on its own through [`MergeOutcome::UnresolvedConflictMarkers`].
-const MAX_CONFLICT_HANDOFFS: i64 = 5;
-
-fn conflict_handoffs_since_boundary(entries: &[db::TransitionLog]) -> i64 {
-    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
-    crate::task_diagnostics::entries_since_retry_window_boundary(entries, None)
-        .iter()
-        .filter(|entry| {
-            entry.trigger_reason.contains(CONFLICT_HANDOFF_MARKER)
-                && entry.triggered_by == workflow_actor
-        })
-        .count() as i64
-}
+const MAX_CONFLICT_HANDOFFS: i64 = db::budget::Kind::ConflictHandoff.default_limit() as i64;
 
 /// A rebase onto the moved target conflicted and Forge committed the conflict
 /// with its markers. Send the Task to `merge_failed` so its Worker reconciles
 /// the marked files — editing files is all that takes, and the Worker cannot
 /// run the rebase itself — after which the repair gets a fresh review.
-async fn conflict_handoff_result(
+pub(crate) async fn conflict_handoff_result(
     ctx: &HookContext,
     task: &db::Task,
     target_branch: &str,
     paths: &[String],
 ) -> HookResult {
-    let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
+    let count = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::ConflictHandoff.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(error) => return failed(ctx, error),
     };
     let files = paths.join(", ");
-    if conflict_handoffs_since_boundary(&entries) >= MAX_CONFLICT_HANDOFFS {
+    if !db::budget::allows_retry(MAX_CONFLICT_HANDOFFS, count) {
         let block_reason = format!(
             "rebase onto {target_branch} conflicted again after {MAX_CONFLICT_HANDOFFS} conflict repairs (now in {files}); the branch is committed with conflict markers for repair"
         );
@@ -609,9 +667,7 @@ async fn conflict_handoff_result(
         )
         .await
         {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
         return HookResult::Ok;
     }
@@ -624,16 +680,12 @@ async fn conflict_handoff_result(
     )
     .await
     {
-        return HookResult::Failed {
-            reason: error.to_string(),
-        };
+        return failed(ctx, error);
     }
     if let Err(error) =
         persist_merge_error(ctx, task, api_types::FailureKind::MergeConflict, &details).await
     {
-        return HookResult::Failed {
-            reason: error.to_string(),
-        };
+        return failed(ctx, error);
     }
     ctx.event_bus.publish(ForgeEvent {
         event_type: "merge.failed".to_string(),
@@ -646,15 +698,13 @@ async fn conflict_handoff_result(
     });
     HookResult::Cascade {
         to: default_states::MERGE_FAILED.to_string(),
-        reason: format!(
-            "{CONFLICT_HANDOFF_MARKER} {details}{}{encoded}",
-            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
-            encoded = serde_json::to_string(paths).expect("path list serializes"),
-        ),
+        reason: details,
+
+        bridge: api_types::TransitionBridge::conflict_handoff(paths),
     }
 }
 
-pub(super) async fn merge_failure_result(
+pub(crate) async fn merge_failure_result(
     ctx: &HookContext,
     task: &db::Task,
     reason: String,
@@ -673,9 +723,7 @@ pub(super) async fn merge_failure_result(
         {
             Ok(updated) => task = updated,
             Err(error) => {
-                return HookResult::Failed {
-                    reason: error.to_string(),
-                };
+                return failed(ctx, error);
             }
         }
     }
@@ -700,17 +748,13 @@ pub(super) async fn merge_failure_result(
             )
             .await
             {
-                return HookResult::Failed {
-                    reason: error.to_string(),
-                };
+                return failed(ctx, error);
             }
             return HookResult::Ok;
         }
         Ok(false) => {}
         Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
     }
 
@@ -733,39 +777,33 @@ pub(super) async fn merge_failure_result(
         )
         .await
         {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
         return HookResult::Ok;
     }
 
-    let budget = match runtime_retry_budget(
+    let budget = match db::budget::limit(
         &task,
-        RetryBudgetKind::MergeFix,
+        db::budget::Kind::MergeFix,
         Some(&ctx.state_config),
         ctx.gate_config.as_ref(),
     ) {
         Ok(budget) => budget,
         Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
     };
-    let existing_follow_ups = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
-            &entries,
-            default_states::MERGING,
-        ),
-        Err(error) => {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
+    let existing_follow_ups = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::MergeFix.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(error) => return failed(ctx, error),
     };
-
-    if existing_follow_ups >= i64::from(budget) {
+    if !db::budget::allows_retry(i64::from(budget), existing_follow_ups) {
         let block_reason = "merge-fix retry budget exhausted";
         if let Err(error) = block_task_with_annotation(
             ctx,
@@ -777,16 +815,53 @@ pub(super) async fn merge_failure_result(
         )
         .await
         {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
+            return failed(ctx, error);
         }
         HookResult::Ok
     } else {
         HookResult::Cascade {
             to: default_states::MERGE_FAILED.to_string(),
             reason,
+
+            bridge: Default::default(),
         }
+    }
+}
+
+/// Shared with the integration queue's `send_back` step (plan 3.2 stage D1b):
+/// the failure annotation and `merge.failed` event `run_merge` records before
+/// it hands a failed integration on, with the optional system comment first.
+pub(crate) async fn record_integration_failure(
+    ctx: &HookContext,
+    task: &db::Task,
+    kind: api_types::FailureKind,
+    details: &str,
+    comment: Option<String>,
+) -> db::Result<db::Task> {
+    if let Some(comment) = comment {
+        create_system_comment(ctx, comment).await?;
+    }
+    let task = persist_merge_error(ctx, task, kind, details).await?;
+    ctx.event_bus.publish(ForgeEvent {
+        event_type: "merge.failed".to_string(),
+        entity_id: ctx.task_id.clone(),
+        timestamp: event_timestamp(),
+        context: EventContext::MergeFailed {
+            task_id: ctx.task_id.clone(),
+            reason: details.to_owned(),
+        },
+    });
+    Ok(task)
+}
+
+/// A `run_merge` failure. A transient one (the step queue's own retry
+/// classification) asks the hook step to retry with back-off instead of
+/// settling; anything else settles the step failed with a merge annotation.
+fn failed(ctx: &HookContext, error: impl Into<crate::ServiceError>) -> HookResult {
+    let error = error.into();
+    crate::workflow::engine::durable::note_hook_failure(&ctx.task_id, &error);
+    HookResult::Failed {
+        reason: error.to_string(),
     }
 }
 
@@ -805,10 +880,6 @@ fn manual_merge_recovery_annotation(
         artifact: None,
         message: Some(reason.to_owned()),
         hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask,
-        ],
     });
     serde_json::to_string(&annotation).expect("a blocking annotation always serializes")
 }
@@ -879,5 +950,38 @@ impl HookAction for RequireConflictMarkersResolved {
                 reason: format!("conflict marker check failed: {error}"),
             },
         }
+    }
+}
+
+/// Test seam: queue errors for a Task's next `run_merge` attempts.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::{Mutex, OnceLock},
+    };
+
+    type Faults = Mutex<HashMap<String, VecDeque<crate::ServiceError>>>;
+
+    fn faults() -> &'static Faults {
+        static FAULTS: OnceLock<Faults> = OnceLock::new();
+        FAULTS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn inject(task_id: &str, error: crate::ServiceError) {
+        faults()
+            .lock()
+            .expect("merge faults")
+            .entry(task_id.to_owned())
+            .or_default()
+            .push_back(error);
+    }
+
+    pub(super) fn take(task_id: &str) -> Option<crate::ServiceError> {
+        faults()
+            .lock()
+            .expect("merge faults")
+            .get_mut(task_id)
+            .and_then(VecDeque::pop_front)
     }
 }

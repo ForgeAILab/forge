@@ -846,8 +846,12 @@ pub fn render_product_genesis_prompt(
         decisions_still_required: bounded_items(&context.decisions_still_required),
         ..crate::MainOperatingSkillContext::default()
     };
-    crate::render_main_operating_skill(&operating_context)
-        .expect("discovering Product Genesis always activates the Main operating skill")
+    format!(
+        "{}\n\n{}",
+        crate::render_main_operating_skill(&operating_context)
+            .expect("discovering Product Genesis always activates the Main operating skill"),
+        crate::operating_skills::render_main_state_card(&operating_context),
+    )
 }
 
 fn bounded_text(value: &str) -> String {
@@ -1066,6 +1070,9 @@ mod tests {
             let rendered = render_product_genesis_prompt(maturity, &context());
             assert!(rendered
                 .starts_with("Forge Main Agent — Project Discovery and Portfolio Protocol v2\n"));
+            assert!(rendered.contains("small modules with clear ownership"));
+            assert!(rendered
+                .contains("per-feature files discovered/registered without shared-list edits"));
             assert!(rendered.contains("Current understanding:"));
             assert!(rendered.contains("### Assumptions"));
             assert!(rendered.contains("### Decisions still required"));

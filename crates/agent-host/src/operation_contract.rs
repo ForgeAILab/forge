@@ -10,18 +10,15 @@ use agent_runtime::core::prelude::RuntimeError;
 use serde_json::{Value, json};
 
 use crate::operation_catalog::{
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
-    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
-    PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION,
-    TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_READINESS_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+};
+#[cfg(test)]
+use crate::{
+    MAIN_GENESIS_START_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -72,19 +69,6 @@ pub(crate) fn provenance_ref_schema() -> Value {
             "observed_at": string_or_null_schema(),
         }),
         &["source_kind", "source_id"],
-    )
-}
-
-pub(crate) fn artifact_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "artifact_id": {"type":"string","minLength":1},
-            "revision_id": {"type":"string","minLength":1},
-            "content_digest": {"type":"string","minLength":1},
-            "render_version": string_or_null_schema(),
-            "render_digest": string_or_null_schema(),
-        }),
-        &["artifact_id", "revision_id", "content_digest"],
     )
 }
 
@@ -217,115 +201,51 @@ pub(crate) fn charter_content_schema() -> Value {
     )
 }
 
-pub(crate) fn document_content_schema() -> Value {
-    json!({
-        "oneOf": [
-            object_schema(json!({
-                "question":{"type":"string","minLength":1},
-                "decision_informed":{"type":"string","minLength":1},
-                "scope":{"type":"string","minLength":1},
-                "stopping_condition":{"type":"string","minLength":1},
-                "sources":{"type":"array","items":object_schema(json!({
-                    "id":{"type":"string","minLength":1},"url":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"retrieved_at":{"type":"string","minLength":1},"quality":string_or_null_schema(),"claim":{"type":"string","minLength":1},"is_inference":{"type":"boolean"}
-                }), &["id","url","title","retrieved_at","claim","is_inference"])},
-                "findings":string_array_schema(),"evidence":string_array_schema(),"inferences":string_array_schema(),"alternatives":string_array_schema(),"recommendation":string_or_null_schema(),"uncertainty":string_array_schema(),"unresolved_questions":string_array_schema(),"affected_artifact_ids":string_array_schema(),"affected_decision_ids":string_array_schema()
-            }), &["question","decision_informed","scope","stopping_condition"]),
-            object_schema(json!({
-                "intended_deliverables":string_array_schema(),"boundaries":string_array_schema(),"plan_items":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"dependencies":string_array_schema(),"task_ids":string_array_schema()}), &["id","outcome"])},"acceptance_matrix":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1},"statement":{"type":"string","minLength":1},"evidence":string_array_schema(),"required":{"type":"boolean"}}), &["id","statement","required"])},"risks":{"type":"array","items":charter_risk_schema()},"rollback_and_recovery":string_array_schema(),"adaptive_envelope":string_array_schema(),"governing_charter_revision_id":string_or_null_schema()
-            }), &[]),
-            object_schema(json!({
-                "problem_and_outcome":{"type":"string","minLength":1},"actors":string_array_schema(),"journeys_and_flows":string_array_schema(),"functional_requirements":string_array_schema(),"loading_empty_error_recovery_states":string_array_schema(),"acceptance_scenarios":{"type":"array"},"non_functional_and_safety_requirements":string_array_schema(),"out_of_scope":string_array_schema(),"traceability":{"type":"array","items":artifact_ref_schema()}
-            }), &["problem_and_outcome"]),
-            object_schema(json!({"experience_principles":string_array_schema(),"information_architecture":string_array_schema(),"flows":string_array_schema(),"design_tokens_reference":string_or_null_schema(),"component_states":string_array_schema(),"responsive_behavior":string_array_schema(),"accessibility":string_array_schema(),"prototype_or_evidence_links":string_array_schema(),"open_decisions":string_array_schema()}), &[]),
-            object_schema(json!({"context_and_constraints":{"type":"string","minLength":1},"system_boundary":string_array_schema(),"components_and_data":string_array_schema(),"interfaces":string_array_schema(),"security_and_privacy":string_array_schema(),"concurrency":string_array_schema(),"failure_and_recovery":string_array_schema(),"observability_and_operations":string_array_schema(),"migrations":string_array_schema(),"alternatives_and_tradeoffs":string_array_schema(),"validation_plan":string_array_schema()}), &["context_and_constraints"]),
-            object_schema(json!({"ordered_milestone_outcomes":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"linked_artifact_refs":{"type":"array","items":artifact_ref_schema()},"task_queries_or_ids":string_array_schema(),"acceptance_evidence_contract":{"type":"array"},"release_notes":string_array_schema(),"known_issues":string_array_schema()}), &[]),
-        ]
-    })
+/// Whether a property is an object with declared fields, directly, as a
+/// nullable alternative, or as the item of an array.
+fn declares_structure(schema: &Value) -> bool {
+    schema.get("properties").is_some()
+        || schema.get("items").is_some_and(declares_structure)
+        || ["anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(*keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|variants| variants.iter().any(declares_structure))
+        })
+}
+
+fn advertised_proposal_line(
+    spec: &operation_registry::OperationSpec<std::convert::Infallible>,
+) -> String {
+    if spec
+        .surfaces
+        .iter()
+        .any(|surface| surface.native_aggregate == "forge_main_orchestration_propose")
+    {
+        // Field names alone cannot be called when a field is itself a
+        // structure: a Charter draft needs every section's shape, and the
+        // tool description is the only place a Main model is shown it.
+        let schema = &spec.input.schema;
+        let nested = schema["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.values().any(declares_structure));
+        if nested {
+            return format!("{}: {}", spec.id, schema_signature(schema, 0));
+        }
+        return spec.contract_line();
+    }
+    format!(
+        "{}; {} Payload <=65536 serialized UTF-8 bytes.",
+        spec.contract_line(),
+        spec.summary
+    )
 }
 
 pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
+    if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+        return spec.canonical_schema();
+    }
     match operation {
-        MAIN_GENESIS_START_OPERATION => object_schema(
-            json!({
-                "action":{"const":"start"},
-                "maturity":{"type":["string","null"],"enum":["prototype","mvp","production","critical",null]},
-                "preferred_project_agent_identity_id":string_or_null_schema()
-            }),
-            &["action"],
-        ),
-        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"select"},
-                "genesis_session_id":string_or_null_schema(),
-                "expected_session_version":{"type":"integer","minimum":1},
-                "project_agent_identity_id":{"type":"string","minLength":1}
-            }),
-            &[
-                "action",
-                "expected_session_version",
-                "project_agent_identity_id",
-            ],
-            "Persist the exact structured Project Agent preference for the active Product Genesis session. Read genesis.project_agents.read first; Charter approval will freeze this identity's current profile, operating-skill revision, and policy digest. This operation never changes Charter prose.",
-        ),
-        MAIN_CHARTER_DRAFT_OPERATION => object_schema(
-            json!({
-                "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},"render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},"provenance":revision_provenance_schema()
-            }),
-            // `rendered_view`/`render_version` stay optional: the server
-            // renders the canonical view itself and only verifies these
-            // fields when a caller round-trips them. Requiring them forces
-            // the model to reproduce the server renderer byte-for-byte,
-            // which always fails.
-            &[
-                "action",
-                "charter_id",
-                "project_mode",
-                "maturity",
-                "content",
-                "provenance",
-            ],
-        ),
-        MAIN_CHARTER_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        MAIN_CHARTER_DIFF_OPERATION => object_schema(
-            json!({"action":{"const":"compare_revisions"},"charter_id":{"type":"string","minLength":1},"base_revision_id":{"type":"string","minLength":1},"candidate_revision_id":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-            ],
-        ),
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION => object_schema(
-            json!({"action":{"const":"present"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1},"approved_project_name":{"type":"string","minLength":1},"approved_project_slug":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"selected_project_agent_identity_id":{"type":"string","minLength":1},"selected_project_agent_profile_revision_id":{"type":"string","minLength":1},"selected_project_agent_operating_skill_revision":{"type":"string","minLength":1},"selected_project_agent_policy_digest":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "approved_project_name",
-                "project_mode",
-                "selected_project_agent_identity_id",
-                "selected_project_agent_profile_revision_id",
-                "selected_project_agent_operating_skill_revision",
-                "selected_project_agent_policy_digest",
-            ],
-        ),
-        MAIN_PROJECT_CREATE_OPERATION => object_schema(
-            json!({"action":{"const":"create_from_approval"},"approval_id":{"type":"string","minLength":1}}),
-            &["action", "approval_id"],
-        ),
         PROJECT_CHARTER_ADOPTION_OPERATION => described_object_schema(
             json!({
                 "action":{"const":"draft_revision"},
@@ -351,118 +271,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "content",
                 "provenance",
             ],
-            "Setup-only Project Agent adoption Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
-        ),
-        PROJECT_REVIEW_CONFIG_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"set_ci_steps"},
-                "expected_project_version":{"type":"integer","minimum":1,"description":"Copy the current Project version from project.current_state. A conflict returns the replacement value."},
-                "ci_steps":{
-                    "type":"array",
-                    "maxItems":16,
-                    "uniqueItems":true,
-                    "items":{"type":"string","minLength":1,"maxLength":2048},
-                    "description":"Deterministic repository-native commands required for each subsequent Task review. An empty array deliberately clears the defaults. This replaces ci_steps and preserves the Project's reviewer prompt and requirement policy."
-                },
-                "setup_steps":{
-                    "type":"array",
-                    "maxItems":16,
-                    "uniqueItems":true,
-                    "items":{"type":"string","minLength":1,"maxLength":2048},
-                    "description":"Optional commands that prepare each detached clean review checkout before ci_steps run, such as pnpm install --frozen-lockfile, npm ci, pip install -r requirements.txt, or bundle install. Omit to preserve the current setup_steps; send an empty array to clear them."
-                }
-            }),
-            &["action", "expected_project_version", "ci_steps"],
-            "Set the bound Project's default clean-checkout setup and independent review commands before proposing implementation Tasks. Read project.current_state first and preserve a non-empty user configuration unless the Project's repository or validation policy has materially changed. Setup commands run before checks when a Task next enters review; they do not retroactively rerun a completed review.",
-        ),
-        PROJECT_DOCUMENT_OPERATION => {
-            let document_kinds = json!({
-                "type":"string",
-                "enum":["research","delivery_brief","product_spec","design","architecture","execution_plan"]
-            });
-            let identity = json!({
-                "document_id":{"type":"string","minLength":1},
-                "kind":document_kinds,
-                "title":{"type":"string","minLength":1},
-            });
-            let draft_properties = {
-                let mut properties = identity.clone();
-                properties["action"] = json!({"enum":["draft_revision","propose_approval"]});
-                properties["base_revision_id"] = string_or_null_schema();
-                properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                properties["content"] = document_content_schema();
-                properties
-            };
-            let draft = object_schema(
-                draft_properties,
-                &[
-                    "action",
-                    "document_id",
-                    "kind",
-                    "title",
-                    "expected_document_version",
-                    "content",
-                ],
-            );
-            let approval = object_schema(
-                {
-                    let mut properties = identity;
-                    properties["action"] = json!({"const":"approve"});
-                    properties["revision_id"] = json!({"type":"string","minLength":1});
-                    properties["content_digest"] = json!({"type":"string","minLength":1});
-                    properties["render_digest"] = json!({"type":"string","minLength":1});
-                    properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                    properties["envelope_digest"] = string_or_null_schema();
-                    properties
-                },
-                &[
-                    "action",
-                    "document_id",
-                    "kind",
-                    "title",
-                    "revision_id",
-                    "content_digest",
-                    "render_digest",
-                    "expected_document_version",
-                ],
-            );
-            // Keep the operation-level property contract discoverable for
-            // clients that inspect `action.enum`, while the closed oneOf
-            // variants make draft/proposal versus policy-scoped approval
-            // payloads exact and disallow cross-action fields.
-            json!({
-                "type":"object",
-                "required":["action","document_id","kind","title","expected_document_version"],
-                "properties":{
-                    "action":{"type":"string","enum":["draft_revision","propose_approval","approve"]},
-                    "document_id":{"type":"string","minLength":1},
-                    "kind":{"type":"string","enum":["research","delivery_brief","product_spec","design","architecture","execution_plan"]},
-                    "title":{"type":"string","minLength":1},
-                    "base_revision_id":string_or_null_schema(),
-                    "revision_id":{"type":"string","minLength":1},
-                    "expected_document_version":{"type":"integer","minimum":1},
-                    "content":document_content_schema(),
-                    "content_digest":{"type":"string","minLength":1},
-                    "render_digest":{"type":"string","minLength":1},
-                    "envelope_digest":string_or_null_schema()
-                },
-                "oneOf":[draft, approval],
-                "additionalProperties":false
-            })
-        }
-        PROJECT_DECISION_OPERATION => described_object_schema(
-            json!({"action":{"enum":["record_candidate","record_effective"]},"question":{"type":"string","minLength":1},"options":string_array_schema(),"selected_outcome":string_or_null_schema(),"rationale":string_or_null_schema(),"decision_class":{"const":"project_implementation"},"expected_project_version":{"type":"integer","minimum":1},"decision_id":string_or_null_schema(),"affected_artifact_refs":{"type":"array","items":artifact_ref_schema()},"affected_task_ids":string_array_schema(),"affected_milestone_ids":string_array_schema()}),
-            &[
-                "action",
-                "question",
-                "decision_class",
-                "expected_project_version",
-            ],
-            "Project Agent decisions are limited to implementation choices inside the approved Project Charter. User-scope decisions, policy decisions, waivers, and manual approvals are user-only actions outside this tool.",
-        ),
-        PROJECT_MILESTONE_OPERATION => object_schema(
-            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver","task_validation"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual for a genuinely human observation, and task_validation for an integrated check an agent can run and record through project.validation."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]}}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
-            &["action", "expected_milestone_version"],
+            "Project Agent adoption or amendment Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
         ),
         PROJECT_EVIDENCE_OPERATION => described_object_schema(
             json!({"action":{"enum":["attach","capture"],"description":"attach binds an existing Project media asset (asset_id + checksum required). capture stores an artifact your own verification run produced and attaches it in the same call: supply exactly one of content or path, never asset_id/checksum."},"milestone_id":{"type":"string","minLength":1},"expected_milestone_version":{"type":"integer","minimum":1},"asset_id":{"type":["string","null"],"minLength":1,"description":"attach only: the existing Project media asset to bind."},"task_id":string_or_null_schema(),"source_validation_id":{"type":["string","null"],"minLength":1,"description":"The id of the recorded validation RESULT this artifact backs — the `validation_id`/result id returned by `project.validation` (`record`), never the acceptance-check id. Record the check result first, then capture its proof citing that returned id."},"acceptance_check_ids":string_array_schema(),"caption":{"type":"string","minLength":1},"kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},"checksum":{"type":["string","null"],"minLength":1,"description":"attach only: SHA-256 of the named asset's bytes."},"content":{"type":["string","null"],"minLength":1,"description":"capture only: inline text artifact (for example a verification report)."},"path":{"type":["string","null"],"minLength":1,"description":"capture only: a file path under your Project workspace root (forge/ or checkout/)."},"filename":{"type":["string","null"],"minLength":1,"description":"capture only: display filename override, no path separators."}}),
@@ -475,39 +284,9 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             ],
             "Evidence for a milestone acceptance check. attach an existing asset, or capture the proof your own verification run produced — the server creates the Project media asset and attaches it atomically. Never create a Task just to produce evidence.",
         ),
-        PROJECT_VALIDATION_OPERATION => object_schema(
-            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"observed_command_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"The observation_id values forge_task_command returned for the commands you ran in your checkout to settle this check. Required for a pass or fail: the server verifies each one is a command you ran in this Project after the delivered Task landed. A Task's or reviewer's report is narration and cannot stand in for one."},"observed_task_id":{"type":["string","null"],"minLength":1,"description":"The delivered Task whose result you exercised, for traceability only; it settles nothing by itself. Never name a Task that did not actually run: the server verifies it belongs to this Project and reached a delivered state."},"evidence_asset_id":{"type":["string","null"],"minLength":1,"description":"Optional id of an artifact backing this observation: one the observed Task captured through `task.evidence`, or one you captured yourself through `project.evidence` (`capture`)."},"governing_revision_ids":string_array_schema()}),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "check_id",
-                "definition_revision_id",
-                "status",
-                "result",
-                "input_digest",
-            ],
-        ),
         PROJECT_READINESS_OPERATION => object_schema(
             json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1}}),
             &["action", "milestone_id", "milestone_version"],
-        ),
-        PROJECT_RELEASE_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"propose_candidate"},
-                "milestone_id":{"type":"string","minLength":1},
-                "milestone_version":{"type":"integer","minimum":1},
-                "readiness_snapshot_id":{"type":"string","minLength":1},
-                "readiness_digest":{"type":"string","minLength":1}
-            }),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "readiness_snapshot_id",
-                "readiness_digest",
-            ],
-            "Project Agent release candidate only. Invoke this only for an exact current ReadinessSnapshot whose result is ready. A blocked, failed, or stale snapshot must be reported with every canonical blocker and must never be described as a release proposal or as Known Issues: None. This submits a user-release request; it never approves, executes, or creates a final release manifest.",
         ),
         TASK_PROPOSE_OPERATION => described_object_schema(
             json!({
@@ -526,14 +305,10 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             &["action", "title", "review_requirement_ids"],
             "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state. review_requirement_ids is an explicit ownership decision: list only non-universal Charter requirements this Task directly owns, or use [] when it owns none. Copy each ID verbatim from selectable_review_requirements in the project.charter read rather than constructing it. depends_on_task_ids expresses prerequisite DAG edges only: it does not create a parent/child hierarchy or workspace sharing. Project-wide completion is evaluated at milestone readiness.",
         ),
-        TASK_RECOVER_OPERATION => described_object_schema(
-            json!({
-                "action":{"type":"string","enum":["resume_session","reexecute","reset_to_initial","reset_retry_window","cancel_task"]},
-                "task_id":{"type":"string","minLength":1},
-                "reason":{"type":"string","minLength":1,"description":"What stopped this Task, in your own words."}
-            }),
-            &["action", "task_id", "reason"],
-            "Recover a Task that stopped so it can run again, rather than creating a replacement. Use this when the Task definition is sound and the failure was operational -- an expired worker lease, a runtime that went away, a dispatch race, an exhausted retry window. `resume_session` continues the interrupted run; `reexecute` starts a fresh run of the same Task; `reset_to_initial` returns it to the queue for normal dispatch; `reset_retry_window` clears an exhausted retry budget; `cancel_task` ends a Task whose outcome no longer needs a run at all -- a verification-shaped Task you absorbed by settling its checks yourself. Replace a Task only when what it asks for is actually wrong: a duplicate leaves the original stranded and the work double-counted.",
+        TASK_ACTION_OPERATION => described_object_schema(
+            json!({ "task_id":{"type":"string","minLength":1}, "action":api_types::task_action_schema(), "version":{"type":"integer","minimum":1} }),
+            &["task_id", "action", "version"],
+            "Apply a Task's current available_actions. Copy an offered action and supply its Task version. retry queues work, restart returns interrupted work to the initial state, and cancel ends obsolete work. Agents cannot override a gate. Unavailable actions return current offers; use them instead of repeating a denial.",
         ),
         TASK_PLAN_OPERATION => described_object_schema(
             json!({
@@ -564,26 +339,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             &["action", "kind", "caption"],
             "Capture one artifact this Task run actually produced and register it as authoritative evidence bound to this Task. Supply exactly one of `path` (a file in the Task workspace) or `content` (verbatim captured output). The server stores the bytes, computes the checksum, and returns the asset id a milestone evidence attachment references. Never describe an observation you did not make: this records what the run produced, not what you expect it to produce.",
         ),
-        TASK_REVIEW_OPERATION => described_object_schema(
-            json!({
-                "task_id":{"type":"string","minLength":1},
-                "decision":{"type":"string","enum":["accept","reject"]},
-                "expected_task_version":{"type":"integer","minimum":1},
-                "reason":string_or_null_schema()
-            }),
-            &["task_id", "decision", "expected_task_version"],
-            "Accept or reject an exact human-required Task review in the bound Project. This uses the normal Task workflow, version, CI, and evidence checks and cannot review another Project.",
-        ),
-        TASK_CANCEL_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"cancel"},
-                "task_id":{"type":"string","minLength":1},
-                "expected_task_version":{"type":"integer","minimum":1},
-                "reason":{"type":"string","minLength":1,"description":"Why this Task is no longer needed or should stop."}
-            }),
-            &["action", "task_id", "expected_task_version", "reason"],
-            "Cancel one non-terminal Task in the bound Project at an exact version. This is valid for healthy queued or running work and uses the normal Task cancellation lifecycle, including stopping active executions. Use task.recover only when stopped work should continue.",
-        ),
+
         TASK_DEPENDENCY_OPERATION => described_object_schema(
             json!({
                 "action":{"type":"string","enum":["add","remove"]},
@@ -732,7 +488,11 @@ fn schema_signature(schema: &Value, depth: usize) -> String {
     if depth > MAX_DEPTH {
         return "object".to_owned();
     }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+    // Derived registry schemas spell a nullable structure as `anyOf`.
+    if let Some(variants) = ["oneOf", "anyOf"]
+        .iter()
+        .find_map(|keyword| schema.get(*keyword).and_then(Value::as_array))
+    {
         return variants
             .iter()
             .map(|variant| schema_signature(variant, depth))
@@ -894,10 +654,13 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "supply exactly one of workspace-relative path or inline content; filename is optional."
         ));
     }
+    if operations.contains("task.propose") || operations.contains(TASK_ADAPTIVE_OPERATION) {
+        lines.push(crate::MERGE_FRIENDLY_TASK_GUIDANCE);
+    }
     if operations.contains("task.propose") {
         lines.push(concat!(
             "task.propose — create a Task in the bound Project. Fields: ",
-            "title (required); description (outcome plus acceptance criteria); ",
+            "title (required); description (outcome, acceptance criteria, and owned repository-relative paths); ",
             "priority (integer, higher runs sooner); ",
             "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
             "plan_item_id (optional traceability to a stable item in the active execution ",
@@ -910,7 +673,7 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "those); risk_class (only when the baseline declares allowed classes). ",
             "depends_on_task_ids (optional accepted Task ids in this Project; these are ",
             "prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; ",
-            "each prerequisite must reach done before this Task can dispatch). ",
+            "each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. ",
             "Forge binds implementation authority to the Project's current approved Charter. ",
             "Baseline references are optional traceability; never echo baseline ids or digests.",
         ));
@@ -930,39 +693,10 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "and unknown fields are rejected."
         ));
     }
-    if operations.contains(TASK_RECOVER_OPERATION) {
-        lines.push(concat!(
-            "task.recover — repair a Task that stopped, instead of replacing it. ",
-            "Fields: task_id (required, a Task in this Project); ",
-            "reason (required: state what stopped it); ",
-            "action (required: \"resume_session\", \"reexecute\", \"reset_to_initial\", ",
-            "\"reset_retry_window\", or \"cancel_task\"). ",
-            "Use this to restart work that stopped for a transient reason — an expired ",
-            "lease, a lost runtime, a dispatch race — rather than proposing a duplicate ",
-            "Task. A Task that cannot succeed as specified, such as a read-only task_type ",
-            "whose work needs repository writes, will fail every retry: stop it rather ",
-            "than duplicating it. Prefer versioned `task.cancel` for stopping a ",
-            "non-terminal Task; `cancel_task` here ends one whose outcome no longer needs ",
-            "a run at all, such as a verification-shaped Task you absorbed by settling ",
-            "its checks yourself."
-        ));
+    if operations.contains(TASK_ACTION_OPERATION) {
+        lines.push("task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n");
     }
-    if operations.contains(TASK_CANCEL_OPERATION) {
-        lines.push(concat!(
-            "task.cancel — cancel one healthy or stopped non-terminal Task in the bound Project. ",
-            "Fields: action (required: \"cancel\"), task_id, expected_task_version, and a ",
-            "non-empty reason (all required). Forge stops active executions and applies the ",
-            "normal Task cancellation transition. Refresh and retry on a version conflict."
-        ));
-    }
-    if operations.contains(TASK_REVIEW_OPERATION) {
-        lines.push(concat!(
-            "task.review — record a human-required review verdict on one Task in the bound ",
-            "Project. Fields: task_id, decision (required: \"accept\" or \"reject\"), and ",
-            "expected_task_version (all required); reason is an optional note. This uses the ",
-            "normal review workflow, CI, and evidence checks."
-        ));
-    }
+
     if operations.contains(TASK_DEPENDENCY_OPERATION) {
         lines.push(concat!(
             "task.dependency — add or remove one prerequisite edge between two Tasks in the ",
@@ -974,6 +708,13 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "cancelling and recreating Tasks, which changes their ids and orphans dependents."
         ));
     }
+    let mut lines = lines.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    lines.extend(
+        operations
+            .iter()
+            .filter_map(|operation| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+            .map(advertised_proposal_line),
+    );
     if lines.is_empty() {
         String::new()
     } else {
@@ -996,9 +737,12 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
     // surface. Listing the names here meant a new operation silently got a
     // payload surface with none of its fields declared, which is invisible
     // until a provider that only surfaces declared properties strips them.
-    let has_generic_coordination = operations
-        .iter()
-        .any(|operation| crate::operation_catalog::is_coordination_generic_proposal(operation));
+    let has_generic_coordination = operations.iter().any(|operation| {
+        crate::operation_catalog::is_coordination_generic_proposal(operation)
+            && operation_registry::PROPOSAL_CATALOG
+                .lookup(operation)
+                .is_none()
+    });
     let has_task_execution_command = operations.iter().any(|operation| {
         matches!(
             operation.as_str(),
@@ -1016,7 +760,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "description": {
                 "type": ["string", "null"],
-                "description": "task.propose: outcome plus acceptance criteria."
+                "description": "task.propose: outcome, acceptance criteria, and owned repository-relative paths."
             },
             "priority": {
                 "type": ["integer", "null"],
@@ -1041,25 +785,20 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "task_id": {
                 "type": ["string", "null"],
-                "description": "task.recover/task.cancel/task.review/task.dependency: required Task id in this Project."
-            },
-            "reason": {
-                "type": ["string", "null"],
-                "description": "task.recover/task.cancel: required explanation. task.review: optional note on the decision."
-            },
-            "decision": {
-                "type": ["string", "null"],
-                "description": "task.review: required, either \"accept\" or \"reject\". This is the whole review verdict; without it the Task cannot be reviewed through this surface."
+                "description": "task.action/task.dependency: required Task id in this Project."
             },
             "action": {
-                "type": ["string", "null"],
-                "description": concat!(
-                    "task.recover: required, one of \"resume_session\", \"reexecute\", ",
-                    "\"reset_to_initial\", \"reset_retry_window\", or \"cancel_task\". ",
-                    "task.adaptive: \"split\", \"sequence\", or \"replace\". ",
-                    "task.cancel: \"cancel\". ",
-                    "task.dependency: \"add\" or \"remove\"."
-                )
+                "type": ["string", "object", "null"],
+                "properties": {
+                    "verb": {"type":"string", "enum":["start","hold","release","retry","send_back","approve","restart","cancel"]},
+                    "reason": string_or_null_schema(),
+                    "guidance": string_or_null_schema(),
+                    "override": {"type":["boolean","null"]},
+                    "fresh_session": {"type":["boolean","null"]},
+                    "refresh_workspace": {"type":["boolean","null"]},
+                    "reset_budget": {"type":["boolean","null"]}
+                },
+                "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string."
             },
             "capability_class": {
                 "type": ["string", "null"],
@@ -1149,13 +888,13 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream."
         });
     }
-    if operations.contains(TASK_ADAPTIVE_OPERATION)
-        || operations.contains(TASK_CANCEL_OPERATION)
-        || operations.contains(TASK_REVIEW_OPERATION)
-    {
+    if operations.contains(TASK_ACTION_OPERATION) {
+        properties["version"] = json!({"type":["integer","null"], "description":"task.action: required current Task version from the offered actions."});
+    }
+    if operations.contains(TASK_ADAPTIVE_OPERATION) {
         properties["expected_task_version"] = json!({
             "type": ["integer", "null"],
-            "description": "task.adaptive/task.cancel/task.review: Task version precondition."
+            "description": "task.adaptive: Task version precondition. task.action uses version."
         });
     }
     if operations.contains(TASK_ADAPTIVE_OPERATION) {
@@ -1194,6 +933,10 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
     let mut guidance =
         vec!["Payload shape by operation (exact contract enforced server-side):".to_owned()];
     for operation in operations {
+        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+            guidance.push(format!("- {}", advertised_proposal_line(spec)));
+            continue;
+        }
         let summary = orchestration_payload_summary(&orchestration_payload_schema(operation));
         guidance.push(format!("- {operation}: {summary}"));
     }
@@ -1230,102 +973,21 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
 }
 
 pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
-    match operation {
-        MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => described_object_schema(
-            json!({"genesis_session_id":string_or_null_schema()}),
-            &[],
-            "List the exact account-owned Project Agent identities eligible for explicit selection in the active Product Genesis session, plus the currently persisted preference and resolved approval selection.",
-        ),
-        MAIN_INQUIRY_RUN_OPERATION => described_object_schema(
-            json!({
-                "title":{"type":"string","minLength":1,"maxLength":120},
-                "question":{"type":"string","minLength":1,"maxLength":4000},
-                "context":{"type":["string","null"],"maxLength":8000}
-            }),
-            &["title", "question"],
-            "Dispatch one ephemeral read-only sub-agent to answer a bounded question, and wait for its findings. Use this for a research excursion whose working material you do not want to carry for the rest of this conversation -- reading across many Projects, reconciling a long event history, comparing options. The sub-agent gets the account read surface and its own scratch directory; it cannot propose anything, touch a repository, or dispatch further sub-agents. `title` is what the user sees in the inquiry list while it runs, so name the question, not the activity. `question` is the sub-agent's entire brief: it does not see this conversation, so state everything it needs. Put supporting material in `context`. You get back a bounded abstract plus the path to the sub-agent's full findings file, which you can read with the file tools if the abstract is not enough.",
-        ),
-        PROJECT_OBSERVATIONS_OPERATION => described_object_schema(
-            json!({
-                "task_id":string_or_null_schema(),
-                "limit":{"type":["integer","null"],"minimum":1,"maximum":50}
-            }),
-            &[],
-            "Read what Task runs in this Project actually reported: worklog entries with the execution and role that wrote them, and the artifacts those runs captured. Captured text (a log or report) is returned inline so you can read what was observed; binary artifacts return their metadata and asset id. Use this to check an observation before citing it in `project.validation`, and to decide whether an outcome needs a corrective Task.",
-        ),
-        MAIN_CHARTER_READ_OPERATION => object_schema(
-            json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
-            &[],
-        ),
-        MAIN_CHARTER_READINESS_OPERATION => object_schema(
-            json!({
-                "genesis_session_id":string_or_null_schema(),
-                "charter_id":{"type":"string","minLength":1},
-                "revision_id":{"type":"string","minLength":1},
-                "content_digest":{"type":"string","minLength":1},
-                "render_digest":{"type":"string","minLength":1},
-                "expected_charter_version":{"type":"integer","minimum":1}
-            }),
-            &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        MAIN_CHARTER_DIFF_OPERATION => object_schema(
-            json!({
-                "genesis_session_id":string_or_null_schema(),
-                "charter_id":{"type":"string","minLength":1},
-                "base_revision_id":{"type":"string","minLength":1},
-                "candidate_revision_id":{"type":"string","minLength":1}
-            }),
-            &["charter_id", "base_revision_id", "candidate_revision_id"],
-        ),
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION => object_schema(
-            json!({
-                "genesis_session_id":string_or_null_schema(),
-                "charter_id":{"type":"string","minLength":1},
-                "revision_id":{"type":"string","minLength":1},
-                "content_digest":{"type":"string","minLength":1},
-                "render_digest":{"type":"string","minLength":1},
-                "expected_charter_version":{"type":"integer","minimum":1}
-            }),
-            &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        PROJECT_CURRENT_STATE_OPERATION => described_object_schema(
-            json!({
-                "limit":{"type":"integer","minimum":1,"maximum":64}
-            }),
-            &[],
-            "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
-        ),
-        PROJECT_CHARTER_READ_OPERATION => described_object_schema(
-            json!({}),
-            &[],
-            "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",
-        ),
-        PROJECT_SKILL_SECTION_OPERATION => described_object_schema(
-            json!({
-                "section":{"type":"string","enum":PROJECT_SKILL_SECTION_NAMES}
-            }),
-            &["section"],
-            "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release.",
-        ),
-        _ => object_schema(json!({}), &[]),
+    if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+        return spec.canonical_schema();
     }
+    object_schema(json!({}), &[])
 }
 
 pub(crate) fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
     let mut guidance = vec!["Arguments by operation:".to_owned()];
     for operation in operations {
+        // A registered operation states its own contract, generated from its
+        // spec. The contract is enforced at preparation, not by this schema.
+        if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+            guidance.push(format!("- {}", spec.contract_line()));
+            continue;
+        }
         let arguments = orchestration_read_arguments_schema(operation);
         let keys = arguments
             .get("properties")
@@ -1372,42 +1034,72 @@ pub(crate) fn validate_orchestration_proposal_arguments(
         .keys()
         .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
     {
-        return Err(RuntimeError::tool(format!(
-            "Forge orchestration proposal field `{field}` is not admitted"
-        )));
-    }
-    let payload = object
-        .get("payload")
-        .and_then(Value::as_object)
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration payload action is required"))?;
-    let schema = orchestration_payload_schema(operation);
-    let action_schema = schema
-        .get("properties")
-        .and_then(|properties| properties.get("action"))
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration action schema is unavailable"))?;
-    if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
-        if action != expected {
-            return Err(RuntimeError::tool(format!(
-                "Forge orchestration action must be {expected}"
-            )));
-        }
-    } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
-        if !actions
-            .iter()
-            .any(|candidate| candidate.as_str() == Some(action))
-        {
-            return Err(RuntimeError::tool(
-                "Forge orchestration action is outside this typed contract",
-            ));
-        }
-    } else {
         return Err(RuntimeError::tool(
-            "Forge orchestration action schema is not closed",
+            match operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+                Some(spec) => format!(
+                    "{operation}: envelope field `{field}` is not admitted; expected {}",
+                    spec.contract_line()
+                ),
+                None => format!("Forge orchestration proposal field `{field}` is not admitted"),
+            },
         ));
+    }
+    if operation_registry::PROPOSAL_CATALOG
+        .lookup(operation)
+        .is_none()
+    {
+        let payload = object
+            .get("payload")
+            .and_then(Value::as_object)
+            .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
+        if operation == PROJECT_ESCALATE_OPERATION {
+            let request: api_types::ProjectEscalateRequest =
+                serde_json::from_value(Value::Object(payload.clone()))
+                    .map_err(|error| RuntimeError::tool(error.to_string()))?;
+            if request.need.trim().is_empty()
+                || request.need.chars().count() > 4096
+                || request.task_ids.len() > 100
+                || request.task_ids.iter().any(|id| id.is_empty())
+            {
+                return Err(RuntimeError::tool(
+                    "escalation need and Task IDs must be bounded and nonblank",
+                ));
+            }
+        } else {
+            let action = payload
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RuntimeError::tool("Forge orchestration payload action is required")
+                })?;
+            let schema = orchestration_payload_schema(operation);
+            let action_schema = schema
+                .get("properties")
+                .and_then(|properties| properties.get("action"))
+                .ok_or_else(|| {
+                    RuntimeError::tool("Forge orchestration action schema is unavailable")
+                })?;
+            if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
+                if action != expected {
+                    return Err(RuntimeError::tool(format!(
+                        "Forge orchestration action must be {expected}"
+                    )));
+                }
+            } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
+                if !actions
+                    .iter()
+                    .any(|candidate| candidate.as_str() == Some(action))
+                {
+                    return Err(RuntimeError::tool(
+                        "Forge orchestration action is outside this typed contract",
+                    ));
+                }
+            } else {
+                return Err(RuntimeError::tool(
+                    "Forge orchestration action schema is not closed",
+                ));
+            }
+        }
     }
     if let Some(value) = object.get("causation_id") {
         if !value.is_null() && !value.is_string() {
@@ -1434,9 +1126,35 @@ mod tests {
         MIGRATED_OPERATION_CONTRACTS, OperationInputContract, OperationOutputContract,
         SHARED_ORCHESTRATION_OUTCOME,
     };
+    use crate::{
+        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+    };
 
     #[test]
-    fn every_migrated_contract_resolves_to_a_closed_input_and_shared_output() {
+    fn project_escalate_descriptor_is_small_and_project_only() {
+        let schema = orchestration_payload_schema(crate::PROJECT_ESCALATE_OPERATION);
+        let description = schema["description"].as_str().unwrap();
+        assert!(description.split_whitespace().count() <= 25);
+        let c = crate::operation_contract(crate::PROJECT_ESCALATE_OPERATION).unwrap();
+        assert!(
+            !c.supported_scopes
+                .contains(&crate::CanonicalScopeType::Account)
+        );
+        assert!(
+            !c.supported_scopes
+                .contains(&crate::CanonicalScopeType::Task)
+        );
+        assert_eq!(
+            crate::classify_operation(
+                crate::PROJECT_ESCALATE_OPERATION,
+                Some(&serde_json::json!({"need":"disk","task_ids":[]}))
+            ),
+            crate::OperationClassification::DirectCommand
+        );
+    }
+
+    #[test]
+    fn every_migrated_contract_resolves_to_its_input_and_shared_output() {
         for contract in MIGRATED_OPERATION_CONTRACTS {
             let schema = match contract.input {
                 OperationInputContract::ReadArguments => {
@@ -1449,12 +1167,43 @@ mod tests {
             };
 
             assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
-            assert_eq!(
-                schema.get("additionalProperties").and_then(Value::as_bool),
-                Some(false),
-                "{} must remain a closed input contract",
-                contract.operation
-            );
+            if contract.operation == crate::MAIN_PROJECT_CREATE_OPERATION {
+                // The enqueuer keeps extra payload fields (the user executor
+                // ignores them), so this one contract is open. The Charter
+                // approval reference itself is required: the agent is its
+                // only source and the executor refuses an action without it.
+                assert!(schema.get("additionalProperties").is_none());
+                assert_eq!(schema["required"], json!(["approval_id"]));
+                assert_eq!(
+                    schema["properties"]["approval_id"],
+                    json!({"type":"string","minLength":1})
+                );
+                let spec = operation_registry::PROPOSAL_CATALOG
+                    .lookup(contract.operation)
+                    .unwrap();
+                spec.validate_arguments(
+                    &json!({"action":"ignored", "approval_id":"approval", "unknown":"preserved"}),
+                )
+                .unwrap();
+                for refused in [
+                    json!({}),
+                    json!({"approval_id":null}),
+                    json!({"approval_id":""}),
+                ] {
+                    assert!(
+                        spec.validate_arguments(&refused)
+                            .unwrap_err()
+                            .contains("approval_id")
+                    );
+                }
+            } else {
+                assert_eq!(
+                    schema.get("additionalProperties").and_then(Value::as_bool),
+                    Some(false),
+                    "{} must remain a closed input contract",
+                    contract.operation
+                );
+            }
             // Every contract must resolve past the unhandled-operation
             // fallthrough: either operation-specific properties or an
             // explicit root description marking a deliberate zero-argument
@@ -1496,14 +1245,54 @@ mod tests {
             &milestone["properties"]["content"]["properties"]["evidence_requirements"]["items"];
         assert_eq!(
             evidence["properties"]["evidence_kind"]["enum"],
-            json!([
-                "screenshot",
-                "walkthrough_video",
-                "log",
-                "report",
-                "other",
-                null
-            ])
+            json!(["screenshot", "walkthrough_video", "log", "report", "other"])
+        );
+        assert!(
+            evidence["properties"]["evidence_kind"]["type"]
+                .as_array()
+                .is_some_and(|kinds| kinds.contains(&json!("null")))
+        );
+    }
+
+    /// The Main description is the only place a model is shown the Charter
+    /// structure, so the generated draft line must carry every nested shape,
+    /// and the same shapes the hand adoption schema declares.
+    #[test]
+    fn main_charter_draft_line_advertises_the_nested_charter_shape() {
+        let operations = BTreeSet::from(["charter.draft".to_owned(), "genesis.start".to_owned()]);
+        let schema = orchestration_proposal_schema(&operations);
+        let description = schema["properties"]["payload"]["description"]
+            .as_str()
+            .expect("payload description");
+        let line = |operation: &str| {
+            description
+                .lines()
+                .find(|line| line.starts_with(&format!("- {operation}: ")))
+                .unwrap_or_else(|| panic!("{operation} line"))
+        };
+        let draft = line("charter.draft");
+        for (field, hand) in [
+            ("content", charter_content_schema()),
+            ("provenance", revision_provenance_schema()),
+        ] {
+            assert!(
+                draft.contains(&format!("{field}: {}", schema_signature(&hand, 0))),
+                "{field} shape is missing from: {draft}"
+            );
+        }
+        for field in [
+            "charter_id: string",
+            "expected_charter_version?: integer|null",
+            "project_mode: compact|standard",
+            "source_refs?: [{",
+        ] {
+            assert!(draft.contains(field), "{field}");
+        }
+        assert!(!draft.contains("{action") && !draft.contains(" action"));
+        assert_eq!(
+            line("genesis.start"),
+            "- genesis.start: {maturity?: one of prototype|mvp|production|critical, \
+             preferred_project_agent_identity_id?}"
         );
     }
 
@@ -1511,12 +1300,11 @@ mod tests {
     fn genesis_start_contract_is_closed_and_carries_no_source_authority() {
         let schema = orchestration_payload_schema(MAIN_GENESIS_START_OPERATION);
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["action"]["const"], "start");
+        assert!(schema["properties"].get("action").is_none());
         let properties = schema["properties"].as_object().expect("properties");
         assert_eq!(
             properties.keys().cloned().collect::<Vec<_>>(),
             [
-                "action".to_owned(),
                 "maturity".to_owned(),
                 "preferred_project_agent_identity_id".to_owned(),
             ]
@@ -1540,14 +1328,10 @@ mod tests {
 
         let select = orchestration_payload_schema(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION);
         assert_eq!(select["additionalProperties"], false);
-        assert_eq!(select["properties"]["action"]["const"], "select");
+        assert!(select["properties"].get("action").is_none());
         assert_eq!(
             select["required"],
-            json!([
-                "action",
-                "expected_session_version",
-                "project_agent_identity_id"
-            ])
+            json!(["expected_session_version", "project_agent_identity_id"])
         );
         let properties = select["properties"].as_object().expect("properties");
         assert!(!properties.contains_key("charter_content"));
@@ -1626,6 +1410,32 @@ mod tests {
     }
 
     #[test]
+    fn task_shaping_guidance_is_shared_once_for_each_admitted_surface() {
+        let rule = crate::MERGE_FRIENDLY_TASK_GUIDANCE;
+        assert_eq!(
+            rule,
+            "Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file."
+        );
+        assert!(rule.split_whitespace().count() <= 25);
+        for operations in [
+            BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]),
+            BTreeSet::from([TASK_ADAPTIVE_OPERATION.to_owned()]),
+            BTreeSet::from([
+                TASK_PROPOSE_OPERATION.to_owned(),
+                TASK_ADAPTIVE_OPERATION.to_owned(),
+            ]),
+        ] {
+            let guidance = coordination_payload_guidance(&operations);
+            assert_eq!(guidance.matches(rule).count(), 1);
+            assert!(!guidance.contains(crate::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+        }
+        assert!(
+            !coordination_payload_guidance(&BTreeSet::from([TASK_WORKLOG_OPERATION.to_owned()]))
+                .contains(rule)
+        );
+    }
+
+    #[test]
     fn task_proposal_requires_an_explicit_review_scope_decision() {
         let schema = orchestration_payload_schema(TASK_PROPOSE_OPERATION);
         assert!(
@@ -1654,6 +1464,9 @@ mod tests {
         }
         let operations = BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]);
         let guidance = coordination_payload_guidance(&operations);
+        assert!(guidance.contains("owned repository-relative paths"));
+        assert!(guidance.contains("parallel Tasks disjoint files"));
+        assert!(guidance.contains("dependencies to order shared-file edits"));
         assert!(guidance.contains("prerequisite DAG edges only"));
         assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
         let properties = coordination_payload_properties(&operations).expect("flat properties");
@@ -1662,6 +1475,12 @@ mod tests {
                 .as_str()
                 .expect("flat prerequisite guidance")
                 .contains("prerequisite DAG edges only")
+        );
+        assert!(
+            properties["description"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("owned repository-relative paths")
         );
         // A field the server requires but the flat surface never declares is
         // a field a declared-properties-only provider cannot send at all:
@@ -1727,10 +1546,17 @@ mod tests {
                 crate::operation_catalog::is_coordination_generic_proposal(operation)
             })
             .collect();
-        assert!(
-            coordination.len() >= 6,
-            "the coordination envelope should carry the task command family: {coordination:?}"
-        );
+        for required in [
+            TASK_PROPOSE_OPERATION,
+            TASK_ADAPTIVE_OPERATION,
+            TASK_DEPENDENCY_OPERATION,
+            TASK_ACTION_OPERATION,
+        ] {
+            assert!(
+                coordination.contains(&required),
+                "the coordination envelope must carry {required}: {coordination:?}"
+            );
+        }
 
         for operation in coordination {
             let alone: BTreeSet<String> = [operation.to_owned()].into_iter().collect();
@@ -1775,9 +1601,9 @@ mod tests {
     fn every_operation_resolves_its_own_payload_schema() {
         let cases = [
             (TASK_ADAPTIVE_OPERATION, "split"),
-            (TASK_CANCEL_OPERATION, "cancel"),
+            (TASK_ACTION_OPERATION, "cancel"),
             (TASK_DEPENDENCY_OPERATION, "add"),
-            (TASK_RECOVER_OPERATION, "resume_session"),
+            (TASK_ACTION_OPERATION, "retry"),
             (TASK_PLAN_OPERATION, "write"),
             (TASK_WORKLOG_OPERATION, "append"),
             (TASK_EVIDENCE_OPERATION, "capture"),
@@ -1787,15 +1613,21 @@ mod tests {
         for (operation, expected_action) in cases {
             let schema = orchestration_payload_schema(operation);
             let action = &schema["properties"]["action"];
-            let admits = action
-                .get("const")
-                .and_then(Value::as_str)
-                .map(|value| value == expected_action)
-                .unwrap_or_else(|| {
-                    action["enum"]
-                        .as_array()
-                        .is_some_and(|values| values.iter().any(|v| v == expected_action))
-                });
+            let admits = if operation == TASK_ACTION_OPERATION {
+                jsonschema::validator_for(action)
+                    .expect("closed Task action schema")
+                    .is_valid(&json!({"verb": expected_action}))
+            } else {
+                action
+                    .get("const")
+                    .and_then(Value::as_str)
+                    .map(|value| value == expected_action)
+                    .unwrap_or_else(|| {
+                        action["enum"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|v| v == expected_action))
+                    })
+            };
             assert!(
                 admits,
                 "{operation} resolved a schema whose action does not admit \
@@ -1939,8 +1771,7 @@ mod tests {
     fn combined_task_command_action_guidance_names_every_discriminator() {
         let operations = [
             TASK_ADAPTIVE_OPERATION.to_owned(),
-            TASK_CANCEL_OPERATION.to_owned(),
-            TASK_RECOVER_OPERATION.to_owned(),
+            TASK_ACTION_OPERATION.to_owned(),
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1950,15 +1781,164 @@ mod tests {
             .expect("action guidance");
 
         for discriminator in [
-            "task.recover: required",
-            "\"resume_session\"",
+            "task.action: required closed verb object",
+            "retry",
             "task.adaptive: \"split\", \"sequence\", or \"replace\"",
-            "task.cancel: \"cancel\"",
+            "cancel",
         ] {
             assert!(
                 action_description.contains(discriminator),
                 "combined action guidance must name {discriminator}: {action_description}"
             );
         }
+    }
+    #[test]
+    fn task_action_flat_payload_has_version_and_no_retired_envelope_fields() {
+        let operations = [TASK_ACTION_OPERATION.to_owned()].into_iter().collect();
+        let properties = coordination_payload_properties(&operations).unwrap();
+        for required in ["task_id", "action", "version"] {
+            assert!(properties.get(required).is_some());
+        }
+        for retired in ["reason", "decision", "expected_task_version"] {
+            assert!(properties.get(retired).is_none());
+        }
+    }
+    #[tokio::test]
+    async fn task_action_flat_schema_survives_gemini_and_openai_conversion() {
+        use agent_runtime::{
+            core::{
+                cancel::Cancellation,
+                clock::Deadline,
+                content::Message,
+                ids::{AttemptId, RequestId, SessionId},
+                provider::{
+                    ModelId, Provider, ProviderAttemptPurpose, ProviderCallContext, ProviderError,
+                    ProviderRequest, ToolSchema,
+                },
+                store::Secret,
+            },
+            provider::{
+                gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider},
+                openai::{OpenAiConfig, OpenAiProvider},
+                transport::{ByteStream, HttpRequest, HttpTransport},
+            },
+        };
+        use futures_util::StreamExt;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Debug, Default)]
+        struct Capture(Arc<Mutex<Vec<Value>>>);
+        #[async_trait::async_trait]
+        impl HttpTransport for Capture {
+            async fn post_stream(&self, request: HttpRequest) -> Result<ByteStream, ProviderError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&request.body).unwrap());
+                Ok(Box::pin(futures_util::stream::empty()))
+            }
+        }
+        #[derive(Debug)]
+        struct Noop;
+        #[async_trait::async_trait]
+        impl crate::ForgeToolProvider for Noop {
+            async fn read(
+                &self,
+                _: &str,
+                _: &crate::CanonicalScope,
+                _: &str,
+                _: Value,
+            ) -> Result<Value, crate::AgentHostError> {
+                Ok(json!({}))
+            }
+            async fn propose(
+                &self,
+                _: &str,
+                _: &crate::CanonicalScope,
+                _: &str,
+                _: &str,
+                _: Value,
+            ) -> Result<Value, crate::AgentHostError> {
+                Ok(json!({}))
+            }
+        }
+        let composition = crate::ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "project-agent",
+            crate::CanonicalScope {
+                scope_type: crate::CanonicalScopeType::AgentChat,
+                scope_id: "chat".to_owned(),
+                workspace_access: crate::WorkspaceAccess::Deny,
+            },
+            None,
+            None,
+            &["read_project".to_owned(), "propose_task".to_owned()]
+                .into_iter()
+                .collect(),
+            true,
+            Some(Arc::new(Noop)),
+        )
+        .unwrap();
+        let tool = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_propose")
+            .unwrap();
+        let schema = tool.spec().input_schema.clone();
+        assert_eq!(
+            schema["properties"]["action"]["properties"],
+            schema["properties"]["payload"]["properties"]["action"]["properties"]
+        );
+        let action = &schema["properties"]["payload"]["properties"]["action"];
+        for field in [
+            "verb",
+            "reason",
+            "guidance",
+            "override",
+            "fresh_session",
+            "refresh_workspace",
+            "reset_budget",
+        ] {
+            assert!(action["properties"].get(field).is_some(), "{field}");
+        }
+        let capture = Capture::default();
+        let gemini = GeminiInteractionsProvider::new(
+            capture.clone(),
+            GeminiInteractionsConfig::new("https://example.test/v1beta", "gemini-test")
+                .with_api_key(Secret::new("offline-test")),
+        )
+        .unwrap();
+        let openai = OpenAiProvider::new(
+            capture.clone(),
+            OpenAiConfig::new("https://example.test/v1", "openai-test")
+                .with_api_key(Secret::new("offline-test")),
+        );
+        for (provider, model) in [
+            (&gemini as &dyn Provider, "gemini-test"),
+            (&openai as &dyn Provider, "openai-test"),
+        ] {
+            let mut request = ProviderRequest::new(
+                ModelId::new(model),
+                vec![Message::user("Read the offered action")],
+            );
+            request.tools.push(ToolSchema {
+                name: "forge_scope_propose".to_owned(),
+                description: "Apply offered action".to_owned(),
+                input_schema: schema.clone(),
+            });
+            let context = ProviderCallContext {
+                session: SessionId::new("test"),
+                request_id: RequestId::new("test"),
+                attempt_id: AttemptId::new("test"),
+                cache_identity: None,
+                purpose: ProviderAttemptPurpose::Ordinary,
+                cancel: Cancellation::new(),
+                deadline: Deadline::never(),
+            };
+            let mut stream = provider.stream(request, context).await.unwrap();
+            while stream.next().await.is_some() {}
+        }
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tools"][0]["parameters"], schema);
+        assert_eq!(requests[1]["tools"][0]["function"]["parameters"], schema);
     }
 }

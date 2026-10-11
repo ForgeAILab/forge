@@ -2,7 +2,7 @@ use api_types::AgentChatTurnStatus;
 use chrono::{DateTime, Utc};
 use services::agent_chat_policy::guard_agent_chat_content;
 use services::{
-    claim_agent_chat_turn, fail_agent_chat_turn, recover_expired_agent_chat_turn,
+    claim_agent_chat_turn, fail_agent_chat_turn_after_claim, recover_expired_agent_chat_turn,
     AgentChatOperation, AgentChatPolicyError, AgentChatScope,
 };
 
@@ -90,11 +90,27 @@ fn chat_turn_recovery_is_finite_and_does_not_reinvoke_after_budget() {
         .expect("queued turn is claimable");
     assert_eq!(lease.status, AgentChatTurnStatus::Leased);
 
-    let first_failure = fail_agent_chat_turn(0, 2, now, "provider\nerror");
+    let first_failure = fail_agent_chat_turn_after_claim(
+        &api_types::TurnFailure::Unclassified,
+        1,
+        2,
+        0,
+        services::agent_chat_turn_policy::UsageLimitDeferrals::default(),
+        now,
+        "provider\nerror",
+    );
     assert_eq!(first_failure.status, AgentChatTurnStatus::RetryWait);
     assert_eq!(first_failure.attempt_count, 1);
     assert_eq!(first_failure.error, "providererror");
-    let terminal = fail_agent_chat_turn(first_failure.attempt_count, 2, at(105), "last");
+    let terminal = fail_agent_chat_turn_after_claim(
+        &api_types::TurnFailure::Unclassified,
+        first_failure.attempt_count + 1,
+        2,
+        0,
+        services::agent_chat_turn_policy::UsageLimitDeferrals::default(),
+        at(105),
+        "last",
+    );
     assert_eq!(terminal.status, AgentChatTurnStatus::Failed);
     assert_eq!(terminal.attempt_count, 2);
     assert!(terminal.next_attempt_at.is_none());
@@ -108,11 +124,29 @@ fn chat_turn_recovery_is_finite_and_does_not_reinvoke_after_budget() {
     )
     .is_none());
 
-    let recovered =
-        recover_expired_agent_chat_turn(AgentChatTurnStatus::Leased, Some(at(99)), 1, 3, at(100))
-            .expect("expired lease is recovered without invoking the model");
+    // Once its lease refunds are spent, the lease was already charged at claim
+    // time; recovery records the same consumed attempt rather than charging the
+    // stale invocation twice.
+    let recovered = recover_expired_agent_chat_turn(
+        AgentChatTurnStatus::Leased,
+        Some(at(99)),
+        1,
+        3,
+        services::agent_chat_turn_policy::MAX_LEASE_REFUNDS,
+        at(100),
+    )
+    .expect("expired lease is recovered without invoking the model");
     assert_eq!(recovered.status, AgentChatTurnStatus::RetryWait);
-    // The lease was already charged at claim time; recovery records the same
-    // consumed attempt rather than charging the stale invocation twice.
     assert_eq!(recovered.attempt_count, 1);
+    // Before then, an expiry (a restart) refunds the attempt.
+    let refunded = recover_expired_agent_chat_turn(
+        AgentChatTurnStatus::Leased,
+        Some(at(99)),
+        1,
+        3,
+        0,
+        at(100),
+    )
+    .expect("expired lease is recovered without invoking the model");
+    assert_eq!(refunded.attempt_count, 0);
 }

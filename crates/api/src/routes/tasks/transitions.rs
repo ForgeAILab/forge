@@ -20,9 +20,15 @@ pub async fn transition_task(
         .task_service
         .is_task_awaiting_human(&result.task)
         .await?;
-    let response =
-        task_response_with_awaiting_human(&state.db, result.task, awaiting_human).await?;
+    let response = task_response_with_awaiting_human(
+        &state.db,
+        &state.workspace_backend_router,
+        result.task,
+        awaiting_human,
+    )
+    .await?;
     Ok(Json(TransitionTaskResponse {
+        pending_steps: result.pending_steps,
         task: response,
         review: result
             .review

@@ -19,6 +19,7 @@ import type {
   SetCliRuntimeAvailabilityRequest,
   SetProviderEntryAvailabilityRequest,
   StartProviderAuthorizationRequest,
+  ProjectEscalationResponse,
 } from '@/types/generated'
 import type {
   AgentConnectionHealth,
@@ -386,6 +387,30 @@ export function getEffectivePermissions(
 
 export function getMissionControl(): Promise<MissionControlResponse> {
   return apiFetch<MissionControlResponse>(federationApiPaths.missionControl)
+}
+
+export function resolveAttentionItem(id: string, expectedVersion: number): Promise<AttentionItem> {
+  return apiFetch<AttentionItem>(
+    `${federationApiPaths.missionControl}/attention/${encodeURIComponent(id)}/resolve`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: expectedVersion }),
+    },
+  )
+}
+
+/** Answer an owner escalation at its current version. */
+export async function answerProjectEscalation(
+  projectId: string,
+  escalationId: string,
+  answer: string,
+): Promise<ProjectEscalationResponse> {
+  const path = `/projects/${encodeURIComponent(projectId)}/escalations/${encodeURIComponent(escalationId)}`
+  const current = await apiFetch<ProjectEscalationResponse>(path)
+  return apiFetch<ProjectEscalationResponse>(`${path}/answer`, {
+    method: 'POST',
+    body: JSON.stringify({ expected_version: Number(current.version), answer }),
+  })
 }
 
 export function getContextManifest(

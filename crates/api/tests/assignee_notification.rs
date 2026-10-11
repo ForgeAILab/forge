@@ -45,6 +45,7 @@ async fn review_rejection_notifies_role_holder_via_event_bus() {
     )
     .await;
     task = transition(&harness.app, &task, "in_progress").await;
+    harness._state.task_service.drain(&task.id).await.unwrap();
     task = transition(&harness.app, &task, "review").await;
 
     let mut rx = harness.event_bus.subscribe();
@@ -52,12 +53,13 @@ async fn review_rejection_notifies_role_holder_via_event_bus() {
     let rejected: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/gates/review/reject", task.id),
-        json!({ "version": task.version, "reason": "please revise" }),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "action": {"verb":"send_back","guidance":"please revise"},  "version": task.version}),
         StatusCode::OK,
     )
     .await;
     assert_eq!(rejected.status, "in_progress");
+    harness._state.task_service.drain(&task.id).await.unwrap();
 
     let events = drain_events(&mut rx).await;
     assert!(
@@ -181,7 +183,7 @@ async fn test_app() -> Harness {
     )
     .await
     .expect("seed test user");
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");

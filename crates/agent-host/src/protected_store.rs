@@ -1,3 +1,4 @@
+use operation_registry::authority::permission_set;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
@@ -217,50 +218,18 @@ impl SqliteProtectedRuntimeStore {
 
     fn snapshot_digest(&self, snapshot: &SessionSnapshot) -> Result<String, RuntimeError> {
         // Runtime snapshots stamp the clock on every call, even without a state change.
+        // Diagnostic manifests are a bounded recent window and are omitted from
+        // new protected checkpoints; neither belongs to canonical state identity.
         let bytes = serde_json::to_vec(&(
             &snapshot.id,
             &snapshot.history,
             &snapshot.usage,
             &snapshot.identity,
-            &snapshot.manifests,
             &snapshot.extension_state,
         ))?;
         let mut mac = self.snapshot_mac.clone();
         mac.update(&bytes);
         Ok(hex::encode(mac.sign().as_ref()))
-    }
-
-    /// Drops LCM component state this binary can no longer decode.
-    ///
-    /// The runtime folds Forge's sizer, pressure policy, and summary policy
-    /// into one LCM component revision, and `decode_state` rejects state
-    /// written under a different one — a conflict that fails the turn and is
-    /// replayed on every attempt, so a Forge-side LCM policy change would
-    /// otherwise wedge every existing session permanently. The component's
-    /// state is a cache over the durable timeline (`agent_lcm_entry` /
-    /// `agent_lcm_node`), so dropping it loses nothing: the coordinator
-    /// synchronizes it back from the timeline on the next turn. Canonical
-    /// history, usage, and manifests in the snapshot are untouched.
-    ///
-    /// `None` is state written before the marker column existed, and is
-    /// treated as stale once.
-    fn drop_stale_lcm_state(snapshot: &mut SessionSnapshot, stored_revision: Option<&str>) {
-        if stored_revision == Some(crate::FORGE_LCM_POLICY_REVISION) {
-            return;
-        }
-        if snapshot
-            .extension_state
-            .remove(agent_runtime::harness::LCM_COMPONENT_ID)
-            .is_some()
-        {
-            tracing::info!(
-                session_id = %snapshot.id.as_str(),
-                stored_revision = stored_revision.unwrap_or("none"),
-                current_revision = crate::FORGE_LCM_POLICY_REVISION,
-                "dropped LCM component state written under a superseded Forge LCM policy; \
-                 it will be rebuilt from the durable timeline"
-            );
-        }
     }
 
     /// Internal protected-payload seam used by the interaction broker.  The
@@ -305,7 +274,7 @@ impl SqliteProtectedRuntimeStore {
 
     /// Loads the server-issued identity/scope binding for one runtime session.
     ///
-    /// The optional Task workspace is joined by the exact host-supplied path;
+    /// The optional Task workspace is authorized by the exact host-supplied path;
     /// a path that is not the current persisted workspace is therefore
     /// rejected before RuntimeBuilder receives a filesystem-capable tool.
     pub(crate) async fn runtime_scope_binding(
@@ -365,7 +334,7 @@ impl SqliteProtectedRuntimeStore {
         workspace_path: Option<&str>,
     ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id,
+            "SELECT session.identity_id, session.profile_id,
                     identity.account_permission_ceiling,
                     identity.paused,
                     identity.archived_at,
@@ -379,8 +348,7 @@ impl SqliteProtectedRuntimeStore {
                     chat.project_id AS agent_chat_project_id,
                     binding.permission_ceiling_json AS binding_permission_ceiling,
                     bound_project.charter_setup_required AS project_charter_setup_required,
-                    COALESCE(workspace.worktree_path, scope.workspace_path)
-                        AS worktree_path
+                    scope.workspace_path
              FROM agent_session AS session
              JOIN agent_identity AS identity
                ON identity.id = session.identity_id
@@ -403,16 +371,11 @@ impl SqliteProtectedRuntimeStore {
                     WHEN scope.scope_type = 'agent_chat' THEN chat.project_id
                     ELSE scope.project_id
                   END
-             LEFT JOIN workspace
-               ON workspace.task_id = scope.scope_id
-              AND workspace.status IN ('creating', 'ready', 'error')
-              AND workspace.worktree_path = ?
              WHERE session.id = ?
                AND session.runtime_session_id IS ?
                AND (? IS NOT NULL OR (session.backend_kind = 'cli' AND profile.backend_kind = 'cli'))
              LIMIT 1",
         )
-        .bind(workspace_path)
         .bind(forge_session_id)
         .bind(runtime_session_id)
         .bind(runtime_session_id)
@@ -457,8 +420,8 @@ impl SqliteProtectedRuntimeStore {
         let workspace_access: String = row
             .try_get("workspace_access")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let persisted_workspace_path: Option<String> = row
-            .try_get("worktree_path")
+        let mut persisted_workspace_path: Option<String> = row
+            .try_get("workspace_path")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let binding_permission_ceiling: Option<String> = row
             .try_get("binding_permission_ceiling")
@@ -530,12 +493,21 @@ impl SqliteProtectedRuntimeStore {
             } else {
                 None
             };
-        if matches!(scope.scope_type, crate::CanonicalScopeType::Task)
-            && persisted_workspace_path.is_none()
-        {
-            return Err(crate::AgentHostError::Authority(
-                "Task session has no active persisted workspace".to_owned(),
-            ));
+        if matches!(scope.scope_type, crate::CanonicalScopeType::Task) {
+            let mut authorized_path = None;
+            if let Some(path) = workspace_path {
+                if db::WorkspaceRepo::task_owns_embedded_path(&*self.db, &scope.scope_id, path)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                {
+                    authorized_path = Some(path.to_owned());
+                }
+            }
+            persisted_workspace_path = Some(authorized_path.ok_or_else(|| {
+                crate::AgentHostError::Authority(
+                    "Task session has no active persisted workspace".to_owned(),
+                )
+            })?);
         }
         // A Project Agent Chat owns its verification checkout and a Main Agent
         // Chat (or an inquiry sub-agent under the account scope) owns its
@@ -581,26 +553,55 @@ impl SqliteProtectedRuntimeStore {
                 "native session Project authority is no longer active".to_owned(),
             ));
         }
-        let mut allowed_permissions = permission_set(&account_permission_ceiling);
-        intersect_permissions(
-            &mut allowed_permissions,
-            &permission_set(&profile_tool_policy),
-        );
-        intersect_permissions(
-            &mut allowed_permissions,
-            &scope_permission_set(
-                scope.scope_type,
-                scope.workspace_access,
-                agent_chat_project_id.is_some(),
-                project_charter_setup_required,
-            ),
-        );
-        if let Some(binding_permissions) = binding_permission_ceiling {
+        let authority = if scope.scope_type != crate::CanonicalScopeType::Task {
+            let profile_id: String = row
+                .try_get("profile_id")
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            let authority = self
+                .db
+                .resolve_effective_authority(
+                    &identity_id,
+                    Some(&profile_id),
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    workspace_access_name(scope.workspace_access),
+                )
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            if !authority.active {
+                return Err(crate::AgentHostError::Authority(
+                    "session binding is no longer active".to_owned(),
+                ));
+            }
+            Some(authority)
+        } else {
+            None
+        };
+        let allowed_permissions = if let Some(authority) = &authority {
+            authority.ceiling.clone()
+        } else {
+            let mut allowed_permissions = permission_set(&account_permission_ceiling);
             intersect_permissions(
                 &mut allowed_permissions,
-                &permission_set(&binding_permissions),
+                &permission_set(&profile_tool_policy),
             );
-        }
+            intersect_permissions(
+                &mut allowed_permissions,
+                &scope_permission_set(
+                    scope.scope_type,
+                    scope.workspace_access,
+                    agent_chat_project_id.is_some(),
+                    project_charter_setup_required,
+                ),
+            );
+            if let Some(binding_permissions) = binding_permission_ceiling {
+                intersect_permissions(
+                    &mut allowed_permissions,
+                    &permission_set(&binding_permissions),
+                );
+            }
+            allowed_permissions
+        };
         Ok(crate::RuntimeScopeBinding {
             identity_id,
             scope,
@@ -609,6 +610,7 @@ impl SqliteProtectedRuntimeStore {
             agent_chat_project_id,
             project_charter_setup_required,
             allowed_permissions,
+            authority,
         })
     }
 
@@ -616,14 +618,72 @@ impl SqliteProtectedRuntimeStore {
     /// LCM timeline. The runtime id and canonical scope must both match the
     /// persisted Forge session; a timeline id alone cannot be used to open
     /// the store.
+    ///
+    /// A session first resolves to its own durable binding. Without one it
+    /// may continue a timeline it already owns (stamped with its runtime id),
+    /// or adopt the one pre-V149 owner-less timeline its *own* persisted LCM
+    /// state references; that adoption stamps the owner in the same
+    /// transaction, so no other runtime session can resolve to it afterwards.
+    /// Anything else gets a fresh timeline.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+        self.resolve_lcm_store(runtime_id, scope_type, scope_id, false)
+            .await
+    }
+
+    /// Resolves a topic-rotation successor. A successor never adopts or
+    /// shares an existing timeline: it is always bound to a fresh, empty one
+    /// (replays reuse that same binding).
+    pub async fn lcm_store_for_successor_runtime_session(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+        self.resolve_lcm_store(runtime_id, scope_type, scope_id, true)
+            .await
+    }
+
+    /// The LCM timeline the runtime session's own persisted state is bound
+    /// to, if it has any. Only this timeline may be adopted while owner-less.
+    async fn referenced_lcm_timeline(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<String>, crate::AgentHostError> {
+        let id = SessionId::new(runtime_id);
+        let snapshot = match SessionStore::load(self, &id)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+        {
+            Some(snapshot) => Some(snapshot),
+            None => CheckpointStore::load_latest(self, &id)
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                .map(|checkpoint| checkpoint.snapshot),
+        };
+        Ok(snapshot.and_then(|snapshot| {
+            snapshot
+                .extension_state
+                .get(agent_runtime::harness::LCM_COMPONENT_ID)
+                .and_then(|state| state.value.get("timeline_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
+    async fn resolve_lcm_store(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        successor: bool,
+    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id, session.created_at, scope.scope_type, scope.scope_id
+            "SELECT session.identity_id, session.profile_id, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
@@ -641,9 +701,6 @@ impl SqliteProtectedRuntimeStore {
         let identity_id: String = row
             .try_get("identity_id")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let session_created_at: String = row
-            .try_get("created_at")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let stored_scope_type: String = row
             .try_get("scope_type")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
@@ -654,19 +711,115 @@ impl SqliteProtectedRuntimeStore {
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
-        crate::SqliteLcmStore::open_for_binding(
-            Arc::clone(&self.db),
-            &identity_id,
-            &stored_scope_type,
-            &stored_scope_id,
-            authorization_revision.as_str(),
-            Some(db::AgentLcmSessionClaim {
-                runtime_session_id: runtime_id.to_owned(),
-                session_created_at,
-            }),
-            &db::now_rfc3339(),
+        let has_binding: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?)",
         )
+        .bind(runtime_id)
+        .fetch_one(self.db.pool())
         .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        // Decrypting the snapshot happens outside the write transaction.
+        let referenced = if successor || has_binding {
+            None
+        } else {
+            self.referenced_lcm_timeline(runtime_id).await?
+        };
+        let mut tx = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+        )
+        .bind(runtime_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let timeline_id = if let Some(id) = existing {
+            id
+        } else {
+            let candidate: Option<String> = if successor {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "SELECT id FROM agent_lcm_timeline
+                     WHERE identity_id = ?1 AND scope_type = ?2 AND canonical_scope_id = ?3
+                       AND (runtime_session_id = ?4
+                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5)
+                            OR (scope_type <> 'agent_chat' AND claim_owner IS NULL
+                                AND retired_at IS NULL
+                                AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e
+                                               WHERE e.timeline_id = agent_lcm_timeline.id)))
+                     ORDER BY runtime_session_id IS NULL ASC LIMIT 1",
+                )
+                .bind(&identity_id)
+                .bind(&stored_scope_type)
+                .bind(&stored_scope_id)
+                .bind(runtime_id)
+                .bind(referenced.as_deref())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+            };
+            let id = match candidate {
+                Some(id) => {
+                    // Adopting a legacy owner-less row stamps its owner, so
+                    // the lookup above can never hand it to another session
+                    // (a rotation successor in particular).
+                    sqlx::query(
+                        "UPDATE agent_lcm_timeline SET runtime_session_id = ?
+                         WHERE id = ? AND runtime_session_id IS NULL",
+                    )
+                    .bind(runtime_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    id
+                }
+                None => {
+                    let id = db::new_uuid_v4();
+                    let now = db::now_rfc3339();
+                    sqlx::query(
+                        "INSERT INTO agent_lcm_timeline (
+                            id, identity_id, scope_type, scope_id, canonical_scope_id,
+                            runtime_session_id, authorization_revision, revision,
+                            created_at, updated_at
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    )
+                    .bind(&id)
+                    .bind(&identity_id)
+                    .bind(&stored_scope_type)
+                    .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
+                    .bind(&stored_scope_id)
+                    .bind(runtime_id)
+                    .bind(authorization_revision.as_str())
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    id
+                }
+            };
+            sqlx::query(
+                "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
+                 VALUES (?, ?)",
+            )
+            .bind(runtime_id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            id
+        };
+        tx.commit()
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+            .ok_or(crate::AgentHostError::ProtectedPersistence)?;
+        Ok(crate::SqliteLcmStore::new(self.db.clone(), timeline))
     }
 
     pub async fn create_credential(
@@ -1463,27 +1616,6 @@ impl ProviderCredentialSource for SqliteProviderCredentialSource {
     }
 }
 
-fn permission_set(value: &str) -> BTreeSet<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(value) else {
-        return BTreeSet::new();
-    };
-    match value {
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        serde_json::Value::Object(map) => map
-            .get("permissions")
-            .or_else(|| map.get("allowed"))
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        _ => BTreeSet::new(),
-    }
-}
-
 fn intersect_permissions(target: &mut BTreeSet<String>, layer: &BTreeSet<String>) {
     *target = target.intersection(layer).cloned().collect();
 }
@@ -1494,70 +1626,29 @@ fn scope_permission_set(
     project_agent_chat: bool,
     project_charter_setup_required: bool,
 ) -> BTreeSet<String> {
-    let mut values: Vec<&str> = match scope_type {
-        // An inquiry sub-agent runs under the Account scope with a scratch
-        // directory. It gets the bounded account reads and public research
-        // only: withholding the propose permissions here is what keeps a
-        // sub-agent structurally unable to create a Project, publish a
-        // handoff, or otherwise act on the account that dispatched it.
-        crate::CanonicalScopeType::Account
-            if workspace_access == crate::WorkspaceAccess::AccountScratch =>
-        {
-            vec!["read_account", "propose_discovery"]
-        }
-        crate::CanonicalScopeType::Account => vec![
-            "read_account",
-            "propose_discovery",
-            "propose_project",
-            "propose_handoff",
-        ],
-        crate::CanonicalScopeType::Project => {
-            let mut project = vec![
-                "read_project",
-                "read_memory",
-                "propose_project",
-                "propose_message",
-            ];
-            if !project_charter_setup_required {
-                project.extend([
-                    "propose_task",
-                    "propose_commitment",
-                    "propose_memory",
-                    "propose_review",
-                    "propose_decision",
-                    "propose_session",
-                ]);
-            }
-            project
-        }
-        crate::CanonicalScopeType::AgentChat => {
-            let mut chat = vec!["read_agent_chat", "read_memory", "propose_message"];
-            if project_agent_chat && !project_charter_setup_required {
-                chat.extend(["propose_commitment", "propose_memory", "propose_session"]);
-            }
-            chat
-        }
-        crate::CanonicalScopeType::Task => match workspace_access {
-            crate::WorkspaceAccess::TaskRead => {
-                vec!["read_task", "read_memory", "task_read", "propose_review"]
-            }
-            crate::WorkspaceAccess::TaskWrite => {
-                vec!["read_task", "read_memory", "task_read", "task_write"]
-            }
-            crate::WorkspaceAccess::Deny
-            | crate::WorkspaceAccess::ProjectVerify
-            | crate::WorkspaceAccess::AccountScratch => vec![],
-        },
-    };
-    if matches!(scope_type, crate::CanonicalScopeType::AgentChat) && project_agent_chat {
-        values.push("propose_project");
-        if !project_charter_setup_required {
-            values.push("propose_task");
-        }
-    } else if matches!(scope_type, crate::CanonicalScopeType::AgentChat) {
-        values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
+    operation_registry::authority::scope_permissions(
+        scope_type_name(scope_type),
+        workspace_access_name(workspace_access),
+        project_agent_chat,
+        project_charter_setup_required,
+    )
+}
+fn scope_type_name(scope: crate::CanonicalScopeType) -> &'static str {
+    match scope {
+        crate::CanonicalScopeType::Account => "account",
+        crate::CanonicalScopeType::Project => "project",
+        crate::CanonicalScopeType::AgentChat => "agent_chat",
+        crate::CanonicalScopeType::Task => "task",
     }
-    values.into_iter().map(str::to_owned).collect()
+}
+fn workspace_access_name(access: crate::WorkspaceAccess) -> &'static str {
+    match access {
+        crate::WorkspaceAccess::Deny => "deny",
+        crate::WorkspaceAccess::TaskRead => "task_read",
+        crate::WorkspaceAccess::TaskWrite => "task_write",
+        crate::WorkspaceAccess::ProjectVerify => "project_verify",
+        crate::WorkspaceAccess::AccountScratch => "account_scratch",
+    }
 }
 
 impl fmt::Debug for SqliteProtectedRuntimeStore {
@@ -1711,14 +1802,10 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         let nonce: Option<Vec<u8>> = row
             .try_get("snapshot_nonce")
             .map_err(|_| RuntimeError::internal("protected session row is invalid"))?;
-        let lcm_policy_revision: Option<String> = row
-            .try_get("lcm_policy_revision")
-            .map_err(|_| RuntimeError::internal("protected session row is invalid"))?;
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self.open_session_state(ciphertext, nonce).await?;
-                let mut snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
-                Self::drop_stale_lcm_state(&mut snapshot, lcm_policy_revision.as_deref());
+                let snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
                 Ok(Some(snapshot))
             }
             // A checkpoint already owns the exact canonical snapshot. NULL
@@ -1841,9 +1928,6 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         let nonce: Option<Vec<u8>> = row
             .try_get("checkpoint_nonce")
             .map_err(|_| RuntimeError::internal("protected checkpoint row is invalid"))?;
-        let lcm_policy_revision: Option<String> = row
-            .try_get("lcm_policy_revision")
-            .map_err(|_| RuntimeError::internal("protected checkpoint row is invalid"))?;
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self
@@ -1859,19 +1943,15 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
                             ),
                         )
                     })?;
-                let mut checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
-                    RuntimeError::new(ErrorKind::Serialization, format!(
-                        "protected checkpoint for session {} contains invalid checkpoint JSON",
-                        session.as_str()))
+                let checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
+                    RuntimeError::new(
+                        ErrorKind::Serialization,
+                        format!(
+                            "protected checkpoint for session {} contains invalid checkpoint JSON",
+                            session.as_str()
+                        ),
+                    )
                 })?;
-                // The checkpoint carries its own copy of every extension
-                // namespace, and the resume overlay reinstates a namespace the
-                // session snapshot no longer has. Stale LCM state has to leave
-                // by both doors or it comes straight back.
-                Self::drop_stale_lcm_state(
-                    &mut checkpoint.snapshot,
-                    lcm_policy_revision.as_deref(),
-                );
                 Ok(Some(checkpoint))
             }
             (None, None) => Ok(None),
@@ -2063,7 +2143,6 @@ mod tests {
             &snapshot.history,
             &snapshot.usage,
             &snapshot.identity,
-            &snapshot.manifests,
             &snapshot.extension_state,
         ))
         .unwrap();
@@ -2096,6 +2175,94 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, store.snapshot_digest(&checkpoint.snapshot).unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_state_manifest_window_does_not_change_checkpoint_digest() {
+        use agent_runtime::{
+            core::{
+                ids::TurnId,
+                manifest::{CapabilityResolution, ModelResolution, RunManifest},
+                provider::ModelId,
+                store::{TurnManifest, VersionedSessionState},
+            },
+            registry::{Fingerprint, RegistryRevision},
+            runtime::MANIFEST_BOUNDARY_NAMESPACE,
+        };
+        let (store, db, mut snapshot) = session_store().await;
+        let fingerprint = Fingerprint::of(b"manifest-fixture");
+        let manifest = RunManifest::new(
+            fingerprint.clone(),
+            fingerprint.clone(),
+            ModelResolution::new(
+                "fixture",
+                ModelId::new("fixture-model"),
+                fingerprint.clone(),
+                Default::default(),
+            ),
+            CapabilityResolution::new(RegistryRevision::new("fixture-resolver")),
+            fingerprint.clone(),
+            fingerprint,
+        );
+        snapshot.manifests.push(TurnManifest::new(
+            TurnId::new("earlier-turn"),
+            manifest.clone(),
+        ));
+        snapshot.extension_state.insert(
+            MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+            VersionedSessionState::new(
+                RegistryRevision::new("manifest-boundary-1"),
+                serde_json::json!({"schema_version": 1, "planned_steps": 1}),
+            ),
+        );
+        // The ordinary snapshot retains diagnostics and the protected boundary.
+        SessionStore::save(&store, &snapshot).await.unwrap();
+        assert_eq!(
+            SessionStore::load(&store, &snapshot.id).await.unwrap(),
+            Some(snapshot.clone())
+        );
+        let mut checkpoint = session_checkpoint(snapshot);
+        let live = checkpoint.snapshot.clone();
+        assert!(!live.manifests.is_empty());
+        // Model Runtime's checkpoint capture, which preserves execution state
+        // and its boundary extension but leaves diagnostics in the live window.
+        checkpoint.snapshot.manifests.clear();
+        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        let loaded = SessionStore::load(&store, &live.id).await.unwrap().unwrap();
+        // SessionStore references the checkpoint's execution state, whose
+        // serialized snapshot omits the live diagnostic window.
+        assert!(loaded.manifests.is_empty());
+        assert_eq!(loaded.extension_state, live.extension_state);
+        assert_eq!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&loaded).unwrap()
+        );
+        let mut retained = live.clone();
+        retained
+            .manifests
+            .push(TurnManifest::new(TurnId::new("latest-turn"), manifest));
+        retained.manifests.remove(0);
+        assert_eq!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&retained).unwrap()
+        );
+        // Neither the restored state nor the live diagnostic window requires
+        // a conflicting independent save over the checkpoint-backed row.
+        sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
+            .execute(db.pool()).await.unwrap();
+        SessionStore::save(&store, &loaded).await.unwrap();
+        SessionStore::save(&store, &retained).await.unwrap();
+        // The runtime-owned boundary remains protected even though manifests
+        // are diagnostic: changing its frontier must change the digest.
+        retained
+            .extension_state
+            .get_mut(MANIFEST_BOUNDARY_NAMESPACE)
+            .unwrap()
+            .value = serde_json::json!({"schema_version": 1, "planned_steps": 2});
+        assert_ne!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&retained).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2529,13 +2696,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(loaded.extension_state.is_empty());
+        assert_eq!(loaded.extension_state, snapshot.extension_state);
         SessionStore::save(&store, &loaded).await.unwrap();
         let checkpoint = CheckpointStore::load_latest(&store, &snapshot.id)
             .await
             .unwrap()
             .unwrap();
-        assert!(checkpoint.snapshot.extension_state.is_empty());
+        assert_eq!(
+            checkpoint.snapshot.extension_state,
+            snapshot.extension_state
+        );
         let row = sqlx::query("SELECT lcm_policy_revision, checkpoint_lcm_policy_revision FROM protected_agent_session_state")
             .fetch_one(db.pool()).await.unwrap();
         assert_eq!(

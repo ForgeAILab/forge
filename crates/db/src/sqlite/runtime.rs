@@ -3,7 +3,7 @@ use super::*;
 #[async_trait]
 impl RuntimeRepo for SqliteDb {
     async fn create(&self, input: CreateRuntime) -> Result<Runtime> {
-        sqlx::query("INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, labels_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        let result = sqlx::query("INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, labels_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS(SELECT 1 FROM daemon WHERE id = ? AND removed_at IS NULL)")
             .bind(&input.id)
             .bind(&input.daemon_id)
             .bind(&input.kind)
@@ -12,8 +12,12 @@ impl RuntimeRepo for SqliteDb {
             .bind(&input.labels_json)
             .bind(&input.created_at)
             .bind(&input.updated_at)
+            .bind(&input.daemon_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
         RuntimeRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -40,7 +44,7 @@ impl RuntimeRepo for SqliteDb {
     }
 
     async fn upsert_by_daemon_kind(&self, input: CreateRuntime) -> Result<Runtime> {
-        sqlx::query("INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, labels_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(daemon_id, kind) DO UPDATE SET workspace_root = excluded.workspace_root, status = excluded.status, labels_json = excluded.labels_json, updated_at = excluded.updated_at")
+        let result = sqlx::query("INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, labels_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS(SELECT 1 FROM daemon WHERE id = ? AND removed_at IS NULL) ON CONFLICT(daemon_id, kind) DO UPDATE SET workspace_root = excluded.workspace_root, status = excluded.status, labels_json = excluded.labels_json, updated_at = excluded.updated_at")
             .bind(&input.id)
             .bind(&input.daemon_id)
             .bind(&input.kind)
@@ -49,8 +53,12 @@ impl RuntimeRepo for SqliteDb {
             .bind(&input.labels_json)
             .bind(&input.created_at)
             .bind(&input.updated_at)
+            .bind(&input.daemon_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
 
         sqlx::query("SELECT * FROM runtime WHERE daemon_id = ? AND kind = ?")
             .bind(&input.daemon_id)
@@ -65,9 +73,9 @@ impl RuntimeRepo for SqliteDb {
     async fn list(&self, query: RuntimeListQuery) -> Result<Page<Runtime>> {
         let offset = decode_offset(&query.page.cursor)?;
         let where_sql = if query.daemon_id.is_some() {
-            " WHERE daemon_id = ?"
+            " WHERE daemon_id = ? AND EXISTS(SELECT 1 FROM daemon WHERE id=runtime.daemon_id AND removed_at IS NULL)"
         } else {
-            ""
+            " WHERE EXISTS(SELECT 1 FROM daemon WHERE id=runtime.daemon_id AND removed_at IS NULL)"
         };
         let sql = format!(
             "SELECT * FROM runtime{} ORDER BY {} LIMIT ? OFFSET ?",

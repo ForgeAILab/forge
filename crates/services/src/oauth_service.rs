@@ -77,11 +77,6 @@ impl From<sqlx::Error> for OAuthError {
 }
 
 #[derive(Debug, Clone)]
-pub struct AuthorizationGrant {
-    pub user_id: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct IssuedTokenPair {
     pub access_token: String,
     pub refresh_token: String,

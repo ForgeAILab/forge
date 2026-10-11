@@ -32,12 +32,25 @@ pub async fn register_daemon(
     headers: HeaderMap,
     Json(request): Json<DaemonRegisterRequest>,
 ) -> ApiResult<Json<DaemonRegisterResponse>> {
+    // `embedded:` names a server's own in-process daemon and `removed:` a
+    // tombstone; neither is an identity an external daemon may claim.
+    let machine_id = request.machine_id.trim();
+    if machine_id.starts_with("removed:")
+        || (machine_id.starts_with("embedded:")
+            && !services::embedded_daemon::is_embedded_daemon_machine(machine_id))
+    {
+        return Err(ApiError::conflict_with_code(
+            "machine_id_reserved",
+            "This machine_id is reserved for the Forge server",
+        ));
+    }
     let owner_id = registration_owner_id(&state, &headers).await?;
     let visibility = owner_id.as_ref().map(|_| "account".to_owned());
 
     let registration = state
         .daemon_service
         .register(services::DaemonRegisterInput {
+            max_concurrent_runs: request.max_concurrent_runs,
             machine_id: request.machine_id,
             hostname: request.hostname,
             os: request.os,
@@ -74,11 +87,16 @@ pub async fn report_daemon(
         .await
         .map_err(|_| ApiError::unauthorized("invalid daemon bearer token"))?;
 
+    // Kept before the report is ingested, so the reply already shows it.
+    if let Some(disk) = request.disk.as_ref() {
+        db::machine_disk::record_daemon_disk(&state.db, &id, disk).await?;
+    }
     let daemon = state
         .daemon_service
         .ingest_report(
             &id,
             services::DaemonReportInput {
+                max_concurrent_runs: request.max_concurrent_runs,
                 detected_clis: request
                     .detected_clis
                     .into_iter()
@@ -102,7 +120,7 @@ pub async fn report_daemon(
         )
         .await?;
 
-    Ok(Json(daemon_response(daemon)))
+    Ok(Json(daemon_response(&state.db, daemon)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +152,8 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
     let outbound_tx = connection.outbound.clone();
     let connection_id = connection.id();
     let mut stale_rx = connection.stale_receiver();
+    let lifecycle_lock = state.daemon_connections.socket_lifecycle_lock(&daemon_id);
+    let lifecycle_guard = lifecycle_lock.lock().await;
 
     if state
         .daemon_connections
@@ -162,6 +182,7 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
         }
         return;
     }
+    drop(lifecycle_guard);
 
     tracing::info!(
         daemon_id = %daemon_id,
@@ -271,6 +292,9 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
         }
     }
 
+    // Keep the ownership check, removal, offline commit and event publication
+    // ordered with a replacement socket's registration and online commit.
+    let lifecycle_guard = lifecycle_lock.lock().await;
     let should_unregister = !connection.is_stale()
         && state
             .daemon_connections
@@ -286,6 +310,7 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
             );
         }
     }
+    drop(lifecycle_guard);
 
     drop(outbound_tx);
     drop(connection);
@@ -352,9 +377,38 @@ async fn handle_daemon_text_frame(
         }
     }
 
-    state
-        .daemon_connections
-        .dispatch_incoming_for_connection(daemon_id, connection_id, frame)
+    let is_handshake = matches!(
+        &frame,
+        DaemonFrame::Notification { method, .. } if method == api_types::METHOD_DAEMON_HANDSHAKE
+    );
+    let accepted =
+        state
+            .daemon_connections
+            .dispatch_incoming_for_connection(daemon_id, connection_id, frame);
+    if accepted
+        && is_handshake
+        && state
+            .daemon_connections
+            .get(daemon_id)
+            .is_some_and(|connection| {
+                connection.id() == connection_id
+                    && !connection.is_stale()
+                    && connection.protocol_compatible()
+            })
+    {
+        let repo_location_service = std::sync::Arc::clone(&state.repo_location_service);
+        let daemon_id = daemon_id.to_owned();
+        // Verification responses are received by this socket reader.
+        tokio::spawn(async move {
+            if let Err(error) = repo_location_service
+                .retry_verification_on_reconnect(&daemon_id)
+                .await
+            {
+                tracing::warn!(%daemon_id, %error, "failed to retry repository location verification");
+            }
+        });
+    }
+    accepted
 }
 
 async fn send_invalid_frame(
@@ -392,7 +446,9 @@ pub async fn list_daemons(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<DaemonResponse>>> {
     let page = state.daemon_service.list(page_request(&params)?).await?;
-    Ok(Json(paginated(page, daemon_response)))
+    Ok(Json(paginated(page, |daemon| {
+        daemon_response(&state.db, daemon)
+    })))
 }
 
 pub async fn get_daemon(
@@ -405,7 +461,52 @@ pub async fn get_daemon(
         .get(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("daemon", id))?;
-    Ok(Json(daemon_response(daemon)))
+    Ok(Json(daemon_response(&state.db, daemon)))
+}
+
+pub async fn remove_daemon(
+    State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::RemoveDaemonResponse>> {
+    // Database ownership/connection checks are atomic with credential revocation.
+    Ok(Json(
+        state
+            .daemon_service
+            .remove(&id, &user.user_id, user.is_admin)
+            .await?,
+    ))
+}
+
+pub async fn preview_daemon_removal(
+    State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::RemoveDaemonPreview>> {
+    Ok(Json(
+        state
+            .daemon_service
+            .removal_preview(&id, &user.user_id, user.is_admin)
+            .await?,
+    ))
+}
+
+pub async fn update_daemon(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<api_types::UpdateDaemonRequest>,
+) -> ApiResult<Json<DaemonResponse>> {
+    if request.run_limit == Some(0) {
+        return Err(ApiError::bad_request("run_limit must be positive or null"));
+    }
+    Ok(Json(daemon_response(
+        &state.db,
+        state
+            .daemon_service
+            .update_run_limit(&id, request.version, request.run_limit)
+            .await?,
+    )))
 }
 
 fn runtime_report_input(runtime: api_types::RuntimeReport) -> RuntimeReportInput {

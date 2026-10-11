@@ -11,6 +11,21 @@ pub struct SatisfyDependents;
 #[async_trait]
 impl HookAction for SatisfyDependents {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        if let Ok(Some(task)) = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false).await {
+            if ctx.workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
+                && ctx.workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+            {
+                if let Err(error) = ctx
+                    .task_service
+                    .wake_dependents_of_completed_task(&task)
+                    .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+        }
         let dependents = match TaskDependencyRepo::list_dependents(&*ctx.db, &ctx.task_id).await {
             Ok(dependents) => dependents,
             Err(error) => {
@@ -179,7 +194,6 @@ mod subtask_hook_test_support {
                 name: "forge".to_owned(),
                 remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -274,6 +288,9 @@ mod subtask_hook_test_support {
                 project_id,
                 from_state: from_state.to_owned(),
                 to_state: to_state.to_owned(),
+                workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(
+                    &db,
+                )),
                 db,
                 event_bus,
                 gate_config: None,

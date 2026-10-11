@@ -12,7 +12,6 @@ use db::{
 };
 use events::EventBus;
 use serde_json::json;
-use services::workflow::engine::WorkflowEngine;
 
 #[tokio::test]
 async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_guards() {
@@ -27,6 +26,7 @@ async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_gu
         .expect("task loads")
         .expect("task exists");
     let qa = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             &task_id,
             "qa",
@@ -35,6 +35,7 @@ async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_gu
             &Actor::user(UserActionSource::Test),
             "ready for qa",
             false,
+            Default::default(),
         )
         .await
         .expect("todo -> qa succeeds")
@@ -42,6 +43,7 @@ async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_gu
     assert_eq!(qa.status, "qa");
 
     let cancelled = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             &task_id,
             "cancelled",
@@ -50,6 +52,7 @@ async fn explicit_cancellation_state_uses_implicit_edge_and_skips_before_exit_gu
             &Actor::user(UserActionSource::Test),
             "cancel explicitly",
             false,
+            Default::default(),
         )
         .await
         .expect("implicit qa -> cancelled cancellation transition succeeds")
@@ -118,7 +121,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: Some("https://example.com/repo.git".to_owned()),
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -173,21 +175,8 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
     .expect("task creates");
 }
 
-fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
-    let task_service = services::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    WorkflowEngine {
-        db,
-        event_bus,
-        review_runner: None,
-        merge_service: None,
-        cleanup_scheduler: None,
-        task_service,
-        daemon_connections: None,
-        workspace_exec_locks: None,
-        terminal_activity: None,
-        workspace_root: std::path::PathBuf::new(),
-        repo_cache_locks: None,
-    }
+fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> services::TaskService {
+    services::TaskService::new_for_test(db, event_bus)
 }
 
 fn cancellation_workflow() -> WorkflowDefinition {

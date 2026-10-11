@@ -1,4 +1,4 @@
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
+use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use api_types::{
     Actor, FailurePolicy, StateDefinition, StateKind, TaskMovedEventPayload, WorkflowDefinition,
@@ -6,13 +6,12 @@ use api_types::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, CompareAndMoveTask, CreateDomainEvent, DomainEventRepo,
-    MoveTaskPersistence, MoveTaskResult, ProjectRepo, TaskBoardRepo, TaskRepo, TransitionLog,
-    TransitionLogRepo, UpdateTask,
+    MoveTaskPersistence, MoveTaskResult, ProjectRepo, TaskBoardRepo, TaskRepo, TaskStepRepo,
+    TransitionLog, TransitionLogRepo, UpdateTask,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent, TASK_MOVED_EVENT};
 use sqlx::{query, Row};
 use tracing::Instrument;
-use workspace::RepoCacheLockManager;
 
 use self::{
     context::{
@@ -24,16 +23,12 @@ use self::{
     },
 };
 use crate::{
-    deferred_dispatch,
-    merge_service::MergeService,
-    terminal_service::TerminalActivityTracker,
     workflow::{default_workflow, inherited_subtask_workflow, registry, HookContext, HookResult},
-    workspace_cleanup::WorkspaceCleanupScheduler,
-    workspace_execution_lock::WorkspaceExecutionLockManager,
     ServiceError,
 };
 
 mod context;
+pub(crate) mod durable;
 mod hooks;
 #[cfg(test)]
 mod tests;
@@ -49,18 +44,12 @@ struct ReviewEntryFailure {
     cascade: Option<(String, String)>,
 }
 
-// review -> merging -> merge_failed -> review -> merging uses four cascades
-// when review authority carries after a target-moved rebase. Eight allows a
-// second such round plus its terminal completion, while bounding real loops.
-const MAX_CASCADE_DEPTH: u8 = 8;
-
 fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
     serde_json::json!({
-        "type": DISPATCH_FAILED_ANNOTATION,
+        "type": api_types::FailureKind::DispatchFailed,
         "message": message,
         "state": state,
         "detected_at": now_rfc3339(),
-        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
     })
     .to_string()
 }
@@ -68,6 +57,16 @@ fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
 /// The checks `run_ci_steps` will execute when this Task next enters review,
 /// resolved from the same merged review-state config the hook reads. Empty
 /// when the workflow has no review state or the config names no steps.
+/// A state's configuration as its hooks see it: the workflow's, overlaid by
+/// the Project's and the Task's.
+pub(crate) fn effective_state_config(
+    state: &StateDefinition,
+    project: Option<&db::Project>,
+    task_state_config_json: Option<&str>,
+) -> serde_json::Value {
+    hooks::merged_state_config(state, project, task_state_config_json)
+}
+
 pub(crate) fn review_ci_steps_for_task(
     workflow: &api_types::WorkflowDefinition,
     project: Option<&db::Project>,
@@ -94,8 +93,18 @@ pub(crate) fn is_dispatch_failed_annotation(raw_annotation: Option<&str>) -> boo
         .is_some_and(|kind| kind == DISPATCH_FAILED_ANNOTATION)
 }
 
-/// Persist a `dispatch_failed` error annotation on the task, retrying version
-/// conflicts. Shared by the engine's dispatch-failure fallback and the task
+fn preserve_dispatch_annotation(raw_annotation: Option<&str>) -> bool {
+    raw_annotation
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value["type"].as_str().map(str::to_owned))
+        .is_some_and(|kind| {
+            kind != DISPATCH_FAILED_ANNOTATION
+                && crate::task_dispatcher::is_blocking_annotation_type(&kind)
+        })
+}
+
+/// Persist a `dispatch_failed` error annotation through the Task writer.
+/// Shared by the engine's dispatch-failure fallback and the task
 /// dispatcher's governance parking.
 pub(crate) async fn annotate_dispatch_failure(
     db: &db::SqliteDb,
@@ -104,11 +113,112 @@ pub(crate) async fn annotate_dispatch_failure(
     message: &str,
     authority: Option<&WorkflowAuthority>,
 ) -> db::Result<()> {
-    let annotation = dispatch_failed_annotation_json(state, message);
-    let mut current = TaskRepo::get_by_id(db, task_id, false)
+    annotate_dispatch_failure_details(db, task_id, state, message, authority, None).await
+}
+
+pub(crate) async fn annotate_upgrade_dispatch_refusal(
+    db: &db::SqliteDb,
+    task_id: &str,
+    state: &str,
+    error: &crate::ServiceError,
+) -> db::Result<()> {
+    let daemon_ids: Vec<&str> = match error {
+        crate::ServiceError::PlacementUnavailable(refusal) if refusal.needs_daemon_upgrade() => {
+            refusal.upgrade_daemon_ids().collect()
+        }
+        crate::ServiceError::DaemonUpgradeRequired { daemon_id } => vec![daemon_id],
+        _ => return Ok(()),
+    };
+    let details =
+        serde_json::json!({"code": api_types::DAEMON_UPGRADE_REQUIRED, "daemon_ids": daemon_ids});
+    let task = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
-    for attempt in 0..3 {
+    let expected_annotation = if preserve_dispatch_annotation(task.error_annotation.as_deref()) {
+        serde_json::from_str::<serde_json::Value>(task.error_annotation.as_deref().unwrap())
+            .expect("blocking annotation JSON")
+    } else {
+        let mut annotation: serde_json::Value =
+            serde_json::from_str(&dispatch_failed_annotation_json(state, &error.to_string()))
+                .expect("annotation JSON");
+        annotation
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
+        // The annotation writer creates its own timestamp. Fence the refusal's
+        // content, without comparing separately generated detection times.
+        annotation.as_object_mut().unwrap().remove("detected_at");
+        annotation
+    };
+    let metadata: serde_json::Value = task
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let mut marker = details.clone();
+    marker["error_annotation"] = expected_annotation;
+    marker["dispatch_disposition"] = metadata["dispatch_disposition"].clone();
+    marker["deferred_dispatch"] = metadata["deferred_dispatch"].clone();
+    TaskRepo::mutate_metadata(
+        db,
+        task_id,
+        Some(task.version),
+        vec![
+            db::TaskMetadataMutation::Set {
+                key: "daemon_upgrade_refusal".into(),
+                value: marker,
+            },
+            db::TaskMetadataMutation::Remove {
+                key: "owner_wait".into(),
+            },
+        ],
+        &now_rfc3339(),
+    )
+    .await?;
+    annotate_dispatch_failure_details(db, task_id, state, &error.to_string(), None, Some(details))
+        .await
+}
+
+async fn annotate_dispatch_failure_details(
+    db: &db::SqliteDb,
+    task_id: &str,
+    state: &str,
+    message: &str,
+    authority: Option<&WorkflowAuthority>,
+    details: Option<serde_json::Value>,
+) -> db::Result<()> {
+    let mut annotation: serde_json::Value =
+        serde_json::from_str(&dispatch_failed_annotation_json(state, message))
+            .expect("annotation JSON");
+    if let Some(details) = &details {
+        annotation
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
+    }
+    let annotation = annotation.to_string();
+    let current = TaskRepo::get_by_id(db, task_id, false)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    {
+        if let Some(raw) = current.error_annotation.as_deref() {
+            if preserve_dispatch_annotation(Some(raw)) {
+                return Ok(());
+            }
+            // The hook retained typed refusal details before the engine's
+            // string-only fallback. Preserve them for reconnection recovery.
+            if details.is_none()
+                && serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .is_some_and(|value| {
+                        (value["message"] == message
+                            && value["code"] == api_types::DAEMON_UPGRADE_REQUIRED)
+                            || (value["state"] == state && value["code"] == "placement_unavailable")
+                    })
+            {
+                return Ok(());
+            }
+        }
         let update = UpdateTask {
             id: current.id.clone(),
             expected_version: current.version,
@@ -124,6 +234,20 @@ pub(crate) async fn annotate_dispatch_failure(
             parent_task_id: None,
             updated_at: now_rfc3339(),
         };
+        if !db::task_writer::owns_task(task_id) {
+            return db
+                .run_task_mutation(
+                    task_id,
+                    db::TaskMutation::TaskUpdateIfAnnotation {
+                        input: update,
+                        expected_annotation: current.error_annotation.clone(),
+                        expected_project_version: authority.map(|a| a.project_version),
+                        expected_workflow_definition: authority
+                            .map(|a| a.workflow_definition.clone()),
+                    },
+                )
+                .await;
+        }
         let result = match authority {
             Some(authority) => {
                 TaskRepo::update_with_workflow_authority(
@@ -137,16 +261,10 @@ pub(crate) async fn annotate_dispatch_failure(
             None => TaskRepo::update(db, update).await,
         };
         match result {
-            Ok(_) => return Ok(()),
-            Err(db::DbError::VersionConflict) if attempt < 2 => {
-                current = TaskRepo::get_by_id(db, task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-            }
-            Err(error) => return Err(error),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
         }
     }
-    Ok(())
 }
 
 /// Clear a `dispatch_failed` error annotation (and only that annotation type)
@@ -157,11 +275,26 @@ pub(crate) async fn clear_dispatch_failure_annotation(
     task_id: &str,
     authority: Option<&WorkflowAuthority>,
 ) -> db::Result<()> {
-    let mut current = TaskRepo::get_by_id(db, task_id, false)
+    clear_dispatch_failure_matching(db, task_id, authority, |_| true).await
+}
+
+async fn clear_dispatch_failure_matching(
+    db: &db::SqliteDb,
+    task_id: &str,
+    authority: Option<&WorkflowAuthority>,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> db::Result<()> {
+    let current = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
-    for attempt in 0..3 {
+    {
         if !is_dispatch_failed_annotation(current.error_annotation.as_deref()) {
+            return Ok(());
+        }
+        let annotation: serde_json::Value =
+            serde_json::from_str(current.error_annotation.as_deref().unwrap())
+                .expect("dispatch annotation JSON");
+        if !matches(&annotation) {
             return Ok(());
         }
         let update = UpdateTask {
@@ -179,6 +312,20 @@ pub(crate) async fn clear_dispatch_failure_annotation(
             parent_task_id: None,
             updated_at: now_rfc3339(),
         };
+        if !db::task_writer::owns_task(task_id) {
+            return db
+                .run_task_mutation(
+                    task_id,
+                    db::TaskMutation::TaskUpdateIfAnnotation {
+                        input: update,
+                        expected_annotation: current.error_annotation.clone(),
+                        expected_project_version: authority.map(|a| a.project_version),
+                        expected_workflow_definition: authority
+                            .map(|a| a.workflow_definition.clone()),
+                    },
+                )
+                .await;
+        }
         let result = match authority {
             Some(authority) => {
                 TaskRepo::update_with_workflow_authority(
@@ -192,43 +339,148 @@ pub(crate) async fn clear_dispatch_failure_annotation(
             None => TaskRepo::update(db, update).await,
         };
         match result {
-            Ok(_) => return Ok(()),
-            Err(db::DbError::VersionConflict) if attempt < 2 => {
-                current = TaskRepo::get_by_id(db, task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-            }
-            Err(error) => return Err(error),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
         }
+    }
+}
+
+pub(crate) async fn wake_upgraded_daemon_tasks(
+    db: &db::SqliteDb,
+    daemon_ids: &[String],
+) -> crate::Result<()> {
+    let task_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM task WHERE deleted_at IS NULL AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.daemon_upgrade_refusal.code') END = ?"
+    ).bind(api_types::DAEMON_UPGRADE_REQUIRED).fetch_all(db.pool()).await?;
+    for task_id in task_ids {
+        let matches = |marker: &serde_json::Value| {
+            marker["code"] == api_types::DAEMON_UPGRADE_REQUIRED
+                && marker["daemon_ids"].as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| daemon_ids.iter().any(|daemon| id == daemon))
+                })
+        };
+        let Some(task) = TaskRepo::get_by_id(db, &task_id, false).await? else {
+            continue;
+        };
+        let Some(metadata) = task
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        else {
+            continue;
+        };
+        if !matches(&metadata["daemon_upgrade_refusal"]) {
+            continue;
+        }
+        clear_upgrade_dispatch_refusal(db, &task).await?;
     }
     Ok(())
 }
 
+async fn clear_upgrade_dispatch_refusal(db: &db::SqliteDb, task: &db::Task) -> crate::Result<bool> {
+    // Clearing and waking are one CAS. A manual action that changes the row
+    // or metadata after the scan must keep its newly recorded deferral.
+    let metadata: serde_json::Value = task
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let marker = &metadata["daemon_upgrade_refusal"];
+    let mut annotation = task
+        .error_annotation
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or_default();
+    if annotation["type"] == DISPATCH_FAILED_ANNOTATION {
+        annotation.as_object_mut().unwrap().remove("detected_at");
+    }
+    if marker["code"] != api_types::DAEMON_UPGRADE_REQUIRED
+        || marker["error_annotation"] != annotation
+        || marker["dispatch_disposition"] != metadata["dispatch_disposition"]
+        || marker["deferred_dispatch"] != metadata["deferred_dispatch"]
+    {
+        return Ok(false);
+    }
+    let clear_annotation = annotation["type"] == DISPATCH_FAILED_ANNOTATION
+        && annotation["code"] == api_types::DAEMON_UPGRADE_REQUIRED;
+    let result = db::task_writer::TaskQuery::new(db,&task.id,
+        "UPDATE task SET
+            error_annotation = CASE WHEN ? THEN NULL ELSE error_annotation END,
+            metadata_json = NULLIF(json_remove(metadata_json, '$.daemon_upgrade_refusal', '$.dispatch_disposition', '$.deferred_dispatch'), '{}'),
+            version = version + 1, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL AND version = ?
+            AND metadata_json IS ? AND error_annotation IS ?
+            AND json_extract(metadata_json, '$.daemon_upgrade_refusal.code') = ?"
+    )
+    .bind(clear_annotation)
+    .bind(now_rfc3339())
+    .bind(&task.id)
+    .bind(task.version)
+    .bind(&task.metadata_json)
+    .bind(&task.error_annotation)
+    .bind(api_types::DAEMON_UPGRADE_REQUIRED)
+    .execute(db.pool()).await?;
+    let changed = result != 0;
+    if changed {
+        tracing::info!(task_id = %task.id, "task dispatch woken after daemon upgrade");
+    }
+    Ok(changed)
+}
+
+/// Immutable engine shared by a service and all its clones. Configured dispatch
+/// dependencies belong to the service supplied for each execution.
 pub struct WorkflowEngine {
     pub db: Arc<db::SqliteDb>,
     pub event_bus: Arc<EventBus>,
-    pub review_runner: Option<Arc<review::ReviewRunner>>,
-    pub merge_service: Option<Arc<MergeService>>,
-    pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    /// Single authority for execution dispatch dependencies. A separate
-    /// executor on the engine could let hook dispatch observe a stale or
-    /// differently configured service clone.
-    pub task_service: crate::TaskService,
-    pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
-    pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
-    pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
-    pub workspace_root: PathBuf,
-    pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    #[cfg(test)]
+    invocations: std::sync::atomic::AtomicUsize,
 }
 
+/// Borrowed operation context; it owns neither the engine nor its service.
+pub struct WorkflowExecution<'a> {
+    engine: &'a WorkflowEngine,
+    pub task_service: &'a crate::TaskService,
+}
+
+impl std::ops::Deref for WorkflowExecution<'_> {
+    type Target = WorkflowEngine;
+    fn deref(&self) -> &WorkflowEngine {
+        self.engine
+    }
+}
+
+impl WorkflowEngine {
+    pub fn new(db: Arc<db::SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self {
+            db,
+            event_bus,
+            #[cfg(test)]
+            invocations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn invocation_count(&self) -> usize {
+        self.invocations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn bind<'a>(&'a self, task_service: &'a crate::TaskService) -> WorkflowExecution<'a> {
+        WorkflowExecution {
+            engine: self,
+            task_service,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TransitionResult {
     pub task: db::Task,
     pub review: Option<db::Review>,
-    pub cascaded: bool,
+    pub queued_step_id: Option<String>,
+    pub pending_steps: i64,
     pub board_move: Option<BoardMoveOutcome>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BoardMoveRequest {
     pub operation_id: String,
     pub project_id: String,
@@ -241,7 +493,7 @@ pub struct BoardMoveRequest {
 /// Project workflow authority captured alongside the Task snapshot that a
 /// transition used. Both values are checked while the Task mutation holds
 /// SQLite's writer transaction, so a stale workflow cannot commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowAuthority {
     pub project_version: i64,
     pub workflow_definition: String,
@@ -252,13 +504,13 @@ pub struct WorkflowAuthority {
     pub clear_review_passed_at_on_commit: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BoardMoveOutcome {
     Committed(MoveTaskResult),
     Replayed(MoveTaskResult),
 }
 
-impl WorkflowEngine {
+impl WorkflowExecution<'_> {
     /// Blocking hooks may settle review authority by advancing the Task
     /// version. Refresh the local transition snapshot after every hook so the
     /// subsequent barrier/CAS uses the version that the hook actually left in
@@ -267,14 +519,12 @@ impl WorkflowEngine {
     async fn refresh_task_after_hook(
         &self,
         task: &mut db::Task,
-        expected_status: &str,
+        _expected_status: &str,
+        _step: Option<&db::TaskStep>,
     ) -> crate::Result<()> {
         let latest = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        if latest.status != expected_status {
-            return Err(db::DbError::VersionConflict.into());
-        }
         *task = latest;
         Ok(())
     }
@@ -323,15 +573,31 @@ impl WorkflowEngine {
         if action != "run_ci_steps" || actor.is_user() {
             return Ok(None);
         }
+        // A typed owner/preflight refusal was settled atomically by the hook.
+        // It may have occurred before any Review row was created.
+        let interrupted = task
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|barrier| {
+                barrier["status"] == "blocked"
+                    && barrier["interrupted_at"]
+                        .as_str()
+                        .is_some_and(|at| at >= entry_started_at)
+            });
+        if interrupted {
+            return Ok(Some(ReviewEntryFailure {
+                task: task.clone(),
+                cascade: None,
+            }));
+        }
         let Some(review) = latest_review(&self.db, &task.id).await? else {
             return Ok(None);
         };
-        if review.status != db::ReviewStatus::Failed {
-            return Ok(None);
-        }
-        // A configuration/runner failure before attempt creation must not
-        // route a failed Review left over from an earlier state entry.
-        if review.started_at.as_str() < entry_started_at {
+        // Authority-loss cancellations retain the base routing.
+        if review.status != db::ReviewStatus::Failed
+            || review.started_at.as_str() < entry_started_at
+        {
             return Ok(None);
         }
         let task = self
@@ -374,8 +640,9 @@ impl WorkflowEngine {
         actor: &Actor,
         reason: &str,
         rejection: bool,
+        bridge: api_types::TransitionBridge,
     ) -> crate::Result<TransitionResult> {
-        self.transition_with_deferred_dispatch(
+        self.transition_with_deferred_dispatch_and_authority(
             task_id,
             target_state,
             version,
@@ -384,6 +651,8 @@ impl WorkflowEngine {
             reason,
             rejection,
             None,
+            None,
+            bridge,
         )
         .await
     }
@@ -410,6 +679,7 @@ impl WorkflowEngine {
             rejection,
             defer_dispatch_until,
             None,
+            Default::default(),
         )
         .await
     }
@@ -426,6 +696,7 @@ impl WorkflowEngine {
         rejection: bool,
         defer_dispatch_until: Option<String>,
         authority: Option<WorkflowAuthority>,
+        bridge: api_types::TransitionBridge,
     ) -> crate::Result<TransitionResult> {
         self.transition_inner(
             task_id.to_string(),
@@ -438,8 +709,10 @@ impl WorkflowEngine {
             false,
             defer_dispatch_until,
             None,
-            0,
+            None,
             authority,
+            false,
+            bridge,
         )
         .await
     }
@@ -466,6 +739,7 @@ impl WorkflowEngine {
             rejection,
             None,
             Some(authority),
+            Default::default(),
         )
         .await
     }
@@ -517,32 +791,10 @@ impl WorkflowEngine {
             false,
             None,
             Some(move_request),
-            0,
-            authority,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn manual_override_transition(
-        &self,
-        task_id: &str,
-        target_state: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: Actor,
-        reason: &str,
-        rejection: bool,
-    ) -> crate::Result<TransitionResult> {
-        self.manual_override_transition_with_authority(
-            task_id,
-            target_state,
-            version,
-            workflow,
-            actor,
-            reason,
-            rejection,
             None,
+            authority,
+            false,
+            Default::default(),
         )
         .await
     }
@@ -574,42 +826,14 @@ impl WorkflowEngine {
             true,
             None,
             None,
-            0,
+            None,
             authority,
+            false,
+            Default::default(),
         )
         .await
     }
 
-    pub async fn retry_entry_barrier(
-        &self,
-        task_id: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: &Actor,
-        reason: &str,
-    ) -> crate::Result<TransitionResult> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        self.retry_entry_barrier_with_authority(
-            task_id,
-            version,
-            workflow,
-            actor,
-            reason,
-            WorkflowAuthority {
-                project_version: project.version,
-                workflow_definition: project.workflow_definition,
-                clear_review_passed_at_on_commit: false,
-            },
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn retry_entry_barrier_with_authority(
         &self,
         task_id: &str,
@@ -649,304 +873,30 @@ impl WorkflowEngine {
                 target_state, task.status
             )));
         }
-        let state = Self::find_state(workflow, &target_state).ok_or_else(|| {
-            ServiceError::InvalidOperation {
-                message: Self::undefined_state_message(&target_state, workflow),
-            }
-        })?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-
-        let started_at = barrier
-            .get("started_at")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(now_rfc3339);
-        let retry_started_at = now_rfc3339();
-        let running_barrier = serde_json::json!({
-            "state": target_state.as_str(),
-            "status": "running",
-            "started_at": started_at.as_str(),
-            "retry_started_at": retry_started_at.as_str(),
-            "retry_reason": reason,
-        })
-        .to_string();
-        let mut task = TaskRepo::set_entry_barrier_with_workflow_authority(
-            &*self.db,
-            task_id,
-            task.version,
-            Some(running_barrier),
-            &retry_started_at,
-            authority.project_version,
-            authority.workflow_definition.clone(),
+        self.transition_inner(
+            task_id.to_owned(),
+            target_state,
+            version,
+            workflow,
+            actor.clone(),
+            reason.to_owned(),
+            false,
+            true,
+            None,
+            None,
+            None,
+            Some(authority),
+            true,
+            Default::default(),
         )
-        .await?;
-
-        let state_config =
-            merged_state_config(state, Some(&project), task.task_state_config.as_deref());
-        let workflow_ctx = Arc::new(workflow.clone());
-        let latest_execution = latest_execution_context(&self.db, &task.id).await?;
-        let latest_executor = latest_executor_context(&self.db, &task.id).await?;
-        let workspace_id = latest_execution
-            .as_ref()
-            .and_then(|execution| execution.workspace_id.clone())
-            .or_else(|| {
-                latest_executor
-                    .as_ref()
-                    .and_then(|execution| execution.workspace_id.clone())
-            });
-        let execution_id = latest_executor
-            .as_ref()
-            .map(|execution| execution.id.clone())
-            .or_else(|| {
-                latest_execution
-                    .as_ref()
-                    .map(|execution| execution.id.clone())
-            });
-        let enter_ctx = HookContext {
-            task_id: task.id.clone(),
-            project_id: task.project_id.clone(),
-            from_state: target_state.clone(),
-            to_state: target_state.clone(),
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            gate_config: state.gate_config.clone(),
-            workflow: Arc::clone(&workflow_ctx),
-            project_version: Some(authority.project_version),
-            project_workflow_definition: Some(authority.workflow_definition.clone()),
-            triggered_by: actor.clone(),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.task_service.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_id,
-            agent_id: latest_execution
-                .as_ref()
-                .and_then(|execution| execution.agent_id.clone()),
-            execution_id,
-            state_config,
-        };
-
-        let mut cascade: Option<(String, String)> = None;
-        let mut ci_rejection_cascade = false;
-        let mut blocked = false;
-        for hook in &state.hooks.before_enter {
-            if !hook_audience_matches(hook.applies_to, actor) {
-                log_hook_skipped_by_audience(
-                    &task.id,
-                    &target_state,
-                    &target_state,
-                    "before_enter",
-                    hook,
-                    actor,
-                );
-                continue;
-            }
-            let action = registry::resolve_action(&hook.action)?;
-            log_hook_start(
-                &task.id,
-                &target_state,
-                &target_state,
-                "before_enter",
-                hook,
-                actor,
-            );
-            let started = Instant::now();
-            let result = action.execute(&enter_ctx).await;
-            self.refresh_task_after_hook(&mut task, &target_state)
-                .await?;
-            let duration_ms = elapsed_ms(started);
-            log_hook_result(
-                &task.id,
-                &target_state,
-                &target_state,
-                "before_enter",
-                hook,
-                &result,
-                duration_ms,
-            );
-            match result {
-                HookResult::Failed { reason: error } => {
-                    if let Some(settled) = self
-                        .settle_failed_ci_entry(
-                            &task,
-                            &hook.action,
-                            actor,
-                            &retry_started_at,
-                            Some(&authority),
-                        )
-                        .await?
-                    {
-                        task = settled.task;
-                        cascade = settled.cascade.map(|(target, _)| (target, error.clone()));
-                        ci_rejection_cascade = cascade.is_some();
-                        blocked = cascade.is_none();
-                        break;
-                    }
-                    if matches!(hook.on_failure, FailurePolicy::Block) {
-                        let blocked_at = now_rfc3339();
-                        let blocked_barrier = serde_json::json!({
-                            "state": target_state.as_str(),
-                            "status": "blocked",
-                            "started_at": started_at.as_str(),
-                            "updated_at": blocked_at.as_str(),
-                            "blocking_reason": error.as_str(),
-                            "retry_reason": reason,
-                        })
-                        .to_string();
-                        task = TaskRepo::set_entry_barrier_with_workflow_authority(
-                            &*self.db,
-                            task_id,
-                            task.version,
-                            Some(blocked_barrier),
-                            &blocked_at,
-                            authority.project_version,
-                            authority.workflow_definition.clone(),
-                        )
-                        .await?;
-                        blocked = true;
-                        break;
-                    }
-                }
-                HookResult::Cascade {
-                    to,
-                    reason: cascade_reason,
-                } => {
-                    cascade = Some((to, cascade_reason));
-                    break;
-                }
-                HookResult::Ok | HookResult::Skipped { .. } => {}
-            }
-        }
-
-        if blocked {
-            let review = latest_review(&self.db, &task.id).await?;
-            return Ok(TransitionResult {
-                task,
-                review,
-                cascaded: false,
-                board_move: None,
-            });
-        }
-
-        if cascade.is_none() {
-            task = TaskRepo::update_with_workflow_authority(
-                &*self.db,
-                UpdateTask {
-                    id: task.id.clone(),
-                    expected_version: task.version,
-                    title: None,
-                    description: None,
-                    priority: None,
-                    merge_config: None,
-                    plan: None,
-                    error_annotation: Some(None),
-                    blocked_json: Some(None),
-                    failed_json: None,
-                    task_state_config: None,
-                    parent_task_id: None,
-                    updated_at: now_rfc3339(),
-                },
-                authority.project_version,
-                authority.workflow_definition.clone(),
-            )
-            .await?;
-
-            for hook in &state.hooks.on_enter {
-                if !hook_audience_matches(hook.applies_to, actor) {
-                    continue;
-                }
-                let action = registry::resolve_action(&hook.action)?;
-                let result = action.execute(&enter_ctx).await;
-                self.refresh_task_after_hook(&mut task, &target_state)
-                    .await?;
-                if let HookResult::Cascade {
-                    to,
-                    reason: cascade_reason,
-                } = result
-                {
-                    cascade = Some((to, cascade_reason));
-                    break;
-                }
-            }
-        }
-
-        if cascade.is_none() {
-            let cleared_at = now_rfc3339();
-            task = TaskRepo::set_entry_barrier_with_workflow_authority(
-                &*self.db,
-                task_id,
-                task.version,
-                None,
-                &cleared_at,
-                authority.project_version,
-                authority.workflow_definition.clone(),
-            )
-            .await?;
-        }
-
-        if cascade.is_none() {
-            let effective_after_enter_hooks = effective_after_enter_hooks(state);
-            for hook in &effective_after_enter_hooks {
-                if !hook_audience_matches(hook.applies_to, actor) {
-                    continue;
-                }
-                let action = registry::resolve_action(&hook.action)?;
-                let result = action.execute(&enter_ctx).await;
-                self.refresh_task_after_hook(&mut task, &target_state)
-                    .await?;
-                if let HookResult::Cascade {
-                    to,
-                    reason: cascade_reason,
-                } = result
-                {
-                    cascade = Some((to, cascade_reason));
-                    break;
-                }
-            }
-        }
-
-        if let Some((cascade_to, cascade_reason)) = cascade {
-            let mut cascaded = self
-                .transition_inner(
-                    task_id.to_owned(),
-                    cascade_to,
-                    task.version,
-                    workflow,
-                    Actor::system(api_types::SystemComponent::Workflow),
-                    cascade_reason,
-                    ci_rejection_cascade,
-                    false,
-                    None,
-                    None,
-                    1,
-                    Some(authority.clone()),
-                )
-                .await?;
-            cascaded.cascaded = true;
-            return Ok(cascaded);
-        }
-
-        let review = latest_review(&self.db, &task.id).await?;
-        Ok(TransitionResult {
-            task,
-            review,
-            cascaded: false,
-            board_move: None,
-        })
+        .await
     }
 
     #[tracing::instrument(
         skip(self, workflow),
         fields(task_id = %task_id, target_state = %target_state, version = version, actor = %actor, reason = %reason)
     )]
-    pub async fn reset_to_initial(
+    pub async fn restart(
         &self,
         task_id: &str,
         target_state: &str,
@@ -955,9 +905,9 @@ impl WorkflowEngine {
         actor: &Actor,
         reason: &str,
     ) -> crate::Result<db::Task> {
-        let to_state = Self::find_state(workflow, target_state).ok_or_else(|| {
+        let to_state = WorkflowEngine::find_state(workflow, target_state).ok_or_else(|| {
             ServiceError::InvalidOperation {
-                message: Self::undefined_state_message(target_state, workflow),
+                message: WorkflowEngine::undefined_state_message(target_state, workflow),
             }
         })?;
         if to_state.kind != StateKind::Initial {
@@ -978,15 +928,17 @@ impl WorkflowEngine {
                 true,
                 None,
                 None,
-                0,
                 None,
+                None,
+                false,
+                Default::default(),
             )
             .await?;
         Ok(result.task)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn reset_to_initial_with_authority(
+    pub async fn restart_with_authority(
         &self,
         task_id: &str,
         target_state: &str,
@@ -996,9 +948,9 @@ impl WorkflowEngine {
         reason: &str,
         authority: WorkflowAuthority,
     ) -> crate::Result<db::Task> {
-        let to_state = Self::find_state(workflow, target_state).ok_or_else(|| {
+        let to_state = WorkflowEngine::find_state(workflow, target_state).ok_or_else(|| {
             ServiceError::InvalidOperation {
-                message: Self::undefined_state_message(target_state, workflow),
+                message: WorkflowEngine::undefined_state_message(target_state, workflow),
             }
         })?;
         if to_state.kind != StateKind::Initial {
@@ -1019,88 +971,17 @@ impl WorkflowEngine {
                 true,
                 None,
                 None,
-                0,
+                None,
                 Some(authority),
+                false,
+                Default::default(),
             )
             .await?;
         Ok(result.task)
     }
 
-    pub fn validate_claimable(
-        workflow: &WorkflowDefinition,
-        current_status: &str,
-    ) -> crate::Result<()> {
-        if let Some(state) = Self::find_state(workflow, current_status) {
-            if state.kind == StateKind::Backlog {
-                return Err(ServiceError::InvalidOperation {
-                    message: "task is in backlog and cannot be claimed".to_string(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn transition_requires_system_actor(
-        trigger: WorkflowTrigger,
-        from_state: &StateDefinition,
-        to_state: &StateDefinition,
-    ) -> bool {
-        if !trigger.system_only() {
-            return false;
-        }
-
-        let is_direct_work_start = trigger == WorkflowTrigger::Retry
-            && from_state.kind == StateKind::Initial
-            && to_state.kind == StateKind::Active;
-        !is_direct_work_start
-    }
-
-    pub fn resolve_workflow(workflow_definition_json: &str) -> WorkflowDefinition {
-        let raw = workflow_definition_json.trim();
-        if raw.is_empty() || raw == "{}" {
-            return default_workflow::default_workflow();
-        }
-
-        serde_json::from_str(raw).unwrap_or_else(|_| default_workflow::default_workflow())
-    }
-
-    pub fn resolve_subtask_workflow() -> WorkflowDefinition {
-        inherited_subtask_workflow()
-    }
-
-    /// Single source of truth for which workflow governs a task at transition entry.
-    ///
-    /// - Root tasks always use the project workflow.
-    /// - Subtasks in a state absent from the inherited subtask workflow use the project
-    ///   workflow for every actor.
-    /// - Subtasks in a shared subtask-workflow state use the inherited subtask workflow
-    ///   for non-user actors and the project workflow for user actors.
-    pub fn resolve_workflow_for_task(
-        task: &db::Task,
-        workflow_definition_json: &str,
-        actor: &Actor,
-    ) -> WorkflowDefinition {
-        let project_workflow = Self::resolve_workflow(workflow_definition_json);
-        if task.parent_task_id.is_none() {
-            return project_workflow;
-        }
-
-        let subtask_wf = inherited_subtask_workflow();
-        let current_in_subtask = subtask_wf
-            .states
-            .iter()
-            .any(|s| s.name.as_str() == task.status.as_str());
-        if !current_in_subtask {
-            return project_workflow;
-        }
-        if actor.is_user() {
-            return project_workflow;
-        }
-        subtask_wf
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn transition_inner<'a>(
+    pub(crate) fn transition_inner<'a>(
         &'a self,
         task_id: String,
         target_state: String,
@@ -1112,9 +993,15 @@ impl WorkflowEngine {
         skip_before_exit: bool,
         defer_dispatch_until: Option<String>,
         board_move: Option<BoardMoveRequest>,
-        depth: u8,
+        step: Option<db::TaskStep>,
         authority: Option<WorkflowAuthority>,
+        entry_retry: bool,
+        bridge: api_types::TransitionBridge,
     ) -> Pin<Box<dyn Future<Output = crate::Result<TransitionResult>> + Send + 'a>> {
+        #[cfg(test)]
+        self.engine
+            .invocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let span = tracing::info_span!(
             "workflow.transition_inner",
             task_id = %task_id,
@@ -1125,15 +1012,29 @@ impl WorkflowEngine {
             rejection = rejection,
             skip_before_exit = skip_before_exit,
             defer_dispatch = defer_dispatch_until.is_some(),
-            depth = depth,
+            step_id = ?step.as_ref().map(|step| &step.id),
         );
 
         Box::pin(async move {
+            if !db::task_writer::owns_task(&task_id) {
+                let preempt = WorkflowEngine::is_cancellation_target(workflow, &target_state);
+                let command=crate::task_service::commands::TaskCommand {
+                    operation:"engine_transition".to_owned(),preempt,
+                    arguments:serde_json::json!({"task_id":task_id,"target_state":target_state,"version":version,"workflow":workflow,"actor":actor,"reason":reason,"rejection":rejection,"skip_before_exit":skip_before_exit,"defer_dispatch_until":defer_dispatch_until,"board_move":board_move,"authority":authority,"entry_retry":entry_retry,"bridge_kind":bridge.bridge_kind,"bridge_payload":bridge.bridge_payload}),
+                };
+                if db::task_writer::current_task_step().is_some_and(|step|step.task_id!=task_id) && preempt {
+                    self.task_service.enqueue_task_command(&task_id,&command.operation,command.arguments,preempt).await?;
+                    let task=TaskRepo::get_by_id(&*self.db,&task_id,false).await?.ok_or(db::DbError::NotFound)?;
+                    return Ok(TransitionResult {task,review:None,queued_step_id:None,pending_steps:self.db.pending_steps(&task_id).await?,board_move:None});
+                }
+                return Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(self.task_service.clone()))
+                    .request_command(&task_id,command).await;
+            }
             let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
 
-            if task.version != version {
+            if step.is_none() && !db::task_writer::owns_task(&task_id) && task.version != version {
                 tracing::warn!(
                     task_id = %task.id,
                     expected_version = version,
@@ -1154,6 +1055,7 @@ impl WorkflowEngine {
                 });
             }
 
+            let version = task.version;
             let current_status = task.status.to_string();
             tracing::debug!(
                 task_id = %task.id,
@@ -1161,36 +1063,36 @@ impl WorkflowEngine {
                 to_state = %target_state,
                 actor = %actor,
                 reason = %reason,
-                depth = depth,
+                step_id = ?step.as_ref().map(|step| &step.id),
                 "workflow transition requested"
             );
-            let from_state = Self::find_state(workflow, &current_status).ok_or_else(|| {
+            let from_state = WorkflowEngine::find_state(workflow, &current_status).ok_or_else(|| {
                 ServiceError::InvalidOperation {
-                    message: Self::undefined_state_message(&current_status, workflow),
+                    message: WorkflowEngine::undefined_state_message(&current_status, workflow),
                 }
             })?;
-            let to_state = Self::find_state(workflow, &target_state).ok_or_else(|| {
+            let to_state = WorkflowEngine::find_state(workflow, &target_state).ok_or_else(|| {
                 ServiceError::InvalidOperation {
-                    message: Self::undefined_state_message(&target_state, workflow),
+                    message: WorkflowEngine::undefined_state_message(&target_state, workflow),
                 }
             })?;
             let transition = workflow.trigger_between(&current_status, &target_state);
             let trigger_name = transition.map(|trigger| trigger.as_str().to_owned());
             let is_user_actor = actor.is_user();
             let is_agent_cancellation = actor.is_agent()
-                && Self::is_cancellation_target(workflow, &target_state)
+                && WorkflowEngine::is_cancellation_target(workflow, &target_state)
                 && from_state.kind != StateKind::Terminal;
             let none_allowance = transition.is_none()
                 && (((current_status == target_state || to_state.kind == StateKind::Initial)
                     && skip_before_exit)
-                    || (Self::is_cancellation_target(workflow, &target_state)
+                    || (WorkflowEngine::is_cancellation_target(workflow, &target_state)
                         && from_state.kind != StateKind::Terminal));
             let strict_missing_edge = transition.is_none() && !none_allowance;
             let strict_system_only = matches!(
                 transition,
                 Some(trigger)
                     if !skip_before_exit
-                        && Self::transition_requires_system_actor(trigger, from_state, to_state)
+                        && WorkflowEngine::transition_requires_system_actor(trigger, from_state, to_state)
                         && !actor.is_system()
                         && !is_agent_cancellation
             );
@@ -1224,7 +1126,7 @@ impl WorkflowEngine {
                     }
                     None if skip_before_exit && to_state.kind == StateKind::Initial => true,
                     None if skip_before_exit && current_status == target_state => true,
-                    None if Self::is_cancellation_target(workflow, &target_state)
+                    None if WorkflowEngine::is_cancellation_target(workflow, &target_state)
                         && from_state.kind != StateKind::Terminal =>
                     {
                         true
@@ -1255,7 +1157,7 @@ impl WorkflowEngine {
                 reason = %reason,
                 rejection = rejection,
                 skip_before_exit = effective_skip_before_exit,
-                depth = depth,
+                step_id = ?step.as_ref().map(|step| &step.id),
                 "workflow transition accepted"
             );
 
@@ -1309,15 +1211,16 @@ impl WorkflowEngine {
                     .as_ref()
                     .map(|authority| authority.workflow_definition.clone()),
                 triggered_by: actor.clone(),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
+                review_runner: self.task_service.review_runner.clone(),
+                merge_service: self.task_service.merge_service.clone(),
+                cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
                 task_service: self.task_service.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
+                daemon_connections: self.task_service.daemon_connections.clone(),
+                workspace_exec_locks: self.task_service.workspace_exec_locks.clone(),
+                terminal_activity: self.task_service.terminal_activity.clone(),
+                workspace_root: self.task_service.workspace_root.clone(),
+                repo_cache_locks: self.task_service.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.task_service.workspace_backend_router),
                 workspace_id: workspace_id.clone(),
                 agent_id: latest_execution
                     .as_ref()
@@ -1341,15 +1244,16 @@ impl WorkflowEngine {
                     .as_ref()
                     .map(|authority| authority.workflow_definition.clone()),
                 triggered_by: actor.clone(),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
+                review_runner: self.task_service.review_runner.clone(),
+                merge_service: self.task_service.merge_service.clone(),
+                cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
                 task_service: self.task_service.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
+                daemon_connections: self.task_service.daemon_connections.clone(),
+                workspace_exec_locks: self.task_service.workspace_exec_locks.clone(),
+                terminal_activity: self.task_service.terminal_activity.clone(),
+                workspace_root: self.task_service.workspace_root.clone(),
+                repo_cache_locks: self.task_service.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.task_service.workspace_backend_router),
                 workspace_id,
                 agent_id: latest_execution
                     .as_ref()
@@ -1359,20 +1263,13 @@ impl WorkflowEngine {
             };
 
             let mut hook_results = Vec::new();
-            let mut cascade: Option<(String, String)> = None;
-            // Set when a failed dispatch hook rolls the task back to the
-            // workflow's initial state: the rollback must not be blocked by
-            // the active state's exit guards (reset_to_initial idiom).
-            let mut cascade_skip_before_exit = false;
-            let mut before_enter_rejection_cascade = false;
-            let mut skip_target_enter_hooks = false;
             // `merge_failed` is only an edge-compatible bridge for mechanical
             // contention refreshes. It must run its on-enter dispatcher so the
             // task can cascade to review, but it must not run repair-state
             // entry hooks or create a retryable entry barrier along the way.
             let review_refresh_bridge = current_status == crate::workflow::default_states::MERGING
                 && target_state == crate::workflow::default_states::MERGE_FAILED
-                && reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
+                && bridge.is_review_refresh()
                 && matches!(
                     &actor,
                     Actor::System {
@@ -1385,7 +1282,7 @@ impl WorkflowEngine {
             // itself spends merge-fix budget before the real conflict is seen.
             let conflict_handoff_bridge = current_status == crate::workflow::default_states::MERGING
                 && target_state == crate::workflow::default_states::MERGE_FAILED
-                && reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
+                && bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
                 && matches!(
                     &actor,
                     Actor::System {
@@ -1393,13 +1290,6 @@ impl WorkflowEngine {
                     }
                 );
             let rejection = rejection && !review_refresh_bridge && !conflict_handoff_bridge;
-            let has_blocking_before_enter = !review_refresh_bridge
-                && to_state
-                    .hooks
-                    .before_enter
-                    .iter()
-                    .any(|hook| matches!(hook.on_failure, FailurePolicy::Block));
-
             if !effective_skip_before_exit {
                 for hook in &from_state.hooks.before_exit {
                     if !hook_audience_matches(hook.applies_to, &actor) {
@@ -1424,7 +1314,8 @@ impl WorkflowEngine {
                     );
             let started = Instant::now();
             let result = action.execute(&exit_ctx).await;
-            self.refresh_task_after_hook(&mut task, &current_status).await?;
+            self.refresh_task_after_hook(&mut task, &current_status, None)
+                .await?;
             let duration_ms = elapsed_ms(started);
                     log_hook_result(
                         &task.id,
@@ -1477,109 +1368,12 @@ impl WorkflowEngine {
                 }
             }
 
-            if board_move.is_some() && !review_refresh_bridge {
-                for hook in &to_state.hooks.before_enter {
-                    if !hook_audience_matches(hook.applies_to, &actor) {
-                        log_hook_skipped_by_audience(
-                            &task.id,
-                            &current_status,
-                            &target_state,
-                            "before_enter",
-                            hook,
-                            &actor,
-                        );
-                        continue;
-                    }
-                    let action = registry::resolve_action(&hook.action)?;
-                    log_hook_start(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "before_enter",
-                        hook,
-                        &actor,
-                    );
-                    let started = Instant::now();
-                    let result = action.execute(&enter_ctx).await;
-                    self.refresh_task_after_hook(&mut task, &current_status).await?;
-                    let duration_ms = elapsed_ms(started);
-                    log_hook_result(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "before_enter",
-                        hook,
-                        &result,
-                        duration_ms,
-                    );
-                    hook_results.push(hook_result_entry(
-                        &hook.action,
-                        "before_enter",
-                        &result,
-                        duration_ms,
-                    ));
-                    match result {
-                        HookResult::Failed { reason: error }
-                            if matches!(hook.on_failure, FailurePolicy::Block) =>
-                        {
-                            self.event_bus.publish(ForgeEvent {
-                                event_type: "transition.guard_rejected".to_owned(),
-                                entity_id: task.id.clone(),
-                                timestamp: event_timestamp(),
-                                context: EventContext::TransitionGuardRejected {
-                                    task_id: task.id.clone(),
-                                    from_state: current_status.clone(),
-                                    to_state: target_state.clone(),
-                                    guard_name: hook.action.clone(),
-                                    reason: error.clone(),
-                                },
-                            });
-                            return Err(ServiceError::GuardRejection {
-                                guard: hook.action.clone(),
-                                reason: error,
-                            });
-                        }
-                        HookResult::Failed { reason: error } => {
-                            self.event_bus.publish(ForgeEvent {
-                                event_type: "transition.effect_failed".to_owned(),
-                                entity_id: task.id.clone(),
-                                timestamp: event_timestamp(),
-                                context: EventContext::TransitionEffectFailed {
-                                    task_id: task.id.clone(),
-                                    from_state: current_status.clone(),
-                                    to_state: target_state.clone(),
-                                    action: hook.action.clone(),
-                                    error,
-                                },
-                            });
-                        }
-                        HookResult::Cascade {
-                            to,
-                            reason: cascade_reason,
-                        } => {
-                            cascade = Some((to, cascade_reason));
-                            break;
-                        }
-                        HookResult::Ok | HookResult::Skipped { .. } => {}
-                    }
-                }
-            }
-
             let updated_at = now_rfc3339();
-            let entry_barrier_started_at = updated_at.clone();
-            let entry_barrier_json = (board_move.is_none() && has_blocking_before_enter)
-                .then(|| {
-                    serde_json::json!({
-                        "state": target_state.as_str(),
-                        "status": "running",
-                        "started_at": entry_barrier_started_at.as_str(),
-                    })
-                    .to_string()
-                });
+            let entry_barrier_json = entry_retry.then(|| task.entry_barrier_json.clone()).flatten();
             let cleanup_guard = if from_state.kind == StateKind::Terminal
                 && to_state.kind != StateKind::Terminal
             {
-                if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+                if let Some(scheduler) = self.task_service.cleanup_scheduler.as_ref() {
                     Some(scheduler.lock_task(&task).await)
                 } else {
                     None
@@ -1590,13 +1384,56 @@ impl WorkflowEngine {
             let reopens_visible_work = from_state.kind == StateKind::Terminal
                 && to_state.kind != StateKind::Terminal
                 && !task.is_automation;
-            let transition_log_id = new_uuid_v4();
+            let transition_log_id = step.as_ref().map(|s| s.id.clone()).unwrap_or_else(new_uuid_v4);
             let workflow_snapshot = crate::workflow::transition_event::transition_workflow_snapshot(
                 &task,
                 workflow,
                 &current_status,
                 &target_state,
             )?;
+            let mut producing = task.clone();
+            producing.status = target_state.clone();
+            producing.version = version + 1;
+            let input = self.cascade_step_input(&producing, workflow, target_state.clone(), reason.clone(), bridge.clone(), false, false, authority.clone(), step.as_ref(), transition_log_id.clone(), None).await?;
+            let frozen = self.db.store_step_workflow(&serde_json::to_string(&durable::HookDefinition { workflow: workflow.clone(), project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()) }).map_err(|e| ServiceError::invalid_operation(e.to_string()))?).await?;
+            let cascade_payload: crate::worker_runtime::queue::CascadePayload = serde_json::from_str(&input.payload_json).map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+            let mut dispatch_index = to_state.hooks.on_enter.iter().position(|h| registry::is_dispatch_action(&h.action) && hook_audience_matches(h.applies_to, &actor))
+                .map(|i| (from_state.hooks.on_exit.len() + to_state.hooks.before_enter.len() + i) as i64);
+            let mut admission_agent_id=dispatch_index.and(cascade_payload.admission_agent_id);
+            let role_unassigned = if let Some(role)=crate::workflow::effective_role(to_state) { crate::task_hierarchy::effective_role_assignment(&self.db,&producing,role).await?.is_none_or(|r| r.assignment.assignee_id.is_none()) } else { false };
+            let action_dispatch = crate::TaskService::task_action_command_active() && !entry_retry;
+            let should_defer_dispatch=(defer_dispatch_until.is_some() || action_dispatch) && (to_state.kind!=StateKind::Active || action_dispatch) && dispatch_index.is_some();
+            let deferred_marker=should_defer_dispatch.then(||serde_json::json!({"target_state":target_state,"not_before":defer_dispatch_until.clone().unwrap_or_else(now_rfc3339),"reason":if crate::TaskService::task_action_command_active(){"task action dispatch"}else{"board drag dispatch cooldown"}}).to_string());
+            // Optional, unassigned planning is an imminent fast role entry:
+            // reserve its coder slot while the hook step discovers the skip.
+            if admission_agent_id.is_none() && role_unassigned && dispatch_index.is_some() && from_state.hooks.on_exit.is_empty()
+                && durable::hooks_lane(workflow,&current_status,&target_state)=="fast"
+                && to_state.gate_config.as_ref().is_some_and(|g|g.optional_when_unassigned() && !g.requires_user_approval())
+                && to_state.hooks.after_enter.iter().any(|h|h.action=="auto_cascade_on_unassigned_role" && hook_audience_matches(h.applies_to,&actor))
+            {
+                if let Some(target)=workflow.outgoing_trigger_targets(&target_state).filter(|(trigger,_)|!trigger.system_only()).find_map(|(_,to)|WorkflowEngine::find_state(workflow,&to).filter(|s|s.kind==StateKind::Active)) {
+                    if let Some(role)=crate::workflow::effective_role(target) {
+                        admission_agent_id=crate::task_hierarchy::effective_role_assignment(&self.db,&producing,role).await?.map(|r|r.assignment).filter(|a|a.assignee_type==Some(db::AssigneeKind::Agent)).and_then(|a|a.assignee_id);
+                        if admission_agent_id.is_some() { dispatch_index=None; }
+                    }
+                }
+            }
+            let hook_payload = durable::HookPayload {
+                from: current_status.clone(), to: target_state.clone(), actor: actor.clone(), reason: reason.clone(), bridge: bridge.clone(), transition_log_id: transition_log_id.clone(),
+                workflow_ref: crate::worker_runtime::queue::WorkflowReference::Snapshot(frozen), authority: authority.as_ref().map(|a| a.project_version),
+                from_config: exit_ctx.state_config.clone(), to_config: enter_ctx.state_config.clone(), workspace_id: enter_ctx.workspace_id.clone(), execution_id: enter_ctx.execution_id.clone(), agent_id: enter_ctx.agent_id.clone(),
+                skip_before_enter: review_refresh_bridge, skip_on_exit: entry_retry, defer_dispatch_until: defer_dispatch_until.clone(), action_dispatch, pre_results: hook_results.clone(), dispatch_index, admission_agent_id, evidence: cascade_payload.evidence,
+            };
+            let has_hooks = from_state.hooks.on_exit.iter()
+                .chain(&to_state.hooks.before_enter).chain(&to_state.hooks.on_enter).chain(effective_after_enter_hooks(to_state).iter())
+                .next().is_some() || (to_state.kind == StateKind::Terminal && self.task_service.cleanup_scheduler.is_some());
+            let hook_json = serde_json::to_string(&hook_payload).map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+            let initial_hook_step = has_hooks.then(|| db::EnqueueTaskStep {
+                kind: "hooks".into(), lane: durable::hooks_lane(workflow, &current_status, &target_state).into(),
+                payload_json: hook_json,
+                chain_position: step.as_ref().filter(|p| p.chain_id == input.chain_id).map(|p| p.chain_position).unwrap_or(input.chain_position),
+                ..input
+            });
             let (mut task, transition_log, board_move_outcome) =
                 if let Some(move_request) = board_move {
                     let persistence = TaskBoardRepo::compare_and_move_task(
@@ -1612,10 +1449,15 @@ impl WorkflowEngine {
                             before_id: move_request.before_id,
                             after_id: move_request.after_id,
                             entry_barrier_json: entry_barrier_json.clone(),
+                            post_commit_step: initial_hook_step.clone(),
+                            integration_cancel: current_status != target_state
+                                && workflow.cancellation_state.as_deref()
+                                    == Some(target_state.as_str()),
                             transition_log_id: transition_log_id.clone(),
                             workflow_snapshot: workflow_snapshot.clone(),
                             trigger_name: trigger_name.clone(),
-                            triggered_by: actor.display(),
+                            triggered_by: actor.clone(),
+                            bridge: bridge.clone(),
                             trigger_reason: reason.clone(),
                             rejection,
                             expected_project_version: authority
@@ -1634,7 +1476,8 @@ impl WorkflowEngine {
                             return Ok(TransitionResult {
                                 task: result.task.clone(),
                                 review,
-                                cascaded: false,
+                queued_step_id: None,
+                pending_steps: self.db.pending_steps(&task_id).await?,
                                 board_move: Some(BoardMoveOutcome::Replayed(*result)),
                             });
                         }
@@ -1649,6 +1492,9 @@ impl WorkflowEngine {
                     }
                 } else {
                     let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        self.db.fence_current_step_in_tx(&mut transaction).await?;
+                    let version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id=?")
+                        .bind(&task_id).fetch_one(&mut *transaction).await?;
                     if let Some(authority) = authority.as_ref() {
                         let project_authority = query(
                             "SELECT version, workflow_definition FROM project WHERE id = ?",
@@ -1670,43 +1516,59 @@ impl WorkflowEngine {
                     let clear_review_passed_at = authority
                         .as_ref()
                         .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
+                    // A status change bumps status_epoch through its trigger.
+                    // A workflow self-transition (planning -> planning on a
+                    // gate reject) is also a new entry: bump it here. A step
+                    // fences on status plus epoch, never on the version.
                     let update = query(
-                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
+                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END,\n                     status_epoch = status_epoch + (status = ?)\n                 WHERE id = ? AND deleted_at IS NULL AND ((? = 0 AND version = ?) OR (? = 1 AND status = ? AND status_epoch = ?))",
                     )
                     .bind(&target_state)
                     .bind(&updated_at)
                     .bind(entry_barrier_json.as_deref())
                     .bind(clear_review_passed_at)
+                    .bind(&target_state)
                     .bind(&task_id)
+                    .bind(step.is_some())
                     .bind(version)
+                    .bind(step.is_some())
+                    .bind(step.as_ref().map(|s| s.expected_status.as_str()))
+                    .bind(step.as_ref().map(|s| s.expected_epoch))
                     .execute(&mut *transaction)
                     .await?;
 
                     if update.rows_affected() != 1 {
                         return Err(db::DbError::VersionConflict.into());
                     }
+                    // A Cancel of a Task the integration queue holds asks the
+                    // queue to release its attempt, in this transaction. Once a
+                    // fast-forward may have started, the Cancel waits behind
+                    // the protected result step instead (nothing is written).
+                    if current_status != target_state
+                        && workflow.cancellation_state.as_deref() == Some(target_state.as_str())
+                        && db::request_task_integration_cancel_in_tx(&mut transaction, &task_id, &updated_at).await?
+                            == db::TaskIntegrationCancel::Protected
+                    {
+                        let pending_steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE task_id=? AND status IN ('pending','claimed')")
+                            .bind(&task_id).fetch_one(&mut *transaction).await?;
+                        return Err(db::DbError::TaskBusy { pending_steps, retry_after_ms: 250 }.into());
+                    }
+                    if let Some(marker)=&deferred_marker {
+                        sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch',json(?)) WHERE id=?")
+                            .bind(marker).bind(&task_id).execute(&mut *transaction).await?;
+                    } else {
+                        sqlx::query("UPDATE task SET metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch') ELSE metadata_json END WHERE id=?").bind(&task_id).execute(&mut *transaction).await?;
+                    }
+                    // Carry paused integration through the status hop. Only a
+                    // durable successful merge consumes this marker.
+                    sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.paused_integration.state',?) WHERE id=? AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.paused_integration.state') END=?")
+                        .bind(&target_state).bind(&task_id).bind(&current_status).execute(&mut *transaction).await?;
                     if reopens_visible_work {
                         ProjectRepo::increment_project_work_epoch(
                             &*self.db,
                             &mut transaction,
                             &task.project_id,
                             1,
-                        )
-                        .await?;
-                    }
-                    if task.blocked_json.is_some() {
-                        let mut interruption_snapshot = task.clone();
-                        interruption_snapshot.status = target_state.clone();
-                        interruption_snapshot.blocked_json = None;
-                        interruption_snapshot.entry_barrier_json = entry_barrier_json.clone();
-                        interruption_snapshot.version = version + 1;
-                        interruption_snapshot.updated_at = updated_at.clone();
-                        let interruption_event =
-                            CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
-                        DomainEventRepo::append_event_in_tx(
-                            &*self.db,
-                            &mut transaction,
-                            &interruption_event,
                         )
                         .await?;
                     }
@@ -1723,12 +1585,11 @@ impl WorkflowEngine {
                         updated_at.clone(),
                         workflow_snapshot,
                     );
-                    DomainEventRepo::append_event_in_tx(&*self.db, &mut transaction, &event).await?;
                     sqlx::query(
                         "INSERT INTO transition_log (
                             id, task_id, from_state, to_state, trigger_name, triggered_by,
-                            trigger_reason, hook_results_json, rejection, created_at
-                         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                            trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
                     )
                     .bind(&transition_log_id)
                     .bind(&task.id)
@@ -1737,14 +1598,54 @@ impl WorkflowEngine {
                     .bind(trigger_name.as_deref())
                     .bind(actor.display())
                     .bind(&reason)
+                    .bind(serde_json::to_string(&hook_results).map_err(|e| ServiceError::invalid_operation(e.to_string()))?)
                     .bind(if rejection { 1_i64 } else { 0_i64 })
                     .bind(&updated_at)
+                    .bind(bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+                    .bind(bridge.bridge_payload.as_ref().map(ToString::to_string))
+                    .bind(&task.id)
                     .execute(&mut *transaction)
                     .await?;
+                    if entry_barrier_json.is_none() {
+                        db::budget::fresh_entry(&mut transaction, &task.id, &transition_log_id).await?;
+                    }
+                    // A cascade out of a failed review entry shares that entry's charge.
+                    let entry_step = step
+                        .as_ref()
+                        .filter(|step| step.kind == "cascade")
+                        .and_then(|step| step.causation_step_id.as_deref());
+                    db::budget::transition(
+                        &mut transaction,
+                        &task.id,
+                        &current_status,
+                        actor.is_owner(),
+                        &bridge,
+                        rejection,
+                        &transition_log_id,
+                        entry_step,
+                    )
+                    .await?;
+                    // State the entry once its receipt exists: the status CAS,
+                    // its SQL-computed metadata writes and the transition row
+                    // above are one entry. The step settlement and the hooks
+                    // enqueue below restate their own step witness.
+                    self.db
+                        .state_condition_in_tx(&mut transaction, &task_id, db::ConditionChange::Entry)
+                        .await?;
+                    if let Some(step) = &step {
+                        self.db.finish_step_in_tx(&mut transaction, step, "done", None).await?;
+                    }
+                    if let Some(input) = &initial_hook_step {
+                        self.db.enqueue_step_in_tx(&mut transaction, input).await?;
+                    }
+                    if task.blocked_json.is_some() {
+                        let interruption_snapshot = self.db.get_task_in_tx(&mut transaction,&task_id).await?.ok_or(db::DbError::NotFound)?;
+                        let interruption_event = CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
+                        DomainEventRepo::append_event_in_tx(&*self.db,&mut transaction,&interruption_event).await?;
+                    }
+                    DomainEventRepo::append_event_in_tx(&*self.db,&mut transaction,&event).await?;
+                    let task = self.db.get_task_in_tx(&mut transaction, &task_id).await?.ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
                     transaction.commit().await?;
-                    let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
                     let transition_log = TransitionLog {
                         id: transition_log_id.clone(),
                         task_id: task.id.clone(),
@@ -1752,6 +1653,7 @@ impl WorkflowEngine {
                         to_state: target_state.clone(),
                         trigger_name: trigger_name.clone(),
                         triggered_by: actor.display(),
+                        bridge: bridge.clone(),
                         trigger_reason: reason.clone(),
                         hook_results_json: None,
                         rejection,
@@ -1760,41 +1662,6 @@ impl WorkflowEngine {
                     (task, transition_log, None)
                 };
             drop(cleanup_guard);
-
-            // The authoritative event was committed with the task mutation.
-            // Fetching by the transition-log/event id also makes replayed board
-            // moves publish at most the already-committed event.
-            if let Some(event) = DomainEventRepo::get_event(&*self.db, &transition_log.id).await? {
-                crate::DomainEventService::new(
-                    Arc::clone(&self.db),
-                    Arc::clone(&self.event_bus),
-                )
-                .publish_committed(&event);
-            }
-            let should_defer_dispatch = defer_dispatch_until.is_some()
-                && to_state.kind != StateKind::Active
-                && to_state
-                    .hooks
-                    .on_enter
-                    .iter()
-                    .any(|hook| hook.action == "dispatch_role_agent");
-            if should_defer_dispatch {
-                deferred_dispatch::set(
-                    &self.db,
-                    &task,
-                    &target_state,
-                    defer_dispatch_until
-                        .as_deref()
-                        .expect("deferred dispatch timestamp exists"),
-                    "board drag dispatch cooldown",
-                )
-                .await?;
-            } else if deferred_dispatch::pending_until(&task).is_some() {
-                deferred_dispatch::clear(&self.db, &task).await?;
-                task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-            }
 
             tracing::info!(
                 task_id = %task.id,
@@ -1805,14 +1672,6 @@ impl WorkflowEngine {
                 transition_log_id = %transition_log.id,
                 "workflow transition applied"
             );
-
-            let memory_service = crate::MemoryService::new(Arc::clone(&self.db));
-            if let Err(error) = memory_service
-                .record_transition_if_failure(&task.project_id, &transition_log, None)
-                .await
-            {
-                tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-            }
 
             if let Some(BoardMoveOutcome::Committed(result)) = &board_move_outcome {
                 self.event_bus.publish(ForgeEvent {
@@ -1845,717 +1704,255 @@ impl WorkflowEngine {
                 });
             }
 
-            for hook in &from_state.hooks.on_exit {
-                if !hook_audience_matches(hook.applies_to, &actor) {
-                    log_hook_skipped_by_audience(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "on_exit",
-                        hook,
-                        &actor,
-                    );
-                    continue;
-                }
-
-                let action = registry::resolve_action(&hook.action)?;
-                log_hook_start(
-                    &task.id,
-                    &current_status,
-                    &target_state,
-                    "on_exit",
-                    hook,
-                    &actor,
-                );
-                let started = Instant::now();
-                let result = action.execute(&exit_ctx).await;
-                self.refresh_task_after_hook(&mut task, &target_state).await?;
-                let duration_ms = elapsed_ms(started);
-                log_hook_result(
-                    &task.id,
-                    &current_status,
-                    &target_state,
-                    "on_exit",
-                    hook,
-                    &result,
-                    duration_ms,
-                );
-                hook_results.push(hook_result_entry(
-                    &hook.action,
-                    "on_exit",
-                    &result,
-                    duration_ms,
-                ));
-
-                match result {
-                    HookResult::Failed { reason: error } => {
-                        tracing::warn!(
-                            action = %hook.action,
-                            task_id = %task.id,
-                            from_state = %current_status,
-                            to_state = %target_state,
-                            %error,
-                            "workflow effect failed on_exit"
-                        );
-                        self.event_bus.publish(ForgeEvent {
-                            event_type: "transition.effect_failed".to_string(),
-                            entity_id: task.id.clone(),
-                            timestamp: event_timestamp(),
-                            context: EventContext::TransitionEffectFailed {
-                                task_id: task.id.clone(),
-                                from_state: current_status.clone(),
-                                to_state: target_state.clone(),
-                                action: hook.action.clone(),
-                                error,
-                            },
-                        });
-                    }
-                    HookResult::Cascade {
-                        to,
-                        reason: cascade_reason,
-                    } => {
-                        cascade = Some((to, cascade_reason));
-                        break;
-                    }
-                    HookResult::Ok | HookResult::Skipped { .. } => {}
+            let queued_step_id = initial_hook_step.as_ref().map(|i| i.id.clone());
+            crate::deferred_dispatch::finish_machine_wait(&self.db, &mut task, version).await?;
+            if let Some(persisted) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? {
+                if persisted.status == task.status && persisted.version == task.version {
+                    task = persisted;
                 }
             }
-
-            if board_move_outcome.is_none() && cascade.is_none() && !review_refresh_bridge {
-                for hook in &to_state.hooks.before_enter {
-                    if !hook_audience_matches(hook.applies_to, &actor) {
-                        log_hook_skipped_by_audience(
-                            &task.id,
-                            &current_status,
-                            &target_state,
-                            "before_enter",
-                            hook,
-                            &actor,
-                        );
-                        continue;
-                    }
-                    let action = registry::resolve_action(&hook.action)?;
-                    log_hook_start(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "before_enter",
-                        hook,
-                        &actor,
-                    );
-                    let started = Instant::now();
-                    let result = action.execute(&enter_ctx).await;
-                    self.refresh_task_after_hook(&mut task, &target_state).await?;
-                    let duration_ms = elapsed_ms(started);
-                    log_hook_result(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "before_enter",
-                        hook,
-                        &result,
-                        duration_ms,
-                    );
-                    hook_results.push(hook_result_entry(
-                        &hook.action,
-                        "before_enter",
-                        &result,
-                        duration_ms,
-                    ));
-
-                    match result {
-                        HookResult::Failed { reason: error } => {
-                            tracing::warn!(
-                                action = %hook.action,
-                                task_id = %task.id,
-                                from_state = %current_status,
-                                to_state = %target_state,
-                                %error,
-                                "workflow effect failed before_enter"
-                            );
-                            self.event_bus.publish(ForgeEvent {
-                                event_type: "transition.effect_failed".to_string(),
-                                entity_id: task.id.clone(),
-                                timestamp: event_timestamp(),
-                                context: EventContext::TransitionEffectFailed {
-                                    task_id: task.id.clone(),
-                                    from_state: current_status.clone(),
-                                    to_state: target_state.clone(),
-                                    action: hook.action.clone(),
-                                    error: error.clone(),
-                                },
-                            });
-
-                            if let Some(settled) = self
-                                .settle_failed_ci_entry(
-                                    &task, &hook.action, &actor, &entry_barrier_started_at, authority.as_ref(),
-                                )
-                                .await?
-                            {
-                                task = settled.task;
-                                cascade = settled.cascade.map(|(target, _)| (target, error.clone()));
-                                before_enter_rejection_cascade = cascade.is_some();
-                                skip_target_enter_hooks = true;
-                                break;
-                            }
-
-                            if matches!(hook.on_failure, FailurePolicy::Block) {
-                                if target_state == crate::workflow::default_states::REVIEW {
-                                    if let Some(reject_target) = to_state
-                                        .gate_config
-                                        .as_ref()
-                                        .and_then(|config| config.reject_target.clone())
-                                    {
-                                        let existing_rejections =
-                                            crate::task_diagnostics::count_gate_rejections_for_task(
-                                                &self.db,
-                                                &task_id,
-                                                &target_state,
-                                            )
-                                            .await?;
-                                        let max_rejections = to_state
-                                            .gate_config
-                                            .as_ref()
-                                            .and_then(|gc| gc.max_rejections)
-                                            .unwrap_or(i32::MAX);
-
-                                        if existing_rejections + 1 >= i64::from(max_rejections) {
-                                            let blocked_at = now_rfc3339();
-                                            let barrier = serde_json::json!({
-                                                "state": target_state.as_str(),
-                                                "status": "blocked",
-                                                "started_at": entry_barrier_started_at.as_str(),
-                                                "updated_at": blocked_at.as_str(),
-                                                "blocking_reason": "review retry budget exhausted",
-                                            })
-                                            .to_string();
-                                            task = self.set_entry_barrier_with_authority(
-                                                &task_id,
-                                                task.version,
-                                                Some(barrier),
-                                                &blocked_at,
-                                                authority.as_ref(),
-                                            )
-                                            .await?;
-                                            skip_target_enter_hooks = true;
-                                        } else {
-                                            let clear_updated_at = now_rfc3339();
-                                            task = self.set_entry_barrier_with_authority(
-                                                &task_id,
-                                                task.version,
-                                                None,
-                                                &clear_updated_at,
-                                                authority.as_ref(),
-                                            )
-                                            .await?;
-                                            before_enter_rejection_cascade = true;
-                                            cascade = Some((reject_target, error));
-                                        }
-                                    } else {
-                                        let blocked_at = now_rfc3339();
-                                        let barrier = serde_json::json!({
-                                            "state": target_state.as_str(),
-                                            "status": "blocked",
-                                            "started_at": entry_barrier_started_at.as_str(),
-                                            "updated_at": blocked_at.as_str(),
-                                            "blocking_reason": error.as_str(),
-                                        })
-                                        .to_string();
-                                        task = self.set_entry_barrier_with_authority(
-                                            &task_id,
-                                            task.version,
-                                            Some(barrier),
-                                            &blocked_at,
-                                            authority.as_ref(),
-                                        )
-                                        .await?;
-                                        skip_target_enter_hooks = true;
-                                    }
-                                } else {
-                                    let blocked_at = now_rfc3339();
-                                    let barrier = serde_json::json!({
-                                        "state": target_state.as_str(),
-                                        "status": "blocked",
-                                        "started_at": entry_barrier_started_at.as_str(),
-                                        "updated_at": blocked_at.as_str(),
-                                        "blocking_reason": error.as_str(),
-                                    })
-                                    .to_string();
-                                    task = self.set_entry_barrier_with_authority(
-                                        &task_id,
-                                        task.version,
-                                        Some(barrier),
-                                        &blocked_at,
-                                        authority.as_ref(),
-                                    )
-                                    .await?;
-                                    skip_target_enter_hooks = true;
-                                }
-                                break;
-                            }
-                        }
-                        HookResult::Cascade {
-                            to,
-                            reason: cascade_reason,
-                        } => {
-                            cascade = Some((to, cascade_reason));
-                            break;
-                        }
-                        HookResult::Ok | HookResult::Skipped { .. } => {}
-                    }
-                }
-            }
-
-            if cascade.is_none() && !skip_target_enter_hooks {
-                for hook in &to_state.hooks.on_enter {
-                    if !hook_audience_matches(hook.applies_to, &actor) {
-                        log_hook_skipped_by_audience(
-                            &task.id,
-                            &current_status,
-                            &target_state,
-                            "on_enter",
-                            hook,
-                            &actor,
-                        );
-                        continue;
-                    }
-                    if should_defer_dispatch && hook.action == "dispatch_role_agent" {
-                        let result = HookResult::Skipped {
-                            reason: "dispatch deferred after board drag".to_owned(),
-                        };
-                        log_hook_result(
-                            &task.id,
-                            &current_status,
-                            &target_state,
-                            "on_enter",
-                            hook,
-                            &result,
-                            0,
-                        );
-                        hook_results.push(hook_result_entry(&hook.action, "on_enter", &result, 0));
-                        // The deferred dispatch is executed later by the task
-                        // dispatcher, which skips tasks carrying a
-                        // dispatch_failed annotation — the user's drag is an
-                        // explicit restart, so drop the stale annotation now.
-                        if is_dispatch_failed_annotation(task.error_annotation.as_deref()) {
-                            if let Err(error) = clear_dispatch_failure_annotation(
-                                &self.db,
-                                &task_id,
-                                authority.as_ref(),
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    task_id = %task.id,
-                                    %error,
-                                    "failed to clear dispatch failure annotation before deferred dispatch"
-                                );
-                            } else {
-                                task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                                    .await?
-                                    .ok_or_else(|| {
-                                        ServiceError::not_found("task", task_id.clone())
-                                    })?;
-                            }
-                        }
-                        continue;
-                    }
-
-                    let action = registry::resolve_action(&hook.action)?;
-                    log_hook_start(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "on_enter",
-                        hook,
-                        &actor,
-                    );
-                    let started = Instant::now();
-                    let result = action.execute(&enter_ctx).await;
-                    self.refresh_task_after_hook(&mut task, &target_state).await?;
-                    let duration_ms = elapsed_ms(started);
-                    log_hook_result(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "on_enter",
-                        hook,
-                        &result,
-                        duration_ms,
-                    );
-                    hook_results.push(hook_result_entry(
-                        &hook.action,
-                        "on_enter",
-                        &result,
-                        duration_ms,
-                    ));
-
-                    match result {
-                        HookResult::Failed { reason: error } => {
-                            tracing::warn!(
-                                action = %hook.action,
-                                task_id = %task.id,
-                                from_state = %current_status,
-                                to_state = %target_state,
-                                %error,
-                                "workflow effect failed on_enter"
-                            );
-                            self.event_bus.publish(ForgeEvent {
-                                event_type: "transition.effect_failed".to_string(),
-                                entity_id: task.id.clone(),
-                                timestamp: event_timestamp(),
-                                context: EventContext::TransitionEffectFailed {
-                                    task_id: task.id.clone(),
-                                    from_state: current_status.clone(),
-                                    to_state: target_state.clone(),
-                                    action: hook.action.clone(),
-                                    error: error.clone(),
-                                },
-                            });
-
-                            // A failed dispatch entering an active state means
-                            // no execution is driving the task; left alone it
-                            // would sit there looking in-flight forever. Roll
-                            // it back to the workflow's initial state and
-                            // record the dispatch error on the task.
-                            if to_state.kind == StateKind::Active
-                                && registry::is_dispatch_action(&hook.action)
-                            {
-                                let fallback = workflow
-                                    .states
-                                    .iter()
-                                    .find(|state| state.kind == StateKind::Initial)
-                                    .map(|state| state.name.clone());
-                                if let Some(fallback) = fallback {
-                                    if !has_running_execution(&self.db, &task.id).await? {
-                                        if let Err(annotate_error) = annotate_dispatch_failure(
-                                            &self.db,
-                                            &task.id,
-                                            &target_state,
-                                            &error,
-                                            authority.as_ref(),
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                task_id = %task.id,
-                                                %annotate_error,
-                                                "failed to record dispatch failure annotation"
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            task_id = %task.id,
-                                            state = %target_state,
-                                            fallback = %fallback,
-                                            %error,
-                                            "dispatch failed entering active state; rolling task back"
-                                        );
-                                        cascade = Some((
-                                            fallback,
-                                            format!(
-                                                "dispatch failed entering {target_state}: {error}"
-                                            ),
-                                        ));
-                                        cascade_skip_before_exit = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        HookResult::Cascade {
-                            to,
-                            reason: cascade_reason,
-                        } => {
-                            cascade = Some((to, cascade_reason));
-                            break;
-                        }
-                        HookResult::Ok => {
-                            // A dispatch that succeeds again invalidates any
-                            // stale dispatch_failed annotation, un-parking the
-                            // task for the task dispatcher.
-                            if registry::is_dispatch_action(&hook.action)
-                                && is_dispatch_failed_annotation(
-                                    task.error_annotation.as_deref(),
-                                )
-                            {
-                                if let Err(error) = clear_dispatch_failure_annotation(
-                                    &self.db,
-                                    &task_id,
-                                    authority.as_ref(),
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        task_id = %task.id,
-                                        %error,
-                                        "failed to clear dispatch failure annotation after successful dispatch"
-                                    );
-                                } else {
-                                    task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                                        .await?
-                                        .ok_or_else(|| {
-                                            ServiceError::not_found("task", task_id.clone())
-                                        })?;
-                                }
-                            }
-                        }
-                        HookResult::Skipped { .. } => {}
-                    }
-                }
-            }
-
-            // Keep the entry barrier through target-state dispatch. The
-            // periodic dispatcher treats a running barrier as authoritative,
-            // so clearing it before `on_enter` creates a window where it can
-            // launch a fresh execution before an inline continuation dispatch
-            // (for example ResumeLatestTargetRoleThread) has claimed the role.
-            // Cascades retain the barrier until their transition replaces it;
-            // blocked entry hooks retain their explicit blocked barrier.
-            if has_blocking_before_enter
-                && cascade.is_none()
-                && !skip_target_enter_hooks
-                && task.entry_barrier_is_running()
-            {
-                let clear_updated_at = now_rfc3339();
-                task = self
-                    .set_entry_barrier_with_authority(
-                        &task_id,
-                        task.version,
-                        None,
-                        &clear_updated_at,
-                        authority.as_ref(),
-                    )
-                    .await?;
-            }
-
-            if cascade.is_none() && !skip_target_enter_hooks {
-                let effective_after_enter_hooks = effective_after_enter_hooks(to_state);
-                for hook in &effective_after_enter_hooks {
-                    if !hook_audience_matches(hook.applies_to, &actor) {
-                        log_hook_skipped_by_audience(
-                            &task.id,
-                            &current_status,
-                            &target_state,
-                            "after_enter",
-                            hook,
-                            &actor,
-                        );
-                        continue;
-                    }
-
-                    let action = registry::resolve_action(&hook.action)?;
-                    log_hook_start(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "after_enter",
-                        hook,
-                        &actor,
-                    );
-                    let started = Instant::now();
-                    let result = action.execute(&enter_ctx).await;
-                    self.refresh_task_after_hook(&mut task, &target_state).await?;
-                    let duration_ms = elapsed_ms(started);
-                    log_hook_result(
-                        &task.id,
-                        &current_status,
-                        &target_state,
-                        "after_enter",
-                        hook,
-                        &result,
-                        duration_ms,
-                    );
-                    hook_results.push(hook_result_entry(
-                        &hook.action,
-                        "after_enter",
-                        &result,
-                        duration_ms,
-                    ));
-
-                    match result {
-                        HookResult::Failed { reason: error } => {
-                            tracing::warn!(
-                                action = %hook.action,
-                                task_id = %task.id,
-                                from_state = %current_status,
-                                to_state = %target_state,
-                                %error,
-                                "workflow validator failed"
-                            );
-                            self.event_bus.publish(ForgeEvent {
-                                event_type: "transition.effect_failed".to_string(),
-                                entity_id: task.id.clone(),
-                                timestamp: event_timestamp(),
-                                context: EventContext::TransitionEffectFailed {
-                                    task_id: task.id.clone(),
-                                    from_state: current_status.clone(),
-                                    to_state: target_state.clone(),
-                                    action: hook.action.clone(),
-                                    error,
-                                },
-                            });
-                        }
-                        HookResult::Cascade {
-                            to,
-                            reason: cascade_reason,
-                        } => {
-                            cascade = Some((to, cascade_reason));
-                            break;
-                        }
-                        HookResult::Ok | HookResult::Skipped { .. } => {}
-                    }
-                }
-            }
-
-            if to_state.kind == StateKind::Terminal {
-                if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
-                    let delay = match workflow.cleanup_policy_for(&target_state) {
-                        Some(api_types::CleanupPolicy::Delayed { seconds }) => {
-                            std::time::Duration::from_secs(seconds)
-                        }
-                        _ => std::time::Duration::ZERO,
-                    };
-                    if let Err(error) = scheduler.schedule_terminal_task(&task.id, delay).await {
-                        tracing::warn!(task_id = %task.id, %error, "terminal Task cleanup deferred");
-                    }
-                }
-            }
-
-            if let Ok(payload) = serde_json::to_string(&hook_results) {
-                if let Err(error) =
-                    TransitionLogRepo::update_hook_results(&*self.db, &transition_log.id, &payload)
-                        .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        transition_log_id = %transition_log.id,
-                        %error,
-                        "workflow failed to persist hook results"
-                    );
-                } else {
-                    let memory_service = crate::MemoryService::new(Arc::clone(&self.db));
-                    if let Err(error) = memory_service
-                        .record_transition_if_failure(
-                            &task.project_id,
-                            &transition_log,
-                            Some(&payload),
-                        )
-                        .await
-                    {
-                        tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
-                    }
-                }
-            }
-
-            if let Some((cascade_to, cascade_reason)) = cascade {
-                if to_state.kind == StateKind::Gate
-                    && to_state
-                        .gate_config
-                        .as_ref()
-                        .is_some_and(|gate_config| gate_config.requires_user_approval())
-                    && !before_enter_rejection_cascade
-                    && !to_state.gate_config.as_ref().is_some_and(|gate_config| {
-                        gate_config.optional_when_unassigned()
-                            && cascade_reason.starts_with("gate skipped:")
-                    })
-                {
-                    tracing::info!(
-                        task_id = %task.id,
-                        state = %target_state,
-                        cascade_to = %cascade_to,
-                        cascade_reason = %cascade_reason,
-                        "workflow cascade paused because gate requires user approval"
-                    );
-                    let review = latest_review(&self.db, &task.id).await?;
-                    return Ok(TransitionResult {
-                        task,
-                        review,
-                        cascaded: false,
-                        board_move: board_move_outcome,
-                    });
-                }
-
-                // Terminal states are absorbing: completing a cascade cannot
-                // loop, regardless of how many mechanical refreshes preceded it.
-                if depth >= MAX_CASCADE_DEPTH && !Self::is_terminal(workflow, &cascade_to) {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        state = %target_state,
-                        cascade_to = %cascade_to,
-                        cascade_reason = %cascade_reason,
-                        depth = depth,
-                        "workflow cascade depth exceeded"
-                    );
-                    self.event_bus.publish(ForgeEvent {
-                        event_type: "transition.cascade_depth_exceeded".to_string(),
-                        entity_id: task.id.clone(),
-                        timestamp: event_timestamp(),
-                        context: EventContext::TransitionCascadeDepthExceeded {
-                            task_id: task.id.clone(),
-                            state: target_state,
-                            depth,
-                        },
-                    });
-                } else {
-                    task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-                    let cascade_rejection = before_enter_rejection_cascade
-                        || (to_state.kind == StateKind::Gate
-                            && !cascade_reason.starts_with("gate skipped:")
-                            && !cascade_reason
-                                .contains(crate::workflow::REVIEW_REFRESH_MARKER)
-                            && !cascade_reason
-                                .contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
-                            && !Self::is_terminal(workflow, &cascade_to));
-
-                    tracing::info!(
-                        task_id = %task.id,
-                        from_state = %target_state,
-                        cascade_to = %cascade_to,
-                        cascade_reason = %cascade_reason,
-                        cascade_rejection = cascade_rejection,
-                        cascade_skip_before_exit = cascade_skip_before_exit,
-                        depth = depth,
-                        next_depth = depth + 1,
-                        "workflow executing cascade transition"
-                    );
-                    let mut cascaded = self
-                        .transition_inner(
-                            task_id,
-                            cascade_to,
-                            task.version,
-                            workflow,
-                            Actor::system(api_types::SystemComponent::Workflow),
-                            cascade_reason,
-                            cascade_rejection,
-                            cascade_skip_before_exit,
-                            None,
-                            None,
-                            depth + 1,
-                            authority.clone(),
-                        )
-                        .await?;
-                    cascaded.cascaded = true;
-                    cascaded.board_move = board_move_outcome;
-                    return Ok(cascaded);
-                }
-            }
-
+            let pending_steps = self.db.pending_steps(&task_id).await?;
+            if let Some(id) = &queued_step_id { self.db.ready_step(id).await?; }
             let review = latest_review(&self.db, &task.id).await?;
 
             Ok(TransitionResult {
                 task,
                 review,
-                cascaded: false,
+                queued_step_id,
+                pending_steps,
                 board_move: board_move_outcome,
             })
         }
         .instrument(span))
     }
 
-    /// Canonical undefined-state rejection text. All transition layers must use this helper;
-    /// the legacy non-enumerating `state '…' is not defined in workflow` format must not appear elsewhere.
+    pub(crate) async fn transition_step(
+        &self,
+        step: &db::TaskStep,
+        payload: &crate::worker_runtime::queue::CascadePayload,
+        workflow: &WorkflowDefinition,
+        authority: Option<WorkflowAuthority>,
+    ) -> crate::Result<TransitionResult> {
+        db::task_writer::in_task_step(
+            step.clone(),
+            self.transition_inner(
+                step.task_id.clone(),
+                payload.to.clone(),
+                step.expected_version,
+                workflow,
+                crate::worker_runtime::queue::cascade_actor(),
+                payload.reason.clone(),
+                payload.rejection,
+                payload.skip_before_exit,
+                None,
+                None,
+                Some(step.clone()),
+                authority,
+                false,
+                payload.bridge.clone(),
+            ),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cascade_step_input(
+        &self,
+        task: &db::Task,
+        workflow: &WorkflowDefinition,
+        to: String,
+        reason: String,
+        bridge: api_types::TransitionBridge,
+        rejection: bool,
+        skip_before_exit: bool,
+        authority: Option<WorkflowAuthority>,
+        parent: Option<&db::TaskStep>,
+        causation_key: String,
+        expected_epoch: Option<i64>,
+    ) -> crate::Result<db::EnqueueTaskStep> {
+        let review_evidence = latest_review(&self.db, &task.id)
+            .await?
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    db::ReviewStatus::Passed | db::ReviewStatus::Failed
+                )
+            })
+            .map(|r| format!("{}:{}", r.id, r.updated_at));
+        let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        let rebases = entries
+            .iter()
+            .filter(|entry| {
+                entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase)
+                    && entry.triggered_by == crate::worker_runtime::queue::cascade_actor().display()
+            })
+            .count();
+        let head: Option<String> = sqlx::query_scalar("SELECT h.head_sha FROM workspace_expected_head h JOIN workspace_placement p ON p.id=h.placement_id AND p.generation=h.generation WHERE p.task_id=? ORDER BY h.recorded_at DESC LIMIT 1")
+            .bind(&task.id).fetch_optional(self.db.pool()).await?;
+        let evidence = Some(format!("{review_evidence:?}|{rebases}|{head:?}"));
+        let workflow_ref = if authority.is_some() {
+            crate::worker_runtime::queue::WorkflowReference::Project
+        } else {
+            crate::worker_runtime::queue::WorkflowReference::Snapshot(
+                self.db
+                    .store_step_workflow(
+                        &serde_json::to_string(workflow)
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+                    )
+                    .await?,
+            )
+        };
+        let continuing = parent.filter(|p| {
+            serde_json::from_str::<crate::worker_runtime::queue::CascadePayload>(&p.payload_json)
+                .map(|p| p.evidence)
+                .or_else(|_| {
+                    serde_json::from_str::<durable::HookPayload>(&p.payload_json)
+                        .map(|p| p.evidence)
+                })
+                .is_ok_and(|e| e == evidence)
+        });
+        let admission_agent_id = if bridge.is_review_refresh()
+            || bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
+        {
+            None
+        } else if let Some(role) = workflow
+            .states
+            .iter()
+            .find(|state| state.name == to)
+            .and_then(crate::workflow::effective_role)
+        {
+            crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
+                .await?
+                .map(|resolved| resolved.assignment)
+                .filter(|assignment| assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                .and_then(|assignment| assignment.assignee_id)
+        } else {
+            None
+        };
+        let payload = crate::worker_runtime::queue::CascadePayload {
+            to,
+            reason,
+            bridge,
+            rejection,
+            skip_before_exit,
+            workflow_ref,
+            admission_agent_id,
+            clear_review_passed_at_on_commit: authority
+                .as_ref()
+                .is_some_and(|a| a.clear_review_passed_at_on_commit),
+            evidence,
+        };
+        Ok(db::EnqueueTaskStep {
+            kind: "cascade".into(),
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            payload_json: serde_json::to_string(&payload)
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+            causation_step_id: parent.map(|p| p.id.clone()),
+            causation_key,
+            chain_id: continuing
+                .map(|p| p.chain_id.clone())
+                .unwrap_or_else(new_uuid_v4),
+            chain_position: continuing
+                .map(|p| {
+                    p.chain_position
+                        + i64::from(!(p.kind == "hooks" && p.causation_step_id.is_none()))
+                })
+                .unwrap_or(1),
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch,
+            lane: crate::worker_runtime::queue::cascade_lane(workflow, &payload.to).into(),
+            available_at: now_rfc3339(),
+        })
+    }
+}
+
+impl WorkflowEngine {
+    pub fn validate_claimable(
+        workflow: &WorkflowDefinition,
+        current_status: &str,
+    ) -> crate::Result<()> {
+        if let Some(state) = Self::find_state(workflow, current_status) {
+            if state.kind == StateKind::Backlog {
+                return Err(ServiceError::InvalidOperation {
+                    message: "task is in backlog and cannot be claimed".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+    fn transition_requires_system_actor(
+        trigger: WorkflowTrigger,
+        from_state: &StateDefinition,
+        to_state: &StateDefinition,
+    ) -> bool {
+        if !trigger.system_only() {
+            return false;
+        }
+
+        let is_direct_work_start = trigger == WorkflowTrigger::Retry
+            && from_state.kind == StateKind::Initial
+            && to_state.kind == StateKind::Active;
+        !is_direct_work_start
+    }
+    pub fn resolve_workflow(workflow_definition_json: &str) -> WorkflowDefinition {
+        let raw = workflow_definition_json.trim();
+        if raw.is_empty() || raw == "{}" {
+            return default_workflow::default_workflow();
+        }
+
+        serde_json::from_str(raw).unwrap_or_else(|_| default_workflow::default_workflow())
+    }
+    pub fn resolve_subtask_workflow() -> WorkflowDefinition {
+        inherited_subtask_workflow()
+    }
+    /// Single source of truth for which workflow governs a task at transition entry.
+    ///
+    /// - Root tasks always use the project workflow.
+    /// - Subtasks in a state absent from the inherited subtask workflow use the project
+    ///   workflow for every actor.
+    /// - Subtasks in a shared subtask-workflow state use the inherited subtask workflow
+    ///   for non-user actors and the project workflow for user actors.
+    pub fn resolve_workflow_for_task(
+        task: &db::Task,
+        workflow_definition_json: &str,
+        actor: &Actor,
+    ) -> WorkflowDefinition {
+        let project_workflow = WorkflowEngine::resolve_workflow(workflow_definition_json);
+        if task.parent_task_id.is_none() {
+            return project_workflow;
+        }
+
+        let subtask_wf = inherited_subtask_workflow();
+        let current_in_subtask = subtask_wf
+            .states
+            .iter()
+            .any(|s| s.name.as_str() == task.status.as_str());
+        if !current_in_subtask {
+            return project_workflow;
+        }
+        if actor.is_user() {
+            return project_workflow;
+        }
+        subtask_wf
+    }
+    pub(crate) fn cascade_allowed(
+        state: &StateDefinition,
+        bridge: &api_types::TransitionBridge,
+        rejection: bool,
+    ) -> bool {
+        state.kind != StateKind::Gate
+            || rejection
+            || !state
+                .gate_config
+                .as_ref()
+                .is_some_and(|g| g.requires_user_approval())
+            || state.gate_config.as_ref().is_some_and(|g| {
+                g.optional_when_unassigned()
+                    && bridge.bridge_kind == Some(api_types::TransitionBridgeKind::GateSkipped)
+            })
+    }
     pub fn undefined_state_message(state_name: &str, workflow: &WorkflowDefinition) -> String {
         let defined_states = workflow
             .states
@@ -2567,23 +1964,20 @@ impl WorkflowEngine {
             "state '{state_name}' is not defined in workflow; defined states are: {defined_states}"
         )
     }
-
-    fn find_state<'a>(workflow: &'a WorkflowDefinition, name: &str) -> Option<&'a StateDefinition> {
-        workflow.states.iter().find(|s| s.name == name)
-    }
-
     fn is_terminal(workflow: &WorkflowDefinition, name: &str) -> bool {
         Self::find_state(workflow, name)
             .map(|state| state.kind == StateKind::Terminal)
             .unwrap_or(false)
     }
-
     fn is_cancellation_target(workflow: &WorkflowDefinition, target_state: &str) -> bool {
         workflow
             .cancellation_state
             .as_deref()
             .map(|state| state == target_state)
             .unwrap_or(false)
+    }
+    fn find_state<'a>(workflow: &'a WorkflowDefinition, name: &str) -> Option<&'a StateDefinition> {
+        workflow.states.iter().find(|s| s.name == name)
     }
 }
 
@@ -2597,6 +1991,7 @@ mod resolve_workflow_tests {
     fn task(parent_task_id: Option<String>, status: &str) -> db::Task {
         let now = now_rfc3339();
         db::Task {
+            condition: Default::default(),
             id: new_uuid_v4(),
             project_id: new_uuid_v4(),
             parent_task_id: parent_task_id.clone(),

@@ -435,22 +435,7 @@ pub(crate) async fn reauthorize_direct_project_command_in_tx(
 }
 
 fn permission_ceiling_contains(value: &str, permission: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .and_then(|value| match value {
-            serde_json::Value::Array(values) => Some(values),
-            serde_json::Value::Object(map) => map
-                .get("permissions")
-                .or_else(|| map.get("allowed"))
-                .and_then(serde_json::Value::as_array)
-                .cloned(),
-            _ => None,
-        })
-        .is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| value.as_str() == Some(permission))
-        })
+    operation_registry::authority::permission_set(value).contains(permission)
 }
 
 fn is_direct_project_command_operation(operation: &str) -> bool {
@@ -1298,23 +1283,7 @@ async fn recheck_task_proposal_authorization_in_tx(
     {
         return Err(DbError::IdempotencyConflict);
     }
-    let permits_task_proposal = !permission_ceiling.is_empty() && {
-        let json = permission_ceiling.as_str();
-        serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("allowed")
-                    .or_else(|| value.get("permissions"))
-                    .cloned()
-            })
-            .and_then(|value| value.as_array().cloned())
-            .is_some_and(|permissions| {
-                permissions
-                    .iter()
-                    .any(|permission| permission.as_str() == Some("propose_task"))
-            })
-    };
+    let permits_task_proposal = permission_ceiling_contains(&permission_ceiling, "propose_task");
     if !permits_task_proposal {
         return Err(DbError::InvalidTransition);
     }
@@ -1622,6 +1591,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(&task.id)
             .bind(&task.project_id)
             .execute(&mut *transaction)
+            .await?;
+            crate::task_condition::produce(
+                &mut transaction,
+                &task.id,
+                crate::ConditionChange::Legacy,
+            )
             .await?;
         }
         if !task.is_automation {
@@ -3707,7 +3682,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(identity_id)
             .bind(profile_id)
             .bind(&binding_policy)
-            .bind(&binding_ceiling)
+            .bind({
+                operation_registry::authority::parse_permissions(&binding_ceiling)?;
+                &binding_ceiling
+            })
             .bind(&binding_subscriptions)
             .bind(binding_wake_budget)
             .bind(binding_version)
@@ -3876,6 +3854,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .execute(&mut *tx)
             .await
             .map_err(orchestration_write_error)?;
+            super::chat_read_events::append(
+                self,
+                &mut tx,
+                super::chat_read_events::ChatReadEvent {
+                    event_type: "agent_chat.message.appended",
+                    entity_type: "agent_chat_message",
+                    entity_id: &message_id,
+                    chat_id: &project_chat_id,
+                    status: Some("complete"),
+                    dedupe_key: Some(format!("chat-message:{message_id}")),
+                    created_at: &now_rfc3339(),
+                },
+            )
+            .await?;
             Some(message_id)
         } else {
             if input.bootstrap_message_id.is_some()
@@ -9799,6 +9791,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
+        super::chat_read_events::append(
+            self,
+            &mut tx,
+            super::chat_read_events::ChatReadEvent {
+                event_type: "agent_chat.message.appended",
+                entity_type: "agent_chat_message",
+                entity_id: &input.target_message_id,
+                chat_id: &project_chat_id,
+                status: Some("complete"),
+                dedupe_key: Some(format!("chat-message:{}", input.target_message_id)),
+                created_at: &now_rfc3339(),
+            },
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO agent_chat_turn_job (
                 id, chat_id, triggering_message_id, responder_identity_id, profile_id,

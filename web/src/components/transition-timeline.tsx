@@ -118,9 +118,7 @@ export function TransitionTimeline({ taskId }: { taskId: string }) {
                     rejection
                   </span>
                 )}
-                {(entry.trigger_reason === 'CI-only re-review passed' ||
-                  entry.trigger_reason?.includes('CI-only') ||
-                  entry.trigger_reason?.includes('pass_ci_only')) && (
+                {entry.bridge_kind === 'ci_only_review_passed' && (
                   <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-micro font-medium text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">
                     CI-only re-review
                   </span>

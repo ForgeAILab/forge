@@ -318,6 +318,7 @@ async fn write_auditor_failure(ctx: &ExecutionContext) -> Result<(), ExecutorErr
 }
 
 struct TestHarness {
+    _step_worker: common::StepWorkerGuard,
     app: Router,
     state: Arc<AppState>,
     event_bus: Arc<EventBus>,
@@ -341,7 +342,7 @@ async fn test_app(
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -375,6 +376,7 @@ async fn test_app(
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     TestHarness {
+        _step_worker: common::StepWorkerGuard::start(&state),
         app,
         state,
         event_bus,

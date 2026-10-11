@@ -1,0 +1,1064 @@
+# Scheduler decisions recorded from 9d9b228f (the deployed base of plan 3.1 stage 3).
+#
+# Recorded by copying tests/equivalence.rs unchanged into a 9d9b228f worktree and running
+#   SCHEDULER_EQUIVALENCE_RECORD=<dir> cargo test -p services --lib scheduler_equivalence
+# there: every line below is what the scanning dispatcher did with real rows. Two
+# recordings from the same binary were byte-identical. Sections, in order: steady
+# (dispatcher already running), startup (first pass), review, load, wake.
+#
+# A line `key: outcome` is the base outcome for that Task. A line starting with
+# `@<Exception> ` replaces the outcome for its key; only the three changes the
+# stage allows may be named:
+#   ExplicitOwnerPark   a Task the base left with no step, owner or annotation
+#                       now carries a visible annotation naming its owner action
+#   MissedWakeRepair    work the base only re-drove at startup is re-driven on
+#                       an ordinary pass
+#   IdleTickQuiescence  the dispatcher does no work on an idle tick; no recorded
+#                       outcome differs, so no line names it
+
+steady todo_coder T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady todo_coder (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady todo_coder (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+steady todo_unassigned T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady todo_unassigned (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady todo_unassigned (events): {}
+steady todo_defaults T: from=todo dv=3 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady todo_defaults (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady todo_defaults (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+steady todo_user_assignee T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady todo_user_assignee (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady todo_user_assignee (events): {}
+steady dep_unfinished D: from=todo dv=4 status=planning ann=- B=- F=- E=- meta=[-] disp=[-] execs=[planner@A1:running] hooks=1
+steady dep_unfinished T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:guard rejected: dependency_gate: task has 1 unsatisfied dependency: <id>] execs=[] hooks=0
+steady dep_unfinished (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+steady dep_unfinished (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1, "transition.guard_rejected": 1}
+steady dep_done D: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady dep_done T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady dep_done (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady dep_done (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+steady dep_cancelled D: from=cancelled dv=0 status=cancelled ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady dep_cancelled T: from=todo dv=1 status=todo ann=- B=workflow_guard_rejected/required dependency cancelled: <id> F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady dep_cancelled (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady dep_cancelled (events): {"task.blocked": 1, "transition.guard_rejected": 1}
+steady children_seq C1: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+steady children_seq C2: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady children_seq R: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady children_seq (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=2 limit=5]
+steady children_seq (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+steady children_first_done C1: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady children_first_done C2: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+steady children_first_done R: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady children_first_done (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady children_first_done (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+steady root_children_complete C1: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady root_children_complete C2: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady root_children_complete R: from=in_progress dv=2 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=2
+steady root_children_complete (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady root_children_complete (events): {"task.status_changed": 2}
+steady root_flag_children_incomplete C1: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+steady root_flag_children_incomplete C2: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady root_flag_children_incomplete R: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[coordination_review_pending,dispatch_disposition] disp=[coordination_root_advance:invalid operation: coordination root <id> cannot enter aggregate review before every subtask is terminal] execs=[] hooks=0
+steady root_flag_children_incomplete (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+steady root_flag_children_incomplete (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+steady root_flag_no_children T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[coordination_review_pending] disp=[-] execs=[coder@A1:running] hooks=0
+steady root_flag_no_children (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady root_flag_no_children (events): {"task.execution_launched": 1}
+steady active_noexec T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady active_noexec (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_noexec (events): {"task.execution_launched": 1}
+steady active_running T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady active_running (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_running (events): {}
+steady active_completed_unsettled T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@none:completed coder@A1:running] hooks=0
+steady active_completed_unsettled (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_completed_unsettled (events): {"task.execution_launched": 1}
+steady active_failed T: from=in_progress dv=1 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch,last_execution_failure_at,last_execution_failure_execution_id] disp=[-] execs=[coder@A1:failed] hooks=0
+steady active_failed (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_failed (events): {"task.execution_retry": 1}
+steady active_cancelled_manual T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled] hooks=0
+steady active_cancelled_manual (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_cancelled_manual (events): {}
+steady active_cancelled_auto T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled coder@A1:running] hooks=0
+steady active_cancelled_auto (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_cancelled_auto (events): {"task.execution_launched": 1}
+steady active_cancelled_nopolicy T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled] hooks=0
+steady active_cancelled_nopolicy (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_cancelled_nopolicy (events): {}
+steady review_reviewer T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[review:conflict: task <id> is in review with no implementation execution to review] execs=[] hooks=0
+steady review_reviewer (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady review_reviewer (events): {}
+steady review_ci_no_review T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady review_ci_no_review (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady review_ci_no_review (events): {}
+steady review_no_reviewer T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady review_no_reviewer (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady review_no_reviewer (events): {}
+steady blocked_json_active T: from=in_progress dv=0 status=in_progress ann=- B=other/x F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady blocked_json_active (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady blocked_json_active (events): {}
+steady failed_json_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=other/x E=- meta=[-] disp=[-] execs=[] hooks=0
+steady failed_json_active (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady failed_json_active (events): {}
+steady barrier_running_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=running/- meta=[-] disp=[-] execs=[] hooks=0
+steady barrier_running_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady barrier_running_active (events): {}
+steady barrier_blocked_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=blocked/- meta=[-] disp=[-] execs=[] hooks=0
+steady barrier_blocked_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady barrier_blocked_active (events): {}
+steady blocked_json_todo T: from=todo dv=0 status=todo ann=- B=other/x F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady blocked_json_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady blocked_json_todo (events): {}
+steady barrier_todo T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady barrier_todo (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady barrier_todo (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+steady ann_manual_stop T: from=in_progress dv=0 status=in_progress ann=manual_stop/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_manual_stop (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_manual_stop (events): {}
+steady ann_workflow_loop T: from=in_progress dv=0 status=in_progress ann=workflow_loop/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_workflow_loop (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_workflow_loop (events): {}
+steady ann_cascade_failed T: from=in_progress dv=0 status=in_progress ann=cascade_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_cascade_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_cascade_failed (events): {}
+steady ann_workspace_error T: from=in_progress dv=0 status=in_progress ann=workspace_error/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_workspace_error (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_workspace_error (events): {}
+steady ann_agent_timeout T: from=in_progress dv=0 status=in_progress ann=agent_timeout/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_agent_timeout (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_agent_timeout (events): {}
+steady ann_recovery_required T: from=in_progress dv=0 status=in_progress ann=recovery_required/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_recovery_required (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_recovery_required (events): {}
+steady ann_workspace_reset_required T: from=in_progress dv=0 status=in_progress ann=workspace_reset_required/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_workspace_reset_required (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_workspace_reset_required (events): {}
+steady ann_max_turns_exceeded T: from=in_progress dv=0 status=in_progress ann=max_turns_exceeded/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_max_turns_exceeded (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_max_turns_exceeded (events): {}
+steady ann_before_work_hook_failed T: from=in_progress dv=0 status=in_progress ann=before_work_hook_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_before_work_hook_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_before_work_hook_failed (events): {}
+steady ann_before_work_hook_timeout T: from=in_progress dv=0 status=in_progress ann=before_work_hook_timeout/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_before_work_hook_timeout (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_before_work_hook_timeout (events): {}
+steady ann_review_needs_owner T: from=in_progress dv=0 status=in_progress ann=review_needs_owner/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_review_needs_owner (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_review_needs_owner (events): {}
+steady ann_dispatch_failed T: from=in_progress dv=0 status=in_progress ann=dispatch_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_dispatch_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady ann_dispatch_failed (events): {}
+steady ann_dispatch_failed_todo T: from=todo dv=0 status=todo ann=dispatch_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady ann_dispatch_failed_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady ann_dispatch_failed_todo (events): {}
+steady ann_merge_conflict T: from=in_progress dv=0 status=in_progress ann=merge_conflict/-/m B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady ann_merge_conflict (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady ann_merge_conflict (events): {"task.execution_launched": 1}
+steady ann_ci_failed T: from=in_progress dv=0 status=in_progress ann=ci_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady ann_ci_failed (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady ann_ci_failed (events): {"task.execution_launched": 1}
+steady ann_empty_object T: from=in_progress dv=0 status=in_progress ann=?/-/- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady ann_empty_object (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady ann_empty_object (events): {"task.execution_launched": 1}
+steady ann_malformed T: from=in_progress dv=0 status=in_progress ann=unparsable B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady ann_malformed (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady ann_malformed (events): {"task.execution_launched": 1}
+steady held T: from=in_progress dv=0 status=in_progress ann=manual_stop/hold/- B=manual_stop/hold F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady held (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady held (events): {}
+steady deferred_future T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+steady deferred_future (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady deferred_future (events): {}
+steady deferred_past T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady deferred_past (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady deferred_past (events): {"task.execution_launched": 1}
+steady deferred_future_todo T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+steady deferred_future_todo (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady deferred_future_todo (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+steady disposition_current T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+steady disposition_current (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady disposition_current (events): {}
+steady disposition_stale T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady disposition_stale (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady disposition_stale (events): {"task.execution_launched": 1}
+steady disposition_current_todo T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+steady disposition_current_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady disposition_current_todo (events): {}
+steady disposition_acked T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+steady disposition_acked (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady disposition_acked (events): {}
+steady disposition_acked_todo T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+steady disposition_acked_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady disposition_acked_todo (events): {}
+steady queued_recovery_malformed T: from=in_progress dv=2 status=in_progress ann=recovery_required/invalid operation: stored queued intent no longer has a current apply plan/invalid operation: stored queued intent no longer has a current apply plan B=recovery_required/invalid operation: stored queued intent no longer has a current apply plan F=- E=- meta=[task_action_migrated_intent] disp=[-] execs=[] hooks=0
+steady queued_recovery_malformed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady queued_recovery_malformed (events): {}
+steady paused_integration T: from=merging dv=3 status=merging ann=- B=- F=- E=- meta=[paused_integration] disp=[-] execs=[] hooks=3
+steady paused_integration (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady paused_integration (events): {"task.status_changed": 3}
+steady owner_wait_fresh T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+steady owner_wait_fresh (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady owner_wait_fresh (events): {"task.execution_launched": 1}
+steady owner_wait_expired T: from=in_progress dv=1 status=in_progress ann=recovery_required/owner_disconnected_timeout/daemon unavailable: <id> B=recovery_required/daemon unavailable: <id> F=- E=- meta=[owner_wait] disp=[-] execs=[] hooks=0
+steady owner_wait_expired (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady owner_wait_expired (events): {}
+steady env_wait_unverified T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[environment_wait] disp=[-] execs=[] hooks=0
+steady env_wait_unverified (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady env_wait_unverified (events): {}
+steady env_wait_provision_failed T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[environment_wait] disp=[-] execs=[] hooks=0
+steady env_wait_provision_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady env_wait_provision_failed (events): {}
+steady env_wait_probe T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+steady env_wait_probe (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady env_wait_probe (events): {"task.execution_launched": 1}
+steady placement_refusal T: from=in_progress dv=1 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+steady placement_refusal (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady placement_refusal (events): {"task.execution_launched": 1}
+steady publication_claim_orphan T: from=planning dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+steady publication_claim_orphan (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady publication_claim_orphan (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+steady publication_claim_malformed T: from=planning dv=0 status=planning ann=- B=- F=- E=- meta=[plan_publication_claim] disp=[-] execs=[] hooks=0
+steady publication_claim_malformed (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady publication_claim_malformed (events): {}
+steady publication_cleanup_orphan T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady publication_cleanup_orphan (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady publication_cleanup_orphan (events): {"task.execution_launched": 1}
+steady malformed_metadata_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[unparsable] disp=[-] execs=[] hooks=0
+steady malformed_metadata_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady malformed_metadata_active (events): {}
+steady malformed_metadata_todo T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[unparsable] disp=[-] execs=[] hooks=0
+steady malformed_metadata_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady malformed_metadata_todo (events): {}
+steady project_paused T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady project_paused U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady project_paused (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+steady project_paused (events): {}
+steady project_limit RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady project_limit T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (2/1 active)] execs=[] hooks=0
+steady project_limit U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady project_limit (pass): spawned=1 failed_ticks=[] slots=[active=2 parked=0 queued=1 limit=1]
+steady project_limit (events): {"task.execution_launched": 1, "task.updated": 1}
+steady agent_paused T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady agent_paused U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady agent_paused (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+steady agent_paused (events): {}
+steady agent_full RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A?:running] hooks=0
+steady agent_full T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady agent_full U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady agent_full (pass): spawned=0 failed_ticks=[] slots=[active=2 parked=0 queued=1 limit=5]
+steady agent_full (events): {}
+steady agent_offline T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady agent_offline U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady agent_offline (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+steady agent_offline (events): {}
+steady machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=0
+steady machine_cap T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+steady machine_cap U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+steady machine_cap (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=1 queued=1 limit=5]
+steady machine_cap (events): {"task.updated": 1}
+steady merging_no_hooks T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady merging_no_hooks (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady merging_no_hooks (events): {}
+steady merging_no_hooks_witness T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady merging_no_hooks_witness (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady merging_no_hooks_witness (events): {}
+steady custom_state_unknown T: from=weird_state dv=0 status=weird_state ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady custom_state_unknown (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+steady custom_state_unknown (events): {}
+steady awaiting_human_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[awaiting_human,awaiting_human_reason] disp=[-] execs=[] hooks=0
+steady awaiting_human_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady awaiting_human_active (events): {}
+steady awaiting_human_planning T: from=planning dv=0 status=planning ann=- B=- F=- E=- meta=[awaiting_human,awaiting_human_reason] disp=[-] execs=[] hooks=0
+steady awaiting_human_planning (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady awaiting_human_planning (events): {}
+steady plan_review_wait T: from=planning dv=0 status=planning ann=- B=- F=- E=- meta=[-] disp=[-] execs=[planner@A2:running] hooks=0
+steady plan_review_wait (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady plan_review_wait (events): {"task.execution_launched": 1}
+steady backlog T: from=backlog dv=0 status=backlog ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady backlog (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+steady backlog (events): {}
+steady done_task T: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady done_task (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+steady done_task (events): {}
+steady todo_archived T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady todo_archived (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+steady todo_archived (events): {}
+steady merge_failed_state T: from=merge_failed dv=0 status=merge_failed ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady merge_failed_state (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady merge_failed_state (events): {"task.execution_launched": 1}
+steady two_todo_priority HIGH: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady two_todo_priority LOW: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady two_todo_priority (pass): spawned=2 failed_ticks=[] slots=[active=2 parked=0 queued=0 limit=5]
+steady two_todo_priority (events): {"task.execution_launched": 2, "task.role_agent_dispatched": 2, "task.status_changed": 4}
+steady queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=0
+steady queued_recovery_valid_waiting T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch,dispatch_disposition,queued_recovery] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:cancelled] hooks=0
+steady queued_recovery_valid_waiting (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=1 queued=0 limit=5]
+steady queued_recovery_valid_waiting (events): {}
+steady queued_recovery_valid_free RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+steady queued_recovery_valid_free T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled coder@A1:running] hooks=0
+steady queued_recovery_valid_free (pass): spawned=1 failed_ticks=[] slots=[active=2 parked=0 queued=0 limit=5]
+steady queued_recovery_valid_free (events): {"task.execution_launched": 1, "task.recovery_action": 1}
+steady remote_cancel_fence_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:invalid operation: canonical plan artifact is unreadable: workspace reset required for task <id>: waiting for remote workspace cancellation acknowledgment] execs=[] hooks=0
+steady remote_cancel_fence_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady remote_cancel_fence_active (events): {}
+steady remote_cancel_fence_todo T: from=todo dv=4 status=todo ann=dispatch_failed/-/invalid operation: canonical plan artifact is unreadable: workspace reset required for task <id>: waiting for remote workspace cancellation acknowledgment B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=2
+steady remote_cancel_fence_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+steady remote_cancel_fence_todo (events): {"task.status_changed": 3, "transition.effect_failed": 1}
+steady merging_custom_hooks T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady merging_custom_hooks (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady merging_custom_hooks (events): {}
+steady merging_custom_hooks_witness T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady merging_custom_hooks_witness (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady merging_custom_hooks_witness (events): {}
+steady owner_offline_admitted_limit OWNER: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+steady owner_offline_admitted_limit T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (1/1 active)] execs=[] hooks=0
+steady owner_offline_admitted_limit (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=1]
+steady owner_offline_admitted_limit (events): {"task.execution_launched": 1, "task.updated": 1}
+steady review_needs_owner_limit OWNER: from=review dv=0 status=review ann=review_needs_owner/-/needs the owner B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady review_needs_owner_limit T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+steady review_needs_owner_limit U: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (1/1 active)] execs=[] hooks=0
+steady review_needs_owner_limit (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=1 queued=1 limit=1]
+steady review_needs_owner_limit (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2, "task.updated": 1}
+steady active_no_role T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady active_no_role (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_no_role (events): {}
+steady review_needs_owner_review T: from=review dv=0 status=review ann=review_needs_owner/-/needs the owner B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady review_needs_owner_review (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+steady review_needs_owner_review (events): {}
+steady root_unknown_state_children C1: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady root_unknown_state_children C2: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady root_unknown_state_children R: from=weird_state dv=0 status=weird_state ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady root_unknown_state_children (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=2 limit=5]
+steady root_unknown_state_children (events): {}
+steady active_user_assignee T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady active_user_assignee (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady active_user_assignee (events): {}
+steady review_user_reviewer T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+steady review_user_reviewer (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+steady review_user_reviewer (events): {}
+startup todo_coder T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup todo_coder (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup todo_coder (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+startup todo_unassigned T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup todo_unassigned (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup todo_unassigned (events): {}
+startup todo_defaults T: from=todo dv=3 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup todo_defaults (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup todo_defaults (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+startup todo_user_assignee T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup todo_user_assignee (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup todo_user_assignee (events): {}
+startup dep_unfinished D: from=todo dv=4 status=planning ann=- B=- F=- E=- meta=[-] disp=[-] execs=[planner@A1:running] hooks=1
+startup dep_unfinished T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:guard rejected: dependency_gate: task has 1 unsatisfied dependency: <id>] execs=[] hooks=0
+startup dep_unfinished (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+startup dep_unfinished (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1, "transition.guard_rejected": 1}
+startup dep_done D: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup dep_done T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup dep_done (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup dep_done (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+startup dep_cancelled D: from=cancelled dv=0 status=cancelled ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup dep_cancelled T: from=todo dv=1 status=todo ann=- B=workflow_guard_rejected/required dependency cancelled: <id> F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup dep_cancelled (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup dep_cancelled (events): {"task.blocked": 1, "transition.guard_rejected": 1}
+startup children_seq C1: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+startup children_seq C2: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup children_seq R: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup children_seq (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=2 limit=5]
+startup children_seq (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+startup children_first_done C1: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup children_first_done C2: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+startup children_first_done R: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup children_first_done (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup children_first_done (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+startup root_children_complete C1: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup root_children_complete C2: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup root_children_complete R: from=in_progress dv=2 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=2
+startup root_children_complete (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup root_children_complete (events): {"task.status_changed": 2}
+startup root_flag_children_incomplete C1: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+startup root_flag_children_incomplete C2: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup root_flag_children_incomplete R: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[coordination_review_pending,dispatch_disposition] disp=[coordination_root_advance:invalid operation: coordination root <id> cannot enter aggregate review before every subtask is terminal] execs=[] hooks=0
+startup root_flag_children_incomplete (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+startup root_flag_children_incomplete (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+startup root_flag_no_children T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[coordination_review_pending] disp=[-] execs=[coder@A1:running] hooks=0
+startup root_flag_no_children (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup root_flag_no_children (events): {"task.execution_launched": 1}
+startup active_noexec T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup active_noexec (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_noexec (events): {"task.execution_launched": 1}
+startup active_running T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup active_running (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_running (events): {}
+startup active_completed_unsettled T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@none:completed coder@A1:running] hooks=0
+startup active_completed_unsettled (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_completed_unsettled (events): {"task.execution_launched": 1}
+startup active_failed T: from=in_progress dv=1 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch,last_execution_failure_at,last_execution_failure_execution_id] disp=[-] execs=[coder@A1:failed] hooks=0
+startup active_failed (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_failed (events): {"task.execution_retry": 1}
+startup active_cancelled_manual T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled] hooks=0
+startup active_cancelled_manual (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_cancelled_manual (events): {}
+startup active_cancelled_auto T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled coder@A1:running] hooks=0
+startup active_cancelled_auto (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_cancelled_auto (events): {"task.execution_launched": 1}
+startup active_cancelled_nopolicy T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled] hooks=0
+startup active_cancelled_nopolicy (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_cancelled_nopolicy (events): {}
+startup review_reviewer T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[review:conflict: task <id> is in review with no implementation execution to review] execs=[] hooks=0
+startup review_reviewer (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup review_reviewer (events): {}
+startup review_ci_no_review T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup review_ci_no_review (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup review_ci_no_review (events): {}
+startup review_no_reviewer T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup review_no_reviewer (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup review_no_reviewer (events): {}
+startup blocked_json_active T: from=in_progress dv=0 status=in_progress ann=- B=other/x F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup blocked_json_active (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup blocked_json_active (events): {}
+startup failed_json_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=other/x E=- meta=[-] disp=[-] execs=[] hooks=0
+startup failed_json_active (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup failed_json_active (events): {}
+startup barrier_running_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=running/- meta=[-] disp=[-] execs=[] hooks=0
+startup barrier_running_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup barrier_running_active (events): {}
+startup barrier_blocked_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=blocked/- meta=[-] disp=[-] execs=[] hooks=0
+startup barrier_blocked_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup barrier_blocked_active (events): {}
+startup blocked_json_todo T: from=todo dv=0 status=todo ann=- B=other/x F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup blocked_json_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup blocked_json_todo (events): {}
+startup barrier_todo T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup barrier_todo (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup barrier_todo (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+startup ann_manual_stop T: from=in_progress dv=0 status=in_progress ann=manual_stop/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_manual_stop (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_manual_stop (events): {}
+startup ann_workflow_loop T: from=in_progress dv=0 status=in_progress ann=workflow_loop/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_workflow_loop (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_workflow_loop (events): {}
+startup ann_cascade_failed T: from=in_progress dv=0 status=in_progress ann=cascade_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_cascade_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_cascade_failed (events): {}
+startup ann_workspace_error T: from=in_progress dv=0 status=in_progress ann=workspace_error/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_workspace_error (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_workspace_error (events): {}
+startup ann_agent_timeout T: from=in_progress dv=0 status=in_progress ann=agent_timeout/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_agent_timeout (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_agent_timeout (events): {}
+startup ann_recovery_required T: from=in_progress dv=0 status=in_progress ann=recovery_required/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_recovery_required (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_recovery_required (events): {}
+startup ann_workspace_reset_required T: from=in_progress dv=0 status=in_progress ann=workspace_reset_required/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_workspace_reset_required (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_workspace_reset_required (events): {}
+startup ann_max_turns_exceeded T: from=in_progress dv=0 status=in_progress ann=max_turns_exceeded/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_max_turns_exceeded (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_max_turns_exceeded (events): {}
+startup ann_before_work_hook_failed T: from=in_progress dv=0 status=in_progress ann=before_work_hook_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_before_work_hook_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_before_work_hook_failed (events): {}
+startup ann_before_work_hook_timeout T: from=in_progress dv=0 status=in_progress ann=before_work_hook_timeout/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_before_work_hook_timeout (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_before_work_hook_timeout (events): {}
+startup ann_review_needs_owner T: from=in_progress dv=0 status=in_progress ann=review_needs_owner/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_review_needs_owner (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_review_needs_owner (events): {}
+startup ann_dispatch_failed T: from=in_progress dv=0 status=in_progress ann=dispatch_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_dispatch_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup ann_dispatch_failed (events): {}
+startup ann_dispatch_failed_todo T: from=todo dv=0 status=todo ann=dispatch_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup ann_dispatch_failed_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup ann_dispatch_failed_todo (events): {}
+startup ann_merge_conflict T: from=in_progress dv=0 status=in_progress ann=merge_conflict/-/m B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup ann_merge_conflict (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup ann_merge_conflict (events): {"task.execution_launched": 1}
+startup ann_ci_failed T: from=in_progress dv=0 status=in_progress ann=ci_failed/-/m B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup ann_ci_failed (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup ann_ci_failed (events): {"task.execution_launched": 1}
+startup ann_empty_object T: from=in_progress dv=0 status=in_progress ann=?/-/- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup ann_empty_object (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup ann_empty_object (events): {"task.execution_launched": 1}
+startup ann_malformed T: from=in_progress dv=0 status=in_progress ann=unparsable B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup ann_malformed (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup ann_malformed (events): {"task.execution_launched": 1}
+startup held T: from=in_progress dv=0 status=in_progress ann=manual_stop/hold/- B=manual_stop/hold F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup held (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup held (events): {}
+startup deferred_future T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+startup deferred_future (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup deferred_future (events): {}
+startup deferred_past T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup deferred_past (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup deferred_past (events): {"task.execution_launched": 1}
+startup deferred_future_todo T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+startup deferred_future_todo (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup deferred_future_todo (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+startup disposition_current T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+startup disposition_current (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup disposition_current (events): {}
+startup disposition_stale T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup disposition_stale (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup disposition_stale (events): {"task.execution_launched": 1}
+startup disposition_current_todo T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+startup disposition_current_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup disposition_current_todo (events): {}
+startup disposition_acked T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+startup disposition_acked (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup disposition_acked (events): {}
+startup disposition_acked_todo T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+startup disposition_acked_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup disposition_acked_todo (events): {}
+startup queued_recovery_malformed T: from=in_progress dv=2 status=in_progress ann=recovery_required/invalid operation: stored queued intent no longer has a current apply plan/invalid operation: stored queued intent no longer has a current apply plan B=recovery_required/invalid operation: stored queued intent no longer has a current apply plan F=- E=- meta=[task_action_migrated_intent] disp=[-] execs=[] hooks=0
+startup queued_recovery_malformed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup queued_recovery_malformed (events): {}
+startup paused_integration T: from=merging dv=3 status=merging ann=- B=- F=- E=- meta=[paused_integration] disp=[-] execs=[] hooks=3
+startup paused_integration (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup paused_integration (events): {"task.status_changed": 3}
+startup owner_wait_fresh T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+startup owner_wait_fresh (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup owner_wait_fresh (events): {"task.execution_launched": 1}
+startup owner_wait_expired T: from=in_progress dv=1 status=in_progress ann=recovery_required/owner_disconnected_timeout/daemon unavailable: <id> B=recovery_required/daemon unavailable: <id> F=- E=- meta=[owner_wait] disp=[-] execs=[] hooks=0
+startup owner_wait_expired (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup owner_wait_expired (events): {}
+startup env_wait_unverified T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[environment_wait] disp=[-] execs=[] hooks=0
+startup env_wait_unverified (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup env_wait_unverified (events): {}
+startup env_wait_provision_failed T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[environment_wait] disp=[-] execs=[] hooks=0
+startup env_wait_provision_failed (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup env_wait_provision_failed (events): {}
+startup env_wait_probe T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+startup env_wait_probe (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup env_wait_probe (events): {"task.execution_launched": 1}
+startup placement_refusal T: from=in_progress dv=1 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+startup placement_refusal (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup placement_refusal (events): {"task.execution_launched": 1}
+startup publication_claim_orphan T: from=planning dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=1
+startup publication_claim_orphan (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup publication_claim_orphan (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 1}
+startup publication_claim_malformed T: from=planning dv=0 status=planning ann=- B=- F=- E=- meta=[plan_publication_claim] disp=[-] execs=[] hooks=0
+startup publication_claim_malformed (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup publication_claim_malformed (events): {}
+startup publication_cleanup_orphan T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup publication_cleanup_orphan (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup publication_cleanup_orphan (events): {"task.execution_launched": 1}
+startup malformed_metadata_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[unparsable] disp=[-] execs=[] hooks=0
+startup malformed_metadata_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup malformed_metadata_active (events): {}
+startup malformed_metadata_todo T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[unparsable] disp=[-] execs=[] hooks=0
+startup malformed_metadata_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup malformed_metadata_todo (events): {}
+startup project_paused T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup project_paused U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup project_paused (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+startup project_paused (events): {}
+startup project_limit RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup project_limit T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (2/1 active)] execs=[] hooks=0
+startup project_limit U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup project_limit (pass): spawned=1 failed_ticks=[] slots=[active=2 parked=0 queued=1 limit=1]
+startup project_limit (events): {"task.execution_launched": 1, "task.updated": 1}
+startup agent_paused T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup agent_paused U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup agent_paused (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+startup agent_paused (events): {}
+startup agent_full RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A?:running] hooks=0
+startup agent_full T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup agent_full U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup agent_full (pass): spawned=0 failed_ticks=[] slots=[active=2 parked=0 queued=1 limit=5]
+startup agent_full (events): {}
+startup agent_offline T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup agent_offline U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup agent_offline (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+startup agent_offline (events): {}
+startup machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=0
+startup machine_cap T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+startup machine_cap U: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+startup machine_cap (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=1 queued=1 limit=5]
+startup machine_cap (events): {"task.updated": 1}
+startup merging_no_hooks T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup merging_no_hooks (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup merging_no_hooks (events): {}
+startup merging_no_hooks_witness T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup merging_no_hooks_witness (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup merging_no_hooks_witness (events): {}
+startup custom_state_unknown T: from=weird_state dv=0 status=weird_state ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup custom_state_unknown (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+startup custom_state_unknown (events): {}
+startup awaiting_human_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[awaiting_human,awaiting_human_reason] disp=[-] execs=[] hooks=0
+startup awaiting_human_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup awaiting_human_active (events): {}
+startup awaiting_human_planning T: from=planning dv=0 status=planning ann=- B=- F=- E=- meta=[awaiting_human,awaiting_human_reason] disp=[-] execs=[] hooks=0
+startup awaiting_human_planning (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup awaiting_human_planning (events): {}
+startup plan_review_wait T: from=planning dv=0 status=planning ann=- B=- F=- E=- meta=[-] disp=[-] execs=[planner@A2:running] hooks=0
+startup plan_review_wait (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup plan_review_wait (events): {"task.execution_launched": 1}
+startup backlog T: from=backlog dv=0 status=backlog ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup backlog (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+startup backlog (events): {}
+startup done_task T: from=done dv=0 status=done ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup done_task (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+startup done_task (events): {}
+startup todo_archived T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup todo_archived (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=0 limit=5]
+startup todo_archived (events): {}
+startup merge_failed_state T: from=merge_failed dv=0 status=merge_failed ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup merge_failed_state (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup merge_failed_state (events): {"task.execution_launched": 1}
+startup two_todo_priority HIGH: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup two_todo_priority LOW: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup two_todo_priority (pass): spawned=2 failed_ticks=[] slots=[active=2 parked=0 queued=0 limit=5]
+startup two_todo_priority (events): {"task.execution_launched": 2, "task.role_agent_dispatched": 2, "task.status_changed": 4}
+startup queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=0
+startup queued_recovery_valid_waiting T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch,dispatch_disposition,queued_recovery] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:cancelled] hooks=0
+startup queued_recovery_valid_waiting (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=1 queued=0 limit=5]
+startup queued_recovery_valid_waiting (events): {}
+startup queued_recovery_valid_free RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+startup queued_recovery_valid_free T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:cancelled coder@A1:running] hooks=0
+startup queued_recovery_valid_free (pass): spawned=1 failed_ticks=[] slots=[active=2 parked=0 queued=0 limit=5]
+startup queued_recovery_valid_free (events): {"task.execution_launched": 1, "task.recovery_action": 1}
+startup remote_cancel_fence_active T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:invalid operation: canonical plan artifact is unreadable: workspace reset required for task <id>: waiting for remote workspace cancellation acknowledgment] execs=[] hooks=0
+startup remote_cancel_fence_active (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup remote_cancel_fence_active (events): {}
+startup remote_cancel_fence_todo T: from=todo dv=4 status=todo ann=dispatch_failed/-/invalid operation: canonical plan artifact is unreadable: workspace reset required for task <id>: waiting for remote workspace cancellation acknowledgment B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=2
+startup remote_cancel_fence_todo (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=1 limit=5]
+startup remote_cancel_fence_todo (events): {"task.status_changed": 3, "transition.effect_failed": 1}
+startup merging_custom_hooks T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup merging_custom_hooks (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup merging_custom_hooks (events): {}
+startup merging_custom_hooks_witness T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup merging_custom_hooks_witness (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup merging_custom_hooks_witness (events): {}
+startup owner_offline_admitted_limit OWNER: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=0
+startup owner_offline_admitted_limit T: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (1/1 active)] execs=[] hooks=0
+startup owner_offline_admitted_limit (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=1]
+startup owner_offline_admitted_limit (events): {"task.execution_launched": 1, "task.updated": 1}
+startup review_needs_owner_limit OWNER: from=review dv=0 status=review ann=review_needs_owner/-/needs the owner B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup review_needs_owner_limit T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+startup review_needs_owner_limit U: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (1/1 active)] execs=[] hooks=0
+startup review_needs_owner_limit (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=1 queued=1 limit=1]
+startup review_needs_owner_limit (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2, "task.updated": 1}
+startup active_no_role T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup active_no_role (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_no_role (events): {}
+startup review_needs_owner_review T: from=review dv=0 status=review ann=review_needs_owner/-/needs the owner B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup review_needs_owner_review (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=1 queued=0 limit=5]
+startup review_needs_owner_review (events): {}
+startup root_unknown_state_children C1: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup root_unknown_state_children C2: from=todo dv=0 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup root_unknown_state_children R: from=weird_state dv=0 status=weird_state ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup root_unknown_state_children (pass): spawned=0 failed_ticks=[] slots=[active=0 parked=0 queued=2 limit=5]
+startup root_unknown_state_children (events): {}
+startup active_user_assignee T: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup active_user_assignee (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup active_user_assignee (events): {}
+startup review_user_reviewer T: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+startup review_user_reviewer (pass): spawned=0 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
+startup review_user_reviewer (events): {}
+review failed_review_old stranded failed CI: from=review dv=3 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@none:completed] hooks=1
+review failed_review_in_grace stranded failed CI: from=review dv=0 status=review ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@none:completed] hooks=0
+load/steady round0 (admission order): ["S02", "S05", "S08", "S11"]
+load/steady round0 (spawned): ["S02", "S05", "S08", "S11"]
+load/steady round0 (running): ["S02@A1", "S05@A2", "S08@A1", "S11@A2"] slots=[active=4 parked=0 queued=26 limit=6]
+load/steady round0 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round0 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S02: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/steady round0 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S05: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/steady round0 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S08: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/steady round0 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S11: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/steady round0 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S14: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round0 S17: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/steady round1 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/steady round1 (spawned): ["S14", "S17"]
+load/steady round1 (running): ["S08@A1", "S11@A2", "S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=24 limit=6]
+load/steady round1 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round1 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round1 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round1 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S08: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/steady round1 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S11: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/steady round1 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S14: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/steady round1 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round1 S17: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/steady round2 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/steady round2 (spawned): []
+load/steady round2 (running): ["S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=24 limit=6]
+load/steady round2 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round2 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round2 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round2 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S08: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round2 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S11: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round2 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S14: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a Project slot] execs=[coder@A1:running] hooks=2
+load/steady round2 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round2 S17: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a Project slot] execs=[coder@A2:running] hooks=2
+load/steady round3 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/steady round3 (spawned): []
+load/steady round3 (running): [] slots=[active=6 parked=0 queued=24 limit=6]
+load/steady round3 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round3 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round3 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round3 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S08: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round3 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S11: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round3 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S14: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round3 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round3 S17: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round4 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/steady round4 (spawned): []
+load/steady round4 (running): [] slots=[active=6 parked=0 queued=24 limit=6]
+load/steady round4 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/steady round4 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round4 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round4 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S08: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round4 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S11: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/steady round4 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S14: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/steady round4 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/steady round4 S17: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round0 (admission order): ["S02", "S05", "S08", "S11"]
+load/startup round0 (spawned): ["S02", "S05", "S08", "S11"]
+load/startup round0 (running): ["S02@A1", "S05@A2", "S08@A1", "S11@A2"] slots=[active=4 parked=0 queued=26 limit=6]
+load/startup round0 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round0 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S02: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/startup round0 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S05: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/startup round0 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S08: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/startup round0 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S11: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/startup round0 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S14: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round0 S17: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[] hooks=0
+load/startup round1 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/startup round1 (spawned): ["S14", "S17"]
+load/startup round1 (running): ["S08@A1", "S11@A2", "S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=24 limit=6]
+load/startup round1 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round1 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round1 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round1 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S08: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/startup round1 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S11: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/startup round1 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S14: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A1:running] hooks=2
+load/startup round1 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round1 S17: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[machine_capacity:machine_capacity: waiting for a machine run slot] execs=[coder@A2:running] hooks=2
+load/startup round2 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/startup round2 (spawned): []
+load/startup round2 (running): ["S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=24 limit=6]
+load/startup round2 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round2 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round2 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round2 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S08: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round2 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S11: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round2 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S14: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a Project slot] execs=[coder@A1:running] hooks=2
+load/startup round2 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round2 S17: status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a Project slot] execs=[coder@A2:running] hooks=2
+load/startup round3 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/startup round3 (spawned): []
+load/startup round3 (running): [] slots=[active=6 parked=0 queued=24 limit=6]
+load/startup round3 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round3 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round3 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round3 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S08: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round3 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S11: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round3 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S14: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round3 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round3 S17: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round4 (admission order): ["S02", "S05", "S08", "S11", "S14", "S17"]
+load/startup round4 (spawned): []
+load/startup round4 (running): [] slots=[active=6 parked=0 queued=24 limit=6]
+load/startup round4 R0: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R0C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 R0C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R0C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R1C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 R1C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R1C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R2C0: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 R2C1: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 R2C2: status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+load/startup round4 S00: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S01: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S02: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round4 S03: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S04: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S05: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round4 S06: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S07: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S08: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round4 S09: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S10: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S11: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+load/startup round4 S12: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S13: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S14: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:completed] hooks=4
+load/startup round4 S15: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S16: status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[project_capacity:project_at_capacity: waiting for a slot (6/6 active)] execs=[] hooks=0
+load/startup round4 S17: status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:completed] hooks=4
+wake deferral_project_in_progress (parked): status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+wake deferral_project_in_progress (woken): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+wake deferral_project_in_progress (after): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+wake deferral_project_todo (parked): status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_project_todo (woken): dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_project_todo (after): dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_task_in_progress (parked): status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+wake deferral_task_in_progress (woken): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+wake deferral_task_in_progress (after): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+wake deferral_task_todo (parked): status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_task_todo (woken): dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_task_todo (after): dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_none_in_progress (parked): status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+wake deferral_none_in_progress (woken): dv=0 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+wake deferral_none_in_progress (after): dv=0 status=in_progress ann=- B=- F=- E=- meta=[deferred_dispatch] disp=[-] execs=[] hooks=0
+wake deferral_none_todo (parked): status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_none_todo (woken): dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake deferral_none_todo (after): dv=0 status=in_progress ann=- B=- F=- E=- meta=[] disp=[-] execs=[coder@A1:running] hooks=2
+wake refusal_project_in_progress (parked): status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+wake refusal_project_in_progress (woken): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+wake refusal_project_in_progress (after): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+wake refusal_project_todo (parked): status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+wake refusal_project_todo (woken): dv=1 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+wake refusal_project_todo (after): dv=3 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+wake refusal_task_in_progress (parked): status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+wake refusal_task_in_progress (woken): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+wake refusal_task_in_progress (after): dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+wake refusal_task_todo (parked): status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+wake refusal_task_todo (woken): dv=1 status=todo ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+wake refusal_task_todo (after): dv=3 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+wake refusal_none_in_progress (parked): status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+wake refusal_none_in_progress (woken): dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+wake refusal_none_in_progress (after): dv=0 status=in_progress ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[in_progress:refused: probe] execs=[] hooks=0
+wake refusal_none_todo (parked): status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+wake refusal_none_todo (woken): dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+wake refusal_none_todo (after): dv=0 status=todo ann=- B=- F=- E=- meta=[dispatch_disposition] disp=[coder:refused: probe] execs=[] hooks=0
+#
+# The allowed exceptions.
+@ExplicitOwnerPark steady publication_claim_malformed T: from=planning dv=1 status=planning ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for plan publication cleanup. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[plan_publication_claim] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark steady merging_no_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for entry hooks. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@MissedWakeRepair steady merging_no_hooks_witness T: from=merging dv=2 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@ExplicitOwnerPark steady custom_state_unknown T: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark steady merging_custom_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark steady merging_custom_hooks_witness T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark steady root_unknown_state_children R: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark startup publication_claim_malformed T: from=planning dv=1 status=planning ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for plan publication cleanup. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[plan_publication_claim] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark startup merging_no_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for entry hooks. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@MissedWakeRepair startup merging_no_hooks_witness T: from=merging dv=2 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@ExplicitOwnerPark startup custom_state_unknown T: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark startup merging_custom_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark startup merging_custom_hooks_witness T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@ExplicitOwnerPark startup root_unknown_state_children R: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@OwnSlotIsNoWait load/startup round0 S02: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round0 S05: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round0 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round0 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round1 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/startup round2 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/startup round2 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S02: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S05: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round0 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S08: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S11: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round1 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait load/steady round2 S14: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
+@OwnSlotIsNoWait load/steady round2 S17: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A2:running] hooks=2
+@OwnSlotIsNoWait startup machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@OwnSlotIsNoWait startup queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@OwnSlotIsNoWait steady machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@OwnSlotIsNoWait steady queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0

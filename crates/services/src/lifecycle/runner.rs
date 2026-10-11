@@ -13,10 +13,13 @@ use tokio::{process::Command, time::timeout};
 use tracing::{error, info, warn};
 
 use crate::lifecycle::{LifecycleHookContext, PluginRegistry, PluginResult};
+use crate::workspace_backend::{
+    ResolvedWorkspace, RunSpec, WorkspaceBackendError, WorkspaceRunPurpose,
+};
 
 pub struct LifecycleHookRunner;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LifecycleHookRun {
     pub index: usize,
     pub entry: Value,
@@ -39,6 +42,27 @@ impl LifecycleHookRunner {
         hooks: &[api_types::LifecycleHookDef],
         plugin_registry: Arc<PluginRegistry>,
     ) {
+        Self::run_hooks_inner(ctx, hooks, plugin_registry, None).await;
+    }
+
+    pub async fn run_workspace_hooks(
+        ctx: LifecycleHookContext,
+        hooks: &[api_types::LifecycleHookDef],
+        plugin_registry: Arc<PluginRegistry>,
+        workspace: &ResolvedWorkspace,
+    ) -> Vec<(usize, String)> {
+        Self::run_hooks_inner(ctx, hooks, plugin_registry, Some(workspace)).await
+    }
+
+    async fn run_hooks_inner(
+        ctx: LifecycleHookContext,
+        hooks: &[api_types::LifecycleHookDef],
+        plugin_registry: Arc<PluginRegistry>,
+        workspace: Option<&ResolvedWorkspace>,
+    ) -> Vec<(usize, String)> {
+        // Hooks that could not be started at all, by index. A hook that ran
+        // and failed has its own log entry.
+        let mut unavailable = Vec::new();
         for (index, hook) in hooks.iter().enumerate() {
             match hook {
                 api_types::LifecycleHookDef::Script {
@@ -55,9 +79,19 @@ impl LifecycleHookRunner {
                         );
                         continue;
                     }
-                    let mut run =
-                        Self::run_script_hook(&ctx, index, command, *timeout_seconds).await;
-                    run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
+                    match Self::run_script(&ctx, index, command, *timeout_seconds, workspace).await
+                    {
+                        Ok(mut run) => {
+                            run.log_path = Self::write_log_entry(&ctx, index, &run.entry)
+                        }
+                        Err(error) => {
+                            warn!(
+                                event = %event_name(&ctx.event), task_id = %ctx.task_id,
+                                hook_index = index, %error, "lifecycle workspace hook unavailable"
+                            );
+                            unavailable.push((index, error.to_string()));
+                        }
+                    }
                 }
                 api_types::LifecycleHookDef::Plugin {
                     name,
@@ -74,12 +108,19 @@ impl LifecycleHookRunner {
                         continue;
                     }
 
-                    let entry =
-                        Self::run_plugin_hook(&ctx, index, name, plugin_registry.as_ref()).await;
+                    let entry = Self::run_plugin_hook(
+                        &ctx,
+                        index,
+                        name,
+                        plugin_registry.as_ref(),
+                        workspace,
+                    )
+                    .await;
                     Self::write_log_entry(&ctx, index, &entry);
                 }
             }
         }
+        unavailable
     }
 
     pub async fn run_blocking_before_work_hooks(
@@ -102,15 +143,83 @@ impl LifecycleHookRunner {
             if !blocking {
                 continue;
             }
-
             let mut run = Self::run_script_hook(&ctx, index, command, *timeout_seconds).await;
             run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
             if run.status != "success" {
                 return Some(run);
             }
         }
-
         None
+    }
+
+    pub async fn run_blocking_workspace_hooks(
+        ctx: LifecycleHookContext,
+        hooks: &[api_types::LifecycleHookDef],
+        workspace: &ResolvedWorkspace,
+    ) -> crate::Result<Option<LifecycleHookRun>> {
+        if ctx.event != api_types::LifecycleEvent::BeforeWork {
+            return Ok(None);
+        }
+
+        for (index, hook) in hooks.iter().enumerate() {
+            let api_types::LifecycleHookDef::Script {
+                command,
+                timeout_seconds,
+                blocking,
+            } = hook
+            else {
+                continue;
+            };
+            if !blocking {
+                continue;
+            }
+            let attempt = crate::workflow::engine::durable::current_hook(&ctx.task_id);
+            let (recorded, interrupted) = match &attempt {
+                Some(attempt) => {
+                    attempt
+                        .db
+                        .start_hook_script(&attempt.step, attempt.index, index as i64)
+                        .await?
+                }
+                None => (None, false),
+            };
+            let mut run = if let Some(recorded) = recorded {
+                serde_json::from_str::<LifecycleHookRun>(&recorded)
+                    .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))?
+            } else {
+                let mut run = Self::run_workspace_script_hook(
+                    &ctx,
+                    index,
+                    command,
+                    *timeout_seconds,
+                    workspace,
+                )
+                .await?;
+                if let Some(attempt) = &attempt {
+                    run.entry["step_id"] = json!(attempt.step.id);
+                    if interrupted {
+                        run.entry["rerun_after_interruption"] = json!(true);
+                    }
+                    attempt
+                        .db
+                        .finish_hook_script(
+                            &attempt.step,
+                            attempt.index,
+                            index as i64,
+                            &serde_json::to_string(&run).map_err(|e| {
+                                crate::ServiceError::invalid_operation(e.to_string())
+                            })?,
+                        )
+                        .await?;
+                }
+                run
+            };
+            run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
+            if run.status != "success" {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn test_script_hook(
@@ -122,6 +231,147 @@ impl LifecycleHookRunner {
         let mut run = Self::run_script_hook(ctx, index, command, timeout_seconds).await;
         run.log_path = Self::write_log_entry(ctx, index, &run.entry);
         run
+    }
+
+    pub async fn test_workspace_script_hook(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        command: &str,
+        timeout_seconds: u64,
+        workspace: &ResolvedWorkspace,
+    ) -> crate::Result<LifecycleHookRun> {
+        let mut run =
+            Self::run_workspace_script_hook(ctx, index, command, timeout_seconds, workspace)
+                .await?;
+        run.log_path = Self::write_log_entry(ctx, index, &run.entry);
+        Ok(run)
+    }
+
+    async fn run_script(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        command: &str,
+        timeout_seconds: u64,
+        workspace: Option<&ResolvedWorkspace>,
+    ) -> crate::Result<LifecycleHookRun> {
+        match workspace {
+            Some(workspace) => {
+                Self::run_workspace_script_hook(ctx, index, command, timeout_seconds, workspace)
+                    .await
+            }
+            None => Ok(Self::run_script_hook(ctx, index, command, timeout_seconds).await),
+        }
+    }
+
+    async fn run_workspace_script_hook(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        command: &str,
+        timeout_seconds: u64,
+        workspace: &ResolvedWorkspace,
+    ) -> crate::Result<LifecycleHookRun> {
+        let start = Instant::now();
+        let working_dir = working_dir(ctx);
+        let environment_preview = environment_preview(ctx);
+        let mut env = ctx.env.clone();
+        env.extend(environment_preview.clone());
+        let result = workspace
+            .backend
+            .run(
+                &workspace.placement,
+                &RunSpec {
+                    purpose: WorkspaceRunPurpose::Hook,
+                    command: command.to_owned(),
+                    env,
+                    timeout_secs: if timeout_seconds == 0 {
+                        30
+                    } else {
+                        timeout_seconds
+                    },
+                    // Hook output is collected before its historical 10 KiB prefix
+                    // is retained; conformance commands have separate size budgets.
+                    max_output_bytes: isize::MAX as usize,
+                },
+            )
+            .await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let returned_output = result.is_ok();
+        let (exit_code, timed_out, stdout, stderr, error) = match result {
+            Ok(result) => {
+                let exit_code = (result.exit_code >= 0).then_some(result.exit_code);
+                let error = match exit_code {
+                    Some(0) => None,
+                    Some(code) => Some(format!("exit code {code}")),
+                    None => Some("terminated by signal".to_owned()),
+                };
+                (
+                    exit_code,
+                    false,
+                    truncate_output(&executors::environment::redact_environment_values(
+                        &result.stdout_tail,
+                        &ctx.env,
+                    )),
+                    truncate_output(&executors::environment::redact_environment_values(
+                        &result.stderr_tail,
+                        &ctx.env,
+                    )),
+                    error,
+                )
+            }
+            Err(WorkspaceBackendError::Other(error)) => {
+                let error = match *error {
+                    crate::ServiceError::InvalidOperation { message } => message,
+                    error => return Err(error),
+                };
+                let timed_out = error == "review command timed out";
+                let error = if timed_out {
+                    "timeout".to_owned()
+                } else {
+                    error
+                };
+                (None, timed_out, String::new(), String::new(), Some(error))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = if error.is_none() { "success" } else { "failed" };
+        let mut entry = json!({
+            "event": event_name(&ctx.event),
+            "hook_type": "script",
+            "command": command,
+            "duration_ms": duration_ms,
+            "status": status,
+            "working_dir": working_dir,
+            "timeout": timed_out,
+            "environment": environment_preview.clone(),
+        });
+        if let Some(error) = error.as_ref() {
+            entry["error"] = json!(error);
+            warn!(event = %event_name(&ctx.event), task_id = %ctx.task_id, hook_index = index,
+                %command, duration_ms, %error, "lifecycle script hook failed");
+        } else {
+            info!(event = %event_name(&ctx.event), task_id = %ctx.task_id, hook_index = index,
+                %command, duration_ms, "lifecycle script hook completed");
+        }
+        if returned_output {
+            entry["exit_code"] = json!(exit_code);
+            entry["stdout"] = json!(stdout);
+            entry["stderr"] = json!(stderr);
+        }
+        Ok(LifecycleHookRun {
+            index,
+            entry,
+            status: status.to_owned(),
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+            error,
+            command: Some(command.to_owned()),
+            working_dir,
+            duration_ms,
+            log_path: None,
+            environment_preview,
+        })
     }
 
     async fn run_script_hook(
@@ -139,7 +389,18 @@ impl LifecycleHookRunner {
         };
         let environment_preview = environment_preview(ctx);
 
-        let child = match Command::new("bash")
+        // The hook's temp directory lives until this function returns.
+        let run_scope = ctx.worktree_path.as_deref().map_or_else(
+            || executors::sandbox::SandboxEnv::none().scoped(),
+            |worktree| {
+                executors::sandbox::SandboxEnv::for_command(
+                    std::path::Path::new(worktree),
+                    executors::sandbox::RunPurpose::Hook,
+                )
+            },
+        );
+        let mut child_command = Command::new("bash");
+        child_command
             .arg("-lc")
             .arg(command)
             .current_dir(&working_dir)
@@ -167,9 +428,9 @@ impl LifecycleHookRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        executors::run_process::apply_sandboxed(&mut child_command, &ctx.env, run_scope.env());
+        let child = match child_command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -397,6 +658,7 @@ impl LifecycleHookRunner {
         index: usize,
         name: &str,
         plugin_registry: &PluginRegistry,
+        workspace: Option<&ResolvedWorkspace>,
     ) -> Value {
         let start = Instant::now();
         let Some(plugin) = plugin_registry.get(name) else {
@@ -437,7 +699,11 @@ impl LifecycleHookRunner {
             });
         }
 
-        match plugin.execute(ctx).await {
+        let result = match workspace {
+            Some(workspace) => plugin.execute_in_workspace(ctx, workspace).await,
+            None => plugin.execute(ctx).await,
+        };
+        match result {
             Ok(PluginResult::Success) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 info!(
@@ -497,7 +763,11 @@ impl LifecycleHookRunner {
         }
     }
 
-    fn write_log_entry(ctx: &LifecycleHookContext, index: usize, entry: &Value) -> Option<String> {
+    pub(crate) fn write_log_entry(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        entry: &Value,
+    ) -> Option<String> {
         let log_dir = ctx.log_dir.as_ref()?;
 
         if let Err(err) = std::fs::create_dir_all(log_dir) {
@@ -763,5 +1033,107 @@ mod tests {
         assert!(!run.timed_out);
         let log_path = run.log_path.as_deref().expect("log path");
         assert!(std::path::Path::new(log_path).exists());
+    }
+
+    #[tokio::test]
+    async fn script_hook_gets_a_task_root_tmpdir_removed_after_success_failure_and_timeout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        let tmp_root = worktree.parent().unwrap().join(".forge-task/tmp");
+        let seen_file = temp.path().join("seen");
+        for (tail, timeout_seconds) in [("exit 0", 5), ("exit 7", 5), ("sleep 30", 1)] {
+            let hooks = vec![api_types::LifecycleHookDef::Script {
+                command: format!(
+                    "touch \"$TMPDIR/made\" && printf '%s' \"$TMPDIR\" > {}; {tail}",
+                    seen_file.display()
+                ),
+                timeout_seconds,
+                blocking: true,
+            }];
+            let failure =
+                LifecycleHookRunner::run_blocking_before_work_hooks(ctx(&worktree), &hooks).await;
+            assert_eq!(failure.is_some(), tail != "exit 0");
+            let seen = std::path::PathBuf::from(std::fs::read_to_string(&seen_file).unwrap());
+            assert_eq!(seen.parent(), Some(tmp_root.as_path()));
+            assert_eq!(std::fs::read_dir(&tmp_root).unwrap().count(), 0, "{tail}");
+        }
+    }
+
+    /// What a run printed for `$RUSTC_WRAPPER|$KACHE_CACHE_DIR` when Forge
+    /// offered `wrapper` and `store`. The operator's own environment wins
+    /// over Forge's, so on a machine whose environment names a wrapper (or a
+    /// kache directory) this asserts that rule instead.
+    #[cfg(unix)]
+    fn assert_saw_compiler_cache(seen: &str, wrapper: &std::path::Path, store: &std::path::Path) {
+        let operator = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+        let (wrapper, store) = (wrapper.to_str().unwrap(), store.to_str().unwrap());
+        if operator("RUSTC_WRAPPER") {
+            assert!(!seen.starts_with(wrapper), "{seen}");
+        } else if operator("KACHE_CACHE_DIR") {
+            assert!(seen.starts_with(&format!("{wrapper}|")), "{seen}");
+        } else {
+            assert_eq!(seen, format!("{wrapper}|{store}"));
+        }
+    }
+
+    /// Plan 3.4 F: a script hook in a Task worktree is handed the machine's
+    /// shared compiler cache.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_hook_gets_the_shared_compiler_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let worktree = root.join("t").join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        // A linked worktree of the repository `r1`, as the server lays it out.
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", root.join(".repos/r1/worktrees/t").display()),
+        )
+        .unwrap();
+        // The repository names the worktree back, as Git does; without it the
+        // worktree's own `.git` file claims nothing.
+        std::fs::create_dir_all(root.join(".repos/r1/worktrees/t")).unwrap();
+        std::fs::write(
+            root.join(".repos/r1/worktrees/t/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        let wrapper = temp.path().join("kache");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        executors::compiler_cache::install(
+            &root,
+            Some(executors::compiler_cache::CompilerCache {
+                kind: executors::compiler_cache::WrapperKind::of(&wrapper),
+                wrapper: wrapper.clone(),
+                dir: root.join(executors::compiler_cache::CACHE_DIR),
+                max_bytes: 1 << 30,
+            }),
+        );
+        let store = root.join(executors::compiler_cache::CACHE_DIR).join("r1");
+        let seen_file = temp.path().join("seen");
+        let script = format!(
+            "printf '%s|%s' \"$RUSTC_WRAPPER\" \"$KACHE_CACHE_DIR\" > '{}'",
+            seen_file.display()
+        );
+        let hooks = vec![api_types::LifecycleHookDef::Script {
+            command: script,
+            timeout_seconds: 5,
+            blocking: true,
+        }];
+        let failure =
+            LifecycleHookRunner::run_blocking_before_work_hooks(ctx(&worktree), &hooks).await;
+        executors::compiler_cache::install(&root, None);
+        assert!(failure.is_none());
+        assert_saw_compiler_cache(
+            &std::fs::read_to_string(&seen_file).unwrap(),
+            &wrapper,
+            &store,
+        );
     }
 }

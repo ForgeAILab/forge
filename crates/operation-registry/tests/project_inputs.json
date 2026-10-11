@@ -1,0 +1,94 @@
+{
+  "message.send": {
+    "content": "Pending proposal"
+  },
+  "memory.publish": {
+    "content": "Pending proposal"
+  },
+  "project.release.request": {
+    "action": "propose_candidate",
+    "milestone_id": "scope-composition-milestone",
+    "milestone_version": 1,
+    "readiness_digest": "scope-composition-readiness-digest",
+    "readiness_snapshot_id": "scope-composition-readiness"
+  },
+  "memory.supersede": {
+    "content": "Pending proposal"
+  },
+  "project.document": {
+    "action": "draft_revision",
+    "base_revision_id": null,
+    "content": {
+      "affected_artifact_ids": [],
+      "affected_decision_ids": [],
+      "alternatives": [],
+      "decision_informed": "Whether adapters should validate domain fields.",
+      "evidence": [],
+      "findings": [],
+      "inferences": [],
+      "question": "Which boundary is authoritative?",
+      "recommendation": null,
+      "scope": "The Project-native boundary.",
+      "sources": [],
+      "stopping_condition": "The service returns a typed outcome.",
+      "uncertainty": [],
+      "unresolved_questions": []
+    },
+    "document_id": "registry-document",
+    "expected_document_version": 1,
+    "kind": "research",
+    "title": "Registry research"
+  },
+  "project.decision": {
+    "action": "record_effective",
+    "decision_class": "project_implementation",
+    "decision_id": "registry-decision",
+    "expected_project_version": 2,
+    "options": [
+      "A",
+      "B"
+    ],
+    "question": "Choose implementation",
+    "rationale": "Keep the scope bounded",
+    "selected_outcome": "A"
+  },
+  "project.review_config": {
+    "action": "set_ci_steps",
+    "ci_steps": [
+      "cargo test --lib"
+    ],
+    "expected_project_version": 2
+  },
+  "commitment.update": {
+    "content": "Pending proposal"
+  },
+  "project.milestone": {
+    "action": "define",
+    "content": {
+      "name": "Delivery",
+      "outcome": "Deliver the requirement"
+    },
+    "expected_milestone_version": 2
+  },
+  "review.request": {
+    "content": "Pending proposal"
+  },
+  "session.action": {
+    "action": "cancel",
+    "session_id": "pending-session"
+  },
+  "project.validation": {
+    "action": "record",
+    "check_id": "delivery",
+    "definition_revision_id": "registry-definition",
+    "input_digest": "registry-input",
+    "milestone_id": "registry-milestone",
+    "milestone_version": 1,
+    "result": "Independent execution has not run",
+    "status": "unavailable"
+  },
+  "project.escalate": {
+    "need": "Confirm the delivery requirement",
+    "task_ids": []
+  }
+}

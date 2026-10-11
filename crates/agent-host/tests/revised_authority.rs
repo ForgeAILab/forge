@@ -842,11 +842,14 @@ fn every_advertised_read_argument_is_admitted_by_the_read_path() {
             .any(|operation| operation == "inquiry.run"),
         "inquiry.run must be advertised before its arguments can matter"
     );
+    // The registry enforces the whole contract, so each advertised field is
+    // probed inside an otherwise complete call.
     for field in ["title", "question", "context"] {
-        let arguments = serde_json::json!({
+        let mut arguments = serde_json::json!({
             "operation": "inquiry.run",
-            "arguments": { field: "x" },
+            "arguments": {"title": "x", "question": "x"},
         });
+        arguments["arguments"][field] = serde_json::json!("y");
         assert!(
             forge_agent_host::admits_orchestration_read_argument("inquiry.run", &arguments),
             "`{field}` is advertised for inquiry.run but refused by the read path"
@@ -855,7 +858,7 @@ fn every_advertised_read_argument_is_admitted_by_the_read_path() {
 }
 
 /// Scratch diagnostic: the propose tool must both require `payload` and
-/// describe `task.recover`'s fields, or the model has no way to form the call.
+/// describe `task.action`'s fields, or the model has no way to form the call.
 #[test]
 fn project_propose_tool_requires_payload_and_documents_recover() {
     let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
@@ -880,18 +883,18 @@ fn project_propose_tool_requires_payload_and_documents_recover() {
     let schema = tool.spec().input_schema.clone();
     let full = schema.to_string();
     assert!(
-        full.contains("task.recover"),
+        full.contains("task.action"),
         "recover guidance missing from the propose schema"
     );
     assert!(
-        full.contains("cancel_task"),
-        "cancel_task action not described to the model"
+        full.contains("cancel"),
+        "cancel verb not described to the model"
     );
-    // `task.recover` must be reachable at all: it is the only remedy for a
+    // `task.action` must be reachable at all: it is the only remedy for a
     // Task that fails by construction, and it was absent from the advertised
     // operation enum's admitted set until the direct-command gate was fixed.
     assert!(
-        full.contains("task.recover"),
-        "task.recover must be advertised on the project propose surface"
+        full.contains("task.action"),
+        "task.action must be advertised on the project propose surface"
     );
 }

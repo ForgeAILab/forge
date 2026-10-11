@@ -14,6 +14,7 @@ async fn batch_5_4_subtask_management_allows_manual_child_transition() {
             child.id.clone(),
             "in_progress".to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: child.version,
                 reason: None,
                 triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),

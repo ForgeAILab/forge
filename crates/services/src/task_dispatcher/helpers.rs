@@ -1,7 +1,7 @@
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
     ExecutionRepo, ExecutionStatus, PageRequest, ResumePolicy, ReviewRepo, ReviewStatus, SortBy,
-    SortOrder, TaskRoleAssignmentRepo,
+    SortOrder, TaskRepo,
 };
 use serde_json::Value;
 
@@ -46,8 +46,11 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::DependencyGate
         | ServiceError::MissingPrimaryRepo { .. }
         | ServiceError::PrimaryRepoNotFound { .. }
-        | ServiceError::RepoMismatch { .. }
-        | ServiceError::PrProviderMissing { .. } => true,
+        | ServiceError::RepoMismatch { .. } => true,
+        ServiceError::DaemonUpgradeRequired { .. } => true,
+        ServiceError::PlacementUnavailable(error) => {
+            error.needs_daemon_upgrade() || error.is_deterministic()
+        }
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
         // A slot held by a concurrently running execution frees itself the
         // moment that execution terminalises, and nothing about that clears a
@@ -63,6 +66,13 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
     }
 }
 
+/// One list with the Task condition mapping, so the two cannot drift.
+pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = db::LEGACY_BLOCKING_ANNOTATION_KINDS;
+const _: () = assert!(matches!(
+    crate::workflow::engine::DISPATCH_FAILED_ANNOTATION.as_bytes(),
+    b"dispatch_failed"
+));
+
 pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     if task.blocked_json.is_some() || task.failed_json.is_some() {
         return true;
@@ -76,18 +86,11 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     let Some(kind) = annotation.get("type").and_then(Value::as_str) else {
         return false;
     };
-    matches!(
-        kind,
-        "manual_stop"
-            | "workspace_error"
-            | "agent_timeout"
-            | "recovery_required"
-            | "workspace_reset_required"
-            | "max_turns_exceeded"
-            | "before_work_hook_failed"
-            | "before_work_hook_timeout"
-            | crate::workflow::engine::DISPATCH_FAILED_ANNOTATION
-    )
+    is_blocking_annotation_type(kind)
+}
+
+pub(crate) fn is_blocking_annotation_type(kind: &str) -> bool {
+    BLOCKING_ANNOTATION_KINDS.contains(&kind)
 }
 
 pub(super) fn awaiting_human(task: &db::Task) -> bool {
@@ -141,8 +144,7 @@ pub(super) async fn execution_superseded_by_role_assignment(
     canonical_role: &str,
     execution: &db::Execution,
 ) -> Result<bool> {
-    let assignment =
-        TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, canonical_role).await?;
+    let assignment = effective_assignment(db, task_id, canonical_role).await?;
     Ok(assignment.is_some_and(|assignment| {
         let Ok(assignment_updated_at) =
             chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
@@ -262,6 +264,8 @@ fn review_ci_steps_finished(step_results_json: &str) -> bool {
 ///   the guard meant for failed/cancelled attempts.
 /// - `Failed`/`Cancelled` with `resume_policy: Some(ResumePolicy::Auto)` —
 ///   the executor already opted this attempt into automatic retry.
+/// - Environment pre-dispatch failures — the Project pause owns recovery.
+#[cfg(test)]
 pub(super) async fn latest_stopped_execution_blocks_dispatch(
     db: &db::SqliteDb,
     task_id: &str,
@@ -311,6 +315,9 @@ async fn latest_execution_needs_explicit_decision(
     let Some(execution) = page.items.into_iter().next() else {
         return Ok(false);
     };
+    if crate::project_environment::is_environment_pre_dispatch_failure(&execution) {
+        return Ok(false);
+    }
     let terminal = matches!(
         execution.status,
         ExecutionStatus::Failed | ExecutionStatus::Cancelled
@@ -334,7 +341,7 @@ async fn latest_execution_needs_explicit_decision(
     // scoped to this exact Task/role, so it can authorize one fresh dispatcher
     // attempt without weakening the default no-auto-retry rule for failures or
     // manual stops. A newly stopped attempt will again be newer and block.
-    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, role_name).await?;
+    let assignment = effective_assignment(db, task_id, role_name).await?;
     let assignment_is_newer = assignment.is_some_and(|assignment| {
         let Ok(assignment_updated_at) =
             chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
@@ -427,4 +434,19 @@ fn merge_project_review_config(merged: &mut Value, project: &db::Project) {
             *merged = Value::Object(review_config.clone());
         }
     }
+}
+
+async fn effective_assignment(
+    db: &db::SqliteDb,
+    task_id: &str,
+    role: &str,
+) -> Result<Option<db::TaskRoleAssignment>> {
+    let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
+        return Ok(None);
+    };
+    Ok(
+        crate::task_hierarchy::effective_role_assignment(db, &task, role)
+            .await?
+            .map(|resolved| resolved.assignment),
+    )
 }

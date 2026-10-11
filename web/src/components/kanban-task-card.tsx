@@ -5,19 +5,26 @@ import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { AgentAssigneeDropdown } from '@/components/task-controls'
 import { Avatar } from '@/components/ui/avatar'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
+import { TaskCapacityNotice } from '@/components/task-capacity-notice'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
-import { getBlockingAnnotation, getStateColors, taskHasError } from '@/lib/workflow-utils'
+import {
+  blockedInterruption,
+  getBlockingAnnotation,
+  getStateColors,
+  taskHasError,
+} from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
 import type { TaskListItem as Task } from '@/types/generated'
 
 export type TaskCardMenuRenderer = (task: Task) => ReactNode
 
 function formatBlockingReason(value: string) {
+  if (value === 'review_needs_owner') return 'Needs owner'
   const withSpaces = value.replace(/_/g, ' ')
   return withSpaces.charAt(0).toUpperCase() + withSpaces.slice(1)
 }
@@ -68,7 +75,7 @@ export function KanbanTaskCard({
     coderAssignment?.assignee_type === 'user' ? (coderAssignment.assignee_id ?? 'manual') : null
   const coderIsHuman = coderAssignment?.assignee_type === 'user'
   const pausedAnnotation = getBlockingAnnotation(task)
-  const blockedReason = task.blocked?.reason ?? pausedAnnotation?.blocking_reason
+  const blockedReason = blockedInterruption(task)?.reason ?? pausedAnnotation?.blocking_reason
   const isPaused = task.status !== 'cancelled' && Boolean(blockedReason)
   const hasActiveError = taskHasError(task)
   return (
@@ -171,6 +178,7 @@ export function KanbanTaskCard({
                   <span className="italic">Unassigned</span>
                 )}
               </div>
+              <TaskCapacityNotice task={task} />
             </div>
             <div
               className="pointer-events-auto flex shrink-0 items-center gap-0.5"

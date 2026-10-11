@@ -1,5 +1,6 @@
 import type { TaskListItem as Task } from '@/types/generated'
 import type {
+  CheckWait,
   StateKind,
   TaskBlockingAnnotation,
   TaskExecutionObservability,
@@ -42,13 +43,13 @@ export function groupByColumns(tasks: Task[], cols: BoardColumn[]): Record<strin
   return result
 }
 
-type TaskAnnotationSummary = Pick<TaskResponse, 'blocked' | 'failed' | 'error_annotation'> & {
+type TaskAnnotationSummary = Pick<TaskResponse, 'condition'> & {
   execution_observability?: Pick<TaskExecutionObservability, 'latest_execution_id'>
 }
 
 export function taskHasError(task: TaskAnnotationSummary): boolean {
-  if (task.blocked || task.failed) return true
-  if (!task.error_annotation) return false
+  if (task.condition.details.failed || task.condition.details.blocked) return true
+  if (!task.condition.details.diagnostic) return false
   return !isStaleBlockingAnnotation(task)
 }
 
@@ -73,21 +74,118 @@ export function getTaskWorkflowWarning(
   }
 }
 
+/** The durable check this Task waits on, as primary or secondary reason. */
+export function checkWait(task: TaskAnnotationSummary): CheckWait | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked' && condition.kind !== 'failed') return null
+  const first = condition.kind === 'parked' ? condition.primary : condition.failure
+  for (const reason of [first, ...condition.additional]) {
+    if (reason.kind === 'check') return reason.wait
+  }
+  return null
+}
+
+/**
+ * How a check wait reads. Waiting for a result or a slot is the check
+ * runner's own work, not a failure; only exhausted infrastructure retries
+ * need the owner (Retry or Cancel), and they are no verdict on the change.
+ */
+export function checkWaitNotice(
+  task: TaskAnnotationSummary,
+): { title: string; message: string; needsOwner: boolean } | null {
+  const wait = checkWait(task)
+  if (!wait) return null
+  switch (wait.phase) {
+    case 'result':
+      return {
+        title: 'Waiting for checks',
+        message: 'The checks for this change are running. The Task continues when their result arrives.',
+        needsOwner: false,
+      }
+    case 'slot':
+      return {
+        title: 'Waiting for a check slot',
+        message: 'The machine that holds this checkout is at its run limit. The checks start when a slot frees.',
+        needsOwner: false,
+      }
+    case 'infrastructure_exhausted':
+      return {
+        title: 'Checks could not run',
+        message:
+          'The checks produced no result after the automatic retries. This is not a failure of the change: retry the checks or cancel the Task.',
+        needsOwner: true,
+      }
+  }
+}
+
+const PARENT_WAIT_CAUSES: Record<string, string> = {
+  held: 'is on hold',
+  blocked: 'is blocked',
+  not_coordinating: 'is not running subtasks yet',
+}
+
+const AGENT_WAIT_STATUSES: Record<string, string> = {
+  paused: 'is paused',
+  daemon_offline: 'is offline',
+}
+
+/**
+ * What a parked Task waits for when the wait is on something other than the
+ * Task itself: its parent Task, its Agent, or unfinished dependencies. These
+ * are waits, not failures, so they carry no blocked or failed record.
+ */
+export function getTaskWaitNotice(
+  task: Pick<TaskResponse, 'condition'>,
+): { title: string; message: string } | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked') return null
+  const reason = [condition.primary, ...condition.additional].find(
+    (candidate) =>
+      candidate.kind === 'parent' ||
+      candidate.kind === 'agent' ||
+      (candidate.kind === 'dependencies' && !candidate.cancelled),
+  )
+  if (!reason) return null
+  if (reason.kind === 'parent') {
+    const cause = PARENT_WAIT_CAUSES[reason.cause] ?? 'does not let it run yet'
+    return {
+      title: 'Waiting for parent task',
+      message: `The parent task ${cause}. This subtask runs when the parent lets its subtasks run.`,
+    }
+  }
+  if (reason.kind === 'agent') {
+    const status = AGENT_WAIT_STATUSES[reason.status] ?? `is ${reason.status.replace(/_/g, ' ')}`
+    return {
+      title: 'Waiting for agent',
+      message: `The assigned agent ${status}. This task runs when the agent can take work.`,
+    }
+  }
+  if (reason.kind === 'dependencies') {
+    const count = reason.dependency_ids.length
+    return {
+      title: 'Waiting for dependencies',
+      message:
+        count === 1
+          ? 'One dependency is unfinished. This task runs when it finishes or the dependency is removed.'
+          : `${count > 1 ? count : 'Some'} dependencies are unfinished. This task runs when they finish or are removed.`,
+    }
+  }
+  return null
+}
+
+/** The Task's blocked record. A failure record alone is not a block. */
+export function blockedInterruption(task: TaskAnnotationSummary) {
+  return task.condition.details.blocked ? task.condition.details.interruption : null
+}
+
 export function isTaskBlocked(task: TaskAnnotationSummary): boolean {
-  if (task.blocked) return true
+  if (task.condition.details.blocked) return true
+  if (checkWait(task)?.phase === 'infrastructure_exhausted') return true
   return Boolean(getBlockingAnnotation(task))
 }
 
 function rawBlockingAnnotation(task: TaskAnnotationSummary): TaskBlockingAnnotation | null {
-  if (
-    !task.error_annotation ||
-    typeof task.error_annotation !== 'object' ||
-    task.error_annotation === null ||
-    !('blocking_reason' in task.error_annotation)
-  ) {
-    return null
-  }
-  return task.error_annotation as TaskBlockingAnnotation
+  return task.condition.details.diagnostic
 }
 
 export function isStaleBlockingAnnotation(task: TaskAnnotationSummary): boolean {
@@ -111,7 +209,13 @@ export function matchesFilters(
   task: Task,
   filters: { priorityMax?: number; priorityMin?: number; types: string[]; blockedOnly?: boolean },
 ): boolean {
-  if (filters.blockedOnly && !task.blocked) return false
+  if (
+    filters.blockedOnly &&
+    !task.condition.details.blocked &&
+    checkWait(task)?.phase !== 'infrastructure_exhausted'
+  ) {
+    return false
+  }
   if (filters.priorityMin !== undefined && task.priority < filters.priorityMin) return false
   if (filters.priorityMax !== undefined && task.priority > filters.priorityMax) return false
   if (filters.types.length > 0 && !filters.types.includes(task.task_type)) return false

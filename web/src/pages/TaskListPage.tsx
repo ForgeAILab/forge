@@ -4,13 +4,13 @@ import {
   useAgentsQuery,
   useArchiveTask,
   useAssignRole,
-  useCancelTask,
   useMembersQuery,
   useProjectAgentsQuery,
   useRemoveRole,
   useTasksQuery,
   useTransitionTask,
 } from '@/api/hooks'
+import { BulkCancelTasks, TaskRowActions } from '@/components/task-detail/task-list-actions'
 import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -27,20 +27,12 @@ import { Funnel, Plus, UserCircle, X } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
 import { toastApiError } from '@/lib/api-error'
 import { productTerm } from '@/lib/i18n'
-import { getBlockingAnnotation } from '@/lib/workflow-utils'
+import { blockedInterruption, getBlockingAnnotation } from '@/lib/workflow-utils'
 import type { TaskStatus } from '@/types/generated'
 import type { TaskListItem as Task } from '@/types/generated'
 
 export type TaskListSortBy = 'title' | 'status' | 'agent' | 'priority' | 'task_type' | 'updated_at'
 export type TaskListSortOrder = 'asc' | 'desc'
-
-const cancellableStatuses = new Set<TaskStatus>([
-  'todo',
-  'in_progress',
-  'review',
-  'merge_failed',
-  'blocked',
-])
 
 const tableColumns: Array<{ key: TaskListSortBy; label: string }> = [
   { key: 'title', label: 'Title' },
@@ -97,7 +89,6 @@ export function TaskListPage({
   const agentsQuery = useAgentsQuery()
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
-  const cancelTask = useCancelTask()
   const archiveTask = useArchiveTask()
   const assignRole = useAssignRole()
   const removeRole = useRemoveRole()
@@ -121,7 +112,7 @@ export function TaskListPage({
   const visibleTasks = useMemo(
     () =>
       tasks.filter((task) => {
-        if (blockedOnly && !task.blocked) return false
+        if (blockedOnly && !task.condition.details.blocked) return false
         if (priorityMin !== undefined && task.priority < priorityMin) return false
         if (priorityMax !== undefined && task.priority > priorityMax) return false
         return true
@@ -137,7 +128,6 @@ export function TaskListPage({
     () => visibleTasks.filter((task) => selectedIds.has(task.id)),
     [selectedIds, visibleTasks],
   )
-  const cancellableSelected = selectedTasks.filter((task) => cancellableStatuses.has(task.status))
   const assignableSelected = selectedTasks.filter(
     (task) => task.status !== 'done' && task.status !== 'cancelled',
   )
@@ -182,15 +172,6 @@ export function TaskListPage({
       }
       return next
     })
-  }
-
-  const cancelSelected = () => {
-    for (const task of cancellableSelected) {
-      cancelTask.mutate(task.id, {
-        onError: (error) => toastApiError(error, 'Task cancellation failed'),
-      })
-    }
-    setSelectedIds(new Set())
   }
 
   const archiveSelected = () => {
@@ -279,14 +260,7 @@ export function TaskListPage({
       {selectedTasks.length > 0 ? (
         <div className="flex flex-wrap items-center gap-2 rounded-md border bg-background p-3 shadow-soft">
           <span className="text-sm font-medium">{selectedTasks.length} selected</span>
-          <Button
-            disabled={cancellableSelected.length === 0 || cancelTask.isPending}
-            size="sm"
-            variant="outline"
-            onClick={cancelSelected}
-          >
-            Cancel selected
-          </Button>
+          <BulkCancelTasks tasks={selectedTasks} onComplete={() => setSelectedIds(new Set())} />
           <Button
             disabled={archiveTask.isPending}
             size="sm"
@@ -533,6 +507,7 @@ export function TaskListPage({
                         >
                           {task.title}
                         </button>
+                        <TaskRowActions taskId={task.id} />
                       </td>
                       {/* Pri */}
                       <td className="w-14 px-3 py-[10px]">
@@ -551,7 +526,7 @@ export function TaskListPage({
                           {(() => {
                             const blockingAnnotation = getBlockingAnnotation(task)
                             const blockedReason =
-                              task.blocked?.reason ?? blockingAnnotation?.blocking_reason
+                              blockedInterruption(task)?.reason ?? blockingAnnotation?.blocking_reason
                             if (!blockedReason || task.status === 'cancelled') return null
                             return (
                               <span className="inline-flex items-center rounded bg-red-500/10 px-2 py-[3px] text-micro font-medium text-red-300">

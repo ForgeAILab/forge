@@ -1,9 +1,11 @@
 //! Provider entry health learned from real provider calls, with backoff.
 //!
-//! A failing call is classified from the typed provider error text that the
+//! Chat calls carry typed TurnFailure evidence. Task and connection-test
+//! adapters still provide only messages, classified from the text that the
 //! agent-host transport produces (`provider returned HTTP 429`, `provider HTTP
 //! request failed`, `provider usage limit reached; resets in 2h 5m`, ...).
-//! Only provider-side failures count; tool, policy, and configuration errors
+//! Native provider auth rejections are recorded before mapping to Configuration.
+//! Only provider-side failures count; tool, policy, and local configuration errors
 //! say nothing about the endpoint.
 //!
 //! While a timed backoff is active, or an auth failure awaits a successful
@@ -12,7 +14,7 @@
 //! timed backoff lapses is the trial: success clears it, failure waits longer.
 
 use chrono::{DateTime, Duration, Utc};
-use db::{AgentRepo, CredentialHandleRepo, ProviderEntryHealth, SqliteDb};
+use db::{CredentialHandleRepo, ProviderEntryHealth, SqliteDb};
 
 use crate::Result;
 
@@ -49,6 +51,7 @@ impl ProviderFailureKind {
     }
 }
 
+/// Legacy Task/connection-test path, where no typed TurnFailure is available.
 /// Classifies a failed provider call, or `None` when the error is not the
 /// provider's (tool, policy, configuration, cancellation).
 pub fn classify(message: &str) -> Option<ProviderFailureKind> {
@@ -149,25 +152,71 @@ pub fn after_failure(
     message: &str,
     now: DateTime<Utc>,
 ) -> ProviderEntryHealth {
-    let failures = current
-        .map(|row| row.consecutive_failures)
-        .unwrap_or(0)
-        .saturating_add(1);
-    let until = backoff_seconds(kind, failures, message)
-        .map(|seconds| (now + Duration::seconds(seconds)).to_rfc3339());
+    let failures = current.map_or(1, |row| row.consecutive_failures.saturating_add(1));
+    let until =
+        backoff_seconds(kind, failures, message).map(|seconds| now + Duration::seconds(seconds));
+    failure_health(
+        current,
+        credential_id,
+        owner_user_id,
+        kind,
+        public_error_message(kind, message),
+        until,
+        now,
+    )
+}
+
+fn failure_health(
+    current: Option<&ProviderEntryHealth>,
+    credential_id: &str,
+    owner_user_id: &str,
+    kind: ProviderFailureKind,
+    message: String,
+    until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> ProviderEntryHealth {
     ProviderEntryHealth {
         credential_id: credential_id.to_owned(),
         owner_user_id: owner_user_id.to_owned(),
         status: if kind.is_error() { "error" } else { "backoff" }.to_owned(),
-        consecutive_failures: failures,
+        consecutive_failures: current.map_or(1, |row| row.consecutive_failures.saturating_add(1)),
         last_error_kind: Some(kind.as_str().to_owned()),
-        last_error_message: Some(public_error_message(kind, message)),
+        last_error_message: Some(message),
         last_failure_at: Some(now.to_rfc3339()),
         last_success_at: current.and_then(|row| row.last_success_at.clone()),
-        backoff_until: until,
+        backoff_until: until.map(|at| at.to_rfc3339()),
         version: current.map_or(1, |row| row.version.saturating_add(1)),
         updated_at: now.to_rfc3339(),
     }
+}
+
+fn after_chat_failure(
+    current: Option<&ProviderEntryHealth>,
+    credential_id: &str,
+    owner_user_id: &str,
+    failure: &api_types::TurnFailure,
+    resume_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<ProviderEntryHealth> {
+    let kind = match failure {
+        api_types::TurnFailure::UsageLimit { .. } => ProviderFailureKind::UsageExhausted,
+        api_types::TurnFailure::Transient { .. } => ProviderFailureKind::Network,
+        _ => return None,
+    };
+    let until = resume_at?;
+    Some(failure_health(
+        current,
+        credential_id,
+        owner_user_id,
+        kind,
+        match kind {
+            ProviderFailureKind::UsageExhausted => "Provider usage limit reached",
+            _ => "Provider request failed before a response",
+        }
+        .to_owned(),
+        Some(until.min(now + Duration::hours(6))),
+        now,
+    ))
 }
 
 /// Auth failures remain unavailable until a successful manual connection test.
@@ -264,20 +313,79 @@ async fn record_entry_outcome_inner(
     Ok(())
 }
 
-/// Records one provider call's outcome for the entry an agent runs through.
-/// Agents without a provider entry (CLI runtimes) are ignored.
-pub async fn record_agent_outcome(
+/// Record provider auth evidence before it becomes the chat Configuration class.
+/// Local profile/configuration errors never enter this path.
+pub(crate) async fn record_chat_auth_rejection(db: &SqliteDb, credential_id: &str) -> Result<()> {
+    let Some(handle) = CredentialHandleRepo::get_credential_handle(db, credential_id).await? else {
+        return Ok(());
+    };
+    loop {
+        let current = CredentialHandleRepo::get_provider_entry_health(db, credential_id).await?;
+        let next = after_failure(
+            current.as_ref(),
+            credential_id,
+            &handle.owner_user_id,
+            ProviderFailureKind::Auth,
+            "Provider rejected the credential",
+            Utc::now(),
+        );
+        if CredentialHandleRepo::upsert_provider_entry_health(
+            db,
+            next,
+            current.as_ref().map(|row| row.version),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Chat health uses typed evidence and its scheduled retry time. Configuration,
+/// authority and tool failures do not establish endpoint unavailability.
+pub async fn record_chat_outcome(
     db: &SqliteDb,
-    agent_id: &str,
-    outcome: std::result::Result<(), &str>,
+    profile_id: &str,
+    outcome: std::result::Result<(), &api_types::TurnFailure>,
+    resume_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
-    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
+    let Some(profile) = db::AgentProfileRepo::get_profile(db, profile_id).await? else {
         return Ok(());
     };
-    let Some(credential_id) = agent.credential_ref.as_deref() else {
+    let Some(credential_id) = profile.credential_ref.as_deref() else {
         return Ok(());
     };
-    record_entry_outcome(db, credential_id, outcome).await
+    let failure = match outcome {
+        Ok(()) => return record_entry_outcome_inner(db, credential_id, Ok(()), false).await,
+        Err(failure) => failure,
+    };
+    let Some(handle) = CredentialHandleRepo::get_credential_handle(db, credential_id).await? else {
+        return Ok(());
+    };
+    loop {
+        let now = Utc::now();
+        let current = CredentialHandleRepo::get_provider_entry_health(db, credential_id).await?;
+        let Some(next) = after_chat_failure(
+            current.as_ref(),
+            credential_id,
+            &handle.owner_user_id,
+            failure,
+            resume_at,
+            now,
+        ) else {
+            return Ok(());
+        };
+        if CredentialHandleRepo::upsert_provider_entry_health(
+            db,
+            next,
+            current.as_ref().map(|row| row.version),
+        )
+        .await?
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Whether an agent's provider entry currently blocks new work.
@@ -292,6 +400,59 @@ pub async fn entry_unavailable(db: &SqliteDb, credential_id: &str) -> Result<boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_chat_health_honours_schedule_and_ignores_non_provider_failures() {
+        use api_types::TurnFailure;
+        let now = DateTime::from_timestamp(100, 0).unwrap();
+        for failure in [
+            TurnFailure::Configuration,
+            TurnFailure::Authority,
+            TurnFailure::Unclassified,
+            TurnFailure::ProviderRejected {
+                retryable: false,
+                retry_after: None,
+            },
+        ] {
+            assert!(after_chat_failure(
+                None,
+                "entry",
+                "owner",
+                &failure,
+                Some(now + Duration::hours(2)),
+                now
+            )
+            .is_none());
+        }
+        let health = after_chat_failure(
+            None,
+            "entry",
+            "owner",
+            &TurnFailure::UsageLimit { resets_at: Some(1) },
+            Some(now + Duration::hours(2)),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            health.backoff_until,
+            Some((now + Duration::hours(2)).to_rfc3339())
+        );
+        assert!(is_unavailable(&health, now + Duration::hours(1)));
+        assert!(!is_unavailable(&health, now + Duration::hours(2)));
+        let ceiling = after_chat_failure(
+            None,
+            "entry",
+            "owner",
+            &TurnFailure::UsageLimit { resets_at: None },
+            Some(now + Duration::hours(24)),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            ceiling.backoff_until,
+            Some((now + Duration::hours(6)).to_rfc3339())
+        );
+    }
 
     #[test]
     fn classifies_transport_errors() {

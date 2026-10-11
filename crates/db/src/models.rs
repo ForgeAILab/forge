@@ -1,9 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use crate::pagination::PageRequest;
-use crate::repository::{
-    AdmitAgentChatTurn, CompleteDomainEvent, CreateAgentActionExecution, CreateCommandReceipt,
-};
+use crate::repository::{AdmitAgentChatTurn, CreateAgentActionExecution, CreateCommandReceipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, Row};
@@ -13,7 +11,7 @@ use sqlx::{sqlite::SqliteRow, Row};
 /// use this default unless the user explicitly configured a budget.
 pub const DEFAULT_PROJECT_AGENT_WAKE_BUDGET: i64 = 10;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -22,10 +20,11 @@ pub struct Project {
     pub workflow_template_name: Option<String>,
     pub primary_repo_id: Option<String>,
     pub paused_at: Option<String>,
-    /// Set only alongside `paused_at` by the Task dispatcher's own
-    /// auto-pause (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None` for a user's
-    /// own pause. See migration V128.
+    /// Set alongside `paused_at` for a repository or environment auto-pause;
+    /// `None` for a user's own pause. See migrations V128 and V202610010410.
     pub system_pause_reason: Option<String>,
+    /// Durable detail and schedule for an environment-owned Project pause.
+    pub environment_pause_json: Option<String>,
     pub owner_id: Option<String>,
     pub project_hooks_json: String,
     pub project_work_epoch: i64,
@@ -41,6 +40,24 @@ pub struct Project {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Project response inputs and the display revision from the same SELECT.
+#[derive(Debug, Clone)]
+pub struct ProjectSlotRead {
+    pub project: Project,
+    pub list_revision: i64,
+}
+
+/// Counts and revision fences read together by the batched slot statement.
+#[derive(Debug)]
+pub struct ProjectSlotCounts {
+    pub project_id: String,
+    pub project_version: i64,
+    pub list_revision: i64,
+    pub active: i64,
+    pub parked: i64,
+    pub queued: i64,
 }
 
 /// Durable, retryable work that reconciles a Project's repository and
@@ -403,7 +420,6 @@ pub struct Repo {
     pub name: String,
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
-    pub work_mode: WorkMode,
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
@@ -414,35 +430,40 @@ pub fn normalize_repo_remote_url(remote_url: Option<String>) -> Option<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkMode {
-    DirectMerge,
-    PullRequest,
+pub enum RepoLocationOwnerKind {
+    Server,
+    Daemon,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrProviderConfig {
+pub enum RepoLocationKind {
+    PrimaryCheckout,
+    ManagedClone,
+    SharedMount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoLocationStatus {
+    Unverified,
+    Ready,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLocation {
     pub id: String,
     pub repo_id: String,
-    pub provider_type: String,
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: i64,
-    pub token_secret_ref: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrMetadata {
-    pub id: String,
-    pub task_id: String,
-    pub provider_type: String,
-    pub provider_pr_id: Option<String>,
-    pub pr_url: Option<String>,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub pr_state: String,
-    pub merge_status: String,
-    pub last_synced_at: Option<String>,
+    pub owner_kind: RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub path: String,
+    pub kind: RepoLocationKind,
+    pub is_default: bool,
+    pub status: RepoLocationStatus,
+    pub last_verified_at: Option<String>,
+    pub last_error: Option<String>,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -817,12 +838,10 @@ pub struct CreateAgentWakeDisposition {
     pub updated_at: String,
 }
 
-/// Atomically persists the first disposition for a claimed event, its
-/// current-pointer row, and the event projection receipt/cursor checkpoint.
+/// Transaction-owned first wake disposition, current pointer and optional admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteClaimedWake {
+pub struct PersistAgentWake {
     pub disposition: CreateAgentWakeDisposition,
-    pub completion: CompleteDomainEvent,
     /// Required for `turn_admitted`.  The DB inserts/replays this message and
     /// turn inside the same transaction as the disposition and source-event
     /// checkpoint, closing the crash seam between admission and delivery.
@@ -902,6 +921,40 @@ pub struct AttentionProjection {
     pub source_sequence: Option<i64>,
 }
 
+/// Remove, at any depth, what identifies one delivery of a blocker rather
+/// than the blocker: event identity, Task version, bookkeeping times and the
+/// execution that happened to report it. The incident digest and the Task
+/// condition's material blocker share this one definition.
+pub fn strip_attention_delivery_metadata(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in [
+                "source_event_id",
+                "source_event_type",
+                "source_sequence",
+                "task_version",
+                "created_at",
+                "updated_at",
+                "detected_at",
+                "last_checked_at",
+                "next_check_at",
+                "execution_id",
+            ] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                strip_attention_delivery_metadata(child);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                strip_attention_delivery_metadata(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Canonical, redaction-safe digest used to bind a wake decision to the exact
 /// Attention materialization it observed.  Keep this in `db` so the atomic
 /// admission transaction can validate a snapshot without depending on the
@@ -913,20 +966,27 @@ pub fn canonical_attention_incident_digest(attention: &AttentionProjection) -> S
         .take(8_192)
         .collect::<String>();
     let canonical_details = serde_json::from_str::<serde_json::Value>(&bounded_details)
-        .map(|value| value.to_string())
+        .map(|mut value| {
+            strip_attention_delivery_metadata(&mut value);
+            // A renamed Task or a changed action offer is not a new blocker.
+            if let Some(task) = value.get_mut("task").and_then(|v| v.as_object_mut()) {
+                task.remove("task_title");
+            }
+            if let Some(recovery) = value.get_mut("recovery").and_then(|v| v.as_object_mut()) {
+                recovery.remove("actions");
+            }
+            value.to_string()
+        })
         .unwrap_or(bounded_details);
     let details_digest = wake_incident_digest(&canonical_details);
     let canonical = format!(
-        "type={};scope_type={};scope_id={};status={};source_event_id={};source_sequence={:?};details_digest={};recommended_action={};version={}",
+        "type={};scope_type={};scope_id={};status={};details_digest={};recommended_action={}",
         bounded_wake_ref(&attention.attention_type),
         bounded_wake_ref(&attention.scope_type),
         bounded_wake_ref(&attention.scope_id),
         bounded_wake_ref(&attention.status),
-        bounded_wake_ref(&attention.source_event_id),
-        attention.source_sequence,
         details_digest,
         bounded_wake_ref(&attention.recommended_action),
-        attention.version,
     );
     wake_incident_digest(&canonical)
 }
@@ -988,37 +1048,6 @@ pub struct AttentionListQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events: i64,
-    pub version: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpsertAttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events_delta: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventConsumerCursor {
     pub consumer_name: String,
     pub last_sequence: i64,
@@ -1034,28 +1063,102 @@ pub struct EventConsumerCutover {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub task_id: String,
     pub repo_id: String,
-    pub worktree_path: String,
+    pub(crate) worktree_path: String,
     pub branch: String,
     pub status: WorkspaceStatus,
     pub before_sha: Option<String>,
     pub cleanup_after: Option<String>,
+    pub cleanup_attempts: i64,
+    pub last_cleanup_error: Option<String>,
     pub error: Option<String>,
+    /// Disk bytes of the Task root as last measured by the garbage-collection
+    /// sweep; `None` until a walk of it has finished.
+    pub disk_bytes: Option<i64>,
+    pub disk_measured_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Workspace {
+    /// Backend-only access to the legacy server path. Consumers must resolve
+    /// the placement through `WorkspaceBackendRouter` instead.
+    pub fn embedded_worktree_path_for_backend(&self) -> &str {
+        &self.worktree_path
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WorkspaceStatus {
     Creating,
     Ready,
     Error,
     Cleaning,
     Cleaned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementOwnerKind {
+    Server,
+    Daemon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementState {
+    Reserved,
+    Preparing,
+    Ready,
+    Disconnected,
+    Cleaning,
+    Cleaned,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementSelectedBy {
+    Scheduler,
+    Pin,
+    Inherited,
+    Backfill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementFailureCause {
+    PlacementUnavailable,
+    PrepareFailed,
+    OwnerDisconnected,
+    OwnerDisconnectedTimeout,
+    OwnerLostExecution,
+    StaleGeneration,
+    WrongOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePlacement {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: PlacementOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: PlacementState,
+    pub selected_by: PlacementSelectedBy,
+    pub selection_reason: String,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<PlacementFailureCause>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Scheduler-issued authority for one assigned Task/repository operation.
@@ -1094,6 +1197,11 @@ pub struct WorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Daemon {
+    pub run_limit: Option<u32>,
+    pub max_concurrent_runs: Option<i64>,
+    /// The disk facts of its workspace root from its last report, as JSON
+    /// ([`api_types::MachineDiskFacts`]). `None` until it reports one.
+    pub disk_json: Option<String>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -1180,6 +1288,7 @@ pub struct CreateNotification {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "TaskArchive")]
 pub struct Task {
     pub id: String,
     pub project_id: String,
@@ -1208,6 +1317,81 @@ pub struct Task {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub condition: crate::TaskCondition,
+}
+/// Decoder for private stored Task receipts written before condition became public.
+/// Live REST/MCP serializers always use their dedicated DTOs.
+#[derive(Deserialize)]
+struct TaskArchive {
+    pub id: String,
+    pub project_id: String,
+    pub parent_task_id: Option<String>,
+    pub assignee_type: Option<String>,
+    pub assignee_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub task_type: String,
+    pub status: TaskStatus,
+    pub is_automation: bool,
+    pub priority: i64,
+    pub board_position: f64,
+    pub subtask_order: Option<i64>,
+    pub task_state_config: Option<String>,
+    pub merge_config: Option<String>,
+    pub metadata_json: Option<String>,
+    pub plan: Option<String>,
+    pub error_annotation: Option<String>,
+    pub blocked_json: Option<String>,
+    pub failed_json: Option<String>,
+    pub entry_barrier_json: Option<String>,
+    pub review_passed_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub condition: Option<crate::TaskCondition>,
+}
+impl From<TaskArchive> for Task {
+    fn from(archive: TaskArchive) -> Self {
+        let condition = archive.condition;
+        let mut task = Self {
+            id: archive.id,
+            project_id: archive.project_id,
+            parent_task_id: archive.parent_task_id,
+            assignee_type: archive.assignee_type,
+            assignee_id: archive.assignee_id,
+            title: archive.title,
+            description: archive.description,
+            task_type: archive.task_type,
+            status: archive.status,
+            is_automation: archive.is_automation,
+            priority: archive.priority,
+            board_position: archive.board_position,
+            subtask_order: archive.subtask_order,
+            task_state_config: archive.task_state_config,
+            merge_config: archive.merge_config,
+            metadata_json: archive.metadata_json,
+            plan: archive.plan,
+            error_annotation: archive.error_annotation,
+            blocked_json: archive.blocked_json,
+            failed_json: archive.failed_json,
+            entry_barrier_json: archive.entry_barrier_json,
+            review_passed_at: archive.review_passed_at,
+            archived_at: archive.archived_at,
+            deleted_at: archive.deleted_at,
+            version: archive.version,
+            created_at: archive.created_at,
+            updated_at: archive.updated_at,
+            condition: crate::TaskCondition::default(),
+        };
+        task.condition = condition.unwrap_or_else(|| {
+            crate::map_legacy_condition(&crate::LegacyConditionInput::from(&task))
+        });
+        task
+    }
 }
 
 pub type TaskStatus = String;
@@ -1225,6 +1409,11 @@ pub struct MoveTaskIdentity {
 
 #[derive(Debug, Clone)]
 pub struct CompareAndMoveTask {
+    pub post_commit_step: Option<crate::EnqueueTaskStep>,
+    /// The move enters the workflow's cancellation state: ask the integration
+    /// queue to release the Task's attempt in the move's own transaction, as
+    /// the cancel transition does (`request_task_integration_cancel_in_tx`).
+    pub integration_cancel: bool,
     pub operation_id: String,
     pub project_id: String,
     pub task_id: String,
@@ -1239,7 +1428,8 @@ pub struct CompareAndMoveTask {
     /// Server-derived effective workflow semantics, pinned to task_version.
     pub workflow_snapshot: serde_json::Value,
     pub trigger_name: Option<String>,
-    pub triggered_by: String,
+    pub triggered_by: api_types::Actor,
+    pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub rejection: bool,
     /// Exact Project workflow authority observed before resolving this move.
@@ -1283,7 +1473,7 @@ pub enum MoveTaskPersistence {
     Replayed(Box<MoveTaskResult>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Execution {
     pub id: String,
     pub task_id: String,
@@ -1518,12 +1708,37 @@ pub struct AgentChatTurnJob {
     pub response_message_id: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub failure_class: Option<api_types::TurnFailure>,
+    pub retry_decision: Option<api_types::TurnRetryDecision>,
+    pub pre_provider_failure_count: i64,
+    pub invocation_count: i64,
+    pub usage_limit_deferral_count: i64,
+    pub usage_limit_first_deferred_at: Option<String>,
+    /// Derived from later turns for this message or any later chat message.
+    /// Computed only for failed or cancelled turns, the ones `retry_action`
+    /// consults; `false` for every other status.
+    pub retry_superseded: bool,
     pub correlation_id: String,
     pub causation_id: Option<String>,
     pub causation_depth: i64,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl AgentChatTurnJob {
+    pub fn retry_action(&self) -> Option<api_types::RetryTurnAction> {
+        (matches!(
+            self.status,
+            AgentChatTurnState::Failed | AgentChatTurnState::Cancelled
+        ) && !self.retry_superseded)
+            .then(|| api_types::RetryTurnAction {
+                kind: api_types::RetryTurnActionKind::RetryTurn,
+                chat_id: self.chat_id.clone(),
+                turn_id: self.id.clone(),
+                expected_version: self.version,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1806,7 +2021,7 @@ pub struct ContextManifestSource {
     pub fragment_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecutionStatus {
     Running,
     Completed,
@@ -1814,7 +2029,7 @@ pub enum ExecutionStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopReason {
     UserCancelled,
     TaskCancelled,
@@ -1829,7 +2044,7 @@ pub enum StopReason {
     LegacyUnknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResumePolicy {
     Auto,
     Manual,
@@ -1841,7 +2056,7 @@ pub enum ResumePolicy {
 /// a hard deadline, the first claim establishes that immutable deadline for
 /// the attempt; `None` leaves the execution bounded only by its renewable
 /// owner lease and explicit cancellation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClaimExecutionLease {
     pub execution_id: String,
     pub expected_version: i64,
@@ -1941,12 +2156,21 @@ pub struct UsageLedgerSettlement {
     pub events: Vec<CreateUsageEvent>,
 }
 
+/// Private artifact content committed only by the winning terminal CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportedExecutionPlan {
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub size: Option<i64>,
+}
+
 /// Composite terminalization input for Task execution. The optional receipt
 /// identity is used by remote daemon delivery: it is persisted in the
 /// terminal domain event and lets a post-restart duplicate be acknowledged
 /// without mutating the execution or appending usage a second time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalizeExecutionWithLedger {
+    pub plan: Option<TransportedExecutionPlan>,
     pub terminal: TerminalizeExecution,
     pub settlements: Vec<UsageLedgerSettlement>,
     pub terminal_report_id: Option<String>,
@@ -2035,7 +2259,7 @@ pub enum ExecutionTerminalOutcome {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Review {
     pub id: String,
     pub task_id: String,
@@ -2053,7 +2277,7 @@ pub struct Review {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReviewStatus {
     Running,
     AwaitingHuman,
@@ -2417,9 +2641,54 @@ macro_rules! enum_strings {
     };
 }
 
-enum_strings!(WorkMode {
-    DirectMerge => "direct_merge",
-    PullRequest => "pull_request",
+enum_strings!(RepoLocationOwnerKind {
+    Server => "server",
+    Daemon => "daemon",
+});
+
+enum_strings!(RepoLocationKind {
+    PrimaryCheckout => "primary_checkout",
+    ManagedClone => "managed_clone",
+    SharedMount => "shared_mount",
+});
+
+enum_strings!(RepoLocationStatus {
+    Unverified => "unverified",
+    Ready => "ready",
+    Unavailable => "unavailable",
+    Invalid => "invalid",
+});
+
+enum_strings!(PlacementOwnerKind {
+    Server => "server",
+    Daemon => "daemon",
+});
+
+enum_strings!(PlacementState {
+    Reserved => "reserved",
+    Preparing => "preparing",
+    Ready => "ready",
+    Disconnected => "disconnected",
+    Cleaning => "cleaning",
+    Cleaned => "cleaned",
+    Failed => "failed",
+});
+
+enum_strings!(PlacementSelectedBy {
+    Scheduler => "scheduler",
+    Pin => "pin",
+    Inherited => "inherited",
+    Backfill => "backfill",
+});
+
+enum_strings!(PlacementFailureCause {
+    PlacementUnavailable => "placement_unavailable",
+    PrepareFailed => "prepare_failed",
+    OwnerDisconnected => "owner_disconnected",
+    OwnerDisconnectedTimeout => "owner_disconnected_timeout",
+    OwnerLostExecution => "owner_lost_execution",
+    StaleGeneration => "stale_generation",
+    WrongOwner => "wrong_owner",
 });
 
 enum_strings!(IntegrationPlatform {
@@ -2601,10 +2870,36 @@ pub struct TransitionLog {
     pub to_state: String,
     pub trigger_name: Option<String>,
     pub triggered_by: String,
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub hook_results_json: Option<String>,
     pub rejection: bool,
     pub created_at: String,
+}
+
+/// Decode the stored `bridge_kind` / `bridge_payload` columns. The schema keeps
+/// both open; an unknown kind or a payload that is not JSON is a typed
+/// [`crate::DbError::TransitionBridgeCorrupt`], never a panic or a silent NULL.
+pub fn decode_transition_bridge(
+    transition_log_id: &str,
+    kind: Option<&str>,
+    payload: Option<&str>,
+) -> crate::Result<api_types::TransitionBridge> {
+    let corrupt = |reason: String| crate::DbError::TransitionBridgeCorrupt {
+        transition_log_id: transition_log_id.to_owned(),
+        reason,
+    };
+    Ok(api_types::TransitionBridge {
+        bridge_kind: kind
+            .map(str::parse::<api_types::TransitionBridgeKind>)
+            .transpose()
+            .map_err(corrupt)?,
+        bridge_payload: payload
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|error| corrupt(format!("bridge_payload is not JSON: {error}")))?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2626,6 +2921,8 @@ pub struct CreateTransitionLog {
     pub to_state: String,
     pub trigger_name: Option<String>,
     pub triggered_by: String,
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub hook_results_json: Option<String>,
     pub rejection: bool,
@@ -2957,7 +3254,7 @@ pub struct AgentActionExecution {
 /// immutable in both the Rust repository surface and the SQLite schema so an
 /// identical retry can return the original result without rerunning a domain
 /// mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandReceipt {
     pub id: String,
     pub principal_type: String,
@@ -4846,4 +5143,61 @@ pub struct CreateCostEstimateRevision {
     pub reason_code: Option<CostCoverageReasonCode>,
     pub estimate_digest: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainEventConsumerLag {
+    pub consumer_name: String,
+    pub last_sequence: i64,
+    pub lag: i64,
+    pub last_advanced_at: Option<String>,
+    pub oldest_unprocessed_at: Option<String>,
+    pub initialized_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteStorageStatus {
+    pub incremental_vacuum: bool,
+    pub free_pages: i64,
+}
+
+impl DomainEventConsumerLag {
+    pub fn stalled(&self, now: chrono::DateTime<chrono::Utc>, seconds: i64) -> bool {
+        let old = |date: &str| {
+            chrono::DateTime::parse_from_rfc3339(date)
+                .ok()
+                .is_some_and(|date| {
+                    (now - date.with_timezone(&chrono::Utc)).num_seconds() > seconds
+                })
+        };
+        self.lag > 0
+            && self.oldest_unprocessed_at.as_deref().is_some_and(old)
+            && self.last_advanced_at.as_deref().is_none_or(old)
+            && self.initialized_at.as_deref().is_none_or(old)
+    }
+}
+
+impl DomainEvent {
+    /// Decode immutable stored interruption events. The old payload is accepted
+    /// only here at the event archive boundary; new writers emit the typed form.
+    pub fn task_material_blocker(&self) -> Option<crate::MaterialBlocker> {
+        if self.event_type != "task.interruption_changed" {
+            return None;
+        }
+        let payload: serde_json::Value = serde_json::from_str(&self.payload_json).ok()?;
+        if let Some(material) = payload.get("material_blocker") {
+            return serde_json::from_value(material.clone()).ok();
+        }
+        let mut interruption = payload
+            .get("interruption")
+            .filter(|v| !v.is_null())
+            .cloned();
+        if let Some(value) = &mut interruption {
+            crate::strip_attention_delivery_metadata(value);
+        }
+        Some(crate::MaterialBlocker {
+            requires_intervention: payload.get("requires_intervention")?.as_bool()?,
+            interruption,
+        })
+    }
 }

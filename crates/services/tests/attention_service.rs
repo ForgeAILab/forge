@@ -71,14 +71,29 @@ async fn identity(db: &SqliteDb, id: &str) {
 /// Project creation seeds the setup-required binding; this helper only fills
 /// in the binding fields that wake admission requires.
 async fn configured_project(db: &Arc<SqliteDb>, identity_id: &str, name: &str) -> String {
-    let profile_id: String =
-        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
-            .bind(identity_id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
     let project_id = new_uuid_v4();
     let now = now_rfc3339();
+    let owner_id = new_uuid_v4();
+    db::UserRepo::create_user(
+        &**db,
+        &db::User {
+            id: owner_id.clone(),
+            email: format!("{owner_id}@example.test"),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_identity SET owner_id=? WHERE id=?")
+        .bind(&owner_id)
+        .bind(identity_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     ProjectRepo::create(
         &**db,
         CreateProject {
@@ -87,26 +102,29 @@ async fn configured_project(db: &Arc<SqliteDb>, identity_id: &str, name: &str) -
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some(owner_id.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
-             version = version + 1, updated_at = ?
-         WHERE project_id = ? AND state = 'agent_setup_required'",
-    )
-    .bind(identity_id)
-    .bind(profile_id)
-    .bind(&now)
-    .bind(&project_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let version:i64=sqlx::query_scalar("SELECT version FROM project_agent_binding WHERE project_id=? AND state='agent_setup_required'").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    services::AgentChatService::new(db.clone())
+        .set_project_binding(services::SetProjectAgentBindingInput {
+            actor_user_id: owner_id,
+            project_id: project_id.clone(),
+            identity_id: Some(identity_id.to_owned()),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 10,
+            expected_version: Some(version),
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
     project_id
 }
 
@@ -184,7 +202,8 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
     let project_id = configured_project(&db, &identity_id, "intentional-stops").await;
-    let tasks = services::TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::default()));
+    let tasks =
+        services::TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::default()));
     let attention = AttentionService::new(Arc::clone(&db));
 
     for pause in [true, false] {
@@ -205,7 +224,7 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
                 .unwrap();
         } else {
             tasks
-                .cancel_execution(&execution.id, "Stop this work".to_owned())
+                .stop_execution(&execution.id, "Stop this work".to_owned())
                 .await
                 .unwrap();
         }
@@ -216,10 +235,18 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
         let annotation: serde_json::Value =
             serde_json::from_str(current.error_annotation.as_deref().unwrap()).unwrap();
         assert_eq!(annotation["type"], "manual_stop");
-        assert!(!annotation["recovery_actions"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(annotation.get("recovery_actions").is_none());
+        let offers = tasks
+            .task_action_offers(
+                &task.id,
+                &api_types::Actor::user(api_types::UserActionSource::Test),
+            )
+            .await
+            .unwrap();
+        assert!(offers
+            .available_actions
+            .iter()
+            .any(|offer| offer.action.verb() == "cancel"));
         let run = attention.project_once(100).await.unwrap();
         assert_eq!(
             run.processed_events, run.claimed_events,
@@ -228,7 +255,8 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
         let payload: String = sqlx::query_scalar("SELECT payload_json FROM domain_event WHERE event_type = 'task.interruption_changed' AND entity_id = ? ORDER BY sequence DESC LIMIT 1")
             .bind(&task.id).fetch_one(db.pool()).await.unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["requires_intervention"],
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["material_blocker"]
+                ["requires_intervention"],
             false
         );
     }
@@ -323,7 +351,7 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
         let project_id = configured_project(&db, &identity_id, outcome).await;
         // Project the incident while the responder is unavailable, then change
         // execution/Task truth before retrying admission for the open incident.
-        sqlx::query("UPDATE project_agent_binding SET state = 'paused' WHERE project_id = ?")
+        sqlx::query("UPDATE agent_chat SET status = 'agent_setup_required' WHERE project_id = ?")
             .bind(&project_id)
             .execute(db.pool())
             .await
@@ -431,10 +459,13 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
                 .execute(db.pool())
                 .await
                 .unwrap();
+                db.check_task_conditions_of(std::slice::from_ref(&task.id))
+                    .await
+                    .unwrap();
             }
             _ => unreachable!(),
         }
-        sqlx::query("UPDATE project_agent_binding SET state = 'active' WHERE project_id = ?")
+        sqlx::query("UPDATE agent_chat SET status = 'ready' WHERE project_id = ?")
             .bind(&project_id)
             .execute(db.pool())
             .await
@@ -555,25 +586,16 @@ async fn wake_admission_deduplicates_and_suppresses_recursive_events() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
-    let service = AttentionService::new(Arc::clone(&db));
-
-    let first = service
-        .admit_wake(request(&identity_id, "incident-1"))
-        .await
-        .unwrap();
-    assert!(matches!(first, WakeAdmissionResult::Admitted { .. }));
-
-    let duplicate = service
-        .admit_wake(request(&identity_id, "incident-1"))
-        .await
-        .unwrap();
+    let service = AttentionService::new(db.clone());
     assert!(matches!(
-        duplicate,
+        service
+            .admit_wake(request(&identity_id, "missing-incident"))
+            .await
+            .unwrap(),
         WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::DuplicateIncident
+            reason: WakeSuppressionReason::ResolvedIncident
         }
     ));
-
     let mut recursive = request(&identity_id, "incident-2");
     recursive.reaction_depth = 9;
     assert!(matches!(
@@ -619,117 +641,6 @@ async fn wake_admission_deduplicates_and_suppresses_recursive_events() {
     .await
     .unwrap();
     assert!(suppressed_count >= 3);
-}
-
-#[tokio::test]
-async fn wake_policy_persists_cooldown_budget_and_global_identity_suppression() {
-    let db = database().await;
-    let first_identity = new_uuid_v4();
-    let replacement_identity = new_uuid_v4();
-    identity(&db, &first_identity).await;
-    identity(&db, &replacement_identity).await;
-    let service = AttentionService::new(Arc::clone(&db));
-
-    let mut first = request(&first_identity, "incident-cooldown");
-    first.causation_id = Some("source-cooldown-1".to_owned());
-    assert!(matches!(
-        service.admit_wake(first.clone()).await.unwrap(),
-        WakeAdmissionResult::Admitted { .. }
-    ));
-
-    let mut cooldown = first.clone();
-    cooldown.lease_owner = "replacement-worker".to_owned();
-    cooldown.causation_id = Some("source-cooldown-2".to_owned());
-    cooldown.now = "2026-01-01T00:00:31Z".to_owned();
-    assert!(matches!(
-        service.admit_wake(cooldown).await.unwrap(),
-        WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::Cooldown
-        }
-    ));
-
-    // Once the cooldown expires, replaying the same source decision returns
-    // its original admission metadata without charging the wake budget a
-    // second time.
-    let mut replay = first.clone();
-    replay.now = "2026-01-01T00:10:00Z".to_owned();
-    assert!(matches!(
-        service.admit_wake(replay).await.unwrap(),
-        WakeAdmissionResult::Admitted { .. }
-    ));
-    let replay_count: i64 = sqlx::query_scalar(
-        "SELECT admitted_count FROM agent_wake_budget_window
-         WHERE identity_id = ? AND scope_type = 'account' AND scope_id = 'account-1'",
-    )
-    .bind(&first_identity)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(replay_count, 1);
-
-    let mut replacement = request(&replacement_identity, "incident-global");
-    replacement.causation_id = Some("source-global-1".to_owned());
-    assert!(matches!(
-        service.admit_wake(replacement.clone()).await.unwrap(),
-        WakeAdmissionResult::Admitted { .. }
-    ));
-    replacement.now = "2026-01-01T00:00:10Z".to_owned();
-    replacement.identity_id = first_identity.clone();
-    replacement.lease_owner = "old-binding-worker".to_owned();
-    replacement.causation_id = Some("source-global-2".to_owned());
-    assert!(matches!(
-        service.admit_wake(replacement).await.unwrap(),
-        WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::DuplicateIncident
-        }
-    ));
-
-    // Saturating the persisted window must not be counted again by a
-    // suppression decision.
-    sqlx::query(
-        "INSERT INTO agent_wake_budget_window (
-             identity_id, scope_type, scope_id, window_started_at,
-             window_seconds, admitted_count, version, updated_at
-         ) VALUES (?, 'account', 'account-1', ?, 3600, 10, 1, ?)
-         ON CONFLICT(identity_id, scope_type, scope_id) DO UPDATE SET
-             window_started_at = excluded.window_started_at,
-             admitted_count = excluded.admitted_count,
-             version = agent_wake_budget_window.version + 1,
-             updated_at = excluded.updated_at",
-    )
-    .bind(&first_identity)
-    .bind("2026-01-01T00:00:00Z")
-    .bind("2026-01-01T00:00:00Z")
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let mut budget = request(&first_identity, "incident-budget");
-    budget.now = "2026-01-01T00:00:30Z".to_owned();
-    budget.causation_id = Some("source-budget".to_owned());
-    assert!(matches!(
-        service.admit_wake(budget).await.unwrap(),
-        WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::BudgetExhausted
-        }
-    ));
-    let admitted_count: i64 = sqlx::query_scalar(
-        "SELECT admitted_count FROM agent_wake_budget_window
-         WHERE identity_id = ? AND scope_type = 'account' AND scope_id = 'account-1'",
-    )
-    .bind(&first_identity)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(admitted_count, 10);
-
-    let decisions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM domain_event
-         WHERE event_type = 'agent.wake.suppressed'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert!(decisions >= 2);
 }
 
 #[tokio::test]
@@ -803,7 +714,8 @@ async fn retry_exhausted_agent_chat_is_suppressed_before_binding_setup() {
             causation_id: None,
             causation_depth: 0,
             dedupe_key: Some("retry-suppression-source".to_owned()),
-            payload_json: r#"{"status":"failed"}"#.to_owned(),
+            payload_json: r#"{"status":"failed","failure_class":{"kind":"configuration"}}"#
+                .to_owned(),
             created_at: now,
         },
     )
@@ -838,52 +750,19 @@ async fn binding_replacement_cannot_create_a_second_active_incident_lease() {
     let new_identity = new_uuid_v4();
     identity(&db, &old_identity).await;
     identity(&db, &new_identity).await;
-    let old_profile: String =
-        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
-            .bind(&old_identity)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    let new_profile: String =
-        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
-            .bind(&new_identity)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    let project_id = new_uuid_v4();
+    let project_id = configured_project(&db, &old_identity, "binding-replacement-project").await;
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO project (
-             id, name, settings, workflow_definition, owner_id, created_at, updated_at
-         ) VALUES (?, 'binding-replacement-project', '{}', '{}', NULL, ?, ?)",
-    )
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let binding_id: String = sqlx::query_scalar(
-        "SELECT id FROM project_agent_binding
-         WHERE project_id = ? AND state = 'agent_setup_required'",
-    )
-    .bind(&project_id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
-             version = version + 1, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&old_identity)
-    .bind(&old_profile)
-    .bind(&now)
-    .bind(&binding_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let owner: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id=?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET owner_id=? WHERE id=?")
+        .bind(&owner)
+        .bind(&new_identity)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let entity_id = new_uuid_v4();
     let first_source = new_uuid_v4();
     DomainEventRepo::append_event(
@@ -918,32 +797,28 @@ async fn binding_replacement_cannot_create_a_second_active_incident_lease() {
     .unwrap();
     assert_eq!(admitted_identity, old_identity);
 
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET state = 'replaced', version = version + 1, updated_at = ?
-         WHERE id = ? AND state = 'active'",
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM project_agent_binding WHERE project_id=? AND state='active'",
     )
-    .bind(&now)
-    .bind(&binding_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO project_agent_binding (
-             id, project_id, identity_id, profile_id, state,
-             autonomy_policy_json, permission_ceiling_json, subscriptions_json,
-             wake_budget, version, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'active', '{}', '{}', '[]', 10, 1, ?, ?)",
-    )
-    .bind(new_uuid_v4())
     .bind(&project_id)
-    .bind(&new_identity)
-    .bind(&new_profile)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
+    .fetch_one(db.pool())
     .await
     .unwrap();
+    services::AgentChatService::new(db.clone())
+        .set_project_binding(services::SetProjectAgentBindingInput {
+            actor_user_id: owner,
+            project_id: project_id.clone(),
+            identity_id: Some(new_identity),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 10,
+            expected_version: Some(version),
+            replacement_reason: Some("binding replacement test".to_owned()),
+        })
+        .await
+        .unwrap();
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent {
@@ -1230,7 +1105,7 @@ async fn recovered_task_suppresses_a_stale_interruption_wake_before_budget() {
 }
 
 #[tokio::test]
-async fn projection_health_batches_writes_and_keeps_exact_completed_counts() {
+async fn projection_health_uses_buffered_checkpoints_and_idle_polls_do_not_write() {
     let db = database().await;
     for sequence in 0..100 {
         DomainEventRepo::append_event(
@@ -1255,30 +1130,27 @@ async fn projection_health_batches_writes_and_keeps_exact_completed_counts() {
         .await
         .unwrap();
     }
-    let service = AttentionService::new(Arc::clone(&db));
-    let run = service.project_once(100).await.unwrap();
-    assert_eq!(run.processed_events, 100);
-    let health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(health.processed_events, 100);
-    assert_eq!(health.last_sequence, run.last_sequence);
-    assert_eq!(health.version, 3); // lease acquisition, 100-event flush, lease release
-    assert!(health.lease_owner.is_none());
-    assert!(health.lease_until.is_none());
-    // Idle polls still claim/release ledger leases, but must not churn health.
-    sqlx::query("CREATE TRIGGER reject_health_write BEFORE UPDATE ON attention_consumer_health BEGIN SELECT RAISE(ABORT, 'unexpected health write'); END")
+    let service = Arc::new(AttentionService::new(Arc::clone(&db)));
+    let runtime =
+        services::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service));
+    assert_eq!(
+        runtime.run_once(100).await.unwrap(),
+        0,
+        "ignored events have no per-event write"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+    runtime.run_once(100).await.unwrap(); // buffered scan checkpoint
+    let health = service.consumer_health().await.unwrap().unwrap();
+    assert!(!health.stale);
+    assert_eq!(health.last_sequence, 100);
+    sqlx::query("CREATE TRIGGER reject_health_write BEFORE UPDATE ON worker_health BEGIN SELECT RAISE(ABORT, 'unexpected health write'); END")
         .execute(db.pool()).await.unwrap();
     for _ in 0..10 {
-        assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+        assert_eq!(runtime.run_once(100).await.unwrap(), 0);
     }
-    let idle_health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(idle_health.version, health.version);
-    assert_eq!(idle_health.processed_events, 100);
+    let idle_health = service.consumer_health().await.unwrap().unwrap();
+    assert_eq!(idle_health.updated_at, health.updated_at);
+    assert!(!health.stale);
 }
 
 #[tokio::test]
@@ -1323,18 +1195,16 @@ async fn projection_worker_drains_events_reports_health_and_stops() {
     let handle = std::sync::Arc::clone(&service).start(shutdown_rx);
     let mut health = None;
     for _ in 0..100 {
-        health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
-            .await
-            .unwrap();
+        health = service.consumer_health().await.unwrap();
         if health
             .as_ref()
-            .is_some_and(|value| value.processed_events >= 1)
+            .is_some_and(|value| value.last_sequence >= 1)
         {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(health.is_some_and(|value| value.processed_events >= 1));
+    assert!(health.is_some_and(|value| value.last_sequence >= 1));
 
     shutdown_tx.send(true).unwrap();
     handle.await.unwrap();
@@ -1859,10 +1729,28 @@ async fn actionable_task_interruption_wakes_once_and_resolution_closes_attention
     assert_eq!(attention.0, "execution_failed");
     assert_eq!(attention.1, "open");
     let details: serde_json::Value = serde_json::from_str(&attention.2).unwrap();
+    let task_service =
+        services::TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(32)));
+    let expected = task_service
+        .task_action_offers(&task.id, &api_types::Actor::agent(&identity_id))
+        .await
+        .unwrap()
+        .available_actions;
     assert_eq!(
         details["recovery"]["actions"],
-        serde_json::json!(["reexecute", "cancel_task"])
+        serde_json::to_value(&expected).unwrap()
     );
+    assert_eq!(
+        expected
+            .iter()
+            .map(|offer| offer.action.verb())
+            .collect::<Vec<_>>(),
+        vec!["cancel", "restart"]
+    );
+    assert!(expected.iter().all(|offer| offer
+        .parameters
+        .iter()
+        .any(|parameter| parameter.name == "reason" && parameter.required)));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM domain_event
@@ -2311,5 +2199,965 @@ async fn review_ready_wakes_only_for_a_human_required_review_gate() {
         review_attention_rows(&db, &human_reviewed).await,
         vec!["review_ready".to_owned()],
         "a human-required review gate must raise exactly one review_ready attention"
+    );
+}
+
+#[tokio::test]
+async fn audit_skipped_activity_is_not_stale() {
+    let db = database().await;
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(1).await.unwrap(); // initialize the worker row
+    for _ in 0..5 {
+        append_attention_event(&db, "ignored.kind", "t", "p", serde_json::json!({})).await;
+    }
+    assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+    service.project_once(100).await.unwrap(); // lazy scan checkpoint
+    let health = service.consumer_health().await.unwrap().unwrap();
+    println!(
+        "health: checkpoint={} success={:?} stale={}",
+        health.last_sequence, health.last_success_at, health.stale
+    );
+    // Whether or not the lazy checkpoint has been written by a fresh runtime,
+    // the events were consumed without ever recording a success time.
+    assert!(health.last_success_at.is_none());
+    assert!(
+        !health.stale,
+        "skipped activity must not make the consumer stale"
+    );
+}
+
+#[tokio::test]
+async fn audit_in_window_budget_exhaustion_does_not_publish_autonomy_stall() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "stall-project").await;
+    let task = project_task(&db, &project_id, "Recover actionable interruption").await;
+    let now = now_rfc3339();
+    let blocked_json = serde_json::json!({
+        "reason": "executor failed",
+        "created_at": now,
+        "kind": "executor_failed",
+        "execution_id": new_uuid_v4()
+    })
+    .to_string();
+    let error_annotation = serde_json::json!({
+        "type": "executor_failed",
+        "recovery_actions": ["reexecute", "cancel_task"]
+    })
+    .to_string();
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(error_annotation)),
+            blocked_json: Some(Some(blocked_json)),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    // The hourly window is already full (budget 10, 10 admitted, in window).
+    sqlx::query(
+        "INSERT INTO agent_wake_budget_window (identity_id, scope_type, scope_id, category, window_started_at, window_seconds, admitted_count, version, updated_at)
+         VALUES (?, 'project', ?, 'blocker', ?, 3600, 4, 1, ?)",
+    )
+    .bind(&identity_id)
+    .bind(&project_id)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let bus = Arc::new(events::EventBus::new(64));
+    let mut rx = bus.subscribe();
+    let service = AttentionService::new(Arc::clone(&db)).with_event_bus(Arc::clone(&bus));
+    service.project_once(100).await.unwrap();
+    let suppressed: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM domain_event WHERE event_type = 'agent.wake.suppressed'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    println!("AUDIT suppressed decisions: {suppressed:?}");
+    let mut stalls = 0;
+    while let Ok(event) = rx.try_recv() {
+        println!("AUDIT bus event: {}", event.event_type);
+        if event.event_type == "project.autonomy_stalled" {
+            stalls += 1;
+        }
+    }
+    println!("AUDIT stalls published for in-window exhaustion: {stalls}");
+    assert!(suppressed.iter().any(|p| p.contains("budget_exhausted")));
+    assert_eq!(
+        stalls, 0,
+        "full hourly window must not send a stall notification"
+    );
+}
+
+#[tokio::test]
+async fn audit_idle_and_new_upgrade_health_are_not_stale_and_stalled_backlog_is() {
+    let db = database().await;
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(1).await.unwrap();
+    sqlx::query("UPDATE worker_health SET last_success_at = '2000-01-01T00:00:00Z' WHERE worker_name = 'attention_projection'").execute(db.pool()).await.unwrap();
+    assert!(!service.consumer_health().await.unwrap().unwrap().stale);
+    append_attention_event_at(
+        &db,
+        "ignored.kind",
+        "t",
+        "p",
+        serde_json::json!({}),
+        "2000-01-01T00:00:00Z",
+    )
+    .await;
+    sqlx::query("UPDATE event_consumer_cursor SET updated_at = '2000-01-01T00:00:00Z' WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
+    assert!(
+        !service.consumer_health().await.unwrap().unwrap().stale,
+        "initialization grace applies to upgraded checkpoints"
+    );
+    sqlx::query("UPDATE worker_health SET created_at = '2000-01-01T00:00:00Z' WHERE worker_name = 'attention_projection'").execute(db.pool()).await.unwrap();
+    assert!(
+        service.consumer_health().await.unwrap().unwrap().stale,
+        "old pending event plus old checkpoint is stalled"
+    );
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = (SELECT MAX(sequence) FROM domain_event) WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
+    assert!(
+        !service.consumer_health().await.unwrap().unwrap().stale,
+        "caught-up idle consumer is healthy even with old success timestamps"
+    );
+}
+
+#[tokio::test]
+async fn audit_health_reports_worker_error_kind_and_message() {
+    use services::worker_runtime::{HealthErrorKind, WorkItem, WorkerHealth};
+
+    let db = database().await;
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(1).await.unwrap();
+    let health = WorkerHealth::new(Arc::clone(&db), "attention_projection");
+    for kind in ["failure", "transient", "terminal"] {
+        let message = format!("diagnostic for {kind}");
+        health
+            .report_classified_error(HealthErrorKind::Tick, kind, &message)
+            .await
+            .unwrap();
+        let view = service.consumer_health().await.unwrap().unwrap();
+        assert_eq!(view.last_error_code.as_deref(), Some(kind));
+        assert_eq!(view.last_error_message.as_deref(), Some(message.as_str()));
+        assert!(
+            !view.stale,
+            "an idle worker is not stale even after an error"
+        );
+    }
+    health
+        .clear_error_if_set(HealthErrorKind::Tick)
+        .await
+        .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    health
+        .failure_in_tx(
+            &mut tx,
+            WorkItem {
+                source_key: "test-terminal",
+                item_type: "test",
+            },
+            db::RetryPolicy::default(),
+            "deterministic projection rejection",
+            true,
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let view = service.consumer_health().await.unwrap().unwrap();
+    assert_eq!(view.last_error_code.as_deref(), Some("terminal"));
+    assert_eq!(
+        view.last_error_message.as_deref(),
+        Some("deterministic projection rejection")
+    );
+}
+
+#[tokio::test]
+async fn audit_zero_budget_chat_stall_uses_project_scope() {
+    let db = database().await;
+    let id = new_uuid_v4();
+    identity(&db, &id).await;
+    let project = configured_project(&db, &id, "chat-budget").await;
+    let chat = services::AgentChatService::new(Arc::clone(&db))
+        .ensure_project_chat(&project)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_chat SET status = 'ready' WHERE id = ?")
+        .bind(&chat.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE project_agent_binding SET wake_budget = 0 WHERE project_id = ?")
+        .bind(&project)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    append_attention_event(
+        &db,
+        "validation.failed",
+        "task-budget",
+        &project,
+        serde_json::json!({}),
+    )
+    .await;
+    let source: String = sqlx::query_scalar("SELECT id FROM domain_event WHERE entity_id = 'task-budget' ORDER BY sequence DESC LIMIT 1").fetch_one(db.pool()).await.unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, identity_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at) VALUES (?, 'validation_failed', 'project', ?, ?, ?, 1, 'open', 'Needs work', '{}', 'chat-budget-incident', ?, ?)")
+        .bind(new_uuid_v4()).bind(&project).bind(&id).bind(source).bind(now_rfc3339()).bind(now_rfc3339()).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let bus = Arc::new(events::EventBus::new(16));
+    let mut rx = bus.subscribe();
+    let service = AttentionService::new(Arc::clone(&db)).with_event_bus(bus);
+    let result = service
+        .admit_wake(services::WakeAdmissionRequest {
+            identity_id: id,
+            scope_type: "agent_chat".into(),
+            scope_id: chat.id,
+            incident_key: "chat-budget-incident".into(),
+            lease_owner: "test".into(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            caused_by_identity_id: None,
+            reaction_depth: 0,
+            now: now_rfc3339(),
+            lease_seconds: 60,
+            cooldown_seconds: 300,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        WakeAdmissionResult::Suppressed {
+            reason: WakeSuppressionReason::BudgetExhausted
+        }
+    ));
+    let requests: Vec<(String, String)> = sqlx::query_as("SELECT scope_id, payload_json FROM domain_event WHERE event_type = 'notification.requested'").fetch_all(db.pool()).await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, project);
+    let request: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
+    assert_eq!(request["event_type"], "project.autonomy_stalled");
+    assert_eq!(request["project_id"], project);
+    // Delivery reads only the committed request, independently of the live hint.
+    let notifications = Arc::new(services::NotificationService::new(
+        Arc::clone(&db),
+        Arc::new(events::EventBus::new(1)),
+    ));
+    services::worker_runtime::WorkerRuntime::new(Arc::clone(&db), notifications)
+        .run_once(100)
+        .await
+        .unwrap();
+    let inbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification WHERE project_id = ? AND event_type = 'project.autonomy_stalled'").bind(&project).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(inbox_count, 1);
+    let event = rx.try_recv().unwrap();
+    assert!(
+        matches!(event.context, events::EventContext::ProjectAutonomyStalled { project_id, .. } if project_id == project)
+    );
+}
+
+#[tokio::test]
+async fn audit_admitted_source_replay_is_a_noop() {
+    let db = database().await;
+    let id = new_uuid_v4();
+    identity(&db, &id).await;
+    let project = configured_project(&db, &id, "replay-noop").await;
+    append_attention_event(
+        &db,
+        "validation.failed",
+        "task-replay",
+        &project,
+        serde_json::json!({}),
+    )
+    .await;
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+    let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM domain_event WHERE event_type LIKE 'agent.wake.%'), (SELECT version FROM attention_projection LIMIT 1), (SELECT admitted_count FROM agent_wake_budget_window LIMIT 1)").fetch_one(db.pool()).await.unwrap();
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 0 WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
+    service.project_once(100).await.unwrap();
+    let after: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM domain_event WHERE event_type LIKE 'agent.wake.%'), (SELECT version FROM attention_projection LIMIT 1), (SELECT admitted_count FROM agent_wake_budget_window LIMIT 1)").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        before, after,
+        "already admitted source does not increment budget/version or append suppression"
+    );
+}
+
+#[tokio::test]
+async fn audit_lost_wake_lease_cas_suppresses_without_charging_budget() {
+    let db = database().await;
+    let id = new_uuid_v4();
+    identity(&db, &id).await;
+    let project = configured_project(&db, &id, "lease-cas").await;
+    let now = now_rfc3339();
+    let event = db
+        .append_event(CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "test.incident".to_owned(),
+            entity_type: "project".to_owned(),
+            entity_id: project.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
+        })
+        .await
+        .unwrap();
+    db.insert_attention(CreateAttentionProjection {
+        id: new_uuid_v4(),
+        attention_type: "validation_failed".to_owned(),
+        scope_type: "project".to_owned(),
+        scope_id: project.clone(),
+        identity_id: Some(id.clone()),
+        source_event_id: event.id,
+        priority: 80,
+        status: "open".to_owned(),
+        summary: "CAS loss".to_owned(),
+        details_json: "{}".to_owned(),
+        dedupe_key: "cas-loss".to_owned(),
+        occurred_at: now.clone(),
+        updated_at: now,
+        acknowledged_at: None,
+        snoozed_until: None,
+        resolved_at: None,
+        updated_by_user_id: None,
+        recommended_action: "inspect".to_owned(),
+        source_sequence: Some(event.sequence),
+    })
+    .await
+    .unwrap();
+    let service = AttentionService::new(Arc::clone(&db));
+    sqlx::raw_sql("CREATE TRIGGER lose_wake_lease BEFORE INSERT ON agent_wake_lease BEGIN SELECT RAISE(IGNORE); END;").execute(db.pool()).await.unwrap();
+    let mut input = request(&id, "cas-loss");
+    input.scope_type = "project".to_owned();
+    input.scope_id = project;
+    let result = service.admit_wake(input).await.unwrap();
+    assert!(matches!(
+        result,
+        WakeAdmissionResult::Suppressed {
+            reason: WakeSuppressionReason::DuplicateIncident
+        }
+    ));
+    let budgets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_wake_budget_window")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(budgets, 0);
+}
+
+#[tokio::test]
+async fn conflict_hotspots_project_per_path_reopen_and_keep_wake_rules() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "conflict-hotspots").await;
+    let service = AttentionService::new(Arc::clone(&db));
+    let mut first_id: Option<String> = None;
+    for (path, count) in [("src/共有.rs", 3), ("src/共有.rs", 4), ("src/other.rs", 3)] {
+        if count == 4 {
+            let current = db
+                .get_attention(first_id.as_ref().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            db.update_attention_lifecycle(UpdateAttentionLifecycle {
+                id: current.id,
+                expected_version: current.version,
+                status: "resolved".into(),
+                acknowledged_at: None,
+                snoozed_until: Some(None),
+                resolved_at: Some(Some(now_rfc3339())),
+                updated_by_user_id: None,
+                updated_at: now_rfc3339(),
+            })
+            .await
+            .unwrap();
+        }
+        db.append_event(CreateDomainEvent {
+            id: new_uuid_v4(), event_type: "project.conflict_hotspot.detected".into(),
+            entity_type: "project".into(), entity_id: project_id.clone(),
+            actor_type: "system".into(), actor_id: Some("conflict-hotspots".into()),
+            scope_type: "project".into(), scope_id: project_id.clone(),
+            correlation_id: new_uuid_v4(), causation_id: None, causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: serde_json::json!({"project_id": project_id, "path": path,
+                "task_ids": ["task-3", "task-2", "task-1"], "handoff_count": count, "window_days": 7}).to_string(),
+            created_at: now_rfc3339(),
+        }).await.unwrap();
+        service.project_once(100).await.unwrap();
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, i64, String, i64)>(
+            "SELECT id, scope_type, scope_id, summary, recommended_action, priority, details_json, version
+             FROM attention_projection WHERE attention_type = 'conflict_hotspot' ORDER BY source_sequence",
+        ).fetch_all(db.pool()).await.unwrap();
+        let item = rows.last().unwrap();
+        assert_eq!(item.1, "project");
+        assert_eq!(item.2, project_id);
+        assert_eq!(
+            item.3,
+            format!("{path} conflicted in {count} Tasks this week")
+        );
+        assert_eq!(item.4, "split_hotspot");
+        assert_eq!(item.5, 60);
+        let details: serde_json::Value = serde_json::from_str(&item.6).unwrap();
+        assert_eq!(details["conflict_hotspot"]["path"], path);
+        if path == "src/共有.rs" {
+            assert_eq!(rows.len(), 1);
+            match &first_id {
+                None => first_id = Some(item.0.clone()),
+                Some(first) => {
+                    assert_eq!(&item.0, first);
+                    assert!(item.7 > 1);
+                }
+            }
+        } else {
+            assert_eq!(rows.len(), 2);
+            assert_ne!(Some(&item.0), first_id.as_ref());
+        }
+        let projection = db.get_attention(&item.0).await.unwrap().unwrap();
+        assert_eq!(projection.status, "open");
+        assert!(projection.resolved_at.is_none());
+        assert_eq!(
+            services::attention_service::attention_item(projection)
+                .unwrap()
+                .category,
+            api_types::AttentionCategory::ConflictHotspot
+        );
+    }
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(admitted, 2); // A later episode still obeys the same path's live lease/cooldown.
+    let ineligible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.suppressed' AND json_extract(payload_json, '$.reason') = 'ineligible_scope'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(ineligible, 0);
+}
+
+/// A real stage-three-shaped condition/event, an already open incident and a
+/// configured responder cross the migration without a new incident or wake.
+#[tokio::test]
+async fn condition_reader_upgrade_keeps_open_incident_and_wake_identity() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "Condition cutover").await;
+    let task = project_task(&db, &project_id, "Unchanged blocker").await;
+    let reason = "owner must repair the workspace";
+    let interrupted =
+        serde_json::json!({"kind":"workspace_error","reason":reason,"created_at":now_rfc3339()})
+            .to_string();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+        .bind(&interrupted)
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.sync_condition_in_tx(&mut tx, &task.id).await.unwrap();
+    // The typed presentation did not exist on the stage-three base.
+    let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+        .bind(&task.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let mut old: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    old["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation");
+    sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+        .bind(old.to_string())
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    append_attention_event(&db,"task.interruption_changed",&task.id,&project_id,serde_json::json!({"task_id":task.id,"task_version":task.version,"task_status":task.status,"requires_intervention":true,"interruption":{"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"}})).await;
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+    let incident_id: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    // The incident row as `777b5f1f` stored it. That server copied the
+    // event's `interruption` into the incident as written, reporting
+    // execution included; this build strips delivery metadata on the way in.
+    // That one field is the only part of the stored incident the two builds
+    // write differently for this event, so put it back as the old server
+    // left it and take the digest from that row.
+    sqlx::query("UPDATE attention_projection SET details_json=json_set(details_json,'$.interruption',json(?)) WHERE id=?")
+        .bind(serde_json::json!({"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"}).to_string())
+        .bind(&incident_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stored_details: String =
+        sqlx::query_scalar("SELECT details_json FROM attention_projection WHERE id=?")
+            .bind(&incident_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(stored_details.contains("historical-reporter"));
+    let before = AttentionRepo::get_attention(&*db, &incident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let digest = db::canonical_attention_incident_digest(&before);
+    let wakes_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM domain_event WHERE event_type='agent.wake.admitted' AND scope_id=?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        wakes_before, 1,
+        "the responder is configured and the old blocker admitted a wake"
+    );
+    // Reinstall just the predecessor's projection trigger/index, then replay
+    // the new migration through the production runner. Task and event data stay.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM _migration WHERE version=202610070507")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX idx_task_condition_retry_project")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    run_migrations(db.pool()).await.unwrap();
+    let condition = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .condition;
+    assert!(db::material_blocker(&condition).requires_intervention);
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    DomainEventRepo::append_event(&*db, CreateDomainEvent::task_interruption_changed(&current))
+        .await
+        .unwrap();
+    service.project_once(100).await.unwrap();
+    let after = AttentionRepo::get_attention(&*db, &incident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(digest, db::canonical_attention_incident_digest(&after));
+    assert_eq!(before.id, after.id);
+    let incidents: i64 = sqlx::query_scalar("SELECT count(*) FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(incidents, 1);
+    let wakes_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM domain_event WHERE event_type='agent.wake.admitted' AND scope_id=?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        wakes_after, wakes_before,
+        "migration must not re-arm a consumed incident"
+    );
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    TaskRepo::update(&*db,db::UpdateTask {id:task.id.clone(),expected_version:current.version,title:None,description:None,priority:None,merge_config:None,plan:None,error_annotation:Some(None),blocked_json:Some(Some(serde_json::json!({"kind":"workspace_error","reason":"a different workspace blocker","created_at":now_rfc3339()}).to_string())),failed_json:Some(None),task_state_config:None,parent_task_id:None,updated_at:now_rfc3339()}).await.unwrap();
+    service.project_once(100).await.unwrap();
+    let changed = AttentionRepo::get_attention(&*db, &incident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(digest, db::canonical_attention_incident_digest(&changed));
+    let material_events: i64 = sqlx::query_scalar("SELECT count(*) FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id=?").bind(&task.id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        material_events, 3,
+        "one historical event, one unchanged typed replay, exactly one real blocker change"
+    );
+}
+
+/// Plan 3.1 stage 5a, Attention continuity. The starting state is what the
+/// deployed build (`9d9b228f`) leaves in the database, not what this build
+/// would write:
+///
+/// - the `task.interruption_changed` event in that build's payload shape
+///   (`crates/db/src/repository.rs:976-982` there: no `condition`, no
+///   `material_blocker`);
+/// - the open incident row with the `details_json` that build's projector
+///   stored (`crates/services/src/attention_service.rs:2562-2584` there),
+///   hard-coded below member by member;
+/// - the wake rows and their stored incident digest. `db::sqlite::agent_wake`
+///   is unchanged since that commit, and the digest stored there is checked
+///   against that build's digest algorithm (`crates/db/src/models.rs:926-1003`
+///   there), restated here so it does not share code with this build.
+///
+/// This build then starts and runs its first projection and wake sweep.
+#[tokio::test]
+async fn incident_stored_by_the_deployed_build_survives_this_builds_first_pass() {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    fn deployed_strip(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for key in [
+                    "source_event_id",
+                    "source_event_type",
+                    "source_sequence",
+                    "task_version",
+                    "created_at",
+                    "updated_at",
+                    "detected_at",
+                    "last_checked_at",
+                    "next_check_at",
+                    "execution_id",
+                ] {
+                    object.remove(key);
+                }
+                object.values_mut().for_each(deployed_strip);
+            }
+            Value::Array(array) => array.iter_mut().for_each(deployed_strip),
+            _ => {}
+        }
+    }
+    fn sha(value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+    /// `canonical_attention_incident_digest` as `9d9b228f` computes it.
+    async fn deployed_digest(db: &SqliteDb, incident_id: &str) -> String {
+        let (kind, scope_type, scope_id, status, details, action): (String, String, String, String, String, String) =
+            sqlx::query_as("SELECT attention_type,scope_type,scope_id,status,details_json,recommended_action FROM attention_projection WHERE id=?")
+                .bind(incident_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let bounded: String = details.chars().take(8_192).collect();
+        let canonical = serde_json::from_str::<Value>(&bounded)
+            .map(|mut value| {
+                deployed_strip(&mut value);
+                if let Some(task) = value.get_mut("task").and_then(|v| v.as_object_mut()) {
+                    task.remove("task_title");
+                }
+                if let Some(recovery) = value.get_mut("recovery").and_then(|v| v.as_object_mut()) {
+                    recovery.remove("actions");
+                }
+                value.to_string()
+            })
+            .unwrap_or(bounded);
+        let take = |value: &str| value.chars().take(256).collect::<String>();
+        sha(&format!(
+            "type={};scope_type={};scope_id={};status={};details_digest={};recommended_action={}",
+            take(&kind),
+            take(&scope_type),
+            take(&scope_id),
+            take(&status),
+            sha(&canonical),
+            take(&action),
+        ))
+    }
+    async fn count(db: &SqliteDb, sql: &str, bind: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .bind(bind)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+    const INCIDENTS: &str = "SELECT count(*) FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?";
+    const WAKES: &str =
+        "SELECT count(*) FROM domain_event WHERE event_type='agent.wake.admitted' AND scope_id=?";
+    const BLOCKERS: &str = "SELECT count(*) FROM agent_wake_blocker WHERE attention_id=?";
+
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "Deployed incident").await;
+    let task = project_task(&db, &project_id, "Unchanged blocker").await;
+    let reason = "owner must repair the workspace";
+
+    // The Task as the deployed build blocked it. Its condition is what the
+    // upgrade migration restates from those fields.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+        .bind(
+            json!({"kind":"workspace_error","reason":reason,"created_at":now_rfc3339()})
+                .to_string(),
+        )
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.sync_condition_in_tx(&mut tx, &task.id).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // The event as the deployed build wrote it.
+    let deployed_interruption = json!({"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"});
+    append_attention_event(
+        &db,
+        "task.interruption_changed",
+        &task.id,
+        &project_id,
+        json!({
+            "task_id": task.id,
+            "task_version": task.version,
+            "task_status": task.status,
+            "requires_intervention": true,
+            "interruption": deployed_interruption,
+        }),
+    )
+    .await;
+    let (event_id, event_sequence): (String, i64) = sqlx::query_as(
+        "SELECT id,sequence FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id=?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    // The wake rows, written by code that is unchanged since the deployed
+    // build. The incident row this pass also writes is replaced below.
+    AttentionService::new(Arc::clone(&db))
+        .project_once(100)
+        .await
+        .unwrap();
+    let incident_id: String = sqlx::query_scalar(
+        "SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let written: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT details_json FROM attention_projection WHERE id=?",
+        )
+        .bind(&incident_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The incident row the deployed build stored for that event. The offers
+    // are illustrative, not captured from a deployed database: both builds
+    // remove `recovery.actions` before taking the digest.
+    let deployed_actions = json!([{
+        "action": {"verb": "retry", "reason": null, "fresh_session": null, "refresh_workspace": null, "reset_budget": null, "guidance": null},
+        "accepts": ["guidance"],
+        "allowed_actors": ["owner", "project_agent"],
+        "reason": "blocked",
+        "label": "Retry Task",
+    }]);
+    let deployed_details = json!({
+        "source_event_id": event_id,
+        "source_event_type": "task.interruption_changed",
+        "source_sequence": event_sequence,
+        "entity_type": "task",
+        "entity_id": task.id,
+        "scope_type": written["scope_type"],
+        "scope_id": written["scope_id"],
+        "task": {
+            "task_title": "Unchanged blocker",
+            "task_status": task.status,
+            "task_version": task.version,
+        },
+        "failure_class": null,
+        "retry_decision": null,
+        "retry_action": null,
+        "decision": null,
+        "role": null,
+        "stop_reason": null,
+        "error": null,
+        "interruption": deployed_interruption,
+        "recovery": {
+            "requires_intervention": true,
+            "actions": deployed_actions,
+            "automatic_retry": false,
+        },
+    });
+    // Guard on the hard-coded row: this build writes the same document
+    // except for the two members the builds are known to write differently
+    // (the interruption it strips, and the offers it computes).
+    let mut comparable = written.clone();
+    comparable["interruption"] = deployed_interruption.clone();
+    comparable["recovery"]["actions"] = deployed_actions.clone();
+    comparable["task"]["task_version"] = json!(task.version);
+    assert_eq!(
+        comparable, deployed_details,
+        "the hard-coded deployed incident row"
+    );
+    let deployed_details = deployed_details.to_string();
+    sqlx::query("UPDATE attention_projection SET details_json=? WHERE id=?")
+        .bind(&deployed_details)
+        .bind(&incident_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // The digest the wake rows store is the deployed build's digest of that row.
+    let digest = deployed_digest(&db, &incident_id).await;
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT incident_digest FROM agent_wake_attention_latest WHERE attention_id=?",
+    )
+    .bind(&incident_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        latest.as_deref(),
+        Some(digest.as_str()),
+        "stored wake digest"
+    );
+    let stored_blockers: Vec<String> =
+        sqlx::query_scalar("SELECT incident_digest FROM agent_wake_blocker WHERE attention_id=?")
+            .bind(&incident_id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_blockers,
+        vec![digest.clone()],
+        "stored blocker digest"
+    );
+    let wakes = count(&db, WAKES, &project_id).await;
+    assert_eq!(
+        wakes, 1,
+        "the deployed build admitted one wake for this blocker"
+    );
+
+    // This build starts: its first projection pass and wake sweep.
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+    assert_eq!(
+        count(&db, INCIDENTS, &project_id).await,
+        1,
+        "no new incident"
+    );
+    assert_eq!(count(&db, WAKES, &project_id).await, wakes, "no wake");
+    assert_eq!(count(&db, BLOCKERS, &incident_id).await, 1);
+    assert_eq!(
+        deployed_digest(&db, &incident_id).await,
+        digest,
+        "same digest"
+    );
+    let stored: String =
+        sqlx::query_scalar("SELECT details_json FROM attention_projection WHERE id=?")
+            .bind(&incident_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, deployed_details,
+        "the first pass leaves the stored incident alone"
+    );
+
+    // The first event this build writes about the same, unchanged blocker.
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    DomainEventRepo::append_event(&*db, CreateDomainEvent::task_interruption_changed(&current))
+        .await
+        .unwrap();
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+    assert_eq!(
+        count(&db, INCIDENTS, &project_id).await,
+        1,
+        "no new incident"
+    );
+    assert_eq!(count(&db, WAKES, &project_id).await, wakes, "no wake");
+    assert_eq!(count(&db, BLOCKERS, &incident_id).await, 1);
+    assert_eq!(
+        deployed_digest(&db, &incident_id).await,
+        digest,
+        "same digest"
+    );
+
+    // A real blocker change, through the real writer: one new event, the one
+    // incident restated with a new digest, and never more than one wake.
+    // (In this fixture the first wake's turn is still open and no second
+    // wake is admitted, also when swept past the cooldown.)
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(None),
+            blocked_json: Some(Some(
+                json!({"kind":"workspace_error","reason":"a different workspace blocker","created_at":now_rfc3339()})
+                    .to_string(),
+            )),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+    assert_eq!(
+        count(&db, INCIDENTS, &project_id).await,
+        1,
+        "one incident, restated"
+    );
+    let changed = deployed_digest(&db, &incident_id).await;
+    assert_ne!(changed, digest, "a real change is a new blocker");
+    let events = count(
+        &db,
+        "SELECT count(*) FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id=?",
+        &task.id,
+    )
+    .await;
+    assert_eq!(
+        events, 3,
+        "deployed event, unchanged restatement, one real change"
+    );
+    // The admitted wake holds a cooldown; sweep past it, twice.
+    for minutes in [10, 20] {
+        service
+            .sweep_once_at(&(Utc::now() + Duration::minutes(minutes)).to_rfc3339())
+            .await
+            .unwrap();
+    }
+    let new_wakes = count(&db, WAKES, &project_id).await - wakes;
+    let new_blockers = count(&db, BLOCKERS, &incident_id).await - 1;
+    println!("after a real change: wakes +{new_wakes}, blockers +{new_blockers}");
+    assert!(
+        new_wakes <= 1 && new_blockers <= 1,
+        "at most one wake for one change"
     );
 }

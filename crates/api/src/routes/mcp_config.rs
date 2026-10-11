@@ -936,7 +936,6 @@ command = "other"
                 name: "world".to_owned(),
                 remote_url: Some("https://example.com/world.git".to_owned()),
                 local_path,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),

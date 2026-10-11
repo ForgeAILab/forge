@@ -130,7 +130,9 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
     .await;
     assert_eq!(task.status, "in_progress".to_owned());
     let blocked = task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert_eq!(
@@ -138,7 +140,7 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
         Some(api_types::FailureKind::InternalCommandFailed)
     );
     assert!(
-        task.error_annotation.is_some(),
+        task.condition.details().diagnostic.is_some(),
         "blocked task records error annotation"
     );
 
@@ -248,7 +250,7 @@ async fn test_app(
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),

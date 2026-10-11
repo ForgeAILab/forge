@@ -18,8 +18,12 @@ pub async fn get_task_detail(
     // database work together so this bootstrap request costs one network hop
     // without adding the two backend latencies together.
     let awaiting_human = state.task_service.is_task_awaiting_human(&task).await?;
-    let task_response =
-        task_response_and_workflow_with_awaiting_human(&state.db, task, awaiting_human);
+    let task_response = task_response_and_workflow_with_awaiting_human(
+        &state.db,
+        &state.workspace_backend_router,
+        task,
+        awaiting_human,
+    );
     let db = &*state.db;
     let executions = async move {
         ExecutionRepo::list_by_task(db, &task_id, execution_page_request)

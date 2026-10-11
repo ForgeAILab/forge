@@ -86,14 +86,6 @@ impl CommandScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandOperationMetadata {
-    pub operation: String,
-    pub classification: OperationClassification,
-    pub required_permission: Option<String>,
-    pub allowed_scopes: Vec<CommandScopeType>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ExpectedCommandState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -280,15 +272,6 @@ impl CommandOutcomeContext {
             correlation_id: correlation_id.into(),
         }
     }
-
-    #[must_use]
-    pub fn from_command_context(context: &CommandContext) -> Self {
-        Self::new(
-            context.operation().to_owned(),
-            CanonicalScopeRef::from(&context.canonical_scope),
-            context.correlation_id().to_owned(),
-        )
-    }
 }
 
 impl From<&CommandScope> for CanonicalScopeRef {
@@ -332,6 +315,29 @@ pub fn outcome_for_service_error_with_correction(
     retry: Option<RetryInstruction>,
 ) -> OrchestrationOutcome {
     let (code, safe_message, default_retry, setup_requirements) = match error {
+        ServiceError::TaskBusy { .. } => (
+            OutcomeCode::TaskBusy,
+            "Task has pending steps; accepted work remains queued",
+            Some(RetryInstruction::new(RetryAction::RefreshAndRetry, true)),
+            None,
+        ),
+        ServiceError::TurnFailure { error, .. } => {
+            return outcome_for_service_error_with_correction(error, context, current, retry)
+        }
+        // Not retryable from here: only a build that understands the
+        // stored condition can act on this Task.
+        ServiceError::TaskConditionQuarantined { .. } => (
+            OutcomeCode::ActionUnavailable,
+            "the Task's stored condition was written by a newer Forge build and is quarantined; nothing was changed",
+            None,
+            None,
+        ),
+        ServiceError::Db(db::DbError::TurnNotRetryable | db::DbError::ChatTurnLive) => (
+            OutcomeCode::ValidationError,
+            "Agent Chat turn cannot be retried in its current state",
+            None,
+            None,
+        ),
         ServiceError::Db(db::DbError::IdempotencyConflict) => (
             OutcomeCode::IdempotencyConflict,
             "the idempotency key is already bound to different command input",
@@ -384,8 +390,6 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::MissingPrimaryRepo { .. }
         | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. }
-        | ServiceError::PrProviderMissing { .. }
-        | ServiceError::PrProviderTokenMissing { .. }
         | ServiceError::ParentWorkspaceRequired { .. }
         | ServiceError::TerminalDisabled
         | ServiceError::TerminalWorkspaceNotReady => (
@@ -406,12 +410,26 @@ pub fn outcome_for_service_error_with_correction(
                 None,
             )
         }
-        ServiceError::DaemonUnavailable { .. }
+        ServiceError::DaemonUpgradeRequired { .. } => (
+            OutcomeCode::SetupRequired,
+            api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE,
+            None,
+            None,
+        ),
+        ServiceError::PlacementUnavailable(error) if error.needs_daemon_upgrade() => (
+            OutcomeCode::SetupRequired,
+            api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE,
+            None,
+            None,
+        ),
+        ServiceError::DaemonNotReady { .. }
+        | ServiceError::DaemonUnavailable { .. }
+        | ServiceError::PlacementUnavailable(_)
+        | ServiceError::PrepareFailed { .. }
         | ServiceError::DaemonTimeout { .. }
         | ServiceError::TerminalDaemonUnavailable { .. }
         | ServiceError::TerminalActiveExecution { .. }
-        | ServiceError::ExecutionAlreadyRunning { .. }
-        | ServiceError::PrSyncFailure { .. } => (
+        | ServiceError::ExecutionAlreadyRunning { .. } => (
             OutcomeCode::TransientFailure,
             "the command could not complete right now; retry later",
             Some(RetryInstruction::new(RetryAction::RefreshAndRetry, true)),
@@ -422,6 +440,7 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::TaskActionUnavailable { .. }
         | ServiceError::Conflict(_)
         | ServiceError::NestedSubtaskUnsupported
+        | ServiceError::SubtaskParentClosed { .. }
         | ServiceError::WorkspaceResetRequired { .. }
         | ServiceError::TerminalSessionLimit { .. }
         | ServiceError::TerminalNotFound => (
@@ -463,6 +482,20 @@ pub fn outcome_for_service_error_with_correction(
         }));
     }
 
+    outcome.denied_by = match error {
+        ServiceError::PlacementUnavailable(refusal) if refusal.needs_daemon_upgrade() => {
+            Some(api_types::DeniedBy::DaemonUpgradeRequired)
+        }
+        ServiceError::PlacementUnavailable(_) => Some(api_types::DeniedBy::PlacementUnavailable),
+        ServiceError::DaemonUpgradeRequired { .. } => {
+            Some(api_types::DeniedBy::DaemonUpgradeRequired)
+        }
+        ServiceError::WorkspaceResetRequired { .. } => {
+            Some(api_types::DeniedBy::WorkspaceResetRequired)
+        }
+        _ => None,
+    };
+
     let allows_correction = matches!(
         code,
         OutcomeCode::VersionConflict | OutcomeCode::DigestConflict | OutcomeCode::SetupRequired
@@ -481,10 +514,6 @@ fn setup_requirement_for(error: &ServiceError) -> SetupRequirement {
         ServiceError::MissingPrimaryRepo { .. } => SetupRequirement::new("primary_repository"),
         ServiceError::PrimaryRepoNotFound { .. } => SetupRequirement::new("repository_link"),
         ServiceError::RepoMismatch { .. } => SetupRequirement::new("repository_link"),
-        ServiceError::PrProviderMissing { .. } => SetupRequirement::new("pull_request_provider"),
-        ServiceError::PrProviderTokenMissing { .. } => {
-            SetupRequirement::new("pull_request_provider_token")
-        }
         ServiceError::ParentWorkspaceRequired { .. } => SetupRequirement::new("parent_workspace"),
         ServiceError::TerminalDisabled => SetupRequirement::new("terminal_enabled"),
         ServiceError::TerminalWorkspaceNotReady => SetupRequirement::new("terminal_workspace"),
@@ -504,6 +533,38 @@ mod tests {
             CanonicalScopeRef::new(OutcomeScopeType::Project, "project-1"),
             "correlation-1",
         )
+    }
+
+    #[test]
+    fn daemon_target_refusals_preserve_their_specific_cause() {
+        for (error, cause) in [
+            (
+                ServiceError::PlacementUnavailable(crate::placement::PlacementUnavailable {
+                    task_id: "task".into(),
+                    repo_id: "repo".into(),
+                    rejected_candidates: vec![],
+                }),
+                api_types::DeniedBy::PlacementUnavailable,
+            ),
+            (
+                ServiceError::DaemonUpgradeRequired {
+                    daemon_id: "owner".into(),
+                },
+                api_types::DeniedBy::DaemonUpgradeRequired,
+            ),
+            (
+                ServiceError::WorkspaceResetRequired {
+                    task_id: "task".into(),
+                    reason: "lost".into(),
+                },
+                api_types::DeniedBy::WorkspaceResetRequired,
+            ),
+        ] {
+            let outcome = outcome_for_service_error(&error, &outcome_context());
+            assert_eq!(outcome.denied_by, Some(cause.clone()));
+            assert!(!cause.withdraws_operation());
+            assert_ne!(outcome.code, OutcomeCode::InternalFailure);
+        }
     }
 
     #[test]

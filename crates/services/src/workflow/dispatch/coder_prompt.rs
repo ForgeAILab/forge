@@ -275,14 +275,22 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
 /// The latest `merge_failed` entry, when Forge committed a rebase conflict
 /// with its markers for this Worker to reconcile.
 fn conflict_handoff_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    last_merge_failed_reason(ctx)
-        .filter(|reason| reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER))
+    ctx.transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == default_states::MERGE_FAILED)
+        .filter(|entry| {
+            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
+        })
+        .map(|entry| entry.trigger_reason.clone())
 }
 
 fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
-    let annotation = ctx.task.error_annotation.as_deref()?;
-    let value = serde_json::from_str::<serde_json::Value>(annotation).ok()?;
-    serde_json::from_value(value.get("type")?.clone()).ok()
+    ctx.task
+        .condition
+        .read()
+        .diagnostic
+        .map(|a| a.annotation_type)
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {

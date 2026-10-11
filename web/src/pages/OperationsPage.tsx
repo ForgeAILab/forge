@@ -1,12 +1,18 @@
 import { Link } from '@tanstack/react-router'
 import { ArrowClockwise, CheckCircle, Pulse, WarningCircle } from '@phosphor-icons/react'
-import type { ReactNode } from 'react'
-import { useOperationsStatusQuery, useRefreshOperationsMutation } from '@/api/hooks'
+import { useState, type ReactNode } from 'react'
+import {
+  useDeadLetterActionMutation,
+  useOperationsStatusQuery,
+  useRefreshOperationsMutation,
+} from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanChecklist } from '@/components/plan-checklist'
 import { PolicyBadge } from '@/components/policy-badge'
 import { CostSummaryView } from '@/components/analytics/CostSummary'
 import { formatRuntimeSeconds, formatTokenCount } from '@/components/task-execution-observability'
+import { Input } from '@/components/ui/input'
+import { getApiErrorCode, getApiErrorMessage } from '@/lib/api-error'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
@@ -17,6 +23,9 @@ import type {
   AgentPressureSummary,
   DaemonIssueSummary,
   DaemonPressureSummary,
+  EventConsumerStatus,
+  WorkerDeadLetterSummary,
+  DeadLetterActionResponse,
   OperatorSeverity,
   RecentErrorSummary,
   RetryPressureSummary,
@@ -220,7 +229,8 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
                   <span>
                     {execution.token_totals.cost.coverage === 'pending'
                       ? 'Cost pending'
-                      : execution.token_totals.cost.coverage === 'complete' && execution.token_totals.cost.complete_total
+                      : execution.token_totals.cost.coverage === 'complete' &&
+                          execution.token_totals.cost.complete_total
                         ? formatMoneyAmount(execution.token_totals.cost.complete_total)
                         : execution.token_totals.cost.coverage === 'no_usage'
                           ? 'No usage'
@@ -248,7 +258,7 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
 
 function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
   return (
-    <Section title={`${productTerm('runtime')} Pressure`} count={items.length}>
+    <Section title="Machine Pressure" count={items.length}>
       <div className="divide-y">
         {items.map((item) => (
           <div
@@ -256,11 +266,15 @@ function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
             className="flex min-w-0 items-center justify-between gap-4 px-4 py-3 transition-colors hover:bg-muted/20"
           >
             <div className="min-w-0">
-              <EntityLink href={`/daemons/${item.daemon_id}`}>
+              <EntityLink
+                href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}
+              >
                 {item.hostname ?? item.daemon_id}
               </EntityLink>
               <p className="mt-1 text-xs text-muted-foreground">
-                {item.active_sessions}/{item.max_sessions ?? '-'} active sessions
+                {item.active_runs}/{item.max_concurrent_runs ?? 'Unlimited'} active runs
+                {item.logical_cores != null &&
+                  ` · ${item.logical_cores} cores · ${item.build_jobs_per_run === 0 ? 'budget off' : `${item.build_jobs_per_run} jobs/run`} · nice +${item.run_nice}`}
               </p>
             </div>
             <CapacityBadge atCapacity={item.at_capacity} />
@@ -284,10 +298,14 @@ function AgentPressureSection({ items }: { items: AgentPressureSummary[] }) {
               <p className="truncate text-sm font-medium text-foreground">{item.agent_name}</p>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span>
-                  {item.active_sessions}/{item.max_sessions} active sessions
+                  {item.active_tasks}/{item.max_concurrent_tasks} active tasks
                 </span>
                 {item.daemon_id ? (
-                  <EntityLink href={`/daemons/${item.daemon_id}`}>
+                  <EntityLink
+                    href={
+                      item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`
+                    }
+                  >
                     Daemon {item.daemon_id}
                   </EntityLink>
                 ) : null}
@@ -459,16 +477,203 @@ function RetryPressureSection({ items }: { items: RetryPressureSummary[] }) {
   )
 }
 
+function DeadLetterRow({
+  dead,
+  receipt,
+  onResolved,
+}: {
+  dead: WorkerDeadLetterSummary
+  receipt?: DeadLetterActionResponse
+  onResolved: (result: DeadLetterActionResponse) => void
+}) {
+  const action = useDeadLetterActionMutation()
+  const [reason, setReason] = useState('')
+  const [result, setResult] = useState<DeadLetterActionResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [pending, setPending] = useState<'replay' | 'dismiss' | null>(null)
+  const actionResult = result ?? receipt
+  const summary =
+    actionResult && actionResult.dead_letter.summary.attempts > dead.attempts
+      ? actionResult.dead_letter.summary
+      : dead
+  const resolved = actionResult?.dead_letter.state === 'resolved'
+  async function apply(kind: 'replay' | 'dismiss') {
+    setPending(kind)
+    setError(null)
+    try {
+      const response = await action.mutateAsync({
+        id: dead.id,
+        action: kind,
+        reason: kind === 'dismiss' && reason.trim() ? reason.trim() : undefined,
+      })
+      setResult(response)
+      if (response.dead_letter.state === 'resolved') onResolved(response)
+    } catch (error) {
+      setError(
+        getApiErrorCode(error) === 'version_conflict'
+          ? 'Dead letter already resolved or changed. Refresh status.'
+          : getApiErrorMessage(error, 'Action failed. Try again.'),
+      )
+    } finally {
+      setPending(null)
+    }
+  }
+  return (
+    <div
+      className="mt-3 min-w-0 rounded-md border border-border-subtle p-3"
+      role="group"
+      aria-label={`Dead letter ${dead.id}`}
+    >
+      <p className="break-all font-mono text-xs">
+        {summary.event_type} · {summary.consumer_name}
+      </p>
+      <p className="mt-1 break-words text-xs text-muted-foreground">
+        {summary.item_key} · {summary.attempts} attempts · {formatDate(summary.occurred_at)}
+      </p>
+      <p className="mt-1 break-words text-xs text-destructive">{summary.reason}</p>
+      {!resolved && (
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          {summary.replayable && (
+            <div className="flex max-w-full flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={pending !== null}
+                onClick={() => void apply('replay')}
+              >
+                {pending === 'replay' ? 'Replaying…' : 'Replay'}
+              </Button>
+              <span
+                className="text-xs text-muted-foreground"
+                title={summary.event_created_at ?? undefined}
+              >
+                {summary.event_created_at
+                  ? `Event ${formatRuntimeSeconds(Math.max(0, (Date.now() - Date.parse(summary.event_created_at)) / 1000))} old`
+                  : 'Event age unavailable'}{' '}
+                · {summary.events_since} later events processed
+              </span>
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <label className="text-xs text-muted-foreground" htmlFor={`dismiss-reason-${dead.id}`}>
+              Dismiss reason (optional)
+            </label>
+            <Input
+              id={`dismiss-reason-${dead.id}`}
+              value={reason}
+              maxLength={1024}
+              disabled={pending !== null}
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={pending !== null}
+            onClick={() => void apply('dismiss')}
+          >
+            {pending === 'dismiss' ? 'Dismissing…' : 'Dismiss'}
+          </Button>
+        </div>
+      )}
+      {actionResult && (
+        <p role="status" className="mt-2 text-xs text-muted-foreground">
+          {actionResult.outcome === 'replay_failed'
+            ? 'Replay failed; remains open. Retry after fixing the cause.'
+            : actionResult.outcome === 'skipped'
+              ? 'Replay completed; consumer skipped this event.'
+              : actionResult.outcome === 'dismissed'
+                ? 'Dismissed without delivery.'
+                : 'Replayed successfully.'}
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="mt-2 break-words text-xs text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
+  const [receipts, setReceipts] = useState<DeadLetterActionResponse[]>([])
+  function resolved(receipt: DeadLetterActionResponse) {
+    setReceipts((current) =>
+      [
+        receipt,
+        ...current.filter((row) => row.dead_letter.summary.id !== receipt.dead_letter.summary.id),
+      ].slice(0, 5),
+    )
+  }
+  return (
+    <Section title="Event Consumers" count={items.length}>
+      <div className="divide-y">
+        {items.map((item) => (
+          <div
+            key={item.consumer_name}
+            className="flex min-w-0 flex-wrap items-start justify-between gap-4 px-4 py-3"
+          >
+            <div className="min-w-0">
+              <p className="break-all font-mono text-xs text-foreground">{item.consumer_name}</p>
+              <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
+                <span>Pending events {item.lag}</span>
+                <span>Cursor {item.last_sequence}</span>
+                <span>Dead letters {item.dead_letter_count}</span>
+                <span>Last advanced {formatDate(item.last_advanced_at)}</span>
+                {item.oldest_unprocessed_age_seconds !== null ? (
+                  <span>
+                    Oldest pending {formatRuntimeSeconds(item.oldest_unprocessed_age_seconds)}
+                  </span>
+                ) : null}
+              </div>
+              {[
+                ...item.recent_dead_letters,
+                ...receipts
+                  .map((row) => row.dead_letter.summary)
+                  .filter(
+                    (row) =>
+                      row.consumer_name === item.consumer_name &&
+                      !item.recent_dead_letters.some((dead) => dead.id === row.id),
+                  ),
+              ].map((dead) => (
+                <DeadLetterRow
+                  key={dead.id}
+                  dead={dead}
+                  receipt={receipts.find((row) => row.dead_letter.summary.id === dead.id)}
+                  onResolved={resolved}
+                />
+              ))}
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              <span>
+                {item.stalled ? 'Stalled' : item.oldest_unprocessed_at ? 'Processing' : 'Caught up'}
+              </span>
+              {item.stalled ? <SeverityBadge severity="attention" /> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  )
+}
+
 function RecentErrorsSection({ errors }: { errors: RecentErrorSummary[] }) {
   return (
-    <Section title="Recent Errors" count={errors.length}>
+    <Section title="Errors and Alerts" count={errors.length}>
       <div className="divide-y">
         {errors.map((error) => (
           <div
             key={`${error.entity_type}-${error.entity_id}-${error.occurred_at}`}
             className="flex min-w-0 items-start gap-3 px-4 py-3 transition-colors hover:bg-muted/20"
           >
-            <WarningCircle size={16} className="mt-0.5 shrink-0 text-red-500" />
+            <WarningCircle
+              size={16}
+              className={cn(
+                'mt-0.5 shrink-0',
+                error.severity === 'attention' ? 'text-warning' : 'text-destructive',
+              )}
+            />
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <SeverityBadge severity={error.severity} />
@@ -525,7 +730,8 @@ export function OperationsPage() {
     status.agent_pressure.length === 0 &&
     status.workspace_cleanup.length === 0 &&
     status.retry_pressure.length === 0 &&
-    status.recent_errors.length === 0
+    status.recent_errors.length === 0 &&
+    status.event_consumers.every((consumer) => consumer.lag === 0)
 
   return (
     <div className="space-y-4">
@@ -564,9 +770,30 @@ export function OperationsPage() {
         <StatCard label="Blocked" value={status.blocked_tasks.length} />
         <StatCard label={productTerm('runtime', 0)} value={status.daemon_issues.length} />
         <StatCard label="Cleanup" value={status.workspace_cleanup.length} />
+        <StatCard label="Remote cleanup" value={status.pending_remote_cancels} />
         <StatCard label="Retries" value={status.retry_pressure.length} />
         <StatCard label="Errors" value={status.recent_errors.length} />
       </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <StatCard
+          label="Database vacuum"
+          value={status.database.incremental_vacuum ? 'Incremental' : 'Conversion required'}
+        />
+        <StatCard label="Database free pages" value={status.database.free_pages} />
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Event relay {status.event_relay.running ? 'Running' : 'Stopped'} · Position{' '}
+        {status.event_relay.position ?? '-'} · Head {status.event_relay.head ?? '-'}
+        {status.event_relay.last_error ? ` · ${status.event_relay.last_error}` : ''}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        Usage index {(status.usage_index.current_size_bytes / (1024 * 1024)).toFixed(1)} MiB
+        {' / '}
+        {status.usage_index.budget_bytes / (1024 * 1024)} MiB budget ·{' '}
+        {status.usage_index.fallback ? 'Memoized full reads' : 'Incremental reads'}
+      </p>
+      <EventConsumersSection items={status.event_consumers} />
 
       {status.usage_summary ? (
         <div className="space-y-3">

@@ -1,17 +1,51 @@
-use super::workspace::prepare_workspace_owned;
 use super::*;
 use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
-use sqlx::Row;
+use api_types::{Actor, SystemComponent, WorkflowDefinition};
 
 impl TaskService {
-    pub async fn claim_task(
+    /// The accepted claim owns startup even when its HTTP waiter times out.
+    pub async fn claim_and_start_task(
         &self,
         task_id: impl Into<String>,
         assignee: Assignee,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<ClaimedTask> {
         let task_id = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "claim_and_start_task",
+                    serde_json::json!([task_id, assignee, overrides]),
+                    false,
+                )
+                .await;
+        }
+        let mut claimed = self.claim_task(&task_id, assignee, overrides).await?;
+        self.start_execution(&claimed.execution.id).await?;
+        claimed.task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id))?;
+        Ok(claimed)
+    }
+    pub async fn claim_task(
+        &self,
+        task_id: impl Into<String>,
+        assignee: Assignee,
+        overrides: Option<ExecutionOverrides>,
+    ) -> Result<ClaimedTask> {
+        let task_id: String = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "claim_task",
+                    serde_json::json!([task_id, assignee, overrides]),
+                    false,
+                )
+                .await;
+        }
+
         validate_required("task_id", &task_id)?;
 
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -96,7 +130,7 @@ impl TaskService {
         }
         if let Some(claiming_agent_id) = agent.as_ref().map(|agent| agent.id.as_str()) {
             if let Some(role_name) = target_role.as_deref() {
-                self.ensure_claim_role_available(&task.id, role_name, claiming_agent_id)
+                self.ensure_claim_role_available(&task, role_name, claiming_agent_id)
                     .await?;
             }
         }
@@ -111,8 +145,9 @@ impl TaskService {
             } else {
                 claim_execution_role.as_str()
             };
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, assignment_role)
+            crate::task_hierarchy::effective_role_assignment(&self.db, &task, assignment_role)
                 .await?
+                .map(|resolved| resolved.assignment)
         } else {
             None
         };
@@ -132,6 +167,7 @@ impl TaskService {
         };
         let mut execution_admission = agent.as_ref().map(|claiming_agent| {
             let mut admission = db::ExecutionAdmission {
+                purpose: None,
                 expected_queued_recovery_id: None,
                 expected_project_version: Some(project.version),
                 expected_task_version: task.version,
@@ -174,14 +210,16 @@ impl TaskService {
             admission
         });
         let previous_status = task.status.clone();
-        let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task_id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        let workspace_admission = self
+            .reserve_workspace_admission(
+                &task,
+                agent.as_ref(),
+                &claim_execution_role,
+                crate::placement::selection::EnvironmentAdmission::LaunchPreflight,
+            )
+            .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = &workspace_admission.workspace;
         let now = now_rfc3339();
         let execution_id = new_uuid_v4();
         let executor_config_snapshot_json = match agent.as_ref() {
@@ -193,7 +231,7 @@ impl TaskService {
                             &self.db,
                             &task_id,
                             agent,
-                            &workspace,
+                            workspace,
                             &execution_id,
                             error.to_string(),
                         )
@@ -231,19 +269,13 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let execution_lease = match self.initial_execution_lease(&execution).await {
-            Ok(lease) => lease,
-            Err(error) => {
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(&task, &workspace)
-                        .await;
-                }
-                return Err(error);
-            }
-        };
+        let execution_lease = self.initial_execution_lease(&execution).await?;
         let mut transaction = db::begin_immediate(self.db.pool())
             .await
             .map_err(DbError::from)?;
+        self.check_claim_placement_in_tx(&mut transaction, &task, &workspace_admission)
+            .await?;
+        self.check_placement_lease_owner(&workspace_admission.placement, &execution_lease)?;
         let claimed = TaskRepo::claim(
             &*self.db,
             &mut transaction,
@@ -267,56 +299,12 @@ impl TaskService {
             Ok(claimed) => claimed,
             Err(error) => {
                 drop(transaction);
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(&task, &workspace)
-                        .await;
-                }
                 return Err(error.into());
             }
         };
-        if let (Some(role_name), Some(claiming_agent_id)) =
-            (target_role.as_deref(), agent_id.as_deref())
-        {
-            let role_now = now_rfc3339();
-            sqlx::query(
-                "INSERT INTO task_role_assignment
-                    (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-                 VALUES (?, ?, ?, 'agent', ?, ?, ?)
-                 ON CONFLICT(task_id, role_name) DO NOTHING",
-            )
-            .bind(new_uuid_v4())
-            .bind(&claimed.task.id)
-            .bind(role_name)
-            .bind(claiming_agent_id)
-            .bind(&role_now)
-            .bind(&role_now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(DbError::from)?;
-            let assignment = sqlx::query(
-                "SELECT assignee_type, assignee_id
-                 FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-            )
-            .bind(&claimed.task.id)
-            .bind(role_name)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(DbError::from)?;
-            if assignment
-                .get::<Option<String>, _>("assignee_type")
-                .as_deref()
-                != Some("agent")
-                || assignment
-                    .get::<Option<String>, _>("assignee_id")
-                    .as_deref()
-                    != Some(claiming_agent_id)
-            {
-                return Err(ServiceError::conflict(format!(
-                    "role '{}' is assigned to a different agent",
-                    role_name
-                )));
-            }
-        }
+        // `TaskRepo::claim` verifies (and, only when truly absent, creates)
+        // the effective assignment inside this same write transaction. Do not
+        // materialize a root default on the child after that guarded insert.
         // Human claims remain user-managed work and do not mint repository
         // authority. Only a scheduler-dispatched Agent Worker/reviewer gets
         // an execution-scoped WorkspaceLease.
@@ -325,7 +313,7 @@ impl TaskService {
                 .issue_workspace_lease_in_tx(
                     &mut transaction,
                     &claimed.task,
-                    &workspace,
+                    workspace,
                     target_role.as_deref().unwrap_or("executor"),
                     agent_id.as_deref(),
                     &execution_id,
@@ -335,10 +323,6 @@ impl TaskService {
                 Ok(lease) => Some(lease),
                 Err(error) => {
                     drop(transaction);
-                    if workspace_created_by_attempt {
-                        self.cleanup_fresh_execution_workspace(&task, &workspace)
-                            .await;
-                    }
                     return Err(error);
                 }
             }
@@ -353,10 +337,6 @@ impl TaskService {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     drop(transaction);
-                    if workspace_created_by_attempt {
-                        self.cleanup_fresh_execution_workspace(&task, &workspace)
-                            .await;
-                    }
                     return Err(ServiceError::invalid_operation(format!(
                         "invalid executor config snapshot for usage admission: {error}"
                     )));
@@ -373,23 +353,21 @@ impl TaskService {
             .await
             {
                 drop(transaction);
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(&task, &workspace)
-                        .await;
-                }
                 return Err(error);
             }
         }
+        crate::placement::admission::resolve_workspace_attention_in_tx(
+            &self.db,
+            &mut transaction,
+            &task_id,
+        )
+        .await?;
         if let Err(error) = transaction.commit().await.map_err(DbError::from) {
             // The commit may have succeeded at SQLite despite a transport
             // error; revoke the lease idempotently so a crashed claimant can
             // never retain repository authority.
             if let Some(lease) = lease.as_ref() {
                 self.revoke_workspace_lease(lease).await;
-            }
-            if workspace_created_by_attempt {
-                self.cleanup_fresh_execution_workspace(&task, &workspace)
-                    .await;
             }
             return Err(error.into());
         }
@@ -486,6 +464,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             workspace_id,
             agent_id: task.assignee_id.clone(),
             execution_id: Some(execution_id.to_owned()),
@@ -517,12 +496,13 @@ impl TaskService {
 
     async fn ensure_claim_role_available(
         &self,
-        task_id: &str,
+        task: &Task,
         role_name: &str,
         claiming_agent_id: &str,
     ) -> Result<()> {
-        let existing =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
+        let existing = crate::task_hierarchy::effective_role_assignment(&self.db, task, role_name)
+            .await?
+            .map(|resolved| resolved.assignment);
         if existing.as_ref().is_some_and(|assignment| {
             assignment.assignee_type != Some(AssigneeKind::Agent)
                 || assignment.assignee_id.as_deref() != Some(claiming_agent_id)
@@ -536,26 +516,8 @@ impl TaskService {
 }
 
 fn resolve_claim_target(workflow: &WorkflowDefinition, current_status: &str) -> Result<String> {
-    let source_kind = workflow.state_kind(current_status);
-    let targets = workflow
-        .outgoing_trigger_targets(current_status)
-        .filter(|(trigger, _)| {
-            !trigger.system_only()
-                || matches!(source_kind, Some(StateKind::Initial | StateKind::Custom))
-        })
-        .filter_map(|(_, target_name)| {
-            workflow
-                .states
-                .iter()
-                .find(|target| target.name == target_name)
-                .map(|target| (target.name.clone(), target.kind))
-        })
-        .collect::<Vec<_>>();
-    let target = targets
-        .iter()
-        .find(|(_, kind)| *kind == StateKind::Active)
-        .or_else(|| targets.iter().find(|(_, kind)| *kind == StateKind::Gate))
-        .map(|(name, _)| name.clone());
+    let target = crate::workflow::claim_target_state(workflow, current_status)
+        .map(|state| state.name.clone());
 
     target.ok_or_else(|| {
         ServiceError::invalid_operation(format!(

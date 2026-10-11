@@ -8,6 +8,7 @@ use crate::{
         default_states,
         engine::{WorkflowAuthority, WorkflowEngine},
     },
+    workspace_backend::{EmbeddedWorkspaceBackend, WorkspaceBackendRouter},
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
@@ -51,9 +52,11 @@ mod actions;
 pub use actions::task_review_requires_user_decision;
 mod adaptive;
 mod claim;
+pub(crate) mod commands;
 mod common;
 pub(crate) mod config;
 mod create;
+pub(crate) use create::PreparedProjectHookTask;
 mod create_subtasks;
 mod dependencies;
 pub(crate) mod execution;
@@ -61,6 +64,7 @@ mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
 mod move_task;
+mod placement_refusal;
 pub(crate) mod project_agent_workspace;
 mod proposal;
 mod reorder_subtasks;
@@ -68,8 +72,10 @@ mod repository_authority;
 mod review;
 mod review_config;
 mod roles;
+pub(crate) use roles::RoleSweepEvent;
 mod subtask;
 mod transition;
+pub(crate) use transition::next_workflow_state;
 mod update;
 mod validation;
 pub(crate) mod workspace;
@@ -178,8 +184,9 @@ pub(crate) async fn execution_admission_for_task(
             role
         };
         Some(
-            TaskRoleAssignmentRepo::get_by_task_and_role(db, &task.id, assignment_role)
+            crate::task_hierarchy::effective_role_assignment(db, task, assignment_role)
                 .await?
+                .map(|resolved| resolved.assignment)
                 .ok_or_else(|| {
                     ServiceError::conflict(format!(
                         "task {} has no assignment for workflow role {}",
@@ -189,6 +196,7 @@ pub(crate) async fn execution_admission_for_task(
         )
     };
     Ok(ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: Some(expected_project_version),
         expected_task_version: task.version,
@@ -225,7 +233,7 @@ use self::{
     logs::execution_logs_path,
     review_config::review_config_from_json,
     validation::{serialize_config, validate_required},
-    workspace::{default_workspace_root, prepare_workspace, reset_workspace},
+    workspace::{prepare_workspace, reset_workspace},
 };
 
 pub(super) const DISPATCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -396,45 +404,81 @@ pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
                 | "target_repo_dirty"
                 | "executor_failed"
                 | "review_budget_exhausted"
+                | "review_needs_owner"
                 | "merge_fix_budget_exhausted"
                 | "merge_fix_ci_failed"
         )
     )
 }
 
-#[derive(Clone)]
-pub struct TaskService {
-    db: Arc<SqliteDb>,
-    event_bus: Arc<EventBus>,
-    merge_service: Option<Arc<MergeService>>,
-    cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    review_runner: Option<Arc<ReviewRunner>>,
-    task_executor: Option<Arc<dyn TaskExecutor>>,
-    daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
-    workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
-    terminal_activity: Option<Arc<TerminalActivityTracker>>,
-    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
-    workspace_root: PathBuf,
-    memory_service: Arc<MemoryService>,
-    move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Task IDs whose completion cascade is running right now. Shared by
-    /// every clone, so competing terminal completions cannot apply effects
-    /// to the same Task at once.
-    completion_cascades: Arc<std::sync::Mutex<HashSet<String>>>,
-    /// Wakes completion cascades that arrived while another execution for
-    /// the same Task was settling. Waiters retry the Task slot after every
-    /// release, so a successor completion is never silently dropped.
-    completion_cascade_released: Arc<tokio::sync::Notify>,
-    credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
+/// The check runtime of one Task service, as [`TaskService::compose_checks`]
+/// builds it.
+pub struct ComposedChecks {
+    pub runner: Arc<crate::check_runner::CheckRunner>,
+    pub consumers: Arc<crate::check_runner::consumer::TaskCheckConsumers>,
+    pub worker: Arc<crate::check_runner::worker::CheckRunWorker>,
+    /// The workspace owners the worker dispatches to (one instance: its
+    /// live-operation counter is what the garbage-collection sweep reads).
+    pub owners: Arc<crate::check_runner::owners::WorkspaceCheckOwners>,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+pub struct TaskService {
+    workflow_engine: Arc<WorkflowEngine>,
+    task_step_driver:
+        Arc<std::sync::Mutex<Option<Arc<crate::worker_runtime::queue::TaskStepWorker>>>>,
+    pub(crate) task_step_replies: Arc<
+        std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
+    >,
+    /// Bound once by the runtime; the `apply_check_result` step applies
+    /// check results through it.
+    pub(crate) check_consumers:
+        Arc<std::sync::OnceLock<Arc<crate::check_runner::consumer::TaskCheckConsumers>>>,
+    /// Bound once by the runtime: the worker that executes requested
+    /// checks. A harness that starts the Task-step worker on its own starts
+    /// this one with it, or no check a step asks for is ever answered.
+    pub(crate) check_worker:
+        Arc<std::sync::OnceLock<Arc<crate::check_runner::worker::CheckRunWorker>>>,
+    pub(crate) check_runner: Arc<std::sync::OnceLock<Arc<crate::check_runner::CheckRunner>>>,
+    pub(crate) check_owners:
+        Arc<std::sync::OnceLock<Arc<crate::check_runner::owners::WorkspaceCheckOwners>>>,
+    pub(crate) db: Arc<SqliteDb>,
+    pub(crate) event_bus: Arc<EventBus>,
+    pub(crate) merge_service: Option<Arc<MergeService>>,
+    pub(crate) cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
+    pub(crate) review_runner: Option<Arc<ReviewRunner>>,
+    task_executor: Option<Arc<dyn TaskExecutor>>,
+    placement_adapter_registry: Option<Arc<executors::AdapterRegistry>>,
+    pub(crate) daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    pub(crate) workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
+    pub(crate) terminal_activity: Option<Arc<TerminalActivityTracker>>,
+    pub(crate) repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub(crate) workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    test_workspace_backend: bool,
+    pub(crate) workspace_root: PathBuf,
+    workspace_max_disconnect: Duration,
+    memory_service: Arc<MemoryService>,
+    move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Shared with manual checks: a Project has at most one host re-check.
+    environment_rechecks: Arc<std::sync::Mutex<HashSet<String>>>,
+    dispatch_notify: Arc<tokio::sync::Notify>,
+    credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
+    pub(crate) dispatch_wake: Arc<tokio::sync::Notify>,
+    /// The runtime's dispatcher instance, for commands it queued.
+    dispatcher: Arc<std::sync::Mutex<std::sync::Weak<crate::task_dispatcher::DispatcherInstance>>>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionResult {
     pub task: Task,
     pub review: Option<Review>,
+    pub pending_steps: i64,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionOptions {
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub version: i64,
     pub reason: Option<String>,
     pub triggered_by: Actor,
@@ -445,6 +489,7 @@ pub struct TransitionOptions {
 impl From<i64> for TransitionOptions {
     fn from(version: i64) -> Self {
         Self {
+            bridge: Default::default(),
             version,
             reason: None,
             triggered_by: Actor::system(api_types::SystemComponent::General),
@@ -457,6 +502,7 @@ impl From<i64> for TransitionOptions {
 impl From<(i64, Option<String>)> for TransitionOptions {
     fn from((version, reason): (i64, Option<String>)) -> Self {
         Self {
+            bridge: Default::default(),
             version,
             reason,
             triggered_by: Actor::user(UserActionSource::Api),
@@ -469,6 +515,7 @@ impl From<(i64, Option<String>)> for TransitionOptions {
 impl From<(i64, Option<String>, bool)> for TransitionOptions {
     fn from((version, reason, rejection): (i64, Option<String>, bool)) -> Self {
         Self {
+            bridge: Default::default(),
             version,
             reason,
             triggered_by: Actor::user(UserActionSource::Api),
@@ -478,6 +525,7 @@ impl From<(i64, Option<String>, bool)> for TransitionOptions {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct LaunchExecutionResult {
     pub task: Task,
     pub execution: Execution,
@@ -485,48 +533,247 @@ pub struct LaunchExecutionResult {
 }
 
 impl TaskService {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+    /// The durable check runner's Task-step consumer contract, once the
+    /// runtime has composed it. Consumer families register through it.
+    pub fn check_worker(&self) -> Option<Arc<crate::check_runner::worker::CheckRunWorker>> {
+        self.check_worker.get().cloned()
+    }
+    /// The one place the check runtime of a Task service is composed: the
+    /// runner, the consumer contract with EVERY consumer family (review
+    /// entry and integration), and the worker with its workspace owners.
+    /// The production runtime and every test build it here, so no caller
+    /// can end up with a subset of the families. Idempotent: the first
+    /// composition wins and later calls return it.
+    pub fn compose_checks(
+        &self,
+        daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+        disconnect_bound: std::time::Duration,
+    ) -> ComposedChecks {
+        let runner = self
+            .check_runner
+            .get_or_init(|| Arc::new(crate::check_runner::CheckRunner::new(self.db.clone())))
+            .clone();
+        let consumers = self
+            .check_consumers
+            .get_or_init(|| {
+                let consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
+                    self.db.clone(),
+                    runner.clone(),
+                ));
+                crate::integration_steps::IntegrationCheckFamily::register(
+                    &consumers,
+                    Arc::new(crate::integration_steps::IntegrationSteps::new(
+                        self.clone(),
+                    )),
+                );
+                consumers.register(
+                    db::CheckConsumerOrigin::Entry,
+                    Arc::new(crate::check_runner::review_entry::ReviewEntryChecks::new(
+                        self.db.clone(),
+                    )),
+                );
+                consumers
+            })
+            .clone();
+        let owners = self
+            .check_owners
+            .get_or_init(|| {
+                Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
+                    self.db.clone(),
+                    daemon_connections,
+                    disconnect_bound,
+                ))
+            })
+            .clone();
+        let worker = self
+            .check_worker
+            .get_or_init(|| {
+                Arc::new(crate::check_runner::worker::CheckRunWorker::new(
+                    self.db.clone(),
+                    owners.clone(),
+                ))
+            })
+            .clone();
+        ComposedChecks {
+            runner,
+            consumers,
+            worker,
+            owners,
+        }
+    }
+    /// The check worker `drain` drives. The runtime composes it before any
+    /// step runs; a service built without a runtime (tests) composes the
+    /// same runtime here, through [`Self::compose_checks`], with the daemon
+    /// registry the service was given (or one with no daemon connected).
+    pub fn check_worker_or_embedded(&self) -> Arc<crate::check_runner::worker::CheckRunWorker> {
+        if let Some(worker) = self.check_worker() {
+            return worker;
+        }
+        self.compose_checks(
+            self.daemon_connections.clone().unwrap_or_else(|| {
+                Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers())
+            }),
+            std::time::Duration::from_secs(60),
+        )
+        .worker
+    }
+    pub fn check_consumers(
+        &self,
+    ) -> Option<Arc<crate::check_runner::consumer::TaskCheckConsumers>> {
+        self.check_consumers.get().cloned()
+    }
+
+    /// Production services receive the runtime's shared owner router and
+    /// the workspace root the start settled.
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        event_bus: Arc<EventBus>,
+        workspace_backend_router: Arc<WorkspaceBackendRouter>,
+        workspace_root: PathBuf,
+    ) -> Self {
+        db.server_run_cap
+            .initialize_identity(&::config::embedded_machine_id());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
+        let workflow_engine =
+            Arc::new(WorkflowEngine::new(Arc::clone(&db), Arc::clone(&event_bus)));
         Self {
+            workflow_engine,
             db,
+            task_step_driver: Arc::default(),
+            task_step_replies: Arc::default(),
+            check_consumers: Arc::default(),
+            check_runner: Arc::default(),
+            check_owners: Arc::default(),
+            check_worker: Arc::default(),
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,
             review_runner: None,
             task_executor: None,
+            placement_adapter_registry: None,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             repo_cache_locks: None,
-            workspace_root: default_workspace_root(),
+            workspace_backend_router,
+            test_workspace_backend: false,
+            workspace_root,
+            workspace_max_disconnect: Duration::from_secs(::config::DEFAULT_MAX_DISCONNECT_SECONDS),
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
-            completion_cascades: Arc::default(),
-            completion_cascade_released: Arc::default(),
+            environment_rechecks: Arc::default(),
+            dispatch_notify: Arc::default(),
             credential_env: None,
+            dispatch_wake: Arc::default(),
+            dispatcher: Arc::default(),
         }
+    }
+
+    /// Embedded-only fixture constructor for tests outside this crate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let workspace_root = crate::workspace_root::fixture_root();
+        let router = crate::lifecycle::context::embedded_workspace_router_for_test(
+            Arc::clone(&db),
+            workspace_root.clone(),
+            None,
+        );
+        let mut service = Self::new_with_router(db, event_bus, router, workspace_root);
+        service.placement_adapter_registry =
+            Some(Arc::new(cli_adapters::test_support::test_registry()));
+        service.test_workspace_backend = true;
+        service
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self::new_for_test(db, event_bus)
     }
 
     pub fn with_merge_service(mut self, merge_service: Arc<MergeService>) -> Self {
         self.merge_service = Some(merge_service);
+        self.configure_workspace_backend();
+        self.task_step_driver = Arc::default();
         self
     }
 
-    pub(crate) async fn publish_domain_event_by_dedupe(&self, dedupe_key: &str) {
-        let service =
-            crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
-            tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
+    /// Inject the graph's shared router after configuring workspace dependencies.
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self.test_workspace_backend = false;
+        self.task_step_driver = Arc::default();
+        self
+    }
+
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
+    pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
+        Arc::clone(&self.workspace_backend_router)
+    }
+
+    fn configure_workspace_backend(&mut self) {
+        if !self.test_workspace_backend {
+            return;
         }
+        let merge_service = self.merge_service.clone().unwrap_or_else(|| {
+            Arc::new(MergeService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+                self.workspace_root.clone(),
+            ))
+        });
+        let mut embedded = EmbeddedWorkspaceBackend::new(
+            Arc::clone(&self.db),
+            merge_service,
+            self.workspace_root.clone(),
+        );
+        if let Some(locks) = &self.repo_cache_locks {
+            embedded = embedded.with_repo_cache_locks(Arc::clone(locks));
+        }
+        self.workspace_backend_router = Arc::new(WorkspaceBackendRouter::new(Arc::new(embedded)));
     }
 
     pub fn with_review_runner(mut self, review_runner: Arc<ReviewRunner>) -> Self {
         self.review_runner = Some(review_runner);
+        self.task_step_driver = Arc::default();
         self
+    }
+
+    pub(crate) fn dispatch_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.dispatch_notify)
+    }
+
+    pub(crate) fn register_dispatcher(
+        &self,
+        dispatcher: std::sync::Weak<crate::task_dispatcher::DispatcherInstance>,
+    ) {
+        *self.dispatcher.lock().expect("dispatcher registration") = dispatcher;
+    }
+
+    pub(crate) fn registered_dispatcher(
+        &self,
+    ) -> Option<Arc<crate::task_dispatcher::DispatcherInstance>> {
+        self.dispatcher
+            .lock()
+            .expect("dispatcher registration")
+            .upgrade()
     }
 
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {
         self.task_executor = Some(task_executor);
+        self.task_step_driver = Arc::default();
+        self
+    }
+
+    /// Supply the adapters used to determine embedded placement availability.
+    pub fn with_placement_adapter_registry(
+        mut self,
+        registry: Arc<executors::AdapterRegistry>,
+    ) -> Self {
+        self.placement_adapter_registry = Some(registry);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -535,11 +782,13 @@ impl TaskService {
         daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
     ) -> Self {
         self.daemon_connections = Some(daemon_connections);
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_workspace_exec_locks(mut self, locks: Arc<WorkspaceExecutionLockManager>) -> Self {
         self.workspace_exec_locks = Some(locks);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -548,6 +797,7 @@ impl TaskService {
         terminal_activity: Arc<TerminalActivityTracker>,
     ) -> Self {
         self.terminal_activity = Some(terminal_activity);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -556,6 +806,8 @@ impl TaskService {
             scheduler.set_repo_cache_locks(Arc::clone(&locks));
         }
         self.repo_cache_locks = Some(locks);
+        self.configure_workspace_backend();
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -567,16 +819,30 @@ impl TaskService {
             cleanup_scheduler.set_repo_cache_locks(Arc::clone(locks));
         }
         self.cleanup_scheduler = Some(cleanup_scheduler);
+        self.task_step_driver = Arc::default();
+        self
+    }
+
+    pub(crate) fn owner_wait_timeout(&self) -> Duration {
+        self.workspace_max_disconnect
+    }
+
+    pub fn with_workspace_max_disconnect(mut self, timeout: Duration) -> Self {
+        self.workspace_max_disconnect = timeout;
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = workspace_root;
+        self.configure_workspace_backend();
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_memory_service(mut self, memory_service: Arc<MemoryService>) -> Self {
         self.memory_service = memory_service;
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -588,20 +854,88 @@ impl TaskService {
         embedded: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
     ) -> Self {
         self.credential_env = Some(embedded);
+        self.task_step_driver = Arc::default();
         self
     }
 
     fn publish(&self, event: ForgeEvent) {
+        if matches!(
+            event.event_type.as_str(),
+            "execution.completed" | "execution.failed" | "execution.cancelled"
+        ) {
+            self.dispatch_wake.notify_one();
+        }
         self.event_bus.publish(event);
     }
 
-    /// Make a forced Project deletion safe to commit. Every running execution
-    /// is terminalized through the owner/version CAS and its provider is asked
-    /// to stop; any provider failure is returned. Leases that are not attached
-    /// to one of those executions are revoked explicitly as well. The caller
-    /// still performs a final DB in-use check immediately before deletion to
-    /// catch work admitted concurrently with this pass.
-    pub async fn prepare_project_deletion(&self, project_id: &str) -> Result<()> {
+    /// Phase one of a forced Project deletion. It changes nothing. A check
+    /// run that was dispatched to a daemon which is not connected (and not
+    /// removed) cannot be stopped or confirmed now, and its row is what
+    /// fences the process on that machine, so the deletion will be refused
+    /// whatever else is cancelled. The machines of those runs are returned:
+    /// the caller refuses before it cancels anything. A queued run, a run on
+    /// the server, a run on a connected daemon, a run whose owner already
+    /// reported and a run on a removed machine can all be settled.
+    pub async fn project_deletion_unreachable_machines(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>> {
+        validate_required("project_id", project_id)?;
+        let mut machines = std::collections::BTreeSet::new();
+        for (id, _, state) in self.db.live_project_check_runs(project_id).await? {
+            if state == "queued" {
+                continue;
+            }
+            let record = match db::CheckWorkerRepo::check_worker_record(&*self.db, &id).await {
+                Ok(record) => record,
+                Err(DbError::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if record.run.state.terminal() || record.receipt.is_some() {
+                continue;
+            }
+            let Some(db::CheckDispatchIntent {
+                target: db::CheckDispatchTarget::Daemon { workspace },
+                ..
+            }) = &record.dispatch
+            else {
+                continue;
+            };
+            let daemon: Option<(Option<String>, String)> =
+                sqlx::query_as("SELECT removed_at, hostname FROM daemon WHERE id = ?")
+                    .bind(&workspace.daemon_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+            let Some((None, hostname)) = daemon else {
+                // Removed or unknown: the check worker settles the run.
+                continue;
+            };
+            if !self
+                .daemon_connections
+                .as_ref()
+                .is_some_and(|registry| registry.is_connected(&workspace.daemon_id))
+            {
+                machines.insert(hostname);
+            }
+        }
+        Ok(machines.into_iter().collect())
+    }
+
+    /// Phase two of a forced Project deletion: make it safe to commit. Every
+    /// running execution is terminalized through the owner/version CAS and
+    /// its provider is asked to stop; any provider failure is returned.
+    /// Leases that are not attached to one of those executions are revoked
+    /// explicitly as well. Unfinished check runs are stopped and given until
+    /// `settle_until` to settle; the deadline is the caller's, so a request
+    /// that calls this several times waits once. The caller asks
+    /// [`Self::project_deletion_unreachable_machines`] first and still
+    /// performs a final DB in-use check immediately before deletion to catch
+    /// work admitted concurrently with this pass.
+    pub async fn prepare_project_deletion(
+        &self,
+        project_id: &str,
+        settle_until: tokio::time::Instant,
+    ) -> Result<()> {
         validate_required("project_id", project_id)?;
 
         let running = ExecutionRepo::list_running_for_project(&*self.db, project_id).await?;
@@ -661,7 +995,72 @@ impl TaskService {
                 }
             }
         }
-        Ok(())
+        self.stop_project_check_runs(project_id, settle_until).await
+    }
+
+    /// Force deletion stops the Project's unfinished check runs first and
+    /// waits, until `settle_until`, for each to settle. Their consumers are
+    /// cancelled, so nobody waits for a result: a queued run is cancelled
+    /// here, a running one is cancelled on its owner by the check worker
+    /// (which notices a run without consumers within about a second). A run
+    /// that has not settled by then stays live, and the deletion guard then
+    /// refuses: the row that fences the process is never deleted from under
+    /// it. Without a check worker nothing can settle a run, so nothing is
+    /// cancelled either.
+    async fn stop_project_check_runs(
+        &self,
+        project_id: &str,
+        settle_until: tokio::time::Instant,
+    ) -> Result<()> {
+        if self
+            .db
+            .live_project_check_runs(project_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let Some(worker) = self.check_worker() else {
+            return Ok(());
+        };
+        self.db.cancel_project_check_consumers(project_id).await?;
+        loop {
+            let live = self.db.live_project_check_runs(project_id).await?;
+            if live.is_empty() {
+                return Ok(());
+            }
+            for (id, version, state) in &live {
+                if state != "queued" {
+                    continue;
+                }
+                // A queued run has spawned nothing: it is settled as
+                // cancelled at once instead of at the worker's next sweep
+                // (or, on a full machine, when a slot frees).
+                let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                match db::CheckRunRepo::claim_check_run(
+                    &*self.db,
+                    id,
+                    *version,
+                    "project-deletion",
+                    &now_rfc3339(),
+                    &until,
+                )
+                .await
+                {
+                    Ok(run) => {
+                        if let Err(error) = worker.drive(run).await {
+                            tracing::warn!(run_id = %id, %error, "queued check run was not cancelled for Project deletion");
+                        }
+                    }
+                    Err(DbError::VersionConflict | DbError::NotFound) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if tokio::time::Instant::now() >= settle_until {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Prepare the scheduler-owned lease installed with a newly-created
@@ -686,24 +1085,24 @@ impl TaskService {
         .unwrap_or(Value::Null);
         let hard_deadline_at = execution::execution_deadline_seconds(&snapshot)
             .map(|seconds| execution::rfc3339_after(&input.updated_at, i64::from(seconds)));
-        let remote_owner = if let Some(agent_id) = input.agent_id.as_deref() {
-            AgentRepo::get_by_id(&*self.db, agent_id)
-                .await?
-                .and_then(|agent| {
-                    agent.daemon_id.as_deref().and_then(|daemon_id| {
-                        self.daemon_connections.as_ref().and_then(|registry| {
-                            registry.get(daemon_id).map(|connection| {
-                                crate::daemon_transport::execution_lease_owner(
-                                    daemon_id,
-                                    connection.id(),
-                                )
-                            })
-                        })
-                    })
-                })
-        } else {
-            None
+        let placement = match input.workspace_id.as_deref() {
+            Some(id) => db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, id).await?,
+            None => None,
         };
+        let daemon_id = placement.as_ref().and_then(|placement| {
+            placement
+                .execution_daemon_id
+                .as_deref()
+                .or(placement.daemon_id.as_deref())
+        });
+        let remote_owner = daemon_id.and_then(|daemon_id| {
+            self.daemon_connections
+                .as_ref()
+                .and_then(|registry| registry.get(daemon_id))
+                .map(|connection| {
+                    crate::daemon_transport::execution_lease_owner(daemon_id, connection.id())
+                })
+        });
         let (owner, lease_expires_at) = match remote_owner {
             Some(owner) => (
                 owner,
@@ -733,6 +1132,16 @@ impl TaskService {
         mut input: CreateExecution,
         workspace_created_by_attempt: bool,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(&input.task_id) {
+            return self
+                .request_task_command(
+                    &input.task_id,
+                    "create_running_execution",
+                    serde_json::json!([input, workspace_created_by_attempt]),
+                    false,
+                )
+                .await;
+        }
         let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
             let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
                 .await?
@@ -868,15 +1277,21 @@ impl TaskService {
                 admission.expected_auditor_execution_id = auditor_execution_id;
             }
         }
-        self.create_running_execution_with_admission(input, workspace_created_by_attempt, admission)
-            .await
+        self.create_running_execution_with_admission(
+            input,
+            workspace_created_by_attempt,
+            admission,
+            None,
+        )
+        .await
     }
 
-    pub(crate) async fn create_running_execution_with_admission(
+    async fn create_running_execution_with_admission(
         &self,
         mut input: CreateExecution,
         workspace_created_by_attempt: bool,
         mut admission: Option<ExecutionAdmission>,
+        workspace_admission: Option<&workspace::WorkspaceAdmission>,
     ) -> Result<Execution> {
         // Replay authority follows this call chain only; spawned execution
         // runners and unrelated API requests do not inherit the task-local.
@@ -945,69 +1360,97 @@ impl TaskService {
             }
         }
 
-        let create_result = if input.status == ExecutionStatus::Running {
-            let lease = self.initial_execution_lease(&input).await?;
-            ExecutionRepo::create_with_lease_and_admission(
-                &*self.db,
-                input.clone(),
-                lease,
-                admission,
-            )
-            .await
-        } else {
-            ExecutionRepo::create(&*self.db, input.clone()).await
-        };
+        let create_result: Result<Execution> = async {
+            if input.status == ExecutionStatus::Running {
+                let (task, workspace) = repository_context
+                    .as_ref()
+                    .expect("repository context loaded");
+                let prepared_admission;
+                let workspace_admission = match workspace_admission {
+                    Some(admission) => admission,
+                    None => {
+                        let agent = match input.agent_id.as_deref() {
+                            Some(id) => {
+                                Some(AgentRepo::get_by_id(&*self.db, id).await?.ok_or_else(
+                                    || ServiceError::not_found("agent", id.to_owned()),
+                                )?)
+                            }
+                            None => None,
+                        };
+                        // Placement adds a large reserve/prepare future to every
+                        // recovery path; keep it off the enclosing admission frame.
+                        let reservation = Box::pin(self.reserve_claim_workspace(
+                            task,
+                            agent.as_ref(),
+                            &input.role,
+                        ))
+                        .await?;
+                        prepared_admission =
+                            Box::pin(self.prepare_claim_workspace(reservation)).await?;
+                        &prepared_admission
+                    }
+                };
+                if workspace.id != workspace_admission.workspace.id {
+                    return Err(DbError::VersionConflict.into());
+                }
+                let lease = self.initial_execution_lease(&input).await?;
+                let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                self.check_claim_placement_in_tx(&mut transaction, task, workspace_admission)
+                    .await?;
+                self.check_placement_lease_owner(&workspace_admission.placement, &lease)?;
+                let execution = ExecutionRepo::create_with_lease_and_admission_in_tx(
+                    &*self.db,
+                    &mut transaction,
+                    input.clone(),
+                    lease,
+                    admission,
+                )
+                .await?;
+                self.issue_workspace_lease_in_tx(
+                    &mut transaction,
+                    task,
+                    &workspace_admission.workspace,
+                    &input.role,
+                    input.agent_id.as_deref(),
+                    &input.id,
+                )
+                .await?;
+                if let Some(attempt) = crate::workflow::engine::durable::current_hook(&input.task_id) {
+                    self.db.fence_hook_in_tx(&mut transaction, &attempt.step).await?;
+                    let linked = sqlx::query("UPDATE task_hook_checkpoint SET execution_id=? WHERE step_id=? AND hook_index=? AND execution_id IS NULL")
+                        .bind(&execution.id).bind(&attempt.step.id).bind(attempt.index).execute(&mut *transaction).await?.rows_affected();
+                    if linked != 1 { return Err(DbError::VersionConflict.into()); }
+                }
+                transaction.commit().await?;
+                Ok(execution)
+            } else {
+                Ok(ExecutionRepo::create(&*self.db, input.clone()).await?)
+            }
+        }
+        .await;
         let execution = match create_result {
             Ok(execution) => execution,
             Err(error) => {
-                if workspace_created_by_attempt {
+                if crate::placement::is_machine_capacity_refusal(&error) {
+                    if let Some(task) =
+                        TaskRepo::get_by_id(&*self.db, &input.task_id, false).await?
+                    {
+                        self.defer_placement_refusal(&task, &error).await?;
+                    }
+                }
+                if workspace_created_by_attempt
+                    && !crate::placement::is_machine_capacity_refusal(&error)
+                {
                     self.cleanup_fresh_execution_workspace_by_id(
                         &input.task_id,
                         input.workspace_id.as_deref(),
                     )
                     .await;
                 }
-                return Err(error.into());
-            }
-        };
-        if let Some((task, workspace)) = repository_context.as_ref() {
-            if let Err(error) = self
-                .issue_workspace_lease(
-                    task,
-                    workspace,
-                    &input.role,
-                    input.agent_id.as_deref(),
-                    &input.id,
-                )
-                .await
-            {
-                if let Err(mark_error) = self
-                    .fail_execution_before_dispatch(&execution.id, error.to_string())
-                    .await
-                {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %mark_error,
-                        "failed to terminalize execution after WorkspaceLease rejection"
-                    );
-                }
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(task, workspace)
-                        .await;
-                }
                 return Err(error);
             }
-        }
+        };
         Ok(execution)
-    }
-
-    pub(crate) async fn cleanup_fresh_execution_workspace(
-        &self,
-        task: &Task,
-        workspace: &Workspace,
-    ) {
-        self.cleanup_fresh_execution_workspace_by_id(&task.id, Some(&workspace.id))
-            .await;
     }
 
     async fn cleanup_fresh_execution_workspace_by_id(
@@ -1024,24 +1467,56 @@ impl TaskService {
         } else {
             None
         };
+        // Capture the server path while its placement row still exists. The
+        // conditional DELETE below is the admission/concurrent-launch fence.
+        let worktree_path = match workspace.as_ref() {
+            Some(workspace) => self
+                .workspace_backend_router
+                .embedded_path(&self.db, workspace)
+                .await
+                .ok(),
+            None => None,
+        };
         if let Some(workspace_id) = workspace_id {
             // Delete only our workspace row and only while no execution has
             // acquired it. This protects a concurrent launch which reused
             // the same Task workspace after this attempt lost admission.
-            match sqlx::query(
-                "DELETE FROM workspace
-                 WHERE id = ? AND task_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM execution
-                       WHERE execution.workspace_id = workspace.id
-                   )",
-            )
-            .bind(workspace_id)
-            .bind(task_id)
-            .execute(self.db.pool())
-            .await
-            {
-                Ok(result) => removed_workspace = result.rows_affected() == 1,
+            let deleted: std::result::Result<bool, db::DbError> = async {
+                let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                let removed = sqlx::query(
+                    "DELETE FROM workspace
+                     WHERE id = ? AND task_id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM execution
+                           WHERE execution.workspace_id = workspace.id
+                       )",
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    == 1;
+                if removed {
+                    // A cancellation fences its Task through this row.
+                    if let Err(error) = self
+                        .db
+                        .produce_condition_in_tx(
+                            &mut transaction,
+                            task_id,
+                            db::ConditionChange::Operations,
+                        )
+                        .await
+                    {
+                        tracing::warn!(task_id, %error, "Task condition not updated after workspace removal");
+                    }
+                }
+                transaction.commit().await?;
+                Ok(removed)
+            }
+            .await;
+            match deleted {
+                Ok(removed) => removed_workspace = removed,
                 Err(cleanup_error) => tracing::warn!(
                     task_id,
                     workspace_id,
@@ -1056,6 +1531,9 @@ impl TaskService {
         }
         if removed_workspace {
             let Some(workspace) = workspace else {
+                return;
+            };
+            let Some(worktree_path) = worktree_path else {
                 return;
             };
             let source = match RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await {
@@ -1073,11 +1551,7 @@ impl TaskService {
                 _ => return,
             };
             if let Err(cleanup_error) = manager
-                .cleanup_worktree(
-                    task_id,
-                    std::path::Path::new(&source),
-                    std::path::Path::new(&workspace.worktree_path),
-                )
+                .cleanup_worktree(task_id, std::path::Path::new(&source), &worktree_path)
                 .await
             {
                 tracing::warn!(
@@ -1393,27 +1867,28 @@ impl TaskService {
         } else {
             "failed"
         });
-        let (status, stop_reason, stopped_by, stopped_at, terminal_error) = match outcome {
-            "completed" => (ExecutionStatus::Completed, None, None, None, None),
-            "cancelled" => (
-                ExecutionStatus::Cancelled,
-                Some(db::StopReason::ExecutorCancelled),
-                Some(Actor::system(api_types::SystemComponent::Executor).display()),
-                Some(notification.ts.clone()),
-                None,
-            ),
-            _ => (
-                ExecutionStatus::Failed,
-                Some(db::StopReason::ExecutorFailed),
-                Some(Actor::system(api_types::SystemComponent::Executor).display()),
-                Some(notification.ts.clone()),
-                Some(remote_terminal_error_message(
-                    notification.exit_code,
-                    signal,
-                    error,
-                )),
-            ),
-        };
+        let (mut status, mut stop_reason, mut stopped_by, mut stopped_at, mut terminal_error) =
+            match outcome {
+                "completed" => (ExecutionStatus::Completed, None, None, None, None),
+                "cancelled" => (
+                    ExecutionStatus::Cancelled,
+                    Some(db::StopReason::ExecutorCancelled),
+                    Some(Actor::system(api_types::SystemComponent::Executor).display()),
+                    Some(notification.ts.clone()),
+                    None,
+                ),
+                _ => (
+                    ExecutionStatus::Failed,
+                    Some(db::StopReason::ExecutorFailed),
+                    Some(Actor::system(api_types::SystemComponent::Executor).display()),
+                    Some(notification.ts.clone()),
+                    Some(remote_terminal_error_message(
+                        notification.exit_code,
+                        signal,
+                        error,
+                    )),
+                ),
+            };
 
         let executor_unavailable = notification.failure_class
             == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable);
@@ -1441,6 +1916,41 @@ impl TaskService {
             )?,
             None => None,
         };
+
+        let environment =
+            match TaskRepo::get_by_id(&*self.db, &current_execution.task_id, true).await? {
+                Some(task) => self.project_environment(&task.project_id).await?.env,
+                None => Default::default(),
+            };
+        let plan = if executors::task_role_can_write_plan(Some(&current_execution.role)) {
+            Some(
+                crate::plan_artifact::transport::candidate(
+                    &self.db,
+                    &current_execution,
+                    notification.plan_text.as_deref(),
+                    &environment,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if status == ExecutionStatus::Completed
+            && notification
+                .plan_text
+                .as_ref()
+                .is_some_and(|text| text.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES)
+        {
+            status = ExecutionStatus::Failed;
+            stop_reason = Some(db::StopReason::ExecutorFailed);
+            stopped_by = Some(Actor::system(api_types::SystemComponent::Executor).display());
+            stopped_at = Some(notification.ts.clone());
+            terminal_error = Some(format!(
+                "transported execution plan exceeds the {}-byte limit: {} bytes",
+                api_types::MAX_EXECUTION_PLAN_BYTES,
+                notification.plan_text.as_ref().unwrap().len()
+            ));
+        }
 
         let remote_reports = remote_usage_reports(&notification.usage_reports);
         let snapshot_value = current_execution
@@ -1562,41 +2072,45 @@ impl TaskService {
             }
             let attempt = ExecutionRepo::terminalize_with_ledger_and_invocations(
                 &*self.db,
-                execution::ledger::terminal_with_late_ledger(
-                    TerminalizeExecution {
-                        execution_id: notification.execution_id.clone(),
-                        expected_version: terminal_candidate.execution_version,
-                        lease_owner: Some(lease_owner.clone()),
-                        status: status.clone(),
-                        stop_reason: stop_reason.clone().map(Some),
-                        stopped_by: stopped_by.clone().map(Some),
-                        stopped_at: stopped_at.clone().map(Some),
-                        resume_policy: terminal_resume_policy.clone(),
-                        agent_session_id: notification.agent_session_id.clone().map(Some),
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        last_progress_at: None,
-                        summary: notification.summary.clone().map(Some),
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: notification.after_sha.clone().map(Some),
-                        error: terminal_error.clone().map(Some),
-                        executor_config_snapshot_json: snapshot_update.clone().map(Some),
-                        updated_at: terminal_updated_at.clone(),
-                        actor_type: "daemon".to_owned(),
-                        actor_id: Some(lease_owner.clone()),
-                        correlation_id: Some(format!(
-                            "remote-execution:{}",
-                            notification.execution_id
-                        )),
-                        causation_id: None,
-                        causation_depth: 0,
-                        lease_disposition: ExecutionLeaseDisposition::Revoke,
-                    },
-                    usage_settlements.clone(),
-                    Some(notification.terminal_report_id.clone()),
-                    Some(terminal_report_digest.clone()),
-                ),
+                {
+                    let mut input = execution::ledger::terminal_with_late_ledger(
+                        TerminalizeExecution {
+                            execution_id: notification.execution_id.clone(),
+                            expected_version: terminal_candidate.execution_version,
+                            lease_owner: Some(lease_owner.clone()),
+                            status: status.clone(),
+                            stop_reason: stop_reason.clone().map(Some),
+                            stopped_by: stopped_by.clone().map(Some),
+                            stopped_at: stopped_at.clone().map(Some),
+                            resume_policy: terminal_resume_policy.clone(),
+                            agent_session_id: notification.agent_session_id.clone().map(Some),
+                            agent_message_id: None,
+                            last_activity_at: None,
+                            last_progress_at: None,
+                            summary: notification.summary.clone().map(Some),
+                            logs_path: None,
+                            before_sha: None,
+                            after_sha: notification.after_sha.clone().map(Some),
+                            error: terminal_error.clone().map(Some),
+                            executor_config_snapshot_json: snapshot_update.clone().map(Some),
+                            updated_at: terminal_updated_at.clone(),
+                            actor_type: "daemon".to_owned(),
+                            actor_id: Some(lease_owner.clone()),
+                            correlation_id: Some(format!(
+                                "remote-execution:{}",
+                                notification.execution_id
+                            )),
+                            causation_id: None,
+                            causation_depth: 0,
+                            lease_disposition: ExecutionLeaseDisposition::Revoke,
+                        },
+                        usage_settlements.clone(),
+                        Some(notification.terminal_report_id.clone()),
+                        Some(terminal_report_digest.clone()),
+                    );
+                    input.plan = plan.clone();
+                    input
+                },
                 remote_invocations.clone(),
             )
             .await?;
@@ -1650,7 +2164,10 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
+        // A failure is not fenced: it is retried or blocks its Task under the
+        // current Project revision (`annotate_executor_failure_block`).
         if execution.role != crate::workflow::default_roles::INTERACTIVE
+            && execution.status != ExecutionStatus::Failed
             && execution_dispatch_project_version(execution) != Some(project.version)
         {
             tracing::info!(
@@ -1670,7 +2187,14 @@ impl TaskService {
 
         if execution.status != ExecutionStatus::Completed {
             if let Some(workspace) = workspace.as_ref() {
-                execution::discard_execution_plan_stage(&workspace.worktree_path, &execution.id);
+                // The plan stage sits in the Task root, beside the worktree.
+                if let Ok(path) = crate::workspace_backend::EmbeddedWorkspaceBackend::ensure_recorded_server_placement(&self.db, workspace)
+                    .await
+                    .map_err(ServiceError::from)
+                    .and_then(|placement| crate::workspace_manager::task_root_anchor_of(&placement))
+                {
+                    execution::discard_execution_plan_stage(&path.to_string_lossy(), &execution.id);
+                }
             }
         }
 
@@ -1790,6 +2314,14 @@ impl TaskService {
                 {
                     return Ok(false);
                 }
+            } else if assignment_role == crate::workflow::default_roles::CODER
+                && task.parent_task_id.is_some()
+            {
+                // An inherited root assignment is admission authority, not
+                // live ownership of an already-running child. Root default
+                // changes intentionally affect only children that have not
+                // started, so an admitted child with no own coder keeps its
+                // current role attempt through completion.
             } else if execution.agent_id.is_some() {
                 return Ok(false);
             }
@@ -1854,3 +2386,23 @@ fn remote_terminal_error_message(
 
 #[cfg(test)]
 mod tests;
+
+impl TaskService {
+    pub fn task_step_worker(&self) -> Arc<crate::worker_runtime::queue::TaskStepWorker> {
+        let mut cached = self.task_step_driver.lock().expect("Task step driver");
+        if let Some(worker) = cached.as_ref() {
+            return Arc::clone(worker);
+        }
+        let mut service = self.clone();
+        // The worker's service must not retain the cache that owns it.
+        service.task_step_driver = Arc::default();
+        let worker = Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(service));
+        let executor: Arc<dyn db::task_writer::TaskStepExecutor> = worker.clone();
+        self.db.set_task_step_executor(Arc::downgrade(&executor));
+        *cached = Some(worker.clone());
+        worker
+    }
+    pub async fn drain(&self, task_id: &str) -> Result<Task> {
+        self.task_step_worker().drain(task_id).await
+    }
+}

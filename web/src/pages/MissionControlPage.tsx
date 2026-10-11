@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import {
   ArrowClockwise,
@@ -15,9 +15,19 @@ import {
 } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { useAgentChatsQuery } from '@/features/agent-chat/hooks'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  useAgentChatsQuery,
+  useAgentChatTurnsQuery,
+  useRetryAgentChatTurnMutation,
+} from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
-import { useMissionControlQuery } from '@/features/federation/hooks'
+import type { RetryTurnAction } from '@/types/generated/bindings/RetryTurnAction'
+import {
+  useAnswerEscalationMutation,
+  useMissionControlQuery,
+  useResolveAttentionMutation,
+} from '@/features/federation/hooks'
 import type {
   AgentHealthItem,
   AttentionConsumerHealth,
@@ -75,6 +85,31 @@ function count(value: bigint | number): number {
   return typeof value === 'bigint' ? Number(value) : value
 }
 
+function attentionRetryAction(
+  item: AttentionItem,
+): (Omit<RetryTurnAction, 'expected_version'> & { expected_version: number }) | null {
+  if (item.lifecycle === 'resolved') return null
+  const candidate = item.details.retry_action
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null
+  const action = candidate as Record<string, unknown>
+  if (
+    action.kind !== 'retry_turn' ||
+    typeof action.chat_id !== 'string' ||
+    typeof action.turn_id !== 'string' ||
+    typeof action.expected_version !== 'number' ||
+    !Number.isSafeInteger(action.expected_version) ||
+    action.expected_version < 0
+  ) {
+    return null
+  }
+  return {
+    kind: action.kind,
+    chat_id: action.chat_id,
+    turn_id: action.turn_id,
+    expected_version: action.expected_version,
+  }
+}
+
 function attentionTone(item: AttentionItem): string {
   if (
     [
@@ -93,6 +128,7 @@ function attentionTone(item: AttentionItem): string {
       'review_risk',
       'budget_threshold',
       'commitment_overdue',
+      'conflict_hotspot',
       'progress_warning',
     ].includes(item.category)
   ) {
@@ -101,9 +137,71 @@ function attentionTone(item: AttentionItem): string {
   return 'border-border-subtle bg-card'
 }
 
+function escalationOf(item: AttentionItem): { id: string; need: string } | null {
+  if (item.recommended_action !== 'answer_escalation' || item.scope_type !== 'project') return null
+  const id = item.details.escalation_id
+  const need = item.details.need
+  return typeof id === 'string' && id
+    ? { id, need: typeof need === 'string' ? need : item.summary }
+    : null
+}
+
+/** The owner's answer to a Project Agent escalation; it wakes the Agent. */
+function EscalationAnswer({
+  item,
+  escalation,
+}: {
+  item: AttentionItem
+  escalation: { id: string; need: string }
+}) {
+  const [answer, setAnswer] = useState('')
+  const submit = useAnswerEscalationMutation()
+  const inputId = `escalation-answer-${item.id}`
+  return (
+    <div className="mt-3 space-y-2">
+      <p className="whitespace-pre-wrap text-xs leading-5 text-foreground">{escalation.need}</p>
+      <label htmlFor={inputId} className="sr-only">
+        Answer
+      </label>
+      <Textarea
+        id={inputId}
+        value={answer}
+        maxLength={4096}
+        placeholder="Answer the Project Agent"
+        disabled={submit.isPending || submit.isSuccess}
+        onChange={(event) => setAnswer(event.target.value)}
+      />
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!answer.trim() || submit.isPending || submit.isSuccess}
+        onClick={() =>
+          submit.mutate({ projectId: item.scope_id, escalationId: escalation.id, answer })
+        }
+      >
+        {submit.isPending ? 'Answering…' : 'Answer'}
+      </Button>
+      {submit.error ? (
+        <p className="text-xs text-destructive" role="alert">
+          {submit.error.message}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 function AttentionCard({ item }: { item: AttentionItem }) {
   const isProgressWarning = item.category === 'progress_warning'
   const taskId = isProgressWarning ? attentionTaskId(item) : null
+  const retryAction = attentionRetryAction(item)
+  const retryTurn = useRetryAgentChatTurnMutation(retryAction?.chat_id)
+  const resolve = useResolveAttentionMutation()
+  const escalation = escalationOf(item)
+  const turns = useAgentChatTurnsQuery(retryAction?.chat_id)
+  const anotherTurnLive =
+    turns.data?.some((turn) =>
+      ['queued', 'leased', 'retry_wait', 'awaiting_input'].includes(turn.status),
+    ) ?? false
   return (
     <article
       className={`rounded-lg border p-4 ${attentionTone(item)}`}
@@ -122,6 +220,17 @@ function AttentionCard({ item }: { item: AttentionItem }) {
               {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
             </h3>
             <StateBadge status={item.lifecycle} />
+            {item.lifecycle !== 'resolved' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto"
+                disabled={resolve.isPending || resolve.isSuccess}
+                onClick={() => resolve.mutate({ id: item.id, expectedVersion: item.version })}
+              >
+                {resolve.isPending ? 'Resolving…' : 'Resolve'}
+              </Button>
+            ) : null}
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             {isProgressWarning ? (
@@ -139,7 +248,30 @@ function AttentionCard({ item }: { item: AttentionItem }) {
           {item.recommended_action ? (
             <div className="mt-3 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2 text-xs font-medium text-foreground">
               <span>Next: </span>
-              {isProgressWarning && taskId && isInspectRunAction(item.recommended_action) ? (
+              {retryAction ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={
+                    retryTurn.isPending ||
+                    retryTurn.isSuccess ||
+                    turns.isLoading ||
+                    turns.isError ||
+                    anotherTurnLive
+                  }
+                  onClick={() =>
+                    retryTurn.mutate({
+                      turnId: retryAction.turn_id,
+                      input: {
+                        expected_version: retryAction.expected_version,
+                        idempotency_key: `agent-chat-turn-retry:${retryAction.turn_id}:${retryAction.expected_version}`,
+                      },
+                    })
+                  }
+                >
+                  {retryTurn.isPending ? 'Retrying…' : 'Retry turn'}
+                </Button>
+              ) : isProgressWarning && taskId && isInspectRunAction(item.recommended_action) ? (
                 <Link
                   to="/tasks/$taskId/$tab"
                   params={{ taskId, tab: 'executions' }}
@@ -153,6 +285,19 @@ function AttentionCard({ item }: { item: AttentionItem }) {
                 <span>{attentionActionLabel(item.recommended_action)}</span>
               )}
             </div>
+          ) : null}
+          {escalation && item.lifecycle !== 'resolved' ? (
+            <EscalationAnswer item={item} escalation={escalation} />
+          ) : null}
+          {retryTurn.error ? (
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {retryTurn.error.message}
+            </p>
+          ) : null}
+          {resolve.error ? (
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {resolve.error.message}
+            </p>
           ) : null}
         </div>
       </div>
@@ -551,10 +696,6 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
       <p className="mt-3 text-sm font-medium text-foreground">{health.consumer_name}</p>
       <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2">
         <div>
-          <p className="text-muted-foreground">Processed events</p>
-          <p className="mt-1 font-mono text-foreground">{health.processed_events}</p>
-        </div>
-        <div>
           <p className="text-muted-foreground">Last sequence</p>
           <p className="mt-1 font-mono text-foreground">{health.last_sequence}</p>
         </div>
@@ -563,6 +704,9 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
         Last success {formatDate(health.last_success_at)}
         {health.last_error_code ? ` · ${health.last_error_code}` : ''}
       </p>
+      {health.last_error_message ? (
+        <p className="mt-2 text-xs text-muted-foreground">{health.last_error_message}</p>
+      ) : null}
     </Card>
   )
 }

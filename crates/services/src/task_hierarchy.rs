@@ -1,7 +1,10 @@
 //! Root-Task and ordered-subtask classification and policy.
 
-use api_types::{CanonicalPhase, StateKind, WorkflowDefinition};
-use db::{ProjectRepo, SqliteDb, Task, TaskRepo};
+#[cfg(test)]
+use std::collections::HashSet;
+
+use api_types::{CanonicalPhase, EffectiveCoderSource, StateKind, WorkflowDefinition};
+use db::{ProjectRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo};
 use sqlx::SqliteConnection;
 
 use crate::{
@@ -52,7 +55,8 @@ impl<'a> RootRolePolicy<'a> {
 
     /// Return whether `role` may be assigned to a coordination root.
     pub(crate) fn allows_assignment(&self, role: &str) -> bool {
-        self.implementation_role() != Some(role) && self.is_aggregate_review_role(role)
+        role == crate::workflow::default_roles::CODER
+            || (self.implementation_role() != Some(role) && self.is_aggregate_review_role(role))
     }
 
     /// Return the only role that may execute on a coordination root in
@@ -71,23 +75,92 @@ impl<'a> RootRolePolicy<'a> {
 
     /// Return whether `role` may execute on a coordination root in `state_name`.
     pub(crate) fn allows_execution(&self, state_name: &str, role: &str) -> bool {
-        self.execution_role_for_state(state_name) == Some(role)
+        role != crate::workflow::default_roles::CODER
+            && self.implementation_role() != Some(role)
+            && self.execution_role_for_state(state_name) == Some(role)
     }
 }
 
 /// Error returned when a role may not be assigned to a coordination root.
 pub(crate) fn root_assignment_denied() -> ServiceError {
     ServiceError::invalid_operation(
-        "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
+        "coordination roots accept only the coder default worker and aggregate review roles",
+    )
+}
+
+/// A Task's resolved coder assignment and the row that supplied it.
+#[derive(Debug, Clone)]
+pub struct EffectiveCoderAssignment {
+    pub assignment: TaskRoleAssignment,
+    pub source: EffectiveCoderSource,
+}
+
+/// Resolve coder authority without materializing inherited rows on children.
+///
+/// A child's own row wins even when its assignee is empty. Only the absence of
+/// an own row falls back to the direct coordination root.
+pub async fn effective_coder_assignment(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    if let Some(assignment) = TaskRoleAssignmentRepo::get_by_task_and_role(
+        db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await?
+    {
+        return Ok(Some(EffectiveCoderAssignment {
+            assignment,
+            source: EffectiveCoderSource::Own,
+        }));
+    }
+
+    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+        return Ok(None);
+    };
+    Ok(TaskRoleAssignmentRepo::get_by_task_and_role(
+        db,
+        parent_task_id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await?
+    .map(|assignment| EffectiveCoderAssignment {
+        assignment,
+        source: EffectiveCoderSource::InheritedFromRoot,
+    }))
+}
+
+/// Resolve an execution role, applying root inheritance only to `coder`.
+pub async fn effective_role_assignment(
+    db: &SqliteDb,
+    task: &Task,
+    role: &str,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    let canonical_role = if role == "executor" {
+        crate::workflow::default_roles::CODER
+    } else {
+        role
+    };
+    if canonical_role == crate::workflow::default_roles::CODER {
+        return effective_coder_assignment(db, task).await;
+    }
+    Ok(
+        TaskRoleAssignmentRepo::get_by_task_and_role(db, &task.id, canonical_role)
+            .await?
+            .map(|assignment| EffectiveCoderAssignment {
+                assignment,
+                source: EffectiveCoderSource::Own,
+            }),
     )
 }
 
 /// Return whether any root-blocking or recovery field is present.
 pub(crate) fn root_blocked(task: &Task) -> bool {
-    task.blocked_json.is_some()
-        || task.failed_json.is_some()
-        || task.error_annotation.is_some()
-        || task.entry_barrier_json.is_some()
+    task.condition.read().interruption_present
+        || task.condition.read().hard_failure
+        || task.condition.read().diagnostic_present
+        || task.condition.read().entry_recorded
 }
 
 /// Return whether a child is terminal in either inherited or Project workflow.
@@ -155,6 +228,27 @@ pub(crate) async fn coordination_root_has_subtasks(db: &SqliteDb, task: &Task) -
         return Ok(false);
     }
     Ok(!ordered_children(db, &task.id).await?.is_empty())
+}
+
+/// Project-scoped batch form of `coordination_root_has_subtasks`, with the
+/// same visible-child semantics, for slot counting without a query per root.
+#[cfg(test)]
+pub(crate) async fn coordination_root_ids_with_subtasks(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<HashSet<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT root.id FROM task AS root
+         WHERE root.project_id = ? AND root.parent_task_id IS NULL
+           AND root.deleted_at IS NULL
+           AND EXISTS (SELECT 1 FROM task AS child
+                       WHERE child.parent_task_id = root.id AND child.deleted_at IS NULL)",
+    )
+    .bind(project_id)
+    .fetch_all(db.pool())
+    .await?
+    .into_iter()
+    .collect())
 }
 
 /// Check coordination-root status inside an existing write transaction.
@@ -245,6 +339,29 @@ pub(crate) async fn coordination_root_context(
     Ok((parent, workflow))
 }
 
+/// Refuse a new subtask under a parent whose state never dispatches a child
+/// (the state rule of [`coordination_root_allows_child_dispatch`]): a
+/// terminal parent stays terminal, and a parent in a review-phase gate
+/// (review, merging) is judged on the work it already has. A working state
+/// in the review phase (`merge_failed`) does dispatch children, so a
+/// corrective subtask is accepted there.
+pub(crate) fn ensure_parent_accepts_subtasks(
+    parent: &Task,
+    workflow: &WorkflowDefinition,
+) -> Result<()> {
+    let kind = workflow.state_kind(&parent.status);
+    let closed = kind == Some(StateKind::Terminal)
+        || (kind == Some(StateKind::Gate)
+            && workflow.canonical_phase_for_state(&parent.status) == CanonicalPhase::Review);
+    if closed {
+        return Err(ServiceError::SubtaskParentClosed {
+            parent_task_id: parent.id.clone(),
+            state: parent.status.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Return whether a root state permits its next child to dispatch.
 pub(crate) fn coordination_root_allows_child_dispatch(
     parent: &Task,
@@ -267,6 +384,7 @@ pub(crate) fn coordination_root_allows_child_dispatch(
 }
 
 /// Return whether a coordination root's non-empty child sequence is complete.
+#[cfg(test)]
 pub(crate) async fn coordination_root_sequence_complete(
     db: &SqliteDb,
     task: &Task,
@@ -324,25 +442,13 @@ pub async fn is_subtask(db: &SqliteDb, task_id: &str) -> Result<bool> {
     Ok(!is_root_task(db, task_id).await?)
 }
 
-/// Resolve a Task to itself when root, or to its direct parent when a child.
-pub async fn root_for(db: &SqliteDb, task_id: &str) -> Result<Task> {
-    let task = TaskRepo::get_by_id(db, task_id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
-        return Ok(task);
-    };
-    TaskRepo::get_by_id(db, parent_task_id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn task(id: &str, status: &str, parent_task_id: Option<&str>) -> Task {
         Task {
+            condition: Default::default(),
             id: id.to_owned(),
             project_id: "project".to_owned(),
             parent_task_id: parent_task_id.map(str::to_owned),
@@ -370,6 +476,39 @@ mod tests {
             version: 0,
             created_at: "2026-09-28T00:00:00Z".to_owned(),
             updated_at: "2026-09-28T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// A subtask is refused exactly where the parent's state never
+    /// dispatches a child, so a corrective subtask under `merge_failed`
+    /// (a working state in the review phase) is accepted.
+    #[test]
+    fn parent_refuses_subtasks_only_in_states_that_never_dispatch_a_child() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        for (status, accepts) in [
+            ("backlog", true),
+            ("todo", true),
+            ("planning", true),
+            ("in_progress", true),
+            ("merge_failed", true),
+            ("review", false),
+            ("merging", false),
+            ("done", false),
+            ("cancelled", false),
+        ] {
+            let parent = task("root", status, None);
+            let refusal = ensure_parent_accepts_subtasks(&parent, &workflow);
+            assert_eq!(refusal.is_ok(), accepts, "{status}");
+            if !accepts {
+                assert!(
+                    !coordination_root_allows_child_dispatch(&parent, &workflow),
+                    "{status}: refused although its children would be dispatched"
+                );
+                assert!(matches!(
+                    refusal,
+                    Err(ServiceError::SubtaskParentClosed { state, .. }) if state == status
+                ));
+            }
         }
     }
 
@@ -425,27 +564,34 @@ mod tests {
         assert!(!root_blocked(&root));
 
         root.blocked_json = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.blocked_json = None;
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         root.failed_json = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.failed_json = None;
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         root.error_annotation = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.error_annotation = None;
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         root.entry_barrier_json = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
     }
 
     #[test]
-    fn task_hierarchy_root_role_policy_allows_only_aggregate_review() {
+    fn task_hierarchy_root_role_policy_allows_default_worker_and_aggregate_review() {
         let mut workflow = crate::workflow::default_workflow::default_workflow();
         let policy = RootRolePolicy::for_workflow(&workflow);
 
         assert_eq!(policy.implementation_role(), Some("coder"));
         assert!(policy.is_aggregate_review_role("reviewer"));
         assert!(policy.allows_assignment("reviewer"));
-        assert!(!policy.allows_assignment("coder"));
+        assert!(policy.allows_assignment("coder"));
         assert!(!policy.allows_assignment("planner"));
 
         workflow
@@ -456,7 +602,8 @@ mod tests {
             .role = Some("coder".to_owned());
         let policy = RootRolePolicy::for_workflow(&workflow);
         assert!(policy.is_aggregate_review_role("coder"));
-        assert!(!policy.allows_assignment("coder"));
+        assert!(policy.allows_assignment("coder"));
+        assert!(!policy.allows_execution(default_states::REVIEW, "coder"));
     }
 
     #[test]
@@ -498,6 +645,7 @@ mod tests {
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
         root.status = default_states::IN_PROGRESS.to_owned();
         root.error_annotation = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
     }
 }

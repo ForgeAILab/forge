@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202609302227 (protected session snapshot digest).
+// Embedded migration bundle revision: V202610101906 (check run and check consumer changes that free a machine slot mark the run-slot waiters; existing run-slot wait rows are made due once); previous V202610101235 (nullable daemon disk_json: the disk facts of a daemon's workspace root from its report); previous V202610100820 (step status `suspended` with wake deadline and awaited check consumer; data-preserving task_step rebuild); previous V202610100719 (nullable workspace disk_bytes and disk_measured_at written by the garbage-collection sweep); previous V202610100137 (step kind `integration` for the queue's Task-step consumer; data-preserving task_step rebuild); previous V202610091612 (passive integration activation: cancel request, head timings, sweep and retention indexes); previous V202610091347 (durable check worker intent, receipt and delivery checkpoints); previous V202610082320 (check run identity: applied timeout, consumer purpose, no-cleanup pass; data-preserving check_result rebuild); previous V202610082317 (integration owner fences and attempt receipts); previous V202610080851 (passive canonical check runs/results/consumers); previous V202610080123 (passive integration queues and attempts); previous V202610070507 (condition public readers, projection revisions and retry index); previous V202610060838 (internal Task scheduler dirty generations, parks and sweep cursor, running-Task execution index); previous V202610060030 (Task condition shadow column with a Rust-mapped preserving backfill; no view or trigger); previous V202610052305 (data-preserving machine registration tombstones and guarded cleanup receipt abandonment); previous V202610051649 (per-kind Task budget ledger and retained-allowance backfill); previous V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -38,7 +38,18 @@ struct Migration {
     path: PathBuf,
 }
 
+#[cfg(feature = "test-template")]
+mod template;
+
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    #[cfg(feature = "test-template")]
+    if template::try_restore(pool).await? {
+        return Ok(());
+    }
+    run_migrations_replay(pool).await
+}
+
+async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
     ensure_migration_table(pool).await?;
 
     let mut migrations: Vec<(Migration, String)> = MIGRATIONS_DIR
@@ -63,6 +74,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     }
 
     reconcile_project_admission_bindings(pool).await?;
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
 
     Ok(())
 }
@@ -332,6 +344,7 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
         apply_migration(pool, &migration).await?;
     }
 
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
     Ok(())
 }
 
@@ -382,18 +395,16 @@ async fn pending_migrations<T>(
     Ok(pending)
 }
 
-async fn ensure_migration_table(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        r#"
+const MIGRATION_TABLE_SQL: &str = r#"
         CREATE TABLE IF NOT EXISTS _migration (
             version     INTEGER PRIMARY KEY,
             name        TEXT NOT NULL,
             applied_at  TEXT NOT NULL
         )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+        "#;
+
+async fn ensure_migration_table(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(MIGRATION_TABLE_SQL).execute(pool).await?;
     Ok(())
 }
 
@@ -472,6 +483,25 @@ async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str
         let mut transaction = crate::begin_immediate(pool).await?;
 
         sqlx::raw_sql(sql).execute(&mut *transaction).await?;
+        if migration.name == "task_budgets" {
+            crate::budget::migrate_pending_mutations(&mut transaction).await?;
+        }
+        if migration.name == "task_condition_readers" {
+            // A presentation rewrite must not fan out across all capacity waiters
+            // or turn settled history into newly dirty scheduler work.
+            let triggers: Vec<(String,String)> = sqlx::query_as("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND name IN ('task_schedule_update','task_schedule_relationship')").fetch_all(&mut *transaction).await?;
+            for (name, _) in &triggers {
+                sqlx::raw_sql(&format!("DROP TRIGGER {name}"))
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            crate::task_condition::backfill(&mut transaction).await?;
+            for (_, ddl) in triggers {
+                sqlx::raw_sql(&ddl).execute(&mut *transaction).await?;
+            }
+        } else if migration.name == "task_condition" {
+            crate::task_condition::backfill(&mut transaction).await?;
+        }
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(migration.version)
             .bind(&migration.name)
@@ -495,6 +525,205 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn single_writer_upgrade_preserves_claims_causation_and_hook_script_checkpoints() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        ensure_migration_table(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE task(id TEXT PRIMARY KEY); CREATE TABLE workspace(id TEXT PRIMARY KEY); CREATE TABLE workspace_placement(id TEXT PRIMARY KEY); CREATE TABLE execution(id TEXT PRIMARY KEY); INSERT INTO task VALUES('t');").execute(&pool).await.unwrap();
+        let old = include_str!("../migrations/V202610040225__durable_hook_steps.sql");
+        let schema = old
+            .split("INSERT INTO task_step_new")
+            .next()
+            .unwrap()
+            .replace("task_step_new", "task_step");
+        sqlx::raw_sql(&schema).execute(&pool).await.unwrap();
+        let checkpoints = format!(
+            "CREATE TABLE task_hook_checkpoint{}",
+            old.split("CREATE TABLE task_hook_checkpoint")
+                .nth(1)
+                .unwrap()
+                .split("-- Legacy running")
+                .next()
+                .unwrap()
+        );
+        sqlx::raw_sql(&checkpoints).execute(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,attempts,created_at,updated_at,expected_epoch,lane) VALUES('hooks','t',1,'hooks','{}','entry','chain',1,'review',7,'claimed','owner','2099-01-01','2000-01-01',2,'2000-01-01','2000-01-01',5,'long'); INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,expected_epoch,lane) VALUES('cascade','t',2,'cascade','{}','hooks','next','chain',2,'review',7,'pending','2000-01-01','2000-01-01','2000-01-01',5,'fast'); INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,result_json,effects_json) VALUES('hooks',0,'2000-01-01','{\"Ok\":null}','{\"effect\":\"kept\"}'); INSERT INTO task_hook_script(step_id,hook_index,script_index,started_at,result_json) VALUES('hooks',0,0,'2000-01-01','{\"status\":\"passed\"}');").execute(&pool).await.unwrap();
+        apply_migration_sql(
+            &pool,
+            &Migration {
+                version: 202610051045,
+                name: "task_single_writer".into(),
+                path: PathBuf::new(),
+            },
+            include_str!("../migrations/V202610051045__task_single_writer.sql"),
+        )
+        .await
+        .unwrap();
+        let claim: (String,String,String,i64,i64) = sqlx::query_as("SELECT status,claimed_by,lease_until,attempts,expected_epoch FROM task_step WHERE id='hooks'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            claim,
+            ("claimed".into(), "owner".into(), "2099-01-01".into(), 2, 5)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT causation_step_id FROM task_step WHERE id='cascade'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "hooks"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT effects_json FROM task_hook_checkpoint WHERE step_id='hooks'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "{\"effect\":\"kept\"}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_json FROM task_hook_script WHERE step_id='hooks'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "{\"status\":\"passed\"}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_list_revision_triggers_exist_after_bundled_migrations() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        run_migrations_replay(&pool).await.unwrap();
+        let expected: std::collections::BTreeSet<String> =
+            include_str!("../migrations/V202610011636__task_list_revisions.sql")
+                .lines()
+                .chain(include_str!("../migrations/V202610051649__task_budgets.sql").lines())
+                .filter_map(|line| line.strip_prefix("CREATE TRIGGER "))
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| name.starts_with("task_list_revision_"))
+                .map(str::to_owned)
+                .collect();
+        assert!(!expected.is_empty());
+        let actual: std::collections::BTreeSet<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'task_list_revision_*'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn task_list_revision_migration_accepts_malformed_metadata() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        ensure_migration_table(&pool).await.unwrap();
+        let mut bundle: Vec<_> = MIGRATIONS_DIR
+            .files()
+            .filter(|file| file.path().extension().is_some_and(|ext| ext == "sql"))
+            .map(|file| {
+                (
+                    parse_migration_path(file.path().to_path_buf()).unwrap(),
+                    file.contents_utf8().unwrap(),
+                )
+            })
+            .collect();
+        bundle.sort_by_key(|(migration, _)| migration.version);
+        for (migration, sql) in bundle
+            .iter()
+            .filter(|(migration, _)| migration.version < 202610011636)
+        {
+            apply_migration_sql(&pool, migration, sql).await.unwrap();
+        }
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('malformed-project', 'Malformed metadata', 'now', 'now')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task (id, project_id, title, metadata_json, created_at, updated_at) VALUES ('empty', 'malformed-project', 'Empty', '', 'now', 'now'), ('invalid', 'malformed-project', 'Invalid', 'not JSON', 'now', 'now')").execute(&pool).await.unwrap();
+        run_migrations_replay(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task (id, project_id, title, metadata_json, created_at, updated_at) VALUES ('after', 'malformed-project', 'After', 'still not JSON', 'now', 'now')").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE task SET metadata_json = '' WHERE id = 'after'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET metadata_json = 'not JSON either' WHERE id = 'empty'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let metadata: Vec<String> = sqlx::query_scalar(
+            "SELECT metadata_json FROM task WHERE project_id = 'malformed-project' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(metadata, ["", "not JSON either", "not JSON"]);
+        let db = crate::SqliteDb::new(pool.clone());
+        assert!(
+            db.begin_task_list_read("malformed-project")
+                .await
+                .unwrap()
+                .conditional_safe
+        );
+        let plans = sqlx::query("EXPLAIN QUERY PLAN SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_extract(condition_json,'$.evidence.presentation.retry_recorded')=1 AND deleted_at IS NULL)")
+            .bind("malformed-project").fetch_all(&pool).await.unwrap();
+        assert!(
+            plans.iter().any(|row| row
+                .get::<String, _>("detail")
+                .contains("idx_task_condition_retry_project")),
+            "the guarded probe must use idx_task_condition_retry_project"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_turn_failure_migration_preserves_historical_outcomes() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE agent_chat_turn_job (id TEXT PRIMARY KEY, attempt_count INTEGER NOT NULL, error_code TEXT, error_message TEXT); CREATE TABLE usage_invocation (source_id TEXT, attempt_ordinal INTEGER); INSERT INTO agent_chat_turn_job VALUES ('old', 3, 'configuration_invalid', 'old provider failure'), ('parked', 0, NULL, NULL); INSERT INTO usage_invocation VALUES ('parked', 0), ('parked', 4), ('old', 1);")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/V202610010600__chat_turn_failure_class.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = 'old'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let parked_count: i64 = sqlx::query_scalar(
+            "SELECT invocation_count FROM agent_chat_turn_job WHERE id = 'parked'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            parked_count, 5,
+            "parked invocations must never reuse ledger ordinals"
+        );
+        assert_eq!(row.get::<i64, _>("attempt_count"), 3);
+        assert_eq!(row.get::<i64, _>("invocation_count"), 3);
+        assert_eq!(row.get::<i64, _>("pre_provider_failure_count"), 0);
+        assert_eq!(row.get::<String, _>("error_code"), "configuration_invalid");
+        assert_eq!(
+            row.get::<String, _>("error_message"),
+            "old provider failure"
+        );
+        assert!(row.get::<Option<String>, _>("failure_class_json").is_none());
+        assert!(row.get::<Option<String>, _>("retry_decision").is_none());
+    }
 
     #[test]
     fn bundled_migrations_have_unique_versions_and_timestamp_numbers_after_v149() {
@@ -533,6 +762,47 @@ mod tests {
                 "migration `{name}` uses version {version}; migrations after V{LAST_SEQUENTIAL_VERSION} \
                  must use their UTC creation time (VYYYYMMDDHHMM__name.sql)"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod machine_capacity_tests {
+    #[tokio::test]
+    async fn machine_capacity_migration_carries_label_priority_and_preserves_null() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE daemon (id TEXT, labels_json TEXT); INSERT INTO daemon VALUES
+            ('priority', '{\"max_concurrent_sessions\":6,\"max_sessions\":2}'),
+            ('fallback', '{\"max_concurrent_sessions\":0,\"active_session_cap\":3}'),
+            ('empty', '{}'), ('invalid', 'not-json'), ('string', '{\"max_sessions\":\"5\"}'), ('oversized', '{\"max_sessions\":18446744073709551615}');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/V202610020900__machine_run_caps.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        use sqlx::Row;
+        let rows = sqlx::query("SELECT id, max_concurrent_runs, run_limit FROM daemon ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        for row in rows {
+            let id: String = row.get("id");
+            let cap: Option<i64> = row.get("max_concurrent_runs");
+            assert_eq!(
+                cap,
+                match id.as_str() {
+                    "priority" => Some(6),
+                    "fallback" => Some(3),
+                    _ => None,
+                }
+            );
+            assert_eq!(row.get::<Option<i64>, _>("run_limit"), None);
         }
     }
 }

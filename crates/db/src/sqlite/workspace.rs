@@ -38,19 +38,60 @@ impl WorkspaceRepo for SqliteDb {
             .transpose()
     }
 
+    async fn embedded_path_is_owned_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        path: &str,
+    ) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM workspace WHERE worktree_path = ? LIMIT 1")
+                .bind(path)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .is_some(),
+        )
+    }
+
+    async fn task_owns_embedded_path(&self, task_id: &str, path: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM workspace
+             LEFT JOIN workspace_placement AS placement
+               ON placement.workspace_id = workspace.id
+             WHERE workspace.task_id = ?
+               AND workspace.status IN ('creating', 'ready', 'error')
+               AND ((placement.owner_kind = 'server' AND placement.workspace_handle = ?)
+                    OR (placement.id IS NULL AND workspace.worktree_path = ?))
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(path)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some())
+    }
+
     async fn set_cleanup_after(
         &self,
         id: &str,
         cleanup_after: Option<String>,
         updated_at: &str,
     ) -> Result<Workspace> {
-        let result =
-            sqlx::query("UPDATE workspace SET cleanup_after = ?, updated_at = ? WHERE id = ?")
-                .bind(cleanup_after.as_deref())
-                .bind(updated_at)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET cleanup_after = ?,
+                 cleanup_attempts = CASE WHEN ? IS NULL THEN 0 ELSE cleanup_attempts END,
+                 last_cleanup_error = CASE WHEN ? IS NULL THEN NULL ELSE last_cleanup_error END,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(cleanup_after.as_deref())
+        .bind(cleanup_after.as_deref())
+        .bind(cleanup_after.as_deref())
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
@@ -61,7 +102,10 @@ impl WorkspaceRepo for SqliteDb {
 
     async fn mark_cleaned(&self, id: &str, updated_at: &str) -> Result<Workspace> {
         let result = sqlx::query(
-            "UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE workspace
+             SET status = 'cleaned', cleanup_after = NULL, cleanup_attempts = 0,
+                 last_cleanup_error = NULL, error = NULL, updated_at = ?
+             WHERE id = ?",
         )
         .bind(updated_at)
         .bind(id)
@@ -109,13 +153,37 @@ impl WorkspaceRepo for SqliteDb {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
+        // A pending_remote_cancel record is daemon-scoped and never blocks
+        // deletion; reconnect still sends workspace.cancel for it. A remote
+        // operation whose step is still live does.
+        let running: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_remote_operation r JOIN task_step s ON s.id=r.step_id WHERE r.workspace_id=? AND r.state='running' AND s.status IN ('pending','claimed'))")
+            .bind(id).fetch_one(&mut *transaction).await?;
+        if running {
+            return Err(DbError::ResourceInUse {
+                resource: format!("workspace {id}"),
+                reason: "a remote workspace operation is still running".into(),
+            });
+        }
+        // A cancellation fences Tasks through its workspace row. Read who it
+        // fences before the row goes, and restate their conditions after.
+        let fenced = crate::remote_cancel::fenced_tasks(&mut transaction, id).await?;
         let result = sqlx::query("DELETE FROM workspace WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        for task_id in &fenced {
+            crate::task_condition::produce(
+                &mut transaction,
+                task_id,
+                crate::ConditionChange::Operations,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 }

@@ -104,9 +104,9 @@ forge-cli → api → services → db
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
 - **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.
-- **Review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc` commands in the worktree; empty steps auto-pass.
+- **Review** — workflow entry hooks run configured checks and dispatch ordinary reviewers; `ReviewRunner` owns explicit reviewer/auditor reruns.
 - **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.
-- **Workspace** — file-based locking via `.forge.lock`; path validation prevents traversal escapes.
+- **Workspace** — no lock files: keyed in-process locks serialize repository-cache/integration and Workspace execution operations; path validation prevents traversal escapes. The `workspace` crate owns Task-root reclamation (permission repair, exact worktree removal, delivered-branch deletion) for the server and the daemon.
 - **Config precedence** — CLI flags > env vars > config file > defaults. Default bind `127.0.0.1:8080`.
 
 ## Database

@@ -10,6 +10,7 @@ import { taskListItem } from '@/test-utils/task-list-item'
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn() }))
 
 const task: Task = {
+  condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
   id: 'task-1',
   project_id: 'project-1',
   title: 'Current task',
@@ -18,7 +19,11 @@ const task: Task = {
   priority: 0,
   board_position: 0,
   role_assignments: [],
+  effective_coder: null,
+  effective_coder_source: null,
   remaining_retries: {},
+  retry_limits: {},
+  placement: null,
   version: 1,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',

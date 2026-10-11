@@ -111,7 +111,7 @@ and keep the five lane counts visible above it.
 
 | Key | Action |
 |---|---|
-| `Enter` | Submit a non-empty composer draft; confirm the selected setup/question/approval/review/cancellation action. |
+| `Enter` | Submit a non-empty composer draft; confirm the selected setup/question/approval/review/cancellation action. Request changes first opens a required guidance field; type the changes and press Enter again to send. |
 | `Shift+Enter` | Insert a newline in the composer. |
 | `Backspace`, `Delete` | Delete before/after the composer cursor. |
 | `Left`, `Right` | Move the composer cursor in Main Chat, or move between non-empty Kanban lanes. |
@@ -126,7 +126,7 @@ and keep the five lane counts visible above it.
 | `t`, `a`, `v` (Kanban) | Open Tasks, Attention, or Approvals. |
 | `a` (Main Chat, outside composer) | Expand/collapse the live activity row when one is present. |
 | `Shift+R` (outside composer) | Expand/collapse ordinary reasoning (collapsed by default). |
-| `r` | Retry the current eligible failed turn; when setup is unavailable and retryable, refresh setup. |
+| `r` | Retry the current failed or cancelled turn if it has not been superseded; when setup is unavailable and retryable, refresh setup. |
 | `?` (outside composer), `F1` | Open help when no other modal is active; close help when it is focused. |
 | `Esc` | Close the focused modal; in the setup picker it returns focus without changing the selected candidate; otherwise it is ignored. It never cancels a live turn by itself. |
 | `Ctrl+C` (when no modal is active) | With a live turn, open cancellation for that exact turn; otherwise request quit. During bounded shutdown, a second `Ctrl+C` forces terminal restoration and leaves durable recovery for the next launch. |
@@ -187,9 +187,9 @@ idempotency key.
 | `login`   | Authenticate the CLI and store a reusable token |
 | `logout`  | Remove stored CLI credentials |
 | `whoami`  | Show stored CLI login state |
-| `project` | Create / list / show projects |
+| `project` | Create / list / show projects, re-check environment checks |
 | `analytics` | Inspect account-wide usage, cost coverage, and pricing provenance |
-| `repo`    | Add / list repos under a project |
+| `repo`    | Add / list repos and manage their machine-local locations |
 | `memory`  | Search and retrieve project-scoped memory |
 | `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
 | `agent`   | Register / list / show agents |
@@ -249,12 +249,117 @@ forge-ctl agent register --name "Claude" --executor-type shell
 forge-ctl task list --project-id <ID>
 forge-ctl task show <TASK_ID>
 forge-ctl task prompt-preview <TASK_ID> --role coder
-forge-ctl task cancel <TASK_ID>
+forge-ctl task action <TASK_ID> cancel
 ```
 
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
 to preview the prompt for a transition target instead of the task's current
 state.
+
+### Project environment checks
+
+```bash
+forge-ctl project env-check <PROJECT_ID> --name cargo --command 'cargo --version' --scope machine
+forge-ctl project env-check <PROJECT_ID> --name tests --command 'cargo check' --scope workspace --role coder --timeout-seconds 120
+```
+
+Adds or replaces one named check while preserving other Project settings.
+`--scope` is `workspace` (default) or `machine`; machine checks need no checkout
+and can gate cloning. Commands must be read-only. `--role` may be repeated;
+omitting it applies to all roles. The server validates timeout bounds 1–300.
+The update uses the current Project version; a concurrent edit returns 409.
+Project settings also accept `placement.provision = when_verified` (default)
+or `never`, editable in the web Environment settings.
+
+### Project owner escalations
+
+```bash
+forge-ctl project escalations list <PROJECT_ID>
+forge-ctl project escalations list <PROJECT_ID> --status open
+forge-ctl project escalations answer <PROJECT_ID> <ESCALATION_ID> --answer "Token added to the vault"
+```
+
+`list` reads `GET /api/v1/projects/{id}/escalations` (first page, oldest
+first); table output shows each escalation's id, status, version, need, and
+answer. `answer` reads the escalation's current version and posts the answer;
+it wakes the Project Agent without spending its wake budget. Both are
+owner-only: another Project member gets 403 and anyone else 404. A stale or
+second answer returns 409.
+
+### Project environment readiness and re-check
+
+```bash
+forge-ctl project env-status <PROJECT_ID>
+forge-ctl project env-recheck <PROJECT_ID>
+forge-ctl project env-recheck <PROJECT_ID> --machine server
+forge-ctl project env-recheck <PROJECT_ID> --machine <RUNTIME_ID>
+forge-ctl --output json project env-status <PROJECT_ID>
+forge-ctl --output json project env-recheck <PROJECT_ID> --machine server
+```
+
+`env-status` reads the Project's recorded `environment_readiness`. Table output
+shows machine name/ID, status, failing checks, output, and checked/next-check
+times; no rows produce an empty-state message. JSON output is the readiness
+array. This read does not start checks.
+
+`env-recheck` runs every configured check through
+`POST /api/v1/projects/{id}/environment/recheck`, on all known machines or the
+selected machine. `server` names the host; daemon machines use runtime IDs from
+`env-status`. Table output groups checks and unavailable-machine errors by
+machine, followed by the updated Project. JSON output is `{machines, project}`.
+Passing a machine resumes a matching environment pause; user/repository pauses
+remain. On a daemon that supports machine probes the re-check runs there
+directly; other daemons need a ready workspace recorded on that machine, and a
+machine without one returns an unavailable result and keeps its facts.
+
+Both commands exit 0 after a successful API response, including checks that
+report failure or unavailability. Inspect `passed` and `error` for those
+outcomes. Request/HTTP errors exit 1, and invalid CLI arguments exit 2. Authority
+is the same as the API. This command does not wait for the scheduled re-check
+interval (default 600 seconds).
+
+### Repository locations
+
+Use `repo location` to manage physical checkouts of a Repo. Every command
+requires `--repo-id` and Project owner/admin access (or a server administrator).
+Registration verifies the location and prints its persisted status and error.
+
+```bash
+forge-ctl repo location list --repo-id <REPO_ID> --include-total
+forge-ctl repo location add --repo-id <REPO_ID> \
+  --owner server --path /srv/checkouts/app --default
+forge-ctl repo location add --repo-id <REPO_ID> \
+  --owner daemon --daemon-id <DAEMON_ID> --runtime-id <RUNTIME_ID> \
+  --path /Volumes/Data/codes/app --kind primary_checkout
+forge-ctl repo location verify --repo-id <REPO_ID> <LOCATION_ID> --version <VERSION>
+forge-ctl repo location set-default --repo-id <REPO_ID> <LOCATION_ID> --version <VERSION>
+forge-ctl repo location remove --repo-id <REPO_ID> <LOCATION_ID>
+```
+
+`add` defaults to `--owner server` and `--kind primary_checkout`. Other kinds
+are `managed_clone` and `shared_mount`; a shared mount uses `--owner server`
+with both daemon/runtime IDs. Daemon/runtime IDs must be visible and belong
+together. Configure the daemon's `--workspace-root` to include the checkout
+path supplied to `add`; a daemon path must lie within that runtime's advertised
+root, and the server never opens it. Verification uses `repo_location.verify`
+over the daemon command stream; an offline daemon reports `unavailable` with
+`daemon_unavailable`. Shared mounts also require the daemon to read back a
+server-written probe under the server's worktree root at the same path.
+Verification is retried after an accepted daemon handshake, including for
+previously ready locations. A root escape reports `invalid` with
+`outside_workspace_root`.
+
+Table output includes full location, daemon, and runtime IDs, the path, kind,
+default flag, status, version, and last error. Use `--output json` for the full
+response and verification timestamps. `list` accepts `--limit`, `--cursor`,
+and `--include-total`; pass the returned next cursor unchanged. A successful
+request can return an `invalid` or `unavailable` location: inspect its status
+to determine whether verification succeeded.
+
+Pass the current version shown by `list` to `verify` and `set-default`.
+A stale version returns 409. Setting a new default clears the old default
+atomically, which also changes that old location's version. `remove` returns
+409 naming the Task while any non-cleaned placement still uses the location.
 
 ### Usage and cost analytics
 
@@ -279,6 +384,89 @@ An unknown or incomplete cost is never printed as zero. `Cost unknown` means
 settled activity could not be priced; `$0.00` is reserved for complete,
 explicitly known zero.
 
+### Machine capacity flags
+
+`forge --max-concurrent-runs N` overrides `FORGE_SERVER_MAX_CONCURRENT_RUNS`,
+which overrides `server.max_concurrent_runs` in Forge YAML. Unset means
+`max(2, logical_cores / 2)`; `0` means unlimited. Administrators can change this
+setting live through Settings.
+
+`forge-daemon --max-concurrent-runs N` and
+`forge-ctl daemon link|start|report --max-concurrent-runs N` override the daemon's
+local `max_concurrent_runs` in `daemon.yaml` beside its credentials. The same
+automatic default is computed on the daemon machine. Each registration/report
+sends the resolved typed value. Legacy session-cap labels are no longer read.
+
+Each report also sends the free bytes and inodes of the filesystem holding
+`--workspace-root`, and whether the daemon's garbage collector runs on that
+root. The reply carries the server's free-space floor
+(`workspace.min_free_*`, `workspace.gc_free_*` in the server's `forge.yaml`),
+which the daemon uses for its own collector; there is no daemon-side key for
+it. While the reading is under the floor the server places no new worktree
+on that machine; work already in a worktree there, checks included, carries
+on. The daemon checks its own disk as well: asked to make a worktree while
+its reading is under the floor, it refuses with `disk_pressure` and the Task
+waits. A reading older than five minutes (a daemon that stopped reporting)
+no longer counts.
+`forge-ctl daemon` tables print the reading in the `Disk` column: free space,
+or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
+floor, or `-` before the first reading. `--output json` carries the same as
+`disk` and `workspace_floor`.
+
+### Moving the server workspace root
+
+This is a flag of the server binary (`forge`), not of `forge-ctl`: it works
+on the data directory with the server stopped.
+
+```text
+forge [--data-dir <DIR>] --migrate-workspace-root [<NEW_ROOT>]
+```
+
+Moves the server's workspace root (Task worktrees, repository clones under
+`.repos/`, execution logs under `.forge/logs/`, garbage-collection state) to
+`<NEW_ROOT>`; without a path, to the configured root (`workspace.root`,
+`FORGE_WORKSPACE_ROOT`) when one is set, else to `<data dir>/worktrees`; then
+exits. Only what this data directory's database made moves (its Tasks'
+roots, its repositories' clones, its Projects' logs, what its stored paths
+name); anything else in the old root, including another data directory's
+worktrees in a root they shared, stays and is listed.
+It cannot be combined with `--demo`, `--no-mcp`, `--no-embedded-daemon`,
+`--reclaim-workspace-gc` or `--convert-db-to-incremental-vacuum`.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Moved, or nothing to move (no root in use yet, or already there). A summary is printed. |
+| `1` | Refused (nothing changed), interrupted, or `db pending` (files moved, database unchanged): run the same command again. The reason is on stderr. |
+
+It refuses while a Forge server or another maintenance command holds the
+data directory, while work is recorded in flight (a running execution or
+check run, a claimed or suspended task step, an integration attempt that is
+neither finished nor parked, an active workspace lease), when a submodule or
+nested worktree names the old root by absolute path, when `<NEW_ROOT>` is
+not empty (unless the old root is gone), is a file, is inside the old root or
+contains it, cannot be a workspace root (the home directory or a parent of
+it, a Git repository, a top-level directory), or, for a move across
+filesystems, has less free space than the old root's size (hard links
+counted in full) plus `workspace.min_free_bytes`.
+
+Every file is kept, Git worktree links are repaired and checked, and every
+stored path is rewritten in one transaction. The old root keeps a `MOVED`
+file. Daemon-owned workspaces are not touched. A copy never removes a
+socket, pipe or device and does not keep extended attributes. In your own
+repository the only change is `git worktree repair`, run there. An
+interrupted run leaves `<data dir>/workspace-root-migration.json`; the
+server refuses to start (`migration in progress`) until the command is run
+again and finishes. The move rolls forward only; there is no `--abort`. See
+[getting started](getting-started.md#where-the-server-keeps-workspaces-and-how-to-move-them)
+for when a move is needed and what a start does after an upgrade. Forge Solo
+has no such flag: its root always follows its data root, and a refused Solo
+start prints the command to run, `forge --data-dir <Solo data root>
+--migrate-workspace-root <Solo data root>/worktrees`. The configured-root
+default is the configuration `forge` itself loads (`forge.yaml`,
+`FORGE_WORKSPACE_ROOT`), so name the target when moving another data
+directory. An unfinished move is finished by the command without a path
+whatever root is configured.
+
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge
@@ -299,6 +487,15 @@ registration/report that does not keep the command stream open.
 The configured workspace root is created automatically before the daemon
 registers or reports.
 
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
+
 After a daemon has been linked once, use `forge-ctl daemon start` to run it
 again from the saved daemon credentials without registering or claiming it
 again:
@@ -316,11 +513,59 @@ stream heartbeats to keep the daemon's last-seen timestamp fresh while it is
 connected. When the Forge server starts, external daemons are considered
 offline until their command stream reconnects.
 
-Execution dispatch requires the task worktree path created by the server to
-exist at the same absolute path on the daemon host. Use a local daemon or mount
-the server workspace root into the daemon host/container at the same path. A
-daemon on an unrelated filesystem can browse its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
+Repository locations identify a checkout on the server or a particular daemon
+runtime. Register daemon checkouts through `repo location add` and verify them
+before placement. A daemon may execute a server-owned workspace only through
+a verified `shared_mount` location; matching absolute paths alone are
+insufficient. Daemon-owned placement requires CLI Agents for every role that
+touches its worktree.
+
+The daemon reads `workspace.run.allow` from `daemon.yaml` beside its credentials
+(default: `[ci_step]`). Hook and environment setup purposes require local opt-in.
+This dispatch policy has the trust limits described above.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 7 or newer), restarting each with its existing
+`--workspace-root`.
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the older handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
+
+### Removing a disconnected machine
+
+```bash
+forge-ctl daemon remove <daemon-id>
+forge-ctl --output json daemon remove <daemon-id>
+```
+
+Stop the daemon first. Connected machines return `machine_connected` (409), and
+the embedded server machine returns `local_machine` (409). The registration owner
+or an administrator may remove it. Removal revokes the old credential, clears
+pending remote cleanup, releases the workspaces the machine owned and retires the
+Agents pinned to it. Every Task that had a workspace there is re-placed on
+another machine with a fresh workspace from its last server-known branch;
+**work on the removed machine that was not pushed is abandoned**.
+Table output reports the machine name, the cleared cancellations, the released
+workspaces (`placements_failed`), the Tasks that will re-place, the retired Agents
+and the queued Tasks; JSON output returns every removal count. Execution history
+retains the name. Physical files remain on the missing machine. Connecting again
+requires `daemon link` to register a new identity. See
+[the API contract](api.md#removing-a-machine).
 
 ### Installing MCP client config
 
@@ -515,3 +760,99 @@ forge-ctl --output json task list --project-id <ID> | jq '.items[].title'
 Every subcommand respects `--output json` and emits the same payload structure
 the REST API does — the tables shown in the default mode are just a render of
 that JSON.
+
+Task JSON uses the REST condition contract. Task list, get and action results
+remove `error_annotation`, `blocked` and `failed`, and expose `condition.kind`,
+typed reasons/continuation and `condition.details`. Use
+`condition.details.diagnostic` or the computed `workflow_exception` for a
+failure explanation, `condition.details.interruption` for process interruption
+evidence, and `awaiting_human` for the current human wait. The list value now
+agrees with detail. CLI flag names and human table columns do not change.
+
+
+### Per-run build budget and CPU priority
+
+Every CLI agent process (and its children), native tool command, review CI
+step, Project hook and environment check/setup command uses the executing
+machine's build budget. Unset `build_jobs_per_run` computes
+`max(1, logical_cores / run_cap)`: use the configured positive machine cap, or
+the automatic cap `max(2, logical_cores / 2)` when the cap is unset or `0`.
+`build_jobs_per_run: 0` disables Forge's defaults; a positive value is exact.
+Forge supplies `CARGO_BUILD_JOBS=k`, `RUST_TEST_THREADS=k`, `MAKEFLAGS=-j<k>`,
+`CMAKE_BUILD_PARALLEL_LEVEL=k` and `GOFLAGS=-p=<k>`. Each Project's
+`environment.env` takes precedence, then the Forge/daemon process environment,
+then these defaults. These are cooperative tool limits, not a hard CPU quota.
+
+On Unix, run children start with a niceness increment of `run_nice` (default
+`10`, range `0`–`19`; `0` disables it, resulting niceness capped at `19`). Their
+children inherit that priority; Forge's own priority stays unchanged. Failure
+to lower priority logs once and does not fail work. On Windows niceness is a
+no-op. Updates affect newly spawned processes; existing children keep their
+launch environment and priority.
+
+Server controls are `server.build_jobs_per_run` and `server.run_nice` in YAML,
+`FORGE_SERVER_BUILD_JOBS_PER_RUN` and `FORGE_SERVER_RUN_NICE` in the operator
+environment, and `forge --build-jobs-per-run N --run-nice N`. Precedence is file,
+then environment, then flag. Forge Settings changes these values live, with
+cores, effective cap and budget shown beside the machine cap; launch overrides
+apply again after a restart. Operations includes the available server facts.
+
+Daemons use top-level `build_jobs_per_run` and `run_nice` in `daemon.yaml` beside
+their credentials. `forge-daemon`, `forge-ctl daemon link` and
+`forge-ctl daemon start` accept `--build-jobs-per-run N` and `--run-nice N` to
+override the file. This is daemon-local policy, with no transport override and
+no daemon protocol change. Remote policy facts are not reported.
+
+A daemon's opt-in shared compiler cache is `workspace.compiler_cache`
+(`wrapper`, `max_bytes`, `dir`) in the same `daemon.yaml`; `forge-daemon`
+accepts `--compiler-cache-wrapper`, `--compiler-cache-max-bytes` and
+`--compiler-cache-dir` to override it (`forge-ctl daemon link` and
+`forge-ctl daemon start` read the file only). See "Shared compiler cache" in
+`docs/getting-started.md`.
+
+## Task action commands
+
+`forge-ctl task actions <id>` prints current offers and version. `forge-ctl task action <id> <verb> [--version N] [flags]` applies one; without `--version` it reads the current version first. Verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`.
+
+Retry flags are `--fresh-session [true|false]`, `--refresh-workspace [true|false]`, `--reset-budget [true|false]`, `--guidance TEXT`, and `--reason TEXT`. Send-back requires nonblank `--guidance TEXT`. Approval uses `--override [true|false]`; when omitted, the server uses the matching offer's value, which can be true (an override), so check `task actions` first. An override requires `--reason TEXT`. Hold, release, restart and cancel accept `--reason TEXT`. One-shot retry (`--reset-budget false`) also requires a reason. Bare boolean flags mean true. Flags belonging to another verb are rejected locally. Offers define any further required reason and allowed values. `task cancel` is removed; use `task action <id> cancel`.
+
+`--output json` prints the offer/version object or the resulting Task. An HTTP 409 `action_unavailable` prints the current available actions (the structured error object in JSON mode) and exits with code **3**; other failures use the normal nonzero error exit. A stale version remains a version conflict. There is no `execution` command group in forge-ctl; individual execution stop is available through `POST /api/v1/executions/{id}/stop` and the web Stop control.
+
+Task action offer tables include required and conditional inputs, accepted boolean
+values, the action's preset parameters, and `propagates` (subtask cancellation).
+`task action --version` is the Task version, not the CLI version; omit it to fetch
+the current version. The help text names each flag's verb. Exit code 3 means
+`action_unavailable`: read `task actions` again and select a current offer.
+Fixed boolean values and omitted presets are supplied by the server; contradictory
+values are refused.
+
+## Operations dead letters
+
+These commands require an administrator login and share the normal `--server`,
+`--output json|table`, authentication and HTTP error handling.
+
+```bash
+forge-ctl operations dead-letters list [--consumer <name>] [--state open|resolved] [--limit 1..100] [--cursor <opaque>]
+forge-ctl operations dead-letters replay <id>
+forge-ctl operations dead-letters dismiss <id> [--reason <text>]
+```
+
+List defaults to open rows, 50 at a time. JSON returns `items` and `next_cursor`;
+table output prints the next cursor when another page exists. It uses lowercase
+states and shows `replayable`, `event_created_at`, and `events_since`. Pass the cursor
+unchanged with the same filters. Resolved lists order by resolution time. IDs come from this list or Operations status.
+Replay accepts only whole-event bare sequence keys; item-level and wake-retry
+quarantines return 409 `dead_letter_not_replayable` without counting an attempt.
+They remain dismissible. Replay delivers one event to its original consumer through the usual transaction
+and idempotency rules, without moving the cursor. Its outcome is `replayed`,
+`skipped` or `replay_failed`. Failed replay prints its updated row and exits
+nonzero; it remains open for another manual action. Dismiss returns `dismissed`
+and retains the optional reason. Unknown IDs return 404; resolved rows or a lost
+race return 409. Resolved rows are retained for audit and omitted from open counts.
+There is no automatic replay, bulk command or dead-letter retention job.
+
+The server also accepts `--check-run-timeout-seconds N` (positive integer,
+1800 seconds by default), overriding `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`
+and `server.check_run_timeout_seconds` in `forge.yaml`. This defines the future
+whole-check bundle deadline; no execution reads it in 3.3 stage A. It does not
+change today's per-command review timeout or unbounded entry CI.

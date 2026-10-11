@@ -1,15 +1,15 @@
 use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
     validate_uuid_v4, AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo,
-    AgentSessionRepo, AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents,
-    ClaimExecutionLease, ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CreateAgent,
-    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
-    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
-    CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
-    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateTransitionLog,
-    CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError,
-    DomainEventRepo, ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    AgentSessionRepo, AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimExecutionLease, ClaimTask,
+    CompareAndMoveTask, CreateAgent, CreateAgentContextScope, CreateAgentIdentity,
+    CreateAgentProfile, CreateAgentSession, CreateDomainEvent, CreateExecution, CreateProject,
+    CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
+    CreateProjectCharterRevisionAtomically, CreateProjectMember,
+    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateSkill, CreateTask,
+    CreateTaskRoleAssignment, CreateTerminalSession, CreateTransitionLog, CreateWorkspace,
+    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
+    ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
     ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, MemoryAccessQuery,
     MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
     MemorySourceType, MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery,
@@ -21,8 +21,7 @@ use crate::{
     TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
     TransitionLogRepo, UpdateAgent, UpdateExecution, UpdateProject,
     UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
-    UpdateTerminalSessionStatus, UpsertDaemon, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition};
@@ -121,33 +120,45 @@ async fn task_interruption_changes_are_atomic_and_bounded() {
         .expect("interruption payload parses");
     assert_eq!(first["task_id"], task_id);
     assert_eq!(first["task_version"], updated.version);
-    assert_eq!(first["requires_intervention"], true);
-    assert_eq!(first["interruption"]["source"], "failed");
-    assert_eq!(first["interruption"]["kind"], "executor_failed");
+    assert_eq!(first["material_blocker"]["requires_intervention"], true);
     assert_eq!(
-        first["interruption"]["reason"]
+        first["material_blocker"]["interruption"]["source"],
+        "failed"
+    );
+    assert_eq!(
+        first["material_blocker"]["interruption"]["kind"],
+        "executor_failed"
+    );
+    assert_eq!(
+        first["material_blocker"]["interruption"]["reason"]
             .as_str()
             .expect("bounded reason is a string")
             .chars()
             .count(),
         512
     );
-    assert_eq!(first["interruption"]["execution_id"], "execution-1");
-    assert_eq!(
-        first["interruption"]["recovery_actions"],
-        serde_json::json!(["resume_session", "retry_execution"])
+    assert_eq!(first["condition"]["details"]["execution_id"], "execution-1");
+    assert!(first.get("requires_intervention").is_none());
+    assert!(first.get("interruption").is_none());
+    assert_eq!(first["condition"]["kind"], "failed");
+    assert!(
+        first["material_blocker"]["interruption"]
+            .get("recovery_actions")
+            .is_none(),
+        "interruption evidence must not persist an action allowlist"
     );
     let expected_dedupe = format!("task-interruption-update:{task_id}:{}", updated.version);
-    assert_eq!(
-        interruption_events[0].dedupe_key.as_deref(),
-        Some(expected_dedupe.as_str())
-    );
+    assert!(interruption_events[0]
+        .dedupe_key
+        .as_deref()
+        .unwrap()
+        .starts_with(&expected_dedupe));
 
     let second: serde_json::Value = serde_json::from_str(&interruption_events[1].payload_json)
         .expect("cleared interruption payload parses");
     assert_eq!(second["task_version"], cleared.version);
-    assert_eq!(second["requires_intervention"], false);
-    assert!(second["interruption"].is_null());
+    assert_eq!(second["material_blocker"]["requires_intervention"], false);
+    assert!(second["material_blocker"]["interruption"].is_null());
 }
 
 async fn sqlite_db() -> SqliteDb {
@@ -249,6 +260,93 @@ fn pending_claim_lease(execution_id: &str, now: &str) -> ClaimExecutionLease {
         hard_deadline_at: Some("2099-01-01T00:00:00Z".to_owned()),
         now: now.to_owned(),
     }
+}
+
+// Transaction-kernel tests own a real Task step, as production claim does.
+async fn claim_in_test_step(
+    db: &SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: ClaimTask,
+) -> crate::Result<crate::ClaimedTask> {
+    use crate::TaskStepRepo;
+    let task = TaskRepo::get_by_id_in_tx(db, transaction, &input.task_id, false)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    if task.version != input.expected_version {
+        return Err(DbError::VersionConflict);
+    }
+    let id = new_uuid_v4();
+    let now = now_rfc3339();
+    let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+    db.enqueue_step_in_tx(
+        transaction,
+        &crate::EnqueueTaskStep {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            kind: "command".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: id.clone(),
+            chain_id: id.clone(),
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now.clone(),
+        },
+    )
+    .await?;
+    let epoch: i64 = sqlx::query_scalar("SELECT expected_epoch FROM task_step WHERE id=?")
+        .bind(&id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    let changed = sqlx::query("UPDATE task_step SET status='claimed',claimed_by='claim-test',lease_until=?,attempts=1 WHERE id=? AND NOT EXISTS(SELECT 1 FROM task_step held WHERE held.task_id=? AND held.id<>? AND held.lease_until>?)")
+        .bind(&until).bind(&id).bind(&task.id).bind(&id).bind(&now).execute(&mut **transaction).await?.rows_affected();
+    assert_eq!(changed, 1, "one writer for the fixture Task");
+    let step = crate::TaskStep {
+        id: id.clone(),
+        task_id: task.id,
+        seq: 0,
+        kind: "command".into(),
+        payload_json: "{}".into(),
+        causation_step_id: None,
+        causation_key: id.clone(),
+        chain_id: id.clone(),
+        chain_position: 1,
+        expected_status: task.status,
+        expected_version: task.version,
+        expected_epoch: epoch,
+        lane: "fast".into(),
+        status: "claimed".into(),
+        claimed_by: Some("claim-test".into()),
+        lease_until: Some(until),
+        available_at: now.clone(),
+        attempts: 1,
+        last_error: None,
+        created_at: now.clone(),
+        updated_at: now,
+        completed_at: None,
+        result_json: None,
+        entry_fenced: true,
+        suspended_until: None,
+        awaited_consumer_id: None,
+    };
+    let result =
+        crate::task_writer::in_task_step(step.clone(), TaskRepo::claim(db, transaction, input))
+            .await;
+    db.finish_step_in_tx(
+        transaction,
+        &step,
+        if result.is_ok() { "done" } else { "failed" },
+        None,
+    )
+    .await?;
+    sqlx::query("UPDATE task_step SET claimed_by=NULL,lease_until=NULL WHERE id=?")
+        .bind(&id)
+        .execute(&mut **transaction)
+        .await?;
+    result
 }
 
 #[tokio::test]
@@ -703,6 +801,7 @@ async fn seed_daemon(db: &SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -753,7 +852,6 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1708,6 +1806,51 @@ async fn seed_workspace_for_task(db: &SqliteDb, task_id: &str, repo_id: &str) ->
 }
 
 #[tokio::test]
+async fn clearing_workspace_cleanup_deadline_clears_retry_state() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "done".to_owned(),
+        "cleanup retry reset",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    sqlx::query(
+        "UPDATE workspace
+         SET cleanup_attempts = 3, last_cleanup_error = 'cleanup failed'
+         WHERE id = ?",
+    )
+    .bind(&workspace_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let workspace = WorkspaceRepo::set_cleanup_after(
+        &db,
+        &workspace_id,
+        Some("2026-10-01T12:00:00Z".to_owned()),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(workspace.cleanup_attempts, 3);
+    assert_eq!(
+        workspace.last_cleanup_error.as_deref(),
+        Some("cleanup failed")
+    );
+
+    let workspace = WorkspaceRepo::set_cleanup_after(&db, &workspace_id, None, &now_rfc3339())
+        .await
+        .unwrap();
+    assert!(workspace.cleanup_after.is_none());
+    assert_eq!(workspace.cleanup_attempts, 0);
+    assert!(workspace.last_cleanup_error.is_none());
+}
+
+#[tokio::test]
 async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
@@ -2379,6 +2522,7 @@ async fn task_page_projection_batches_roles_and_retry_history() {
                     to_state: to_state.to_owned(),
                     trigger_name: Some("reject".to_owned()),
                     triggered_by: "system".to_owned(),
+                    bridge: Default::default(),
                     trigger_reason: "test".to_owned(),
                     hook_results_json: Some("{}".to_owned()),
                     rejection,
@@ -3291,7 +3435,6 @@ async fn sqlite_repo_create_round_trips_local_path() {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -3300,7 +3443,6 @@ async fn sqlite_repo_create_round_trips_local_path() {
     .await
     .expect("local repo creates");
 
-    assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, Some("/tmp/forge-test-repo".to_owned()));
     assert_eq!(
         repo.remote_url.as_deref(),
@@ -3339,7 +3481,6 @@ async fn sqlite_repo_create_round_trips_remote_url() {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -3348,7 +3489,6 @@ async fn sqlite_repo_create_round_trips_remote_url() {
     .await
     .expect("remote repo creates");
 
-    assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, None);
     assert_eq!(
         repo.remote_url.as_deref(),
@@ -3384,7 +3524,7 @@ async fn sqlite_repo_create_accepts_missing_remote_url() {
         .bind("forge")
         .bind(None::<String>)
         .bind(None::<String>)
-        .bind(WorkMode::DirectMerge.to_string())
+        .bind("direct_merge")
         .bind("main")
         .bind(&now)
         .bind(&now)
@@ -3422,14 +3562,12 @@ async fn sqlite_repo_create_normalizes_blank_remote_url() {
                 name: "Local Repo".to_owned(),
                 remote_url: remote_url.map(str::to_owned),
                 local_path: Some("/tmp/local-repo".to_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             };
             let repo = if primary {
-                RepoRepo::create_primary_for_project(&db, input, None, project.version, now.clone())
-                    .await
+                RepoRepo::create_primary_for_project(&db, input, project.version, now.clone()).await
             } else {
                 RepoRepo::create(&db, input).await
             }
@@ -3471,7 +3609,6 @@ async fn sqlite_repo_update_and_read_normalize_blank_remote_url() {
                 name: None,
                 local_path: None,
                 remote_url: input,
-                work_mode: None,
                 default_branch: None,
                 updated_at: now_rfc3339(),
             },
@@ -3594,6 +3731,60 @@ async fn migration_runner_is_idempotent() {
         })
         .count() as i64;
     assert_eq!(applied_count, expected_count);
+}
+
+#[tokio::test]
+async fn remove_knowledge_lifecycle_hooks_migration_cleans_only_retired_plugins() {
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations(&pool).await.expect("migrations run");
+
+    let changed = r#"{ "max_active_tasks" : 7, "lifecycle_hooks": {"before_work": [ {"type":"script","command":"make setup"}, {"type":"plugin","name":"knowledge-inject","enabled":true}, {"type":"plugin","name":"other","config":{"keep":1}}, {"type":"plugin","name":"knowledge-capture"} ], "on_task_done": [{"type":"plugin","name":"knowledge-capture"},{"type":"script","command":"finish"}]}, "tail" : [1.00, "\u0061"] }"#;
+    let unchanged = r#" { "lifecycle_hooks" : { "before_work" : [ { "type" : "plugin", "name" : "other" } ] }, "untouched" : true } "#;
+    let invalid = "{not json";
+    for (id, settings) in [
+        ("changed", changed),
+        ("unchanged", unchanged),
+        ("invalid", invalid),
+    ] {
+        sqlx::query(
+            "INSERT INTO project (id, name, settings, created_at, updated_at)
+             VALUES (?, ?, ?, '2026-10-01T21:20:00Z', '2026-10-01T21:20:00Z')",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(settings)
+        .execute(&pool)
+        .await
+        .expect("legacy Project inserts");
+    }
+
+    sqlx::query("DELETE FROM _migration WHERE version = 202610012120")
+        .execute(&pool)
+        .await
+        .expect("knowledge hook migration marker clears");
+    run_migrations(&pool)
+        .await
+        .expect("knowledge hook migration re-applies");
+
+    let load_settings = |id: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("Project settings load")
+        }
+    };
+
+    assert_eq!(
+        load_settings("changed").await,
+        r#"{"max_active_tasks":7,"lifecycle_hooks":{"before_work":[{"type":"script","command":"make setup"},{"type":"plugin","name":"other","config":{"keep":1}}],"on_task_done":[{"type":"script","command":"finish"}]},"tail":[1.00,"\u0061"]}"#
+    );
+    assert_eq!(load_settings("unchanged").await, unchanged);
+    assert_eq!(load_settings("invalid").await, invalid);
 }
 
 #[tokio::test]
@@ -3899,6 +4090,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(competing.clone()),
         make_lease(competing.clone()),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -3971,6 +4163,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(stale.clone()),
         make_lease(stale),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -4092,6 +4285,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: "user:test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "first entry".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -4160,6 +4354,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
         now: now.clone(),
     };
     let make_admission = || ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: Some(project.version),
         expected_task_version: task.version,
@@ -4206,6 +4401,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: "user:test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "later re-entry".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -4286,6 +4482,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await;
     assert!(matches!(
@@ -4324,6 +4521,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await;
     assert!(matches!(
@@ -4395,6 +4593,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
         None,
         Vec::new(),
         mutations,
+        None,
     )
     .await
     .expect("clear and queue commit together");
@@ -4418,6 +4617,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
         vec![crate::TaskMetadataMutation::Remove {
             key: "queued_recovery".to_owned(),
         }],
+        None,
     )
     .await;
     assert!(matches!(stale, Err(DbError::VersionConflict)));
@@ -4464,6 +4664,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
             crate::RestoreQueuedRecovery {
                 task_id: task_id.clone(),
                 expected_version,
+                failed_json: None,
                 queued_recovery_id: queued_recovery_id.to_owned(),
                 error_annotation: Some("stale blocker".to_owned()),
                 blocked_json: None,
@@ -4485,6 +4686,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
         .await
         .unwrap();
     let make_admission = |id: &str| ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: Some(id.to_owned()),
         expected_project_version: None,
         expected_task_version: queued.version,
@@ -4651,6 +4853,7 @@ async fn execution_admission_rejects_agent_profile_reassignment_without_capacity
             now: now.to_owned(),
         },
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -4881,6 +5084,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         root_execution_input,
         make_lease(root_execution_id, "embedded:custom-root"),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: root.version,
@@ -4916,6 +5120,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         ),
         make_lease(child_execution_id, "embedded:inherited-child"),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: child.version,
@@ -5029,6 +5234,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
     .await
     .expect("first review creates");
     let make_admission = |parent_execution_id: Option<String>| ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
@@ -5789,6 +5995,8 @@ async fn seed_review_digest_contract(
         assessment: Some(api_types::ReviewAssessment {
             result: api_types::ReviewResult::Pass,
             reason: "checked".into(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             report: String::new(),
         }),
         checks: Vec::new(),
@@ -5837,9 +6045,9 @@ async fn review_digest_settings_and_audit_edits_preserve_passed_contract() {
             name: None,
             settings: Some(
                 serde_json::json!({
-                    "max_active_tasks": 7, "recheck_interval_seconds": 30,
+                    "max_active_tasks": 7,
                     "default_review_config": {"ci_steps": ["true"]},
-                    "environment": {"env": {"TOKEN": "rotated-secret"}},
+                    "environment": {"env": {"TOKEN": "rotated-secret"}, "recheck_interval_seconds": 1200},
                 })
                 .to_string(),
             ),
@@ -5888,6 +6096,68 @@ async fn review_digest_settings_and_audit_edits_preserve_passed_contract() {
         db.review_carry_base(&task_id).await.unwrap().contract,
         contract
     );
+}
+
+#[tokio::test]
+async fn review_digest_flow_settings_preserve_passed_contract() {
+    for (key, value) in [
+        ("max_active_tasks", serde_json::json!(7)),
+        (
+            "environment.recheck_interval_seconds",
+            serde_json::json!(1200),
+        ),
+    ] {
+        let (db, project_id, task_id, contract) = seed_review_digest_contract(2).await;
+        let project = ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut settings: serde_json::Value = serde_json::from_str(&project.settings).unwrap();
+        if key == "max_active_tasks" {
+            settings[key] = value;
+        } else {
+            settings["environment"]["recheck_interval_seconds"] = value;
+        }
+        ProjectRepo::update_at_version(
+            &db,
+            UpdateProject {
+                id: project_id,
+                name: None,
+                settings: Some(settings.to_string()),
+                primary_repo_id: None,
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_review_digest_integrates(&db, &task_id).await;
+        // Carry verifies the previous attempt when a new Review is running.
+        let now = now_rfc3339();
+        ReviewRepo::create(
+            &db,
+            CreateReview {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                execution_id: contract.execution_id.clone(),
+                attempt_number: 2,
+                status: ReviewStatus::Running,
+                step_results_json: "{}".into(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.review_carry_base(&task_id).await.unwrap().contract,
+            contract,
+            "{key}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6254,6 +6524,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         now: now.clone(),
     };
     let stale_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
@@ -6322,6 +6593,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         make_execution(dependency_id.clone()),
         make_lease(dependency_id),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -6353,6 +6625,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         interactive_execution,
         make_lease(interactive_id),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -6458,6 +6731,7 @@ async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
@@ -6611,6 +6885,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: first_task.version,
@@ -6631,6 +6906,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
         expected_workflow_definition: Some("{}".to_owned()),
     };
     let second_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: second_task.version,
@@ -7319,6 +7595,8 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         .await
         .expect("revision loads");
     let input = CompareAndMoveTask {
+        post_commit_step: None,
+        integration_cancel: false,
         operation_id: operation_id.clone(),
         project_id: project_id.clone(),
         task_id: moved_id.clone(),
@@ -7332,7 +7610,8 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         transition_log_id: new_uuid_v4(),
         workflow_snapshot: serde_json::Value::Null,
         trigger_name: None,
-        triggered_by: "user:board_drag".to_owned(),
+        triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+        bridge: Default::default(),
         trigger_reason: "board reorder".to_owned(),
         rejection: false,
         expected_project_version: None,
@@ -7375,6 +7654,8 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
     ));
 
     let stale_task = CompareAndMoveTask {
+        post_commit_step: None,
+        integration_cancel: false,
         operation_id: new_uuid_v4(),
         task_version: moved.version,
         board_revision: result.board_revision,
@@ -7388,6 +7669,8 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
     ));
 
     let stale_board = CompareAndMoveTask {
+        post_commit_step: None,
+        integration_cancel: false,
         operation_id: new_uuid_v4(),
         task_version: loaded.version,
         board_revision,
@@ -7425,6 +7708,8 @@ async fn compare_and_move_rejects_stale_project_workflow_authority_without_mutat
         .await
         .expect("board revision loads");
     let input = CompareAndMoveTask {
+        post_commit_step: None,
+        integration_cancel: false,
         operation_id: new_uuid_v4(),
         project_id: project_id.clone(),
         task_id: task_id.clone(),
@@ -7438,7 +7723,8 @@ async fn compare_and_move_rejects_stale_project_workflow_authority_without_mutat
         transition_log_id: new_uuid_v4(),
         workflow_snapshot: serde_json::Value::Null,
         trigger_name: None,
-        triggered_by: "user:board_drag".to_owned(),
+        triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+        bridge: Default::default(),
         trigger_reason: "stale workflow authority".to_owned(),
         rejection: false,
         expected_project_version: Some(project.version),
@@ -7512,6 +7798,8 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
     let committed = TaskBoardRepo::compare_and_move_task(
         &db,
         CompareAndMoveTask {
+            post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: project_id.clone(),
             task_id: task_id.clone(),
@@ -7525,7 +7813,8 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
             transition_log_id: new_uuid_v4(),
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
+            triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+            bridge: Default::default(),
             trigger_reason: "resolve the block by moving the task".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7540,6 +7829,10 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
         MoveTaskPersistence::Replayed(_) => panic!("first move must commit"),
     };
     assert!(moved.blocked_json.is_none());
+    assert!(
+        !crate::material_blocker(&moved.condition).requires_intervention,
+        "the returned Task states the condition the move produced"
+    );
 
     let events = DomainEventRepo::list_events_after(&db, 0, 100)
         .await
@@ -7555,8 +7848,14 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
         })
         .collect::<Vec<_>>();
     assert_eq!(interruption_payloads.len(), 2);
-    assert_eq!(interruption_payloads[0]["requires_intervention"], true);
-    assert_eq!(interruption_payloads[1]["requires_intervention"], false);
+    assert_eq!(
+        interruption_payloads[0]["material_blocker"]["requires_intervention"],
+        true
+    );
+    assert_eq!(
+        interruption_payloads[1]["material_blocker"]["requires_intervention"],
+        false
+    );
     assert_eq!(interruption_payloads[1]["task_version"], moved.version);
 }
 
@@ -7592,6 +7891,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
     let renormalized = TaskBoardRepo::compare_and_move_task(
         &db,
         CompareAndMoveTask {
+            post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: project_id.clone(),
             task_id: moved_id.clone(),
@@ -7605,7 +7906,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             transition_log_id: new_uuid_v4(),
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
+            triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+            bridge: Default::default(),
             trigger_reason: "board reorder".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7633,6 +7935,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
     let empty_move = TaskBoardRepo::compare_and_move_task(
         &db,
         CompareAndMoveTask {
+            post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: project_id.clone(),
             task_id: source_id,
@@ -7646,7 +7950,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             transition_log_id: new_uuid_v4(),
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
+            triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+            bridge: Default::default(),
             trigger_reason: "board move".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7669,6 +7974,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
     let nonempty = TaskBoardRepo::compare_and_move_task(
         &db,
         CompareAndMoveTask {
+            post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id,
             task_id: another_id,
@@ -7682,7 +7989,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             transition_log_id: new_uuid_v4(),
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
+            triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
+            bridge: Default::default(),
             trigger_reason: "board move".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7894,7 +8202,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             name: None,
             local_path: None,
             remote_url: None,
-            work_mode: None,
             default_branch: Some("trunk".to_owned()),
             updated_at: now.clone(),
         },
@@ -8491,6 +8798,7 @@ async fn review_task_authority_settlement_is_atomic_with_task_cas() {
         &now,
         task.version + 1,
         Some(now.clone()),
+        crate::ReviewEventOrigin::Runner,
     )
     .await;
     assert!(matches!(stale, Err(DbError::VersionConflict)));
@@ -8523,6 +8831,7 @@ async fn review_task_authority_settlement_is_atomic_with_task_cas() {
         &now,
         task.version,
         Some(now.clone()),
+        crate::ReviewEventOrigin::Runner,
     )
     .await
     .expect("review and task authority settle together");
@@ -8539,6 +8848,7 @@ async fn review_task_authority_settlement_is_atomic_with_task_cas() {
         &now,
         settled_task.version,
         Some(now.clone()),
+        crate::ReviewEventOrigin::Runner,
     )
     .await;
     assert!(matches!(replay, Err(DbError::InvalidTransition)));
@@ -8922,7 +9232,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
         .await
         .expect("transaction starts");
     let execution_id = new_uuid_v4();
-    let claimed = TaskRepo::claim(
+    let claimed = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9020,7 +9330,7 @@ async fn claim_capacity_ignores_assigned_but_not_running_tasks() {
     let mut transaction = crate::begin_immediate(db.pool())
         .await
         .expect("claim transaction starts");
-    let claimed = TaskRepo::claim(
+    let claimed = claim_in_test_step(
         &db,
         &mut transaction,
         ClaimTask {
@@ -9120,7 +9430,7 @@ async fn claim_rejects_stale_project_workflow_authority_without_mutation() {
     let mut tx = crate::begin_immediate(db.pool())
         .await
         .expect("claim transaction starts");
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9178,7 +9488,7 @@ async fn claim_rejects_stale_project_workflow_authority_without_mutation() {
 }
 
 #[tokio::test]
-async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
+async fn machine_capacity_rejects_running_execution_at_daemon_limit() {
     let db = sqlite_db().await;
     let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let daemon_id: String = sqlx::query_scalar("SELECT daemon_id FROM agent_current WHERE id = ?")
@@ -9192,8 +9502,8 @@ async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
         .execute(db.pool())
         .await
         .expect("agent task capacity expands");
-    sqlx::query("UPDATE daemon SET labels_json = ?, updated_at = ? WHERE id = ?")
-        .bind(r#"{"max_concurrent_sessions":1}"#)
+    sqlx::query("UPDATE daemon SET max_concurrent_runs = ?, updated_at = ? WHERE id = ?")
+        .bind(1_i64)
         .bind(now_rfc3339())
         .bind(&daemon_id)
         .execute(db.pool())
@@ -9275,7 +9585,7 @@ async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
         make_lease(second_id.clone()),
     )
     .await;
-    assert!(matches!(second_result, Err(DbError::AgentAtCapacity)));
+    assert!(matches!(second_result, Err(DbError::MachineAtCapacity)));
     assert!(ExecutionRepo::get_by_id(&db, &second_id)
         .await
         .expect("rejected execution lookup succeeds")
@@ -9400,6 +9710,12 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
             .unwrap(),
         2
     );
+    let grouped = db
+        .agent_list_active_assignments(&[agent_id.clone(), "missing".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(grouped[&agent_id], 2);
+    assert_eq!(grouped["missing"], 0);
 }
 
 #[tokio::test]
@@ -9517,7 +9833,7 @@ async fn task_claim_rejects_active_entry_barrier() {
         .await
         .expect("transaction starts");
     let execution_id = new_uuid_v4();
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9702,7 +10018,7 @@ async fn test_dependency_gate_blocks_non_context_holder() {
         .await
         .expect("transaction starts");
     let execution_id = new_uuid_v4();
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9834,7 +10150,7 @@ async fn dependency_gate_finds_context_holder_behind_100_newer_attempts() {
         .await
         .expect("transaction starts");
     let execution_id = "dependent-context-holder-000".to_owned();
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut transaction,
         ClaimTask {
@@ -10286,394 +10602,86 @@ async fn test_normalize_failure_kinds_migration_backfill() {
 }
 
 #[tokio::test]
-async fn domain_event_claims_are_ordered_replay_safe_and_deduplicated() {
+async fn domain_event_checkpoints_are_ordered_and_deduplicated() {
     let db = sqlite_db().await;
-    let created_at = "2026-08-12T20:00:00Z".to_owned();
-    let first = CreateDomainEvent {
-        id: "event-first".to_owned(),
-        event_type: "task.transitioned".to_owned(),
-        entity_type: "task".to_owned(),
-        entity_id: "task-1".to_owned(),
-        actor_type: "system".to_owned(),
+    let make = |id: &str| crate::CreateDomainEvent {
+        id: id.into(),
+        event_type: "wanted".into(),
+        entity_type: "task".into(),
+        entity_id: "task".into(),
+        actor_type: "system".into(),
         actor_id: None,
-        scope_type: "task".to_owned(),
-        scope_id: "task-1".to_owned(),
-        correlation_id: "corr-1".to_owned(),
+        scope_type: "project".into(),
+        scope_id: "p".into(),
+        correlation_id: id.into(),
         causation_id: None,
         causation_depth: 0,
-        dedupe_key: Some("task-transition:1".to_owned()),
-        payload_json: r#"{"to_state":"review"}"#.to_owned(),
-        created_at: created_at.clone(),
+        dedupe_key: Some(id.into()),
+        payload_json: "{}".into(),
+        created_at: crate::now_rfc3339(),
     };
-    let first_row = DomainEventRepo::append_event(&db, first.clone())
+    let input = make("checkpoint-a");
+    let a = db.append_event(input.clone()).await.unwrap();
+    let duplicate = db
+        .append_event(CreateDomainEvent {
+            id: "duplicate-id".into(),
+            ..input.clone()
+        })
         .await
-        .expect("first event appends");
-    let duplicate = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-duplicate".to_owned(),
-            payload_json: r#"{"to_state":"review"}"#.to_owned(),
-            ..first
-        },
+        .unwrap();
+    assert_eq!(duplicate.id, a.id);
+    let conflict = db
+        .append_event(CreateDomainEvent {
+            id: "conflict-id".into(),
+            entity_id: "different-task".into(),
+            ..input
+        })
+        .await;
+    assert!(matches!(conflict, Err(DbError::Check(_))));
+    let b = db.append_event(make("checkpoint-b")).await.unwrap();
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    db.ensure_domain_event_cursor_in_tx(&mut tx, "checkpoint-test", &crate::now_rfc3339())
+        .await
+        .unwrap();
+    assert!(db
+        .validate_event_worker_in_tx(
+            &mut tx,
+            "checkpoint-test",
+            0,
+            0,
+            b.sequence,
+            &crate::EventSubscription::All
+        )
+        .await
+        .is_err());
+    db.validate_event_worker_in_tx(
+        &mut tx,
+        "checkpoint-test",
+        0,
+        0,
+        a.sequence,
+        &crate::EventSubscription::All,
     )
     .await
-    .expect("dedupe returns the committed event");
-    assert_eq!(duplicate.id, first_row.id);
-    let conflicting_dedupe = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-conflicting-dedupe".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-other".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-other".to_owned(),
-            correlation_id: "corr-other".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:1".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:00:01Z".to_owned(),
-        },
-    )
-    .await;
-    assert!(matches!(conflicting_dedupe, Err(DbError::Check(_))));
-
-    let second = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-second".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-2".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-2".to_owned(),
-            correlation_id: "corr-2".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:2".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at,
-        },
+    .unwrap();
+    db.advance_domain_event_cursor_in_tx(
+        &mut tx,
+        "checkpoint-test",
+        0,
+        a.sequence,
+        &crate::now_rfc3339(),
     )
     .await
-    .expect("second event appends");
-
-    let claim_input = |owner: &str, now: &str, leased_until: &str| ClaimDomainEvents {
-        consumer_name: "projection".to_owned(),
-        lease_owner: owner.to_owned(),
-        now: now.to_owned(),
-        leased_until: leased_until.to_owned(),
-        limit: 10,
-    };
-    let claimed = DomainEventRepo::claim_event_batch(
-        &db,
-        claim_input("worker-a", "2026-08-12T20:01:00Z", "2026-08-12T20:02:00Z"),
-    )
-    .await
-    .expect("events claim");
+    .unwrap();
+    tx.commit().await.unwrap();
     assert_eq!(
-        claimed
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        ["event-first", "event-second"]
-    );
-
-    let second_out_of_order = DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: second.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:01Z".to_owned(),
-        },
-    )
-    .await;
-    assert!(second_out_of_order.is_err(), "cursor must remain ordered");
-
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: first_row.sequence,
-            event_id: first_row.id.clone(),
-            dedupe_key: first_row.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:02Z".to_owned(),
-        },
-    )
-    .await
-    .expect("first event completes"));
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: second.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:03Z".to_owned(),
-        },
-    )
-    .await
-    .expect("second event completes"));
-    assert_eq!(
-        DomainEventRepo::get_consumer_cursor(&db, "projection")
+        db.get_consumer_cursor("checkpoint-test")
             .await
             .unwrap()
             .unwrap()
             .last_sequence,
-        second.sequence
+        a.sequence
     );
-    assert!(!DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: "task-transition:2".to_owned(),
-            completed_at: "2026-08-12T20:01:04Z".to_owned(),
-        },
-    )
-    .await
-    .expect("duplicate completion is idempotent"));
-
-    // A live lease at the cursor head blocks later sequences from being
-    // claimed by another worker; otherwise that worker could never
-    // checkpoint its out-of-order receipt.
-    let third = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-third".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-3".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-3".to_owned(),
-            correlation_id: "corr-3".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:3".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:01:05Z".to_owned(),
-        },
-    )
-    .await
-    .expect("third event appends");
-    let fourth = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-fourth".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-4".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-4".to_owned(),
-            correlation_id: "corr-4".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:4".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:01:06Z".to_owned(),
-        },
-    )
-    .await
-    .expect("fourth event appends");
-    let head_claim = DomainEventRepo::claim_event_batch(
-        &db,
-        claim_input(
-            "worker-head",
-            "2026-08-12T20:01:07Z",
-            "2026-08-12T20:02:07Z",
-        ),
-    )
-    .await
-    .expect("head events claim");
-    assert_eq!(head_claim.len(), 2);
-    assert_eq!(head_claim[0].id, third.id);
-    assert_eq!(head_claim[1].id, fourth.id);
-    // The same consumer cannot be claimed concurrently by another owner.
-    let blocked_claim = DomainEventRepo::claim_event_batch(
-        &db,
-        claim_input(
-            "worker-other",
-            "2026-08-12T20:01:08Z",
-            "2026-08-12T20:02:08Z",
-        ),
-    )
-    .await
-    .expect("blocked claim succeeds");
-    assert!(blocked_claim.is_empty());
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-head".to_owned(),
-            event_sequence: third.sequence,
-            event_id: third.id.clone(),
-            dedupe_key: third.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:09Z".to_owned(),
-        },
-    )
-    .await
-    .expect("third event completes"));
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-head".to_owned(),
-            event_sequence: fourth.sequence,
-            event_id: fourth.id.clone(),
-            dedupe_key: fourth.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:10Z".to_owned(),
-        },
-    )
-    .await
-    .expect("fourth event completes"));
-
-    // Simulate a legacy crash after writing a projection receipt but before
-    // checkpointing the cursor. Claiming the next batch must repair the
-    // contiguous receipt prefix instead of getting stuck behind event-first.
-    sqlx::query(
-        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, version, updated_at)
-         VALUES ('repair', 0, 1, ?)",
-    )
-    .bind("2026-08-12T20:02:00Z")
-    .execute(db.pool())
-    .await
-    .expect("repair cursor inserts");
-    sqlx::query(
-        "INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at)
-         VALUES ('repair', ?, ?, ?)",
-    )
-    .bind(&first_row.id)
-    .bind(first_row.dedupe_key.as_deref().unwrap())
-    .bind("2026-08-12T20:02:00Z")
-    .execute(db.pool())
-    .await
-    .expect("orphan receipt inserts");
-    let repaired = DomainEventRepo::claim_event_batch(
-        &db,
-        ClaimDomainEvents {
-            consumer_name: "repair".to_owned(),
-            lease_owner: "repair-worker".to_owned(),
-            now: "2026-08-12T20:02:01Z".to_owned(),
-            leased_until: "2026-08-12T20:03:00Z".to_owned(),
-            limit: 1,
-        },
-    )
-    .await
-    .expect("repair claim succeeds");
-    assert_eq!(repaired.len(), 1);
-    assert_eq!(repaired[0].id, second.id);
-    assert_eq!(
-        DomainEventRepo::get_consumer_cursor(&db, "repair")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_sequence,
-        first_row.sequence
-    );
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "repair".to_owned(),
-            lease_owner: "repair-worker".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: second.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:02:02Z".to_owned(),
-        },
-    )
-    .await
-    .expect("repaired cursor completes next event"));
-
-    let recovery_db = sqlite_db().await;
-    let stale_event = DomainEventRepo::append_event(
-        &recovery_db,
-        CreateDomainEvent {
-            id: "event-stale".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-3".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-3".to_owned(),
-            correlation_id: "corr-3".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:3".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:03:00Z".to_owned(),
-        },
-    )
-    .await
-    .unwrap();
-    let first_claim = DomainEventRepo::claim_event_batch(
-        &recovery_db,
-        ClaimDomainEvents {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            now: "2026-08-12T20:03:01Z".to_owned(),
-            leased_until: "2026-08-12T20:03:02Z".to_owned(),
-            limit: 1,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(first_claim[0].id, stale_event.id);
-    let second_claim = DomainEventRepo::claim_event_batch(
-        &recovery_db,
-        ClaimDomainEvents {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-b".to_owned(),
-            now: "2026-08-12T20:03:03Z".to_owned(),
-            leased_until: "2026-08-12T20:03:04Z".to_owned(),
-            limit: 1,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(second_claim[0].id, stale_event.id);
-    let stale_completion = DomainEventRepo::complete_claimed_event(
-        &recovery_db,
-        CompleteDomainEvent {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: stale_event.sequence,
-            event_id: stale_event.id.clone(),
-            dedupe_key: stale_event.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:03:03Z".to_owned(),
-        },
-    )
-    .await;
-    assert!(matches!(stale_completion, Err(DbError::VersionConflict)));
-    assert!(DomainEventRepo::complete_claimed_event(
-        &recovery_db,
-        CompleteDomainEvent {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-b".to_owned(),
-            event_sequence: stale_event.sequence,
-            event_id: stale_event.id,
-            dedupe_key: "task-transition:3".to_owned(),
-            completed_at: "2026-08-12T20:03:04Z".to_owned(),
-        },
-    )
-    .await
-    .expect("replacement worker completes after lease expiry"));
 }
 
 #[tokio::test]
@@ -10875,7 +10883,7 @@ async fn legacy_non_runnable_governance_flag_does_not_block_current_charter_exec
         .await
         .expect("claim transaction begins");
     let execution_id = new_uuid_v4();
-    let _claim = TaskRepo::claim(
+    let _claim = claim_in_test_step(
         &db,
         &mut claim_transaction,
         ClaimTask {
@@ -10967,11 +10975,11 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
         vec![
             (
                 "forge.main.project-discovery/v2".to_owned(),
-                "forge.main.project-discovery/v2@5".to_owned(),
+                "forge.main.project-discovery/v2@7".to_owned(),
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@16".to_owned(),
+                "forge.project.orchestration/v1@21".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -10979,7 +10987,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@16'",
+         WHERE id = 'forge.project.orchestration/v1@21'",
     )
     .fetch_one(db.pool())
     .await
@@ -10993,11 +11001,15 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("OPERATING DOCTRINE (on-demand skill sections)"));
     assert!(body.contains("skill.section"));
     assert!(body.contains("read `project.charter` and `project.current_state`"));
-    assert!(body.contains("cancel a non-terminal Task only through versioned `task.cancel`"));
+    assert!(body.contains(
+        "cancel a non-terminal Task only through the versioned `task.action` cancel offer"
+    ));
     assert!(body.contains("`parent_task_id` establishes one-level coordination"));
     assert!(
         body.contains("Dependency edges only gate execution, never hierarchy or Workspace sharing")
     );
+    assert!(body.contains("name owned modules/files in each Task"));
+    assert!(body.contains("give one Task ownership of shared edits and make others depend on it"));
     assert!(!body.contains("Evidence is mandatory proof, not optional decoration"));
     assert!(!body.contains("MILESTONES AND EVIDENCE"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
@@ -11628,5 +11640,415 @@ async fn unbounded_execution_records_progress_and_progress_warnings() {
     assert!(
         matches!(warning, ExecutionProgressWarningOutcome::Committed { .. }),
         "a stalled unbounded execution must raise a warning: {warning:?}"
+    );
+}
+
+#[tokio::test]
+async fn usage_ledger_revision_tracks_terminal_edits_and_rolls_back() {
+    let db = sqlite_db().await;
+    let (project, _, agent) = seed_project_repo_agent(&db).await;
+    let task = seed_task(&db, &project, None, "todo".into(), "revision").await;
+    let mut tx = db.pool().begin().await.unwrap();
+    sqlx::query("INSERT INTO execution (id,task_id,agent_id,role,status,created_at,updated_at) VALUES ('usage-delta',?,?,'coder','completed','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z')").bind(&task).bind(&agent).execute(&mut *tx).await.unwrap();
+    let inside: i64 =
+        sqlx::query_scalar("SELECT execution_rowid FROM usage_ledger_revision WHERE id=1")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert!(inside > 0);
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT execution_rowid FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    sqlx::query("INSERT INTO execution (id,task_id,agent_id,role,status,created_at,updated_at) VALUES ('usage-delta',?,?,'coder','completed','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z')").bind(task).bind(agent).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE execution SET agent_id=NULL WHERE id='usage-delta'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT execution_revision FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT revision FROM usage_changed_execution WHERE id='usage-delta'"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    sqlx::query("DELETE FROM execution WHERE id='usage-delta'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT deletion_generation FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT execution_rowid FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    for (query, expected) in [
+        ("EXPLAIN QUERY PLAN SELECT id,error FROM execution INDEXED BY idx_execution_usage_failed_recent WHERE status='failed' AND COALESCE(stopped_at,updated_at)>='2026-01-01' ORDER BY COALESCE(stopped_at,updated_at) DESC,id ASC", "idx_execution_usage_failed_recent"),
+        ("EXPLAIN QUERY PLAN SELECT error FROM execution WHERE status='failed' AND task_id='task' ORDER BY COALESCE(stopped_at,updated_at) DESC,id DESC LIMIT 1", "idx_execution_usage_failed_task"),
+    ] {
+        let rows=sqlx::query(query).fetch_all(db.pool()).await.unwrap();
+        let plan=rows.iter().map(|r|sqlx::Row::get::<String,_>(r, "detail")).collect::<Vec<_>>().join(" ");
+        assert!(plan.contains(expected), "{plan}");assert!(!plan.contains("TEMP B-TREE"),"{plan}");
+    }
+}
+
+#[tokio::test]
+async fn agent_list_active_assignments_match_scalar_for_workflow_shapes() {
+    for (label, definition) in [
+        (
+            "custom",
+            serde_json::json!({"states": [
+                {"name": "todo", "kind": "initial"},
+                {"name": "running", "kind": "active"},
+                {"name": "waiting_review", "kind": "gate"},
+                {"name": "in_progress", "kind": "terminal"},
+                {"name": "dup", "kind": "terminal"},
+                {"name": "dup", "kind": "gate"},
+                {"kind": "active"},
+                {"name": "done", "kind": "terminal"}
+            ]})
+            .to_string(),
+        ),
+        ("empty-object", "{}".to_owned()),
+        ("not-json", "not json".to_owned()),
+        ("states-string", "{\"states\": \"x\"}".to_owned()),
+        (
+            "states-array-of-strings",
+            "{\"states\": [\"todo\", \"running\"]}".to_owned(),
+        ),
+        (
+            "states-object",
+            "{\"states\": {\"a\": {\"name\": \"running\", \"kind\": \"active\"}}}".to_owned(),
+        ),
+        ("array-root", "[1,2]".to_owned()),
+        (
+            "numeric-name",
+            "{\"states\": [{\"name\": 5, \"kind\": \"active\"}]}".to_owned(),
+        ),
+    ] {
+        let db = sqlite_db().await;
+        let (p1, _r1, a) = seed_project_repo_agent(&db).await;
+        let (_p2, _r2, b) = seed_project_repo_agent(&db).await;
+        let set = sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+            .bind(&definition)
+            .bind(&p1)
+            .execute(db.pool())
+            .await;
+        if let Err(error) = &set {
+            println!("AUDIT assignments {label}: definition rejected by schema: {error}");
+            continue;
+        }
+        let mut n = 0;
+        for status in [
+            "todo",
+            "in_progress",
+            "review",
+            "merging",
+            "running",
+            "waiting_review",
+            "done",
+            "dup",
+            "5",
+        ] {
+            for owner in [&a, &b] {
+                n += 1;
+                let task = seed_task(&db, &p1, Some(owner), status.to_owned(), "t").await;
+                if n % 3 == 0 {
+                    sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, 'reviewer', 'agent', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+                        .bind(new_uuid_v4()).bind(&task).bind(if n % 2 == 0 { &a } else { owner }).execute(db.pool()).await.unwrap();
+                }
+                if n % 5 == 0 {
+                    sqlx::query("UPDATE task SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?")
+                        .bind(&task)
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+                if n % 4 == 0 {
+                    let parent = seed_task(&db, &p1, None, "todo".to_owned(), "parent").await;
+                    sqlx::query("UPDATE task SET parent_task_id = ? WHERE id = ?")
+                        .bind(&parent)
+                        .bind(&task)
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let ids = vec![a.clone(), b.clone(), "missing".to_owned()];
+        let grouped = db.agent_list_active_assignments(&ids).await;
+        for id in &ids {
+            let single = AgentRepo::count_active_assigned_tasks(&db, id).await;
+            let grouped = grouped.as_ref().map(|g| g[id]).map_err(|e| e.to_string());
+            let single = single.map_err(|e| e.to_string());
+            if ["states-string", "states-array-of-strings"].contains(&label) {
+                // Both scalar and grouped contracts reject malformed state
+                // elements when any assigned Agent visits this Project.
+                assert!(grouped.is_err());
+                if id != "missing" {
+                    assert!(single.is_err());
+                }
+            } else {
+                assert_eq!(single, grouped, "{label} {id}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn usage_read_schema_contains_all_revision_triggers_and_indexes() {
+    let db = sqlite_db().await;
+    let names:Vec<String>=sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'usage_read_%' ORDER BY name").fetch_all(db.pool()).await.unwrap();
+    let mut expected = Vec::new();
+    for table in ["invocation", "event", "estimate", "execution"] {
+        for action in ["insert", "delete"] {
+            expected.push(format!("usage_read_{table}_{action}"));
+        }
+    }
+    expected.extend([
+        "usage_read_invocation_update".to_owned(),
+        "usage_read_execution_update".to_owned(),
+    ]);
+    expected.sort();
+    assert_eq!(names, expected);
+    for name in [
+        "idx_usage_changed_invocation_revision",
+        "idx_usage_changed_execution_revision",
+        "idx_execution_usage_running_agent",
+        "idx_execution_usage_failed_recent",
+        "idx_execution_usage_failed_task",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?"
+            )
+            .bind(name)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1,
+            "{name}"
+        );
+    }
+    let header = sqlx::query("SELECT * FROM usage_ledger_revision WHERE id=1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for (column, table) in [
+        ("invocation_count", "usage_invocation"),
+        ("event_count", "usage_event"),
+        ("estimate_count", "cost_estimate_revision"),
+        ("execution_count", "execution"),
+    ] {
+        let count = sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(sqlx::Row::get::<i64, _>(&header, column), count);
+    }
+    assert_eq!(
+        sqlx::Row::get::<i64, _>(&header, "owned_execution_count"),
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution WHERE agent_id IS NOT NULL")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn machine_capacity_ready_start_is_rechecked_after_chat_arrives() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let daemon_id: String = sqlx::query_scalar("SELECT daemon_id FROM agent_current WHERE id = ?")
+        .bind(&agent_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+        .bind("db-test-host")
+        .bind(&daemon_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.server_run_cap.set(Some(1), 1, "db-test-host");
+    let task_a = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "A",
+    )
+    .await;
+    let task_b = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "B",
+    )
+    .await;
+    let ws_a = seed_workspace_for_task(&db, &task_a, &repo_id).await;
+    let ws_b = seed_workspace_for_task(&db, &task_b, &repo_id).await;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for (ws, task, state) in [(&ws_a, &task_a, "ready"), (&ws_b, &task_b, "reserved")] {
+        sqlx::query("DELETE FROM workspace_placement WHERE workspace_id = ?")
+            .bind(ws)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspace_placement (id, workspace_id, task_id, agent_id, owner_kind, daemon_id, runtime_id, repo_location_id, execution_daemon_id, workspace_handle, generation, state, selected_by, selection_reason, reserved_until, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'server', NULL, NULL, 'audit-location', NULL, NULL, 1, ?, 'scheduler', '{}', '2099-01-01T00:10:00Z', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z')")
+            .bind(new_uuid_v4()).bind(ws).bind(task).bind(&agent_id).bind(state)
+            .execute(db.pool()).await.unwrap();
+    }
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let now = "2099-01-01T00:00:00Z";
+    let attempt = |id: String| {
+        (
+            CreateExecution {
+                id: id.clone(),
+                task_id: task_a.clone(),
+                agent_id: Some(agent_id.clone()),
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: Some(ws_a.clone()),
+                created_at: now.to_owned(),
+                updated_at: now.to_owned(),
+            },
+            ClaimExecutionLease {
+                execution_id: id,
+                expected_version: 1,
+                owner: "embedded:audit".to_owned(),
+                lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+                hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
+                now: now.to_owned(),
+            },
+        )
+    };
+    // Chat admission is deliberately independent: it may fill the machine
+    // after the launch has reserved a slot. The held launch still starts.
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP TABLE agent_chat_turn_job; CREATE TABLE agent_chat_turn_job (id TEXT PRIMARY KEY, responder_identity_id TEXT, status TEXT);").execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_chat_turn_job VALUES ('chat', ?, 'running')")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (execution, lease) = attempt(new_uuid_v4());
+    assert!(matches!(
+        ExecutionRepo::create_with_lease(&db, execution, lease).await,
+        Err(DbError::MachineAtCapacity)
+    ));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM workspace_placement WHERE workspace_id = ?")
+            .bind(&ws_a)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "ready");
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT reserved_until FROM workspace_placement WHERE workspace_id = ?")
+            .bind(&ws_a)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(marker.is_some()); // Legacy deadlines on Ready do not hold capacity.
+    let mut tx = db.pool().begin().await.unwrap();
+    let count =
+        crate::machine_capacity::count_machine_capacity(&mut tx, None, Some(1), "db-test-host")
+            .await
+            .unwrap();
+    assert_eq!(
+        (
+            count.running_executions,
+            count.reservations,
+            count.active_chat_turns
+        ),
+        (0, 1, 1)
+    );
+    assert!(!count.has_capacity());
+}
+
+#[tokio::test]
+async fn archived_interruption_shape_decodes_at_the_event_boundary() {
+    let db = sqlite_db().await;
+    let stored=DomainEventRepo::append_event(&db,crate::CreateDomainEvent{id:new_uuid_v4(),event_type:"task.interruption_changed".into(),entity_type:"task".into(),entity_id:"archived".into(),actor_type:"system".into(),actor_id:None,scope_type:"task".into(),scope_id:"archived".into(),correlation_id:new_uuid_v4(),causation_id:None,causation_depth:0,dedupe_key:None,payload_json:serde_json::json!({"task_id":"archived","task_version":7,"task_status":"review","requires_intervention":true,"interruption":{"source":"blocked","kind":"review_needs_owner","reason":"finding","execution_id":"old-reporter"}}).to_string(),created_at:now_rfc3339()}).await.unwrap();
+    let raw = stored.payload_json.clone();
+    let material = stored.task_material_blocker().unwrap();
+    assert!(material.requires_intervention);
+    assert_eq!(
+        material.interruption.unwrap(),
+        serde_json::json!({"source":"blocked","kind":"review_needs_owner","reason":"finding"})
+    );
+    let reloaded = DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.id == stored.id)
+        .unwrap();
+    assert_eq!(
+        raw, reloaded.payload_json,
+        "decoding does not rewrite stored history"
     );
 }

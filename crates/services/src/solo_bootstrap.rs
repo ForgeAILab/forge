@@ -22,7 +22,7 @@ use db::{
     AgentStatus, CreateAgent, CreateProject, CreateProjectMember, CreateRepo, Page, PageRequest,
     Project, ProjectAdmissionReceiptRepo, ProjectAgentBinding, ProjectAgentBindingRepo,
     ProjectMember, ProjectMemberRepo, ProjectRepo, Repo, RepoRepo, SortBy, SortOrder, SqliteDb,
-    SystemSettingRepo, UpdateProject, UpdateRepo, User, UserRepo, WorkMode,
+    SystemSettingRepo, UpdateProject, UpdateRepo, User, UserRepo,
 };
 use executors::ExecutorKind;
 use serde::{Deserialize, Serialize};
@@ -522,27 +522,6 @@ impl SoloBootstrapService {
             )
             .await?;
         Ok(result)
-    }
-
-    /// List current candidate state for a scoped owner without materializing
-    /// a Project.  This is useful for a retryable first-run picker.
-    pub async fn list_candidates(
-        &self,
-        owner_id: &str,
-        observed: &[SoloAgentCandidateInput],
-    ) -> Result<Vec<SoloAgentCandidate>> {
-        let owner_id = required("owner_id", owner_id)?;
-        let inputs = if observed.is_empty() {
-            self.discovered_candidate_inputs(owner_id).await?
-        } else {
-            observed.to_vec()
-        };
-        Ok(self
-            .evaluate_candidate_inputs(owner_id, inputs)
-            .await?
-            .into_iter()
-            .map(|evaluation| evaluation.candidate)
-            .collect())
     }
 
     /// Create or resume an owner-scoped local CLI Agent from a positive,
@@ -1128,7 +1107,7 @@ impl SoloBootstrapService {
             });
         }
 
-        match compute_effective_status(&self.db, &agent).await? {
+        match compute_effective_status(&self.db, &agent, None).await? {
             EffectiveStatus::Active => {
                 candidate.health = SoloAgentHealth::Healthy;
                 candidate.eligible = true;
@@ -1382,7 +1361,6 @@ impl SoloBootstrapService {
                     // moves and avoids a fabricated network origin.
                     remote_url: Some(request.canonical_repository.clone()),
                     local_path: Some(request.source_path().to_owned()),
-                    work_mode: WorkMode::DirectMerge,
                     default_branch: request.default_branch.clone(),
                     created_at: now.clone(),
                     updated_at: now,
@@ -1440,7 +1418,6 @@ impl SoloBootstrapService {
                 name: None,
                 local_path: Some(Some(request.source_path().to_owned())),
                 remote_url: None,
-                work_mode: None,
                 default_branch: None,
                 updated_at: db::now_rfc3339(),
             },
@@ -2173,22 +2150,7 @@ fn policy_allows_project_chat(tool_policy_json: &str) -> bool {
 }
 
 fn policy_has_permission(tool_policy_json: &str, expected: &str) -> bool {
-    serde_json::from_str::<Value>(tool_policy_json)
-        .ok()
-        .and_then(|value| match value {
-            Value::Array(values) => Some(values),
-            Value::Object(map) => map
-                .get("permissions")
-                .or_else(|| map.get("allowed"))
-                .and_then(Value::as_array)
-                .cloned(),
-            _ => None,
-        })
-        .is_some_and(|permissions| {
-            permissions
-                .iter()
-                .any(|permission| permission.as_str() == Some(expected))
-        })
+    operation_registry::authority::permission_set(tool_policy_json).contains(expected)
 }
 
 fn availability_reason(availability: SoloAgentAvailability) -> &'static str {
@@ -2224,16 +2186,18 @@ fn status_next_step(status: &EffectiveStatus) -> &'static str {
         }
         EffectiveStatus::ConnectionDegraded => "repair the local CLI connection and retry",
         EffectiveStatus::Paused => "unpause the Agent and retry discovery",
-        EffectiveStatus::Error => "repair the Agent error and retry discovery",
         EffectiveStatus::Deactivated => "refresh the local CLI harness configuration",
         EffectiveStatus::Active | EffectiveStatus::Busy => "",
+        EffectiveStatus::DaemonUpgradeRequired => {
+            "upgrade the local Forge daemon and retry discovery"
+        }
+        EffectiveStatus::Error => "repair the Agent error and retry discovery",
     }
 }
 
 fn is_same_repo_identity(repo: &Repo, request: &SoloBootstrapRequest) -> bool {
     repo.remote_url.as_deref() == Some(request.canonical_repository.as_str())
         && repo.default_branch == request.default_branch
-        && repo.work_mode == WorkMode::DirectMerge
 }
 
 fn is_same_source_path(repo: &Repo, request: &SoloBootstrapRequest) -> bool {
@@ -2733,6 +2697,7 @@ mod tests {
         let daemon = db::DaemonRepo::upsert_by_machine_id(
             &*db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: db::new_uuid_v4(),
                 machine_id: "solo-test-machine".to_owned(),
                 hostname: "localhost".to_owned(),
@@ -2753,6 +2718,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon.id.clone(),
                 last_report_at: now.clone(),
                 status: DaemonStatus::Online,
@@ -2874,6 +2840,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: agent.daemon_id.expect("daemon id"),
                 last_report_at: db::now_rfc3339(),
                 status: DaemonStatus::Offline,
@@ -2915,6 +2882,7 @@ mod tests {
         let daemon = db::DaemonRepo::upsert_by_machine_id(
             &*db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: db::new_uuid_v4(),
                 machine_id: "solo-registration-machine".to_owned(),
                 hostname: "localhost".to_owned(),
@@ -2935,6 +2903,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon.id.clone(),
                 last_report_at: now.clone(),
                 status: DaemonStatus::Online,

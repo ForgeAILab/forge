@@ -182,7 +182,14 @@ async fn claim_recovers_task_branch_and_uses_project_primary_repository() {
         .expect("Workspace lease lookup")
         .expect("Agent claim creates a Workspace lease");
     assert_eq!(lease.repository_binding_id, workspace.repo_id);
-    assert!(std::path::Path::new(&workspace.worktree_path).exists());
+    assert!(std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves")
+    )
+    .exists());
     assert_eq!(claimed.task.status, "in_progress");
 }
 
@@ -314,6 +321,7 @@ async fn create_claim_and_transition_task() {
         )
         .await
         .expect("task enters review");
+    let review = crate::test_support::drain_transition(&service, review).await;
     assert!(review.review.is_none());
     assert_eq!(review.task.status, "merging".to_owned());
     let event = rx.recv().await.unwrap();
@@ -618,7 +626,7 @@ async fn claim_rejects_conflicting_implicit_assignee_assignment() {
 }
 
 #[tokio::test]
-async fn claim_allows_first_subtask_in_root_workspace() {
+async fn claim_uses_inherited_root_coder_without_copying_assignment() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
@@ -629,9 +637,15 @@ async fn claim_allows_first_subtask_in_root_workspace() {
     let agent_id = seed_agent(&db).await;
     let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
+    TaskRoleAssignmentRepo::assign(
+        &*db,
+        role_assignment_input(&root.id, default_roles::CODER, Some(agent_id.clone()), None),
+    )
+    .await
+    .expect("root default worker assigns");
 
     let claimed = service
-        .claim_task(subtask.id.clone(), Assignee::Agent(agent_id), None)
+        .claim_task(subtask.id.clone(), Assignee::Agent(agent_id.clone()), None)
         .await
         .expect("first subtask claims");
 
@@ -643,6 +657,17 @@ async fn claim_allows_first_subtask_in_root_workspace() {
     assert_eq!(
         claimed.execution.workspace_id.as_deref(),
         Some(workspace.id.as_str())
+    );
+    assert_eq!(
+        claimed.execution.agent_id.as_deref(),
+        Some(agent_id.as_str())
+    );
+    assert!(
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &subtask.id, default_roles::CODER)
+            .await
+            .expect("child assignment loads")
+            .is_none(),
+        "claim must not copy the root default onto the subtask"
     );
 }
 
@@ -723,4 +748,119 @@ async fn default_workflow_assigns_declared_roles_not_assignee() {
         ]
     );
     assert!(!roles.iter().any(|role| role == default_roles::ASSIGNEE));
+}
+
+#[tokio::test]
+async fn queued_dispatcher_claim_racing_owner_cancel_cannot_start_cancelled_task() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let root = TempDir::new().unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)))
+        .with_workspace_root(root.path().to_path_buf());
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "claim cancel race",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let id = new_uuid_v4();
+    db.enqueue_step(&db::EnqueueTaskStep {
+        id: id.clone(),
+        task_id: task.id.clone(),
+        kind: "mutation".into(),
+        payload_json: serde_json::to_string(&db::TaskMutation::Sql {
+            task_id: task.id.clone(),
+            query: "UPDATE task SET updated_at=updated_at WHERE id=?".into(),
+            arguments: vec![json!(task.id)],
+        })
+        .unwrap(),
+        causation_step_id: None,
+        causation_key: id.clone(),
+        chain_id: id,
+        chain_position: 1,
+        expected_status: task.status.clone(),
+        expected_version: task.version,
+        expected_epoch: None,
+        lane: "fast".into(),
+        available_at: now_rfc3339(),
+    })
+    .await
+    .unwrap();
+    let head = db
+        .claim_step(
+            "fast-predecessor",
+            Some(&task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let claim = {
+        let svc = service.clone();
+        let id = task.id.clone();
+        tokio::spawn(async move { svc.claim_task(id, Assignee::Agent(agent_id), None).await })
+    };
+    let cancel = {
+        let svc = service.clone();
+        let id = task.id.clone();
+        let version = task.version;
+        tokio::spawn(async move {
+            svc.perform_task_action(
+                id,
+                api_types::TaskAction::Cancel {
+                    reason: Some("owner cancel".into()),
+                },
+                version,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if db
+                .task_steps(&task.id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|s| s.kind == "command")
+                .count()
+                >= 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db.finish_step_in_tx(&mut tx, &head, "done", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    db.release_step(&head.id, "fast-predecessor").await.unwrap();
+    assert_eq!(cancel.await.unwrap().unwrap().task.status, "cancelled");
+    assert!(claim.await.unwrap().is_err());
+    assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
 }

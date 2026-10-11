@@ -46,7 +46,7 @@ async fn fixture() -> (Arc<SqliteDb>, TaskService) {
         .await
         .expect("Project creates");
     }
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(256)));
+    let service = TaskService::new_for_test(Arc::clone(&db), Arc::new(EventBus::new(256)));
     (db, service)
 }
 

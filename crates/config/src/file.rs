@@ -51,6 +51,16 @@ pub(crate) struct FileForgePaths {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileServerConfig {
+    pub check_run_timeout_seconds: Option<u32>,
+    pub main_working_set_target_tokens: Option<u32>,
+    pub main_working_set_hard_tokens: Option<u32>,
+    pub project_working_set_target_tokens: Option<u32>,
+    pub project_working_set_hard_tokens: Option<u32>,
+
+    pub max_concurrent_runs: Option<u32>,
+    pub build_jobs_per_run: Option<u32>,
+    pub run_nice: Option<u32>,
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: Option<String>,
     pub public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -58,12 +68,28 @@ pub(crate) struct FileServerConfig {
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
     pub media_upload_limit_bytes: Option<u64>,
+    pub event_consumer_stall_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileWorkspaceConfig {
     pub root: Option<String>,
     pub cleanup_delay_seconds: Option<u64>,
+    pub max_disconnect_seconds: Option<u64>,
+    pub log_retention_days: Option<u32>,
+    pub min_free_bytes: Option<u64>,
+    pub min_free_percent: Option<u8>,
+    pub min_free_inode_percent: Option<u8>,
+    pub gc_free_bytes: Option<u64>,
+    pub gc_free_percent: Option<u8>,
+    pub compiler_cache: Option<FileCompilerCacheConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileCompilerCacheConfig {
+    pub wrapper: Option<String>,
+    pub max_bytes: Option<u64>,
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

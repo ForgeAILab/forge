@@ -66,8 +66,10 @@ async fn update_status_inner(
     expected_review_status: Option<ReviewStatus>,
     expected_review_updated_at: Option<&str>,
     expected_candidate_execution_id: Option<&str>,
+    origin: crate::ReviewEventOrigin,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -103,7 +105,7 @@ async fn update_status_inner(
         return Err(DbError::InvalidTransition);
     }
 
-    let task_authority = if let Some(task_authority) = task_authority {
+    let task_authority = if let Some(mut task_authority) = task_authority {
         if !matches!(status, ReviewStatus::Passed | ReviewStatus::Failed) {
             return Err(DbError::Check(
                 "task review authority requires a terminal Review status".to_owned(),
@@ -138,6 +140,9 @@ async fn update_status_inner(
             .await?
             .ok_or(DbError::NotFound)?;
         let task = map_task(task_row)?;
+        if crate::task_writer::owns_task(&task.id) {
+            task_authority.expected_version = task.version;
+        }
         if task.deleted_at.is_some() || task.version != task_authority.expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -180,6 +185,19 @@ async fn update_status_inner(
         None
     };
 
+    let budget_task = db
+        .get_task_in_tx(&mut transaction, &review.task_id)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    crate::budget::review_verdict(
+        &mut transaction,
+        &budget_task,
+        &review,
+        &status,
+        &details,
+        origin.spends_no_budget(),
+    )
+    .await?;
     let result = sqlx::query(
         "UPDATE review SET status = ?, step_results_json = ?, finished_at = ?, updated_at = ? WHERE id = ?",
     )
@@ -223,7 +241,7 @@ async fn update_status_inner(
         event_type: "review.status_changed".to_owned(),
         entity_type: "review".to_owned(),
         entity_id: review.id.clone(),
-        actor_type: "review_runner".to_owned(),
+        actor_type: origin.actor_type().to_owned(),
         actor_id: None,
         scope_type: "task".to_owned(),
         scope_id: review.task_id.clone(),
@@ -254,6 +272,12 @@ async fn update_status_inner(
         .fetch_one(&mut *transaction)
         .await?;
     let updated_review = map_review(updated_row)?;
+    crate::task_condition::produce(
+        &mut transaction,
+        &review.task_id,
+        crate::ConditionChange::Human,
+    )
+    .await?;
     let updated_task = if task_authority.is_some() {
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&review.task_id)
@@ -263,6 +287,15 @@ async fn update_status_inner(
     } else {
         None
     };
+    db.observe_integration_review_best_effort(
+        &mut transaction,
+        &review.task_id,
+        id,
+        &status,
+        &details,
+        None,
+    )
+    .await;
     transaction.commit().await?;
     Ok((updated_review, updated_task))
 }
@@ -291,6 +324,7 @@ async fn update_status_with_review_authority_inner(
     carry: Option<&crate::NewReviewAuthorityCarry>,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -331,6 +365,11 @@ async fn update_status_with_review_authority_inner(
         .await?
         .ok_or(DbError::NotFound)?;
     let task = map_task(task_row)?;
+    let expected_task_version = if crate::task_writer::owns_task(&task.id) {
+        task.version
+    } else {
+        expected_task_version
+    };
     if task.deleted_at.is_some()
         || task.version != expected_task_version
         || task.status != expected_task_status
@@ -376,6 +415,10 @@ async fn update_status_with_review_authority_inner(
         return Err(DbError::VersionConflict);
     }
 
+    if carry.is_none() {
+        crate::budget::review_verdict(&mut transaction, &task, &review, &status, &details, false)
+            .await?;
+    }
     let result = sqlx::query(
         "UPDATE review
          SET status = ?, step_results_json = ?, finished_at = ?, updated_at = ?
@@ -410,6 +453,16 @@ async fn update_status_with_review_authority_inner(
     }
 
     if let Some(carry) = carry {
+        crate::budget::apply(
+            &mut transaction,
+            &task.id,
+            crate::budget::Mutation::Charge {
+                key: crate::budget::Kind::ReviewCarry.key().into(),
+                limit: i64::from(crate::budget::Kind::ReviewCarry.default_limit()),
+                step: format!("carry:{}", review.id),
+            },
+        )
+        .await?;
         // Same writer transaction as the settlement: a carried Review without
         // its candidate record (or the reverse) can never be observed.
         sqlx::query(
@@ -438,7 +491,12 @@ async fn update_status_with_review_authority_inner(
         event_type: "review.status_changed".to_owned(),
         entity_type: "review".to_owned(),
         entity_id: review.id.clone(),
-        actor_type: "review_runner".to_owned(),
+        actor_type: if carry.is_some() {
+            "workflow"
+        } else {
+            "review_runner"
+        }
+        .to_owned(),
         actor_id: None,
         scope_type: "task".to_owned(),
         scope_id: review.task_id.clone(),
@@ -468,6 +526,12 @@ async fn update_status_with_review_authority_inner(
         .fetch_one(&mut *transaction)
         .await?;
     let updated_review = map_review(updated_row)?;
+    crate::task_condition::produce(
+        &mut transaction,
+        &review.task_id,
+        crate::ConditionChange::Human,
+    )
+    .await?;
     let updated_task = if task_projection.is_some() {
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&review.task_id)
@@ -477,13 +541,135 @@ async fn update_status_with_review_authority_inner(
     } else {
         None
     };
+    db.observe_integration_review_best_effort(
+        &mut transaction,
+        &review.task_id,
+        id,
+        &status,
+        &details,
+        carry,
+    )
+    .await;
     transaction.commit().await?;
     Ok((updated_review, updated_task))
+}
+
+impl SqliteDb {
+    /// Remove a Review attempt that never ran a command, and restate the
+    /// Task's condition from the Review now in front, in one transaction.
+    pub async fn discard_unstarted_review(&self, review_id: &str) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let task_id: Option<String> = sqlx::query_scalar(
+            "DELETE FROM review WHERE id = ? AND status = 'running' RETURNING task_id",
+        )
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(task_id) = &task_id {
+            crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Human).await?;
+        }
+        tx.commit().await?;
+        Ok(task_id.is_some())
+    }
+}
+
+/// What a carry recorded for an integration attempt builds on.
+#[derive(Debug, Clone)]
+pub struct AttemptCarryBase {
+    pub contract: api_types::ReviewContract,
+    /// The commit and target tip the authority covers now (the contract's
+    /// own, or the newest carry's).
+    pub candidate: crate::ReviewCandidate,
+    pub carries_since_review: i64,
+}
+
+impl SqliteDb {
+    /// The passed review an attempt in `merging` may carry forward, read in
+    /// the settle step's transaction. `Ok(None)`: the Task needs no reviewed
+    /// object (no agent reviewer, or the owner passed it by hand).
+    /// `DbError::Check` names why a fresh review is required.
+    pub async fn attempt_carry_base_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Option<AttemptCarryBase>> {
+        let (contract, candidate) =
+            crate::review_integration_authority_in_tx(&mut *tx, task_id).await?;
+        let (Some(contract), Some(candidate)) = (contract, candidate) else {
+            return Ok(None);
+        };
+        let carries_since_review: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id = ? AND kind='review_carry'),0)",
+        )
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(Some(AttemptCarryBase {
+            contract,
+            candidate,
+            carries_since_review,
+        }))
+    }
+
+    /// The integration queue's carry: the candidate an attempt rebased (or
+    /// its Worker repaired) is recorded against the passed contract, and the
+    /// `review_carry` allowance is charged, in the settle step's transaction
+    /// with the permit. No Review row is opened or settled: the Task never
+    /// left `merging`. Idempotent per attempt and commit.
+    pub async fn settle_attempt_review_carry_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        attempt_id: &str,
+        carry: &crate::NewReviewAuthorityCarry,
+        occurred_at: &str,
+    ) -> Result<()> {
+        let recorded: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM review_authority_carry WHERE task_id=? AND contract_execution_id=? AND commit_sha=? AND base_sha=?)")
+            .bind(&carry.task_id)
+            .bind(&carry.contract_execution_id)
+            .bind(&carry.commit_sha)
+            .bind(&carry.base_sha)
+            .fetch_one(&mut **tx)
+            .await?;
+        if recorded {
+            return Ok(());
+        }
+        crate::budget::apply(
+            tx,
+            &carry.task_id,
+            crate::budget::Mutation::Charge {
+                key: crate::budget::Kind::ReviewCarry.key().into(),
+                limit: i64::from(crate::budget::Kind::ReviewCarry.default_limit()),
+                step: format!("carry:attempt:{attempt_id}:{}", carry.commit_sha),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO review_authority_carry
+                (id, task_id, contract_execution_id, commit_sha, base_sha, kind,
+                 changed_paths_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(new_uuid_v4())
+        .bind(&carry.task_id)
+        .bind(&carry.contract_execution_id)
+        .bind(&carry.commit_sha)
+        .bind(&carry.base_sha)
+        .bind(carry.kind.to_string())
+        .bind(
+            serde_json::to_string(&carry.changed_paths)
+                .map_err(|error| DbError::Check(error.to_string()))?,
+        )
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ReviewRepo for SqliteDb {
     async fn create(&self, input: CreateReview) -> Result<Review> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         sqlx::query("INSERT INTO review (id, task_id, execution_id, attempt_number, status, step_results_json, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.task_id)
@@ -494,8 +680,11 @@ impl ReviewRepo for SqliteDb {
             .bind(&input.started_at)
             .bind(&input.created_at)
             .bind(&input.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Human)
+            .await?;
+        tx.commit().await?;
         ReviewRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -585,6 +774,12 @@ impl ReviewRepo for SqliteDb {
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         transaction.commit().await?;
         ReviewRepo::get_by_id(self, &input.id)
             .await?
@@ -595,10 +790,38 @@ impl ReviewRepo for SqliteDb {
         &self,
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::ReviewCreateManualPass {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let result =
+            ReviewRepo::create_manual_pass_with_task_authority_in_tx(self, &mut transaction, input)
+                .await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
+
+    async fn create_manual_pass_with_task_authority_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        mut input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return Err(DbError::Check(
+                "manual Review projection requires the Task step".to_owned(),
+            ));
+        }
+        self.fence_current_step_in_tx(transaction).await?;
         let source = sqlx::query("SELECT * FROM review WHERE id = ?")
             .bind(&input.source_review_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .map(map_review)
             .transpose()?
@@ -619,7 +842,7 @@ impl ReviewRepo for SqliteDb {
              LIMIT 1",
         )
         .bind(&input.task_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if latest_review_id.as_deref() != Some(source.id.as_str()) {
             return Err(DbError::VersionConflict);
@@ -627,10 +850,11 @@ impl ReviewRepo for SqliteDb {
 
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .ok_or(DbError::NotFound)?;
         let task = map_task(task_row)?;
+        input.expected_task_version = task.version;
         if task.deleted_at.is_some()
             || task.version != input.expected_task_version
             || task.status != input.expected_task_status
@@ -639,7 +863,7 @@ impl ReviewRepo for SqliteDb {
         }
         let project = sqlx::query("SELECT version, workflow_definition FROM project WHERE id = ?")
             .bind(&task.project_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .ok_or(DbError::NotFound)?;
         let project_version: i64 = project.try_get("version")?;
@@ -649,12 +873,8 @@ impl ReviewRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        validate_review_candidate_in_tx(
-            &mut transaction,
-            &input.task_id,
-            &input.candidate_execution_id,
-        )
-        .await?;
+        validate_review_candidate_in_tx(transaction, &input.task_id, &input.candidate_execution_id)
+            .await?;
 
         let details: serde_json::Value =
             serde_json::from_str(&input.step_results_json).map_err(|error| {
@@ -663,7 +883,7 @@ impl ReviewRepo for SqliteDb {
                     reason: error.to_string(),
                 }
             })?;
-        validate_review_details(&mut transaction, &source, &ReviewStatus::Passed, &details).await?;
+        validate_review_details(transaction, &source, &ReviewStatus::Passed, &details).await?;
         let attempt_number = source.attempt_number + 1;
         sqlx::query(
             "INSERT INTO review (
@@ -680,7 +900,7 @@ impl ReviewRepo for SqliteDb {
         .bind(&input.occurred_at)
         .bind(&input.occurred_at)
         .bind(&input.occurred_at)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
 
         let task_update = sqlx::query(
@@ -693,7 +913,7 @@ impl ReviewRepo for SqliteDb {
         .bind(&input.task_id)
         .bind(input.expected_task_version)
         .bind(&input.expected_task_status)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if task_update.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
@@ -730,20 +950,23 @@ impl ReviewRepo for SqliteDb {
             .to_string(),
             created_at: input.occurred_at.clone(),
         };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        DomainEventRepo::append_event_in_tx(self, transaction, &event).await?;
 
         let review_row = sqlx::query("SELECT * FROM review WHERE id = ?")
             .bind(&input.id)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?;
         let review = map_review(review_row)?;
-        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
-            .bind(&input.task_id)
-            .fetch_one(&mut *transaction)
+        crate::task_condition::produce(transaction, &input.task_id, crate::ConditionChange::Human)
             .await?;
-        let task = map_task(task_row)?;
-        transaction.commit().await?;
-        Ok((review, task))
+        let task = self
+            .get_task_in_tx(transaction, &input.task_id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let outcome = (review, task);
+        self.record_mutation_reply_in_tx(transaction, &outcome)
+            .await?;
+        Ok(outcome)
     }
 
     async fn create_attempt_with_execution_and_lease(
@@ -753,6 +976,19 @@ impl ReviewRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<(Review, Execution)> {
+        if !crate::task_writer::owns_task(&review.task_id) {
+            return self
+                .run_task_mutation(
+                    &review.task_id,
+                    crate::TaskMutation::ReviewCreateAttemptWithExecution {
+                        review: Box::new(review.clone()),
+                        execution: Box::new(execution),
+                        lease,
+                        admission,
+                    },
+                )
+                .await;
+        }
         let invalid_deadline = lease
             .hard_deadline_at
             .as_deref()
@@ -777,7 +1013,8 @@ impl ReviewRepo for SqliteDb {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         validate_review_candidate_in_tx(&mut transaction, &review.task_id, &review.execution_id)
             .await?;
-        Self::create_execution_in_tx(&mut transaction, &execution, admission.as_ref()).await?;
+        self.create_execution_in_tx(&mut transaction, &execution, admission.as_ref())
+            .await?;
         let lease_result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
@@ -825,15 +1062,29 @@ impl ReviewRepo for SqliteDb {
             .bind(&review.updated_at)
             .execute(&mut *transaction)
             .await?;
+        let persisted_review = map_review(
+            sqlx::query("SELECT * FROM review WHERE id=?")
+                .bind(&review.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
+        let persisted_execution = map_execution(
+            sqlx::query("SELECT * FROM execution WHERE id=?")
+                .bind(&execution.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
+        let outcome = (persisted_review, persisted_execution);
+        self.record_mutation_reply_in_tx(&mut transaction, &outcome)
+            .await?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &review.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         transaction.commit().await?;
-
-        let persisted_review = ReviewRepo::get_by_id(self, &review.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let persisted_execution = ExecutionRepo::get_by_id(self, &execution.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        Ok((persisted_review, persisted_execution))
+        Ok(outcome)
     }
 
     async fn update_status(
@@ -857,6 +1108,7 @@ impl ReviewRepo for SqliteDb {
             None,
             None,
             None,
+            crate::ReviewEventOrigin::Runner,
         )
         .await?;
         Ok(review)
@@ -884,6 +1136,7 @@ impl ReviewRepo for SqliteDb {
             Some(expected_status),
             Some(expected_updated_at),
             None,
+            crate::ReviewEventOrigin::Runner,
         )
         .await
         {
@@ -902,7 +1155,30 @@ impl ReviewRepo for SqliteDb {
         updated_at: &str,
         expected_task_version: i64,
         review_passed_at: Option<String>,
+        origin: crate::ReviewEventOrigin,
     ) -> Result<(Review, Task)> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithTaskAuthority {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        review_passed_at: review_passed_at.clone(),
+                        origin,
+                    },
+                )
+                .await;
+        }
+
         let (review, task) = update_status_inner(
             self,
             id,
@@ -919,6 +1195,7 @@ impl ReviewRepo for SqliteDb {
             None,
             None,
             None,
+            origin,
         )
         .await?;
         Ok((review, task.ok_or(DbError::NotFound)?))
@@ -935,6 +1212,28 @@ impl ReviewRepo for SqliteDb {
         review_passed_at: Option<String>,
         expected_candidate_execution_id: &str,
     ) -> Result<(Review, Task)> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithTaskAuthorityAndCandidate {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        review_passed_at: review_passed_at.clone(),
+                        expected_candidate_execution_id: expected_candidate_execution_id.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let (review, task) = update_status_inner(
             self,
             id,
@@ -951,6 +1250,7 @@ impl ReviewRepo for SqliteDb {
             None,
             None,
             Some(expected_candidate_execution_id),
+            crate::ReviewEventOrigin::Runner,
         )
         .await?;
         Ok((review, task.ok_or(DbError::NotFound)?))
@@ -971,6 +1271,33 @@ impl ReviewRepo for SqliteDb {
         expected_review_updated_at: &str,
         expected_candidate_execution_id: &str,
     ) -> Result<(Review, Task)> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithTaskAuthorityAndProjectCandidate {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        review_passed_at: review_passed_at.clone(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition
+                            .map(str::to_owned),
+                        expected_review_status: expected_review_status.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        expected_candidate_execution_id: expected_candidate_execution_id.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let (review, task) = update_status_inner(
             self,
             id,
@@ -987,6 +1314,7 @@ impl ReviewRepo for SqliteDb {
             Some(expected_review_status),
             Some(expected_review_updated_at),
             Some(expected_candidate_execution_id),
+            crate::ReviewEventOrigin::Runner,
         )
         .await?;
         Ok((review, task.ok_or(DbError::NotFound)?))
@@ -1007,6 +1335,34 @@ impl ReviewRepo for SqliteDb {
         expected_review_updated_at: &str,
         expected_candidate_execution_id: Option<&str>,
     ) -> Result<Review> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithReviewAuthority {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        expected_task_status: expected_task_status.to_owned(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition
+                            .map(str::to_owned),
+                        expected_review_status: expected_review_status.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        expected_candidate_execution_id: expected_candidate_execution_id
+                            .map(str::to_owned),
+                    },
+                )
+                .await;
+        }
+
         if !matches!(status, ReviewStatus::Running | ReviewStatus::AwaitingHuman) {
             return Err(DbError::Check(
                 "review authority updates require a non-terminal Review status".to_owned(),
@@ -1049,6 +1405,34 @@ impl ReviewRepo for SqliteDb {
         expected_candidate_execution_id: &str,
         task_projection: Option<Option<String>>,
     ) -> Result<Review> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithReviewAuthorityAndTaskProjection {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        expected_task_status: expected_task_status.to_owned(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition
+                            .map(str::to_owned),
+                        expected_review_status: expected_review_status.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        expected_candidate_execution_id: expected_candidate_execution_id.to_owned(),
+                        task_projection: task_projection.clone(),
+                    },
+                )
+                .await;
+        }
+
         let (review, _) = update_status_with_review_authority_inner(
             self,
             id,
@@ -1112,31 +1496,8 @@ impl ReviewRepo for SqliteDb {
     }
 
     async fn list_latest_reviews_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Review>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT * FROM (
-                SELECT review.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY task_id
-                           ORDER BY attempt_number DESC, created_at DESC, id DESC
-                       ) AS rn
-                FROM review
-                WHERE task_id IN (",
-        );
-        let mut separated = query.separated(", ");
-        for task_id in task_ids {
-            separated.push_bind(*task_id);
-        }
-        separated.push_unseparated(
-            ")
-            ) ranked
-            WHERE rn = 1
-            ORDER BY task_id ASC",
-        );
-        let rows = query.build().fetch_all(&self.pool).await?;
-        rows.into_iter().map(map_review).collect()
+        let mut connection = self.pool.acquire().await?;
+        latest_reviews(&mut connection, task_ids).await
     }
 
     async fn next_attempt_number(&self, task_id: &str) -> Result<i64> {
@@ -1148,4 +1509,35 @@ impl ReviewRepo for SqliteDb {
         .await?;
         Ok(latest.unwrap_or(0) + 1)
     }
+}
+
+pub(super) async fn latest_reviews(
+    connection: &mut sqlx::SqliteConnection,
+    task_ids: &[&str],
+) -> Result<Vec<Review>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT * FROM (
+                SELECT review.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY attempt_number DESC, created_at DESC, id DESC
+                       ) AS rn
+                FROM review
+                WHERE task_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for task_id in task_ids {
+        separated.push_bind(*task_id);
+    }
+    separated.push_unseparated(
+        ")
+            ) ranked
+            WHERE rn = 1
+            ORDER BY task_id ASC",
+    );
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    rows.into_iter().map(map_review).collect()
 }

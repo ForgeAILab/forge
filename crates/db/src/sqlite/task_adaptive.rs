@@ -145,7 +145,13 @@ pub(super) async fn apply_adaptive_task_command(
     db: &SqliteDb,
     input: ApplyAdaptiveTaskCommand,
 ) -> Result<AppliedAdaptiveTaskCommand> {
+    if !crate::task_writer::owns_task(&input.source_task_id) {
+        return Err(DbError::Check(
+            "adaptive command requires the Task step".to_owned(),
+        ));
+    }
     let mut tx = crate::begin_immediate(db.pool()).await?;
+    db.fence_current_step_in_tx(&mut tx).await?;
     let receipt_input = input
         .command_receipt
         .clone()
@@ -269,6 +275,12 @@ pub(super) async fn apply_adaptive_task_command(
                     .bind(&source.project_id)
                     .execute(&mut *tx)
                     .await?;
+                    crate::task_condition::produce(
+                        &mut tx,
+                        &task.id,
+                        crate::ConditionChange::Legacy,
+                    )
+                    .await?;
                 }
                 if let Some(agent_id) = item.assignee_id.as_deref() {
                     sqlx::query(
@@ -322,6 +334,8 @@ pub(super) async fn apply_adaptive_task_command(
                 .execute(&mut *tx)
                 .await?;
             }
+            // Child witnesses follow the sequence order.
+            crate::task_condition::produce_children(&mut tx, &source.id).await?;
             // `subtask_order` is part of the Task board's sibling ordering but
             // predates the board trigger. Bump the revision explicitly so a
             // stale sequence command cannot overwrite a newer ordering.

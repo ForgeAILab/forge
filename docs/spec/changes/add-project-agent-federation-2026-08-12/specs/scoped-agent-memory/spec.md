@@ -66,6 +66,8 @@ Memory bodies SHALL remain append-only. Publishing private/global memory to a Pr
 
 Forge SHALL expose scoped semantic memory to Agent Runtime through a `MemorySource` bound immutably to the admitted identity and canonical Main Chat, Project Chat, or Task scope. It SHALL return already-authorized, ranked, bounded records with stable IDs, revisions, sensitivity, and retention priorities; Agent Runtime SHALL NOT write Forge memory or infer broader scope.
 
+`ForgeMemorySource` was removed as unwired and must be reintroduced by the change that wires this memory source.
+
 #### Scenario: Required records survive pressure
 
 - **WHEN** selected context exceeds the runtime budget

@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::RecoveryAction;
+use crate::TaskAction;
 
 /// The typed actor responsible for a task transition.
 ///
@@ -14,6 +14,12 @@ pub enum Actor {
     User {
         user_id: Option<String>,
         source: UserActionSource,
+        /// The request authenticated with a credential an agent may also hold
+        /// (MCP: PATs, sessions and OAuth tokens all resolve to the user, with
+        /// no agent-scoped kind). It keeps the user's action authority but not
+        /// the owner's budget exemption: see [`Actor::is_owner`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        delegated: bool,
     },
     Agent {
         agent_id: String,
@@ -30,13 +36,10 @@ pub enum UserActionSource {
     BoardDrag,
     Board,
     Override(Box<UserActionSource>),
-    Recovery(RecoveryAction),
+    Action(TaskAction),
     Reassignment,
     RoleReassignment,
-    ManualAdvance,
     Transition,
-    RetryHook,
-    SkipHookOnce,
     Test,
 }
 
@@ -64,6 +67,17 @@ impl Actor {
         Self::User {
             user_id: None,
             source,
+            delegated: false,
+        }
+    }
+
+    /// A user acting through a credential that cannot be told apart from an
+    /// agent's (MCP).
+    pub fn delegated_user(user_id: impl Into<String>, source: UserActionSource) -> Self {
+        Self::User {
+            user_id: Some(user_id.into()),
+            source,
+            delegated: true,
         }
     }
 
@@ -80,6 +94,18 @@ impl Actor {
 
     pub fn is_user(&self) -> bool {
         matches!(self, Self::User { .. })
+    }
+
+    /// Authenticated as the human owner (REST, web and `forge-ctl` sessions,
+    /// escalation answers). Only the owner's actions spend no retry budget.
+    pub fn is_owner(&self) -> bool {
+        matches!(
+            self,
+            Self::User {
+                delegated: false,
+                ..
+            }
+        )
     }
 
     pub fn is_agent(&self) -> bool {
@@ -100,12 +126,17 @@ impl Actor {
     /// produce nested `user:override:user:override:...` audit values.
     pub fn into_override(self) -> Self {
         match self {
-            Self::User { user_id, source } => Self::User {
+            Self::User {
+                user_id,
+                source,
+                delegated,
+            } => Self::User {
                 user_id,
                 source: match source {
                     UserActionSource::Override(_) => source,
                     source => UserActionSource::Override(Box::new(source)),
                 },
+                delegated,
             },
             actor => actor,
         }
@@ -132,13 +163,10 @@ impl fmt::Display for UserActionSource {
             Self::BoardDrag => f.write_str("board_drag"),
             Self::Board => f.write_str("board"),
             Self::Override(source) => write!(f, "override:{source}"),
-            Self::Recovery(action) => write!(f, "recovery:{action}"),
+            Self::Action(action) => write!(f, "action:{action}"),
             Self::Reassignment => f.write_str("reassignment"),
             Self::RoleReassignment => f.write_str("role_reassignment"),
-            Self::ManualAdvance => f.write_str("manual_advance"),
             Self::Transition => f.write_str("transition"),
-            Self::RetryHook => f.write_str("retry_hook"),
-            Self::SkipHookOnce => f.write_str("skip_hook_once"),
             Self::Test => f.write_str("test"),
         }
     }
@@ -166,26 +194,6 @@ impl fmt::Display for SystemComponent {
     }
 }
 
-impl fmt::Display for RecoveryAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::ResumeSession => "resume_session",
-            Self::Reexecute => "reexecute",
-            Self::ResetToInitial => "reset_to_initial",
-            Self::CancelTask => "cancel_task",
-            Self::MarkReviewed => "mark_reviewed",
-            Self::RetryHook => "retry_hook",
-            Self::ResumeProcess => "resume_process",
-            Self::UpdateWorkspaceAndRetryHook => "update_workspace_and_retry_hook",
-            Self::SkipHookOnce => "skip_hook_once",
-            Self::ResetRetryWindow => "reset_retry_window",
-            Self::ProceedOnce => "proceed_once",
-            Self::OpenInteractive => "open_interactive",
-        };
-        f.write_str(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,13 +208,32 @@ mod tests {
             "system:task_dispatcher"
         );
         assert_eq!(
-            Actor::user(UserActionSource::Recovery(RecoveryAction::ResumeProcess)).display(),
-            "user:recovery:resume_process"
+            Actor::user(UserActionSource::Action(TaskAction::retry())).display(),
+            "user:action:retry"
         );
         assert_eq!(
             Actor::user(UserActionSource::Api).into_override().display(),
             "user:override:api"
         );
+    }
+
+    #[test]
+    fn delegated_user_keeps_audit_format_but_not_owner_authority() {
+        let delegated = Actor::delegated_user("u", UserActionSource::Api);
+        assert_eq!(delegated.display(), "user:api");
+        assert!(delegated.is_user());
+        assert!(!delegated.is_owner());
+        assert!(!delegated.clone().into_override().is_owner());
+        assert!(Actor::user(UserActionSource::Api).is_owner());
+        assert!(!Actor::agent("a").is_owner());
+        let json = serde_json::to_value(Actor::user(UserActionSource::Api)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"User":{"user_id":null,"source":"Api"}})
+        );
+        let round: Actor =
+            serde_json::from_value(serde_json::to_value(&delegated).unwrap()).unwrap();
+        assert_eq!(round, delegated);
     }
 
     #[test]

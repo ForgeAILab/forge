@@ -595,7 +595,8 @@ pub async fn propose_task(
         correlation_id: result.receipt.correlation_id,
         replayed: result.replayed,
         requires_user_authorization: false,
-        task: crate::routes::task_response(&state.db, result.task).await?,
+        task: crate::routes::task_response(&state.db, &state.workspace_backend_router, result.task)
+            .await?,
     };
     Ok((status, Json(response)))
 }

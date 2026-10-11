@@ -22,7 +22,7 @@ use super::merge::RequireConflictMarkersResolved;
 use super::merge::{merge_failure_result, target_moved_result, RunMerge};
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
-    RequireUpstreamRolesCompleted, RunCiSteps,
+    RequireUpstreamRolesCompleted,
 };
 use crate::workflow::{
     default_roles, default_states, default_workflow, HookAction, HookContext, HookResult,
@@ -65,7 +65,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -234,7 +233,6 @@ async fn seed_local_project_repo_and_task(
             name: "forge".to_owned(),
             remote_url: Some(repo_path.to_string_lossy().into_owned()),
             local_path: Some(repo_path.to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -294,14 +292,23 @@ async fn seed_agent(db: &SqliteDb, agent_id: &str) {
 }
 
 async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks: i64) {
-    let now = now_rfc3339();
-    let daemon_id = new_uuid_v4();
+    seed_agent_with_executor(db, agent_id, max_concurrent_tasks, "shell").await;
+}
 
-    DaemonRepo::upsert_by_machine_id(
+async fn seed_agent_with_executor(
+    db: &SqliteDb,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+    executor_type: &str,
+) {
+    let now = now_rfc3339();
+
+    let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
-            id: daemon_id.clone(),
-            machine_id: format!("machine-{daemon_id}"),
+            max_concurrent_runs: None,
+            id: new_uuid_v4(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -316,12 +323,16 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
         },
     )
     .await
-    .expect("daemon creates");
+    .expect("daemon creates")
+    .id;
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
-            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            detected_clis_json:
+                serde_json::json!([{ "kind": executor_type, "availability": "authenticated" }])
+                    .to_string(),
             labels_json: None,
             status: DaemonStatus::Online,
             last_report_at: now.clone(),
@@ -337,7 +348,7 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
             id: agent_id.to_owned(),
             name: "test-agent".to_owned(),
             description: None,
-            executor_type: "shell".to_owned(),
+            executor_type: executor_type.to_owned(),
             model: None,
             reasoning_effort: None,
             permission_policy: None,
@@ -433,12 +444,33 @@ async fn build_role_dispatch_harness(
     agent_id: &str,
     max_concurrent_tasks: i64,
 ) -> DispatchHarness {
+    build_role_dispatch_harness_with_executor(
+        task_id,
+        from_state,
+        to_state,
+        role,
+        agent_id,
+        max_concurrent_tasks,
+        "shell",
+    )
+    .await
+}
+
+async fn build_role_dispatch_harness_with_executor(
+    task_id: &str,
+    from_state: &str,
+    to_state: &str,
+    role: &str,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+    executor_type: &str,
+) -> DispatchHarness {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_root = TempDir::new().expect("workspace dir creates");
     let project_id =
         seed_local_project_repo_and_task(&db, repo_dir.path(), task_id, to_state).await;
-    seed_agent_with_max(&db, agent_id, max_concurrent_tasks).await;
+    seed_agent_with_executor(&db, agent_id, max_concurrent_tasks, executor_type).await;
     assign_agent_role(&db, task_id, role, agent_id).await;
     if role == default_roles::REVIEWER {
         configure_review_defaults(&db, &project_id, &[json!("test -d .")]).await;
@@ -469,6 +501,7 @@ async fn build_role_dispatch_harness(
             project_id,
             from_state: from_state.to_owned(),
             to_state: to_state.to_owned(),
+            workspace_backend_router: task_service.workspace_backend_router(),
             db,
             event_bus,
             gate_config,
@@ -530,6 +563,7 @@ async fn build_no_repo_dispatch_harness(
             project_id,
             from_state: default_states::TODO.to_owned(),
             to_state: default_states::IN_PROGRESS.to_owned(),
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             gate_config,
@@ -603,6 +637,14 @@ async fn assign_agent_role(db: &SqliteDb, task_id: &str, role: &str, agent_id: &
     .await;
 }
 
+/// `run_ci_steps` as the step queue runs it: review-entry CI is a check the
+/// durable runner executes, asked for from the Task's hooks step, and the
+/// hook settles the Review when it runs again with the result.
+async fn run_ci(ctx: &HookContext) -> HookResult {
+    let worker = ctx.task_service.check_worker_or_embedded();
+    crate::workflow::actions::run_ci_steps_in_step(ctx, &worker).await
+}
+
 async fn build_test_ctx(
     task_id: &str,
     from_state: &str,
@@ -635,6 +677,7 @@ async fn build_test_ctx(
         project_id,
         from_state: from_state.to_owned(),
         to_state: to_state.to_owned(),
+        workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
         db,
         event_bus,
         gate_config,
@@ -879,7 +922,7 @@ async fn run_ci_steps_empty_reason_contains_ci_steps() {
     .await;
     ctx.state_config = json!({ "ci_steps": [] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("ci steps")),
@@ -898,7 +941,7 @@ async fn run_ci_steps_skips_when_ci_steps_empty() {
     .await;
     ctx.state_config = json!({ "ci_steps": [] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("ci steps")),
@@ -922,7 +965,7 @@ async fn run_ci_steps_skips_project_implementation_checks_for_discovery_tasks() 
         .expect("Task kind updates");
     ctx.state_config = json!({ "ci_steps": ["false"] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("read-only Task")),
@@ -948,7 +991,7 @@ async fn run_ci_steps_skips_when_workspace_missing() {
     .await;
     ctx.state_config = json!({ "ci_steps": ["cargo test"] });
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("no workspace")),
@@ -968,7 +1011,7 @@ async fn run_ci_steps_skips_when_executor_execution_missing() {
     ctx.state_config = json!({ "ci_steps": ["cargo test"] });
     ctx.workspace_id = Some("workspace-1".to_owned());
 
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     match result {
         HookResult::Skipped { reason } => assert!(reason.contains("no executor execution")),
@@ -991,7 +1034,7 @@ async fn run_ci_steps_creates_passed_review_record() {
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     enter_target_state(&ctx).await;
-    let result = RunCiSteps.execute(&ctx).await;
+    let result = run_ci(&ctx).await;
 
     assert!(matches!(result, HookResult::Ok));
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1018,7 +1061,7 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1308,7 +1351,7 @@ async fn merge_fix_re_review_still_requires_an_assigned_reviewer() {
         .await
         .expect("review_passed_at seeds");
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1355,7 +1398,7 @@ async fn run_ci_steps_failure_prevents_reviewer_dispatch() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["false"] });
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Failed { .. }),
         "{ci_result:?}"
@@ -1430,7 +1473,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
         .await;
     crate::test_support::set_test_agent_capacity(&ctx.db, agent_id, 1).await;
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
@@ -1575,11 +1618,11 @@ async fn run_ci_steps_without_reviewer_cascades_to_merging() {
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     enter_target_state(&ctx).await;
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     match AutoCascadeOnReviewPass.execute(&ctx).await {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::MERGING);
             assert_eq!(reason, "review passed");
         }
@@ -1601,7 +1644,7 @@ async fn cached_passed_review_cannot_cascade_after_its_authority_is_cleared() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
     enter_target_state(&ctx).await;
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
     TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now_rfc3339())
         .await
@@ -1647,7 +1690,7 @@ async fn passed_review_defers_integration_while_project_is_paused() {
     let execution_id = seed_completed_executor_execution(&ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
     ProjectRepo::set_paused_at(&*ctx.db, &ctx.project_id, Some(now_rfc3339()))
         .await
@@ -1690,7 +1733,7 @@ async fn run_ci_steps_with_user_approval_gate_waits_for_human() {
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
     enter_target_state(&ctx).await;
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -1830,6 +1873,7 @@ async fn auto_cascade_review_failure_at_budget_blocks_with_metadata() {
     )
     .await;
 
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2").bind(&ctx.task_id).execute(ctx.db.pool()).await.unwrap();
     match AutoCascadeOnReviewPass.execute(&ctx).await {
         HookResult::Ok => {}
         other => panic!("expected review budget block, got {other:?}"),
@@ -1875,6 +1919,7 @@ async fn auto_cascade_review_failure_budget_blocks_with_metadata() {
     .await;
     let mut rx = ctx.event_bus.subscribe();
 
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2").bind(&ctx.task_id).execute(ctx.db.pool()).await.unwrap();
     match AutoCascadeOnReviewPass.execute(&ctx).await {
         HookResult::Ok => {}
         other => panic!("expected review budget block, got {other:?}"),
@@ -1976,7 +2021,17 @@ async fn dispatch_role_agent_skips_without_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_emits_event_for_coder_assignment() {
     let agent_id = "agent-coder-dispatch";
-    let mut harness = build_initial_dispatch_harness("task-dispatch-coder", agent_id, 1).await;
+    let mut harness = build_role_dispatch_harness_with_executor(
+        "task-dispatch-coder",
+        default_states::TODO,
+        default_states::IN_PROGRESS,
+        default_roles::CODER,
+        agent_id,
+        1,
+        "codex",
+    )
+    .await;
+
     let ctx = harness.ctx.clone();
     let mut rx = ctx.event_bus.subscribe();
 
@@ -2006,7 +2061,7 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
         other => panic!("unexpected event context: {other:?}"),
     }
 
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(30), harness.rx.recv())
         .await
         .expect("executor receives dispatch")
         .expect("executor context exists");
@@ -2020,15 +2075,17 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
     let agent_id = "agent-coder-dirty-worktree";
-    let mut harness = build_role_dispatch_harness(
+    let mut harness = build_role_dispatch_harness_with_executor(
         "task-dispatch-dirty-worktree",
         default_states::MERGING,
         default_states::MERGE_FAILED,
         default_roles::CODER,
         agent_id,
         1,
+        "codex",
     )
     .await;
+
     sqlx::query(
         "UPDATE task
          SET review_passed_at = ?, error_annotation = ?
@@ -2046,6 +2103,12 @@ async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
     .execute(harness.ctx.db.pool())
     .await
     .expect("dirty worktree annotation persists");
+    harness
+        .ctx
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&harness.ctx.task_id))
+        .await
+        .expect("the stored condition follows the raw write");
 
     let dispatch_result = DispatchRoleAgent.execute(&harness.ctx).await;
     assert!(
@@ -2053,7 +2116,7 @@ async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
         "{dispatch_result:?}"
     );
 
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(30), harness.rx.recv())
         .await
         .expect("coder executor spawned in time")
         .expect("coder execution context received");
@@ -2081,17 +2144,14 @@ async fn review_refresh_bypasses_merge_fix_notification_and_dispatch() {
     sqlx::query(
         "INSERT INTO transition_log
          (id, task_id, from_state, to_state, trigger_name, triggered_by,
-          trigger_reason, hook_results_json, rejection, created_at)
-         VALUES (?, ?, ?, ?, 'retry', 'system:workflow', ?, NULL, 0, ?)",
+          trigger_reason, hook_results_json, rejection, created_at, bridge_kind)
+         VALUES (?, ?, ?, ?, 'retry', 'system:workflow', ?, NULL, 0, ?, 'review_refresh')",
     )
     .bind(new_uuid_v4())
     .bind(&harness.ctx.task_id)
     .bind(default_states::MERGING)
     .bind(default_states::MERGE_FAILED)
-    .bind(format!(
-        "{} reviewed commit changed; fresh review required",
-        crate::workflow::REVIEW_REFRESH_MARKER
-    ))
+    .bind("Reviewed commit changed; fresh review required")
     .bind(now_rfc3339())
     .execute(harness.ctx.db.pool())
     .await
@@ -2105,11 +2165,14 @@ async fn review_refresh_bypasses_merge_fix_notification_and_dispatch() {
 
     let dispatch = DispatchRoleAgent.execute(&harness.ctx).await;
     assert!(matches!(
-        dispatch,
-        HookResult::Cascade { to, reason }
-            if to == default_states::REVIEW
-                && reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
-    ));
+            dispatch,
+            HookResult::Cascade { to, bridge,
+
+    ..
+    }
+                if to == default_states::REVIEW
+                    && bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ReviewRefresh)
+        ));
     assert!(harness.rx.try_recv().is_err());
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
@@ -2135,6 +2198,7 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
         to_state: default_states::MERGE_FAILED.to_owned(),
         trigger_name: Some("retry".to_owned()),
         triggered_by: workflow_actor.clone(),
+        bridge: Default::default(),
         trigger_reason: reason.to_owned(),
         hook_results_json: None,
         rejection: true,
@@ -2147,10 +2211,8 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
         to_state: default_states::MERGE_FAILED.to_owned(),
         trigger_name: Some("retry".to_owned()),
         triggered_by: workflow_actor.clone(),
-        trigger_reason: format!(
-            "{} target advanced; re-review required",
-            crate::workflow::REVIEW_REFRESH_MARKER
-        ),
+        bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
+        trigger_reason: "Target advanced; re-review required".to_owned(),
         hook_results_json: None,
         // A direct caller may supply rejection=true; the engine normalizes the
         // durable row, and the counter remains defensive for pre-existing rows.
@@ -2159,7 +2221,7 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
     };
 
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(
             &[rejection("merge conflict"), bridge],
             default_states::MERGING,
         ),
@@ -2232,13 +2294,10 @@ async fn coordination_root_merge_conflict_becomes_manual_repair_block() {
         panic!("coordination merge block must be typed")
     };
     assert_eq!(annotation.blocked_by.as_deref(), Some("coordination_root"));
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask
-        ]
-    );
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 }
 
 #[tokio::test]
@@ -2293,13 +2352,10 @@ async fn ordinary_merge_conflict_parks_for_manual_repair_and_invalidates_review(
         annotation.blocked_by.as_deref(),
         Some("manual_workspace_repair")
     );
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask
-        ]
-    );
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 }
 
 /// Two sibling Tasks each add an entry to the same export list; the first
@@ -2433,16 +2489,16 @@ async fn rebase_conflict_is_handed_back_to_the_worker_with_committed_markers() {
 
     let result = target_moved_result(&ctx, &task, "main advanced", "main").await;
 
-    let HookResult::Cascade { to, reason } = result else {
+    let HookResult::Cascade { to, reason, bridge } = result else {
         panic!("a sibling conflict goes back to the Worker, got {result:?}");
     };
     assert_eq!(to, default_states::MERGE_FAILED);
     assert!(
-        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
     );
     assert!(
-        !reason.contains(crate::workflow::REVIEW_REFRESH_MARKER),
+        !bridge.is_review_refresh(),
         "a conflict needs the Worker, not a bare re-review: {reason}"
     );
     assert!(reason.contains("exports.py"), "{reason}");
@@ -2487,6 +2543,7 @@ async fn record_conflict_handoff(ctx: &HookContext, reason: String, rejection: b
             to_state: default_states::MERGE_FAILED.to_owned(),
             trigger_name: None,
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge: api_types::TransitionBridge::conflict_handoff(&["exports.py".into()]),
             trigger_reason: reason,
             hook_results_json: None,
             rejection,
@@ -2508,11 +2565,7 @@ async fn conflict_handoff_preserves_later_merge_fix_follow_up() {
     .await;
     record_conflict_handoff(
         &ctx,
-        format!(
-            "{} rebased onto main{}[\"exports.py\"]",
-            crate::workflow::CONFLICT_HANDOFF_MARKER,
-            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
-        ),
+        "rebased onto main; conflicts were committed with markers in: exports.py".to_owned(),
         true,
     )
     .await;
@@ -2569,7 +2622,7 @@ async fn run_merge_blocks_unresolved_handed_off_markers() {
         panic!("conflict should hand off");
     };
     record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2607,7 +2660,7 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
         panic!("conflict should hand off");
     };
     record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2666,7 +2719,7 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     .expect("Worker resolves both sides");
     run_git(&worktree_path, &["add", "-A"]);
     run_git(&worktree_path, &["commit", "-m", "resolve handoff"]);
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2694,7 +2747,7 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
     )
     .await;
     let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2702,12 +2755,12 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
 
     let result = RunMerge.execute(&ctx).await;
 
-    let HookResult::Cascade { to, reason } = result else {
+    let HookResult::Cascade { to, reason, bridge } = result else {
         panic!("a plain merge conflict goes back to the Worker, got {result:?}");
     };
     assert_eq!(to, default_states::MERGE_FAILED);
     assert!(
-        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
     );
     let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
@@ -2741,10 +2794,12 @@ async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
                 trigger_name: None,
                 triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow)
                     .display(),
-                trigger_reason: format!(
-                    "{} rebased onto main; conflicts were committed with markers in: exports.py",
-                    crate::workflow::CONFLICT_HANDOFF_MARKER
+                bridge: api_types::TransitionBridge::new(
+                    api_types::TransitionBridgeKind::ConflictHandoff,
                 ),
+                trigger_reason:
+                    "rebased onto main; conflicts were committed with markers in: exports.py"
+                        .to_owned(),
                 hook_results_json: None,
                 rejection: true,
                 created_at: now_rfc3339(),
@@ -3038,6 +3093,7 @@ async fn build_reviewer_dispatch_harness(
             project_id,
             from_state: default_states::IN_PROGRESS.to_owned(),
             to_state: default_states::REVIEW.to_owned(),
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             gate_config,
@@ -3106,7 +3162,7 @@ async fn ci_passes_then_reviewer_dispatched_via_dispatch_role_agent() {
         build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, vec!["test -d ."]).await;
     let ctx = harness.ctx.clone();
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Ok),
         "CI should pass: {ci_result:?}"
@@ -3369,7 +3425,7 @@ async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
     .await
     .expect("subtask execution creates");
     ctx.execution_id = Some(child_execution_id);
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
@@ -3423,7 +3479,7 @@ async fn reviewer_dispatch_ignores_waiting_review_tasks_without_running_executio
     .expect("other task creates");
     assign_agent_role(&ctx.db, other_task_id, default_roles::REVIEWER, reviewer_id).await;
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
@@ -3446,7 +3502,7 @@ async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
     let harness = build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, vec!["exit 1"]).await;
     let ctx = harness.ctx.clone();
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Failed { .. }),
         "CI hook returns Failed on CI failure: {ci_result:?}"
@@ -3470,7 +3526,7 @@ async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
 
     let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
     match cascade_result {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::IN_PROGRESS);
             assert_eq!(reason, "review failed");
         }
@@ -3650,7 +3706,7 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
     .await;
     crate::test_support::set_test_agent_capacity(&ctx.db, reviewer_id, 1).await;
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     assert!(
         matches!(ci_result, HookResult::Ok),
         "CI should pass even when reviewer at capacity: {ci_result:?}"
@@ -3689,7 +3745,7 @@ async fn no_reviewer_assigned_auto_cascade_to_merging() {
     .await;
     ctx.state_config = json!({});
 
-    let ci_result = RunCiSteps.execute(&ctx).await;
+    let ci_result = run_ci(&ctx).await;
     match ci_result {
         HookResult::Skipped { reason } => assert!(reason.contains("ci steps")),
         other => panic!("expected skipped for empty ci, got {other:?}"),
@@ -3703,7 +3759,7 @@ async fn no_reviewer_assigned_auto_cascade_to_merging() {
 
     let cascade_result = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
     match cascade_result {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::MERGING);
             assert!(reason.contains("no checks or reviewer"));
         }
@@ -3731,7 +3787,7 @@ async fn read_only_task_without_reviewer_ignores_implementation_checks_and_casca
     let cascade = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
 
     match cascade {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::MERGING);
             assert!(reason.contains("no checks or reviewer"));
         }
@@ -3850,7 +3906,7 @@ async fn build_carry_scenario(
         changed_paths: vec!["feature.txt".to_owned(), "shared.txt".to_owned()],
     };
     let mut harness = harness;
-    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&harness.ctx.db),
         Arc::clone(&harness.ctx.event_bus),
         harness._workspace_root.path().to_path_buf(),
@@ -3967,6 +4023,8 @@ async fn seed_passed_carry_review(
         status: api_types::ConformanceStatus::Passed,
         contract: Some(contract),
         assessment: Some(api_types::ReviewAssessment {
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             result: api_types::ReviewResult::Pass,
             reason: "looks right".to_owned(),
             report: String::new(),
@@ -4017,6 +4075,7 @@ async fn record_transition_entry(
     to: &str,
     actor: api_types::Actor,
     reason: &str,
+    bridge: api_types::TransitionBridge,
 ) {
     db::TransitionLogRepo::insert(
         &*ctx.db,
@@ -4027,6 +4086,7 @@ async fn record_transition_entry(
             to_state: to.to_owned(),
             trigger_name: None,
             triggered_by: actor.display(),
+            bridge,
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -4042,6 +4102,7 @@ async fn record_transition_entry(
 async fn enter_review_after_bridge(
     ctx: &mut HookContext,
     bridge_reason: &str,
+    bridge: &api_types::TransitionBridge,
     entry_actor: api_types::Actor,
     entry_reason: &str,
     ci_steps: serde_json::Value,
@@ -4053,6 +4114,7 @@ async fn enter_review_after_bridge(
         default_states::MERGE_FAILED,
         workflow_actor,
         bridge_reason,
+        bridge.clone(),
     )
     .await;
     record_transition_entry(
@@ -4061,6 +4123,7 @@ async fn enter_review_after_bridge(
         default_states::REVIEW,
         entry_actor.clone(),
         entry_reason,
+        api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
     )
     .await;
     ctx.from_state = default_states::MERGE_FAILED.to_owned();
@@ -4183,12 +4246,12 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
 
-    let HookResult::Cascade { to, reason } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { to, reason, bridge } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     assert_eq!(to, default_states::MERGE_FAILED);
     assert!(
-        reason.contains(crate::workflow::TARGET_MOVED_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase),
         "{reason}"
     );
     let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
@@ -4197,20 +4260,24 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
-    let HookResult::Cascade { to, reason } = carried else {
+    let HookResult::Cascade { to, reason, bridge } = carried else {
         panic!("a clean rebase with passing checks carries the review, got {carried:?}");
     };
     assert_eq!(to, default_states::MERGING);
-    assert!(reason.contains("[review-carry]"), "{reason}");
+    assert!(
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ReviewCarry),
+        "{reason}"
+    );
 
     assert_eq!(reviewer_execution_count(&ctx).await, reviewers_before);
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -4252,11 +4319,11 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
 
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the conflicting sibling should hand the conflict back");
     };
     assert!(
-        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
     );
     // The Worker reconciles only the handed-off file and commits.
@@ -4272,12 +4339,13 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Test),
         "worker completed the merge repair",
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4308,7 +4376,7 @@ async fn repair_touching_a_new_path_gets_a_full_review() {
         build_carry_scenario("task-carry-scope", "agent-carry-scope", true).await;
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the conflicting sibling should hand the conflict back");
     };
     std::fs::write(
@@ -4324,12 +4392,13 @@ async fn repair_touching_a_new_path_gets_a_full_review() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Test),
         "worker completed the merge repair",
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4355,12 +4424,13 @@ async fn no_configured_checks_means_a_full_review() {
         build_carry_scenario("task-carry-no-ci", "agent-carry-no-ci", false).await;
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!([]),
@@ -4381,7 +4451,7 @@ async fn changed_governing_context_means_a_full_review() {
     let (harness, _scenario) =
         build_carry_scenario("task-carry-context", "agent-carry-context", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     sqlx::query("UPDATE task SET description = 'a different acceptance scope' WHERE id = ?")
@@ -4392,12 +4462,13 @@ async fn changed_governing_context_means_a_full_review() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
     )
     .await;
-    let ci = RunCiSteps.execute(&ctx).await;
+    let ci = run_ci(&ctx).await;
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
@@ -4413,13 +4484,14 @@ async fn other_review_entries_never_carry() {
     let (harness, _scenario) =
         build_carry_scenario("task-carry-entry", "agent-carry-entry", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     // A user moving the Task is never mechanical.
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::user(api_types::UserActionSource::Api),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
@@ -4444,19 +4516,20 @@ async fn carry_for_an_old_review_is_ignored_after_a_newer_real_review() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-superseded", "agent-carry-superseded", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
     )
     .await;
-    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+    assert!(matches!(run_ci(&ctx).await, HookResult::Ok));
     assert!(matches!(
         super::CarryReviewAuthority.execute(&ctx).await,
         HookResult::Cascade { .. }
@@ -4513,7 +4586,7 @@ async fn carries_are_bounded_per_review() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-bound", "agent-carry-bound", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     let contract_execution_id: String =
@@ -4539,19 +4612,97 @@ async fn carries_are_bounded_per_review() {
         .await
         .expect("carry row seeds");
     }
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review_carry',?,5) ON CONFLICT(task_id,kind) DO UPDATE SET spent=5,window_id=excluded.window_id").bind(&ctx.task_id).bind(&contract_execution_id).execute(ctx.db.pool()).await.unwrap();
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
     )
     .await;
-    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+    assert!(matches!(run_ci(&ctx).await, HookResult::Ok));
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
     let HookResult::Skipped { reason } = carried else {
         panic!("the carry bound must force a real review, got {carried:?}");
     };
     assert!(reason.contains("already carried"), "{reason}");
+}
+
+#[tokio::test]
+async fn hook_block_rebases_a_content_edit_under_its_lease_without_cas_retry() {
+    use db::TaskStepRepo;
+    let ctx = build_test_ctx("block-content-race", "in_progress", "in_progress", None).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = new_uuid_v4();
+    ctx.db
+        .enqueue_step(&db::EnqueueTaskStep {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            kind: "hooks".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: id.clone(),
+            chain_id: id,
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+    let step = ctx
+        .db
+        .claim_step(
+            "hook",
+            Some(&task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE task SET title='owner edit',version=version+1 WHERE id=?")
+        .bind(&task.id)
+        .execute(ctx.db.pool())
+        .await
+        .unwrap();
+    db::task_writer::in_task_step(
+        step.clone(),
+        super::common::block_task_with_annotation(
+            &ctx,
+            &task,
+            "CI failed",
+            api_types::FailureKind::CiFailed,
+            Some("CI"),
+            Some(json!({"type":"ci_failed"}).to_string()),
+        ),
+    )
+    .await
+    .unwrap();
+    let result = TaskRepo::get_by_id(&*ctx.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.title, "owner edit");
+    assert!(result
+        .blocked_json
+        .as_deref()
+        .unwrap()
+        .contains("CI failed"));
+    assert_eq!(result.version, task.version + 2);
+    let mut tx = db::begin_immediate(ctx.db.pool()).await.unwrap();
+    ctx.db
+        .finish_step_in_tx(&mut tx, &step, "done", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    ctx.db.release_step(&step.id, "hook").await.unwrap();
+    assert_eq!(ctx.db.task_steps(&task.id).await.unwrap()[0].attempts, 1);
 }

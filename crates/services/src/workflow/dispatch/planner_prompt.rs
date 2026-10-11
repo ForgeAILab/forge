@@ -11,11 +11,12 @@ use crate::workflow::{
 
 pub struct PlannerPromptBuilder;
 
-const PLANNER_ROLE_BOUNDARY: &str = "\
+const PLANNER_ROLE_BOUNDARY: &str = forge_agent_host::merge_friendly_guidance!("\
 Planner boundary:
 - Must investigate enough to produce an executable plan with risks, tests, and acceptance criteria.
 - Must not modify code or mark implementation items done; leave implementation work unchecked unless already complete.
-- Red flags: code edits, completed implementation checkboxes, plans without verification steps.";
+- Red flags: code edits, completed implementation checkboxes, plans without verification steps.
+- For sub-task planning: ", "");
 
 impl PromptBuilder for PlannerPromptBuilder {
     fn id(&self) -> &'static str {

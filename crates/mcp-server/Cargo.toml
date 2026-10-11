@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+operation-registry = { path = "../operation-registry" }
 api-types = { path = "../api-types" }
 executors = { path = "../executors" }
 db = { path = "../db" }
@@ -25,5 +26,7 @@ uuid = "1"
 workspace = true
 
 [dev-dependencies]
+services = { path = "../services", features = ["test-support"] }
+db = { path = "../db", features = ["test-template"] }
 forge-agent-host = { path = "../agent-host" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }

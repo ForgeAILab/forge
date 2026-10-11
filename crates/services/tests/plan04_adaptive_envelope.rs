@@ -10,7 +10,7 @@ use std::sync::Arc;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
     CreateAgentProfile, CreateProject, CreateRepo, CreateTask, ProjectRepo, RepoRepo, SqliteDb,
-    TaskRepo, UpdateProject, WorkMode,
+    TaskRepo, UpdateProject,
 };
 use events::EventBus;
 use forge_agent_host::{
@@ -81,7 +81,6 @@ async fn fixture_with_allowed_operations(
             name: "plan04".to_owned(),
             remote_url: Some("file:///tmp/plan04".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),
@@ -258,7 +257,7 @@ async fn fixture_with_allowed_operations(
     .await
     .expect("root governance");
 
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let service = TaskService::new_for_test(Arc::clone(&db), Arc::new(EventBus::new(32)));
     (db, service)
 }
 

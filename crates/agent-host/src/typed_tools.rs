@@ -7,13 +7,15 @@
 //! actor or scope as tool arguments; those values are captured when the host
 //! composes the tools.
 
+#[cfg(test)]
+use crate::PROJECT_CURRENT_STATE_OPERATION;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     io::ErrorKind,
     path::{Component, Path},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use agent_runtime::core::{
@@ -37,6 +39,7 @@ use agent_runtime::core::{
 };
 use agent_runtime::registry::{Permission, TrustClass};
 use agent_runtime::runtime::RuntimeBuilder;
+use api_types::{DeniedBy, OrchestrationOutcome, OutcomeCode, RetryAction};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
@@ -46,14 +49,9 @@ use agent_runtime::harness::{FetchTool, FetchTransport};
 use crate::{
     AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-        MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
-        MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-        MAIN_INQUIRY_RUN_OPERATION, OperationExposure, OperationSurface,
-        PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        PROJECT_OBSERVATIONS_OPERATION, PROJECT_SKILL_SECTION_NAMES,
-        PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-        TASK_WORKLOG_OPERATION, operation_names_for_surface,
+        MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION, OperationExposure,
+        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, TASK_EVIDENCE_OPERATION,
+        TASK_PLAN_OPERATION, TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -128,6 +126,50 @@ pub struct CommandObservation {
 
 #[async_trait]
 pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
+    fn admitted_authority(&self) -> Option<&operation_registry::authority::EffectiveAuthority> {
+        None
+    }
+    async fn read_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let _ = (actor_identity_id, scope, operation);
+        Ok(())
+    }
+    /// Persist a safe terminal-denial reminder using host-issued session and
+    /// scope values. Inspection-only providers need no durable storage.
+    async fn record_terminal_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        session_token: &str,
+        operation: &str,
+        denied_by: &DeniedBy,
+    ) -> Result<(), AgentHostError> {
+        let _ = (
+            actor_identity_id,
+            scope,
+            session_token,
+            operation,
+            denied_by,
+        );
+        Ok(())
+    }
+
+    /// Remove session reminders after a successful evaluation of the operation.
+    async fn clear_terminal_denials(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        session_token: &str,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let _ = (actor_identity_id, scope, session_token, operation);
+        Ok(())
+    }
+
     /// Performs one already-scope-bound, read-only domain operation.
     async fn read(
         &self,
@@ -136,6 +178,20 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
+
+    /// A registered query evaluates the authority pinned at turn admission.
+    /// No fresh effect occurs, so the inner provider must not resolve again.
+    async fn read_admitted(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+    ) -> Result<Value, AgentHostError> {
+        let _ = authority;
+        self.read(actor, scope, operation, arguments).await
+    }
 
     /// Persists one already-scope-bound proposal envelope.  The provider is
     /// responsible for applying Forge's policy intersection and for keeping
@@ -151,6 +207,71 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
+
+    /// Check current Main proposal authority before revealing payload contracts.
+    async fn proposal_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let _ = (actor_identity_id, scope, operation);
+        Ok(())
+    }
+
+    /// Execute a fingerprinted preparation, including one restored from storage.
+    /// Its arguments have already been admitted; do not validate them against a
+    /// newer contract. Implementations still enforce current authority/domain rules.
+    async fn propose_prepared(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        self.propose(
+            actor_identity_id,
+            scope,
+            runtime_session_id,
+            operation,
+            arguments,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn propose_admitted(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+        prepared: bool,
+    ) -> Result<Value, AgentHostError> {
+        let _ = authority;
+        if prepared {
+            self.propose_prepared(
+                actor_identity_id,
+                scope,
+                runtime_session_id,
+                operation,
+                arguments,
+            )
+            .await
+        } else {
+            self.propose(
+                actor_identity_id,
+                scope,
+                runtime_session_id,
+                operation,
+                arguments,
+            )
+            .await
+        }
+    }
 
     /// Records one command a Project Agent verification session ran and
     /// returns `{"observation_id": ...}`. Surfaces without a verification
@@ -262,6 +383,7 @@ pub struct ProjectChatToolContext {
 pub struct ScopeToolRuntime {
     /// Programs workspace commands may spawn. `None` uses the built-in set.
     pub command_allowlist: Option<Arc<CommandAllowlist>>,
+    pub environment: std::collections::BTreeMap<String, String>,
     /// Outbound transport for the runtime's web fetch tool. `None` leaves
     /// `fetch` out of the catalog entirely, which is what an inspection-only
     /// composition wants.
@@ -369,6 +491,11 @@ impl ScopeToolComposition {
         runtime: ScopeToolRuntime,
     ) -> Result<Self, AgentHostError> {
         scope.validate()?;
+        let admitted_authority = provider
+            .as_ref()
+            .and_then(|provider| provider.admitted_authority())
+            .cloned();
+        let denial_provider = provider.clone();
         // `None` is the built-in set. An owner widens or replaces it in the
         // Forge config and per Project; the resolved list arrives with the
         // turn, so model input can never reach this.
@@ -452,6 +579,7 @@ impl ScopeToolComposition {
                         if task_write_allowed {
                             tools.push(Arc::new(TaskWriteTool));
                             tools.push(Arc::new(TaskCommandTool {
+                                environment: runtime.environment.clone(),
                                 allowlist: Arc::clone(&command_allowlist),
                                 observer: None,
                                 command_dir: None,
@@ -462,7 +590,9 @@ impl ScopeToolComposition {
                     }
                     TaskToolRole::Reviewer => {
                         if task_read_allowed {
-                            tools.push(Arc::new(TaskValidateTool));
+                            tools.push(Arc::new(TaskValidateTool {
+                                environment: runtime.environment.clone(),
+                            }));
                             coverage_set.insert(Permission::ProcessSpawn);
                         }
                     }
@@ -483,12 +613,19 @@ impl ScopeToolComposition {
                 }
                 if let Some(provider) = provider {
                     let (read_operations, propose_operations) = task_operations(role);
-                    let read_operations =
-                        filter_operations(scope.scope_type, &read_operations, allowed_permissions);
+                    let read_operations = filter_operations(
+                        scope.scope_type,
+                        &read_operations,
+                        allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
+                    );
                     let propose_operations = filter_operations(
                         scope.scope_type,
                         &propose_operations,
                         allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
                     );
                     if !read_operations.is_empty() {
                         tools.push(Arc::new(ForgeScopeReadTool::new(
@@ -524,6 +661,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskReadTool));
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        environment: runtime.environment.clone(),
                         allowlist: Arc::clone(&command_allowlist),
                         observer: provider.clone().map(|provider| CommandObserver {
                             actor_identity_id: actor_identity_id.clone(),
@@ -547,6 +685,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskWriteTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        environment: runtime.environment.clone(),
                         allowlist: Arc::clone(&command_allowlist),
                         observer: None,
                         command_dir: None,
@@ -562,12 +701,19 @@ impl ScopeToolComposition {
                         project_chat.is_project_agent_chat,
                         project_chat.charter_setup_required,
                     );
-                    let read_operations =
-                        filter_operations(scope.scope_type, &read_operations, allowed_permissions);
+                    let read_operations = filter_operations(
+                        scope.scope_type,
+                        &read_operations,
+                        allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
+                    );
                     let propose_operations = filter_operations(
                         scope.scope_type,
                         &propose_operations,
                         allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
                     );
                     if !read_operations.is_empty() {
                         tools.push(Arc::new(ForgeScopeReadTool::new(
@@ -646,6 +792,8 @@ impl ScopeToolComposition {
                             scope.scope_type,
                             &orchestration_reads,
                             allowed_permissions,
+                            project_chat,
+                            admitted_authority.as_ref(),
                         );
                         // The depth cap. An inquiry sub-agent runs under the
                         // Account scope, so withholding the dispatch
@@ -665,6 +813,8 @@ impl ScopeToolComposition {
                             scope.scope_type,
                             &orchestration_proposals,
                             allowed_permissions,
+                            project_chat,
+                            admitted_authority.as_ref(),
                         );
                         // An inquiry reads and reports; it never proposes.
                         // Withholding the whole proposal surface is what
@@ -709,6 +859,37 @@ impl ScopeToolComposition {
                     }
                 }
             }
+        }
+        // The runtime seals and caches ToolSpec at registration. It cannot
+        // withdraw an operation between model calls. Keep that catalog and
+        // suppress repeat evaluations in the Forge composition instead.
+        if let Some(provider) = denial_provider {
+            let denials = Arc::new(Mutex::new(BTreeMap::new()));
+            tools = tools
+                .into_iter()
+                .map(|inner| {
+                    if matches!(
+                        inner.spec().name.as_str(),
+                        "forge_scope_read"
+                            | "forge_scope_propose"
+                            | FORGE_MAIN_ORCHESTRATION_READ_TOOL
+                            | FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL
+                            | FORGE_PROJECT_ORCHESTRATION_READ_TOOL
+                            | FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL
+                            | FORGE_PUBLIC_WEB_SEARCH_TOOL
+                    ) {
+                        Arc::new(TerminalDenialTool {
+                            inner,
+                            denials: Arc::clone(&denials),
+                            provider: Arc::clone(&provider),
+                            actor_identity_id: actor_identity_id.clone(),
+                            scope: scope.clone(),
+                        }) as Arc<dyn Tool>
+                    } else {
+                        inner
+                    }
+                })
+                .collect();
         }
         coverage_set.extend(custom_permissions);
         let coverage: PermissionSet = coverage_set.into_iter().collect();
@@ -814,7 +995,23 @@ impl ScopeToolComposition {
             .ok_or_else(|| {
                 AgentHostError::Unsupported("Forge chat tool is not available".to_owned())
             })?;
-        let spec = tool.spec();
+        // Freeze the selected spec with the same registry/validator used by
+        // native execution. Preparation receives only normalized, validated
+        // arguments; failures never retry the raw provider value.
+        let map_error = |error: RuntimeError| {
+            AgentHostError::Runtime(bound_chat_tool_error(
+                error.to_string(),
+                MAX_CHAT_TOOL_ERROR_CHARS,
+            ))
+        };
+        let mut registry = agent_runtime::tool::ToolRegistry::new();
+        registry.register(tool.clone()).map_err(map_error)?;
+        let registry = registry.seal();
+        let spec = registry.spec(tool_name).expect("registered CLI tool");
+        let arguments = tool.normalize_arguments(arguments).map_err(map_error)?;
+        registry
+            .validate_arguments(tool_name, &arguments)
+            .map_err(map_error)?;
 
         let session = SessionId::new(session_id);
         let turn = TurnId::new(turn_id);
@@ -928,6 +1125,20 @@ impl ScopeToolComposition {
         Ok(outcome.value)
     }
 
+    pub(crate) fn filter_results(mut self, filter: Arc<dyn ToolResultFilter>) -> Self {
+        self.tools = self
+            .tools
+            .into_iter()
+            .map(|inner| {
+                Arc::new(FilteredTool {
+                    inner,
+                    filter: filter.clone(),
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+        self
+    }
+
     /// Wraps every composed tool so `observer` sees the exact call id and
     /// result immediately before it returns to the runtime.
     ///
@@ -958,6 +1169,178 @@ impl ScopeToolComposition {
 pub type ToolResultObserver =
     Arc<dyn Fn(&ToolCallId, &Result<ToolOutcome, RuntimeError>) + Send + Sync>;
 
+type DenialKey = (String, Option<String>, String);
+type TurnDenials = Arc<Mutex<BTreeMap<DenialKey, Value>>>;
+
+#[derive(Debug)]
+struct TerminalDenialTool {
+    inner: Arc<dyn Tool>,
+    denials: TurnDenials,
+    provider: Arc<dyn ForgeToolProvider>,
+    actor_identity_id: String,
+    scope: CanonicalScope,
+}
+
+#[async_trait]
+impl Tool for TerminalDenialTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        self.inner.normalize_arguments(arguments)
+    }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        self.inner.prepare(arguments, ctx).await
+    }
+
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let operation = prepared
+            .arguments()
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or(FORGE_PUBLIC_WEB_SEARCH_TOOL)
+            .to_owned();
+        let key = (
+            ctx.session.to_string(),
+            ctx.turn.as_ref().map(ToString::to_string),
+            operation.clone(),
+        );
+        let cached = self
+            .denials
+            .lock()
+            .map_err(|_| RuntimeError::tool("Forge denial cache is unavailable"))?
+            .get(&key)
+            .cloned();
+        if let Some(value) = cached {
+            return Ok(tool_error_outcome(value));
+        }
+        // Never hold a cache lock across provider work. Already-running calls
+        // evaluate independently; later calls observe a completed denial.
+        let result = self.inner.invoke(prepared, ctx).await?;
+        let outcome = if result.is_error {
+            serde_json::from_value::<OrchestrationOutcome>(result.value.clone()).ok()
+        } else {
+            None
+        };
+        if let Some(cause) = outcome
+            .as_ref()
+            .filter(|outcome| {
+                result.is_error
+                    && outcome.code == OutcomeCode::PolicyDenied
+                    && outcome.retry.as_ref().is_some_and(|retry| {
+                        retry.action == RetryAction::None
+                            && retry.scope == Some(api_types::RetryScope::Session)
+                    })
+            })
+            .and_then(|outcome| outcome.denied_by.as_ref())
+            .filter(|cause| cause.withdraws_operation())
+        {
+            self.denials
+                .lock()
+                .map_err(|_| RuntimeError::tool("Forge denial cache is unavailable"))?
+                .insert(key, result.value.clone());
+            if let Err(error) = self
+                .provider
+                .record_terminal_denial(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    ctx.session.as_str(),
+                    &operation,
+                    cause,
+                )
+                .await
+            {
+                tracing::warn!(operation, denied_by = %cause, error = %error,
+                    "could not persist native terminal denial");
+            }
+        } else if !result.is_error {
+            if let Err(error) = self
+                .provider
+                .clear_terminal_denials(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    ctx.session.as_str(),
+                    &operation,
+                )
+                .await
+            {
+                tracing::warn!(operation, error = %error, "could not clear native terminal denial");
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[async_trait]
+pub(crate) trait ToolResultFilter: Send + Sync + fmt::Debug {
+    async fn filter(
+        &self,
+        call_id: &ToolCallId,
+        arguments: &Value,
+        outcome: ToolOutcome,
+    ) -> Result<ToolOutcome, RuntimeError>;
+}
+
+#[derive(Debug)]
+struct FilteredTool {
+    inner: Arc<dyn Tool>,
+    filter: Arc<dyn ToolResultFilter>,
+}
+#[async_trait]
+impl Tool for FilteredTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        self.inner.normalize_arguments(arguments)
+    }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        self.inner.prepare(arguments, ctx).await
+    }
+    fn supports_interaction(&self) -> bool {
+        self.inner.supports_interaction()
+    }
+    fn interaction_request(
+        &self,
+        prepared: &PreparedToolCall,
+        origin: InteractionOrigin,
+        deadline: Deadline,
+    ) -> Result<Option<InteractionRequest>, RuntimeError> {
+        self.inner.interaction_request(prepared, origin, deadline)
+    }
+    fn resolve_interaction(
+        &self,
+        prepared: &PreparedToolCall,
+        response: &InteractionResponse,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        self.inner.resolve_interaction(prepared, response)
+    }
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let arguments = prepared.arguments().clone();
+        let outcome = self.inner.invoke(prepared, ctx).await?;
+        self.filter.filter(&ctx.call_id, &arguments, outcome).await
+    }
+}
+
 struct ObservedTool {
     inner: Arc<dyn Tool>,
     observer: ToolResultObserver,
@@ -976,6 +1359,10 @@ impl fmt::Debug for ObservedTool {
 impl Tool for ObservedTool {
     fn spec(&self) -> ToolSpec {
         self.inner.spec()
+    }
+
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        self.inner.normalize_arguments(arguments)
     }
 
     async fn prepare(
@@ -1245,10 +1632,47 @@ fn filter_operations(
     scope_type: CanonicalScopeType,
     operations: &[String],
     allowed_permissions: &BTreeSet<String>,
+    project_chat: ProjectChatToolContext,
+    admitted: Option<&operation_registry::authority::EffectiveAuthority>,
 ) -> Vec<String> {
     operations
         .iter()
         .filter(|operation| {
+            if let Some(spec) = operation_registry::READ_CATALOG
+                .lookup(operation)
+                .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+            {
+                if let Some(admitted) = admitted {
+                    return admitted.evaluate(spec).is_ok();
+                }
+                use operation_registry::authority::{
+                    AuthorityFacts, EffectiveAuthority, Principal,
+                };
+                let principal = if scope_type == CanonicalScopeType::Project
+                    || project_chat.is_project_agent_chat
+                {
+                    Principal::ProjectAgent {
+                        identity_id: String::new(),
+                        project_id: String::new(),
+                    }
+                } else {
+                    Principal::MainAgent {
+                        identity_id: String::new(),
+                    }
+                };
+                return EffectiveAuthority::resolve(AuthorityFacts {
+                    principal,
+                    scope_type: scope_type_name(scope_type).to_owned(),
+                    scope_id: String::new(),
+                    profile_id: String::new(),
+                    layers: vec![allowed_permissions.clone()],
+                    binding_id: Some("projection".into()),
+                    setup_required: project_chat.charter_setup_required,
+                    active: true,
+                })
+                .evaluate(spec)
+                .is_ok();
+            }
             let descriptor =
                 crate::operation_catalog::descriptor(scope_type, operation.as_str(), None);
             descriptor.is_exposed()
@@ -1362,42 +1786,10 @@ struct ForgeScopeReadTool {
     reject_authority_overrides: bool,
 }
 
-/// Let a provider-emitted call wrap its arguments in a `parameters` object.
-///
-/// OpenAI gpt-5.x models intermittently emit `{"parameters": {...}}` for a
-/// tool whose schema names no such property. The runtime validates the
-/// provider's call against the tool schema before Forge sees it, and a
-/// mismatch fails the whole turn — three attempts in a row on a delivery
-/// wake, leaving a milestone unverified. As with the null-tolerant payload
-/// below, the provider-facing schema admits the envelope and `prepare`
-/// unwraps it; every required field stays enforced there, where a rejection
-/// returns to the model in-turn instead of ending the turn.
-fn tolerate_parameters_envelope(schema: Value) -> Value {
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return schema;
-    };
-    // Neither shape keeps a `required` list: the envelope copy must be as
-    // lenient as the root, or a wrapped call that omits `dedupe_key` still
-    // ends the turn at the provider validator instead of in `prepare`
-    // (PantryPal's handoff turn lost its first attempt exactly that way).
-    let mut inner = schema.clone();
-    inner
-        .as_object_mut()
-        .map(|object| object.remove("required"));
-    let mut properties = properties.clone();
-    properties.insert("parameters".to_owned(), inner);
-    let mut envelope = schema;
-    envelope["properties"] = Value::Object(properties);
-    envelope
-        .as_object_mut()
-        .map(|object| object.remove("required"));
-    envelope
-}
-
-/// Undo the envelope `tolerate_parameters_envelope` admits. Providers emit
-/// both a complete wrapper and a mixed shape with canonical fields outside
-/// plus operation fields inside `parameters`; merge either form before Forge
-/// validates it, rejecting ambiguous duplicates.
+/// Normalize the historical provider envelope only for Forge read/proposal
+/// tools, whose canonical root schemas have no `parameters` property. Nested
+/// properties of that name remain ordinary data; other tools keep identity
+/// normalization. Merge mixed shapes and reject conflicting duplicates.
 fn unwrap_parameters_envelope(mut arguments: Value) -> Result<Value, RuntimeError> {
     let Some(object) = arguments.as_object_mut() else {
         return Ok(arguments);
@@ -1422,28 +1814,53 @@ fn unwrap_parameters_envelope(mut arguments: Value) -> Result<Value, RuntimeErro
     Ok(arguments)
 }
 
+/// Providers send `payload: null` (or omit it) for an operation they believe
+/// takes no fields. For a registered proposal that means the empty object, so
+/// the call reaches the operation's own contract instead of a type refusal.
+fn null_registered_payload_is_empty(arguments: &mut Value) {
+    let registered = arguments
+        .get("operation")
+        .and_then(Value::as_str)
+        .is_some_and(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some());
+    if let (true, Some(object)) = (registered, arguments.as_object_mut()) {
+        if object.get("payload").is_none_or(Value::is_null) {
+            object.insert("payload".to_owned(), json!({}));
+        }
+    }
+}
+
 /// Canonicalize provider-friendly flat coordination fields into `payload`.
-/// The runtime schema exposes both forms because several function-calling
-/// providers lose the nested object while still producing its fields. The
-/// server receives only the canonical envelope.
+/// Hand Task schemas expose both forms. Registered operations derive their
+/// field names from the registry, so normalization does not need a second
+/// declaration in the advertised schema. The server receives the envelope.
 fn lift_coordination_payload(
     arguments: &mut Value,
     operations: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
-    let Some(payload_properties) = coordination_payload_properties(operations) else {
-        return Ok(());
-    };
-    let Some(payload_properties) = payload_properties.as_object() else {
-        return Ok(());
-    };
+    // Canonical field names, not advertised aliases, drive normalization.
+    let mut payload_fields = BTreeSet::new();
+    if let Some(Value::Object(properties)) = coordination_payload_properties(operations) {
+        payload_fields.extend(properties.into_iter().map(|(name, _)| name));
+    }
+    for operation in operations {
+        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+            payload_fields.extend(
+                spec.input.schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned(),
+            );
+        }
+    }
     let Some(object) = arguments.as_object_mut() else {
         return Ok(());
     };
     let mut flat_payload = Map::new();
-    for field in payload_properties.keys() {
+    for field in &payload_fields {
         if let Some(value) = object.remove(field) {
             // Provider schemas declare aliases nullable so an explicit null
-            // reaches `prepare`; null means omitted and must not become an
+            // is normalized; null means omitted and must not become an
             // operation-specific payload field.
             if !value.is_null() {
                 flat_payload.insert(field.clone(), value);
@@ -1520,7 +1937,7 @@ impl ForgeScopeReadTool {
     fn spec_with_operations(&self) -> ToolSpec {
         let description = if self.reject_authority_overrides {
             format!(
-                "Read one bounded Forge orchestration resource from {}. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+                "Read one Forge orchestration resource from {}.",
                 self.scope_label
             )
         } else {
@@ -1545,7 +1962,7 @@ impl ForgeScopeReadTool {
         ToolSpec::new(
             self.tool_name,
             description,
-            tolerate_parameters_envelope(schema),
+            schema,
             ToolEffects::new(Vec::new()),
         )
         .with_permission_upper_bound(PermissionSet::single(Permission::other(
@@ -1560,15 +1977,40 @@ impl Tool for ForgeScopeReadTool {
         self.spec_with_operations()
     }
 
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        unwrap_parameters_envelope(arguments)
+    }
+
     async fn prepare(
         &self,
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let arguments = unwrap_parameters_envelope(arguments)?;
         let object = arguments
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
+        let operation = required_string(&arguments, "operation")?;
+        if !self.operations.contains(operation) {
+            return Err(RuntimeError::tool(
+                "Forge read operation is outside this scope",
+            ));
+        }
+        if operation_registry::READ_CATALOG.lookup(operation).is_some() {
+            if let Err(error) = self
+                .provider
+                .read_denial(&self.actor_identity_id, &self.scope, operation)
+                .await
+            {
+                return prepare_authority_denial(
+                    error,
+                    operation,
+                    self.tool_name,
+                    &self.scope,
+                    ctx,
+                    FORGE_SCOPE_READ_PERMISSION,
+                );
+            }
+        }
         if let Some(field) = object
             .keys()
             .find(|field| !matches!(field.as_str(), "operation" | "arguments"))
@@ -1577,14 +2019,12 @@ impl Tool for ForgeScopeReadTool {
                 "Forge read argument `{field}` is not admitted"
             )));
         }
-        let operation = required_string(&arguments, "operation")?;
-        if !self.operations.contains(operation) {
-            return Err(RuntimeError::tool(
-                "Forge read operation is outside this scope",
-            ));
-        }
         if self.reject_authority_overrides {
             reject_authority_overrides(&arguments)?;
+        }
+        if self.reject_authority_overrides
+            || operation_registry::READ_CATALOG.lookup(operation).is_some()
+        {
             validate_orchestration_read_arguments(operation, &arguments)?;
         }
         let resource = SecurityResource::other(
@@ -1611,6 +2051,9 @@ impl Tool for ForgeScopeReadTool {
         prepared: PreparedToolCall,
         _ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
+        if let Some(denial) = prepared.arguments().get("__forge_authority_denial") {
+            return Ok(tool_error_outcome(denial.clone()));
+        }
         let arguments = prepared.into_arguments();
         let operation = required_string(&arguments, "operation")?;
         let input = arguments
@@ -1738,18 +2181,17 @@ impl Tool for ForgePublicWebSearchTool {
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(MAX_PUBLIC_SEARCH_RESULTS);
-        let output = self
-            .provider
-            .public_search(
-                &self.actor_identity_id,
-                &self.scope,
-                self.search_scope,
-                query,
-                limit,
-            )
-            .await
-            .map_err(host_error_to_runtime)?;
-        Ok(ToolOutcome::json(output))
+        provider_result_to_tool_outcome(
+            self.provider
+                .public_search(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    self.search_scope,
+                    query,
+                    limit,
+                )
+                .await,
+        )
     }
 }
 
@@ -1804,7 +2246,7 @@ impl ForgeScopeProposeTool {
     fn spec_with_operations(&self) -> ToolSpec {
         let description = if self.reject_authority_overrides {
             format!(
-                "Submit a typed Forge orchestration proposal in {}. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+                "Submit one typed Forge orchestration proposal in {}.",
                 self.scope_label
             )
         } else {
@@ -1813,14 +2255,33 @@ impl ForgeScopeProposeTool {
         let schema = if self.reject_authority_overrides {
             portable_const_schema(orchestration_proposal_schema(&self.operations))
         } else {
-            let mut payload_property = json!({"type": ["object", "null"]});
+            let registered = self
+                .operations
+                .iter()
+                .any(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some());
+            let mut payload_property = if registered {
+                json!({"type":"object"})
+            } else {
+                json!({"type":["object","null"]})
+            };
             let guidance = coordination_payload_guidance(&self.operations);
             if !guidance.is_empty() {
                 payload_property["description"] = json!(guidance);
             }
             let payload_properties = coordination_payload_properties(&self.operations);
-            if let Some(properties) = payload_properties.as_ref() {
-                payload_property["properties"] = properties.clone();
+            // Hand operations on this tool still need their payload fields
+            // declared: a provider that only surfaces declared properties
+            // strips the rest. Registered operations rely on their generated
+            // contract line and the flat aliases, so their fields are not
+            // repeated inside `payload`.
+            let hand_operations = self
+                .operations
+                .iter()
+                .filter(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_none())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(properties) = coordination_payload_properties(&hand_operations) {
+                payload_property["properties"] = properties;
             }
             let mut schema = json!({
                 "type": "object",
@@ -1831,25 +2292,29 @@ impl ForgeScopeProposeTool {
                         "enum": self.operations.iter().collect::<Vec<_>>(),
                     },
                     "payload": payload_property,
-                    // Declared null-tolerant on purpose: some providers
-                    // (notably Gemini) emit explicit nulls, and a schema
-                    // violation in the provider's emitted call fails the
-                    // whole turn before Forge sees it. Presence and
-                    // non-emptiness stay enforced in `prepare`/server-side
-                    // validators, whose errors return to the model in-turn.
-                    "dedupe_key": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null idempotency key"},
-                    "correlation_id": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null correlation id"},
+                    // The envelope declares the same non-null identifiers preparation accepts.
+                    "dedupe_key": {"type": "string", "minLength": 1, "description": "Required non-null idempotency key"},
+                    "correlation_id": {"type": "string", "minLength": 1, "description": "Required non-null correlation id"},
                     "causation_id": string_or_null_schema(),
                     "causation_depth": {"type": ["integer", "null"], "minimum": 0, "maximum": 8}
                 },
                 "additionalProperties": false
             });
-            // Provider-friendly aliases. `prepare` removes these and builds
+            if !registered {
+                for field in ["dedupe_key", "correlation_id"] {
+                    schema["properties"][field]["type"] = json!(["string", "null"]);
+                }
+            }
+            // Provider-friendly aliases. Normalization removes these and builds
             // the canonical payload object, so the service boundary still
             // sees exactly one envelope shape.
             if let Some(Value::Object(properties)) = payload_properties {
                 if let Some(root) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-                    root.extend(properties);
+                    root.extend(
+                        properties
+                            .into_iter()
+                            .filter(|(name, _)| name != "parameters"),
+                    );
                 }
             }
             schema
@@ -1857,7 +2322,7 @@ impl ForgeScopeProposeTool {
         ToolSpec::new(
             self.tool_name,
             description,
-            tolerate_parameters_envelope(schema),
+            schema,
             ToolEffects::new(Vec::new()),
         )
         .with_permission_upper_bound(PermissionSet::single(Permission::other(
@@ -1872,19 +2337,51 @@ impl Tool for ForgeScopeProposeTool {
         self.spec_with_operations()
     }
 
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        let mut arguments = unwrap_parameters_envelope(arguments)?;
+        lift_coordination_payload(&mut arguments, &self.operations)?;
+        null_registered_payload_is_empty(&mut arguments);
+        Ok(arguments)
+    }
+
     async fn prepare(
         &self,
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let mut arguments = unwrap_parameters_envelope(arguments)?;
-        lift_coordination_payload(&mut arguments, &self.operations)?;
+        let mut arguments = arguments;
+        null_registered_payload_is_empty(&mut arguments);
         let operation = required_string(&arguments, "operation")?.to_owned();
         let operation = operation.as_str();
         if !self.operations.contains(operation) {
             return Err(RuntimeError::tool(
                 "Forge proposal operation is outside this scope",
             ));
+        }
+        let registered = operation_registry::PROPOSAL_CATALOG.lookup(operation);
+        if registered.is_some() {
+            if let Err(error) = self
+                .provider
+                .proposal_denial(&self.actor_identity_id, &self.scope, operation)
+                .await
+            {
+                return prepare_authority_denial(
+                    error,
+                    operation,
+                    self.tool_name,
+                    &self.scope,
+                    ctx,
+                    FORGE_SCOPE_PROPOSE_PERMISSION,
+                );
+            }
+        }
+        if registered.is_some() {
+            // Preparation refuses everything the registered dispatch guard
+            // refuses, so a call never prepares and then fails at dispatch.
+            reject_authority_overrides(&arguments)?;
+            if crate::contains_authority_override(&arguments) {
+                return Err(authority_override_refusal());
+            }
         }
         if operation == MAIN_CHARTER_DRAFT_OPERATION
             || operation == PROJECT_CHARTER_ADOPTION_OPERATION
@@ -1902,9 +2399,16 @@ impl Tool for ForgeScopeProposeTool {
                 return Err(RuntimeError::tool(format!("{field} cannot be empty")));
             }
         }
-        if self.reject_authority_overrides {
-            reject_authority_overrides(&arguments)?;
+        if self.reject_authority_overrides || registered.is_some() {
+            if registered.is_none() {
+                reject_authority_overrides(&arguments)?;
+            }
             validate_orchestration_proposal_arguments(operation, &arguments)?;
+        }
+        if let Some(spec) = registered {
+            arguments["payload"] = spec
+                .normalize_arguments(&arguments["payload"])
+                .map_err(RuntimeError::tool)?;
         }
         let resource = SecurityResource::other(
             "forge.scope",
@@ -1930,10 +2434,13 @@ impl Tool for ForgeScopeProposeTool {
         prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
+        if let Some(denial) = prepared.arguments().get("__forge_authority_denial") {
+            return Ok(tool_error_outcome(denial.clone()));
+        }
         let runtime_session_id = ctx.session.to_string();
         provider_result_to_tool_outcome(
             self.provider
-                .propose(
+                .propose_prepared(
                     &self.actor_identity_id,
                     &self.scope,
                     &runtime_session_id,
@@ -2198,6 +2705,7 @@ struct CommandObserver {
 
 #[derive(Debug)]
 struct TaskCommandTool {
+    environment: std::collections::BTreeMap<String, String>,
     /// Programs this composition may spawn. Resolved by the host from owner
     /// configuration and the owning Project, never from model input.
     allowlist: Arc<CommandAllowlist>,
@@ -2279,7 +2787,9 @@ impl Tool for TaskCommandTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let program = required_string(prepared.arguments(), "program")?;
         let args = string_array(prepared.arguments(), "args")?;
-        let run = execute_workspace_command(program, &args, self.command_dir, ctx).await?;
+        let run =
+            execute_workspace_command(program, &args, self.command_dir, &self.environment, ctx)
+                .await?;
         let Some(observer) = &self.observer else {
             return Ok(command_outcome(&run, None));
         };
@@ -2323,7 +2833,9 @@ impl Tool for TaskCommandTool {
 }
 
 #[derive(Debug)]
-struct TaskValidateTool;
+struct TaskValidateTool {
+    environment: std::collections::BTreeMap<String, String>,
+}
 
 #[async_trait]
 impl Tool for TaskValidateTool {
@@ -2365,9 +2877,14 @@ impl Tool for TaskValidateTool {
         _prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
-        let run =
-            execute_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], None, ctx)
-                .await?;
+        let run = execute_workspace_command(
+            "git",
+            &["diff".to_owned(), "--check".to_owned()],
+            None,
+            &self.environment,
+            ctx,
+        )
+        .await?;
         Ok(command_outcome(&run, None))
     }
 }
@@ -2401,6 +2918,7 @@ async fn execute_workspace_command(
     program: &str,
     args: &[String],
     command_dir: Option<&str>,
+    environment: &std::collections::BTreeMap<String, String>,
     ctx: &InvocationContext,
 ) -> Result<ExecutedCommand, RuntimeError> {
     if ctx.should_stop() {
@@ -2417,6 +2935,12 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
+    // One temp directory per command, inside the Task root, removed when
+    // the command returns. The environment is cleared above, so without it a
+    // child falls back to the shared platform temp directory.
+    let run_scope =
+        executors::sandbox::SandboxEnv::for_command(root, executors::sandbox::RunPurpose::Command);
+    executors::run_process::apply_sandboxed(&mut command, environment, run_scope.env());
     let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
@@ -2598,22 +3122,11 @@ fn required_string<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, Run
         .ok_or_else(|| RuntimeError::tool(format!("{field} must be a string")))
 }
 
+/// Refuse a server-derived field name or a prompt-injection field name
+/// anywhere in the arguments. `project_id` is not in this guard: reads and
+/// hand-path proposals take a real `project_id` argument.
 fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor_identity_id",
-        "identity_id",
-        "scope_type",
-        "scope_id",
-        "authority",
-        "permission",
-        "workspace",
-        "workspace_path",
-        "workspace_lease",
-        "repository_path",
-        "repository_url",
-        "credential",
-        "target_type",
-        "target_id",
+    const PROMPT_INJECTION_FIELDS: &[&str] = &[
         "instruction",
         "instructions",
         "system_prompt",
@@ -2622,25 +3135,26 @@ fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
         "role",
     ];
 
-    fn contains_forbidden(value: &Value, forbidden_fields: &[&str]) -> bool {
+    fn contains_forbidden(value: &Value) -> bool {
         match value {
             Value::Object(object) => object.iter().any(|(key, nested)| {
-                forbidden_fields.contains(&key.as_str())
-                    || contains_forbidden(nested, forbidden_fields)
+                crate::operation_catalog::SERVER_DERIVED_FIELDS.contains(&key.as_str())
+                    || PROMPT_INJECTION_FIELDS.contains(&key.as_str())
+                    || contains_forbidden(nested)
             }),
-            Value::Array(values) => values
-                .iter()
-                .any(|value| contains_forbidden(value, forbidden_fields)),
+            Value::Array(values) => values.iter().any(contains_forbidden),
             _ => false,
         }
     }
 
-    if contains_forbidden(arguments, FORBIDDEN_FIELDS) {
-        return Err(RuntimeError::tool(
-            "Forge orchestration scope and authority are server-derived",
-        ));
+    if contains_forbidden(arguments) {
+        return Err(authority_override_refusal());
     }
     Ok(())
+}
+
+fn authority_override_refusal() -> RuntimeError {
+    RuntimeError::tool("Forge orchestration scope and authority are server-derived")
 }
 
 /// Whether the read path admits this operation's arguments envelope.
@@ -2662,91 +3176,22 @@ fn validate_orchestration_read_arguments(
     let object = arguments.as_object().ok_or_else(|| {
         RuntimeError::tool("Forge orchestration read arguments must be an object")
     })?;
-    let allowed = match operation {
-        MAIN_CHARTER_READ_OPERATION => &["operation", "arguments"][..],
-        PROJECT_CURRENT_STATE_OPERATION => &["operation", "arguments"][..],
-        _ => &["operation", "arguments"][..],
-    };
-    // The operation wrapper is validated by the tool's schema.  This helper
-    // only guards the nested arguments object so a caller cannot smuggle a
-    // second scope/project selector through the read path.
-    if let Some(value) = object.get("arguments") {
-        let nested = value
-            .as_object()
-            .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
-        let nested_allowed: &[&str] = match operation {
-            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => &["genesis_session_id"],
-            MAIN_CHARTER_READ_OPERATION => &["charter_id", "revision_id", "genesis_session_id"],
-            MAIN_CHARTER_READINESS_OPERATION => &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "genesis_session_id",
-            ],
-            MAIN_CHARTER_DIFF_OPERATION => &[
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-                "genesis_session_id",
-            ],
-            MAIN_CHARTER_APPROVAL_TARGET_OPERATION => &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "genesis_session_id",
-            ],
-            PROJECT_CURRENT_STATE_OPERATION => &["limit"],
-            PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
-            PROJECT_SKILL_SECTION_OPERATION => &["section"],
-            MAIN_INQUIRY_RUN_OPERATION => &["title", "question", "context"],
-            _ => &[],
-        };
-        if let Some(field) = nested
+    if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+        if let Some(field) = object
             .keys()
-            .find(|field| !nested_allowed.contains(&field.as_str()))
+            .find(|field| !matches!(field.as_str(), "operation" | "arguments"))
         {
             return Err(RuntimeError::tool(format!(
-                "Forge orchestration read argument `{field}` is not admitted"
+                "Forge orchestration read field `{field}` is not admitted"
             )));
         }
-        if operation == PROJECT_CURRENT_STATE_OPERATION {
-            if let Some(limit) = nested.get("limit").and_then(Value::as_i64) {
-                if !(1..=64).contains(&limit) {
-                    return Err(RuntimeError::tool(
-                        "Project state read limit must be between 1 and 64",
-                    ));
-                }
-            } else if nested.contains_key("limit") {
-                return Err(RuntimeError::tool(
-                    "Project state read limit must be an integer",
-                ));
-            }
-        }
-        if operation == PROJECT_SKILL_SECTION_OPERATION {
-            match nested.get("section").and_then(Value::as_str) {
-                Some(section) if PROJECT_SKILL_SECTION_NAMES.contains(&section) => {}
-                _ => {
-                    return Err(RuntimeError::tool(format!(
-                        "skill.section requires `section` from: {}",
-                        PROJECT_SKILL_SECTION_NAMES.join(", ")
-                    )));
-                }
-            }
-        }
+        return spec
+            .validate_arguments(object.get("arguments").unwrap_or(&json!({})))
+            .map_err(RuntimeError::tool);
     }
-    if let Some(field) = object
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(RuntimeError::tool(format!(
-            "Forge orchestration read field `{field}` is not admitted"
-        )));
-    }
-    Ok(())
+    Err(RuntimeError::tool(
+        "Forge orchestration read operation has no registered contract",
+    ))
 }
 
 fn string_array(arguments: &Value, field: &str) -> Result<Vec<String>, RuntimeError> {
@@ -3042,6 +3487,9 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::Authority(message)
         | AgentHostError::Configuration(message)
         | AgentHostError::Unsupported(message) => RuntimeError::tool(message),
+        AgentHostError::AgentPaused { .. } | AgentHostError::ProjectPaused { .. } => {
+            RuntimeError::tool("Forge operation is paused")
+        }
         AgentHostError::CredentialNotFound | AgentHostError::SessionNotFound => {
             RuntimeError::not_found("Forge runtime resource unavailable")
         }
@@ -3075,6 +3523,31 @@ fn bound_chat_tool_error(message: String, limit: usize) -> String {
     message.chars().take(limit).collect()
 }
 
+fn prepare_authority_denial(
+    error: AgentHostError,
+    operation: &str,
+    tool_name: &str,
+    scope: &CanonicalScope,
+    ctx: &PreparationContext,
+    permission: &'static str,
+) -> Result<PreparedToolCall, RuntimeError> {
+    let AgentHostError::StructuredOutcome(outcome) = error else {
+        return Err(RuntimeError::tool(error.to_string()));
+    };
+    Ok(PreparedToolCall::new(
+        ctx.call_id.clone(),
+        tool_name,
+        json!({"operation":operation,"__forge_authority_denial":outcome}),
+        PermissionSet::single(Permission::other(permission)),
+        SecurityResource::other(
+            "forge.scope",
+            format!("{}:{}", scope_type_name(scope.scope_type), scope.scope_id),
+        ),
+        ToolEffects::new(Vec::new()),
+        ToolCallDisplay::new("Forge authority revoked"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3104,9 +3577,9 @@ mod tests {
 
     use super::*;
     use crate::operation_catalog::{
-        MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-        PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-        PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+        MAIN_CHARTER_READ_OPERATION, MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION,
+        PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+        PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
     };
     use crate::operation_contract::{
         orchestration_payload_schema, orchestration_read_arguments_schema,
@@ -3145,6 +3618,188 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_commands_receive_project_and_machine_build_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: dir.path().to_string_lossy().into_owned(),
+        });
+        let env = std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project".into())]);
+        let ctx = command_invocation_context(workspace);
+        let output = super::execute_workspace_command(
+            "sh",
+            &[
+                "-c".into(),
+                "printf '%s\\n' \"$CARGO_BUILD_JOBS\" \"$MAKEFLAGS\"".into(),
+            ],
+            None,
+            &env,
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(output.success);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "project");
+        let expected = std::env::var("MAKEFLAGS").unwrap_or_else(|_| {
+            format!(
+                "-j{}",
+                executors::run_process::machine_policy().get().build_jobs()
+            )
+        });
+        assert_eq!(lines[1], expected);
+    }
+
+    /// What a run printed for `$RUSTC_WRAPPER|$KACHE_CACHE_DIR` when Forge
+    /// offered `wrapper` and `store`. The operator's own environment wins
+    /// over Forge's, so on a machine whose environment names a wrapper (or a
+    /// kache directory) this asserts that rule instead.
+    #[cfg(unix)]
+    fn assert_saw_compiler_cache(seen: &str, wrapper: &std::path::Path, store: &std::path::Path) {
+        let operator = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+        let (wrapper, store) = (wrapper.to_str().unwrap(), store.to_str().unwrap());
+        if operator("RUSTC_WRAPPER") {
+            assert!(!seen.starts_with(wrapper), "{seen}");
+        } else if operator("KACHE_CACHE_DIR") {
+            assert!(seen.starts_with(&format!("{wrapper}|")), "{seen}");
+        } else {
+            assert_eq!(seen, format!("{wrapper}|{store}"));
+        }
+    }
+
+    /// Plan 3.4 F: a native tool command in a Task worktree is handed the
+    /// machine's shared compiler cache.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_command_gets_the_shared_compiler_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let worktree = root.join("t").join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        // A linked worktree of the repository `r1`, as the server lays it out.
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", root.join(".repos/r1/worktrees/t").display()),
+        )
+        .unwrap();
+        // The repository names the worktree back, as Git does; without it the
+        // worktree's own `.git` file claims nothing.
+        std::fs::create_dir_all(root.join(".repos/r1/worktrees/t")).unwrap();
+        std::fs::write(
+            root.join(".repos/r1/worktrees/t/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        let wrapper = temp.path().join("kache");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        executors::compiler_cache::install(
+            &root,
+            Some(executors::compiler_cache::CompilerCache {
+                kind: executors::compiler_cache::WrapperKind::of(&wrapper),
+                wrapper: wrapper.clone(),
+                dir: root.join(executors::compiler_cache::CACHE_DIR),
+                max_bytes: 1 << 30,
+            }),
+        );
+        let store = root.join(executors::compiler_cache::CACHE_DIR).join("r1");
+        let seen_file = temp.path().join("seen");
+        let script = format!(
+            "printf '%s|%s' \"$RUSTC_WRAPPER\" \"$KACHE_CACHE_DIR\" > '{}'",
+            seen_file.display()
+        );
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: worktree.to_string_lossy().into_owned(),
+        });
+        let ctx = command_invocation_context(workspace);
+        let output = super::execute_workspace_command(
+            "sh",
+            &["-c".into(), script],
+            None,
+            &std::collections::BTreeMap::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        executors::compiler_cache::install(&root, None);
+        assert!(output.success);
+        assert_saw_compiler_cache(
+            &std::fs::read_to_string(&seen_file).unwrap(),
+            &wrapper,
+            &store,
+        );
+    }
+
+    /// The native command tool clears the child's environment, so without the
+    /// Task root's per-run directory a command falls back to the shared
+    /// platform temp directory. Each command gets its own, removed when the
+    /// command returns (pass or fail); a workspace whose parent Forge did not
+    /// reserve gets nothing and nothing is created beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_command_gets_a_task_root_tmpdir_removed_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let tmp_root = worktree.parent().unwrap().join(".forge-task/tmp");
+        let env = std::collections::BTreeMap::new();
+        let run = |root: &Path, script: &'static str| {
+            let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+                root: root.to_string_lossy().into_owned(),
+            });
+            let env = env.clone();
+            async move {
+                let ctx = command_invocation_context(workspace);
+                super::execute_workspace_command(
+                    "sh",
+                    &["-c".into(), script.into()],
+                    None,
+                    &env,
+                    &ctx,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mut seen = Vec::new();
+        for (script, success) in [
+            (
+                "touch \"$TMPDIR/made\" && printf '%s|%s|%s' \"$TMPDIR\" \"$TMP\" \"$TEMP\"",
+                true,
+            ),
+            (
+                "touch \"$TMPDIR/made\" && printf '%s|%s|%s' \"$TMPDIR\" \"$TMP\" \"$TEMP\"; exit 4",
+                false,
+            ),
+        ] {
+            let output = run(&worktree, script).await;
+            assert_eq!(output.success, success);
+            let text = String::from_utf8(output.stdout).unwrap();
+            let parts: Vec<_> = text.split('|').collect();
+            assert!(parts[0] == parts[1] && parts[1] == parts[2], "{text}");
+            let tmp = std::path::PathBuf::from(parts[0]);
+            assert_eq!(tmp.parent(), Some(tmp_root.as_path()));
+            assert!(!tmp.exists(), "removed when the command returns");
+            seen.push(tmp);
+        }
+        assert_ne!(seen[0], seen[1], "one directory per command");
+        assert_eq!(std::fs::read_dir(&tmp_root).unwrap().count(), 0);
+
+        let plain = dir.path().join("user").join("repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        let output = run(&plain, "printf '%s' \"${TMPDIR-unset}\"").await;
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "unset");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("user")).unwrap().count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn verification_commands_run_inside_the_checkout_never_at_the_workspace_root() {
         // The verification workspace root is the parent of the checkout. A
@@ -3167,6 +3822,7 @@ mod tests {
             root: root.to_string_lossy().into_owned(),
         });
         let tool = TaskCommandTool {
+            environment: Default::default(),
             allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: None,
             command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
@@ -3201,14 +3857,9 @@ mod tests {
 
     #[tokio::test]
     async fn orchestration_tools_admit_and_unwrap_a_parameters_envelope() {
-        let scope = CanonicalScope {
-            scope_type: CanonicalScopeType::Project,
-            scope_id: "project-1".to_owned(),
-            workspace_access: WorkspaceAccess::Deny,
-        };
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
-            scope,
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
             vec![PROJECT_READINESS_OPERATION.to_owned()],
             Arc::new(TestProvider::default()),
         );
@@ -3218,73 +3869,93 @@ mod tests {
             "dedupe_key": "readiness-1",
             "correlation_id": "readiness-1"
         });
-        let enveloped = json!({"parameters": plain.clone()});
-        // The provider-facing schema, which the runtime validates the model's
-        // call against before Forge sees it, admits both shapes.
-        let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
-        assert!(validator.validate(&plain).is_ok(), "plain call validates");
-        assert!(
-            validator.validate(&enveloped).is_ok(),
-            "enveloped call validates"
-        );
-        assert!(
-            validator
-                .validate(&json!({"parameters": {"operation": 7}}))
-                .is_err(),
-            "the envelope carries the same shape, not a looser one"
-        );
-        // A missing required field is `prepare`'s to refuse in-turn, in both
-        // shapes: the provider validator must admit the call so the model
-        // sees a correctable error instead of a dead turn.
-        let mut missing_dedupe = plain.clone();
-        missing_dedupe.as_object_mut().unwrap().remove("dedupe_key");
-        assert!(
-            validator.validate(&missing_dedupe).is_ok(),
-            "plain call without dedupe_key passes the schema"
-        );
-        assert!(
-            validator
-                .validate(&json!({"parameters": missing_dedupe.clone()}))
-                .is_ok(),
-            "enveloped call without dedupe_key passes the schema"
-        );
-        // `prepare` unwraps the envelope and enforces the required fields.
-        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
-            root: "<none>".to_owned(),
-        });
-        let prepared = tool
-            .prepare(enveloped, &command_preparation_context(workspace.clone()))
-            .await
-            .expect("enveloped call prepares");
+        let spec = tool.spec();
+        let validator = jsonschema::validator_for(&spec.input_schema).expect("schema");
+        assert!(spec.input_schema["properties"].get("parameters").is_none());
         assert_eq!(
-            prepared.arguments()["operation"],
-            PROJECT_READINESS_OPERATION
+            spec.input_schema["required"],
+            json!(["operation", "payload", "dedupe_key", "correlation_id"])
         );
+        for arguments in [plain.clone(), json!({"parameters": plain.clone()})] {
+            let normalized = tool.normalize_arguments(arguments).unwrap();
+            validator
+                .validate(&normalized)
+                .expect("normalized call validates");
+            let prepared = tool
+                .prepare(normalized, &test_preparation_context("envelope"))
+                .await
+                .unwrap();
+            assert_eq!(prepared.arguments(), &plain);
+        }
+        for field in ["operation", "payload", "dedupe_key", "correlation_id"] {
+            let mut missing = plain.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            for arguments in [missing.clone(), json!({"parameters": missing})] {
+                let normalized = tool.normalize_arguments(arguments).unwrap();
+                assert!(
+                    !validator.is_valid(&normalized),
+                    "missing {field} must fail schema validation"
+                );
+            }
+        }
+        // The envelope carries the same shape, not a looser one: a wrong type
+        // inside it is unwrapped and then refused by the schema.
+        let wrong_type = tool
+            .normalize_arguments(json!({"parameters": {"operation": 7}}))
+            .unwrap();
+        assert!(
+            !validator.is_valid(&wrong_type),
+            "a non-string operation inside the envelope must fail schema validation"
+        );
+        // `prepare` keeps its own required-field checks. Recovery hands it
+        // stored arguments without schema validation, so these refusals must
+        // not depend on the schema having run first.
+        let no_operation = tool
+            .normalize_arguments(json!({"parameters": {"payload": {}}}))
+            .unwrap();
+        assert!(!validator.is_valid(&no_operation));
         let refused = tool
-            .prepare(
-                json!({"parameters": {"payload": {}}}),
-                &command_preparation_context(workspace.clone()),
-            )
+            .prepare(no_operation, &test_preparation_context("envelope"))
             .await
             .expect_err("a call missing its operation is refused in prepare");
         assert!(refused.to_string().contains("operation"), "{refused}");
+        let mut missing_dedupe = plain.clone();
+        missing_dedupe.as_object_mut().unwrap().remove("dedupe_key");
+        let missing_dedupe = tool
+            .normalize_arguments(json!({"parameters": missing_dedupe}))
+            .unwrap();
+        assert!(!validator.is_valid(&missing_dedupe));
         let refused = tool
-            .prepare(
-                json!({"parameters": missing_dedupe}),
-                &command_preparation_context(workspace),
-            )
+            .prepare(missing_dedupe, &test_preparation_context("envelope"))
             .await
             .expect_err("an enveloped call missing dedupe_key is refused in prepare");
+        assert!(refused.to_string().contains("dedupe_key"), "{refused}");
+        // The schema declares `dedupe_key` nullable, so an explicit null
+        // passes validation and `prepare` is the only guard.
+        let mut null_dedupe = plain.clone();
+        null_dedupe["dedupe_key"] = Value::Null;
+        let null_dedupe = tool
+            .normalize_arguments(json!({"parameters": null_dedupe}))
+            .unwrap();
+        assert!(
+            validator.is_valid(&null_dedupe),
+            "the retained readiness hand envelope remains nullable"
+        );
+        let refused = tool
+            .prepare(null_dedupe, &test_preparation_context("envelope"))
+            .await
+            .expect_err("a null dedupe_key is refused in prepare");
         assert!(refused.to_string().contains("dedupe_key"), "{refused}");
     }
 
     #[tokio::test]
     async fn task_plan_schema_is_visible_null_tolerant_and_lifts_flat_payload_fields() {
+        let root = tempfile::tempdir().expect("Task workspace");
         let composition = ScopeToolComposition::for_scope_with_permissions(
             "planner-1",
             scope(CanonicalScopeType::Task, WorkspaceAccess::TaskRead),
             Some("planner"),
-            Some("/tmp/forge/task-plan-schema"),
+            Some(root.path().to_str().unwrap()),
             &all_permissions(),
             Some(Arc::new(TestProvider::default())),
         )
@@ -3339,7 +4010,13 @@ mod tests {
             }
         });
         assert!(
-            validator.validate(&explicit_null_envelope).is_ok(),
+            validator
+                .validate(
+                    &tool
+                        .normalize_arguments(explicit_null_envelope.clone())
+                        .unwrap()
+                )
+                .is_ok(),
             "Gemini-style explicit nulls must reach prepare for an in-turn correction"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
@@ -3347,7 +4024,7 @@ mod tests {
         });
         let refusal = tool
             .prepare(
-                explicit_null_envelope,
+                tool.normalize_arguments(explicit_null_envelope).unwrap(),
                 &command_preparation_context(workspace.clone()),
             )
             .await
@@ -3363,11 +4040,16 @@ mod tests {
             "correlation_id": "task-plan-1"
         });
         assert!(
-            validator.validate(&flat).is_ok(),
+            validator
+                .validate(&tool.normalize_arguments(flat.clone()).unwrap())
+                .is_ok(),
             "provider-facing schema must admit flat task.plan fields"
         );
         let prepared = tool
-            .prepare(flat, &command_preparation_context(workspace))
+            .prepare(
+                tool.normalize_arguments(flat).unwrap(),
+                &command_preparation_context(workspace),
+            )
             .await
             .expect("flat task.plan call prepares");
         assert_eq!(prepared.arguments()["payload"]["action"], "write");
@@ -3381,7 +4063,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_recovery_lifts_flat_provider_fields_into_payload() {
-        let operation = crate::operation_catalog::TASK_RECOVER_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3399,55 +4081,56 @@ mod tests {
             "parameters": {
                 "operation": operation,
                 "task_id": "task-1",
-                "reason": "the executor stopped",
-                "action": "reexecute"
+                "version": 1,
+                "action": {"verb":"retry","fresh_session":true,"guidance":"the executor stopped"}
             }
         });
         let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
         assert!(
-            validator.validate(&mixed).is_ok(),
+            validator
+                .validate(&tool.normalize_arguments(mixed.clone()).unwrap())
+                .is_ok(),
             "provider-facing schema admits mixed flat recovery fields"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
             root: "<none>".to_owned(),
         });
         let prepared = tool
-            .prepare(mixed, &command_preparation_context(workspace.clone()))
+            .prepare(
+                tool.normalize_arguments(mixed).unwrap(),
+                &command_preparation_context(workspace.clone()),
+            )
             .await
             .expect("flat recovery call prepares");
         assert_eq!(prepared.arguments()["operation"], operation);
         assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
         assert_eq!(
-            prepared.arguments()["payload"]["reason"],
+            prepared.arguments()["payload"]["action"]["guidance"],
             "the executor stopped"
         );
-        assert_eq!(prepared.arguments()["payload"]["action"], "reexecute");
+        assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "retry");
         assert!(prepared.arguments().get("parameters").is_none());
         assert!(prepared.arguments().get("task_id").is_none());
 
         let conflict = tool
-            .prepare(
-                json!({
-                    "operation": operation,
-                    "payload": {
-                        "task_id": "task-1",
-                        "reason": "the executor stopped",
-                        "action": "cancel_task"
-                    },
-                    "action": "reexecute",
-                    "dedupe_key": "recover-task-1-conflict",
-                    "correlation_id": "recover-task-1-conflict"
-                }),
-                &command_preparation_context(workspace),
-            )
-            .await
+            .normalize_arguments(json!({
+                "operation": operation,
+                "payload": {
+                    "task_id": "task-1",
+                    "version": 1,
+                    "action": {"verb":"cancel"}
+                },
+                "action": {"verb":"retry","fresh_session":true},
+                "dedupe_key": "recover-task-1-conflict",
+                "correlation_id": "recover-task-1-conflict"
+            }))
             .expect_err("conflicting flat and nested fields are ambiguous");
         assert!(conflict.to_string().contains("conflicts"), "{conflict}");
     }
 
     #[tokio::test]
     async fn generic_cancellation_lifts_the_versioned_payload_fields() {
-        let operation = crate::operation_catalog::TASK_CANCEL_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3460,29 +4143,32 @@ mod tests {
         );
         let flat = json!({
             "operation": operation,
-            "action": "cancel",
+            "action": {"verb":"cancel"},
             "task_id": "task-1",
-            "expected_task_version": 7,
-            "reason": "Duplicate Task",
+            "version": 7,
             "dedupe_key": "cancel-task-1",
             "correlation_id": "cancel-task-1"
         });
         let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
         assert!(
-            validator.validate(&flat).is_ok(),
+            validator
+                .validate(&tool.normalize_arguments(flat.clone()).unwrap())
+                .is_ok(),
             "provider-facing schema admits flat cancellation fields"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
             root: "<none>".to_owned(),
         });
         let prepared = tool
-            .prepare(flat, &command_preparation_context(workspace))
+            .prepare(
+                tool.normalize_arguments(flat).unwrap(),
+                &command_preparation_context(workspace),
+            )
             .await
             .expect("flat cancellation call prepares");
-        assert_eq!(prepared.arguments()["payload"]["action"], "cancel");
+        assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "cancel");
         assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
-        assert_eq!(prepared.arguments()["payload"]["expected_task_version"], 7);
-        assert_eq!(prepared.arguments()["payload"]["reason"], "Duplicate Task");
+        assert_eq!(prepared.arguments()["payload"]["version"], 7);
     }
 
     #[tokio::test]
@@ -3503,6 +4189,7 @@ mod tests {
         });
         let provider = Arc::new(TestProvider::default());
         let tool = TaskCommandTool {
+            environment: Default::default(),
             allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: Some(CommandObserver {
                 actor_identity_id: "agent-1".to_owned(),
@@ -3619,7 +4306,7 @@ mod tests {
         }
     }
 
-    fn scope(scope_type: CanonicalScopeType, access: WorkspaceAccess) -> CanonicalScope {
+    pub(super) fn scope(scope_type: CanonicalScopeType, access: WorkspaceAccess) -> CanonicalScope {
         CanonicalScope {
             scope_type,
             scope_id: "scope-1".to_owned(),
@@ -3627,7 +4314,7 @@ mod tests {
         }
     }
 
-    fn all_permissions() -> BTreeSet<String> {
+    pub(super) fn all_permissions() -> BTreeSet<String> {
         BTreeSet::from([
             "read_account".to_owned(),
             "read_project".to_owned(),
@@ -4004,8 +4691,14 @@ mod tests {
         );
         let arguments = orchestration_read_arguments_schema(PROJECT_CURRENT_STATE_OPERATION);
         assert_eq!(arguments["additionalProperties"], false);
-        assert_eq!(arguments["properties"]["limit"]["minimum"], 1);
-        assert_eq!(arguments["properties"]["limit"]["maximum"], 64);
+        assert_eq!(
+            arguments["properties"]["limit"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            arguments["properties"]["limit"]["maximum"].as_f64(),
+            Some(64.0)
+        );
         assert!(
             arguments["description"]
                 .as_str()
@@ -4067,7 +4760,6 @@ mod tests {
             );
         }
         for field in [
-            "action",
             "charter_id",
             "project_mode",
             "maturity",
@@ -4084,7 +4776,7 @@ mod tests {
             );
         }
         assert_eq!(payload["additionalProperties"], false);
-        assert_eq!(payload["properties"]["action"]["const"], "save_revision");
+        assert!(payload["properties"].get("action").is_none());
         assert_eq!(
             payload["properties"]["content"]["additionalProperties"],
             false
@@ -4113,11 +4805,13 @@ mod tests {
                 .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
         );
         let create_payload = orchestration_payload_schema(MAIN_PROJECT_CREATE_OPERATION);
-        assert_eq!(create_payload["required"], json!(["action", "approval_id"]));
+        assert_eq!(create_payload["required"], json!(["approval_id"]));
         assert_eq!(
-            create_payload["properties"]["action"]["const"],
-            "create_from_approval"
+            create_payload["properties"]["approval_id"],
+            json!({"type":"string","minLength":1})
         );
+        assert!(create_payload["properties"].get("action").is_none());
+        assert_ne!(create_payload["additionalProperties"], false);
     }
 
     #[test]
@@ -4272,15 +4966,15 @@ mod tests {
         assert_eq!(approval["additionalProperties"], false);
         assert_eq!(
             approval["required"],
+            // `kind` and `title` were required here and never read by the
+            // approval handler; they stay accepted but are no longer required.
             json!([
                 "action",
-                "document_id",
-                "kind",
-                "title",
-                "revision_id",
                 "content_digest",
+                "document_id",
+                "expected_document_version",
                 "render_digest",
-                "expected_document_version"
+                "revision_id"
             ])
         );
         for field in [
@@ -4288,12 +4982,17 @@ mod tests {
             "content_digest",
             "render_digest",
             "expected_document_version",
-            "envelope_digest",
         ] {
             assert!(
                 approval["properties"].get(field).is_some(),
                 "Document approval schema must expose exact {field}"
             );
+        }
+        // The approval handler never read `envelope_digest`, `kind` or
+        // `title`, but they were advertised for it: the closed variant
+        // still accepts them.
+        for unread in ["envelope_digest", "kind", "title"] {
+            assert!(approval["properties"].get(unread).is_some(), "{unread}");
         }
         assert!(
             approval["required"]
@@ -4441,7 +5140,7 @@ mod tests {
             result.is_err(),
             "authority-shaped prompt injection must be denied"
         );
-        let mismatched_action = tool
+        let missing_approval = tool
             .prepare(
                 json!({
                     "operation": MAIN_PROJECT_CREATE_OPERATION,
@@ -4451,11 +5150,25 @@ mod tests {
                 }),
                 &context,
             )
-            .await;
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            mismatched_action.is_err(),
-            "typed orchestration prepare must enforce the action discriminant"
+            missing_approval.contains("argument `approval_id` is required"),
+            "{missing_approval}"
         );
+        // The former `action` discriminator is ignored, whatever its value.
+        tool.prepare(
+            json!({
+                "operation": MAIN_PROJECT_CREATE_OPERATION,
+                "payload": {"action": "approve", "approval_id": "approval-1"},
+                "dedupe_key": "create-3",
+                "correlation_id": "create-correlation-3"
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -4879,7 +5592,231 @@ mod tests {
         outcome
     }
 
-    fn test_preparation_context(call_id: &str) -> PreparationContext {
+    #[derive(Debug, Default)]
+    struct TerminalDenialProvider {
+        cause: Option<DeniedBy>,
+        record_failure: bool,
+        barrier: Option<tokio::sync::Barrier>,
+        succeeds: std::sync::atomic::AtomicBool,
+        evaluations: std::sync::atomic::AtomicUsize,
+        records: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ForgeToolProvider for TerminalDenialProvider {
+        async fn read(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            operation: &str,
+            _: Value,
+        ) -> Result<Value, AgentHostError> {
+            self.evaluations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+                return Ok(json!({"done": true}));
+            }
+            if self.succeeds.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(json!({"done": true}));
+            }
+            Err(AgentHostError::StructuredOutcome(Box::new(
+                OrchestrationOutcome::terminal_denial(
+                    operation,
+                    CanonicalScopeRef::new(OutcomeScopeType::Account, "scope-1"),
+                    "first-correlation",
+                    self.cause
+                        .clone()
+                        .unwrap_or_else(|| DeniedBy::PermissionMissing("read_account".to_owned())),
+                ),
+            )))
+        }
+
+        async fn propose(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            _: &str,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, AgentHostError> {
+            unreachable!("read test")
+        }
+
+        async fn record_terminal_denial(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            _: &str,
+            _: &str,
+            _: &DeniedBy,
+        ) -> Result<(), AgentHostError> {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.record_failure {
+                return Err(AgentHostError::ProtectedPersistence);
+            }
+            Ok(())
+        }
+    }
+
+    fn terminal_test_tool(provider: Arc<TerminalDenialProvider>) -> Arc<dyn Tool> {
+        ScopeToolComposition::for_scope_with_permissions(
+            "actor",
+            scope(CanonicalScopeType::Account, WorkspaceAccess::Deny),
+            None,
+            None,
+            &BTreeSet::from(["read_account".to_owned()]),
+            Some(provider),
+        )
+        .unwrap()
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "forge_scope_read")
+        .unwrap()
+    }
+
+    async fn invoke_terminal_test_tool(tool: &dyn Tool, call_id: &str) -> ToolOutcome {
+        let mut preparation = test_preparation_context(call_id);
+        preparation.turn = Some(TurnId::new("same-turn"));
+        let mut invocation = test_invocation_context(call_id);
+        invocation.turn = preparation.turn.clone();
+        tool.invoke(
+            tool.prepare(json!({"operation":"account.summary"}), &preparation)
+                .await
+                .unwrap(),
+            &invocation,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_cache_ignores_request_specific_and_turn_only_causes() {
+        use std::sync::atomic::Ordering;
+        for cause in [
+            DeniedBy::Unspecified,
+            DeniedBy::TargetAgentPaused,
+            DeniedBy::TaskTerminal,
+            DeniedBy::ReviewerReadOnly,
+            DeniedBy::IndependentApprovalRequired,
+            DeniedBy::UserRequestRequired,
+            DeniedBy::LeasedTurnRequired,
+            DeniedBy::CharterAdoptionNotApplicable,
+            DeniedBy::ReadBoundaryRequired,
+            DeniedBy::DirectCommandNotAdmitted,
+            DeniedBy::ReviewAssignmentRequired,
+            DeniedBy::ProfileNotSelected,
+        ] {
+            let provider = Arc::new(TerminalDenialProvider {
+                cause: Some(cause),
+                ..Default::default()
+            });
+            let tool = terminal_test_tool(provider.clone());
+            assert!(invoke_terminal_test_tool(&*tool, "first").await.is_error);
+            assert!(invoke_terminal_test_tool(&*tool, "second").await.is_error);
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.records.load(Ordering::SeqCst), 0);
+            provider.succeeds.store(true, Ordering::SeqCst);
+            assert!(
+                !invoke_terminal_test_tool(&*tool, "corrected")
+                    .await
+                    .is_error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_record_failure_preserves_denial_and_cache() {
+        use std::sync::atomic::Ordering;
+        let provider = Arc::new(TerminalDenialProvider {
+            record_failure: true,
+            ..Default::default()
+        });
+        let tool = terminal_test_tool(provider.clone());
+        let first = invoke_terminal_test_tool(&*tool, "first").await;
+        let second = invoke_terminal_test_tool(&*tool, "second").await;
+        assert!(first.is_error);
+        assert_eq!(first.value, second.value);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.records.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_cache_allows_parallel_same_operation_evaluations() {
+        let provider = Arc::new(TerminalDenialProvider {
+            barrier: Some(tokio::sync::Barrier::new(2)),
+            ..Default::default()
+        });
+        let tool = terminal_test_tool(provider);
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                invoke_terminal_test_tool(&*tool, "first"),
+                invoke_terminal_test_tool(&*tool, "second")
+            )
+        })
+        .await
+        .expect("same-operation provider calls must execute concurrently");
+        assert!(!first.is_error);
+        assert!(!second.is_error);
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_composition_skips_repeat_evaluation_and_resets_next_turn() {
+        use std::sync::atomic::Ordering;
+        let provider = Arc::new(TerminalDenialProvider::default());
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "actor",
+            scope(CanonicalScopeType::Account, WorkspaceAccess::Deny),
+            None,
+            None,
+            &BTreeSet::from(["read_account".to_owned()]),
+            Some(provider.clone()),
+        )
+        .unwrap();
+        let tool = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_read")
+            .unwrap();
+        let catalog = tool.spec().input_schema;
+        let mut preparation = test_preparation_context("first");
+        preparation.turn = Some(TurnId::new("first-turn"));
+        let mut invocation = test_invocation_context("first");
+        invocation.turn = preparation.turn.clone();
+        let args = json!({"operation":"account.summary"});
+        let first = tool
+            .invoke(
+                tool.prepare(args.clone(), &preparation).await.unwrap(),
+                &invocation,
+            )
+            .await
+            .unwrap();
+        assert!(first.is_error);
+        // A second call has a new call id and still receives the exact original denial.
+        preparation.call_id = ToolCallId::new("second");
+        invocation.call_id = preparation.call_id.clone();
+        let second = tool
+            .invoke(
+                tool.prepare(args.clone(), &preparation).await.unwrap(),
+                &invocation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.value, second.value);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.records.load(Ordering::SeqCst), 1);
+        // The runtime caches this catalog; Forge deliberately keeps its schema stable.
+        assert_eq!(catalog, tool.spec().input_schema);
+        preparation.turn = Some(TurnId::new("next-turn"));
+        invocation.turn = preparation.turn.clone();
+        tool.invoke(tool.prepare(args, &preparation).await.unwrap(), &invocation)
+            .await
+            .unwrap();
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
+    }
+
+    pub(super) fn test_preparation_context(call_id: &str) -> PreparationContext {
         PreparationContext {
             session: agent_runtime::core::ids::SessionId::new("session"),
             turn: None,
@@ -4892,7 +5829,7 @@ mod tests {
         }
     }
 
-    fn test_invocation_context(call_id: &str) -> InvocationContext {
+    pub(super) fn test_invocation_context(call_id: &str) -> InvocationContext {
         InvocationContext {
             session: agent_runtime::core::ids::SessionId::new("session"),
             turn: None,
@@ -5018,7 +5955,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct ConfiguredSearchProvider;
+    pub(super) struct ConfiguredSearchProvider;
 
     #[async_trait]
     impl ForgeToolProvider for ConfiguredSearchProvider {
@@ -5158,3 +6095,14 @@ mod bounded_command_tests {
         assert_gone(background_pid(&pid_file).await).await;
     }
 }
+
+#[cfg(test)]
+#[path = "typed_tools/normalization_tests.rs"]
+mod normalization_tests;
+
+#[cfg(test)]
+#[path = "typed_tools/registry_tests.rs"]
+mod registry_tests;
+
+#[cfg(test)]
+mod proposal_registry_tests;

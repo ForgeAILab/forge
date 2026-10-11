@@ -338,9 +338,427 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 ```
 
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
-`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
+`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_MAX_DISCONNECT_SECONDS`,
+`FORGE_PUBLIC_SEARCH_ENDPOINT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
+`FORGE_EVENT_CONSUMER_STALL_SECONDS`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+
+### Usage index memory budget
+
+The usage observation index defaults to a **128 MiB** memory budget. Set
+`server.usage_index_budget_mb` in `forge.yaml`,
+`FORGE_SERVER_USAGE_INDEX_BUDGET_MB`, or `forge --usage-index-budget-mb N`.
+Launch precedence is CLI > environment > config file > the 128 MiB default.
+Values are non-negative integers in MiB; `0` disables the index and uses
+memoized full reads. For example:
+
+```yaml
+server:
+  usage_index_budget_mb: 64
+```
+
+In **Forge Settings → Server**, edit **Usage index memory budget**; leave it
+blank to restore 128 MiB. The saved budget applies without a restart: on the
+next usage read, a fitting index remains warm, an oversized index is discarded,
+and a changed budget retries a previously discarded index from the ledger.
+Raising the budget can therefore rebuild the index on the next read. A live
+setting supersedes launch overrides until the next restart. **Operations** shows
+the estimated index charge, budget, and incremental or memoized read path.
+
+### Limit concurrent machine runs
+
+Forge defaults to half the host's logical cores, with a minimum of two runs.
+In Forge Settings → Server, set **Max concurrent runs** to a positive integer,
+leave it blank for automatic, or use zero for unlimited. Saving applies
+immediately to new admissions and leaves current work running.
+
+Server YAML uses `server.max_concurrent_runs`; environment and launch overrides
+are `FORGE_SERVER_MAX_CONCURRENT_RUNS` and `--max-concurrent-runs`. Daemons use
+the top-level `max_concurrent_runs` in their local `daemon.yaml` (beside the
+credentials file), or the same flag when launched. Machines shows the daemon's
+reported cap, an admin-editable limit, and the effective lower ceiling.
+Operations includes server-host occupancy and all remote machines. Full
+machines leave Tasks queued until a dispatcher tick sees a free slot. Chat
+turns count toward occupancy but retain their current independent admission.
+
+### Database space and consumer health
+
+Configure the consumer stall threshold with the usual
+**CLI > environment > file > default** precedence:
+
+```yaml
+server:
+  event_consumer_stall_seconds: 300    # positive seconds; default five minutes
+```
+
+The server flag is `--event-consumer-stall-seconds`; the environment variable is
+`FORGE_EVENT_CONSUMER_STALL_SECONDS`. A consumer is stalled only while it has
+unprocessed events and its cursor has not advanced for longer than the threshold.
+A caught-up consumer is never stalled. The expected set follows the workers this
+process starts; disabled workers and their historical cursors are omitted.
+
+Pool connections use WAL with `synchronous=NORMAL`. Committed transactions survive
+process crashes; a power loss or OS crash can lose the most recent commits, while
+WAL recovery preserves database consistency. New databases enable incremental
+auto-vacuum before the first table is created. Every five seconds the storage
+maintenance worker runs
+`PRAGMA incremental_vacuum(100)` to reclaim at most 100 free pages. At 4 KiB per
+page, about 580 MB of free pages can drain in two hours, with each write-lock
+acquisition bounded to 100 pages. The worker is a no-op outside incremental mode.
+The Operations status reports the current mode and free-page count; free pages
+remain reusable even without vacuum.
+
+Existing databases keep their current auto-vacuum mode. To convert one, stop all
+Forge processes using that data directory, then run:
+
+```bash
+forge --data-dir ./test --convert-db-to-incremental-vacuum
+# Installed default data directory:
+forge --convert-db-to-incremental-vacuum
+```
+
+This command runs a one-time full `VACUUM` and exits without starting the server,
+workers, or migrations. It holds the same `<data-dir>/runtime.lock` as the server
+and Solo, and an exclusive SQLite lock for the conversion. Normal requests and
+other database connections cannot use the file during the rebuild. Plan free
+disk at least comparable to the database size; SQLite can require **up to twice
+the database size in additional free disk space** for the temporary rebuild and
+journal/WAL. Data is preserved. Conversion failure reports an error; restart
+Forge only after the command exits. Already-incremental databases are left in
+that mode without another full rebuild. Existing databases are never fully
+vacuumed automatically.
+
+Workspace garbage collection is configured under `workspace` in `forge.yaml`:
+
+```yaml
+workspace:
+  log_retention_days: 30        # logs of a terminal Task; 0 keeps them forever
+  min_free_bytes: 10737418240   # free-space floor: the larger of this
+  min_free_percent: 5           # and this share of the filesystem
+  min_free_inode_percent: 5     # and this share of its inodes; 0 turns it off
+  # gc_free_bytes: 21474836480  # collect at once under the larger of this
+  # gc_free_percent: 10         # and this; unset: twice the floor
+```
+
+Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
+`log_retention_days` after a terminal Task last changed. While the workspace
+root's filesystem has less free space than the floor, the periodic sweep
+deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
+least recently used first; those Tasks rebuild on their next run. Running work
+is never touched. A Task with an open review or an unresolved attention item
+keeps its logs until that is decided or resolved.
+
+The same floor decides admission. While a machine's workspace filesystem is
+under it (bytes or inodes), Forge starts no new worktree on that machine.
+Checks run in a Task's existing worktree and are not held back. On a
+filesystem smaller than twice `min_free_bytes` the byte floor is half the
+filesystem. Other machines stay eligible. A Task that already has its
+worktree there keeps running, and nothing running is stopped: finishing work
+is how space comes back. When every machine that could take a Task is short,
+the Task waits and says so ("Waiting for Disk Space"); it is dispatched by
+itself within about half a minute of a reading recovering. Nothing fails, no retry budget is spent
+and the Project is not paused. Before the server refuses, it collects its
+garbage once and reads the disk again, and under the collector mark
+(`gc_free_*`, default twice the floor) the collector runs at once instead of
+on its 10 minute timer. If the wait says garbage collection is not running on
+a machine, free space there by hand or fix the root's ownership (below):
+nothing will reclaim it automatically. A disk that cannot be read refuses
+nothing.
+
+#### Shared compiler cache (opt-in)
+
+Every Task builds into its own directory (`CARGO_TARGET_DIR` under its Task
+root), so every Task starts with a cold build. If you have a compiler-cache
+wrapper installed, Forge can hand it to runs so that separate Tasks of one
+repository reuse each other's compiled crates, without sharing a build
+directory or a lock. Forge installs nothing and this is off until you name a
+wrapper:
+
+```yaml
+workspace:
+  compiler_cache:
+    wrapper: kache              # absolute path, or a name found on PATH at start
+    # max_bytes: 21474836480    # size cap, default 20 GiB; 0 turns the cache off
+    # dir: /var/cache/forge     # default <workspace root>/.forge/build/cache
+```
+
+`FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER`, `..._MAX_BYTES` and `..._DIR`
+override the file. This is per machine: a daemon reads the same
+`workspace.compiler_cache` block from its own `daemon.yaml`
+(`forge-daemon --compiler-cache-wrapper`, `--compiler-cache-max-bytes` and
+`--compiler-cache-dir` override it) and never receives the server's.
+
+What a run gets, when the wrapper is still executable and the cache
+directory can be written:
+
+| Wrapper (by program name) | Variables set on the run |
+|---|---|
+| `kache` | `RUSTC_WRAPPER`, `KACHE_CACHE_DIR=<dir>/<repository id>`, `KACHE_MAX_SIZE=<max_bytes>` |
+| `sccache` | `RUSTC_WRAPPER=<dir>/<repository id>/rustc-wrapper`, `SCCACHE_DIR=<dir>/<repository id>`, `SCCACHE_CACHE_SIZE`, `SCCACHE_SERVER_UDS=<dir>/<repository id>/s` |
+| anything else | `RUSTC_WRAPPER` only |
+
+It applies to every run that gets the per-Task build directory: agent
+executions, lifecycle hooks, checks and CI commands in a Task worktree, the
+native command tool and a daemon's `workspace.run`. Precedence is the same as
+for the build directory: a `RUSTC_WRAPPER` in the Project environment wins
+(set it to an empty value to turn the wrapper off for one Project), then a
+value already on the command, then `RUSTC_WRAPPER` in the environment Forge
+itself was started with, then this setting. The set is all or nothing: when
+any of those carries `RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER` (which
+`RUSTC_WRAPPER` would shadow) or one of the wrapper's own variables in the
+table (`KACHE_CACHE_DIR`, `SCCACHE_DIR`, ...), Forge sets none of the
+variables above and grants no extra writable directory, so a Project can
+never aim Forge's wrapper at a directory of its own choosing. Hooks, checks
+and `workspace.run` commands run in a login shell, so a `RUSTC_WRAPPER`
+exported by the operator's shell profile also replaces Forge's there.
+
+Two consequences worth knowing. If the environment Forge itself is started
+with already names a wrapper (a global `export RUSTC_WRAPPER=kache`, say),
+every run inherits that, so this setting is off for that process; Forge says
+so in one warning at start. Unset the variable for the Forge process to get
+one store per repository. And a `build.rustc-wrapper` in a repository's
+`.cargo/config.toml` is not something Forge sees: `RUSTC_WRAPPER` shadows
+it, so a Project that wants its own wrapper sets `RUSTC_WRAPPER` (or an
+empty value) in its Project environment.
+
+Things to know:
+
+- **`kache` shares the most.** It reuses a crate across worktrees. `sccache`
+  makes the directory the compiler runs in part of its key, so it shares
+  dependencies (registry and git crates) between Tasks but not the
+  repository's own crates.
+- **`sccache` needs two things from Forge**, both automatic. One server per
+  repository store, started by Forge (`sccache --start-server`, socket and
+  temp directory inside the store, no idle exit): a server started by a
+  run's first compile would keep that run's temporary directory and fail
+  every compile after the run ended. And a two-line launcher,
+  `<store>/rustc-wrapper`, that runs your `sccache` without
+  `CARGO_TARGET_DIR`: `sccache` makes every `CARGO_*` variable part of its
+  key, and each Task has its own. The servers outlive Forge; stop one with
+  `SCCACHE_SERVER_UDS=<store>/s sccache --stop-server`. A cache directory
+  whose socket path would exceed 100 bytes is not used: set `dir` to a
+  shorter path.
+- **A cache never fails a run.** At start `kache` and `sccache` must answer
+  `--version` within five seconds, or the setting is off for the life of the
+  process (one warning). After that, if the wrapper is gone, the directory
+  cannot be created or written (read-only or full disk included), or the
+  `sccache` server does not start, the run builds as it would without the
+  setting and the log carries one warning per cause for the life of the
+  process. Starting an `sccache` server may hold a run's start for up to ten
+  seconds; after three failed starts in a row for one store, runs stop
+  trying for ten minutes. What Forge cannot see is a wrapper that still
+  exists and starts but fails or hangs while compiling: that is a build
+  failure of the run like any other broken tool, and Forge puts no timeout
+  around a compiler.
+- **Who shares a store (trust boundary).** One store is shared by every Task
+  of one repository on one machine, and by nothing else: the store is named
+  after the repository's id (for a repository that is a local checkout,
+  after that checkout's path), and it is taken from the Task worktree only
+  when the repository's own Git directory names that worktree back, so a
+  Task cannot claim another repository's store by editing its `.git` file.
+  Two Projects share a store only if they are bound to the same repository
+  directory on disk. Within a repository the cache is a channel between
+  Tasks: a Task that can write the store can plant an artifact a later Task
+  or check links. That is the same trust you already give Tasks of one
+  repository (their commits reach the same checks); do not turn this on for
+  a repository whose Tasks must not be able to affect each other's builds.
+- **Background processes.** `sccache` servers (above) and the `kache` daemon
+  (which `kache` starts itself on first use, one per store) outlive the run
+  and Forge. Stop a `kache` daemon with
+  `KACHE_CACHE_DIR=<store> kache daemon stop`.
+- **Sandboxed CLIs.** A Codex Task under Forge's managed workspace-write
+  sandbox gets the wrapper only when it is `kache` (which builds uncached
+  when it cannot reach its store), and its store is then added to the
+  sandbox's writable roots. `sccache` and unknown wrappers are not passed
+  into that sandbox: `sccache` fails a compile when it cannot reach its
+  server. Codex under `yolo` gets whatever you configured. Codex with your
+  own sandbox configuration, and Gemini with `--sandbox`, get no wrapper.
+  Forge cannot see a sandbox you switch on inside Claude Code, Cursor,
+  OpenCode or Smith themselves: those runs get the wrapper like any other.
+  If such a sandbox blocks the store or the `sccache` socket, use `kache`
+  (it builds uncached) or set an empty `RUSTC_WRAPPER` in that Project's
+  environment.
+- **Disk.** `max_bytes` is enforced twice. The wrapper holds each repository
+  store to it (`KACHE_MAX_SIZE`, `SCCACHE_CACHE_SIZE`), and on every pass
+  the garbage collector holds all stores of the machine together to it,
+  deleting least recently used entries (by access and modification time)
+  whatever the disk has free and wherever `dir` is. While the workspace
+  filesystem is under its free-space floor, the collector also deletes
+  least recently used entries until the disk is back above the floor or the
+  cache is down to half of `max_bytes`, and only then takes any Task's build
+  output. It deletes entry files only, never a store directory. For a
+  `kache` store it does so only while no run of that repository is live. A
+  cache left behind in the default directory after you remove the setting
+  is trimmed to nothing under floor pressure only; one left in a `dir` of
+  your own is yours to delete. A `dir` on another filesystem than the
+  workspace root is not trimmed for the floor (it would free nothing where
+  space is short), only held to `max_bytes`. A wrapper Forge does not know
+  (`RUSTC_WRAPPER` only) keeps its cache wherever it likes; Forge neither
+  measures nor trims it.
+  Free space admission counts the cache like any other used disk.
+- Check results are not affected: the wrapper is added per run and is not
+  part of the environment a check's identity is computed from.
+
+`FORGE_WORKSPACE_LOG_RETENTION_DAYS`, `FORGE_WORKSPACE_MIN_FREE_BYTES`,
+`FORGE_WORKSPACE_MIN_FREE_PERCENT`, `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`,
+`FORGE_WORKSPACE_GC_FREE_BYTES` and `FORGE_WORKSPACE_GC_FREE_PERCENT` override
+the file values; all take effect on restart. A daemon has no floor of its own:
+it reports the free bytes and inodes of its workspace root with every report
+and takes the server's floor from the reply, for its own collector and for
+refusing to make a worktree while its own disk is under it. Until the first
+reply its collector uses the built-in default and logs that it does, and it
+refuses nothing. A daemon that stops reporting for five minutes is no longer
+counted as short of disk. No key turns
+garbage collection off.
+
+Garbage collection runs only on a workspace root this server's database owns.
+The server adopts its root at start-up by writing `.forge/gc/owner` under it,
+and refuses a root that is the home directory or a parent of it, a git
+repository, a top-level directory or a symbolic link. Give every server its
+own workspace root: a second database on the same root leaves it unswept.
+After a database reset the root still names the old database, nothing is
+reclaimed and the disk can fill; the server log and operator status (the
+Operations page) say so. To take the root over, stop Forge and start it once
+with:
+
+```bash
+forge --reclaim-workspace-gc
+```
+
+Task directories the old database knew and the new one does not are then
+moved to `.forge/gc/` after a day and deleted a day later (see
+[Workspace garbage collection](architecture.md#workspace-garbage-collection)).
+
+#### Where the server keeps workspaces, and how to move them
+
+The server's workspace root holds every Task worktree, the repository clones
+Forge makes (`.repos/`), execution logs (`.forge/logs/`) and build output. A
+server that never chose a root keeps it at `<data dir>/worktrees`
+(`~/.forge/worktrees` by default; `./test/worktrees` for `make dev`).
+`workspace.root` in `forge.yaml`, then `FORGE_WORKSPACE_ROOT`, override it.
+
+The root in use is recorded in the database at the first start
+(`system_setting.workspace_root`), because the database stores absolute
+paths into it. From then on:
+
+- A start without a configured root uses the recorded one, whatever the
+  default of the running release is.
+- A configured root that differs from the recorded one is taken only when
+  nothing lives under the recorded root: no workspace that is not `cleaned`,
+  no repository clone, no running run. Otherwise the server refuses to
+  start, names both directories and tells you to move the data. Forge never
+  runs on two roots.
+
+##### Upgrading from a release that kept the root in the temp directory
+
+**Nothing moves by itself.** Upgrading changes where *new* installs keep
+their workspaces, never where yours are. Releases before this one kept the
+default root in the system temp directory (`<system temp>/forge/worktrees`),
+where the operating system deletes files: worktrees vanished and uncommitted
+work was lost. What the first start after the upgrade does:
+
+| Your install | What the start does |
+|---|---|
+| Never set a root; the database has workspaces, clones or logs | Keeps the root those rows were written under, records it, warns at start and on the Operations page (`workspace_root`) until you move it. The root is read from the stored paths, not from today's temp directory, so a service manager and a shell with different `TMPDIR`s agree. |
+| Root set by `workspace.root`, `FORGE_WORKSPACE_ROOT` or a flag | Records that root. Rows an older configuration left elsewhere keep working and are listed in a warning. |
+| Rows under two roots and no root set | Starts on the root holding the most workspaces that are not `cleaned`, and warns naming the other; nothing is guessed away or moved. |
+| Empty database, or only `cleaned` history | Uses `<data dir>/worktrees`. Directories left in the temp directory are not this install's and are not touched. |
+| The recorded root is gone (the system emptied its temp directory) | Makes the directory again, warns how many workspaces lost their files, and goes on: a Task's worktree is recreated from its branch when the Task next runs. |
+| The recorded root cannot exist here (data directory copied from another machine, volume not mounted) | Refuses to start and prints the exact command. Mount the volume, or run the command: with nothing left to move it only points the database at the new root. |
+| The data directory was moved with its `worktrees` inside | Same refusal; the command finds the files already at the new root, repairs Git's links and rewrites the stored paths without moving anything. |
+| A move was interrupted | Refuses with `migration in progress` until the same command finishes it. |
+
+A start is refused only in the last three cases and when a configured root
+differs from a recorded one that still holds live data; every refusal prints
+the command to run, with `--data-dir` when your data directory is not the
+default one. To leave the temp directory:
+
+```bash
+# Stop Forge first.
+forge --migrate-workspace-root                    # to <data dir>/worktrees
+forge --migrate-workspace-root /srv/forge/worktrees
+forge --data-dir ./test --migrate-workspace-root  # a non-default data dir
+```
+
+Without a path the command moves to the configured root when
+`workspace.root` or `FORGE_WORKSPACE_ROOT` is set, else to
+`<data dir>/worktrees`.
+
+The command needs the server stopped (it takes the lock a running server
+holds and refuses otherwise) and nothing recorded as in flight: no running
+execution or check run, no claimed or suspended task step, no integration
+attempt that is neither finished nor parked, no active workspace lease. The
+new root must be absent or empty (unless the old root no longer exists),
+outside the old root, not the home directory, a Git repository or a
+top-level directory, and, when it is on another filesystem, have room for
+the old root (every hard link counted as a full file) plus the free-space
+floor. A submodule or nested worktree whose link names the old root by
+absolute path is refused by name. Any refusal changes nothing and exits
+non-zero.
+
+What moves is what this database's Forge made: the Task roots of its Tasks,
+the clones of its repositories under `.repos/`, the logs of its Projects
+under `.forge/logs/`, and every other entry one of its stored paths names
+(`repos/`, `main-agents/`). Build directories, run temp directories and
+garbage-collection state move too, unless the root's marker says another
+database adopted it. Anything else stays and is listed in the summary. This
+matters after an upgrade: every data directory on a machine (`~/.forge`, a
+`./test` directory for `make dev`) used to share the one temp-directory
+root, and moving one of them leaves the others' worktrees, clones and
+garbage-collection claim exactly where they are. Move each data directory
+with its own `--data-dir`. Entries are renamed on one filesystem; otherwise copied,
+compared byte for byte and only then removed. A copy keeps contents,
+permissions, modification times, links (as links, never followed) and hard
+links within an entry; it does not keep extended attributes, and it never
+removes a socket, pipe or device (those stay in the old root and are
+listed). Read-only directories move.
+
+Git's worktree links are repaired in both directions and each worktree is
+checked with `git status`; every clone is checked with
+`git fsck --connectivity-only` (a problem is reported, it does not undo the
+move). In a repository of your own that has Forge worktrees, the only thing
+done is `git worktree repair <the moved worktrees>`, run in that repository
+and named in the summary. Uncommitted changes and untracked files move with
+their worktree.
+
+Every stored path is rewritten in one database transaction, and the command
+checks inside that transaction that no path column still names the old
+root: if one does, nothing is committed and the command fails with
+`db pending`. The old root keeps a `MOVED` file, its garbage-collection
+marker moves with the root (another Forge may adopt the old directory), and
+nothing in it is deleted that was not moved. Daemon-owned workspaces are not
+touched: a daemon keeps its own root, and one that was configured to share
+the server's root keeps its `.forge/workspaces` and its recorded runtime
+root in the old one.
+
+Each finished step is written to `<data dir>/workspace-root-migration.json`.
+The move only rolls forward; there is no abort, because entries that were
+already renamed and Git links that were already rewritten cannot be put back
+safely by a tool that was just interrupted. If the command stops (a full
+disk, a permission error, a crash), it says what stopped it, the server
+refuses to start with `migration in progress` while the journal exists, and
+running the same command again goes on from the last finished step: a
+half-made copy is made again from the untouched original.
+
+Forge Solo always keeps its root at `<Solo data root>/worktrees` and records
+it the same way; it was never in the temp directory. Solo has no move
+command of its own: when its start is refused (its data root was moved, or
+copied from another machine), the message prints the command to run, with
+both paths: `forge --data-dir <Solo data root> --migrate-workspace-root
+<Solo data root>/worktrees`. Type the target as printed: without it `forge`
+would use the root of the server's own configuration, if one is set. A Solo data root
+*copied* beside an original that still exists is not supported: both
+databases name the original's worktrees, so remove the copy or the original.
+
+`workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
+placement, or a server-owned workspace executed on a remote daemon, waits for
+that daemon to reconnect. Both freeze heartbeat leases to prevent a second
+execution from writing to a live worktree on a shared mount. The same bound
+covers a Task queued on an offline owner before its first placement exists.
+It defaults to `86400` (24 hours) and must be positive. `FORGE_MAX_DISCONNECT_SECONDS` overrides the file value.
+After the bound elapses, the placement and running execution fail with
+`owner_disconnected_timeout`; execution hard deadlines still apply during the wait.
 
 ### Commands an Agent may run in its workspace
 
@@ -442,6 +860,14 @@ Point the command at a local spark checkout to develop against unreleased
 templates (`bun /path/to/spark/packages/create-spark/src/cli.ts`); the
 `SPARK_ROOT` environment variable is passed through. A missing runtime is a
 typed, retryable `scaffold_runtime_unavailable` provisioning failure.
+
+Forge's layout guidance favors small feature modules with clear ownership.
+Split Tasks along module boundaries and name the modules/files each owns;
+parallel Tasks should edit disjoint files. Avoid shared hub files; prefer
+per-feature discovery or registration without shared-list edits. If a shared
+edit is unavoidable, give one Task ownership and make the others depend on it.
+The Forge section exported to a scaffold's `AGENTS.md` carries the same rule
+and tells workers to report required edits outside their Task scope.
 
 ### Local development data dir
 
@@ -963,7 +1389,7 @@ Project's current primary Repo only when admitting a new execution.
 When repository setup, dependencies, assignment, workflow, source availability,
 and the current Task version all pass, the
 scheduler assigns the selected Worker and issues one Task-scoped Workspace
-lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
+lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/actions` with `start` or the offered `release`/`retry` and normal workflow scheduling
 use the same admission checks. An Agent serving as Main or Project Agent may
 also receive that lease when explicitly assigned, but the Task session is
 isolated from its chat session. Inspect the linked Task, transitions, executions, and Workspace
@@ -972,7 +1398,7 @@ diff through `GET /api/v1/tasks/{id}`, `GET /api/v1/tasks/{id}/transitions`,
 `GET /api/v1/tasks/{id}/diff`.
 
 After an attempt starts, its Workspace/lease repository identity is immutable
-provenance for diff, review, pull request, evidence, and release records. A
+provenance for diff, review, evidence, and release records. A
 later Project repository change does not rewrite that history, and Forge does
 not silently reuse an old-Repo Workspace for a new attempt.
 
@@ -1174,11 +1600,132 @@ local CLI availability and keeps the command stream open. `daemon link` and
 `daemon start` create the configured workspace root if it does not already
 exist, so filesystem browsing can open the launch directory immediately.
 
-Execution dispatch expects the server-created task worktree to exist at the same
-absolute path on the daemon host. For containers, mount the server workspace
-root into the container at that same path. A daemon on an unrelated filesystem
-can still serve filesystem browsing under its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
+### Register a machine-local repository
+
+A linked daemon can own the whole Task workspace lifecycle on its machine:
+preparation, CLI execution, review checks, direct merge, and cleanup. The server
+does not need access to that machine's checkout or worktree paths.
+
+1. Link or start the daemon with `--workspace-root` containing both the checkout
+   you want to register and its generated workspaces. For example, use
+   `/Volumes/Data/codes` for a checkout at `/Volumes/Data/codes/app`; the default
+   `$HOME/.forge/workspaces` root would not contain that checkout.
+2. Register that checkout as a `daemon`-owned `primary_checkout` location for
+   the Project's repository, supplying the linked daemon ID, runtime ID, and
+   machine-local path. Use the [repository location commands](cli.md#repository-locations)
+   to add, inspect, verify, and optionally make it the default location.
+3. Check that the location is `ready`. The daemon verifies that the path is
+   within its root, is a Git worktree, resolves the repository's default branch,
+   and has a matching remote when present. `unverified`, `unavailable`, and
+   `invalid` locations cannot receive work; inspect the last error and retry
+   verification after fixing the checkout or reconnecting the daemon.
+4. Use CLI Agents for every assigned worktree role (coder, reviewer, planner).
+   Install, authenticate, and enable their executors on that daemon, and allow
+   the configured run purposes below. Native Agents are outside this slice.
+
+Claim reserves capacity, prepares the workspace on its owner, then creates the
+Task claim, Running Execution, and lease. Preparation failure creates no
+Execution and spends no retry budget. An unpinned CLI Agent runs on the owner
+selected from eligible locations; a daemon pin restricts that selection. If no
+owner qualifies, claim returns `placement_unavailable` with rejection reasons.
+Task and Workspace responses expose `placement` so you can inspect the owner
+and state. Once prepared, retries and subtasks sharing that workspace stay on
+the same owner.
+
+If the daemon disconnects, the placement becomes `disconnected` and work waits.
+Running leases are frozen until reconciliation or `max_disconnect` (default
+24 hours), while hard deadlines still apply. Reconnect reconciles active and
+journaled executions before dispatch resumes. You can wait, retry on that owner,
+or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
+[the placement and failure model](architecture.md#workspace-placement).
+
+For containers sharing server workspaces, register a server-owned `shared_mount`
+location instead. Forge verifies a server-written probe through the daemon at
+the same path before using it as an execution provider. Matching absolute paths
+alone are insufficient. Daemon ownership requires revision 7 with `workspace.v1`.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 7 or newer), restarting each with its existing
+`--workspace-root`.
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the older handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
+
+### Daemon run policy
+
+The daemon reads `daemon.yaml` beside its credentials file when it starts
+(`~/.forge/daemon.yaml` by default; with `--credentials`, use that file's
+directory). This is local configuration; requests cannot override the effective
+policy loaded at startup. `workspace.run.allow` defaults to `[ci_step]`. To opt into Project hooks and
+environment setup too, save:
+
+```yaml
+workspace:
+  run:
+    allow: [ci_step, hook, environment_setup]
+```
+
+For readiness probes before cloning, also opt in to `environment_probe` and
+`repo_provision` in this same allow list. The daemon advertises
+`machine_probe.v1` and `repo_provision.v1` in its handshake. These purposes
+are accepted only by their dedicated RPCs; `workspace.run` keeps its three
+existing purposes. The default remains `[ci_step]`. Keep only the purposes you
+want to permit; `allow: []` denies every purpose.
+Restart the daemon after editing the file. It advertises the effective policy,
+and claim rejects a daemon with `run_purpose_denied` if the Task's review, hooks,
+or environment needs a disallowed purpose. A refused command returns
+`purpose_denied` and is never retried.
+
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
+
+### Daemon journal migration
+
+Revision 3 keeps terminal reports, their bounded worklog/evidence outbox entries,
+workspace operation results, and cleanup acknowledgements in one journal at
+`<workspace-root>/.forge/journal/`. On first startup after upgrading, the daemon
+automatically converts reports from
+`<workspace-root>/.forge-daemon/terminal-reports/`. Each old report is removed
+only after its journal entry is durably saved; interrupted conversion resumes
+on the next start. Unknown files in the old directory are left intact.
+
+Restart with the same workspace root to migrate its pending reports. No manual
+copy is needed. Unacknowledged terminal and cleanup results replay after
+reconnect until `journal.ack`. After the server durably stores the result, ack
+removes the receipt and releases its space. The whole journal (including its
+registry) is capped at 32 MiB and 1,024 receipts. CI output is capped at 1 MiB per
+stream with a marker before the retained tail; execution time may remain
+unbounded. Unbounded CI retains its exit verdict even when logs are shortened or
+omitted. Completion metadata has reserved headroom in the shared budget. Cleanup
+prunes workspace handles and their execution IDs when its receipt is acknowledged;
+reset and release keep retired review handles fenced until acknowledgement too.
+Requests store environment
+variable names and a digest of the redacted request. Output and errors are
+redacted without changing identities or exit codes. Corrupt or non-regular entries
+are quarantined as `corrupt-<original name>` when possible and logged. A failed
+quarantine is logged and skipped so other entries still replay. Command-stream
+initialization failure stops the process promptly.
 
 ## Where to next
 
@@ -1186,3 +1733,84 @@ cannot run server-created task worktrees yet.
 - **How it's wired together** → [architecture.md](architecture.md)
 - **Run agents from your AI tooling** → [api.md#mcp-tools](api.md#mcp-tools)
 - **Contribute** → [../CONTRIBUTING.md](../CONTRIBUTING.md)
+
+### Per-run build budget and CPU priority
+
+Every CLI agent process (and its children), native tool command, review CI
+step, Project hook and environment check/setup command uses the executing
+machine's build budget. Unset `build_jobs_per_run` computes
+`max(1, logical_cores / run_cap)`: use the configured positive machine cap, or
+the automatic cap `max(2, logical_cores / 2)` when the cap is unset or `0`.
+`build_jobs_per_run: 0` disables Forge's defaults; a positive value is exact.
+Forge supplies `CARGO_BUILD_JOBS=k`, `RUST_TEST_THREADS=k`, `MAKEFLAGS=-j<k>`,
+`CMAKE_BUILD_PARALLEL_LEVEL=k` and `GOFLAGS=-p=<k>`. Each Project's
+`environment.env` takes precedence, then the Forge/daemon process environment,
+then these defaults. These are cooperative tool limits, not a hard CPU quota.
+
+On Unix, run children start with a niceness increment of `run_nice` (default
+`10`, range `0`–`19`; `0` disables it, resulting niceness capped at `19`). Their
+children inherit that priority; Forge's own priority stays unchanged. Failure
+to lower priority logs once and does not fail work. On Windows niceness is a
+no-op. Updates affect newly spawned processes; existing children keep their
+launch environment and priority.
+
+Server controls are `server.build_jobs_per_run` and `server.run_nice` in YAML,
+`FORGE_SERVER_BUILD_JOBS_PER_RUN` and `FORGE_SERVER_RUN_NICE` in the operator
+environment, and `forge --build-jobs-per-run N --run-nice N`. Precedence is file,
+then environment, then flag. Forge Settings changes these values live, with
+cores, effective cap and budget shown beside the machine cap; launch overrides
+apply again after a restart. Operations includes the available server facts.
+
+Daemons use top-level `build_jobs_per_run` and `run_nice` in `daemon.yaml` beside
+their credentials. `forge-daemon`, `forge-ctl daemon link` and
+`forge-ctl daemon start` accept `--build-jobs-per-run N` and `--run-nice N` to
+override the file. This is daemon-local policy, with no transport override and
+no daemon protocol change. Remote policy facts are not reported.
+
+## Before-work hooks
+
+Before-work hooks may run more than once, including after an interrupted step resumes, and must be safe to repeat.
+
+### Native chat working-set budgets
+
+These server keys bound each native request, including tool schemas, history and
+the transient state card. Target controls LCM pressure; hard caps planner input.
+The provider's smaller input window remains authoritative. Values require
+`0 < target <= hard`; CLI chat and other surfaces retain their existing policy.
+
+```yaml
+server:
+  main_working_set_target_tokens: 48000
+  main_working_set_hard_tokens: 64000
+  project_working_set_target_tokens: 96000
+  project_working_set_hard_tokens: 128000
+```
+
+Environment overrides are `FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS`,
+`FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS`,
+`FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS` and
+`FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS`.
+
+Native chat topics rotate after Genesis/handoff turns and before their successors,
+or before the next user turn following eight hours idle; CLI chats never rotate
+automatically. An explicit topic request during a live turn is saved and completed
+at that same idle admission boundary. A rotation that fails three times is
+abandoned with a visible notice, and the chat continues on its current topic.
+
+### Whole-check wall timeout (passive contract setting)
+
+`server.check_run_timeout_seconds` defines the whole mechanical-check bundle
+wall limit, default **1800 seconds**, positive integer. Precedence is
+`forge --check-run-timeout-seconds N`, then
+`FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`, then `server.check_run_timeout_seconds`
+in `forge.yaml`, then the default. For example:
+
+```yaml
+server:
+  check_run_timeout_seconds: 1800
+```
+
+This stage only defines the setting and the canonical spec field. No execution
+reads it yet: existing CI and per-command `review.check_timeout_seconds` behavior
+is unchanged. The durable runner will start wall timing at actual admission and
+clamp each separate command limit to the remaining wall time.

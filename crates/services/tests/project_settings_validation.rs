@@ -192,7 +192,11 @@ async fn the_project_environment_is_validated() {
         ),
         (
             json!({ "checks": [{ "name": "slow", "command": "true", "timeout_seconds": 0 }] }),
-            "positive timeout",
+            "between 1 and 300",
+        ),
+        (
+            json!({ "checks": [{ "name": "too-slow", "command": "true", "timeout_seconds": 301 }] }),
+            "between 1 and 300",
         ),
         (
             json!({ "checks": [{ "name": "browser", "command": "true", "roles": ["reviewre"] }] }),

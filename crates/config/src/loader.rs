@@ -9,19 +9,38 @@ impl ForgeConfig {
         config_path: Option<&Path>,
         overrides: ConfigOverrides,
     ) -> Result<Self, ConfigError> {
-        let mut config = Self::default();
         let path = config_path.map_or_else(default_config_path, Path::to_path_buf);
 
-        if path.exists() {
+        let file_config = if path.exists() {
             let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
                 path: path.clone(),
                 source,
             })?;
-            let file_config =
-                serde_yaml::from_str::<FileConfig>(&text).map_err(|source| ConfigError::Parse {
+            Some(serde_yaml::from_str::<FileConfig>(&text).map_err(|source| {
+                ConfigError::Parse {
                     path: path.clone(),
                     source,
-                })?;
+                }
+            })?)
+        } else {
+            None
+        };
+        let data_dir = overrides
+            .data_dir
+            .clone()
+            .or_else(|| env_value("FORGE_DATA_DIR").map(|value| expand_path(&value)))
+            .or_else(|| {
+                file_config
+                    .as_ref()?
+                    .forge
+                    .as_ref()?
+                    .data_dir
+                    .as_deref()
+                    .map(expand_path)
+            })
+            .unwrap_or_else(crate::default_data_dir);
+        let mut config = Self::with_data_dir(data_dir);
+        if let Some(file_config) = file_config {
             config.apply_file(file_config);
         }
 
@@ -39,6 +58,28 @@ impl ForgeConfig {
         }
 
         if let Some(server) = file.server {
+            if let Some(seconds) = server.check_run_timeout_seconds {
+                self.server.check_run_timeout_seconds = seconds;
+            }
+            if let Some(value) = server.main_working_set_target_tokens {
+                self.server.main_working_set_target_tokens = value;
+            }
+            if let Some(value) = server.main_working_set_hard_tokens {
+                self.server.main_working_set_hard_tokens = value;
+            }
+            if let Some(value) = server.project_working_set_target_tokens {
+                self.server.project_working_set_target_tokens = value;
+            }
+            if let Some(value) = server.project_working_set_hard_tokens {
+                self.server.project_working_set_hard_tokens = value;
+            }
+
+            self.server.max_concurrent_runs = server.max_concurrent_runs;
+            self.server.build_jobs_per_run = server.build_jobs_per_run;
+            if let Some(nice) = server.run_nice {
+                self.server.run_nice = nice;
+            }
+            self.server.usage_index_budget_mb = server.usage_index_budget_mb;
             if let Some(bind) = server.bind {
                 self.server.bind = bind;
             }
@@ -60,14 +101,47 @@ impl ForgeConfig {
             if let Some(media_upload_limit_bytes) = server.media_upload_limit_bytes {
                 self.server.media_upload_limit_bytes = media_upload_limit_bytes;
             }
+            if let Some(seconds) = server.event_consumer_stall_seconds {
+                self.server.event_consumer_stall_seconds = seconds;
+            }
         }
 
         if let Some(workspace) = file.workspace {
             if let Some(root) = workspace.root {
                 self.workspace.root = expand_path(&root);
+                self.workspace.root_explicit = true;
             }
             if let Some(cleanup_delay_seconds) = workspace.cleanup_delay_seconds {
                 self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+            }
+            if let Some(max_disconnect_seconds) = workspace.max_disconnect_seconds {
+                self.workspace.max_disconnect_seconds = max_disconnect_seconds;
+            }
+            if let Some(log_retention_days) = workspace.log_retention_days {
+                self.workspace.log_retention_days = log_retention_days;
+            }
+            if let Some(min_free_bytes) = workspace.min_free_bytes {
+                self.workspace.min_free_bytes = min_free_bytes;
+            }
+            if let Some(min_free_percent) = workspace.min_free_percent {
+                self.workspace.min_free_percent = min_free_percent;
+            }
+            if let Some(percent) = workspace.min_free_inode_percent {
+                self.workspace.min_free_inode_percent = percent;
+            }
+            if workspace.gc_free_bytes.is_some() {
+                self.workspace.gc_free_bytes = workspace.gc_free_bytes;
+            }
+            if workspace.gc_free_percent.is_some() {
+                self.workspace.gc_free_percent = workspace.gc_free_percent;
+            }
+            if let Some(cache) = workspace.compiler_cache {
+                let current = std::mem::take(&mut self.workspace.compiler_cache);
+                self.workspace.compiler_cache = current.overridden(
+                    cache.wrapper,
+                    cache.max_bytes,
+                    cache.dir.as_deref().map(expand_path),
+                );
             }
         }
 
@@ -176,6 +250,45 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS") {
+            self.server.main_working_set_target_tokens =
+                parse_env_u32("FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS") {
+            self.server.main_working_set_hard_tokens =
+                parse_env_u32("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS") {
+            self.server.project_working_set_target_tokens =
+                parse_env_u32("FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS") {
+            self.server.project_working_set_hard_tokens =
+                parse_env_u32("FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_BUILD_JOBS_PER_RUN") {
+            self.server.build_jobs_per_run =
+                Some(parse_env_u32("FORGE_SERVER_BUILD_JOBS_PER_RUN", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_SERVER_RUN_NICE") {
+            self.server.run_nice = parse_env_u32("FORGE_SERVER_RUN_NICE", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS") {
+            self.server.check_run_timeout_seconds =
+                parse_env_u32("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_USAGE_INDEX_BUDGET_MB") {
+            self.server.usage_index_budget_mb =
+                Some(parse_env_u32("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_SERVER_MAX_CONCURRENT_RUNS") {
+            self.server.max_concurrent_runs =
+                Some(parse_env_u32("FORGE_SERVER_MAX_CONCURRENT_RUNS", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_EVENT_CONSUMER_STALL_SECONDS") {
+            self.server.event_consumer_stall_seconds =
+                parse_env_u32("FORGE_EVENT_CONSUMER_STALL_SECONDS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_SERVER_BIND") {
             self.server.bind = value;
         }
@@ -198,10 +311,56 @@ impl ForgeConfig {
         }
         if let Some(value) = env_value("FORGE_WORKSPACE_ROOT") {
             self.workspace.root = expand_path(&value);
+            self.workspace.root_explicit = true;
         }
         if let Some(value) = env_value("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS") {
             self.workspace.cleanup_delay_seconds =
                 parse_env_u64("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_MAX_DISCONNECT_SECONDS") {
+            self.workspace.max_disconnect_seconds =
+                parse_env_u64("FORGE_MAX_DISCONNECT_SECONDS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_LOG_RETENTION_DAYS") {
+            self.workspace.log_retention_days =
+                parse_env_u32("FORGE_WORKSPACE_LOG_RETENTION_DAYS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_MIN_FREE_BYTES") {
+            self.workspace.min_free_bytes =
+                parse_env_u64("FORGE_WORKSPACE_MIN_FREE_BYTES", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_MIN_FREE_PERCENT") {
+            // Anything over 100 is refused by validation, whatever its size.
+            self.workspace.min_free_percent =
+                u8::try_from(parse_env_u32("FORGE_WORKSPACE_MIN_FREE_PERCENT", &value)?)
+                    .unwrap_or(u8::MAX);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT") {
+            self.workspace.min_free_inode_percent = u8::try_from(parse_env_u32(
+                "FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT",
+                &value,
+            )?)
+            .unwrap_or(u8::MAX);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_COMPILER_CACHE_WRAPPER") {
+            self.workspace.compiler_cache.wrapper = Some(value);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES") {
+            self.workspace.compiler_cache.max_bytes =
+                parse_env_u64("FORGE_WORKSPACE_COMPILER_CACHE_MAX_BYTES", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_COMPILER_CACHE_DIR") {
+            self.workspace.compiler_cache.dir = Some(expand_path(&value));
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_GC_FREE_BYTES") {
+            self.workspace.gc_free_bytes =
+                Some(parse_env_u64("FORGE_WORKSPACE_GC_FREE_BYTES", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_GC_FREE_PERCENT") {
+            self.workspace.gc_free_percent = Some(
+                u8::try_from(parse_env_u32("FORGE_WORKSPACE_GC_FREE_PERCENT", &value)?)
+                    .unwrap_or(u8::MAX),
+            );
         }
         if let Some(value) = env_value("FORGE_AGENT_MAX_CONCURRENT_TASKS") {
             self.agent.max_concurrent_tasks =
@@ -239,6 +398,24 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(seconds) = overrides.server_check_run_timeout_seconds {
+            self.server.check_run_timeout_seconds = seconds;
+        }
+        if let Some(jobs) = overrides.server_build_jobs_per_run {
+            self.server.build_jobs_per_run = Some(jobs);
+        }
+        if let Some(nice) = overrides.server_run_nice {
+            self.server.run_nice = nice;
+        }
+        if let Some(budget) = overrides.server_usage_index_budget_mb {
+            self.server.usage_index_budget_mb = Some(budget);
+        }
+        if let Some(cap) = overrides.server_max_concurrent_runs {
+            self.server.max_concurrent_runs = Some(cap);
+        }
+        if let Some(seconds) = overrides.event_consumer_stall_seconds {
+            self.server.event_consumer_stall_seconds = seconds;
+        }
         if let Some(server_bind) = overrides.server_bind {
             self.server.bind = server_bind;
         }
@@ -253,9 +430,13 @@ impl ForgeConfig {
         }
         if let Some(workspace_root) = overrides.workspace_root {
             self.workspace.root = workspace_root;
+            self.workspace.root_explicit = true;
         }
         if let Some(cleanup_delay_seconds) = overrides.workspace_cleanup_delay_seconds {
             self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+        }
+        if let Some(max_disconnect_seconds) = overrides.workspace_max_disconnect_seconds {
+            self.workspace.max_disconnect_seconds = max_disconnect_seconds;
         }
         if let Some(max_concurrent_tasks) = overrides.agent_max_concurrent_tasks {
             self.agent.max_concurrent_tasks = max_concurrent_tasks;

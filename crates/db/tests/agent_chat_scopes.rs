@@ -163,7 +163,6 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
             scope_type: "agent_chat".to_owned(),
             scope_id: chat.id.clone(),
             authorization_revision: "auth-1".to_owned(),
-            runtime_session: None,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
         },
@@ -173,6 +172,7 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
     AgentLcmRepo::append_lcm_entries(
         &db,
         db::AppendAgentLcmEntries {
+            claim: None,
             timeline_id: timeline.id.clone(),
             expected_revision: 0,
             operation_id: "agent-chat-lcm-append".to_owned(),
@@ -220,23 +220,80 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
         title: "Agent Chat memory".to_owned(),
         summary: Some("Persisted in the Agent Chat scope".to_owned()),
         body: "The Agent Chat scope is durable.".to_owned(),
-        metadata_json: "{\"source_ref\":\"agent-chat-message\"}".to_owned(),
+        metadata_json: "{}".to_owned(),
         confidence: Some("confirmed".to_owned()),
         quality_score: Some(80),
         created_by_type: Some("agent".to_owned()),
         created_by_id: Some(identity.id.clone()),
         created_at: now.to_owned(),
     };
-    let (stored_memory, inserted) = ScopedMemoryRepository::insert_memory_item_if_source_absent(
-        &db,
-        &memory,
-        "agent_chat_message",
-        "agent-chat-message",
-    )
-    .await
-    .expect("Agent Chat memory creates");
+    let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+    let inserted = db
+        .insert_memory_item_if_source_absent_in_tx(
+            &mut transaction,
+            &memory,
+            "agent_chat_message",
+            "agent-chat-message",
+        )
+        .await
+        .expect("Agent Chat memory creates");
+    transaction.commit().await.unwrap();
     assert!(inserted);
-    assert_eq!(stored_memory.scope_type, "agent_chat");
+    assert_eq!(memory.scope_type, "agent_chat");
+    // The old projection can have a source receipt while its metadata no
+    // longer carries source_ref. The UNIQUE fallback must undo only the new
+    // item, preserving the caller-owned transaction and the old receipt.
+    let mut duplicate = memory.clone();
+    duplicate.id = db::new_uuid_v4();
+    duplicate.metadata_json = "{\"source_ref\":\"agent-chat-message\"}".to_owned();
+    let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+    assert!(!db
+        .insert_memory_item_if_source_absent_in_tx(
+            &mut transaction,
+            &duplicate,
+            "agent_chat_message",
+            "agent-chat-message"
+        )
+        .await
+        .unwrap());
+    transaction.commit().await.unwrap();
+    let duplicate_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_item WHERE id = ?")
+        .bind(&duplicate.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(duplicate_count, 0);
+    // An item-level INSERT failure releases its savepoint too, while the
+    // caller's earlier write remains commit-able.
+    sqlx::query("CREATE TABLE preserved_parent_write(n INTEGER)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO preserved_parent_write VALUES (1)")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let failed = db
+        .insert_memory_item_if_source_absent_in_tx(
+            &mut transaction,
+            &memory,
+            "agent_chat_message",
+            "another-source",
+        )
+        .await;
+    assert!(failed.is_err());
+    assert!(sqlx::query("RELEASE memory_source_insert")
+        .execute(&mut *transaction)
+        .await
+        .is_err());
+    transaction.commit().await.unwrap();
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preserved_parent_write")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained, 1);
+    let stored_memory = memory;
 
     let binding = ScopedMemoryRepository::create_memory_source_binding(
         &db,
@@ -685,7 +742,6 @@ async fn identity_profile_session_replacement_preserves_per_identity_chat_contin
                 scope_type: "agent_chat".to_owned(),
                 scope_id: chat.id.clone(),
                 authorization_revision: format!("auth-{index}"),
-                runtime_session: None,
                 created_at: now.to_owned(),
                 updated_at: now.to_owned(),
             },
@@ -695,6 +751,7 @@ async fn identity_profile_session_replacement_preserves_per_identity_chat_contin
         AgentLcmRepo::append_lcm_entries(
             &db,
             db::AppendAgentLcmEntries {
+                claim: None,
                 timeline_id: timeline.id.clone(),
                 expected_revision: 0,
                 operation_id: format!("continuity-operation-{index}"),

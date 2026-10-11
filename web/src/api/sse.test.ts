@@ -15,6 +15,52 @@ function createMocks() {
 }
 
 describe('routeSsePayload', () => {
+  it.each(['task.status_changed', 'task.blocked', 'task.recovered'])(
+    'refreshes slot usage for %s in the affected project',
+    (eventType) => {
+      const client = new QueryClient()
+      client.setQueryData(qk.project('proj-1'), {})
+      client.setQueryData(qk.project('proj-2'), {})
+      routeSsePayload(
+        {
+          event_type: eventType,
+          entity_id: 'task-1',
+          project_id: 'proj-1',
+          timestamp: '2026-09-30T12:00:00Z',
+        },
+        client,
+        { dispatch: vi.fn() },
+      )
+      expect(client.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.project('proj-2'))?.isInvalidated).toBe(false)
+      client.clear()
+    },
+  )
+
+  it.each(['task.awaiting_human', 'review.passed'])(
+    'refreshes slot summaries when %s omits the project id',
+    (eventType) => {
+      const client = new QueryClient()
+      client.setQueryData(qk.project('proj-1'), {})
+      client.setQueryData(qk.projectPages(20), {})
+      client.setQueryData(qk.repos('proj-1'), {})
+      routeSsePayload(
+        {
+          event_type: eventType,
+          entity_id: 'review-1',
+          task_id: 'task-1',
+          timestamp: '2026-09-30T12:00:00Z',
+        },
+        client,
+        { dispatch: vi.fn() },
+      )
+      expect(client.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.projectPages(20))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.repos('proj-1'))?.isInvalidated).toBe(false)
+      client.clear()
+    },
+  )
+
   it('does not invalidate broad queries for execution.log', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(
@@ -198,10 +244,8 @@ describe('routeSsePayload', () => {
     expect(dispatch).not.toHaveBeenCalled()
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats'], exact: true }],
         [{ queryKey: ['agent-chats', 'chat-1'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
         [{ queryKey: ['agent-handoffs', 'proj-1'] }],
       ]),
     )
@@ -331,10 +375,8 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats'], exact: true }],
         [{ queryKey: ['agent-chats', 'chat-1'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
         [{ queryKey: ['agent-handoffs', 'proj-1'] }],
       ]),
     )
@@ -453,9 +495,9 @@ describe('routeSsePayload', () => {
     expect(queryClient.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(false)
     expect(queryClient.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(false)
     expect(queryClient.getQueryState(qk.projectAgents('proj-1'))?.isInvalidated).toBe(false)
-    expect(
-      queryClient.getQueryState(['projects', 'proj-1', 'analytics'])?.isInvalidated,
-    ).toBe(false)
+    expect(queryClient.getQueryState(['projects', 'proj-1', 'analytics'])?.isInvalidated).toBe(
+      false,
+    )
     expect(queryClient.getQueryState(qk.agents)?.isInvalidated).toBe(false)
   })
 
@@ -547,10 +589,8 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats'], exact: true }],
         [{ queryKey: ['agent-chats', 'chat-1'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
         [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
@@ -629,6 +669,10 @@ function turn(overrides: Partial<AgentChatTurn> = {}): AgentChatTurn {
     response_message_id: null,
     error_code: null,
     error_message: null,
+    failure_class: null,
+    retry_decision: null,
+    pre_provider_failure_count: 0n,
+    retry_action: null,
     error: null,
     correlation_id: 'corr-1',
     version: 1n,
@@ -773,7 +817,8 @@ describe('useSSE', () => {
   // Bounded fallback for a chat turn's completion frame that never arrives
   // — dropped connection, or delivery throttled while the tab was
   // backgrounded. Correctness cannot depend on the frame showing up.
-  it('actively refetches a stale pending turn in a hidden tab', () => {
+  it('pauses the stale-turn watchdog while hidden and checks immediately on becoming visible', () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-05-05T00:00:10.000Z'))
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
@@ -788,11 +833,17 @@ describe('useSSE', () => {
         turn({ status: 'leased', created_at: '2026-05-05T00:00:00.000Z' }),
       ])
 
-    renderHook(() => useSSE(queryClient, 'test-token'))
+    const { unmount } = renderHook(() => useSSE(queryClient, 'test-token'))
     refetchSpy.mockClear()
 
     act(() => {
-      vi.advanceTimersByTime(3_000)
+      document.dispatchEvent(new Event('visibilitychange'))
+      vi.advanceTimersByTime(15_000)
+    })
+    expect(refetchSpy).not.toHaveBeenCalled()
+    visibility.mockReturnValue('visible')
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
     })
     expect(refetchSpy.mock.calls).toEqual(
       expect.arrayContaining([
@@ -800,6 +851,10 @@ describe('useSSE', () => {
         [{ queryKey: ['agent-chats', 'chat-1', 'turns'], type: 'active' }],
       ]),
     )
+    unmount()
+    refetchSpy.mockClear()
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(refetchSpy).not.toHaveBeenCalled()
   })
 
   it('keeps refetching a cached retrying turn after optimism clears, then stops at terminal', () => {
@@ -817,7 +872,7 @@ describe('useSSE', () => {
     refetchSpy.mockClear()
 
     act(() => {
-      vi.advanceTimersByTime(3_000)
+      vi.advanceTimersByTime(15_000)
     })
     expect(refetchSpy.mock.calls).toEqual(
       expect.arrayContaining([
@@ -833,7 +888,7 @@ describe('useSSE', () => {
     )
 
     act(() => {
-      vi.advanceTimersByTime(3_000)
+      vi.advanceTimersByTime(15_000)
     })
     expect(refetchSpy).not.toHaveBeenCalled()
   })

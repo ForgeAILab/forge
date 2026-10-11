@@ -5,7 +5,7 @@ use crate::{
 };
 use std::str::FromStr;
 
-fn map_task_role_assignment_row(
+pub(super) fn map_task_role_assignment_row(
     row: SqliteRow,
 ) -> std::result::Result<TaskRoleAssignment, DbError> {
     let assignee_type = row
@@ -36,19 +36,26 @@ fn assignment_snapshot_matches(
         && current.updated_at == expected.updated_at
 }
 
-fn map_transition_log_row(row: SqliteRow) -> TransitionLog {
-    TransitionLog {
-        id: row.get(0),
+pub(super) fn map_transition_log_row(row: SqliteRow) -> Result<TransitionLog> {
+    let id: String = row.get(0);
+    let bridge = crate::decode_transition_bridge(
+        &id,
+        row.get::<Option<String>, _>("bridge_kind").as_deref(),
+        row.get::<Option<String>, _>("bridge_payload").as_deref(),
+    )?;
+    Ok(TransitionLog {
+        id,
         task_id: row.get(1),
         from_state: row.get(2),
         to_state: row.get(3),
         trigger_name: row.get(4),
         triggered_by: row.get(5),
+        bridge,
         trigger_reason: row.get(6),
         hook_results_json: row.get(7),
         rejection: row.get::<i64, _>(8) != 0,
         created_at: row.get(9),
-    }
+    })
 }
 
 fn map_workflow_sqlx_error(error: sqlx::Error) -> DbError {
@@ -64,6 +71,19 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         &self,
         input: CreateTaskRoleAssignment,
     ) -> std::result::Result<TaskRoleAssignment, DbError> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentAssign {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
         sqlx::query(
             "INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(task_id, role_name) DO UPDATE SET assignee_type = excluded.assignee_type, assignee_id = excluded.assignee_id, updated_at = excluded.updated_at",
         )
@@ -74,7 +94,7 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .bind(input.assignee_id.as_deref())
         .bind(&input.created_at)
         .bind(&input.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
@@ -83,11 +103,17 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         )
         .bind(&input.task_id)
         .bind(&input.role_name)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        map_task_role_assignment_row(row)
+        let assignment = map_task_role_assignment_row(row)?;
+        self.record_mutation_reply_in_tx(&mut tx, &assignment)
+            .await?;
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Human)
+            .await?;
+        tx.commit().await?;
+        Ok(assignment)
     }
 
     async fn assign_if_unchanged(
@@ -95,7 +121,20 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         input: CreateTaskRoleAssignment,
         expected_previous: Option<&TaskRoleAssignment>,
     ) -> std::result::Result<TaskRoleAssignment, DbError> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentAssignIfUnchanged {
+                        input: input.clone(),
+                        expected_previous: expected_previous.cloned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let current_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
@@ -163,6 +202,12 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)?;
         let assignment = map_task_role_assignment_row(row)?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(assignment)
     }
@@ -202,29 +247,34 @@ impl TaskRoleAssignmentRepo for SqliteDb {
     }
 
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TaskRoleAssignment>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
-             FROM task_role_assignment WHERE task_id IN (",
-        );
-        let mut ids = query.separated(", ");
-        for task_id in task_ids {
-            ids.push_bind(*task_id);
-        }
-        ids.push_unseparated(") ORDER BY task_id, role_name");
-        let rows = query.build().fetch_all(&self.pool).await?;
-        rows.into_iter().map(map_task_role_assignment_row).collect()
+        let mut connection = self.pool.acquire().await?;
+        roles_for_tasks(&mut connection, task_ids).await
     }
 
     async fn remove(&self, task_id: &str, role_name: &str) -> std::result::Result<(), DbError> {
+        if !crate::task_writer::owns_task(task_id) {
+            return self
+                .run_task_mutation(
+                    task_id,
+                    crate::TaskMutation::TaskRoleAssignmentRemove {
+                        task_id: task_id.to_owned(),
+                        role_name: role_name.to_owned(),
+                    },
+                )
+                .await;
+        }
+
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
         sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?")
             .bind(task_id)
             .bind(role_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(map_workflow_sqlx_error)?;
+        crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Human).await?;
+        self.record_mutation_reply_in_tx(&mut tx, &()).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -235,7 +285,22 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         expected_task_version: i64,
         updated_at: &str,
     ) -> std::result::Result<(TaskRoleAssignment, Task), DbError> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentAssignAndClearReviewAuthority {
+                        input: input.clone(),
+                        expected_previous: expected_previous.cloned(),
+                        expected_task_version,
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let current_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
@@ -310,6 +375,12 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)
         .and_then(map_task_role_assignment_row)?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         let task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
             .fetch_one(&mut *transaction)
@@ -326,7 +397,21 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         expected_task_version: i64,
         updated_at: &str,
     ) -> std::result::Result<Task, DbError> {
+        if !crate::task_writer::owns_task(&expected_assignment.task_id) {
+            return self
+                .run_task_mutation(
+                    &expected_assignment.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentRemoveAndClearReviewAuthority {
+                        expected_assignment: expected_assignment.clone(),
+                        expected_task_version,
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let current_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
@@ -384,6 +469,12 @@ impl TaskRoleAssignmentRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
+        crate::task_condition::produce(
+            &mut transaction,
+            &expected_assignment.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         let task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&expected_assignment.task_id)
             .fetch_one(&mut *transaction)
@@ -401,8 +492,27 @@ impl TransitionLogRepo for SqliteDb {
         &self,
         input: CreateTransitionLog,
     ) -> std::result::Result<TransitionLog, DbError> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task = self
+            .get_task_in_tx(&mut transaction, &input.task_id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        // A logged-only transition (a recovery marker) carries no typed actor
+        // and so no owner authority. Production markers never consume a budget;
+        // a RetryWindowReset marker resets every kind whoever records it.
+        crate::budget::transition(
+            &mut transaction,
+            &task.id,
+            &input.from_state,
+            false,
+            &input.bridge,
+            input.rejection,
+            &input.id,
+            None,
+        )
+        .await?;
         sqlx::query(
-            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -414,19 +524,30 @@ impl TransitionLogRepo for SqliteDb {
         .bind(input.hook_results_json.as_deref())
         .bind(if input.rejection { 1_i64 } else { 0_i64 })
         .bind(&input.created_at)
-        .execute(&self.pool)
+        .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+        .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
+        .execute(&mut *transaction)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
         let row = sqlx::query(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at FROM transition_log WHERE id = ?",
+            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload FROM transition_log WHERE id = ?",
         )
         .bind(&input.id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        Ok(map_transition_log_row(row))
+        let result = map_transition_log_row(row)?;
+        // A pre-epoch Task reads its entry from unstamped receipts.
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Entry,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(result)
     }
 
     async fn insert_recovery_marker(
@@ -444,6 +565,13 @@ impl TransitionLogRepo for SqliteDb {
             to_state: current_state.to_owned(),
             trigger_name: Some(action_kind.to_owned()),
             triggered_by: triggered_by.to_owned(),
+            bridge: api_types::TransitionBridge::recovery(
+                action_kind,
+                matches!(
+                    action_kind,
+                    "restart" | "reset_to_initial" | "reset_retry_window"
+                ),
+            ),
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -457,66 +585,19 @@ impl TransitionLogRepo for SqliteDb {
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at FROM transition_log WHERE task_id = ? ORDER BY created_at, rowid",
+            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload FROM transition_log WHERE task_id = ? ORDER BY created_at, rowid",
         )
         .bind(task_id)
         .fetch_all(&self.pool)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        Ok(rows.into_iter().map(map_transition_log_row).collect())
+        rows.into_iter().map(map_transition_log_row).collect()
     }
 
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by,
-                    trigger_reason, hook_results_json, rejection, created_at
-             FROM transition_log WHERE task_id IN (",
-        );
-        let mut ids = query.separated(", ");
-        for task_id in task_ids {
-            ids.push_bind(*task_id);
-        }
-        ids.push_unseparated(") ORDER BY task_id, created_at, rowid");
-        let rows = query.build().fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(map_transition_log_row).collect())
-    }
-
-    async fn count_gate_rejections(
-        &self,
-        task_id: &str,
-        gate_state: &str,
-    ) -> std::result::Result<i64, DbError> {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM transition_log AS rejection
-             WHERE rejection.task_id = ?
-               AND rejection.from_state = ?
-               AND rejection.rejection = 1
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM transition_log AS boundary
-                   WHERE boundary.task_id = rejection.task_id
-                     AND boundary.from_state = rejection.from_state
-                     AND boundary.rejection = 0
-                     AND boundary.trigger_name IN ('reset_retry_window', 'reset_to_initial')
-                     AND (
-                         boundary.created_at > rejection.created_at
-                         OR (
-                             boundary.created_at = rejection.created_at
-                             AND boundary.rowid > rejection.rowid
-                         )
-                     )
-               )",
-        )
-        .bind(task_id)
-        .bind(gate_state)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_workflow_sqlx_error)
+        let mut connection = self.pool.acquire().await?;
+        transitions_for_tasks(&mut connection, task_ids).await
     }
 
     async fn count_to_state_since(
@@ -559,4 +640,45 @@ impl TransitionLogRepo for SqliteDb {
 
         Ok(())
     }
+}
+
+pub(super) async fn roles_for_tasks(
+    connection: &mut sqlx::SqliteConnection,
+    task_ids: &[&str],
+) -> Result<Vec<TaskRoleAssignment>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id IN (",
+    );
+    let mut ids = query.separated(", ");
+    for task_id in task_ids {
+        ids.push_bind(*task_id);
+    }
+    ids.push_unseparated(") ORDER BY task_id, role_name");
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    rows.into_iter().map(map_task_role_assignment_row).collect()
+}
+
+pub(super) async fn transitions_for_tasks(
+    connection: &mut sqlx::SqliteConnection,
+    task_ids: &[&str],
+) -> Result<Vec<TransitionLog>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by,
+                    trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload
+             FROM transition_log WHERE task_id IN (",
+    );
+    let mut ids = query.separated(", ");
+    for task_id in task_ids {
+        ids.push_bind(*task_id);
+    }
+    ids.push_unseparated(") ORDER BY task_id, created_at, rowid");
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    rows.into_iter().map(map_transition_log_row).collect()
 }

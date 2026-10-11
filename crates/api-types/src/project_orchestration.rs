@@ -2653,10 +2653,11 @@ pub struct StartAgentChatTopicRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct StartAgentChatTopicResponse {
-    pub topic: AgentChatTopicResponse,
+    pub topic: Option<AgentChatTopicResponse>,
+    pub rotation_pending: bool,
     /// The visible divider message appended to the chat timeline at the
     /// start of this topic.
-    pub divider_message_id: String,
+    pub divider_message_id: Option<String>,
 }
 
 #[cfg(test)]

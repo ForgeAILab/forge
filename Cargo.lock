@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "agent-runtime-ability",
  "agent-runtime-context",
@@ -47,7 +47,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-ability"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -59,7 +59,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-context"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -70,7 +70,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-core"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "agent-runtime-registry",
  "async-trait",
@@ -88,21 +88,23 @@ dependencies = [
 [[package]]
 name = "agent-runtime-lcm"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "agent-runtime-context",
  "agent-runtime-core",
  "agent-runtime-registry",
  "async-trait",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
 name = "agent-runtime-provider"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -118,7 +120,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-registry"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=ca6c17e#ca6c17eba89e5af39ba5a762945ea7da6f9dbbb7"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=5ee41e4#5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
 dependencies = [
  "serde",
 ]
@@ -212,7 +214,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -223,7 +225,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -239,6 +241,7 @@ dependencies = [
  "api-types",
  "async-trait",
  "axum",
+ "check-executor",
  "chrono",
  "cli-adapters",
  "config",
@@ -246,6 +249,7 @@ dependencies = [
  "events",
  "executors",
  "forge-agent-host",
+ "forge-client",
  "futures-util",
  "git",
  "hex",
@@ -260,12 +264,15 @@ dependencies = [
  "services",
  "sha2 0.11.0",
  "sqlx",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "workspace",
@@ -632,6 +639,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-executor"
+version = "0.13.12"
+dependencies = [
+ "api-types",
+ "chrono",
+ "executors",
+ "git",
+ "process-supervisor",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -993,14 +1015,19 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "db",
  "hex",
  "include_dir",
+ "operation-registry",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "workspace",
 ]
@@ -1075,7 +1102,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1168,7 +1195,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1200,13 +1227,28 @@ dependencies = [
  "api-types",
  "async-trait",
  "chrono",
+ "config",
+ "libc",
  "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
+
+[[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fancy-regex"
@@ -1295,10 +1337,12 @@ dependencies = [
  "async-trait",
  "chacha20poly1305",
  "db",
+ "executors",
  "futures-util",
  "hex",
  "jsonschema",
  "nix 0.28.0",
+ "operation-registry",
  "regex",
  "reqwest",
  "ring",
@@ -1325,8 +1369,12 @@ dependencies = [
  "config",
  "db",
  "events",
+ "executors",
+ "fs2",
  "review",
  "services",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -1341,6 +1389,9 @@ dependencies = [
  "api",
  "api-types",
  "axum",
+ "base64",
+ "check-executor",
+ "chrono",
  "clap",
  "cli-adapters",
  "config",
@@ -1351,18 +1402,25 @@ dependencies = [
  "executors",
  "futures-util",
  "git",
+ "libc",
  "portable-pty",
+ "process-supervisor",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
  "tabled",
  "tempfile",
  "time",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tokio-util",
  "tracing",
  "url",
+ "uuid",
  "which",
+ "workspace",
 ]
 
 [[package]]
@@ -1588,10 +1646,21 @@ dependencies = [
 name = "git"
 version = "0.13.12"
 dependencies = [
+ "process-supervisor",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "url",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash",
 ]
 
 [[package]]
@@ -1625,6 +1694,15 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+dependencies = [
+ "hashbrown 0.14.5",
 ]
 
 [[package]]
@@ -2207,6 +2285,7 @@ dependencies = [
  "executors",
  "forge-agent-host",
  "futures-util",
+ "operation-registry",
  "serde",
  "serde_json",
  "services",
@@ -2306,7 +2385,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2425,6 +2504,18 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "operation-registry"
+version = "0.13.12"
+dependencies = [
+ "async-trait",
+ "jsonschema",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "option-ext"
@@ -2607,6 +2698,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process-supervisor"
+version = "0.13.12"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2940,6 +3040,7 @@ version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
+ "check-executor",
  "chrono",
  "db",
  "events",
@@ -2950,6 +3051,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -2966,6 +3068,20 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+dependencies = [
+ "bitflags 2.13.2",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink 0.9.1",
+ "libsqlite3-sys",
+ "smallvec",
 ]
 
 [[package]]
@@ -2993,7 +3109,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3243,6 +3359,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bcrypt",
+ "check-executor",
  "chrono",
  "cli-adapters",
  "config",
@@ -3253,6 +3370,7 @@ dependencies = [
  "git",
  "hex",
  "jsonwebtoken",
+ "operation-registry",
  "portable-pty",
  "rand 0.8.6",
  "reqwest",
@@ -3261,6 +3379,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_yaml",
+ "services",
  "sha2 0.11.0",
  "sqlx",
  "tempfile",
@@ -3268,6 +3387,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "which",
@@ -3421,7 +3541,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3461,7 +3581,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "hashbrown 0.15.5",
- "hashlink",
+ "hashlink 0.10.0",
  "indexmap",
  "log",
  "memchr",
@@ -3646,7 +3766,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4468,7 +4588,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -32,6 +32,7 @@ async fn user_subtask_into_review_review_pass_cascade_and_hooks_succeed() {
         )
         .await
         .expect("user subtask into review with review-pass cascade completes");
+    let result = crate::test_support::drain_transition(&service, result).await;
 
     assert!(
         result.task.status == crate::workflow::default_states::MERGING
@@ -130,6 +131,7 @@ async fn system_subtask_transition_still_uses_subtask_workflow() {
             subtask.id.clone(),
             crate::workflow::default_states::REVIEW.to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: subtask.version,
                 reason: Some("system cascade attempt".to_owned()),
                 triggered_by: api_types::Actor::system(api_types::SystemComponent::General),
@@ -198,6 +200,7 @@ async fn no_agent_override_move_writes_log_and_no_executor() {
             task.id.clone(),
             "coding".to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 reason: Some(reason.to_owned()),
                 triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),
@@ -278,6 +281,7 @@ async fn override_move_out_of_active_state_cancels_running_execution() {
             task.id.clone(),
             "done".to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 reason: Some("override across missing edge".to_owned()),
                 triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),
@@ -376,6 +380,7 @@ async fn park_running_task_to_backlog() {
             task.id.clone(),
             crate::workflow::default_states::BACKLOG.to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 reason: Some("user parks running task".to_owned()),
                 triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),
@@ -460,6 +465,7 @@ async fn user_assigned_task_moves_anywhere() {
             task.id.clone(),
             crate::workflow::default_states::BACKLOG.to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 reason: Some("user parks own task".to_owned()),
                 triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),
@@ -476,6 +482,7 @@ async fn user_assigned_task_moves_anywhere() {
             parked.task.id.clone(),
             crate::workflow::default_states::REVIEW.to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: parked.task.version,
                 reason: Some("user override to review".to_owned()),
                 triggered_by: api_types::Actor::user(api_types::UserActionSource::Board),

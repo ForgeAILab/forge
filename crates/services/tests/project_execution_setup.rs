@@ -12,7 +12,7 @@ use db::{
     CreateAgentIdentity, CreateAgentProfile, CreateCommandReceipt, CreateProject, CreateRepo,
     CreateTask, DbError, Project, ProjectExecutionSetupCommandRepo, ProjectProvisioningRepo,
     ProjectRepo, RepoRepo, ScheduleProjectProvisioningRetry, SqliteDb, TaskRepo,
-    UpsertAgentConnectionHealth, WorkMode,
+    UpsertAgentConnectionHealth,
 };
 use serde_json::json;
 use services::{
@@ -128,7 +128,6 @@ async fn repo_with_local_path(db: &SqliteDb, project_id: &str, local_path: Optio
             name: "setup-repo".to_owned(),
             remote_url: Some("https://example.invalid/setup-repo".to_owned()),
             local_path: local_path.map(str::to_owned),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -191,6 +190,10 @@ async fn attach_primary_repository_wakes_parked_tasks_at_the_command_boundary() 
         .expect("repository attachment commits");
     assert_eq!(response.execution_setup_state, ExecutionSetupState::Ready);
 
+    TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)))
+        .drain(&task_id)
+        .await
+        .expect("queued repository wake settles");
     let metadata: Option<String> =
         sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ?")
             .bind(&task_id)
@@ -699,7 +702,7 @@ async fn charter_backed_implementation_task_is_claimable_without_a_baseline() {
     );
 
     attach_approved_charter(&db, &project.id).await;
-    let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let tasks = TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     let task = tasks
         .create_task(
             project.id.clone(),
@@ -1394,7 +1397,7 @@ async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
         .await
         .expect("unrelated task reloads")
         .expect("unrelated task exists");
-    let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let tasks = TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     let blocked_result = tasks
         .claim_task(
             blocked_task.id.clone(),

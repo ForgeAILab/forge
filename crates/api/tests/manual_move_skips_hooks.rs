@@ -36,9 +36,9 @@ async fn manual_transitions_without_workspace_skip_contextual_hooks() {
         StatusCode::OK,
     )
     .await;
-    let in_progress = transition(&harness.app, &task, "in_progress").await;
-    let reviewed = transition(&harness.app, &in_progress, "review").await;
-    let done = transition(&harness.app, &reviewed, "done").await;
+    let in_progress = transition(&harness, &task, "in_progress").await;
+    let reviewed = transition(&harness, &in_progress, "review").await;
+    let done = transition(&harness, &reviewed, "done").await;
     assert_eq!(done.status, "done");
 
     let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
@@ -120,6 +120,9 @@ async fn board_drag_to_active_state_does_not_defer_role_dispatch_hook() {
     .await;
     assert_eq!(response.task.status, "in_progress");
 
+    // The entry's on_enter hooks run in their own queued step; settle it so
+    // the assertions below see what the hook did rather than nothing.
+    harness.state.task_service.drain(&task.id).await.unwrap();
     let stored = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
         .await
         .expect("task loads")
@@ -138,18 +141,20 @@ async fn board_drag_to_active_state_does_not_defer_role_dispatch_hook() {
     )
     .await;
     let entries = log["items"].as_array().expect("transition items");
-    assert!(!entries.iter().any(|entry| {
-        entry["to_state"] == "in_progress"
-            && entry["triggered_by"] == "user:board_drag"
-            && entry["hook_results_json"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|hook| {
-                    hook["action"] == "dispatch_role_agent"
-                        && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred after board drag"
-                })
+    let drag_dispatch_hooks: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| {
+            entry["to_state"] == "in_progress" && entry["triggered_by"] == "user:board_drag"
+        })
+        .flat_map(|entry| entry["hook_results_json"].as_array().unwrap())
+        .filter(|hook| hook["action"] == "dispatch_role_agent")
+        .collect();
+    assert!(
+        !drag_dispatch_hooks.is_empty(),
+        "the drag's on_enter dispatch hook ran"
+    );
+    assert!(!drag_dispatch_hooks.iter().any(|hook| {
+        hook["outcome"] == "skipped" && hook["error"] == "dispatch deferred to Task dispatcher"
     }));
 }
 
@@ -181,6 +186,9 @@ async fn default_workflow_board_drag_from_todo_to_in_progress_succeeds() {
     .await;
 
     assert_eq!(response.task.status, "in_progress");
+    // Settle the entry's queued hooks step: nothing it does may route the
+    // drag into planning either.
+    harness.state.task_service.drain(&task.id).await.unwrap();
     let log: Value = empty_request(
         &harness.app,
         Method::GET,
@@ -210,8 +218,8 @@ async fn default_workflow_user_move_to_review_waits_for_human() {
         StatusCode::OK,
     )
     .await;
-    let in_progress = transition(&harness.app, &task, "in_progress").await;
-    let review = transition(&harness.app, &in_progress, "review").await;
+    let in_progress = transition(&harness, &task, "in_progress").await;
+    let review = transition(&harness, &in_progress, "review").await;
 
     assert_eq!(review.status, "review");
     assert!(review.awaiting_human);
@@ -227,7 +235,7 @@ async fn default_workflow_user_move_to_review_waits_for_human() {
         .iter()
         .any(|entry| { entry["from_state"] == "review" && entry["to_state"] == "merging" }));
 
-    let merging = transition(&harness.app, &review, "merging").await;
+    let merging = transition(&harness, &review, "merging").await;
     assert_eq!(merging.status, "merging");
     assert!(!merging.awaiting_human);
 }
@@ -292,12 +300,12 @@ async fn manual_transition_clears_executor_failure_annotation() {
         StatusCode::OK,
     )
     .await;
-    assert!(annotated_response.error_annotation.is_some());
+    assert!(annotated_response.condition.details().diagnostic.is_some());
 
-    let moved = transition(&harness.app, &annotated_response, "in_progress").await;
+    let moved = transition(&harness, &annotated_response, "in_progress").await;
     assert_eq!(moved.status, "in_progress");
     assert!(
-        moved.error_annotation.is_none(),
+        moved.condition.details().diagnostic.is_none(),
         "manual transition should clear stale executor failure annotation"
     );
 }
@@ -338,6 +346,7 @@ async fn board_drag_to_passive_state_defers_role_dispatch_hook() {
     .await;
     assert_eq!(response.task.status, "planning");
 
+    harness.state.task_service.drain(&task.id).await.unwrap();
     let stored = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
         .await
         .expect("task loads")
@@ -366,7 +375,7 @@ async fn board_drag_to_passive_state_defers_role_dispatch_hook() {
                 .any(|hook| {
                     hook["action"] == "dispatch_role_agent"
                         && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred after board drag"
+                        && hook["error"] == "dispatch deferred to Task dispatcher"
                 })
     }));
 }
@@ -429,7 +438,8 @@ fn gate_dispatch_workflow() -> Value {
     })
 }
 
-async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResponse {
+async fn transition(harness: &Harness, task: &TaskResponse, status: &str) -> TaskResponse {
+    let app = &harness.app;
     let response: TransitionTaskResponse = json_request(
         app,
         Method::POST,
@@ -439,7 +449,7 @@ async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResp
     )
     .await;
     assert_eq!(response.task.status, status);
-    response.task
+    common::drain(&harness.state, app, &task.id).await
 }
 
 fn state(name: &str, kind: &str, hooks: Value, config: Value, triggers: Value) -> Value {
@@ -469,7 +479,7 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");

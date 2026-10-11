@@ -5,13 +5,15 @@ import { qk } from '@/api/query-keys'
 import { invalidateProjectTaskDetails } from '@/api/task-detail-invalidation'
 import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
+import type { TasksResponse } from '@/types/generated'
+import type { InfiniteData } from '@tanstack/react-query'
 import type { AgentChatTurn } from '@/features/agent-chat/types'
 
 /**
  * The backend sends SSE as one canonical envelope per frame (D20): every
  * frame is a default `message` event, and the JSON payload's `event_type`
  * field is the sole routing discriminator:
- *   id: <entity_id>
+ *   id: domain-event:<sequence> (durable frames and beyond-head cursor reset only)
  *   data: JSON { event_type, entity_id, timestamp, ...context_fields }
  *
  * Context fields vary by event type and are flattened via serde(flatten).
@@ -117,17 +119,20 @@ function invalidateProjectTaskRelations(
   projectId: string,
   changedTaskId: string,
 ): void {
-  void queryClient.invalidateQueries({
-    predicate: (query) =>
-      query.queryKey[0] === 'tasks' &&
-      query.queryKey[2] === 'relations' &&
-      query.queryKey[1] !== changedTaskId &&
-      query.meta?.projectId === projectId,
-    refetchType: 'active',
-  }, { cancelRefetch: false })
+  void queryClient.invalidateQueries(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === 'tasks' &&
+        query.queryKey[2] === 'relations' &&
+        query.queryKey[1] !== changedTaskId &&
+        query.meta?.projectId === projectId,
+      refetchType: 'active',
+    },
+    { cancelRefetch: false },
+  )
 }
 
-const TASK_LIST_INVALIDATION_THROTTLE_MS = 500
+const TASK_LIST_INVALIDATION_THROTTLE_MS = 1_500
 type TaskListInvalidationState = {
   lastRunAt: number | null
   trailingTimer: ReturnType<typeof setTimeout> | null
@@ -161,6 +166,25 @@ function runProjectSummaryInvalidation(
     { cancelRefetch: false },
   )
   void queryClient.invalidateQueries({ queryKey: qk.projectPagesRoot }, { cancelRefetch: false })
+}
+
+function invalidateProjectSlotUsage(queryClient: QueryClient, projectId?: string): void {
+  if (projectId) {
+    invalidateProjectSummaries(queryClient, projectId)
+    return
+  }
+  // Review and awaiting-human events carry only the Task id. Refresh summary
+  // projections without invalidating every Project-owned detail query.
+  void queryClient.invalidateQueries(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === 'projects' &&
+        query.queryKey.length === 2 &&
+        query.queryKey[1] !== 'pages',
+    },
+    { cancelRefetch: false },
+  )
+  runProjectSummaryInvalidation(queryClient, [])
 }
 
 function invalidateProjectSummaries(queryClient: QueryClient, projectId: string): void {
@@ -215,7 +239,11 @@ function runProjectTaskListInvalidation(queryClient: QueryClient, projectId?: st
   )
 }
 
-function invalidateProjectTaskLists(queryClient: QueryClient, projectId?: string): void {
+function invalidateProjectTaskLists(
+  queryClient: QueryClient,
+  projectId?: string,
+  defer = false,
+): void {
   let state = taskListInvalidationStates.get(queryClient)
   if (!state) {
     state = {
@@ -250,6 +278,7 @@ function invalidateProjectTaskLists(queryClient: QueryClient, projectId?: string
   }
 
   const now = Date.now()
+  if (defer && !state.trailingTimer) state.lastRunAt = now
   if (state.lastRunAt === null || now - state.lastRunAt >= TASK_LIST_INVALIDATION_THROTTLE_MS) {
     if (state.trailingTimer) clearTimeout(state.trailingTimer)
     flush()
@@ -260,6 +289,143 @@ function invalidateProjectTaskLists(queryClient: QueryClient, projectId?: string
     flush,
     TASK_LIST_INVALIDATION_THROTTLE_MS - (now - state.lastRunAt),
   )
+}
+
+/** Paint delivered fields immediately; missing diagnostics and uncertain page
+ * membership converge through a deferred, throttled authoritative read. */
+function patchTaskList(payload: SsePayload, queryClient: QueryClient): boolean {
+  if (
+    !payload.project_id ||
+    !payload.new_status ||
+    !['task.status_changed', 'task.moved'].includes(payload.event_type)
+  )
+    return false
+  // Test clients that only model invalidation have no cache to patch.
+  if (!queryClient.getQueriesData) return false
+  let patched = false
+  let needsRefetch = queryClient.isFetching({ queryKey: qk.projectTasks(payload.project_id) }) !== 0
+  for (const [key, cached] of queryClient.getQueriesData<InfiniteData<TasksResponse>>({
+    queryKey: qk.projectTasks(payload.project_id),
+  })) {
+    if (!cached?.pages) continue
+    // Reject partial lists and membership filters.
+    let search: Record<string, unknown> = {}
+    try {
+      search = JSON.parse(String(key[3] ?? '{}')) as Record<string, unknown>
+    } catch {
+      needsRefetch = true
+      continue
+    }
+    if (
+      cached.pages.some((page) => page.has_more) ||
+      [
+        'status',
+        'canonical_phase',
+        'q',
+        'agent_id',
+        'assignee_id',
+        'assignee_type',
+        'priority',
+      ].some((field) => search[field])
+    ) {
+      needsRefetch = true
+    }
+    const taskId = payload.task_id ?? payload.entity_id
+    const item = cached.pages.flatMap((page) => page.items).find((task) => task.id === taskId)
+    if (!item) {
+      needsRefetch = true
+      continue
+    }
+    if (payload.event_type === 'task.moved' && typeof payload.new_board_position !== 'number')
+      return false
+    // Revision gaps can include renormalized neighbors or missed mutations.
+    if (cached.pages.some((page) => payload.board_revision !== page.board_revision + 1))
+      needsRefetch = true
+    if (item.condition.details.blocked) needsRefetch = true
+    // A status transition can also change diagnostics and retry budgets.
+    // Paint the delivered status immediately, then use the throttled fallback
+    // for fields the event does not carry. Same-status moves need no refetch
+    // only at the next revision and without an older list request in flight.
+    if (item.status !== payload.new_status) needsRefetch = true
+    if (typeof payload.task_version === 'number' && payload.task_version < item.version) continue
+    if (payload.new_status === 'cancelled' && !search.include_cancelled) {
+      needsRefetch = true
+    }
+    // A status/position sort can move a row across pages. Only a complete
+    // single page can be reordered locally without guessing page membership.
+    if (
+      cached.pages.length !== 1 ||
+      (search.sort_by &&
+        ![
+          'board_position',
+          'status',
+          'id',
+          'title',
+          'created_at',
+          'priority',
+          'task_type',
+        ].includes(String(search.sort_by)))
+    ) {
+      needsRefetch = true
+    }
+    queryClient.setQueryData<InfiniteData<TasksResponse>>(key, {
+      ...cached,
+      pages: cached.pages.map((page) => {
+        const items = page.items.map((task) =>
+          task.id === taskId
+            ? {
+                ...task,
+                status: payload.new_status!,
+                canonical_phase: task.canonical_phase,
+                ...(typeof payload.new_board_position === 'number'
+                  ? { board_position: payload.new_board_position }
+                  : {}),
+                ...(typeof payload.task_version === 'number'
+                  ? { version: payload.task_version }
+                  : {}),
+                updated_at: payload.timestamp,
+              }
+            : task,
+        )
+        const sort = String(search.sort_by ?? 'board_position')
+        const direction = search.sort_by && search.sort_order === 'desc' ? -1 : 1
+        if (
+          cached.pages.length === 1 &&
+          !page.has_more &&
+          (sort === 'board_position' || sort === 'status')
+        ) {
+          items.sort(
+            (a, b) =>
+              direction *
+                (sort === 'board_position'
+                  ? a.board_position - b.board_position
+                  : a.status.localeCompare(b.status)) ||
+              (sort === 'board_position'
+                ? direction * a.created_at.localeCompare(b.created_at)
+                : 0) ||
+              direction * a.id.localeCompare(b.id),
+          )
+        }
+        return {
+          ...page,
+          items,
+          ...(payload.board_revision === page.board_revision + 1
+            ? { board_revision: payload.board_revision }
+            : {}),
+        }
+      }),
+    })
+    patched = true
+  }
+  if (patched && needsRefetch) invalidateProjectTaskLists(queryClient, payload.project_id, true)
+  return patched
+}
+
+function invalidateChatQueries(queryClient: QueryClient, chatId: string): void {
+  // The chat prefix includes messages, turns, topics and every turn's activity.
+  void queryClient.invalidateQueries({ queryKey: ['agent-chats'], exact: true })
+  void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId] })
+  void queryClient.invalidateQueries({ queryKey: ['agent-handoffs'] })
 }
 
 function invalidateMissionControl(queryClient: QueryClient): void {
@@ -346,10 +512,10 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
   }
 
   if (scopeType === 'agent_chat' && scopeId) {
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats', scopeId] })
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats', scopeId, 'messages'] })
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats', scopeId, 'turns'] })
+    invalidateChatQueries(queryClient, scopeId)
+    if (entityType === 'agent_inquiry' && payload.domain_entity_id) {
+      void queryClient.invalidateQueries({ queryKey: qk.agentInquiry(payload.domain_entity_id) })
+    }
     invalidateAnalyticsQueries(queryClient)
     return
   }
@@ -357,6 +523,9 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
   if (scopeType === 'task' && scopeId) {
     void queryClient.invalidateQueries({ queryKey: qk.task(scopeId) })
     invalidateProjectTaskLists(queryClient)
+    if (entityType === 'task' || entityType === 'review') {
+      invalidateProjectSlotUsage(queryClient, payload.project_id)
+    }
     if (entityType === 'review') {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(scopeId) })
     }
@@ -417,7 +586,16 @@ export function routeSsePayload(
   if (eventType.startsWith('task.')) {
     const taskId = payload.task_id ?? payload.entity_id
     void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-    invalidateProjectTaskLists(queryClient, payload.project_id)
+    if (!patchTaskList(payload, queryClient))
+      invalidateProjectTaskLists(queryClient, payload.project_id)
+    if (
+      TASK_RELATION_SUMMARY_EVENTS.has(eventType) ||
+      eventType === 'task.awaiting_human' ||
+      eventType === 'task.unblocked' ||
+      eventType === 'task.recovery_applied'
+    ) {
+      invalidateProjectSlotUsage(queryClient, payload.project_id)
+    }
     if (payload.project_id && TASK_RELATION_SUMMARY_EVENTS.has(eventType)) {
       invalidateProjectTaskRelations(queryClient, payload.project_id, taskId)
     }
@@ -487,10 +665,7 @@ export function routeSsePayload(
 
   if (eventType.startsWith('agent_chat.')) {
     const chatId = payload.chat_id ?? payload.entity_id
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId] })
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId, 'messages'] })
-    void queryClient.invalidateQueries({ queryKey: ['agent-chats', chatId, 'turns'] })
+    invalidateChatQueries(queryClient, chatId)
     if (payload.project_id) {
       void queryClient.invalidateQueries({ queryKey: ['agent-handoffs', payload.project_id] })
     }
@@ -525,6 +700,7 @@ export function routeSsePayload(
   }
 
   if ((eventType.startsWith('review.') || eventType.startsWith('merge.')) && payload.task_id) {
+    invalidateProjectSlotUsage(queryClient, payload.project_id)
     void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
     if (eventType.startsWith('review.')) {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(payload.task_id) })
@@ -564,12 +740,12 @@ const TERMINAL_TURN_STATUSES = new Set(['succeeded', 'failed', 'cancelled'])
 // `PENDING_TURN_STALE_AFTER_MS`, re-read its chat's messages/turns directly.
 // Watching the authoritative cache matters after the first server read has
 // cleared the optimistic entry: a turn can still advance from `retry_wait` to
-// `failed` while the tab is hidden. This must be an explicit refetch rather
-// than an invalidation because TanStack pauses interval/background
-// invalidation refetches for hidden tabs. The bounded refetch also gives the
-// REST client a chance to refresh the access token. Polling stops when neither
-// source contains an old live turn, so steady state costs nothing extra.
-const PENDING_TURN_POLL_INTERVAL_MS = 3_000
+// `failed` while the tab is hidden. The watchdog pauses while hidden and
+// checks immediately when the document becomes visible, since global
+// refetch-on-focus is disabled. These explicit reads also give the REST client
+// a chance to refresh the access token. Polling stops when neither source
+// contains an old live turn, so steady state costs nothing extra.
+const PENDING_TURN_POLL_INTERVAL_MS = 15_000
 const PENDING_TURN_STALE_AFTER_MS = 5_000
 
 function isStaleLiveTurn(turn: AgentChatTurn, now: number): boolean {
@@ -579,6 +755,7 @@ function isStaleLiveTurn(turn: AgentChatTurn, now: number): boolean {
 }
 
 function pollStalePendingTurns(queryClient: QueryClient): void {
+  if (document.visibilityState === 'hidden') return
   const { pendingTurns } = useChatSelection.getState()
   const now = Date.now()
   const staleChatIds = new Set<string>()
@@ -725,12 +902,17 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
       () => pollStalePendingTurns(queryClient),
       PENDING_TURN_POLL_INTERVAL_MS,
     )
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') pollStalePendingTurns(queryClient)
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
     return () => {
       cancelled = true
       if (backoffTimer) clearTimeout(backoffTimer)
       if (stableConnectionTimer) clearTimeout(stableConnectionTimer)
       if (resyncTimer) clearTimeout(resyncTimer)
       clearInterval(pendingTurnWatchdog)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       source?.close()
     }
   }, [queryClient, accessToken])

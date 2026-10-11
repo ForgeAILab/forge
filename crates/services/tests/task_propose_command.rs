@@ -140,7 +140,6 @@ async fn seed_project(
             name: format!("{project_id}-repo"),
             remote_url: Some(format!("file:///tmp/{repo_id}")),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),
@@ -342,7 +341,7 @@ async fn fixture() -> Fixture {
     )
     .await;
     Fixture {
-        task_service: TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32))),
+        task_service: TaskService::new_for_test(Arc::clone(&db), Arc::new(EventBus::new(32))),
         action_service: AgentActionService::new(Arc::clone(&db)),
         db,
     }
@@ -452,6 +451,21 @@ async fn count(db: &SqliteDb, query: &str) -> i64 {
         .expect("count")
 }
 
+// V202610030200 captures the Project-hook delivery in the Task writer's
+// transaction, alongside the command's Task-created audit event.
+async fn assert_task_creation_events(db: &SqliteDb, task_id: &str) {
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM domain_event WHERE entity_type='task' AND entity_id=? ORDER BY event_type",
+    ).bind(task_id).fetch_all(db.pool()).await.expect("Task creation event bundle");
+    assert_eq!(
+        kinds,
+        vec![
+            "project_hook.task_created".to_owned(),
+            "task.created".to_owned()
+        ]
+    );
+}
+
 async fn role_ids(db: &SqliteDb, task_id: &str) -> Vec<String> {
     sqlx::query_scalar("SELECT id FROM task_role_assignment WHERE task_id = ? ORDER BY id")
         .bind(task_id)
@@ -533,7 +547,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
 
     let bundle: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
-             (SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND entity_id = ?),
+             (SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created' AND entity_id = ?),
              (SELECT COUNT(*) FROM command_receipt
               WHERE operation = 'task.propose' AND idempotency_key = ?),
              (SELECT COUNT(*) FROM agent_action_execution WHERE action_id = ?),
@@ -547,6 +561,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     .await
     .expect("atomic bundle counts");
     assert_eq!(bundle, (1, 1, 1, 1));
+    assert_task_creation_events(&fixture.db, &task_id).await;
 
     let outcome_json: String = sqlx::query_scalar(
         "SELECT outcome_json FROM command_receipt
@@ -1307,7 +1322,7 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'"
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'"
         )
         .await,
         0
@@ -1417,7 +1432,10 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
         .expect("mutate live action-backed Task");
     let restarted_fixture = Fixture {
         db: Arc::clone(&fixture.db),
-        task_service: TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32))),
+        task_service: TaskService::new_for_test(
+            Arc::clone(&fixture.db),
+            Arc::new(EventBus::new(32)),
+        ),
         action_service: fixture.action_service.clone(),
     };
     let replay = propose(
@@ -1469,11 +1487,12 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
     );
+    assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
         count(
             &fixture.db,
@@ -1674,11 +1693,12 @@ async fn direct_task_proposal_commits_one_receipt_bundle_without_action_rows() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
     );
+    assert_task_creation_events(&fixture.db, &first.task.id).await;
 
     sqlx::query("UPDATE task SET title = 'live direct title' WHERE id = ?")
         .bind(&first.task.id)
@@ -1833,7 +1853,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         0
@@ -1889,11 +1909,12 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
     );
+    assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
         count(
             &fixture.db,
@@ -1917,7 +1938,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
         .await
         .expect("mutate live direct Task");
     let restarted_task_service =
-        TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+        TaskService::new_for_test(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
     let replay = restarted_task_service
         .execute_task_proposal_direct(input)
         .await
@@ -1941,11 +1962,12 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
     );
+    assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
         count(
             &fixture.db,

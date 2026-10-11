@@ -5,8 +5,8 @@ use axum::http::{Method, StatusCode};
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateRepo,
     CreateReview, CreateTask, CreateWorkspace, CreateWorkspaceLease, ExecutionRepo,
-    ExecutionStatus, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRepo, WorkMode,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    ExecutionStatus, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRepo, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use serde_json::{json, Value};
 
@@ -88,7 +88,6 @@ async fn project_delete_removes_all_managed_workspaces_but_preserves_linked_repo
                 name: name.to_owned(),
                 remote_url: Some(path.to_string_lossy().into_owned()),
                 local_path: Some(path.to_string_lossy().into_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -249,7 +248,6 @@ async fn project_delete_preserves_a_repository_path_reused_by_another_project() 
                 name: name.to_owned(),
                 remote_url: Some(shared_path.to_string_lossy().into_owned()),
                 local_path: Some(shared_path.to_string_lossy().into_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -461,7 +459,6 @@ async fn project_delete_reports_active_lease_without_running_execution_and_force
             name: "active-lease-repository".to_owned(),
             remote_url: Some("file:///tmp/active-lease-repository".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -721,7 +718,6 @@ async fn project_delete_collects_workspace_paths_at_the_final_db_boundary() {
             name: "late-repository".to_owned(),
             remote_url: Some(repository_path.to_string_lossy().into_owned()),
             local_path: Some(repository_path.to_string_lossy().into_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -884,4 +880,205 @@ async fn force_delete_retries_provider_failure_instead_of_deleting_on_retry() {
             .expect("project remains after repeated provider failure"),
         1
     );
+}
+
+async fn queue_entry_check(
+    harness: &common::Harness,
+    project_id: &str,
+    repo_id: &str,
+    task_id: &str,
+    key: &str,
+) -> db::StoredCheckRun {
+    use api_types::{CheckDigestInput, CheckEnvironmentIdentity, CheckExecutionRevision};
+    let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id = ?")
+        .bind(task_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("task epoch");
+    let requested = db::CheckRunRepo::request_check_run(
+        &*harness.state.db,
+        db::CheckRunRequest {
+            identity: db::CheckRunIdentity {
+                project_id: project_id.to_owned(),
+                repo_id: repo_id.to_owned(),
+                commit_sha: "a".repeat(40),
+                inputs: CheckDigestInput {
+                    spec: check_executor::legacy_ci_spec(key, &Default::default(), 0, false),
+                    environment: Default::default(),
+                    environment_identity: CheckEnvironmentIdentity::Attested {
+                        input_digest: "a".repeat(64),
+                    },
+                    execution_revision: CheckExecutionRevision {
+                        number: 0,
+                        audit_ref: None,
+                    },
+                },
+            },
+            request_key: key.to_owned(),
+            task_id: Some(task_id.to_owned()),
+            status_epoch: epoch,
+            origin: db::CheckConsumerOrigin::Entry,
+            purpose: api_types::CheckPurpose::EntryCi,
+            workspace_id: None,
+            machine_id: None,
+            wall_timeout_seconds: 1800,
+        },
+    )
+    .await
+    .expect("check run request");
+    assert!(matches!(
+        requested.disposition,
+        db::CheckRequestDisposition::Scheduled
+    ));
+    db::CheckRunRepo::check_run(
+        &*harness.state.db,
+        requested
+            .consumer
+            .run_id
+            .as_deref()
+            .expect("a scheduled run"),
+    )
+    .await
+    .expect("check run read")
+    .expect("check run")
+}
+
+async fn project_exists(harness: &common::Harness, project_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project WHERE id = ?")
+        .bind(project_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("project count")
+        == 1
+}
+
+/// A server-placed review-entry check that is queued or running is in-flight
+/// work of the Project. The plain delete refuses with the same typed refusal
+/// as a running execution; the forced delete cancels a queued run at once and
+/// waits for a running one, refusing while it has not settled.
+#[tokio::test]
+async fn project_delete_counts_live_check_runs_and_force_settles_them_first() {
+    use db::{CheckRunRepo, CheckRunState};
+    let workspace = common::TestDir::new("project-delete-check-runs");
+    let harness = common::test_app(workspace.path(), "project-delete-check-runs").await;
+    // This test owns the runs: nothing else admits or settles them.
+    harness.step_worker.stop_checks().await;
+    let repo_path = common::setup_git_repo(workspace.path());
+    let (project_id, repo_id) =
+        common::create_project_and_repo(&harness.app, "Delete with checks", &repo_path).await;
+    let task: TaskResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "in review" }),
+        StatusCode::OK,
+    )
+    .await;
+    let db = harness.state.db.clone();
+    let queued = queue_entry_check(&harness, &project_id, &repo_id, &task.id, "queued").await;
+    let running = queue_entry_check(&harness, &project_id, &repo_id, &task.id, "running").await;
+    let until = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    // Another worker holds the second run: it is running somewhere.
+    let running = match db::CheckWorkerRepo::admit_check_run(
+        &*db,
+        &running,
+        "another-worker",
+        &now_rfc3339(),
+        &until,
+    )
+    .await
+    .expect("admission")
+    {
+        db::CheckAdmission::Admitted(run) => *run,
+        db::CheckAdmission::Waiting => panic!("the run was not admitted"),
+    };
+
+    let blocked = common::raw_empty_request(
+        &harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}"),
+    )
+    .await;
+    let body: Value = common::parse_response(blocked, StatusCode::CONFLICT).await;
+    assert_eq!(body["code"], "project_in_use");
+    assert_eq!(body["details"]["live_check_runs"], 2);
+    assert_eq!(body["details"]["running_executions"], 0);
+    assert!(project_exists(&harness, &project_id).await);
+    assert_eq!(
+        db.check_run(&queued.id).await.unwrap().unwrap().state,
+        CheckRunState::Queued,
+        "a refused delete touches nothing"
+    );
+
+    // Forced: the queued run is cancelled, the running one is not ours to
+    // settle and has not settled within the bound. Refused, nothing deleted,
+    // and the answer comes within five seconds (it took about 18).
+    let asked = std::time::Instant::now();
+    let forced = common::raw_empty_request(
+        &harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}?force=true"),
+    )
+    .await;
+    let body: Value = common::parse_response(forced, StatusCode::CONFLICT).await;
+    assert!(
+        asked.elapsed() <= std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(body["code"], "project_in_use");
+    assert_eq!(body["details"]["force_cancellation_incomplete"], true);
+    assert_eq!(body["details"]["cancelled"], true);
+    assert_eq!(body["details"]["unreachable_machines"], json!([]));
+    assert_eq!(body["details"]["live_check_runs"], 1);
+    assert!(project_exists(&harness, &project_id).await);
+    assert_eq!(
+        db.check_run(&queued.id).await.unwrap().unwrap().state,
+        CheckRunState::Cancelled
+    );
+    assert_eq!(
+        db.check_run(&running.id).await.unwrap().unwrap().state,
+        CheckRunState::Running
+    );
+
+    // Its worker notices that nobody waits and settles it: now it deletes.
+    let fence = |run: &db::StoredCheckRun| db::CheckRunFence {
+        run_id: run.id.clone(),
+        version: run.version,
+        lease_owner: run.lease_owner.clone(),
+        lease_generation: run.lease_generation,
+    };
+    let current = db.check_run(&running.id).await.unwrap().unwrap();
+    let cleaning = db
+        .transition_check_run(&fence(&current), CheckRunState::Cleaning, &now_rfc3339())
+        .await
+        .expect("cleaning");
+    db.finish_check_run(
+        &fence(&cleaning),
+        db::CheckResultEvidence {
+            outcome: db::CheckResultOutcome::Cancelled,
+            cleanup: db::CheckCleanup::Success,
+            commands: vec![],
+            output_truncated: false,
+            redaction_values: vec![],
+            reusable: false,
+        },
+        &now_rfc3339(),
+    )
+    .await
+    .expect("settled");
+    let forced = common::raw_empty_request(
+        &harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}?force=true"),
+    )
+    .await;
+    assert_eq!(forced.status(), StatusCode::NO_CONTENT);
+    assert!(!project_exists(&harness, &project_id).await);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE project_id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("check run count");
+    assert_eq!(left, 0);
 }

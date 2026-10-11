@@ -3,27 +3,12 @@ use super::*;
 #[async_trait]
 impl NotificationRepo for SqliteDb {
     async fn create(&self, input: CreateNotification) -> Result<Notification> {
-        sqlx::query(
-            "INSERT INTO notification (id, project_id, task_id, event_type, title, body, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.project_id)
-        .bind(input.task_id.as_deref())
-        .bind(&input.event_type)
-        .bind(&input.title)
-        .bind(input.body.as_deref())
-        .bind(if input.read { 1 } else { 0 })
-        .bind(&input.created_at)
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query("SELECT * FROM notification WHERE id = ?")
-            .bind(&input.id)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_notification)
-            .transpose()?
-            .ok_or(DbError::NotFound)
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let notification = self
+            .create_notification_in_tx(&mut transaction, &input)
+            .await?;
+        transaction.commit().await?;
+        Ok(notification)
     }
 
     async fn list(&self, query: NotificationListQuery) -> Result<Page<Notification>> {
@@ -140,5 +125,35 @@ impl NotificationRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
         Ok(())
+    }
+}
+
+impl SqliteDb {
+    pub async fn create_notification_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: &CreateNotification,
+    ) -> Result<Notification> {
+        sqlx::query(
+            "INSERT INTO notification (id, project_id, task_id, event_type, title, body, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.project_id)
+        .bind(input.task_id.as_deref())
+        .bind(&input.event_type)
+        .bind(&input.title)
+        .bind(input.body.as_deref())
+        .bind(if input.read { 1 } else { 0 })
+        .bind(&input.created_at)
+        .execute(&mut **transaction)
+        .await?;
+
+        sqlx::query("SELECT * FROM notification WHERE id = ?")
+            .bind(&input.id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .map(map_notification)
+            .transpose()?
+            .ok_or(DbError::NotFound)
     }
 }

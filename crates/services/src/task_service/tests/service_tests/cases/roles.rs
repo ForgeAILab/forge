@@ -179,7 +179,7 @@ async fn cancel_execution_invokes_task_executor_cancel() {
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     service
-        .cancel_execution(execution.id.clone(), "cancelled by test".to_owned())
+        .stop_execution(execution.id.clone(), "cancelled by test".to_owned())
         .await
         .expect("execution cancels");
 
@@ -374,6 +374,7 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
     )
     .await
     .expect("dispatch disposition records");
+    while rx.try_recv().is_ok() {}
 
     service
         .reassign_role(
@@ -453,14 +454,14 @@ async fn reassign_coder_clears_review_passed_at_on_non_running_task() {
 }
 
 #[tokio::test]
-async fn reassign_mid_exec_coder_with_reset_worktree_flag_in_event() {
+async fn reassign_mid_exec_coder_with_reset_worktree_recovers_deleted_directory() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let workspace_root = TempDir::new().expect("workspace root creates");
     let service = TaskService::new(Arc::clone(&db), event_bus)
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
@@ -474,44 +475,105 @@ async fn reassign_mid_exec_coder_with_reset_worktree_flag_in_event() {
         .expect("initial role assignment succeeds");
     let _ = next_role_reassigned_event(&mut rx).await;
     let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
+    let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    let worktree_path = std::path::PathBuf::from(workspace.embedded_worktree_path_for_backend());
+    std::fs::remove_dir_all(&worktree_path).expect("worktree directory removes");
+    run_git(repo_dir.path(), &["worktree", "prune"]);
     seed_running_coder_execution(&db, &task.id, Some(agent_a), Some(workspace_id)).await;
 
-    let result = service
+    service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_b), None),
             false,
             true,
         )
-        .await;
+        .await
+        .expect("reassignment recovers and resets the worktree");
 
-    match result {
-        Ok(_) => {
-            let event = next_role_reassigned_event(&mut rx).await;
-            match event.context {
-                EventContext::TaskRoleReassigned {
-                    reset_workspace,
-                    reset_worktree,
-                    transitioned_to_todo,
-                    triggered_cancellation,
-                    ..
-                } => {
-                    assert!(!reset_workspace);
-                    assert!(reset_worktree);
-                    assert!(transitioned_to_todo);
-                    assert!(triggered_cancellation);
-                }
-                other => panic!("unexpected event context: {other:?}"),
-            }
+    let event = next_role_reassigned_event(&mut rx).await;
+    match event.context {
+        EventContext::TaskRoleReassigned {
+            reset_workspace,
+            reset_worktree,
+            transitioned_to_todo,
+            triggered_cancellation,
+            ..
+        } => {
+            assert!(!reset_workspace);
+            assert!(reset_worktree);
+            assert!(transitioned_to_todo);
+            assert!(triggered_cancellation);
         }
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("worktree") || message.contains("workspace") =>
-        {
-            // This unit test does not build a real Forge worktree. The current reset_worktree
-            // path reaches WorkspaceManager and reports the missing workspace infrastructure.
-            assert!(message.contains("workspace"));
-        }
-        Err(error) => panic!("unexpected reassignment result: {error:?}"),
+        other => panic!("unexpected event context: {other:?}"),
     }
+    assert!(worktree_path.exists());
+    assert!(git::get_current_sha(&worktree_path).await.is_ok());
+}
+
+#[tokio::test]
+async fn reassign_subtask_with_reset_worktree_preserves_shared_root_worktree() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let mut rx = event_bus.subscribe();
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
+    service
+        .reassign_role(
+            role_assignment_input(&subtask.id, "coder", Some(agent_a.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial subtask role assignment succeeds");
+    let _ = next_role_reassigned_event(&mut rx).await;
+    let workspace_id = seed_workspace_for_task(&db, &root, &repo_id, workspace_root.path()).await;
+    let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    let worktree_path = std::path::PathBuf::from(workspace.embedded_worktree_path_for_backend());
+    let sentinel = worktree_path.join("sibling-uncommitted.txt");
+    std::fs::write(&sentinel, "shared work\n").expect("shared work writes");
+    seed_running_coder_execution(&db, &subtask.id, Some(agent_a), Some(workspace_id)).await;
+
+    service
+        .reassign_role(
+            role_assignment_input(&subtask.id, "coder", Some(agent_b), None),
+            false,
+            true,
+        )
+        .await
+        .expect("subtask reassignment skips the shared worktree reset");
+
+    let event = next_role_reassigned_event(&mut rx).await;
+    match event.context {
+        EventContext::TaskRoleReassigned {
+            reset_workspace,
+            reset_worktree,
+            transitioned_to_todo,
+            triggered_cancellation,
+            ..
+        } => {
+            assert!(!reset_workspace);
+            assert!(!reset_worktree);
+            assert!(transitioned_to_todo);
+            assert!(triggered_cancellation);
+        }
+        other => panic!("unexpected event context: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(sentinel).expect("shared work survives"),
+        "shared work\n"
+    );
 }
 
 #[tokio::test]
@@ -776,6 +838,10 @@ async fn on_agent_deleted_clears_coder_assignee_id_and_preserves_agent_type() {
         .on_agent_deleted(&agent_id)
         .await
         .expect("agent deletion sweep succeeds");
+    service
+        .drain(&task.id)
+        .await
+        .expect("queued deletion assignment sweep settles");
 
     let row = sqlx::query(
         "SELECT assignee_type, assignee_id FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'",
@@ -952,7 +1018,7 @@ async fn reassign_subtask_coder_is_independent() {
 }
 
 #[tokio::test]
-async fn reassign_parent_coder_is_rejected_for_coordination_root() {
+async fn reassign_parent_coder_changes_coordination_root_default_worker() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -970,14 +1036,34 @@ async fn reassign_parent_coder_is_rejected_for_coordination_root() {
         .expect("root coder assignment succeeds");
     seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
-    let result = service
+    let assignment = service
         .reassign_role(
-            role_assignment_input(&root.id, "coder", Some(agent_b), None),
+            role_assignment_input(&root.id, "coder", Some(agent_b.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("coordination root default worker changes");
+    assert_eq!(assignment.assignee_id.as_deref(), Some(agent_b.as_str()));
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*db, &root.id, "coder")
+            .await
+            .expect("root execution count loads"),
+        0,
+        "changing the default worker must not execute the root"
+    );
+
+    let planner_result = service
+        .reassign_role(
+            role_assignment_input(&root.id, "planner", Some(agent_b), None),
             false,
             false,
         )
         .await;
-    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
+    assert!(matches!(
+        planner_result,
+        Err(ServiceError::InvalidOperation { .. })
+    ));
 }
 
 #[tokio::test]
@@ -1048,6 +1134,7 @@ async fn reassign_same_coder_noop_preserves_review_passed_at() {
     )
     .await
     .expect("review_passed_at seeds");
+    while rx.try_recv().is_ok() {}
 
     service
         .reassign_role(

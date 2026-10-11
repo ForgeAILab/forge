@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
-    ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo,
-    TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, Execution, ExecutionRepo,
+    ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo, TaskRoleAssignment,
+    UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
-use tokio::process::Command;
 
 use crate::workflow::{
     default_states,
@@ -15,22 +14,15 @@ use crate::workflow::{
     inherited_subtask_workflow, HookContext, HookResult,
 };
 
-pub(super) async fn publish_domain_event(ctx: &HookContext, dedupe_key: &str) {
-    let service = crate::DomainEventService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus));
-    if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
-        tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
-    }
-}
-
 pub(super) async fn get_role_assignment(
     ctx: &HookContext,
     role: &str,
 ) -> Result<Option<TaskRoleAssignment>, String> {
-    match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role).await {
-        Ok(assignment) => Ok(assignment),
-        Err(DbError::NotFound) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+    let task = task(ctx).await?;
+    crate::task_hierarchy::effective_role_assignment(&ctx.db, &task, role)
+        .await
+        .map(|resolved| resolved.map(|resolved| resolved.assignment))
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {
@@ -64,11 +56,15 @@ pub(super) async fn task_execution_is_read_only(
     ctx: &HookContext,
     task: &db::Task,
 ) -> Result<bool, String> {
+    task_is_read_only(&ctx.db, task).await
+}
+
+pub(crate) async fn task_is_read_only(db: &db::SqliteDb, task: &db::Task) -> Result<bool, String> {
     let capability_class = sqlx::query_scalar::<_, Option<String>>(
         "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
     )
     .bind(&task.id)
-    .fetch_optional(ctx.db.pool())
+    .fetch_optional(db.pool())
     .await
     .map_err(|error| error.to_string())?
     .flatten();
@@ -103,6 +99,27 @@ pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {
         .map(|workspace| workspace.id)
 }
 
+pub(super) fn workspace_backend_router(
+    ctx: &HookContext,
+) -> Arc<crate::workspace_backend::WorkspaceBackendRouter> {
+    Arc::clone(&ctx.workspace_backend_router)
+}
+
+pub(super) async fn resolve_workspace_backend(
+    ctx: &HookContext,
+    workspace: &db::Workspace,
+) -> crate::Result<crate::workspace_backend::ResolvedWorkspace> {
+    Ok(
+        crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &workspace_backend_router(ctx),
+            &ctx.db,
+            workspace,
+            &ctx.workspace_root,
+        )
+        .await?,
+    )
+}
+
 pub(super) async fn cancel_subtask_with_effective_workflow(
     ctx: &HookContext,
     subtask: db::Task,
@@ -120,6 +137,12 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
     if workflow.state_kind(&subtask.status) == Some(api_types::StateKind::Terminal) {
         return Ok(());
     }
+    // The root's cancel wins over a subtask's settling plan artifact.
+    let subtask = ctx
+        .task_service
+        .abandon_plan_publication_for_cancel(subtask)
+        .await
+        .map_err(|error| error.to_string())?;
     crate::task_service::execution::ensure_plan_publication_transition_authority(&subtask, None)
         .map_err(|error| error.to_string())?;
     let target_state = workflow
@@ -156,19 +179,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
     if current_effective_workflow != workflow {
         return Err("project workflow authority changed while cancelling subtask".to_owned());
     }
-    let engine = WorkflowEngine {
-        db: Arc::clone(&ctx.db),
-        event_bus: Arc::clone(&ctx.event_bus),
-        review_runner: ctx.review_runner.clone(),
-        merge_service: ctx.merge_service.clone(),
-        cleanup_scheduler: ctx.cleanup_scheduler.clone(),
-        task_service: ctx.task_service.clone(),
-        daemon_connections: ctx.daemon_connections.clone(),
-        workspace_exec_locks: ctx.workspace_exec_locks.clone(),
-        terminal_activity: ctx.terminal_activity.clone(),
-        workspace_root: ctx.workspace_root.clone(),
-        repo_cache_locks: ctx.repo_cache_locks.clone(),
-    };
+    let engine = ctx.task_service.workflow_execution();
     engine
         .transition_with_authority(
             &subtask.id,
@@ -217,9 +228,9 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
         Ok(task) => task,
         Err(reason) => return Some(HookResult::Failed { reason }),
     };
-    let budget = match crate::task_service::config::runtime_retry_budget(
+    let budget = match db::budget::limit(
         &task,
-        crate::task_service::config::RetryBudgetKind::MergeFix,
+        db::budget::Kind::MergeFix,
         Some(&ctx.state_config),
         ctx.gate_config.as_ref(),
     ) {
@@ -230,21 +241,24 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
             });
         }
     };
-    let count = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
-            &entries,
-            default_states::MERGING,
-        ),
+    let count = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::MergeFix.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
         Err(error) => {
             return Some(HookResult::Failed {
                 reason: error.to_string(),
-            });
+            })
         }
     };
     // This runs after `merging -> merge_failed` has been logged. The current
     // merge_failed entry consumes one allowed merge-fix follow-up, so exhaustion
     // is count > budget here; budget=0 blocks on the first conflict.
-    if count > i64::from(budget) {
+    if db::budget::after_charge_exhausted(i64::from(budget), count) {
         let reason = "merge-fix follow-up failed: conflict";
         if let Err(error) = block_task(
             ctx,
@@ -277,13 +291,50 @@ pub(super) fn follow_up_trigger(ctx: &HookContext) -> &'static str {
     }
 }
 
+tokio::task_local! { static COMMENT_KEY: String; }
+
+/// Run `work` with every system comment it writes through a hook context
+/// keyed by `key` and the comment's text, so a redelivered Task step writes
+/// each comment once. A hook step keeps its own key; nothing else sets one.
+pub(crate) async fn with_comment_key<F: std::future::Future>(key: String, work: F) -> F::Output {
+    COMMENT_KEY.scope(key, work).await
+}
+
 pub(super) async fn create_system_comment(ctx: &HookContext, content: String) -> db::Result<()> {
+    let idempotency_key = crate::workflow::engine::durable::current_hook(&ctx.task_id)
+        .map(|a| format!("hook-comment:{}:{}:{}", a.step.id, a.index, content))
+        .or_else(|| {
+            COMMENT_KEY
+                .try_with(|key| format!("step-comment:{key}:{content}"))
+                .ok()
+        });
+    system_comment(
+        &ctx.db,
+        &ctx.event_bus,
+        &ctx.project_id,
+        &ctx.task_id,
+        content,
+        idempotency_key,
+    )
+    .await
+}
+
+/// A "Forge" comment on the Task, indexed and announced as every system
+/// comment is. `idempotency_key` makes a redelivered step write it once.
+pub(crate) async fn system_comment(
+    db: &Arc<db::SqliteDb>,
+    event_bus: &Arc<events::EventBus>,
+    project_id: &str,
+    task_id: &str,
+    content: String,
+    idempotency_key: Option<String>,
+) -> db::Result<()> {
     let now = now_rfc3339();
     let comment = TaskCommentRepo::create_comment(
-        &*ctx.db,
+        &**db,
         CreateTaskComment {
             id: new_uuid_v4(),
-            task_id: ctx.task_id.clone(),
+            task_id: task_id.to_owned(),
             author_type: CommentAuthorType::System,
             author_id: None,
             author_name: "Forge".to_string(),
@@ -291,25 +342,25 @@ pub(super) async fn create_system_comment(ctx: &HookContext, content: String) ->
             execution_id: None,
             role: None,
             worklog_kind: None,
-            idempotency_key: None,
+            idempotency_key,
             created_at: now.clone(),
             updated_at: now,
         },
     )
     .await?;
-    let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
+    let memory_service = crate::MemoryService::new(Arc::clone(db));
     if let Err(error) = memory_service
-        .record_task_comment(&ctx.project_id, &comment)
+        .record_task_comment(project_id, &comment)
         .await
     {
         tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
     }
-    ctx.event_bus.publish(ForgeEvent {
+    event_bus.publish(ForgeEvent {
         event_type: "comment.created".to_string(),
         entity_id: comment.id.clone(),
         timestamp: event_timestamp(),
         context: EventContext::CommentCreated {
-            task_id: ctx.task_id.clone(),
+            task_id: task_id.to_owned(),
             comment_id: comment.id,
             author_type: "system".to_string(),
             author_name: "Forge".to_string(),
@@ -400,8 +451,8 @@ pub(super) async fn block_task_with_annotation(
         "source": source,
         "execution_id": ctx.execution_id.clone(),
     });
-    let mut current = task.clone();
-    for attempt in 0..3 {
+    let current = task.clone();
+    {
         match TaskRepo::update(
             &*ctx.db,
             UpdateTask {
@@ -432,12 +483,6 @@ pub(super) async fn block_task_with_annotation(
                     execution_id = ?ctx.execution_id,
                     "task blocked"
                 );
-                break;
-            }
-            Err(DbError::VersionConflict) if attempt < 2 => {
-                current = TaskRepo::get_by_id(&*ctx.db, &task.id, false)
-                    .await?
-                    .ok_or(DbError::NotFound)?;
             }
             Err(error) => return Err(error),
         }
@@ -617,17 +662,7 @@ pub(super) async fn cancel_review_after_authority_loss(
     )
     .await
     {
-        Ok(Some(cancelled)) => {
-            publish_domain_event(
-                ctx,
-                &format!(
-                    "review-status:{}:{}:{}",
-                    cancelled.id, cancelled.status, now
-                ),
-            )
-            .await;
-        }
-        Ok(None) => {}
+        Ok(Some(_)) | Ok(None) => {}
         Err(error) => {
             tracing::warn!(
                 review_id = %review.id,
@@ -808,11 +843,7 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
         candidate_execution_id,
     )
     .await?;
-    publish_domain_event(
-        ctx,
-        &format!("review-status:{}:{}:{}", review.id, review.status, now),
-    )
-    .await;
+
     let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
     if let Err(error) = memory_service
         .record_review_result_if_final(&ctx.project_id, &review)
@@ -848,73 +879,6 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
     .await
     .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-pub(super) async fn run_ci_steps_in_worktree(
-    worktree_path: &str,
-    ci_steps: &[String],
-    env: &std::collections::BTreeMap<String, String>,
-) -> Result<(Vec<Value>, Option<usize>), String> {
-    let mut results = Vec::with_capacity(ci_steps.len());
-
-    for (index, step) in ci_steps.iter().enumerate() {
-        // `StepResultEntry` declares `started_at`/`finished_at` and the review
-        // API publishes them, so stamp each step here — this is the only place
-        // that knows when a step actually ran.
-        let started_at = now_rfc3339();
-        let output = Command::new("bash")
-            .arg("-lc")
-            .arg(step)
-            .envs(env)
-            .current_dir(worktree_path)
-            .output()
-            .await
-            .map_err(|error| error.to_string())?;
-        let finished_at = now_rfc3339();
-        let stderr = executors::environment::redact_environment_values(
-            &String::from_utf8_lossy(&output.stderr),
-            env,
-        );
-        let stdout = executors::environment::redact_environment_values(
-            &String::from_utf8_lossy(&output.stdout),
-            env,
-        );
-        let output_tail = if stdout.is_empty() {
-            stderr.clone()
-        } else if stderr.is_empty() {
-            stdout.clone()
-        } else {
-            format!("{stdout}\n{stderr}")
-        };
-        let exit_code = output.status.code().unwrap_or(1);
-        results.push(json!({
-            "index": index,
-            "command": step,
-            "exit_code": exit_code,
-            "stderr_tail": tail_bytes(&stderr, 4096),
-            "output_tail": tail_bytes(&output_tail, 4096),
-            "started_at": started_at,
-            "finished_at": finished_at,
-        }));
-
-        if exit_code != 0 {
-            return Ok((results, Some(index)));
-        }
-    }
-
-    Ok((results, None))
-}
-
-pub(super) fn tail_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-
-    let mut start = text.len().saturating_sub(max_bytes);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text[start..].to_string()
 }
 
 pub(super) fn publish_review_passed(ctx: &HookContext, review: &db::Review) {

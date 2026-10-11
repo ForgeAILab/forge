@@ -1,6 +1,138 @@
 use super::*;
 
 impl TaskService {
+    /// Fresh dispatcher retry uses the same role prompt and review-bound
+    /// admission as workflow dispatch, including the caller's guidance.
+    pub(crate) async fn dispatch_recovery_role(
+        &self,
+        task: &Task,
+        project: &db::Project,
+        workflow: &api_types::WorkflowDefinition,
+        agent_id: &str,
+        role: &str,
+        action: &api_types::TaskAction,
+    ) -> Result<Execution> {
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "dispatch_recovery_role",
+                    serde_json::json!([task, project, workflow, agent_id, role, action]),
+                    false,
+                )
+                .await;
+        }
+
+        if role == crate::workflow::default_roles::REVIEWER {
+            self.ensure_review_attempt_for_recovery(task, project)
+                .await?;
+        }
+        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .ok_or_else(|| ServiceError::invalid_operation("retry state no longer exists"))?;
+        let dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
+        let selection = effective_prompt_selection(role, None, dispatch.as_ref());
+        let context =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role,
+                state_name: &task.status,
+                state_config: state.config.clone(),
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
+        let mut admission = crate::task_service::execution_admission_for_task(
+            &self.db,
+            task,
+            &project.workflow_definition,
+            role,
+            Some(&agent),
+            project.version,
+        )
+        .await?;
+        if role == crate::workflow::default_roles::REVIEWER {
+            let review = context
+                .prior_reviews
+                .iter()
+                .max_by_key(|review| (review.attempt_number, &review.id))
+                .ok_or_else(|| ServiceError::invalid_operation("review retry has no candidate"))?;
+            admission.expected_reviewer_parent_execution_id = Some(review.execution_id.clone());
+            admission.expected_latest_review_candidate_execution_id =
+                Some(review.execution_id.clone());
+            admission.expected_reviewer_id = Some(review.id.clone());
+            admission.expected_reviewer_attempt_number = Some(review.attempt_number);
+            admission.expected_reviewer_status = Some(review.status.to_string());
+            admission.expected_reviewer_updated_at = Some(review.updated_at.clone());
+            admission.expected_reviewer_execution_id = review.reviewer_execution_id.clone();
+            admission.expected_auditor_execution_id = review.auditor_execution_id.clone();
+        }
+        let prompt = self
+            .task_action_role_prompt(task, workflow, role, action)
+            .await?;
+        self.dispatch_initial_role_execution_with_metadata_and_admission(
+            &task.id, agent_id, role, prompt, None, admission,
+        )
+        .await
+    }
+
+    pub(crate) async fn task_action_role_prompt(
+        &self,
+        task: &Task,
+        workflow: &api_types::WorkflowDefinition,
+        role: &str,
+        action: &api_types::TaskAction,
+    ) -> Result<String> {
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .ok_or_else(|| ServiceError::invalid_operation("retry state no longer exists"))?;
+        let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
+        let trigger_dispatch = if matches!(action, api_types::TaskAction::SendBack { .. }) {
+            workflow.states.iter().find_map(|from| {
+                workflow
+                    .trigger_definition_between(&from.name, &task.status)
+                    .filter(|(trigger, _)| *trigger == api_types::WorkflowTrigger::Reject)
+                    .and_then(|(_, definition)| {
+                        dispatch_intent_from_workflow_dispatch(definition.dispatch.as_ref())
+                    })
+            })
+        } else {
+            None
+        };
+        let selection =
+            effective_prompt_selection(role, trigger_dispatch.as_ref(), state_dispatch.as_ref());
+        let context =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role,
+                state_name: &task.status,
+                state_config: state.config.clone(),
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
+        let (prompt, _) =
+            build_effective_prompt(&context, trigger_dispatch.as_ref(), state_dispatch.as_ref());
+        let guidance = match action {
+            api_types::TaskAction::SendBack { guidance } => Some(guidance.as_str()),
+            api_types::TaskAction::Retry { guidance, .. } => guidance.as_deref(),
+            api_types::TaskAction::Release { reason } => reason.as_deref(),
+            _ => None,
+        };
+        Ok(prompt.execution_input(guidance))
+    }
+
     pub async fn dispatch_initial_role_execution(
         &self,
         task_id: &str,
@@ -40,6 +172,24 @@ impl TaskService {
         dispatch_metadata: Option<Value>,
         admission: db::ExecutionAdmission,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_initial_role_execution_with_metadata_and_admission",
+                    serde_json::json!([
+                        task_id,
+                        agent_id,
+                        role,
+                        prompt,
+                        dispatch_metadata,
+                        admission
+                    ]),
+                    false,
+                )
+                .await;
+        }
+
         self.dispatch_initial_role_execution_with_optional_admission(
             task_id,
             agent_id,
@@ -51,7 +201,7 @@ impl TaskService {
         .await
     }
 
-    async fn dispatch_initial_role_execution_with_optional_admission(
+    pub(crate) async fn dispatch_initial_role_execution_with_optional_admission(
         &self,
         task_id: &str,
         agent_id: &str,
@@ -60,6 +210,23 @@ impl TaskService {
         dispatch_metadata: Option<Value>,
         admission: Option<db::ExecutionAdmission>,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_initial_role_execution_with_optional_admission",
+                    serde_json::json!([
+                        task_id,
+                        agent_id,
+                        role,
+                        prompt,
+                        dispatch_metadata,
+                        admission
+                    ]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         validate_required("role", role)?;
@@ -67,6 +234,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        self.ensure_project_not_paused(&task).await?;
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
@@ -108,15 +276,11 @@ impl TaskService {
         }
         self.ensure_no_running_repository_execution(&task).await?;
         self.check_dependency_gate(&task, agent_id).await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
+        let workspace_admission = self
+            .reserve_claim_workspace(&task, Some(&agent), role)
             .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = workspace_admission.workspace.clone();
         let executor_config_snapshot_json = with_dispatch_metadata(
             build_executor_config_snapshot(&self.db, &task, &agent, None).await?,
             dispatch_metadata,
@@ -149,8 +313,9 @@ impl TaskService {
         let execution = self
             .create_running_execution_with_admission(
                 create_input,
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await?;
 
@@ -185,14 +350,26 @@ impl TaskService {
         summary: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
-        let task_id = task_id.into();
-        let agent_id = agent_id.into();
+        let task_id: String = task_id.into();
+        let agent_id: String = agent_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "launch_execution",
+                    serde_json::json!([task_id, agent_id, summary, overrides]),
+                    false,
+                )
+                .await;
+        }
+
         validate_required("task_id", &task_id)?;
         validate_required("agent_id", &agent_id)?;
 
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        self.ensure_project_not_paused(&task).await?;
         if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
             return Err(ServiceError::invalid_operation(
                 "root tasks with subtasks are coordination containers; launch a subtask instead",
@@ -243,15 +420,15 @@ impl TaskService {
             project.version,
         )
         .await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
+        let workspace_admission = self
+            .reserve_claim_workspace(
                 &task,
-                &task_id,
-                self.repo_cache_locks.clone(),
+                Some(&agent),
+                crate::workflow::default_roles::INTERACTIVE,
             )
             .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = workspace_admission.workspace.clone();
         self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(&agent_id), None)
             .await?;
         let executor_config_snapshot_json =
@@ -283,8 +460,9 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await?;
 
@@ -321,6 +499,20 @@ impl TaskService {
         agent_id: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
+        let parent = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.clone()))?;
+        if !db::task_writer::owns_task(&parent.task_id) {
+            return self
+                .request_task_command(
+                    &parent.task_id,
+                    "follow_up_execution",
+                    serde_json::json!([parent_execution_id, message, agent_id, overrides]),
+                    false,
+                )
+                .await;
+        }
         self.follow_up_execution_with_role(parent_execution_id, message, agent_id, overrides, None)
             .await
     }
@@ -335,6 +527,22 @@ impl TaskService {
         agent_id: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "follow_up_interactive_execution",
+                    serde_json::json!([parent_execution_id, message, agent_id, overrides]),
+                    false,
+                )
+                .await;
+        }
+
         self.follow_up_execution_with_role(
             parent_execution_id,
             message,
@@ -353,7 +561,7 @@ impl TaskService {
         overrides: Option<ExecutionOverrides>,
         requested_role: Option<&str>,
     ) -> Result<LaunchExecutionResult> {
-        let parent_execution_id = parent_execution_id.into();
+        let parent_execution_id: String = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
 
         let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
@@ -378,6 +586,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
+        self.ensure_project_not_paused(&task).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -517,15 +726,11 @@ impl TaskService {
         } else {
             parent_execution_id.clone()
         };
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
+        let workspace_admission = self
+            .reserve_claim_workspace(&task, Some(&agent), &follow_up_role)
             .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = workspace_admission.workspace.clone();
         let mut executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
         if let (Some(snapshot_json), Some(parent_snapshot_json)) = (
@@ -545,6 +750,26 @@ impl TaskService {
             );
         }
 
+        // A workflow resume exposes the admitted session identity immediately,
+        // as the recovery handler did. Candidate switching still clears it.
+        let resumed_session_id = (follow_up_role != crate::workflow::default_roles::INTERACTIVE)
+            .then(|| {
+                executor_config_snapshot_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|snapshot| {
+                        snapshot
+                            .get("config")
+                            .and_then(|config| {
+                                config
+                                    .get("resume_session_id")
+                                    .or_else(|| config.get("resume_thread_id"))
+                            })
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            })
+            .flatten();
         let now = now_rfc3339();
         let execution = self
             .create_running_execution_with_admission(
@@ -559,7 +784,7 @@ impl TaskService {
                     resume_policy: None,
                     stopped_at: None,
                     parent_execution_id: Some(durable_parent_execution_id.clone()),
-                    agent_session_id: None,
+                    agent_session_id: resumed_session_id,
                     agent_message_id: None,
                     last_activity_at: None,
                     summary: Some(message),
@@ -572,8 +797,9 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await?;
 
@@ -608,6 +834,7 @@ impl TaskService {
         &self,
         parent_execution_id: impl Into<String>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
         self.re_execute_execution_with_context(parent_execution_id, None)
             .await
     }
@@ -617,16 +844,23 @@ impl TaskService {
         parent_execution_id: impl Into<String>,
         context: Option<String>,
     ) -> Result<LaunchExecutionResult> {
-        self.re_execute_execution_with_context_inner(parent_execution_id, context, false)
-            .await
-    }
+        let parent_execution_id: String = parent_execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "re_execute_execution_with_context",
+                    serde_json::json!([parent_execution_id, context]),
+                    false,
+                )
+                .await;
+        }
 
-    pub(super) async fn re_execute_execution_for_recovery(
-        &self,
-        parent_execution_id: impl Into<String>,
-        context: Option<String>,
-    ) -> Result<LaunchExecutionResult> {
-        self.re_execute_execution_with_context_inner(parent_execution_id, context, true)
+        Box::pin(self.re_execute_execution_with_context_inner(parent_execution_id, context, false))
             .await
     }
 
@@ -636,7 +870,7 @@ impl TaskService {
         context: Option<String>,
         clear_recovery_metadata: bool,
     ) -> Result<LaunchExecutionResult> {
-        let parent_execution_id = parent_execution_id.into();
+        let parent_execution_id: String = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
 
         let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
@@ -655,6 +889,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
+        self.ensure_project_not_paused(&task).await?;
         // The role assignment owns the execution principal: the INSERT
         // transaction compares the launched Agent against that row. Carrying
         // the parent execution's Agent over made re-execute fail as a bare
@@ -800,30 +1035,29 @@ impl TaskService {
                 return Err(error);
             }
         };
-        let (workspace, workspace_created_by_attempt) =
-            match super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
-            .await
-            {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    if let Some(original) = original_recovery_task.as_ref() {
-                        self.restore_recovery_metadata_after_failed_resume(
-                            &task,
-                            original,
-                            None,
-                            &parent_execution.role,
-                        )
-                        .await;
-                    }
-                    return Err(error);
+        let workspace_admission = match async {
+            let admission = self
+                .reserve_claim_workspace(&task, Some(&agent), &parent_execution.role)
+                .await?;
+            self.prepare_claim_workspace(admission).await
+        }
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(original) = original_recovery_task.as_ref() {
+                    self.restore_recovery_metadata_after_failed_resume(
+                        &task,
+                        original,
+                        None,
+                        &parent_execution.role,
+                    )
+                    .await;
                 }
-            };
+                return Err(error);
+            }
+        };
+        let workspace = workspace_admission.workspace.clone();
         let executor_config_snapshot_json =
             match build_executor_config_snapshot(&self.db, &task, &agent, None).await {
                 Ok(snapshot) => snapshot,
@@ -852,13 +1086,16 @@ impl TaskService {
             dispatch_intent_from_workflow_dispatch(state.and_then(|state| state.dispatch.as_ref()));
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
         let dispatch_ctx = match load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &task.status,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            &workflow,
+            crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role: role_name,
+                state_name: &task.status,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow: &workflow,
+            },
         )
         .await
         {
@@ -946,8 +1183,9 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await
         {
@@ -1003,11 +1241,27 @@ impl TaskService {
         })
     }
 
-    pub async fn cancel_execution(
+    pub async fn stop_execution(
         &self,
         execution_id: impl Into<String>,
         reason: String,
     ) -> Result<Execution> {
+        let execution_id: String = execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "stop_execution",
+                    serde_json::json!([execution_id, reason]),
+                    false,
+                )
+                .await;
+        }
+
         self.stop_execution_with_actor(
             execution_id,
             reason,
@@ -1023,6 +1277,22 @@ impl TaskService {
         execution_id: impl Into<String>,
         reason: String,
     ) -> Result<Execution> {
+        let execution_id: String = execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "pause_execution",
+                    serde_json::json!([execution_id, reason]),
+                    false,
+                )
+                .await;
+        }
+
         self.stop_execution_with_actor(
             execution_id,
             reason,
@@ -1041,7 +1311,7 @@ impl TaskService {
         blocking_reason: &str,
         annotation_message: &str,
     ) -> Result<Execution> {
-        let execution_id = execution_id.into();
+        let execution_id: String = execution_id.into();
         let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
@@ -1106,20 +1376,6 @@ impl TaskService {
             }
             return Ok(current);
         }
-        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ];
-        if self
-            .resume_session_recovery_available(&task, &execution)
-            .await?
-        {
-            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ManualStop,
             blocking_reason: blocking_reason.to_owned(),
@@ -1133,7 +1389,6 @@ impl TaskService {
             }),
             message: Some(annotation_message.to_owned()),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1204,9 +1459,9 @@ impl TaskService {
         let Some(role) = role else {
             return Ok(None);
         };
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+        crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
             .await
-            .map_err(Into::into)
+            .map(|resolved| resolved.map(|resolved| resolved.assignment))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1222,10 +1477,30 @@ impl TaskService {
         annotation: String,
         initial_updated_at: String,
     ) -> Result<()> {
+        if !db::task_writer::owns_task(&initial_task.id) {
+            return self
+                .request_task_command(
+                    &initial_task.id,
+                    "persist_manual_stop_annotation",
+                    serde_json::json!([
+                        execution,
+                        initial_task,
+                        expected_status,
+                        expected_state_entry_token,
+                        expected_role,
+                        expected_workflow_definition,
+                        expected_assignment,
+                        annotation,
+                        initial_updated_at
+                    ]),
+                    false,
+                )
+                .await;
+        }
         let initial_error_annotation = initial_task.error_annotation.clone();
-        let mut candidate = initial_task.clone();
-        let mut updated_at = initial_updated_at;
-        for _ in 0..4 {
+        let candidate = initial_task.clone();
+        let updated_at = initial_updated_at;
+        {
             if candidate.status != expected_status {
                 tracing::debug!(
                     task_id = %candidate.id,
@@ -1301,27 +1576,19 @@ impl TaskService {
             )
             .await
             {
-                Ok(_) => return Ok(()),
-                Err(db::DbError::ExecutionAlreadyRunning { .. }) => return Ok(()),
-                Err(db::DbError::VersionConflict) => {
-                    candidate = TaskRepo::get_by_id(&*self.db, &candidate.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", candidate.id.clone()))?;
-                    updated_at = now_rfc3339();
-                }
-                Err(error) => return Err(ServiceError::Db(error)),
+                Ok(_) => Ok(()),
+                Err(db::DbError::ExecutionAlreadyRunning { .. }) => Ok(()),
+                Err(error) => Err(ServiceError::Db(error)),
             }
         }
-        Err(ServiceError::Db(db::DbError::VersionConflict))
     }
 }
 
 fn stop_execution_role_matches(execution_role: &str, current_role: Option<&str>) -> bool {
-    // Interactive executions are deliberately outside the workflow role
-    // contract, but still belong to the current Task state. Their manual-stop
-    // annotation must survive a concurrent Task write just like a role run.
+    // A side session has its own stop resource and does not interrupt the
+    // workflow, whether or not a workflow execution currently runs beside it.
     if execution_role == crate::workflow::default_roles::INTERACTIVE {
-        return current_role.is_some();
+        return false;
     }
     current_role.is_some_and(|role| {
         execution_role == role

@@ -1384,6 +1384,25 @@ async fn charter_draft_receipt_trigger_rolls_back_everything_and_retry_succeeds(
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM domain_event", None).await,
+        2,
+        "the Charter event and its chat projection both commit"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM domain_event WHERE event_type = ?",
+            Some("project_charter.revision_created"),
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM domain_event WHERE event_type = ?",
+            Some("agent_chat.message.appended"),
+        )
+        .await,
         1
     );
     assert_eq!(

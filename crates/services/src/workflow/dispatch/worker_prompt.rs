@@ -174,8 +174,14 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
         Some(api_types::FailureKind::DirtyWorktree)
     ) {
         user.push_str("Integration found unfinished or uncommitted changes in the Task worktree. Preserve the existing work, finish only the intended implementation, run validation, and complete delivery according to the execution harness contract. Do not rebase or discard changes.\n");
-    } else if last_merge_failed_reason(ctx)
-        .is_some_and(|reason| reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER))
+    } else if ctx
+        .transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == default_states::MERGE_FAILED)
+        .is_some_and(|entry| {
+            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
+        })
     {
         user.push_str("Forge rebased this Task's branch onto the latest target and committed the merge conflicts with their Git conflict markers left in place. There is no rebase in progress: reconcile the conflicts by editing files, then commit the reconciled files with an ordinary `git commit` as you would any delivery. Never rebase, merge, or rewrite history — Forge owns the branch.\n\nFor every file listed below, keep the intent of BOTH sides — the target's change and this Task's change — and remove every `<<<<<<<`, `=======`, `>>>>>>>`, and diff3 `|||||||` section. Conflicts in shared registration points (export lists, package or workspace member lists, command indexes, README sections) almost always mean keeping both entries. Where a lockfile conflicted, regenerate it with the project's tool (for example `uv lock` or `pnpm install --lockfile-only`) instead of hand-merging it. Do not rewrite or redesign the feature. Then run the relevant checks, commit, and complete delivery; uncommitted edits are not delivered. Forge refuses to integrate a handed-off file that still adds conflict markers.\n\nForge will run the project's checks on the reconciled commit and integrate it, so keep your change limited to reconciling the files listed above, and run the relevant checks yourself before you commit.\n");
     } else {
@@ -194,9 +200,11 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
-    let annotation = ctx.task.error_annotation.as_deref()?;
-    let value = serde_json::from_str::<serde_json::Value>(annotation).ok()?;
-    serde_json::from_value(value.get("type")?.clone()).ok()
+    ctx.task
+        .condition
+        .read()
+        .diagnostic
+        .map(|a| a.annotation_type)
 }
 
 fn append_task_context(ctx: &AgentDispatchContext, user: &mut String) {

@@ -32,6 +32,8 @@ import {
   deleteProviderPricing,
   removeProviderEntry,
   renameProviderEntry,
+  resolveAttentionItem,
+  answerProjectEscalation,
   rotateAgentSession,
   setMainAgentBinding,
   setCliRuntimeAvailability,
@@ -595,6 +597,35 @@ export function useMissionControlQuery() {
     queryFn: getMissionControl,
     staleTime: 15_000,
     refetchInterval: (query) => (query.state.status === 'error' ? false : 30_000),
+  })
+}
+
+export function useResolveAttentionMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, expectedVersion }: { id: string; expectedVersion: number }) =>
+      resolveAttentionItem(id, expectedVersion),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
+    },
+  })
+}
+
+export function useAnswerEscalationMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      escalationId,
+      answer,
+    }: {
+      projectId: string
+      escalationId: string
+      answer: string
+    }) => answerProjectEscalation(projectId, escalationId, answer),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
+    },
   })
 }
 

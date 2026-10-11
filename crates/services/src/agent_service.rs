@@ -1,8 +1,7 @@
-use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
+use crate::{agent_capacity::has_execution_capacity, Result, ServiceError, TaskService};
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
-    AgentStatus, CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, PageRequest,
-    SortBy, SortOrder, SqliteDb, UpdateAgent,
+    new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentRepo, AgentStatus,
+    CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, SqliteDb, UpdateAgent,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde_json::Value;
@@ -14,6 +13,7 @@ pub enum EffectiveStatus {
     Deactivated,
     DaemonOffline,
     DaemonUnavailable,
+    DaemonUpgradeRequired,
     ConnectionDegraded,
     ConnectionUnavailable,
     SourceDisabled,
@@ -29,6 +29,7 @@ impl EffectiveStatus {
             Self::Deactivated => "deactivated",
             Self::DaemonOffline => "daemon_offline",
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::DaemonUpgradeRequired => api_types::DAEMON_UPGRADE_REQUIRED,
             Self::ConnectionDegraded => "connection_degraded",
             Self::ConnectionUnavailable => "connection_unavailable",
             Self::SourceDisabled => "source_disabled",
@@ -45,8 +46,12 @@ impl fmt::Display for EffectiveStatus {
     }
 }
 
-#[tracing::instrument(skip(db, agent), fields(agent_id = %agent.id, daemon_id = ?agent.daemon_id))]
-pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<EffectiveStatus> {
+#[tracing::instrument(skip(db, agent, connections), fields(agent_id = %agent.id, daemon_id = ?agent.daemon_id))]
+pub async fn compute_effective_status(
+    db: &SqliteDb,
+    agent: &Agent,
+    connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
+) -> Result<EffectiveStatus> {
     if agent.status == AgentStatus::Error {
         return Ok(EffectiveStatus::Error);
     }
@@ -75,7 +80,7 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
             Some("degraded") => return Ok(EffectiveStatus::ConnectionDegraded),
             _ => return Ok(EffectiveStatus::ConnectionUnavailable),
         }
-        if !has_running_execution_capacity(db, agent).await? {
+        if !has_execution_capacity(db, agent).await? {
             return Ok(EffectiveStatus::Busy);
         }
         return Ok(EffectiveStatus::Active);
@@ -85,6 +90,12 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         let Some(daemon) = DaemonRepo::get_by_id(db, daemon_id).await? else {
             return Ok(EffectiveStatus::DaemonOffline);
         };
+        if connections
+            .and_then(|registry| registry.get(daemon_id))
+            .is_some_and(|connection| connection.needs_upgrade())
+        {
+            return Ok(EffectiveStatus::DaemonUpgradeRequired);
+        }
         if daemon.status == DaemonStatus::Offline {
             return Ok(EffectiveStatus::DaemonOffline);
         }
@@ -111,11 +122,226 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         }
     }
 
-    if !has_running_execution_capacity(db, agent).await? {
+    if !has_execution_capacity(db, agent).await? {
         return Ok(EffectiveStatus::Busy);
     }
 
     Ok(EffectiveStatus::Active)
+}
+
+/// Collection counterpart of `compute_effective_status`. Running counts come
+/// from the usage index; source health, policies and live reservations are
+/// loaded in three statements for the whole page.
+pub async fn compute_effective_status_for_agents(
+    db: &SqliteDb,
+    agents: &[Agent],
+    running: &std::collections::HashMap<String, i64>,
+    connections: &crate::daemon_transport::DaemonConnectionRegistry,
+) -> Result<std::collections::HashMap<String, EffectiveStatus>> {
+    use sqlx::Row;
+    use std::collections::HashMap;
+
+    if agents.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let requested = serde_json::to_string(
+        &agents
+            .iter()
+            .map(|agent| {
+                serde_json::json!({
+                    "id": agent.id, "profile": agent.profile_id,
+                    "credential": agent.credential_ref
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let rows = sqlx::query(
+        "WITH requested AS (
+            SELECT json_extract(value,'$.id') AS id,
+                   json_extract(value,'$.profile') AS profile,
+                   json_extract(value,'$.credential') AS credential FROM json_each(?)
+         ), reservations AS (
+            SELECT p.agent_id, COUNT(*) AS n FROM workspace_placement p
+            WHERE p.agent_id IN (SELECT id FROM requested)
+              AND p.state IN ('reserved','preparing')
+              AND julianday(COALESCE(p.reserved_until,datetime(p.updated_at,'+10 minutes'))) > julianday('now')
+              AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.workspace_id=p.workspace_id AND e.status='running')
+            GROUP BY p.agent_id
+         )
+         SELECT requested.id, h.status AS connection_status,
+                c.status AS credential_status, c.enabled AS credential_enabled,
+                p.status AS provider_status, p.last_error_kind, p.backoff_until,
+                COALESCE(reservations.n,0) AS reservations
+         FROM requested LEFT JOIN agent_connection_health h ON h.profile_id=requested.profile
+         LEFT JOIN credential_handle c ON c.id=requested.credential
+         LEFT JOIN provider_entry_health p ON p.credential_id=requested.credential
+         LEFT JOIN reservations ON reservations.agent_id=requested.id",
+    ).bind(requested).fetch_all(db.pool()).await?;
+    let health: HashMap<String, _> = rows
+        .into_iter()
+        .map(|row| Ok((row.try_get::<String, _>("id")?, row)))
+        .collect::<std::result::Result<_, sqlx::Error>>()?;
+    let daemons = sqlx::query("SELECT id,status,detected_clis_json FROM daemon")
+        .fetch_all(db.pool())
+        .await?;
+    let executor_types = serde_json::to_string(
+        &agents
+            .iter()
+            .map(|agent| &agent.executor_type)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let rows = sqlx::query("SELECT owner_user_id,daemon_id,executor_type,enabled FROM cli_runtime_policy WHERE executor_type IN (SELECT value FROM json_each(?))")
+        .bind(executor_types).fetch_all(db.pool()).await?;
+    let mut policies = HashMap::new();
+    let mut global = HashMap::new();
+    for row in rows {
+        let owner: String = row.try_get("owner_user_id")?;
+        let daemon: String = row.try_get("daemon_id")?;
+        let executor: String = row.try_get("executor_type")?;
+        let enabled: bool = row.try_get("enabled")?;
+        global
+            .entry((daemon.clone(), executor.clone()))
+            .and_modify(|value| *value &= enabled)
+            .or_insert(enabled);
+        policies.insert((owner, daemon, executor), enabled);
+    }
+    let enabled = |agent: &Agent, daemon: &str| {
+        agent.owner_id.as_ref().map_or_else(
+            || {
+                global
+                    .get(&(daemon.to_owned(), agent.executor_type.clone()))
+                    .copied()
+                    .unwrap_or(true)
+            },
+            |owner| {
+                policies
+                    .get(&(
+                        owner.clone(),
+                        daemon.to_owned(),
+                        agent.executor_type.clone(),
+                    ))
+                    .copied()
+                    .unwrap_or(true)
+            },
+        )
+    };
+    let now = chrono::Utc::now();
+    agents
+        .iter()
+        .map(|agent| {
+            let row = &health[&agent.id];
+            let status = if agent.status == AgentStatus::Error {
+                EffectiveStatus::Error
+            } else if agent.paused {
+                EffectiveStatus::Paused
+            } else {
+                if agent.credential_ref.is_some() {
+                    if row
+                        .try_get::<Option<String>, _>("credential_status")?
+                        .as_deref()
+                        != Some("configured")
+                        || row.try_get::<Option<bool>, _>("credential_enabled")? != Some(true)
+                    {
+                        return Ok((agent.id.clone(), EffectiveStatus::SourceDisabled));
+                    }
+                    let auth_error = row
+                        .try_get::<Option<String>, _>("provider_status")?
+                        .as_deref()
+                        == Some("error")
+                        && row
+                            .try_get::<Option<String>, _>("last_error_kind")?
+                            .as_deref()
+                            == Some("auth");
+                    let backoff = row
+                        .try_get::<Option<String>, _>("backoff_until")?
+                        .and_then(|until| chrono::DateTime::parse_from_rfc3339(&until).ok())
+                        .is_some_and(|until| until > now);
+                    if auth_error || backoff {
+                        return Ok((agent.id.clone(), EffectiveStatus::ConnectionDegraded));
+                    }
+                }
+                if agent.backend_kind == "native" {
+                    match row
+                        .try_get::<Option<String>, _>("connection_status")?
+                        .as_deref()
+                    {
+                        Some("healthy") => {}
+                        Some("degraded") => {
+                            return Ok((agent.id.clone(), EffectiveStatus::ConnectionDegraded))
+                        }
+                        _ => return Ok((agent.id.clone(), EffectiveStatus::ConnectionUnavailable)),
+                    }
+                } else if let Some(pin) = &agent.daemon_id {
+                    let Some(daemon) = daemons
+                        .iter()
+                        .find(|row| row.get::<String, _>("id") == *pin)
+                    else {
+                        return Ok((agent.id.clone(), EffectiveStatus::DaemonOffline));
+                    };
+                    if connections
+                        .get(pin)
+                        .is_some_and(|connection| connection.needs_upgrade())
+                    {
+                        return Ok((agent.id.clone(), EffectiveStatus::DaemonUpgradeRequired));
+                    }
+                    if daemon.try_get::<String, _>("status")? == "offline" {
+                        return Ok((agent.id.clone(), EffectiveStatus::DaemonOffline));
+                    }
+                    if !parse_detected_clis(&daemon.try_get::<String, _>("detected_clis_json")?)?
+                        .iter()
+                        .any(|cli| {
+                            cli.kind == agent.executor_type
+                                && cli.availability.as_deref() == Some("authenticated")
+                        })
+                    {
+                        return Ok((agent.id.clone(), EffectiveStatus::Deactivated));
+                    }
+                    if !enabled(agent, pin) {
+                        return Ok((agent.id.clone(), EffectiveStatus::SourceDisabled));
+                    }
+                } else {
+                    let candidates = daemons
+                        .iter()
+                        .filter(|daemon| {
+                            daemon.get::<String, _>("status") == "online"
+                                && parse_detected_clis(
+                                    &daemon.get::<String, _>("detected_clis_json"),
+                                )
+                                .is_ok_and(|clis| {
+                                    clis.iter().any(|cli| {
+                                        cli.kind == agent.executor_type
+                                            && cli.availability.as_deref() == Some("authenticated")
+                                    })
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    if candidates.is_empty() {
+                        return Ok((agent.id.clone(), EffectiveStatus::DaemonUnavailable));
+                    }
+                    if !candidates
+                        .iter()
+                        .any(|daemon| enabled(agent, &daemon.get::<String, _>("id")))
+                    {
+                        return Ok((agent.id.clone(), EffectiveStatus::SourceDisabled));
+                    }
+                }
+                if running
+                    .get(&agent.id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(row.try_get::<i64, _>("reservations")?)
+                    >= agent.max_concurrent_tasks
+                {
+                    EffectiveStatus::Busy
+                } else {
+                    EffectiveStatus::Active
+                }
+            };
+            Ok((agent.id.clone(), status))
+        })
+        .collect()
 }
 
 pub async fn resolve_daemon_for_agent(db: &SqliteDb, agent: &Agent) -> Result<Daemon> {
@@ -418,85 +644,13 @@ impl AgentService {
     }
 
     #[tracing::instrument(skip(self, agent_id), fields(agent_id = tracing::field::Empty))]
-    pub async fn update_heartbeat(&self, agent_id: impl Into<String>) -> Result<()> {
-        let agent_id = agent_id.into();
-        tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
-        validate_required("agent_id", &agent_id)?;
-        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        AgentRepo::update(
-            &*self.db,
-            UpdateAgent {
-                id: agent_id,
-                expected_version: agent.version,
-                name: None,
-                description: None,
-                max_concurrent_tasks: None,
-                heartbeat_interval_seconds: None,
-                max_missed_heartbeats: None,
-                status: None,
-                last_heartbeat_at: Some(Some(now_rfc3339())),
-                model: None,
-                reasoning_effort: None,
-                permission_policy: None,
-                capabilities_json: None,
-                config_json: None,
-                daemon_id: None,
-                is_default: None,
-                paused: None,
-                prompt_template: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[tracing::instrument(
-        skip(self, capabilities_filter),
-        fields(capabilities_count = capabilities_filter.as_ref().map(Vec::len).unwrap_or_default())
-    )]
-    pub async fn list_available(
-        &self,
-        capabilities_filter: Option<Vec<String>>,
-    ) -> Result<Vec<Agent>> {
-        let page = AgentRepo::list(
-            &*self.db,
-            AgentListQuery {
-                status: Some(AgentStatus::Idle),
-                executor_type: None,
-                capabilities: capabilities_filter.unwrap_or_default(),
-                page: PageRequest {
-                    cursor: None,
-                    limit: 500,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Asc,
-                },
-            },
-        )
-        .await?;
-
-        let mut available = Vec::new();
-        for agent in page.items {
-            if has_running_execution_capacity(&self.db, &agent).await? {
-                available.push(agent);
-            }
-        }
-        Ok(available)
-    }
-
-    #[tracing::instrument(skip(self, agent_id), fields(agent_id = tracing::field::Empty))]
     pub async fn archive(&self, agent_id: impl Into<String>) -> Result<()> {
         let agent_id = agent_id.into();
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
-        let task_service = TaskService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let role_events = task_service
-            .on_agent_deleted_in_tx(&mut transaction, &agent_id)
-            .await?;
+        let role_events =
+            TaskService::on_agent_deleted_in_tx(&self.db, &mut transaction, &agent_id).await?;
         let now = now_rfc3339();
         let result = sqlx::query(
             "UPDATE agent_identity
@@ -513,7 +667,7 @@ impl AgentService {
             return Err(ServiceError::not_found("agent", agent_id));
         }
         transaction.commit().await?;
-        task_service.publish_role_sweep_events(role_events);
+        TaskService::publish_role_sweep_events(&self.event_bus, role_events);
         self.publish(ForgeEvent {
             event_type: "agent.archived".to_owned(),
             entity_id: agent_id,
@@ -569,6 +723,7 @@ mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),
@@ -601,6 +756,7 @@ mod tests {
         DaemonRepo::update_report(
             db,
             db::UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 detected_clis_json: detected_clis_json.to_owned(),
                 labels_json: None,
@@ -705,7 +861,6 @@ mod tests {
                 name: "forge".to_owned(),
                 remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -802,7 +957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_update_heartbeat_list_and_archive_agent() {
+    async fn register_update_and_archive_agent() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let service = AgentService::new(Arc::clone(&db), Arc::clone(&event_bus));
@@ -842,32 +997,10 @@ mod tests {
         assert_eq!(updated.status, AgentStatus::Busy);
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.status_changed");
 
-        service
-            .update_heartbeat(updated.id.clone())
-            .await
-            .expect("heartbeat updates");
-        let reloaded = AgentRepo::get_by_id(&*db, &updated.id)
-            .await
-            .expect("agent loads")
-            .expect("agent exists");
-        assert!(reloaded.last_heartbeat_at.is_some());
-
-        let available = service
-            .list_available(Some(vec!["rust".to_owned()]))
-            .await
-            .expect("available agents list");
-        assert!(available.is_empty());
-
         let idle = service
-            .update_status(reloaded.id.clone(), AgentStatus::Idle, reloaded.version)
+            .update_status(updated.id.clone(), AgentStatus::Idle, updated.version)
             .await
             .expect("agent returns idle");
-        let available = service
-            .list_available(Some(vec!["rust".to_owned()]))
-            .await
-            .expect("available agents list");
-        assert_eq!(available, vec![idle.clone()]);
-
         service.archive(idle.id).await.expect("agent archives");
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.status_changed");
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.archived");
@@ -904,11 +1037,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batched_effective_status_matches_scalar_sources_health_and_capacity() {
+        let db = sqlite_db().await;
+        let base = seed_effective_agent(
+            &db,
+            AgentStatus::Idle,
+            DaemonStatus::Online,
+            r#"[{"kind":"shell","availability":"authenticated"}]"#,
+            1,
+        )
+        .await;
+        let connections = crate::daemon_transport::DaemonConnectionRegistry::default();
+        let mut agents = vec![
+            base.clone(),
+            detached_agent(AgentStatus::Error),
+            detached_agent(AgentStatus::Idle),
+        ];
+        let mut paused = base.clone();
+        paused.id = new_uuid_v4();
+        paused.paused = true;
+        agents.push(paused);
+        let mut unpinned = base.clone();
+        unpinned.id = new_uuid_v4();
+        unpinned.daemon_id = None;
+        agents.push(unpinned);
+        let mut native = base.clone();
+        native.id = new_uuid_v4();
+        native.backend_kind = "native".into();
+        agents.push(native);
+        let offline =
+            seed_effective_agent(&db, AgentStatus::Idle, DaemonStatus::Offline, "[]", 1).await;
+        agents.push(offline);
+        let deactivated = seed_effective_agent(
+            &db,
+            AgentStatus::Idle,
+            DaemonStatus::Online,
+            r#"[{"kind":"shell","availability":"installed"}]"#,
+            1,
+        )
+        .await;
+        agents.push(deactivated);
+        let mut reserved = seed_effective_agent(
+            &db,
+            AgentStatus::Idle,
+            DaemonStatus::Online,
+            r#"[{"kind":"shell","availability":"authenticated"}]"#,
+            1,
+        )
+        .await;
+        seed_active_task(&db, &reserved.id).await;
+        let (task, repo): (String, String) = sqlx::query_as("SELECT e.task_id,p.primary_repo_id FROM execution e JOIN task t ON t.id=e.task_id JOIN project p ON p.id=t.project_id WHERE e.agent_id=?")
+            .bind(&reserved.id).fetch_one(db.pool()).await.unwrap();
+        sqlx::query("UPDATE execution SET status='completed' WHERE agent_id=?")
+            .bind(&reserved.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = new_uuid_v4();
+        let location = new_uuid_v4();
+        let placement = new_uuid_v4();
+        sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES (?,?,?,?,'test','ready',?,?)")
+            .bind(&workspace).bind(&task).bind(&repo).bind(root.path().to_str().unwrap()).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,created_at,updated_at) VALUES (?,?,'server',?,'primary_checkout',?,?)")
+            .bind(&location).bind(&repo).bind(root.path().to_str().unwrap()).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,agent_id,owner_kind,repo_location_id,state,selected_by,selection_reason,reserved_until,created_at,updated_at) VALUES (?,?,?,?,'server',?,'reserved','scheduler','{}','2099-01-01T00:00:00Z',?,?)")
+            .bind(&placement).bind(&workspace).bind(&task).bind(&reserved.id).bind(&location).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        let reservation_agent = reserved.id.clone();
+        agents.push(reserved.clone());
+        seed_active_task(&db, &base.id).await;
+        let owner = new_uuid_v4();
+        let credential = new_uuid_v4();
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO user(id,email,password_hash,created_at,updated_at) VALUES (?,?,'test',?,?)")
+            .bind(&owner).bind(format!("{owner}@example.test")).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO credential_handle(id,owner_user_id,provider,label,status,enabled,created_at,updated_at) VALUES (?,?,'openai','fixture','configured',1,?,?)")
+            .bind(&credential).bind(&owner).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let mut provider = base.clone();
+        provider.id = new_uuid_v4();
+        provider.credential_ref = Some(credential.clone());
+        agents.push(provider);
+        for phase in 0..5 {
+            if phase == 1 {
+                sqlx::query("UPDATE workspace_placement SET state='ready' WHERE id=?")
+                    .bind(&placement)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO agent_connection_health(profile_id,status,updated_at) VALUES (?,'healthy',?)")
+                    .bind(&base.profile_id).bind(&now).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO cli_runtime_policy(owner_user_id,daemon_id,executor_type,enabled,created_at,updated_at) VALUES (?,?,'shell',0,?,?)")
+                    .bind(&owner).bind(base.daemon_id.as_deref().unwrap()).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            } else if phase == 2 {
+                sqlx::query("UPDATE workspace_placement SET state='preparing',reserved_until='2020-01-01T00:00:00Z' WHERE id=?")
+                    .bind(&placement).execute(db.pool()).await.unwrap();
+                sqlx::query(
+                    "UPDATE agent_connection_health SET status='degraded' WHERE profile_id=?",
+                )
+                .bind(&base.profile_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+                sqlx::query("UPDATE credential_handle SET enabled=0 WHERE id=?")
+                    .bind(&credential)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            } else if phase == 3 {
+                sqlx::query("UPDATE workspace_placement SET state='reserved',reserved_until=NULL,updated_at=? WHERE id=?")
+                    .bind(now_rfc3339()).bind(&placement).execute(db.pool()).await.unwrap();
+                sqlx::query("UPDATE credential_handle SET enabled=1 WHERE id=?")
+                    .bind(&credential)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO provider_entry_health(credential_id,owner_user_id,status,consecutive_failures,last_error_kind,updated_at) VALUES (?,?,'error',1,'auth',?)")
+                    .bind(&credential).bind(&owner).bind(&now).execute(db.pool()).await.unwrap();
+            } else if phase == 4 {
+                reserved.max_concurrent_tasks = 2;
+                *agents
+                    .iter_mut()
+                    .find(|agent| agent.id == reservation_agent)
+                    .unwrap() = reserved.clone();
+                sqlx::query("INSERT INTO execution(id,task_id,agent_id,workspace_id,role,status,created_at,updated_at) VALUES (?,?,?,?,'coder','running',?,?)")
+                    .bind(new_uuid_v4()).bind(&task).bind(&reservation_agent).bind(&workspace).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+                let until = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+                sqlx::query("UPDATE provider_entry_health SET status='backoff',last_error_kind='network',backoff_until=? WHERE credential_id=?")
+                    .bind(until).bind(&credential).execute(db.pool()).await.unwrap();
+            }
+            let mut running = std::collections::HashMap::new();
+            for agent in &agents {
+                running.insert(
+                    agent.id.clone(),
+                    crate::agent_capacity::count_running_executions(&db, &agent.id)
+                        .await
+                        .unwrap(),
+                );
+            }
+            let batched = compute_effective_status_for_agents(&db, &agents, &running, &connections)
+                .await
+                .unwrap();
+            for agent in &agents {
+                assert_eq!(
+                    batched[&agent.id],
+                    compute_effective_status(&db, agent, Some(&connections))
+                        .await
+                        .unwrap(),
+                    "phase={phase} Agent={}",
+                    agent.id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn effective_status_is_error_when_agent_status_is_error() {
         let db = sqlite_db().await;
         let agent = detached_agent(AgentStatus::Error);
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -922,7 +1209,7 @@ mod tests {
         let db = sqlite_db().await;
         let agent = detached_agent(AgentStatus::Idle);
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -941,7 +1228,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -960,7 +1247,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -980,7 +1267,7 @@ mod tests {
         .await;
         seed_active_task(&db, &agent.id).await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1000,7 +1287,7 @@ mod tests {
         .await;
         agent.paused = true;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1019,7 +1306,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1065,7 +1352,7 @@ mod tests {
         .expect("CLI runtime disables");
 
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("disabled status computes"),
             EffectiveStatus::SourceDisabled
@@ -1082,7 +1369,7 @@ mod tests {
         .await
         .expect("CLI runtime reenables");
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("reenabled status computes"),
             EffectiveStatus::Active
@@ -1123,6 +1410,7 @@ mod tests {
         DaemonRepo::update_report(
             &db,
             db::UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
                     .to_owned(),
@@ -1166,7 +1454,7 @@ mod tests {
         .expect("provider Agent creates");
 
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("provider-disabled status computes"),
             EffectiveStatus::SourceDisabled

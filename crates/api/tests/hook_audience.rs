@@ -14,7 +14,7 @@ use db::{
 use events::EventBus;
 use serde_json::json;
 use services::{
-    workflow::{default_roles, default_states, engine::WorkflowEngine},
+    workflow::{default_roles, default_states},
     ServiceError,
 };
 
@@ -33,6 +33,7 @@ async fn agent_only_before_exit_guard_blocks_agents_but_not_users() {
         .expect("task exists");
 
     let agent_result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             &task_id,
             default_states::IN_PROGRESS,
@@ -41,6 +42,7 @@ async fn agent_only_before_exit_guard_blocks_agents_but_not_users() {
             &Actor::agent("coder"),
             "claim",
             false,
+            Default::default(),
         )
         .await;
 
@@ -63,6 +65,7 @@ async fn agent_only_before_exit_guard_blocks_agents_but_not_users() {
     assert_eq!(after_agent_attempt.status, default_states::TODO);
 
     let user_result = engine(db, event_bus)
+        .workflow_execution()
         .transition(
             &task_id,
             default_states::IN_PROGRESS,
@@ -71,6 +74,7 @@ async fn agent_only_before_exit_guard_blocks_agents_but_not_users() {
             &Actor::user(UserActionSource::Test),
             "manual move",
             false,
+            Default::default(),
         )
         .await
         .expect("user-triggered transition skips agent-only guard");
@@ -114,7 +118,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: Some("https://example.com/repo.git".to_owned()),
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -187,21 +190,8 @@ async fn assign_role(db: &SqliteDb, task_id: &str, role_name: &str) {
     .expect("role assignment creates");
 }
 
-fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
-    let task_service = services::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    WorkflowEngine {
-        db,
-        event_bus,
-        review_runner: None,
-        merge_service: None,
-        cleanup_scheduler: None,
-        task_service,
-        daemon_connections: None,
-        workspace_exec_locks: None,
-        terminal_activity: None,
-        workspace_root: std::path::PathBuf::new(),
-        repo_cache_locks: None,
-    }
+fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> services::TaskService {
+    services::TaskService::new_for_test(db, event_bus)
 }
 
 fn workflow_with_agent_only_upstream_guard() -> WorkflowDefinition {

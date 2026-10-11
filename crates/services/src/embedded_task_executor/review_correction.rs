@@ -11,7 +11,9 @@ use std::future::Future;
 use forge_agent_host::{AgentHostError, AgentTurnOutput};
 
 /// Follow-up turns one reviewer run may spend fixing its result block.
-pub(super) const MAX_REPORT_CORRECTIONS: usize = 2;
+#[cfg(test)]
+pub(super) const MAX_REPORT_CORRECTIONS: usize =
+    db::budget::Kind::ReportCorrection.default_limit() as usize;
 
 /// The follow-up turn's input. The model still has its review in context,
 /// so only the missing block is asked for.
@@ -20,8 +22,9 @@ pub(super) fn correction_prompt(problem: &str) -> String {
         "Forge could not read the result of your review, so nothing has been recorded yet.\n\n\
          Problem: {problem}\n\n\
          Reply with ONLY the result block for the review you just wrote, for example:\n\
-         {{\"result\": \"fail\", \"reason\": \"one sentence\"}}\n\
-         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation."
+         {{\"result\": \"fail\", \"reason\": \"one sentence\", \"fixable_by\": \"coder\", \"repeat\": false}}\n\
+         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation.\n\n{}",
+        crate::workflow::dispatch::REVIEW_FINDING_ROUTING_CONTRACT
     )
 }
 
@@ -41,10 +44,11 @@ where
     R: FnMut(String, String) -> Fut,
     Fut: Future<Output = Result<AgentTurnOutput, AgentHostError>>,
 {
-    for _ in 0..MAX_REPORT_CORRECTIONS {
-        let Some(problem) = problem_of(&output.text) else {
+    let mut budget = db::budget::Invocation::new(db::budget::Kind::ReportCorrection);
+    while let Some(problem) = problem_of(&output.text) {
+        if !budget.consume() {
             break;
-        };
+        }
         match rerun(problem, output.text.clone()).await {
             Ok(next) => output = merge_turns(output, next),
             Err(AgentHostError::RuntimeWithUsage { usage_reports, .. }) => {
@@ -142,6 +146,9 @@ mod tests {
         let prompts = prompts.into_inner();
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("Problem: cannot parse garbled"));
+        assert!(prompts[0].contains("`fixable_by` is \"coder\" (default) or \"owner\""));
+        assert!(prompts[0].contains("previous review attempt raised the same blocking finding"));
+        assert!(prompts[0].contains("Owner example:") && prompts[0].contains("Repeat example:"));
     }
 
     #[tokio::test]
@@ -173,6 +180,8 @@ mod tests {
     async fn a_failed_correction_keeps_the_report_and_its_usage() {
         let output = correct_report(turn("bad", "first"), problem_unless_valid, |_, _| async {
             Err(AgentHostError::RuntimeWithUsage {
+                failure: api_types::TurnFailure::Unclassified,
+                provider_auth_rejected: false,
                 message: "provider failed".to_owned(),
                 usage_reports: turn("", "failed-attempt").usage_reports,
             })

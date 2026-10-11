@@ -12,7 +12,7 @@ use axum::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, AttentionRepo, CreateAttentionProjection, CreateDomainEvent,
-    CreateProject, DomainEventRepo, ProjectRepo, UpsertAttentionConsumerHealth,
+    CreateProject, DomainEventRepo, ProjectRepo,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -148,24 +148,46 @@ async fn mission_control_reports_visible_attention_count_and_stale_health() {
     .await
     .expect("attention projection persists");
     let stale = "2020-01-01T00:00:00Z".to_owned();
-    AttentionRepo::upsert_attention_consumer_health(
-        &*harness.state.db,
-        UpsertAttentionConsumerHealth {
-            consumer_name: "attention_projection".to_owned(),
-            last_sequence: 12,
-            last_started_at: Some(stale.clone()),
-            last_success_at: Some(stale.clone()),
-            last_error_at: None,
-            last_error_code: None,
-            last_error_message: None,
-            lease_owner: None,
-            lease_until: None,
-            processed_events_delta: 12,
-            updated_at: stale,
-        },
-    )
-    .await
-    .expect("consumer health persists");
+    let health = db::WorkerHealth::new(
+        std::sync::Arc::clone(&harness.state.db),
+        "attention_projection",
+    );
+    let mut tx = db::begin_immediate(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .initialize_event_worker_in_tx(&mut tx, &health, &db::EventSubscription::All)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_health SET last_success_at = ?, updated_at = ? WHERE worker_name = 'attention_projection'")
+        .bind(&stale).bind(&stale).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 12 WHERE consumer_name = 'attention_projection'").execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    // Fill the ledger through the retained checkpoint: old success timestamps
+    // cannot mark a caught-up consumer stale or reduce healthy capacity.
+    while harness.state.db.domain_event_head().await.unwrap() < 12 {
+        harness
+            .state
+            .db
+            .append_event(CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "ignored".into(),
+                entity_type: "project".into(),
+                entity_id: project.id.clone(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "project".into(),
+                scope_id: project.id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".into(),
+                created_at: now_rfc3339(),
+            })
+            .await
+            .unwrap();
+    }
 
     let home: MissionControlHomeResponse = common::empty_request(
         &harness.app,
@@ -176,11 +198,11 @@ async fn mission_control_reports_visible_attention_count_and_stale_health() {
     .await;
 
     assert_eq!(home.needs_attention.len(), 1);
+    assert!(home.capacity.healthy);
     let health: AttentionConsumerHealthResponse =
         home.consumer_health.expect("consumer health is returned");
-    assert!(health.stale);
+    assert!(!health.stale);
     assert_eq!(health.last_sequence, 12);
-    assert_eq!(health.processed_events, 12);
 }
 
 #[tokio::test]
@@ -554,4 +576,94 @@ fn jwt_for(user_id: &str) -> String {
         &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
     .expect("encode test JWT")
+}
+
+#[tokio::test]
+async fn owner_lists_answers_and_resolves_project_escalations() {
+    let workspace = common::TestDir::new("mission-control-escalation-ws");
+    let harness = common::test_app(workspace.path(), "mission-control-escalation").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "Escalation project"}),
+        StatusCode::OK,
+    )
+    .await;
+    let escalations =
+        services::project_escalation::ProjectEscalationService::new(harness.state.db.clone());
+    let escalation = escalations
+        .escalate(
+            &project.id,
+            services::project_escalation::EscalationAuthority::Owner("test-user-id"),
+            api_types::ProjectEscalateRequest {
+                need: "Need the staging token".to_owned(),
+                task_ids: vec![],
+            },
+            "token",
+        )
+        .await
+        .expect("owner escalation");
+    let list: api_types::ProjectEscalationListResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/escalations?status=open", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(list.items[0].need, "Need the staging token");
+    let _: ErrorResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/escalations?status=closed", project.id),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // Anyone outside the Project cannot learn the escalation exists.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/projects/{}/escalations", project.id))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", jwt_for("outsider-id")),
+                )
+                .body(Body::empty())
+                .expect("build outsider request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // A generic Resolve of the escalation item is the owner's answer.
+    let item = harness
+        .state
+        .db
+        .get_attention(&escalation.attention_id)
+        .await
+        .expect("attention read")
+        .expect("escalation attention");
+    let _: serde_json::Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/mission-control/attention/{}/resolve", item.id),
+        json!({"expected_version": item.version}),
+        StatusCode::OK,
+    )
+    .await;
+    let answered: api_types::ProjectEscalationResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{}/escalations/{}",
+            project.id, escalation.id
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(answered.status, "answered");
+    assert_eq!(answered.answer.as_deref(), Some("Resolved by the owner."));
 }

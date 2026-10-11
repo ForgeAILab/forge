@@ -15,7 +15,7 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse, RepoResponse,
-    ReviewDecisionResponse, ReviewResponse, TaskResponse,
+    ReviewResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -113,18 +113,23 @@ async fn reviewer_rejection_clears_review_passed_at_and_next_review_runs_full_au
         "seeded task should start as already auditor-passed"
     );
 
-    let rejected: ReviewDecisionResponse = json_request(
+    let rejected: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "needs a targeted follow-up" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"needs a targeted follow-up"}}),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(rejected.review.status, api_types::ReviewStatus::Failed);
-    assert_eq!(rejected.task.status, "in_progress".to_owned());
+    let review = db::ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(review.status, db::ReviewStatus::Failed);
+    assert_eq!(rejected.status, "in_progress".to_owned());
     assert_eq!(
-        rejected.task.review_passed_at, None,
+        rejected.review_passed_at, None,
         "review rejection must clear review_passed_at"
     );
 }
@@ -273,7 +278,7 @@ async fn test_app(
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),

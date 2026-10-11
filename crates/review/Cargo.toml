@@ -8,6 +8,9 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
+check-executor = { path = "../check-executor" }
+async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 db = { path = "../db" }
@@ -22,8 +25,8 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+db = { path = "../db", features = ["test-template"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
-async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

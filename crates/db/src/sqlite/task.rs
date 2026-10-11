@@ -1,9 +1,41 @@
 use super::*;
+use crate::ProjectSlotCounts;
 use crate::{
     AssigneeKind, CreateTransitionLog, LatestExecutionMetadataClaim, RestoreQueuedRecovery,
     TaskRoleAssignment,
 };
 use std::collections::HashSet;
+
+/// Load the assignment that authorizes an execution while holding the same
+/// writer transaction that will create it. Coder rows resolve child first,
+/// then direct parent; every other role remains Task-local.
+pub(super) async fn effective_execution_assignment_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+) -> Result<Option<SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT assignment.id,
+                assignment.assignee_type,
+                assignment.assignee_id,
+                assignment.updated_at
+         FROM task
+         JOIN task_role_assignment AS assignment
+           ON assignment.role_name = ?
+          AND (assignment.task_id = task.id
+               OR (? = 'coder'
+                   AND task.parent_task_id IS NOT NULL
+                   AND assignment.task_id = task.parent_task_id))
+         WHERE task.id = ?
+         ORDER BY CASE WHEN assignment.task_id = task.id THEN 0 ELSE 1 END
+         LIMIT 1",
+    )
+    .bind(role_name)
+    .bind(role_name)
+    .bind(task_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
 
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
 where
@@ -118,6 +150,11 @@ async fn latest_execution_authority_matches_in_tx(
             {
                 return Ok(false);
             }
+        } else if assignment_role == "coder" && task.parent_task_id.is_some() {
+            // Mirrors `TaskService::execution_owns_current_role_attempt`: an
+            // inherited root default worker is admission authority, not live
+            // ownership, so a started child with no coder of its own keeps
+            // its current attempt through completion.
         } else if authority.agent_id.is_some() {
             return Ok(false);
         }
@@ -134,6 +171,7 @@ async fn set_review_passed_at_inner(
     updated_at: &str,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -143,7 +181,18 @@ async fn set_review_passed_at_inner(
     if task.deleted_at.is_some() {
         return Err(DbError::NotFound);
     }
+    let expected_version = if crate::task_writer::owns_task(&task.id) && expected_version.is_some()
+    {
+        Some(task.version)
+    } else {
+        expected_version
+    };
     if let Some(expected_version) = expected_version {
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -220,11 +269,59 @@ async fn set_review_passed_at_inner(
     Ok(updated)
 }
 
+async fn apply_task_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task: &str,
+    metadata: &mut TaskMetadata,
+    mutation: TaskMetadataMutation,
+) -> Result<bool> {
+    match mutation {
+        TaskMetadataMutation::Budget(effect) => {
+            crate::budget::apply(transaction, task, effect).await
+        }
+        TaskMetadataMutation::BudgetIfSpent {
+            key,
+            expected,
+            window_id,
+            mutations,
+        } => {
+            if !crate::budget::matches_spent(transaction, task, &key, expected, &window_id).await? {
+                return Ok(false);
+            }
+            let mut changed = false;
+            for mutation in mutations {
+                changed |=
+                    Box::pin(apply_task_mutation(transaction, task, metadata, mutation)).await?;
+            }
+            Ok(changed)
+        }
+        TaskMetadataMutation::CompareAndMutate {
+            key,
+            expected,
+            mutations,
+        } => {
+            if metadata.extra.get(&key) != Some(&expected) {
+                return Ok(false);
+            }
+            let mut changed = false;
+            for mutation in mutations {
+                changed |=
+                    Box::pin(apply_task_mutation(transaction, task, metadata, mutation)).await?;
+            }
+            Ok(changed)
+        }
+        mutation => apply_metadata_mutation(metadata, mutation),
+    }
+}
+
 fn apply_metadata_mutation(
     metadata: &mut TaskMetadata,
     mutation: TaskMetadataMutation,
 ) -> Result<bool> {
     match mutation {
+        TaskMetadataMutation::Budget(_) | TaskMetadataMutation::BudgetIfSpent { .. } => Err(
+            DbError::Check("budget effects require a Task transaction".into()),
+        ),
         TaskMetadataMutation::Set { key, value } => {
             if metadata.extra.get(&key) == Some(&value) {
                 return Ok(false);
@@ -297,8 +394,11 @@ async fn insert_recovery_marker_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     marker: &CreateTransitionLog,
 ) -> Result<()> {
+    if marker.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::RetryWindowReset) {
+        crate::budget::reset_all(transaction, &marker.task_id, &marker.id).await?;
+    }
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&marker.id)
     .bind(&marker.task_id)
@@ -310,14 +410,19 @@ async fn insert_recovery_marker_in_tx(
     .bind(marker.hook_results_json.as_deref())
     .bind(if marker.rejection { 1_i64 } else { 0_i64 })
     .bind(&marker.created_at)
+    .bind(marker.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+    .bind(marker.bridge.bridge_payload.as_ref().map(ToString::to_string))
     .execute(&mut **transaction)
     .await?;
+    // A pre-epoch Task reads its entry from unstamped receipts.
+    crate::task_condition::produce(transaction, &marker.task_id, crate::ConditionChange::Entry)
+        .await?;
     Ok(())
 }
 
 async fn update_task_inner(
     db: &SqliteDb,
-    input: UpdateTask,
+    mut input: UpdateTask,
     recovery_marker: Option<&CreateTransitionLog>,
     workflow_authority: Option<(i64, String)>,
 ) -> Result<Task> {
@@ -325,6 +430,7 @@ async fn update_task_inner(
         return Err(DbError::InvalidTransition);
     }
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(&input.id)
         .fetch_optional(&mut *transaction)
@@ -345,9 +451,13 @@ async fn update_task_inner(
         )
         .await?;
     }
+    if crate::task_writer::owns_task(&input.id) {
+        input.expected_version = task.version;
+    }
     if task.version != input.expected_version {
         return Err(DbError::VersionConflict);
     }
+    let previous_parent = task.parent_task_id.clone();
     let previous_error_annotation = task.error_annotation.clone();
     let previous_blocked_json = task.blocked_json.clone();
     let previous_failed_json = task.failed_json.clone();
@@ -434,6 +544,32 @@ async fn update_task_inner(
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
     }
+    if previous_parent != task.parent_task_id {
+        // A subtask's terminal states and both parents' child witnesses.
+        crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Entry)
+            .await?;
+        task.condition = crate::task_condition::decode_or_unknown(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        );
+        for parent in [&previous_parent, &task.parent_task_id]
+            .into_iter()
+            .flatten()
+        {
+            crate::task_condition::produce_children(&mut transaction, parent).await?;
+        }
+    } else {
+        crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
+            .await?;
+        task.condition = crate::task_condition::decode_or_unknown(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        );
+    }
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -445,6 +581,9 @@ async fn update_task_inner(
     if let Some(marker) = recovery_marker {
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
     }
+    db.record_mutation_reply_in_tx(&mut transaction, &task)
+        .await?;
+
     transaction.commit().await?;
     Ok(task)
 }
@@ -523,6 +662,12 @@ async fn set_error_annotation_if_no_running_execution_inner(
     overlapping_roles: Vec<String>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_task_lease_in_tx(
+        &mut transaction,
+        id,
+        "set_error_annotation_if_no_running_execution",
+    )
+    .await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -532,6 +677,11 @@ async fn set_error_annotation_if_no_running_execution_inner(
     if task.deleted_at.is_some() {
         return Err(DbError::InvalidSoftDelete);
     }
+    let expected_version = if crate::task_writer::owns_task(&task.id) {
+        task.version
+    } else {
+        expected_version
+    };
     if task.version != expected_version {
         return Err(DbError::VersionConflict);
     }
@@ -655,9 +805,20 @@ async fn set_error_annotation_if_no_running_execution_inner(
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
     }
+    crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
+        .await?;
+    task.condition = crate::task_condition::decode_or_unknown(
+        &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(&mut *transaction)
+            .await?,
+    );
     if previous_error_annotation != task.error_annotation {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
+    db.record_mutation_reply_in_tx(&mut transaction, &task)
+        .await?;
+
     transaction.commit().await?;
     Ok(task)
 }
@@ -675,8 +836,11 @@ async fn update_recovery_metadata_inner(
     overlapping_roles: Vec<String>,
     metadata_mutations: Vec<TaskMetadataMutation>,
     expected_queued_recovery_id: Option<&str>,
+    condition: Option<crate::ConditionStatement>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_task_lease_in_tx(&mut transaction, id, "update_recovery_metadata")
+        .await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -686,6 +850,11 @@ async fn update_recovery_metadata_inner(
     if task.deleted_at.is_some() {
         return Err(DbError::InvalidSoftDelete);
     }
+    let expected_version = if crate::task_writer::owns_task(&task.id) {
+        task.version
+    } else {
+        expected_version
+    };
     if task.version != expected_version {
         return Err(DbError::VersionConflict);
     }
@@ -697,7 +866,8 @@ async fn update_recovery_metadata_inner(
             .get("queued_recovery")
             .and_then(|queued| queued.get("id"))
             .and_then(serde_json::Value::as_str)
-            != Some(expected_id)
+            .unwrap_or_default()
+            != expected_id
         {
             return Err(DbError::VersionConflict);
         }
@@ -722,7 +892,7 @@ async fn update_recovery_metadata_inner(
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
         for mutation in metadata_mutations {
-            apply_metadata_mutation(&mut metadata, mutation)?;
+            apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         task.metadata_json = metadata.to_json();
     }
@@ -746,6 +916,27 @@ async fn update_recovery_metadata_inner(
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
     }
+    match &condition {
+        // The writer said what this write means: the condition is stated,
+        // not mapped back from the fields just written.
+        Some(statement) => {
+            crate::task_condition::state(&mut transaction, &task.id, statement).await?
+        }
+        None => {
+            crate::task_condition::produce(
+                &mut transaction,
+                &task.id,
+                crate::ConditionChange::Legacy,
+            )
+            .await?
+        }
+    }
+    task.condition = crate::task_condition::decode_or_unknown(
+        &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(&mut *transaction)
+            .await?,
+    );
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -754,15 +945,141 @@ async fn update_recovery_metadata_inner(
     ) {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
+    db.record_mutation_reply_in_tx(&mut transaction, &task)
+        .await?;
+
     transaction.commit().await?;
     Ok(task)
 }
 
 #[async_trait]
 impl TaskRepo for SqliteDb {
+    async fn count_project_slots(
+        &self,
+        project_id: &str,
+        project_states_json: &str,
+        subtask_states_json: &str,
+    ) -> Result<(i64, i64, i64)> {
+        // Every term is 0 or 1, so each CASE equals the boolean it wraps. The
+        // CASE is for evaluation order: SQLite stops a CASE condition at the
+        // first deciding operand, but as a plain result value it evaluates
+        // every operand, running the review, child and execution probes even
+        // for rows the earlier operands already decide.
+        Ok(sqlx::query_as(
+            "WITH project_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), subtask_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), visible AS MATERIALIZED (
+                SELECT t.id, t.parent_task_id,
+                       COALESCE(s.kind, p.kind) AS kind,
+                       COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
+                       CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
+                       (json_extract(t.condition_json,'$.evidence.presentation.interruption_present') = 1
+                        OR json_extract(t.condition_json,'$.evidence.presentation.hard_failure') = 1
+                        OR (json_extract(t.condition_json,'$.evidence.presentation.refusal.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running'))
+                        OR json_extract(t.condition_json,'$.evidence.presentation.environment_recorded')=1
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.slot_blocker'),0)
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.review_wait'),0))
+                       THEN 1 ELSE 0 END AS parked
+                FROM task t
+                LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
+                LEFT JOIN project_states p ON p.name = t.status
+                WHERE t.project_id = ? AND t.archived_at IS NULL AND t.deleted_at IS NULL
+                  AND COALESCE(s.kind, p.kind) IN ('initial', 'active', 'gate')
+             )
+             SELECT
+               COALESCE(SUM(CASE WHEN kind IN ('active', 'gate') AND NOT parked AND (
+                   parent_task_id IS NOT NULL
+                   OR NOT EXISTS (SELECT 1 FROM task child WHERE child.parent_task_id = visible.id AND child.deleted_at IS NULL)
+                   OR ((owns_work OR EXISTS (SELECT 1 FROM execution e WHERE e.task_id = visible.id AND e.status = 'running'))
+                       AND NOT EXISTS (SELECT 1 FROM visible child WHERE child.parent_task_id = visible.id
+                                       AND child.kind IN ('active', 'gate') AND NOT child.parked))
+               ) THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(kind IN ('active', 'gate') AND parked), 0),
+               COALESCE(SUM(kind = 'initial'), 0)
+             FROM visible",
+        )
+        .bind(project_states_json).bind(subtask_states_json).bind(project_id)
+        .fetch_one(self.pool()).await?)
+    }
+
+    async fn count_projects_slots(
+        &self,
+        project_states_json: &str,
+        subtask_states_json: &str,
+    ) -> Result<Vec<ProjectSlotCounts>> {
+        let rows = sqlx::query(
+            "WITH projects AS MATERIALIZED (
+                SELECT key AS id, value AS states FROM json_each(?)
+             ), project_states AS (
+                SELECT projects.id AS project_id, states.key AS name, json_extract(states.value, '$.kind') AS kind,
+                       json_extract(states.value, '$.owns_work') AS owns_work FROM projects, json_each(projects.states) states
+             ), subtask_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), visible AS MATERIALIZED (
+                SELECT t.id, t.project_id, t.parent_task_id,
+                       COALESCE(s.kind, p.kind) AS kind,
+                       COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
+                       CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
+                       (json_extract(t.condition_json,'$.evidence.presentation.interruption_present') = 1
+                        OR json_extract(t.condition_json,'$.evidence.presentation.hard_failure') = 1
+                        OR (json_extract(t.condition_json,'$.evidence.presentation.refusal.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running'))
+                        OR json_extract(t.condition_json,'$.evidence.presentation.environment_recorded')=1
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.slot_blocker'),0)
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.review_wait'),0))
+                       THEN 1 ELSE 0 END AS parked
+                FROM projects JOIN task t ON t.project_id = projects.id
+                LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
+                LEFT JOIN project_states p ON p.project_id = t.project_id AND p.name = t.status
+                WHERE t.archived_at IS NULL AND t.deleted_at IS NULL
+                  AND COALESCE(s.kind, p.kind) IN ('initial', 'active', 'gate')
+             )
+             SELECT project.id AS project_id, project.version AS project_version, project.list_revision,
+               COALESCE(SUM(CASE WHEN kind IN ('active', 'gate') AND NOT parked AND (
+                   parent_task_id IS NOT NULL
+                   OR NOT EXISTS (SELECT 1 FROM task child WHERE child.parent_task_id = visible.id AND child.deleted_at IS NULL)
+                   OR ((owns_work OR EXISTS (SELECT 1 FROM execution e WHERE e.task_id = visible.id AND e.status = 'running'))
+                       AND NOT EXISTS (SELECT 1 FROM visible child WHERE child.parent_task_id = visible.id
+                                       AND child.project_id = visible.project_id
+                                       AND child.kind IN ('active', 'gate') AND NOT child.parked))
+               ) THEN 1 ELSE 0 END), 0) AS active,
+               COALESCE(SUM(kind IN ('active', 'gate') AND parked), 0) AS parked,
+               COALESCE(SUM(kind = 'initial'), 0) AS queued
+             FROM projects JOIN project ON project.id = projects.id
+             LEFT JOIN visible ON visible.project_id = projects.id
+             GROUP BY project.id",
+        )
+        .bind(project_states_json)
+        .bind(subtask_states_json)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ProjectSlotCounts {
+                    project_id: row.try_get("project_id")?,
+                    project_version: row.try_get("project_version")?,
+                    list_revision: row.try_get("list_revision")?,
+                    active: row.try_get("active")?,
+                    parked: row.try_get("parked")?,
+                    queued: row.try_get("queued")?,
+                })
+            })
+            .collect()
+    }
+
     async fn create(&self, input: CreateTask) -> Result<Task> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task = TaskRepo::create_in_tx(self, &mut transaction, input).await?;
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -798,7 +1115,19 @@ impl TaskRepo for SqliteDb {
             .bind(&input.id)
             .fetch_one(&mut **transaction)
             .await?;
-        map_task(row)
+        let mut task = map_task(row)?;
+        // A new row carries the column default: state every family once.
+        crate::task_condition::produce(transaction, &task.id, crate::ConditionChange::Full).await?;
+        task.condition = crate::task_condition::decode_or_unknown(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut **transaction)
+                .await?,
+        );
+        if let Some(parent) = &task.parent_task_id {
+            crate::task_condition::produce_children(transaction, parent).await?;
+        }
+        Ok(task)
     }
 
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>> {
@@ -815,114 +1144,8 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {
-        let offset = decode_offset(&query.page.cursor)?;
-        let mut where_parts = vec!["project_id = ?"];
-        if !query.include_deleted {
-            where_parts.push("deleted_at IS NULL");
-        }
-        if !query.include_archived {
-            where_parts.push("archived_at IS NULL");
-        }
-        if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
-            where_parts.push("status != 'cancelled'");
-        }
-        if !query.statuses.is_empty() {
-            where_parts.push("status IN (__STATUSES__)");
-        }
-        if !query.agent_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
-        }
-        if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
-        }
-        if query.priority.is_some() {
-            where_parts.push("priority = ?");
-        }
-        let search_pattern = query
-            .q
-            .as_deref()
-            .map(str::trim)
-            .filter(|term| !term.is_empty())
-            .map(search_like_pattern);
-        if search_pattern.is_some() {
-            where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
-        }
-        let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
-        let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
-        let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
-        let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
-        let assignee_type_filter = if query.assignee_types.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_type IN ({assignee_type_placeholders})")
-        };
-        let assignee_id_filter = if query.assignee_ids.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_id IN ({assignee_id_placeholders})")
-        };
-        let where_sql = where_parts
-            .join(" AND ")
-            .replace("__STATUSES__", &status_placeholders)
-            .replace("__AGENTS__", &agent_placeholders)
-            .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
-            .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
-            where_sql,
-            order_clause(&query.page)
-        );
-        let mut q = sqlx::query(&sql).bind(&query.project_id);
-        for status in &query.statuses {
-            q = q.bind(status);
-        }
-        for agent_id in &query.agent_ids {
-            q = q.bind(agent_id);
-        }
-        for assignee_type in &query.assignee_types {
-            q = q.bind(assignee_type);
-        }
-        for assignee_id in &query.assignee_ids {
-            q = q.bind(assignee_id);
-        }
-        if let Some(priority) = query.priority {
-            q = q.bind(priority);
-        }
-        if let Some(search_pattern) = search_pattern.as_ref() {
-            q = q.bind(search_pattern).bind(search_pattern);
-        }
-        let rows = q
-            .bind(limit(&query.page) + 1)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
-        let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
-        let total = if query.page.include_total {
-            let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
-            let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
-            for status in &query.statuses {
-                q = q.bind(status);
-            }
-            for agent_id in &query.agent_ids {
-                q = q.bind(agent_id);
-            }
-            for assignee_type in &query.assignee_types {
-                q = q.bind(assignee_type);
-            }
-            for assignee_id in &query.assignee_ids {
-                q = q.bind(assignee_id);
-            }
-            if let Some(priority) = query.priority {
-                q = q.bind(priority);
-            }
-            if let Some(search_pattern) = search_pattern.as_ref() {
-                q = q.bind(search_pattern).bind(search_pattern);
-            }
-            Some(q.fetch_one(&self.pool).await?)
-        } else {
-            None
-        };
-        page_from_items(items, &query.page, offset, total)
+        let mut connection = self.pool.acquire().await?;
+        list_page(&mut connection, query).await
     }
 
     async fn list_by_project_with_metadata_key(
@@ -1013,6 +1236,7 @@ impl TaskRepo for SqliteDb {
         updated_at: &str,
     ) -> Result<()> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         if ordered_ids.iter().collect::<HashSet<_>>().len() != ordered_ids.len() {
             return Err(DbError::InvalidTransition);
         }
@@ -1052,12 +1276,30 @@ impl TaskRepo for SqliteDb {
                 return Err(DbError::NotFound);
             }
         }
+        // Child witnesses follow the sequence order.
+        crate::task_condition::produce_children(&mut transaction, parent_task_id).await?;
 
         transaction.commit().await?;
         Ok(())
     }
 
     async fn update(&self, input: UpdateTask) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id)
+            && (input.error_annotation.is_some()
+                || input.blocked_json.is_some()
+                || input.failed_json.is_some()
+                || input.parent_task_id.is_some())
+        {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdate {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(self, input, None, None).await
     }
 
@@ -1066,6 +1308,18 @@ impl TaskRepo for SqliteDb {
         input: UpdateTask,
         marker: CreateTransitionLog,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateWithRecoveryMarker {
+                        input: input.clone(),
+                        marker: marker.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(self, input, Some(&marker), None).await
     }
 
@@ -1075,6 +1329,19 @@ impl TaskRepo for SqliteDb {
         expected_project_version: i64,
         expected_workflow_definition: String,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateWithWorkflowAuthority {
+                        input: input.clone(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(
             self,
             input,
@@ -1091,6 +1358,20 @@ impl TaskRepo for SqliteDb {
         expected_project_version: i64,
         expected_workflow_definition: String,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateWithWorkflowAuthorityAndRecoveryMarker {
+                        input: input.clone(),
+                        marker: marker.clone(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(
             self,
             input,
@@ -1115,6 +1396,28 @@ impl TaskRepo for SqliteDb {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetErrorAnnotationIfNoRunningExecution {
+                        id: id.to_owned(),
+                        expected_version,
+                        expected_status: expected_status.to_owned(),
+                        expected_state_entry_token: expected_state_entry_token.map(str::to_owned),
+                        expected_workflow_definition: expected_workflow_definition.to_owned(),
+                        expected_assignment_role: expected_assignment_role.map(str::to_owned),
+                        expected_assignment: expected_assignment.clone(),
+                        annotation: annotation.to_owned(),
+                        updated_at: updated_at.to_owned(),
+                        stopped_execution_id: stopped_execution_id.to_owned(),
+                        workspace_id: workspace_id.map(str::to_owned),
+                        overlapping_roles: overlapping_roles.clone(),
+                    },
+                )
+                .await;
+        }
+
         set_error_annotation_if_no_running_execution_inner(
             self,
             id,
@@ -1144,7 +1447,28 @@ impl TaskRepo for SqliteDb {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
         metadata_mutations: Vec<TaskMetadataMutation>,
+        condition: Option<crate::ConditionStatement>,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskUpdateRecoveryMetadataIfNoRunningExecution {
+                        condition: condition.clone(),
+                        id: id.to_owned(),
+                        expected_version,
+                        error_annotation: error_annotation.clone(),
+                        blocked_json: blocked_json.clone(),
+                        failed_json: failed_json.clone(),
+                        updated_at: updated_at.to_owned(),
+                        workspace_id: workspace_id.map(str::to_owned),
+                        overlapping_roles: overlapping_roles.clone(),
+                        metadata_mutations: metadata_mutations.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_recovery_metadata_inner(
             self,
             id,
@@ -1157,18 +1481,30 @@ impl TaskRepo for SqliteDb {
             overlapping_roles,
             metadata_mutations,
             None,
+            condition,
         )
         .await
     }
 
     async fn restore_queued_recovery(&self, input: RestoreQueuedRecovery) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRestoreQueuedRecovery {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_recovery_metadata_inner(
             self,
             &input.task_id,
             input.expected_version,
             input.error_annotation,
             input.blocked_json,
-            None,
+            input.failed_json,
             &input.updated_at,
             None,
             Vec::new(),
@@ -1181,6 +1517,7 @@ impl TaskRepo for SqliteDb {
                 },
             ],
             Some(&input.queued_recovery_id),
+            None,
         )
         .await
     }
@@ -1191,6 +1528,19 @@ impl TaskRepo for SqliteDb {
         review_passed_at: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetReviewPassedAt {
+                        id: id.to_owned(),
+                        review_passed_at: review_passed_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         set_review_passed_at_inner(self, id, None, review_passed_at, None, updated_at).await
     }
 
@@ -1201,6 +1551,20 @@ impl TaskRepo for SqliteDb {
         review_passed_at: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetReviewPassedAtCas {
+                        id: id.to_owned(),
+                        expected_version,
+                        review_passed_at: review_passed_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let expected_review_updated_at = review_passed_at.as_ref().map(|_| updated_at);
         set_review_passed_at_inner(
             self,
@@ -1221,6 +1585,21 @@ impl TaskRepo for SqliteDb {
         expected_review_updated_at: &str,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetReviewPassedAtCasForReview {
+                        id: id.to_owned(),
+                        expected_version,
+                        review_passed_at: review_passed_at.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         set_review_passed_at_inner(
             self,
             id,
@@ -1239,7 +1618,49 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadata {
+                        id: id.to_owned(),
+                        expected_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
+        let (task, _) = self
+            .mutate_metadata_with_change(id, expected_version, mutations, updated_at)
+            .await?;
+        Ok(task)
+    }
+
+    async fn mutate_metadata_with_change(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<(Task, bool)> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataWithChange {
+                        id: id.to_owned(),
+                        expected_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1249,35 +1670,54 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
-        if expected_version.is_some_and(|expected| task.version != expected) {
+        if !crate::task_writer::owns_task(id)
+            && expected_version.is_some_and(|expected| task.version != expected)
+        {
             return Err(DbError::VersionConflict);
         }
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
-            return Ok(task);
+            return Ok((task, false));
         }
         let metadata_json = metadata.to_json();
+        let condition = if condition_changed {
+            crate::task_condition::metadata_condition(
+                &mut transaction,
+                id,
+                metadata_json.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
         sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
         .bind(updated_at)
         .bind(id)
         .execute(&mut *transaction)
         .await?;
         task.metadata_json = metadata_json;
         task.updated_at = updated_at.to_owned();
+        self.record_mutation_reply_in_tx(&mut transaction, &(&task, true))
+            .await?;
+
         transaction.commit().await?;
-        Ok(task)
+        Ok((task, true))
     }
 
     async fn mutate_metadata_and_bump_version(
@@ -1287,7 +1727,22 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataAndBumpVersion {
+                        id: id.to_owned(),
+                        expected_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1297,15 +1752,22 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
@@ -1313,12 +1775,24 @@ impl TaskRepo for SqliteDb {
         }
 
         let metadata_json = metadata.to_json();
+        let condition = if condition_changed {
+            crate::task_condition::metadata_condition(
+                &mut transaction,
+                id,
+                metadata_json.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1330,6 +1804,9 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.version += 1;
         task.updated_at = updated_at.to_owned();
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1342,7 +1819,23 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataAndBumpVersionWithProjectAuthority {
+                        id: id.to_owned(),
+                        expected_version,
+                        expected_project_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1352,6 +1845,11 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -1367,9 +1865,11 @@ impl TaskRepo for SqliteDb {
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
@@ -1377,12 +1877,24 @@ impl TaskRepo for SqliteDb {
         }
 
         let metadata_json = metadata.to_json();
+        let condition = if condition_changed {
+            crate::task_condition::metadata_condition(
+                &mut transaction,
+                id,
+                metadata_json.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1394,6 +1906,9 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.version += 1;
         task.updated_at = updated_at.to_owned();
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1406,7 +1921,23 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Option<Task>> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataAndBumpVersionForLatestExecution {
+                        id: id.to_owned(),
+                        expected_version,
+                        authority: authority.clone(),
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1416,6 +1947,11 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -1426,21 +1962,35 @@ impl TaskRepo for SqliteDb {
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
             return Ok(Some(task));
         }
         let metadata_json = metadata.to_json();
+        let condition = if condition_changed {
+            crate::task_condition::metadata_condition(
+                &mut transaction,
+                id,
+                metadata_json.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1458,9 +2008,21 @@ impl TaskRepo for SqliteDb {
 
     async fn claim_metadata_for_latest_execution(
         &self,
-        input: LatestExecutionMetadataClaim,
+        mut input: LatestExecutionMetadataClaim,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskClaimMetadataForLatestExecution {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
             .fetch_optional(&mut *transaction)
@@ -1470,6 +2032,7 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        input.expected_task_version = task.version;
         if task.version != input.expected_task_version {
             return Err(DbError::VersionConflict);
         }
@@ -1486,12 +2049,20 @@ impl TaskRepo for SqliteDb {
         }
         metadata.extra.insert(input.key, input.value);
         let metadata_json = metadata.to_json();
+        let condition = crate::task_condition::metadata_condition(
+            &mut transaction,
+            &input.task_id,
+            metadata_json.as_deref(),
+        )
+        .await?;
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
         .bind(&input.updated_at)
         .bind(&input.task_id)
         .bind(input.expected_task_version)
@@ -1503,12 +2074,28 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.version += 1;
         task.updated_at = input.updated_at;
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
 
     async fn wake_dispatch_for_task(&self, id: &str, updated_at: &str) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskWakeDispatchForTask {
+                        id: id.to_owned(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1540,12 +2127,20 @@ impl TaskRepo for SqliteDb {
         }
 
         let metadata_json = metadata.to_json();
+        let condition = crate::task_condition::metadata_condition(
+            &mut transaction,
+            id,
+            metadata_json.as_deref(),
+        )
+        .await?;
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, updated_at = ?, version = version + 1
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, updated_at = ?, version = version + 1
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
         .bind(updated_at)
         .bind(id)
         .execute(&mut *transaction)
@@ -1564,8 +2159,9 @@ impl TaskRepo for SqliteDb {
 
     async fn wake_dispatch_for_project(&self, project_id: &str, updated_at: &str) -> Result<u64> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let changed =
-            wake_dispatch_for_project_in_tx(&mut transaction, project_id, updated_at).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, project_id, updated_at).await?;
         transaction.commit().await?;
         Ok(changed)
     }
@@ -1601,6 +2197,31 @@ impl TaskRepo for SqliteDb {
         entry_barrier_json: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetEntryBarrier {
+                        id: id.to_owned(),
+                        expected_version,
+                        entry_barrier_json: entry_barrier_json.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
+        if entry_barrier_json.is_none() {
+            crate::budget::reset(
+                &mut transaction,
+                id,
+                crate::budget::Kind::ReviewCiInfrastructure.key(),
+                &format!("ci-success:{updated_at}"),
+            )
+            .await?;
+        }
         let result = sqlx::query(
             "UPDATE task SET entry_barrier_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
@@ -1608,14 +2229,25 @@ impl TaskRepo for SqliteDb {
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
-        TaskRepo::get_by_id(self, id, true)
+        let mut task = self
+            .get_task_in_tx(&mut transaction, id)
             .await?
-            .ok_or(DbError::NotFound)
+            .ok_or(DbError::NotFound)?;
+        crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
+            .await?;
+        task.condition = crate::task_condition::decode_or_unknown(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        );
+        transaction.commit().await?;
+        Ok(task)
     }
 
     async fn set_entry_barrier_with_workflow_authority(
@@ -1627,7 +2259,24 @@ impl TaskRepo for SqliteDb {
         expected_project_version: i64,
         expected_workflow_definition: String,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetEntryBarrierWithWorkflowAuthority {
+                        id: id.to_owned(),
+                        expected_version,
+                        entry_barrier_json: entry_barrier_json.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition.clone(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         check_project_workflow_authority_in_tx(
             &mut transaction,
             id,
@@ -1635,6 +2284,15 @@ impl TaskRepo for SqliteDb {
             &expected_workflow_definition,
         )
         .await?;
+        if entry_barrier_json.is_none() {
+            crate::budget::reset(
+                &mut transaction,
+                id,
+                crate::budget::Kind::ReviewCiInfrastructure.key(),
+                &format!("ci-success:{updated_at}"),
+            )
+            .await?;
+        }
         let result = sqlx::query(
             "UPDATE task SET entry_barrier_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
@@ -1651,7 +2309,18 @@ impl TaskRepo for SqliteDb {
             .bind(id)
             .fetch_one(&mut *transaction)
             .await?;
-        let task = map_task(row)?;
+        let mut task = map_task(row)?;
+        crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
+            .await?;
+        task.condition = crate::task_condition::decode_or_unknown(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        );
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1669,16 +2338,22 @@ impl TaskRepo for SqliteDb {
         task.deleted_at = Some(input.deleted_at);
         task.updated_at = input.updated_at;
         task.version += 1;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result = sqlx::query("UPDATE task SET deleted_at = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
             .bind(task.deleted_at.as_deref())
             .bind(&task.updated_at)
             .bind(&task.id)
             .bind(input.expected_version)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        // The row's own facts are unchanged; its parent lost a visible child.
+        if let Some(parent) = &task.parent_task_id {
+            crate::task_condition::produce_children(&mut transaction, parent).await?;
+        }
+        transaction.commit().await?;
         Ok(task)
     }
 
@@ -1687,6 +2362,12 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         mut input: ClaimTask,
     ) -> Result<ClaimedTask> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return Err(DbError::Check(
+                "Task claim requires its claimed step".to_owned(),
+            ));
+        }
+        self.fence_current_step_in_tx(transaction).await?;
         let sql = format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL");
         let row = sqlx::query(&sql)
             .bind(&input.task_id)
@@ -1694,6 +2375,9 @@ impl TaskRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         let mut task = map_task(row)?;
+        if crate::task_writer::owns_task(&input.task_id) {
+            input.expected_version = task.version;
+        }
         if task.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -1877,6 +2561,7 @@ impl TaskRepo for SqliteDb {
                 to_state: task.status.clone(),
                 trigger_name: None,
                 triggered_by: claim_triggered_by,
+                bridge: Default::default(),
                 trigger_reason: "task claimed".to_owned(),
                 hook_results_json: None,
                 rejection: false,
@@ -1902,14 +2587,11 @@ impl TaskRepo for SqliteDb {
                 } else {
                     input.execution.role.as_str()
                 };
-                let assignment = sqlx::query(
-                    "SELECT id, assignee_type, assignee_id, updated_at
-                     FROM task_role_assignment
-                     WHERE task_id = ? AND role_name = ?",
+                let assignment = effective_execution_assignment_in_tx(
+                    transaction,
+                    &input.task_id,
+                    assignment_role,
                 )
-                .bind(&input.task_id)
-                .bind(assignment_role)
-                .fetch_optional(&mut **transaction)
                 .await?;
                 match (
                     admission.expected_assignment_id.as_deref(),
@@ -1953,12 +2635,9 @@ impl TaskRepo for SqliteDb {
             Self::ensure_task_execution_admission_in_tx(transaction, &input.execution, admission)
                 .await?;
         }
-        let mut execution = Self::create_execution_in_tx(
-            transaction,
-            &input.execution,
-            execution_admission.as_ref(),
-        )
-        .await?;
+        let mut execution = self
+            .create_execution_in_tx(transaction, &input.execution, execution_admission.as_ref())
+            .await?;
         // A reviewer/auditor claim owns the selected Review attempt in the
         // same transaction as the Task mutation, Running execution, and
         // initial lease. This keeps claim admission from bypassing the
@@ -2004,6 +2683,17 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateStatus {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_status_inner(self, input, None, None)
             .await?
             .ok_or(DbError::VersionConflict)
@@ -2014,6 +2704,18 @@ impl TaskRepo for SqliteDb {
         input: UpdateTaskStatus,
         authority: LatestExecutionAuthority,
     ) -> Result<Option<Task>> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateStatusForLatestExecution {
+                        input: input.clone(),
+                        authority: authority.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_status_inner(self, input, None, Some(&authority)).await
     }
 
@@ -2022,6 +2724,18 @@ impl TaskRepo for SqliteDb {
         input: UpdateTaskStatus,
         marker: CreateTransitionLog,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateStatusWithRecoveryMarker {
+                        input: input.clone(),
+                        marker: marker.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_status_inner(self, input, Some(&marker), None)
             .await?
             .ok_or(DbError::VersionConflict)
@@ -2030,7 +2744,7 @@ impl TaskRepo for SqliteDb {
 
 async fn update_task_status_inner(
     db: &SqliteDb,
-    input: UpdateTaskStatus,
+    mut input: UpdateTaskStatus,
     recovery_marker: Option<&CreateTransitionLog>,
     latest_execution_authority: Option<&LatestExecutionAuthority>,
 ) -> Result<Option<Task>> {
@@ -2038,6 +2752,8 @@ async fn update_task_status_inner(
         return Err(DbError::InvalidTransition);
     }
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_task_lease_in_tx(&mut transaction, &input.id, "update_task_status")
+        .await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(&input.id)
         .fetch_optional(&mut *transaction)
@@ -2046,6 +2762,9 @@ async fn update_task_status_inner(
     let mut task = map_task(task_row)?;
     if task.deleted_at.is_some() {
         return Err(DbError::InvalidSoftDelete);
+    }
+    if crate::task_writer::owns_task(&input.id) {
+        input.expected_version = task.version;
     }
     if task.version != input.expected_version {
         return Err(DbError::VersionConflict);
@@ -2123,6 +2842,14 @@ async fn update_task_status_inner(
         return Err(DbError::VersionConflict);
     }
 
+    crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Entry)
+        .await?;
+    task.condition = crate::task_condition::decode_or_unknown(
+        &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(&mut *transaction)
+            .await?,
+    );
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -2178,7 +2905,11 @@ async fn append_task_interruption_event(
     transaction: &mut Transaction<'_, Sqlite>,
     task: &Task,
 ) -> Result<()> {
-    let event = CreateDomainEvent::task_interruption_changed(task);
+    let current = db
+        .get_task_in_tx(transaction, &task.id)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let event = CreateDomainEvent::task_interruption_changed(&current);
     DomainEventRepo::append_event_in_tx(db, transaction, &event).await?;
     Ok(())
 }
@@ -2194,4 +2925,118 @@ fn search_like_pattern(term: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+pub(super) async fn list_page(
+    connection: &mut sqlx::SqliteConnection,
+    query: TaskListQuery,
+) -> Result<Page<Task>> {
+    let offset = decode_offset(&query.page.cursor)?;
+    let mut where_parts = vec!["project_id = ?"];
+    if !query.include_deleted {
+        where_parts.push("deleted_at IS NULL");
+    }
+    if !query.include_archived {
+        where_parts.push("archived_at IS NULL");
+    }
+    if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
+        where_parts.push("status != 'cancelled'");
+    }
+    if !query.statuses.is_empty() {
+        where_parts.push("status IN (__STATUSES__)");
+    }
+    if !query.agent_ids.is_empty() {
+        where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
+    }
+    if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
+        where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
+    }
+    if query.priority.is_some() {
+        where_parts.push("priority = ?");
+    }
+    let search_pattern = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(search_like_pattern);
+    if search_pattern.is_some() {
+        where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
+    }
+    let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
+    let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
+    let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
+    let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
+    let assignee_type_filter = if query.assignee_types.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("assignee_type IN ({assignee_type_placeholders})")
+    };
+    let assignee_id_filter = if query.assignee_ids.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("assignee_id IN ({assignee_id_placeholders})")
+    };
+    let where_sql = where_parts
+        .join(" AND ")
+        .replace("__STATUSES__", &status_placeholders)
+        .replace("__AGENTS__", &agent_placeholders)
+        .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
+        .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
+        where_sql,
+        order_clause(&query.page)
+    );
+    let mut q = sqlx::query(&sql).bind(&query.project_id);
+    for status in &query.statuses {
+        q = q.bind(status);
+    }
+    for agent_id in &query.agent_ids {
+        q = q.bind(agent_id);
+    }
+    for assignee_type in &query.assignee_types {
+        q = q.bind(assignee_type);
+    }
+    for assignee_id in &query.assignee_ids {
+        q = q.bind(assignee_id);
+    }
+    if let Some(priority) = query.priority {
+        q = q.bind(priority);
+    }
+    if let Some(search_pattern) = search_pattern.as_ref() {
+        q = q.bind(search_pattern).bind(search_pattern);
+    }
+    let rows = q
+        .bind(limit(&query.page) + 1)
+        .bind(offset)
+        .fetch_all(&mut *connection)
+        .await?;
+    let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
+    let total = if query.page.include_total {
+        let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
+        let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
+        for status in &query.statuses {
+            q = q.bind(status);
+        }
+        for agent_id in &query.agent_ids {
+            q = q.bind(agent_id);
+        }
+        for assignee_type in &query.assignee_types {
+            q = q.bind(assignee_type);
+        }
+        for assignee_id in &query.assignee_ids {
+            q = q.bind(assignee_id);
+        }
+        if let Some(priority) = query.priority {
+            q = q.bind(priority);
+        }
+        if let Some(search_pattern) = search_pattern.as_ref() {
+            q = q.bind(search_pattern).bind(search_pattern);
+        }
+        Some(q.fetch_one(&mut *connection).await?)
+    } else {
+        None
+    };
+    page_from_items(items, &query.page, offset, total)
 }

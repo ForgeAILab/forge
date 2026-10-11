@@ -29,11 +29,11 @@ async fn transition_log_records_review_retry_and_completion_history() {
     task = set_task_status(&harness, &task.id, "in_progress").await;
     assign_human_reviewer(&harness.app, &task).await;
 
-    task = transition(&harness.app, &task, "review", "ready for review").await;
-    task = gate(&harness.app, &task, "review", "reject", "missing tests").await;
-    task = transition(&harness.app, &task, "review", "retry ready").await;
-    task = gate(&harness.app, &task, "review", "approve", "looks good").await;
-    task = transition(&harness.app, &task, "done", "manual merge complete").await;
+    task = transition(&harness, &task, "review", "ready for review").await;
+    task = gate(&harness, &task, "review", "reject", "missing tests").await;
+    task = transition(&harness, &task, "review", "retry ready").await;
+    task = gate(&harness, &task, "review", "approve", "looks good").await;
+    task = transition(&harness, &task, "done", "manual merge complete").await;
     assert_eq!(task.status, "done");
 
     let log: Value = empty_request(
@@ -65,7 +65,7 @@ async fn transition_log_records_review_retry_and_completion_history() {
             (
                 "review".to_owned(),
                 "in_progress".to_owned(),
-                "gate rejected: missing tests".to_owned()
+                "missing tests".to_owned()
             ),
             (
                 "in_progress".to_owned(),
@@ -75,7 +75,7 @@ async fn transition_log_records_review_retry_and_completion_history() {
             (
                 "review".to_owned(),
                 "merging".to_owned(),
-                "gate approved: looks good".to_owned()
+                "gate approved".to_owned()
             ),
             (
                 "merging".to_owned(),
@@ -84,9 +84,31 @@ async fn transition_log_records_review_retry_and_completion_history() {
             ),
         ]
     );
+    let approval = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "gate approved")
+        .unwrap();
+    assert_eq!(approval["bridge_kind"], "gate_approved");
+    assert!(approval["bridge_payload"].is_null());
+    // A send-back with guidance is an ordinary rejection, as base read it.
+    let rejection = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "missing tests")
+        .unwrap();
+    assert!(rejection["bridge_kind"].is_null());
+    let ordinary = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "ready for review")
+        .unwrap();
+    assert!(ordinary["bridge_kind"].is_null());
+    assert!(ordinary["bridge_payload"].is_null());
     assert!(entries
         .iter()
-        .all(|entry| entry["triggered_by"] == "user:api" || entry["triggered_by"] == "system"));
+        .all(|entry| entry["triggered_by"] == "user:api"
+            || entry["triggered_by"]
+                .as_str()
+                .is_some_and(|actor| actor.starts_with("user:action:"))
+            || entry["triggered_by"] == "system"));
 }
 
 async fn assign_human_reviewer(app: &Router, task: &TaskResponse) {
@@ -100,7 +122,13 @@ async fn assign_human_reviewer(app: &Router, task: &TaskResponse) {
     .await;
 }
 
-async fn transition(app: &Router, task: &TaskResponse, status: &str, reason: &str) -> TaskResponse {
+async fn transition(
+    harness: &Harness,
+    task: &TaskResponse,
+    status: &str,
+    reason: &str,
+) -> TaskResponse {
+    let app = &harness.app;
     // Read the version rather than reusing the caller's snapshot: the writes
     // a claim, an assignment or a hook commits advance it, and this helper is
     // asked to move the Task, not to prove a stale precondition.
@@ -121,26 +149,27 @@ async fn transition(app: &Router, task: &TaskResponse, status: &str, reason: &st
     )
     .await;
     assert_eq!(response.task.status, status);
-    response.task
+    common::drain(&harness._state, app, &task.id).await
 }
 
 async fn gate(
-    app: &Router,
+    harness: &Harness,
     task: &TaskResponse,
-    gate_state: &str,
+    _gate_state: &str,
     decision: &str,
     reason: &str,
 ) -> TaskResponse {
+    let app = &harness.app;
     let task: TaskResponse = json_request(
         app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/gates/{gate_state}/{decision}", task.id),
-        json!({ "version": task.version, "reason": reason }),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "version": task.version, "action": if decision == "approve" { json!({"verb":"approve","override":false}) } else { json!({"verb":"send_back","guidance":reason}) } }),
         StatusCode::OK,
     )
     .await;
     assert!(!task.status.is_empty());
-    task
+    common::drain(&harness._state, app, &task.id).await
 }
 
 struct Harness {
@@ -171,7 +200,7 @@ async fn test_app() -> Harness {
     )
     .await
     .expect("seed test user");
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");

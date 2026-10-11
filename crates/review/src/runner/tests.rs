@@ -44,6 +44,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
     DaemonRepo::upsert_by_machine_id(
         &*db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -86,7 +87,6 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -480,7 +480,6 @@ async fn review_source_keeps_execution_workspace_repository_after_project_resele
             name: "replacement".to_owned(),
             remote_url: Some("https://example.com/replacement.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "trunk".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -664,6 +663,44 @@ impl TaskExecutor for CheckResultAwareAuditor {
     }
 }
 
+async fn canonical_spec_for_test(
+    seed: &SeededReview,
+    purpose: api_types::CheckPurpose,
+) -> api_types::CheckSpec {
+    let source = seed
+        .db
+        .review_source(
+            &seed.task_id.to_string(),
+            Some(&seed.executor_execution_id.to_string()),
+        )
+        .await
+        .unwrap();
+    let environment = crate::contract::project_environment(&seed.db, &seed.task_id.to_string())
+        .await
+        .unwrap();
+    crate::check_spec::build_check_spec(
+        purpose,
+        &crate::check_spec::CheckSpecConfiguration {
+            source: &source,
+            entry_state_config: None,
+            environment: &environment,
+            hooks: &[],
+            hook_test_index: None,
+            single_environment_check: None,
+            event: api_types::LifecycleEvent::BeforeWork,
+            role: "reviewer",
+            owner_is_daemon: false,
+            canonical_policy: false,
+            workspace: Some(crate::check_spec::CheckWorkspaceIdentity {
+                workspace_id: "workspace",
+                generation: 1,
+            }),
+            queue_head_bundle: None,
+        },
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn project_default_ci_steps_run_before_the_reviewer() {
     // Live case: NK-1's Project set `default_review_config.ci_steps` and the
@@ -702,6 +739,7 @@ async fn project_default_ci_steps_run_before_the_reviewer() {
         Arc::new(CheckResultAwareAuditor),
     );
 
+    let spec = canonical_spec_for_test(&seed, api_types::CheckPurpose::ReviewCi).await;
     let (review, outcome) = runner.run(req).await.unwrap();
 
     assert_eq!(outcome, ReviewOutcome::Passed);
@@ -712,6 +750,18 @@ async fn project_default_ci_steps_run_before_the_reviewer() {
         api_types::ConformanceStatus::Passed
     );
     assert_eq!(details.conformance.checks[0].check_id, "ci:0");
+    assert_eq!(
+        spec.commands
+            .iter()
+            .map(|c| c.shell_text.as_str())
+            .collect::<Vec<_>>(),
+        details
+            .ci_steps
+            .iter()
+            .map(|s| s.command.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(spec.commands.iter().all(|c| c.timeout_seconds.is_none()));
 }
 
 #[tokio::test]
@@ -866,6 +916,7 @@ async fn clean_review_checkout_runs_setup_before_required_checks() {
         Arc::new(PassingAuditor),
     );
 
+    let spec = canonical_spec_for_test(&seed, api_types::CheckPurpose::Conformance).await;
     let (review, outcome) = runner.run(req).await.unwrap();
 
     assert_eq!(outcome, ReviewOutcome::Passed);
@@ -876,6 +927,23 @@ async fn clean_review_checkout_runs_setup_before_required_checks() {
         api_types::ConformanceStatus::Passed
     );
     assert_eq!(details.conformance.checks.len(), 2);
+    assert_eq!(
+        spec.commands
+            .iter()
+            .map(|c| (&c.id, &c.shell_text))
+            .collect::<Vec<_>>(),
+        details
+            .conformance
+            .checks
+            .iter()
+            .map(|c| (&c.check_id, &c.command))
+            .collect::<Vec<_>>()
+    );
+    assert!(spec
+        .commands
+        .iter()
+        .all(|c| c.timeout_seconds
+            == Some(u64::from(crate::contract::DEFAULT_CHECK_TIMEOUT_SECONDS))));
     assert_eq!(details.conformance.checks[0].check_id, "setup:0");
     assert_eq!(details.conformance.checks[1].check_id, "ci:0");
     assert_eq!(details.conformance.checks[0].exit_code, 0);

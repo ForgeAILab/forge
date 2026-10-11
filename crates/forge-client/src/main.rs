@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{data_dir_from_env, read_server_state, server_state_path};
 use forge_client::{
-    agent, analytics, auth, client::ForgeClient, daemon, embedded, mcp, memory, project, repo, run,
-    task, OutputFormat,
+    agent, analytics, auth, client::ForgeClient, daemon, embedded, mcp, memory, operations,
+    project, repo, run, task, OutputFormat,
 };
 
 #[derive(Parser)]
@@ -31,6 +31,7 @@ enum Commands {
     Daemon(daemon::DaemonArgs),
     Project(project::ProjectArgs),
     Analytics(analytics::AnalyticsArgs),
+    Operations(operations::OperationsArgs),
     Memory(memory::MemoryArgs),
     Repo(repo::RepoArgs),
     Run(run::RunArgs),
@@ -54,7 +55,12 @@ async fn main() -> Result<()> {
         }
         Commands::Task(args) => {
             let client = client_for(cli.server.as_deref())?;
-            args.run(&client, &cli.output).await
+            match args.run(&client, &cli.output).await {
+                Err(error) if error.is::<forge_client::client::ActionUnavailable>() => {
+                    std::process::exit(3)
+                }
+                result => result,
+            }
         }
         Commands::Agent(args) => {
             let client = client_for(cli.server.as_deref())?;
@@ -65,6 +71,10 @@ async fn main() -> Result<()> {
             args.run(&client, &cli.output).await
         }
         Commands::Project(args) => {
+            let client = client_for(cli.server.as_deref())?;
+            args.run(&client, &cli.output).await
+        }
+        Commands::Operations(args) => {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
         }

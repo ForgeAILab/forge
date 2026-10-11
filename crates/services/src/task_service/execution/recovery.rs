@@ -1,5 +1,4 @@
 use super::*;
-use crate::deferred_dispatch::{QueuedRecovery, QueuedRecoveryRequest};
 use db::TaskMetadataMutation;
 
 tokio::task_local! {
@@ -7,112 +6,628 @@ tokio::task_local! {
 }
 
 impl TaskService {
-    pub async fn available_recovery_actions(
-        &self,
-        task_id: impl Into<String>,
-    ) -> Result<Vec<api_types::RecoveryAction>> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id))?;
-        if task.failed_json.is_some() {
-            return Ok(vec![
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ]);
+    pub(crate) fn recovery_context() -> Option<(String, String)> {
+        REPLAYING_RECOVERY.try_with(Clone::clone).ok()
+    }
+    pub(crate) async fn with_recovery_command_context<T>(
+        payload: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let payload = serde_json::from_str::<Value>(payload).unwrap_or(Value::Null);
+        let replay =
+            serde_json::from_value::<(String, String)>(payload["replaying_recovery"].clone()).ok();
+        let actor = serde_json::from_value::<Actor>(payload["action_actor"].clone()).ok();
+        let action_command = payload["action_command"] == true;
+        let replayed = async move {
+            match replay {
+                Some(replay) => REPLAYING_RECOVERY.scope(replay, future).await,
+                None => future.await,
+            }
+        };
+        let acted = async move {
+            match actor {
+                Some(actor) => {
+                    crate::task_service::actions::TASK_ACTION_ACTOR
+                        .scope(actor, replayed)
+                        .await
+                }
+                None => replayed.await,
+            }
+        };
+        if action_command {
+            crate::task_service::actions::TASK_ACTION_COMMAND
+                .scope((), acted)
+                .await
+        } else {
+            acted.await
         }
-        Ok(self
-            .recovery_annotation(&task)
-            .map(|annotation| annotation.recovery_actions)
-            .unwrap_or_default())
+    }
+    pub(crate) fn is_replaying_recovery(task_id: &str) -> bool {
+        REPLAYING_RECOVERY
+            .try_with(|(id, _)| id == task_id)
+            .unwrap_or(false)
     }
 
-    pub async fn recover_task(
-        &self,
-        task_id: impl Into<String>,
-        action: api_types::RecoveryAction,
-        reason: Option<String>,
-        context: Option<String>,
-    ) -> Result<Task> {
-        self.recover_task_inner(task_id.into(), action, reason, context, None)
-            .await
-    }
-
-    pub(crate) async fn recover_task_at_version(
-        &self,
-        task_id: impl Into<String>,
-        action: api_types::RecoveryAction,
-        reason: Option<String>,
-        context: Option<String>,
-        expected_version: i64,
-    ) -> Result<Task> {
-        self.recover_task_inner(
-            task_id.into(),
-            action,
-            reason,
-            context,
-            Some(expected_version),
+    /// Read historical persisted commands at the storage boundary. No old
+    /// action name is accepted by a command endpoint or transport schema.
+    async fn normalize_stored_task_action(&self, task: &Task) -> Result<Task> {
+        if crate::deferred_dispatch::queued_recovery(task).is_some() {
+            return Ok(task.clone());
+        }
+        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let Some(raw) = metadata
+            .extra
+            .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+        else {
+            return Ok(task.clone());
+        };
+        if raw
+            .get("request")
+            .and_then(|request| request.get("offer"))
+            .is_some()
+        {
+            return Ok(task.clone());
+        }
+        raw.get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ServiceError::invalid_operation("stored queued intent has no id"))?;
+        let request = &raw["request"];
+        let saved_reason = request
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let guidance = request
+            .get("context")
+            .or_else(|| request.get("resume_reason"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let name = request
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("resume_session");
+        let actor = Actor::user(UserActionSource::Api);
+        let mut snapshot = self.task_action_snapshot(&task.id, &actor).await?;
+        snapshot.task.error_annotation = raw
+            .get("error_annotation")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        snapshot.task.blocked_json = raw
+            .get("blocked_json")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut projection = metadata.clone();
+        projection
+            .extra
+            .remove(crate::deferred_dispatch::QUEUED_RECOVERY_KEY);
+        snapshot.task.metadata_json = Some(
+            serde_json::to_string(&projection)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        );
+        // The offers below are read from the condition: project it from the
+        // fields as they were before the intent was queued.
+        snapshot.task.condition =
+            db::map_legacy_condition(&db::LegacyConditionInput::from(&snapshot.task));
+        let action = match name {
+            "reset_to_initial" => Some(api_types::TaskAction::Restart {
+                reason: saved_reason.clone(),
+            }),
+            "cancel_task" => Some(api_types::TaskAction::Cancel {
+                reason: saved_reason.clone(),
+            }),
+            "mark_reviewed" | "skip_hook_once" => Some(api_types::TaskAction::Approve {
+                reason: saved_reason.clone(),
+                override_checks: Some(true),
+            }),
+            "defer_to_follow_up" => Some(api_types::TaskAction::Approve {
+                reason: saved_reason.clone(),
+                override_checks: Some(false),
+            }),
+            "resume_process" if snapshot.task.status == "review" => {
+                Some(api_types::TaskAction::SendBack {
+                    guidance: guidance
+                        .clone()
+                        .or_else(|| saved_reason.clone())
+                        .unwrap_or_default(),
+                })
+            }
+            "resume_session"
+            | "reexecute"
+            | "retry_hook"
+            | "resume_process"
+            | "update_workspace_and_retry_hook"
+            | "reset_retry_window"
+            | "proceed_once" => Some(api_types::TaskAction::Retry {
+                reason: saved_reason.clone(),
+                fresh_session: match name {
+                    "resume_session" => Some(false),
+                    "reexecute" => Some(true),
+                    _ => None,
+                },
+                refresh_workspace: (name == "update_workspace_and_retry_hook").then_some(true),
+                reset_budget: match name {
+                    "reset_retry_window" => Some(true),
+                    "proceed_once" => Some(false),
+                    _ => None,
+                },
+                guidance: guidance.clone(),
+            }),
+            _ => None,
+        };
+        let offers = crate::available_actions(&snapshot);
+        let selected = action.as_ref().and_then(|action| {
+            offers
+                .into_iter()
+                .find(|offer| offer.action.verb() == action.verb())
+        });
+        // Keep the original bytes as evidence even when the state/owner has
+        // changed and the old pending command can no longer be represented.
+        let saved = TaskRepo::mutate_metadata_and_bump_version(
+            &*self.db,
+            &task.id,
+            task.version,
+            vec![TaskMetadataMutation::Set {
+                key: "task_action_migrated_intent".to_owned(),
+                value: raw.clone(),
+            }],
+            &now_rfc3339(),
+        )
+        .await?;
+        let same_state =
+            raw.get("target_state").and_then(Value::as_str) == Some(task.status.as_str());
+        if !same_state || selected.is_none() {
+            let error = ServiceError::invalid_operation(
+                "stored queued intent no longer has a current apply plan",
+            );
+            self.restore_failed_task_action(&saved, raw, &error).await?;
+            return Err(error);
+        }
+        snapshot.task.version = saved.version;
+        let offer = selected.expect("selected above");
+        let mut action = action.expect("selected action");
+        // Missing legacy defaults now come from the offer. Parameters absent
+        // from the state are not carried into a different apply plan.
+        if let api_types::TaskAction::Retry {
+            reason: _,
+            fresh_session,
+            refresh_workspace,
+            reset_budget,
+            guidance,
+        } = &mut action
+        {
+            if let api_types::TaskAction::Retry {
+                fresh_session: fresh,
+                refresh_workspace: refresh,
+                reset_budget: reset,
+                ..
+            } = &offer.action
+            {
+                if !offer
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "fresh_session")
+                {
+                    *fresh_session = *fresh;
+                }
+                if !offer
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "refresh_workspace")
+                {
+                    *refresh_workspace = *refresh;
+                }
+                if !offer
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "reset_budget")
+                {
+                    *reset_budget = *reset;
+                }
+                if !offer
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "guidance")
+                {
+                    *guidance = None;
+                }
+            }
+        }
+        self.queue_task_action(
+            &snapshot,
+            offer,
+            action.clone(),
+            Actor::user(UserActionSource::Action(action)),
         )
         .await
     }
 
-    async fn recover_task_inner(
-        &self,
-        task_id: String,
-        action: api_types::RecoveryAction,
-        reason: Option<String>,
-        context: Option<String>,
-        expected_version: Option<i64>,
-    ) -> Result<Task> {
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if let Some(expected) = expected_version {
-            if task.version != expected {
-                return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
-                    expected,
-                    actual: task.version,
-                }));
-            }
-        }
-        if !Self::is_replaying_recovery(&task.id)
-            && crate::deferred_dispatch::queued_recovery(&task).is_some_and(|queued| {
-                matches!(queued.request, QueuedRecoveryRequest::Recover(request) if request.action == action)
-            })
-        {
-            return Ok(task);
-        }
-        let request = api_types::RecoverTaskRequest {
-            action,
-            reason: reason.clone(),
-            context: context.clone(),
-        };
-        match Box::pin(self.apply_recovery_action(task.clone(), action, reason, context)).await {
-            Err(ServiceError::Db(db::DbError::AgentAtCapacity)) => {
-                self.queue_recovery_for_capacity(&task, QueuedRecoveryRequest::Recover(request))
-                    .await
-            }
-            result => result,
-        }
-    }
-
-    async fn apply_recovery_action(
+    pub(crate) async fn reconcile_task_action_owner(
         &self,
         task: Task,
-        action: api_types::RecoveryAction,
-        reason: Option<String>,
-        context: Option<String>,
+        action: api_types::TaskAction,
     ) -> Result<Task> {
-        super::ensure_plan_publication_transition_authority(&task, None)?;
-        if task.failed_json.is_some()
-            && !matches!(
-                action,
-                api_types::RecoveryAction::ResetToInitial | api_types::RecoveryAction::CancelTask
-            )
+        let Some(mut placement) =
+            db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+        else {
+            return Ok(task);
+        };
+        if placement.state == db::PlacementState::Failed
+            && placement.failure_cause == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout)
         {
-            return Err(ServiceError::invalid_operation(
-                "task has failed and cannot be resumed from current context; restart or cancel required",
-            ));
+            let online = match crate::recovery::placement_execution_daemon_id(&placement) {
+                Some(daemon_id) => {
+                    if self
+                        .daemon_connections
+                        .as_ref()
+                        .and_then(|registry| registry.get(daemon_id))
+                        .is_some_and(|connection| connection.needs_upgrade())
+                    {
+                        return Err(ServiceError::DaemonUpgradeRequired {
+                            daemon_id: daemon_id.to_owned(),
+                        });
+                    }
+                    db::DaemonRepo::get_by_id(&*self.db, daemon_id)
+                        .await?
+                        .is_some_and(|daemon| daemon.status == db::DaemonStatus::Online)
+                        && self
+                            .daemon_connections
+                            .as_ref()
+                            .and_then(|registry| registry.get(daemon_id))
+                            .and_then(|connection| connection.snapshot())
+                            .is_some_and(|facts| {
+                                placement.owner_kind == db::PlacementOwnerKind::Server
+                                    || !facts.workspace_incapable
+                            })
+                }
+                None => false,
+            };
+            if !online {
+                return Ok(task);
+            }
+            let mut update = crate::placement::admission::placement_update(&placement);
+            update.state = Some(db::PlacementState::Disconnected);
+            update.disconnected_at = Some(Some(now_rfc3339()));
+            placement = db::WorkspacePlacementRepo::update(&*self.db, update).await?;
+        }
+        let reconciled = if let Some(registry) = self.daemon_connections.as_ref() {
+            registry.reconciliation_notify().notify_one();
+            crate::recovery::reconcile_workspace_placement(
+                &self.db,
+                &self.event_bus,
+                registry,
+                Some(self),
+                &placement,
+            )
+            .await?
+        } else {
+            false
+        };
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        if reconciled
+            && ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+                .await?
+                .is_empty()
+            && self
+                .parse_blocking_annotation(&current)
+                .is_some_and(|annotation| {
+                    matches!(
+                        annotation.blocking_reason.as_str(),
+                        "owner_lost_execution" | "owner_disconnected_timeout"
+                    )
+                })
+        {
+            let actor = TaskService::task_action_actor(Actor::user(UserActionSource::Api));
+            let mut snapshot = self.task_action_snapshot(&task.id, &actor).await?;
+            snapshot.owner_disconnected = false;
+            if let Some(offer) = crate::available_actions(&snapshot)
+                .into_iter()
+                .find(|offer| offer.action.verb() == "retry")
+            {
+                return self
+                    .queue_task_action(&snapshot, offer, action, actor)
+                    .await;
+            }
+        }
+        self.publish_recovery_applied(&current, "retry", Some(&current.status), None);
+        Ok(current)
+    }
+
+    /// Settle a refused or corrupt durable intent under its exact Task/marker CAS.
+    /// The interruption event is appended by the repository transaction.
+    async fn restore_failed_task_action(
+        &self,
+        task: &Task,
+        raw: &Value,
+        error: &ServiceError,
+    ) -> Result<()> {
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        let metadata = db::TaskMetadata::parse(current.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        if metadata
+            .extra
+            .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+            != Some(raw)
+        {
+            return Ok(());
+        }
+        let saved = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
+        let owns_condition = !matches!(current.status.as_str(), "done" | "cancelled")
+            && current.error_annotation.is_none()
+            && current.blocked_json.is_none()
+            && current.failed_json.is_none()
+            && current.archived_at.is_none();
+        let (annotation, blocked, failed) = if owns_condition {
+            let reason = error.to_string();
+            let mut annotation: Value = saved("error_annotation")
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({"type":"recovery_required"}));
+            annotation
+                .as_object_mut()
+                .expect("object above")
+                .remove("recovery_actions");
+            annotation["blocking_reason"] = json!(reason);
+            annotation["message"] = json!(reason);
+            let mut blocked: Value = saved("blocked_json")
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({"kind":"recovery_required"}));
+            blocked
+                .as_object_mut()
+                .expect("object above")
+                .remove("recovery_actions");
+            blocked["reason"] = json!(reason);
+            let failed = saved("failed_json").map(|s| {
+                let mut value: Value = serde_json::from_str(&s)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({"kind":"executor_failed"}));
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("recovery_actions");
+                }
+                value["reason"] = json!(reason);
+                value.to_string()
+            });
+            (
+                Some(annotation.to_string()),
+                if failed.is_none() {
+                    Some(blocked.to_string())
+                } else {
+                    None
+                },
+                failed,
+            )
+        } else {
+            (
+                current.error_annotation.clone(),
+                current.blocked_json.clone(),
+                current.failed_json.clone(),
+            )
+        };
+        TaskRepo::restore_queued_recovery(
+            &*self.db,
+            db::RestoreQueuedRecovery {
+                task_id: current.id,
+                expected_version: current.version,
+                queued_recovery_id: raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                error_annotation: annotation,
+                blocked_json: blocked,
+                failed_json: failed,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Dispatcher-only consumption of an accepted Task action. This never
+    /// calls a command handler or restores the old condition to authorize it.
+    pub(crate) async fn dispatch_queued_recovery(&self, task: &Task) -> Result<bool> {
+        if db::TaskStepRepo::entry_hooks_pending(&*self.db, &task.id).await? {
+            return Ok(false);
+        }
+        if self.db.task_has_pending_remote_cancel(&task.id).await? {
+            return Ok(false);
+        }
+        if !db::task_writer::owns_task(&task.id) {
+            let queued = TaskMetadata::parse(task.metadata_json.as_deref())
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?
+                .extra
+                .contains_key(crate::deferred_dispatch::QUEUED_RECOVERY_KEY);
+            if !queued {
+                return Ok(false);
+            }
+            return self
+                .request_task_command(
+                    &task.id,
+                    "dispatch_queued_recovery",
+                    serde_json::json!([task.id]),
+                    false,
+                )
+                .await;
+        }
+        let result = Box::pin(self.dispatch_queued_task_action_inner(task)).await;
+        if let Err(error) = &result {
+            if self.settle_queued_task_action_refusal(task, error).await? {
+                return Ok(false);
+            }
+        }
+        result
+    }
+
+    /// One failure boundary for replay: wait with its intent, or restore it.
+    pub(crate) async fn settle_queued_task_action_refusal(
+        &self,
+        task: &Task,
+        error: &ServiceError,
+    ) -> Result<bool> {
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        let claim_race = matches!(
+            error,
+            ServiceError::Db(
+                db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. }
+            )
+        ) && current.version != task.version;
+        let waiting = claim_race
+            || matches!(
+                error,
+                ServiceError::AgentPaused { .. } | ServiceError::ProjectPaused { .. }
+            )
+            || crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await?;
+        if waiting {
+            if !claim_race {
+                self.defer_placement_refusal(&current, error).await?;
+            }
+            return Ok(true);
+        }
+        let dependency_gate = match error {
+            ServiceError::DependencyGate => true,
+            ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
+            _ => false,
+        };
+        if dependency_gate && db::task_writer::owns_task(&current.id) {
+            let unsatisfied =
+                TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &current.id).await?;
+            if !unsatisfied.is_empty()
+                && self
+                    .cancelled_dependency_ids(&current, &unsatisfied)
+                    .await?
+                    .is_empty()
+            {
+                // An unfinished dependency is a wait, not a refusal: the
+                // action stays accepted behind the same dependency wait an
+                // unstarted Task shows, and runs when the dependency
+                // settles (`wake_dependents_of_completed_task`) or its link
+                // is removed. Restoring the old park here turned the wait
+                // into an untyped `recovery_required: "dependency gate"`
+                // that offered the refused action again.
+                let dependency_ids = unsatisfied.clone();
+                crate::deferred_dispatch::record_dispatch_disposition_naming(
+                    &self.db,
+                    &current,
+                    crate::deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
+                    &format!(
+                        "waiting for unfinished dependenc{}: {}",
+                        if dependency_ids.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        },
+                        dependency_ids.join(", ")
+                    ),
+                    &dependency_ids,
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+        let original = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .ok()
+            .and_then(|metadata| {
+                metadata
+                    .extra
+                    .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+                    .cloned()
+            });
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        let raw = db::TaskMetadata::parse(current.metadata_json.as_deref())
+            .ok()
+            .and_then(|metadata| {
+                metadata
+                    .extra
+                    .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+                    .cloned()
+            });
+        if let (Some(original), Some(raw)) = (original, raw) {
+            if original.get("id") == raw.get("id") {
+                // A cancelled dependency is its own typed park, with its own
+                // exit: it carries the condition this action had cleared, in
+                // place of an untyped refusal that offers the action again.
+                if dependency_gate && db::task_writer::owns_task(&current.id) {
+                    let unsatisfied =
+                        TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &current.id)
+                            .await?;
+                    let cancelled = self
+                        .cancelled_dependency_ids(&current, &unsatisfied)
+                        .await?;
+                    self.block_cancelled_dependencies(&current, &cancelled)
+                        .await?;
+                }
+                self.restore_failed_task_action(&current, &raw, error)
+                    .await?;
+            }
+        }
+        Ok(false)
+    }
+
+    async fn dispatch_queued_task_action_inner(&self, task: &Task) -> Result<bool> {
+        let raw = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+            .extra
+            .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+            .cloned();
+        let task = match Box::pin(self.normalize_stored_task_action(task)).await {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(raw) = raw.as_ref() {
+                    self.restore_failed_task_action(task, raw, &error).await?;
+                }
+                return Err(error);
+            }
+        };
+        let Some(queued) = crate::deferred_dispatch::queued_recovery(&task) else {
+            if let Some(raw) = raw.as_ref() {
+                self.restore_failed_task_action(
+                    &task,
+                    raw,
+                    &ServiceError::invalid_operation("malformed queued Task action"),
+                )
+                .await?;
+            }
+            return Ok(false);
+        };
+        if queued.target_state != task.status
+            || task.archived_at.is_some()
+            || task.condition.read().hard_failure
+        {
+            self.restore_failed_task_action(
+                &task,
+                raw.as_ref().expect("queued marker came from metadata"),
+                &ServiceError::invalid_operation("stale queued Task action"),
+            )
+            .await?;
+            return Err(ServiceError::invalid_operation("stale queued Task action"));
+        }
+        if let Some(running) = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+            .await?
+            .first()
+        {
+            let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            if crate::deferred_dispatch::queued_recovery(&current)
+                .is_none_or(|intent| intent.id != queued.id)
+            {
+                return Ok(false);
+            }
+            return Err(ServiceError::ExecutionAlreadyRunning {
+                scope: task.id.clone(),
+                execution_id: running.id.clone(),
+            });
         }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
@@ -120,357 +635,209 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            &queued.request.actor,
         );
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
-            return Err(ServiceError::invalid_operation(format!(
-                "cannot recover task {} in terminal status {}",
-                task.id, task.status
-            )));
-        }
-        let annotation = self.recovery_annotation(&task);
-        if let Ok(explicit) = &annotation {
-            if !explicit.recovery_actions.is_empty()
-                && action != api_types::RecoveryAction::MarkReviewed
+        if matches!(
+            queued.request.offer.reason.as_str(),
+            "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
+        ) {
+            let role = crate::workflow::action_role(&workflow, &task.status).ok_or_else(|| {
+                ServiceError::invalid_operation("queued action lost its workflow role")
+            })?;
+            if queued
+                .request
+                .role_name
+                .as_deref()
+                .is_some_and(|saved| saved != role)
             {
-                // A non-empty annotation is the authoritative recovery
-                // contract shown to clients. State-derived actions may fill
-                // in old/empty annotations, but they must never widen an
-                // explicit set and clear the only working recovery path.
-                self.validate_recovery_action(explicit, &action)?;
+                return Err(ServiceError::invalid_operation(
+                    "queued action's workflow role changed",
+                ));
+            }
+            let assignment =
+                crate::task_hierarchy::effective_role_assignment(&self.db, &task, role)
+                    .await?
+                    .map(|resolved| resolved.assignment);
+            if queued
+                .request
+                .assignment_id
+                .as_deref()
+                .is_some_and(|id| assignment.as_ref().is_none_or(|row| row.id != id))
+                || assignment.as_ref().is_some_and(|row| {
+                    row.assignee_type != Some(AssigneeKind::Agent)
+                        || row.assignee_id != queued.request.agent_id
+                })
+            {
+                return Err(ServiceError::invalid_operation(
+                    "queued action's role ownership changed",
+                ));
+            }
+            let needs_session = matches!(
+                queued.request.action,
+                api_types::TaskAction::Release { .. }
+                    | api_types::TaskAction::Retry {
+                        fresh_session: Some(false),
+                        ..
+                    }
+            );
+            if needs_session {
+                if let Some(id) = queued.request.offer.target_execution_id.as_deref() {
+                    let execution = ExecutionRepo::get_by_id(&*self.db, id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("execution", id.to_owned()))?;
+                    let logical = workflow.states.iter().find(|state| state.name == task.status).and_then(|state| state.dispatch.as_ref())
+                        .is_some_and(|dispatch| dispatch.execution_policy == Some(api_types::WorkflowExecutionPolicy::ResumeLatestTargetRoleThread));
+                    if execution.task_id != task.id
+                        || execution.agent_id != queued.request.agent_id
+                        || (!logical && execution.agent_session_id.is_none())
+                    {
+                        return Err(ServiceError::invalid_operation(
+                            "queued action's pinned session is no longer resumable",
+                        ));
+                    }
+                }
             }
         }
-        if !self_validating_recovery_action(action) {
-            let annotation = annotation?;
-            self.validate_recovery_action(&annotation, &action)?;
-            return match action {
-                api_types::RecoveryAction::ResumeSession => {
-                    self.recover_resume_session(task, &annotation, reason, context)
-                        .await
-                }
-                api_types::RecoveryAction::Reexecute => {
-                    self.recover_reexecute(task, &annotation, reason, context)
-                        .await
-                }
-                api_types::RecoveryAction::ResetToInitial => {
-                    self.recover_reset_to_initial(task, &annotation, reason)
-                        .await
-                }
-                api_types::RecoveryAction::CancelTask => {
-                    self.recover_cancel_task(task, reason).await
-                }
-                api_types::RecoveryAction::MarkReviewed => {
-                    self.recover_mark_reviewed(task, reason).await
-                }
-                api_types::RecoveryAction::UpdateWorkspaceAndRetryHook => {
-                    self.recover_update_workspace_and_retry_hook(task, &annotation, reason)
-                        .await
-                }
-                api_types::RecoveryAction::SkipHookOnce => {
-                    self.recover_skip_hook_once(task, reason, None).await
-                }
-                api_types::RecoveryAction::ResetRetryWindow
-                | api_types::RecoveryAction::ProceedOnce
-                | api_types::RecoveryAction::OpenInteractive
-                | api_types::RecoveryAction::RetryHook
-                | api_types::RecoveryAction::ResumeProcess => unreachable!(),
-            };
-        }
-        let annotation = annotation.ok();
-        match action {
-            api_types::RecoveryAction::ResetRetryWindow => {
-                self.recover_reset_retry_window(task, reason).await
+        if let Some(agent_id) = queued.request.agent_id.as_deref() {
+            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+            if agent.paused
+                || crate::agent_service::compute_effective_status(
+                    &self.db,
+                    &agent,
+                    self.daemon_connections.as_deref(),
+                )
+                .await?
+                    == crate::agent_service::EffectiveStatus::DaemonOffline
+            {
+                return Ok(false);
             }
-            api_types::RecoveryAction::ProceedOnce => {
-                self.recover_proceed_once(task, reason, context).await
+            if project.paused_at.is_some() {
+                return Ok(false);
             }
-            api_types::RecoveryAction::OpenInteractive => {
-                self.recover_open_interactive(task, annotation.as_ref(), reason, context)
-                    .await
-            }
-            api_types::RecoveryAction::MarkReviewed => {
-                self.recover_mark_reviewed(task, reason).await
-            }
-            api_types::RecoveryAction::RetryHook => {
-                if let Some(ref annotation) = annotation {
-                    self.recover_retry_hook(task, annotation, reason).await
-                } else {
-                    self.recover_retry_review(task, reason).await
-                }
-            }
-            api_types::RecoveryAction::ResumeProcess => {
-                self.recover_resume_process(task, reason, context).await
-            }
-            api_types::RecoveryAction::ResumeSession
-            | api_types::RecoveryAction::Reexecute
-            | api_types::RecoveryAction::ResetToInitial
-            | api_types::RecoveryAction::CancelTask
-            | api_types::RecoveryAction::UpdateWorkspaceAndRetryHook
-            | api_types::RecoveryAction::SkipHookOnce => unreachable!(),
-        }
-    }
-
-    pub(crate) fn is_replaying_recovery(task_id: &str) -> bool {
-        REPLAYING_RECOVERY
-            .try_with(|(replaying_task, _)| replaying_task == task_id)
-            .unwrap_or(false)
-    }
-
-    pub(crate) async fn queue_recovery_for_capacity(
-        &self,
-        original: &Task,
-        request: QueuedRecoveryRequest,
-    ) -> Result<Task> {
-        let task = TaskRepo::get_by_id(&*self.db, &original.id, false)
+            if crate::placement::machine_precheck::wait_before_dispatch(
+                &self.db,
+                self,
+                &task,
+                &agent,
+                queued.request.role_name.as_deref(),
+            )
             .await?
-            .ok_or_else(|| ServiceError::not_found("task", original.id.clone()))?;
-        // Launch failure may have restored the interruption at a new version.
-        // Never clear a different interruption installed by a concurrent writer.
-        if task.error_annotation != original.error_annotation
-            || task.blocked_json != original.blocked_json
-            || task.failed_json != original.failed_json
-        {
-            return Err(db::DbError::VersionConflict.into());
+                || !crate::agent_capacity::has_execution_capacity(&self.db, &agent).await?
+            {
+                return Ok(false);
+            }
         }
-        let agent_id = self.queued_recovery_agent(original, &request).await?;
-        self.ensure_queued_recovery_agent_available(&agent_id)
-            .await?;
-        let queued = crate::deferred_dispatch::QueuedRecovery {
-            id: new_uuid_v4(),
-            request,
-            target_state: task.status.clone(),
-            error_annotation: task.error_annotation.clone(),
-            blocked_json: task.blocked_json.clone(),
+        // Admission/engine writes fence the exact Task revision and consume
+        // the queue ID. Waiting must not advance Task.version each pass.
+        if project.paused_at.is_some() {
+            return Ok(false);
+        }
+        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Initial) {
+            let slots =
+                crate::task_dispatcher::slots::load_project_slots(&self.db, &project).await?;
+            if slots.limit != 0 && slots.active >= slots.limit {
+                return Ok(false);
+            }
+        }
+        let deferred = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+            .extra
+            .get("deferred_dispatch")
+            .cloned();
+        if crate::deferred_dispatch::is_pending(&task, chrono::Utc::now()) {
+            return Ok(false);
+        }
+        let claim_value = json!({
+            "not_before": (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
+            "reason": "recovery replay in flight",
+            "target_state": queued.target_state,
+        });
+        let mutation = match deferred.as_ref() {
+            Some(old) => TaskMetadataMutation::SetIf {
+                key: "deferred_dispatch".to_owned(),
+                expected: old.clone(),
+                value: claim_value.clone(),
+            },
+            None => TaskMetadataMutation::SetIfAbsent {
+                key: "deferred_dispatch".to_owned(),
+                value: claim_value.clone(),
+            },
         };
-        let now = now_rfc3339();
-        let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        let (claimed, changed) = TaskRepo::mutate_metadata_with_change(
             &*self.db,
             &task.id,
-            task.version,
-            None,
-            None,
-            task.failed_json.clone(),
-            &now,
-            None,
-            Vec::new(),
-            vec![
-                TaskMetadataMutation::Set {
-                    key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
-                    value: serde_json::to_value(&queued)
-                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                },
-                TaskMetadataMutation::Set {
-                    key: "deferred_dispatch".to_owned(),
-                    value: json!({
-                        "not_before": now,
-                        "reason": "recovery queued: agent at capacity",
-                        "target_state": task.status,
-                    }),
-                },
-            ],
+            Some(task.version),
+            vec![mutation],
+            &now_rfc3339(),
         )
         .await?;
-        self.publish(ForgeEvent {
-            event_type: "task.recovery_action".to_owned(),
-            entity_id: updated.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRecovered {
-                project_id: updated.project_id.clone(),
-                reason: match queued.request {
-                    QueuedRecoveryRequest::Recover(request) => request
-                        .reason
-                        .unwrap_or_else(|| format!("{} queued: agent at capacity", request.action)),
-                    QueuedRecoveryRequest::Resume { resume_reason, .. } => resume_reason
-                        .unwrap_or_else(|| "resume queued: agent at capacity".to_owned()),
-                },
-            },
-        });
-        Ok(updated)
-    }
-
-    async fn queued_recovery_agent(
-        &self,
-        task: &Task,
-        request: &QueuedRecoveryRequest,
-    ) -> Result<String> {
-        let request = match request {
-            QueuedRecoveryRequest::Recover(request) => request,
-            QueuedRecoveryRequest::Resume { agent_id, .. } => {
-                if let Some(role) = self.current_effective_role_name(task).await? {
-                    self.ensure_queued_recovery_role_agent(task, &role, agent_id)
-                        .await?;
-                }
-                return Ok(agent_id.clone());
-            }
-        };
-        let annotation = self.recovery_annotation(task).ok();
-        let agent_id = if request.action == api_types::RecoveryAction::OpenInteractive {
-            match self
-                .interactive_follow_up_execution(task, annotation.as_ref())
-                .await?
-                .and_then(|execution| execution.agent_id)
-            {
-                Some(agent_id) => agent_id,
-                None => {
-                    self.interactive_launch_agent(task, annotation.as_ref())
-                        .await?
-                }
-            }
-        } else {
-            let execution = match annotation
-                .as_ref()
-                .and_then(|annotation| annotation.blocked_execution_id.as_deref())
-            {
-                Some(id) => ExecutionRepo::get_by_id(&*self.db, id).await?,
-                None => None,
-            };
-            if request.action == api_types::RecoveryAction::ResumeSession {
-                let execution = execution.ok_or_else(|| {
-                    ServiceError::invalid_operation("queued resume requires its blocked execution")
-                })?;
-                if let Some(agent_id) = execution.agent_id.as_deref() {
-                    self.ensure_queued_recovery_role_agent(task, &execution.role, agent_id)
-                        .await?;
-                }
-                execution.agent_id
-            } else {
-                let role = match execution.as_ref() {
-                    Some(execution) => Some(execution.role.clone()),
-                    None => self.current_effective_role_name(task).await?,
-                };
-                let assignment_role = match role.as_deref() {
-                    Some("executor") => Some(crate::workflow::default_roles::CODER),
-                    Some("interactive" | "auditor") | None => None,
-                    Some(role) => Some(role),
-                };
-                let assigned = match assignment_role {
-                    Some(role) => Some(
-                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
-                            .await?
-                            .filter(|assignment| {
-                                assignment.assignee_type == Some(AssigneeKind::Agent)
-                            })
-                            .and_then(|assignment| assignment.assignee_id)
-                            .ok_or_else(|| {
-                                ServiceError::invalid_operation(format!(
-                                    "role {role} has no assigned agent"
-                                ))
-                            })?,
-                    ),
-                    None => None,
-                };
-                assigned.or_else(|| execution.and_then(|execution| execution.agent_id))
-            }
-            .ok_or_else(|| ServiceError::invalid_operation("queued recovery requires an agent"))?
-        };
-        Ok(agent_id)
-    }
-
-    async fn ensure_queued_recovery_role_agent(
-        &self,
-        task: &Task,
-        role: &str,
-        agent_id: &str,
-    ) -> Result<()> {
-        let role = match role {
-            "interactive" | "auditor" => return Ok(()),
-            "executor" => crate::workflow::default_roles::CODER,
-            role => role,
-        };
-        let assignment =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?;
-        if !assignment.is_some_and(|assignment| {
-            assignment.assignee_type == Some(AssigneeKind::Agent)
-                && assignment.assignee_id.as_deref() == Some(agent_id)
-        }) {
-            return Err(ServiceError::invalid_operation(format!(
-                "role {role} is not assigned to agent {agent_id}"
-            )));
-        }
-        Ok(())
-    }
-
-    async fn ensure_queued_recovery_agent_available(&self, agent_id: &str) -> Result<Agent> {
-        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        match compute_effective_status(&self.db, &agent).await? {
-            EffectiveStatus::Active | EffectiveStatus::Busy => Ok(agent),
-            EffectiveStatus::Paused => Err(ServiceError::AgentPaused { agent_id: agent.id }),
-            status => Err(ServiceError::invalid_operation(format!(
-                "agent {agent_id} cannot run recovery: {status}"
-            ))),
-        }
-    }
-
-    pub(crate) async fn dispatch_queued_recovery(&self, task: &Task) -> Result<bool> {
-        let Some(queued) = crate::deferred_dispatch::queued_recovery(task) else {
+        if !changed {
             return Ok(false);
-        };
-        let result = self.dispatch_queued_recovery_inner(task, &queued).await;
-        if let Err(error) = &result {
-            if !matches!(
-                error,
-                ServiceError::Db(
-                    db::DbError::AgentAtCapacity
-                        | db::DbError::VersionConflict
-                        | db::DbError::TaskVersionConflict { .. }
-                )
-            ) {
-                self.restore_failed_queued_recovery(task, &queued, error)
-                    .await?;
-            }
         }
-        result
-    }
+        let result = REPLAYING_RECOVERY
+            .scope(
+                (claimed.id.clone(), queued.id.clone()),
+                crate::task_service::actions::TASK_ACTION_ACTOR.scope(
+                    queued.request.actor.clone(),
+                    Box::pin(self.apply_queued_task_action(claimed, &queued)),
+                ),
+            )
+            .await;
+        // Release only this replay's temporary claim, preserving an owner or
+        // environment wait installed by admission itself.
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+        let release = match deferred.as_ref() {
+            Some(old) => TaskMetadataMutation::SetIf {
+                key: "deferred_dispatch".to_owned(),
+                expected: claim_value.clone(),
+                value: old.clone(),
+            },
+            None => TaskMetadataMutation::RemoveIf {
+                key: "deferred_dispatch".to_owned(),
+                expected: claim_value.clone(),
+            },
+        };
+        TaskRepo::mutate_metadata_with_change(
+            &*self.db,
+            &task.id,
+            Some(current.version),
+            vec![release],
+            &now_rfc3339(),
+        )
+        .await?;
+        result?;
 
-    async fn restore_failed_queued_recovery(
-        &self,
-        task: &Task,
-        queued: &QueuedRecovery,
-        error: &ServiceError,
-    ) -> Result<()> {
         let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        if !crate::deferred_dispatch::queued_recovery(&current)
-            .is_some_and(|current| current.id == queued.id)
+        if crate::deferred_dispatch::queued_recovery(&current)
+            .is_some_and(|value| value.id == queued.id)
         {
-            return Ok(());
-        }
-        let interruption_matches = (current.error_annotation.is_none()
-            && current.blocked_json.is_none())
-            || (current.error_annotation == queued.error_annotation
-                && current.blocked_json == queued.blocked_json);
-        let mut state_superseded = current.status != queued.target_state;
-        if state_superseded && matches!(error, ServiceError::ExecutionAlreadyRunning { .. }) {
-            let project = ProjectRepo::get_by_id(&*self.db, &current.project_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project", current.project_id.clone()))?;
-            let workflow = WorkflowEngine::resolve_workflow_for_task(
-                &current,
-                &project.workflow_definition,
-                &api_types::Actor::system(api_types::SystemComponent::Dispatch),
-            );
-            // Interactive launch can advance an initial state before taking
-            // the slot. Preserve the queued blocker in that new live state.
-            state_superseded = !workflow
-                .state_kind(&current.status)
-                .is_some_and(|kind| kind != api_types::StateKind::Terminal);
-        }
-        if state_superseded
-            || !interruption_matches
-            || current.failed_json.is_some()
-            || current.archived_at.is_some()
-        {
-            // A newer Task decision owns the interruption; only discard this intent.
+            if crate::deferred_dispatch::is_pending(&current, chrono::Utc::now())
+                || crate::deferred_dispatch::current_dispatch_disposition(&current).is_some_and(
+                    |disposition| {
+                        matches!(
+                            disposition.capability.as_str(),
+                            "machine_capacity" | "project_capacity"
+                        )
+                    },
+                )
+            {
+                return Ok(false);
+            }
             TaskRepo::mutate_metadata_and_bump_version(
                 &*self.db,
                 &current.id,
                 current.version,
                 vec![
-                    TaskMetadataMutation::Remove {
+                    TaskMetadataMutation::RemoveIf {
                         key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                        expected: serde_json::to_value(&queued)
+                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
                     },
                     TaskMetadataMutation::Remove {
                         key: "deferred_dispatch".to_owned(),
@@ -479,350 +846,343 @@ impl TaskService {
                 &now_rfc3339(),
             )
             .await?;
-            return Ok(());
         }
-        let reason = error.to_string();
-        let mut annotation_task = current.clone();
-        annotation_task.error_annotation = queued.error_annotation.clone();
-        annotation_task.blocked_json = queued.blocked_json.clone();
-        let mut annotation = self
-            .recovery_annotation(&annotation_task)
-            .unwrap_or_else(|_| {
-                // Resume can queue a fresh launch even when it began without an interruption.
-                serde_json::from_value(json!({
-                    "type": "recovery_required",
-                    "recovery_actions": ["reexecute", "cancel_task"],
-                }))
-                .expect("valid recovery annotation")
-            });
-        annotation.blocking_reason = reason.clone();
-        annotation.message = Some(reason.clone());
-        let mut blocked: Value = queued
-            .blocked_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({ "kind": "recovery_required" }));
-        blocked["reason"] = json!(reason);
-        TaskRepo::restore_queued_recovery(
-            &*self.db,
-            db::RestoreQueuedRecovery {
-                task_id: current.id,
-                expected_version: current.version,
-                queued_recovery_id: queued.id.clone(),
-                error_annotation: Some(
-                    serde_json::to_string(&annotation)
-                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                ),
-                blocked_json: Some(blocked.to_string()),
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        Ok(())
+        Ok(true)
     }
 
-    async fn dispatch_queued_recovery_inner(
+    async fn apply_queued_task_action(
         &self,
-        task: &Task,
-        queued: &QueuedRecovery,
-    ) -> Result<bool> {
-        let deferred = crate::deferred_dispatch::pending_until(task);
-        let interruption_matches = (task.error_annotation.is_none() && task.blocked_json.is_none())
-            || (task.error_annotation == queued.error_annotation
-                && task.blocked_json == queued.blocked_json);
-        // Check occupied Task slots before state invalidation: an unrelated
-        // interactive launch may itself have advanced the Task's state.
-        if interruption_matches && task.failed_json.is_none() && task.archived_at.is_none() {
-            if let Some(running) = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
-                .await?
-                .first()
-            {
-                return Err(ServiceError::execution_already_running(
-                    if running.role == "interactive" {
-                        "interactive"
-                    } else {
-                        "repository"
-                    },
-                    running.id.clone(),
-                ));
-            }
-        }
-        if queued.target_state != task.status
-            || !interruption_matches
-            || task.failed_json.is_some()
-            || task.archived_at.is_some()
-        {
-            let mut mutations = vec![TaskMetadataMutation::RemoveIf {
-                key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
-                expected: serde_json::to_value(queued)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            }];
-            if let Some(deferred) = deferred {
-                mutations.push(TaskMetadataMutation::RemoveIf {
-                    key: "deferred_dispatch".to_owned(),
-                    expected: serde_json::to_value(deferred)
-                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                });
-            }
-            TaskRepo::mutate_metadata_and_bump_version(
-                &*self.db,
-                &task.id,
-                task.version,
-                mutations,
-                &now_rfc3339(),
-            )
-            .await?;
-            return Ok(false);
-        }
-        // An unrelated admitted execution must not silently consume this intent,
-        // or leave it parked behind its own capacity usage.
-        self.ensure_no_running_repository_execution(task).await?;
-        if crate::deferred_dispatch::is_pending(task, chrono::Utc::now()) {
-            return Ok(false);
-        }
-        let mut recovery_task = task.clone();
-        recovery_task.error_annotation = queued.error_annotation.clone();
-        recovery_task.blocked_json = queued.blocked_json.clone();
-        let agent_id = self
-            .queued_recovery_agent(&recovery_task, &queued.request)
-            .await?;
-        let agent = self
-            .ensure_queued_recovery_agent_available(&agent_id)
-            .await?;
-        if !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await? {
-            return Ok(false);
-        }
-        // The short deferral and version CAS fence scans, while the admission
-        // token permits only this replay to consume the marker with its INSERT.
-        let claimed = TaskRepo::update_recovery_metadata_if_no_running_execution(
-            &*self.db,
-            &task.id,
-            task.version,
-            queued.error_annotation.clone(),
-            queued.blocked_json.clone(),
-            None,
-            &now_rfc3339(),
-            None,
-            Vec::new(),
-            vec![TaskMetadataMutation::Set {
-                key: "deferred_dispatch".to_owned(),
-                value: json!({
-                    "not_before": (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
-                    "reason": "recovery queued: agent at capacity",
-                    "target_state": queued.target_state,
-                }),
-            }],
-        )
-        .await?;
-        let result = REPLAYING_RECOVERY
-            .scope((claimed.id.clone(), queued.id.clone()), async {
-                match &queued.request {
-                    QueuedRecoveryRequest::Recover(request) => {
-                        Box::pin(self.recover_task_at_version(
-                            &claimed.id,
-                            request.action,
-                            request.reason.clone(),
-                            request.context.clone(),
-                            claimed.version,
-                        ))
+        task: Task,
+        queued: &crate::deferred_dispatch::QueuedRecovery,
+    ) -> Result<Task> {
+        let request = &queued.request;
+        let reason = match &request.action {
+            api_types::TaskAction::Approve { reason, .. }
+            | api_types::TaskAction::Retry { reason, .. }
+            | api_types::TaskAction::Cancel { reason }
+            | api_types::TaskAction::Hold { reason }
+            | api_types::TaskAction::Release { reason }
+            | api_types::TaskAction::Restart { reason } => reason.clone(),
+            _ => None,
+        };
+        let guidance = match &request.action {
+            api_types::TaskAction::Retry { guidance, .. } => guidance.clone(),
+            api_types::TaskAction::SendBack { guidance } => Some(guidance.clone()),
+            api_types::TaskAction::Release { reason } => reason.clone(),
+            _ => None,
+        };
+        let annotation = queued
+            .error_annotation
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok());
+        let role_launch = matches!(
+            request.offer.reason.as_str(),
+            "ready_to_start" | "initial_retry" | "manually_held" | "role_retry" | "merge_fix_retry"
+        );
+        let apply = async {
+            match request.offer.reason.as_str() {
+                "hard_failure" | "interrupted_restart" => {
+                    let annotation =
+                        annotation.unwrap_or_else(|| api_types::TaskBlockingAnnotation {
+                            annotation_type: api_types::FailureKind::ExecutorFailed,
+                            blocking_reason: "restart".to_owned(),
+                            blocked_by: None,
+                            blocked_at: None,
+                            blocked_execution_id: None,
+                            artifact: None,
+                            message: None,
+                            hook: None,
+                        });
+                    self.restart_task_condition(task, &annotation, reason.clone())
                         .await
+                }
+                "gate_waiting_for_decision"
+                | "human_review_decision"
+                | "human_review_send_back"
+                | "work_ready_to_submit"
+                | "gate_can_reject" => {
+                    let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("project", task.project_id.clone())
+                        })?;
+                    let workflow = WorkflowEngine::resolve_workflow_for_task(
+                        &task,
+                        &project.workflow_definition,
+                        &request.actor,
+                    );
+                    let (trigger, guidance) = match &request.action {
+                        api_types::TaskAction::SendBack { guidance } => {
+                            (api_types::WorkflowTrigger::Reject, Some(guidance.clone()))
+                        }
+                        _ => (api_types::WorkflowTrigger::Accept, None),
+                    };
+                    self.apply_gate_decision(
+                        &task,
+                        &workflow,
+                        trigger,
+                        guidance,
+                        request.actor.clone(),
+                        matches!(
+                            request.offer.reason.as_str(),
+                            "human_review_decision" | "human_review_send_back"
+                        ),
+                    )
+                    .await
+                }
+                "ready_to_start" | "initial_retry" => {
+                    let agent = request.agent_id.clone().ok_or_else(|| {
+                        ServiceError::invalid_operation("accepted start lost its agent")
+                    })?;
+                    let claimed = self
+                        .claim_task(task.id, Assignee::Agent(agent), None)
+                        .await?;
+                    self.start_execution(claimed.execution.id.clone()).await?;
+                    Ok(claimed.task)
+                }
+                "manually_held" | "role_retry" | "merge_fix_retry" => {
+                    let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("project", task.project_id.clone())
+                        })?;
+                    let workflow = WorkflowEngine::resolve_workflow_for_task(
+                        &task,
+                        &project.workflow_definition,
+                        &request.actor,
+                    );
+                    let role = workflow
+                        .states
+                        .iter()
+                        .find(|state| state.name == task.status)
+                        .and_then(crate::workflow::effective_role)
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation("accepted retry lost its workflow role")
+                        })?;
+                    let fresh = match &request.action {
+                        api_types::TaskAction::Retry { fresh_session, .. } => (*fresh_session)
+                            .or(match request.offer.action {
+                                api_types::TaskAction::Retry { fresh_session, .. } => fresh_session,
+                                _ => None,
+                            })
+                            .unwrap_or(request.offer.target_execution_id.is_none()),
+                        _ => false,
+                    };
+                    if !fresh {
+                        let prompt = self
+                            .task_action_role_prompt(&task, &workflow, role, &request.action)
+                            .await?;
+                        if let Some(execution_id) = request.offer.target_execution_id.as_deref() {
+                            let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    ServiceError::not_found("execution", execution_id.to_owned())
+                                })?;
+                            let logical_thread = workflow.states.iter().find(|state| state.name == task.status)
+                            .and_then(|state| state.dispatch.as_ref()).is_some_and(|dispatch| dispatch.execution_policy == Some(api_types::WorkflowExecutionPolicy::ResumeLatestTargetRoleThread));
+                            if logical_thread && execution.agent_session_id.is_none() {
+                                self.dispatch_role_follow_up(
+                                    &task.id,
+                                    role,
+                                    execution.id,
+                                    prompt.clone(),
+                                    "task_action",
+                                )
+                                .await?;
+                                return Ok(TaskRepo::get_by_id(&*self.db, &task.id, false)
+                                    .await?
+                                    .expect("Task remains present"));
+                            }
+                            let result = self
+                                .follow_up_execution(execution.id, prompt, execution.agent_id, None)
+                                .await?;
+                            self.start_execution(result.execution.id.clone()).await?;
+                            return Ok(result.task);
+                        }
                     }
-                    QueuedRecoveryRequest::Resume { resume_reason, .. } => {
-                        let project = ProjectRepo::get_by_id(&*self.db, &claimed.project_id)
+                    let parent = ExecutionRepo::list_by_task(
+                        &*self.db,
+                        &task.id,
+                        db::PageRequest {
+                            cursor: None,
+                            limit: 100,
+                            include_total: false,
+                            sort_by: db::SortBy::CreatedAt,
+                            sort_order: db::SortOrder::Desc,
+                        },
+                    )
+                    .await?
+                    .items
+                    .into_iter()
+                    .find(|execution| {
+                        execution.status != ExecutionStatus::Running
+                            && execution.role == role
+                            && execution.agent_id == request.agent_id
+                    });
+                    if let Some(parent) = parent {
+                        let result = if guidance.is_some() {
+                            Box::pin(
+                                self.re_execute_execution_with_context(parent.id, guidance.clone()),
+                            )
                             .await?
-                            .ok_or_else(|| {
-                                ServiceError::not_found("project", claimed.project_id.clone())
-                            })?;
-                        let workflow = WorkflowEngine::resolve_workflow_for_task(
-                            &claimed,
-                            &project.workflow_definition,
-                            &api_types::Actor::system(api_types::SystemComponent::Dispatch),
-                        );
-                        Box::pin(self.resume_task_execution(
-                            &claimed,
-                            &workflow,
-                            resume_reason.clone(),
-                            claimed.version,
-                        ))
-                        .await
+                        } else {
+                            Box::pin(self.re_execute_execution(parent.id)).await?
+                        };
+                        self.start_execution(result.execution.id.clone()).await?;
+                        return Ok(result.task);
+                    }
+                    let agent_id = request.agent_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation("accepted retry lost its agent")
+                    })?;
+                    Box::pin(self.dispatch_recovery_role(
+                        &task,
+                        &project,
+                        &workflow,
+                        agent_id,
+                        role,
+                        &request.action,
+                    ))
+                    .await?;
+                    Ok(TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?)
+                }
+                "entry_barrier_blocked" | "state_hooks_failed" => {
+                    if matches!(
+                        &request.action,
+                        api_types::TaskAction::Retry {
+                            refresh_workspace: Some(true),
+                            ..
+                        }
+                    ) {
+                        self.refresh_workspace_and_retry_entry(task, reason.clone())
+                            .await
+                    } else if task.condition.read().entry_recorded {
+                        self.retry_entry_checks(task, reason.clone()).await
+                    } else {
+                        self.recover_retry_current_state_hooks(task, reason.clone())
+                            .await
                     }
                 }
-            })
-            .await;
-        if let Err(error) = &result {
-            if !matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
-                // An admission CAS refusal during our own replay can be
-                // permanent. Only a competing scan's claim CAS is retried.
-                self.restore_failed_queued_recovery(&claimed, queued, error)
-                    .await?;
+                "entry_barrier_override" | "state_hooks_override" => {
+                    self.override_entry_checks_once(
+                        task,
+                        Some(reason.clone().unwrap_or_default()),
+                        None,
+                    )
+                    .await
+                }
+                "retry_budget_exhausted" => {
+                    let mut evidence = task;
+                    evidence.error_annotation = queued.error_annotation.clone();
+                    evidence.blocked_json = queued.blocked_json.clone();
+                    evidence.condition =
+                        db::map_legacy_condition(&db::LegacyConditionInput::from(&evidence));
+                    if matches!(
+                        &request.action,
+                        api_types::TaskAction::Retry {
+                            reset_budget: Some(false),
+                            ..
+                        }
+                    ) {
+                        self.permit_one_task_retry(evidence, reason.clone(), guidance)
+                            .await
+                    } else {
+                        self.reset_task_retry_budget(evidence, reason.clone()).await
+                    }
+                }
+                "review_checks_retry" => {
+                    self.apply_review_check_retry(
+                        &task,
+                        request.offer.clone(),
+                        request.action.clone(),
+                        request.actor.clone(),
+                    )
+                    .await
+                }
+                "review_failed" => self.retry_review_entry(task, guidance).await,
+                "review_owner_retry" => self.retry_review_entry(task, guidance).await,
+                "merge_retry_remediation" => {
+                    let mut evidence = task;
+                    evidence.error_annotation = queued.error_annotation.clone();
+                    evidence.blocked_json = queued.blocked_json.clone();
+                    evidence.condition =
+                        db::map_legacy_condition(&db::LegacyConditionInput::from(&evidence));
+                    self.continue_task_process(evidence, guidance.clone(), guidance)
+                        .await
+                }
+                "manual_merge_repair" => {
+                    self.recover_manual_merge_repair_for_review(task, guidance)
+                        .await
+                }
+                "merge_gate_retry" => self.recover_retry_current_state_hooks(task, guidance).await,
+                "pull_request_merge_wait" => {
+                    self.recover_pull_request_merge_wait(task, guidance).await
+                }
+                "review_needs_owner" | "reviewer_failed_manual_pass" | "failed_review_override" => {
+                    let finding = (request.offer.reason == "review_needs_owner"
+                        && matches!(
+                            request.action,
+                            api_types::TaskAction::Approve {
+                                override_checks: Some(false),
+                                ..
+                            }
+                        ))
+                    .then_some(annotation.as_ref())
+                    .flatten();
+                    self.recover_manual_review_pass(
+                        task,
+                        reason.clone().unwrap_or_default(),
+                        finding,
+                        request.action.clone(),
+                    )
+                    .await
+                }
+                _ => Err(ServiceError::invalid_operation(
+                    "accepted Task action has no apply plan",
+                )),
             }
-        }
-        result?;
-        let current = TaskRepo::get_by_id(&*self.db, &claimed.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", claimed.id.clone()))?;
-        match crate::deferred_dispatch::queued_recovery(&current) {
-            None => Ok(true),
-            Some(current_queue) if current_queue.id != queued.id => Ok(false),
-            Some(_) => {
-                // Non-execution recoveries can finish without an INSERT.
-                TaskRepo::mutate_metadata_and_bump_version(
-                    &*self.db,
-                    &current.id,
-                    current.version,
-                    vec![
-                        TaskMetadataMutation::Remove {
-                            key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
-                        },
-                        TaskMetadataMutation::Remove {
-                            key: "deferred_dispatch".to_owned(),
-                        },
-                    ],
-                    &now_rfc3339(),
-                )
-                .await?;
-                Ok(true)
+        };
+        let updated = if role_launch {
+            Box::pin(apply).await?
+        } else {
+            crate::task_service::actions::TASK_ACTION_COMMAND
+                .scope((), Box::pin(apply))
+                .await?
+        };
+        if role_launch {
+            if matches!(
+                request.action,
+                api_types::TaskAction::Retry { .. } | api_types::TaskAction::Release { .. }
+            ) {
+                self.publish(ForgeEvent {
+                    event_type: "task.recovery_action".to_owned(),
+                    entity_id: updated.id.clone(),
+                    timestamp: event_timestamp(),
+                    context: EventContext::TaskRecovered {
+                        project_id: updated.project_id.clone(),
+                        reason: reason.unwrap_or_else(|| request.action.verb().to_owned()),
+                    },
+                });
             }
+            return Ok(updated);
         }
+        if crate::deferred_dispatch::queued_recovery(&updated)
+            .is_some_and(|intent| intent.id != queued.id)
+        {
+            return Ok(updated);
+        }
+        self.queue_deferred_action_role(
+            updated,
+            request.offer.clone(),
+            request.action.clone(),
+            request.actor.clone(),
+        )
+        .await
     }
 
     fn parse_blocking_annotation(&self, task: &Task) -> Option<api_types::TaskBlockingAnnotation> {
-        let annotation = task.error_annotation.as_deref()?;
-        match serde_json::from_str::<api_types::TaskAnnotation>(annotation) {
-            Ok(api_types::TaskAnnotation::Blocking(annotation)) => Some(annotation),
-            Ok(api_types::TaskAnnotation::Legacy(_)) => None,
-            Err(_) => None,
-        }
-    }
-
-    fn recovery_annotation(&self, task: &Task) -> Result<api_types::TaskBlockingAnnotation> {
-        if let Some(raw_failed) = task.failed_json.as_deref() {
-            // A hard Task failure supersedes any older interruption
-            // annotation, matching the public exception projection and the
-            // closed ResetToInitial/CancelTask check above.
-            let mut annotation = metadata_recovery_annotation(
-                raw_failed,
-                &[
-                    api_types::RecoveryAction::ResetToInitial,
-                    api_types::RecoveryAction::CancelTask,
-                ],
-            )?;
-            annotation.recovery_actions = vec![
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ];
-            return Ok(annotation);
-        }
-        let typed_annotation = self.parse_blocking_annotation(task);
-        if let Some(annotation) = typed_annotation
-            .as_ref()
-            .filter(|annotation| !annotation.recovery_actions.is_empty())
-        {
-            // A populated typed annotation is the current recovery contract.
-            // The blocked/failed JSON projections below exist for legacy rows
-            // and must not replace or widen its explicit action set.
-            return Ok(annotation.clone());
-        }
-        if task
-            .blocked_json
-            .as_deref()
-            .is_some_and(is_retry_exhausted_blocked_metadata)
-        {
-            if let Some(raw_blocked) = task.blocked_json.as_deref() {
-                return metadata_recovery_annotation(
-                    raw_blocked,
-                    &[
-                        api_types::RecoveryAction::RetryHook,
-                        api_types::RecoveryAction::ResumeProcess,
-                        api_types::RecoveryAction::ResetRetryWindow,
-                        api_types::RecoveryAction::OpenInteractive,
-                        api_types::RecoveryAction::CancelTask,
-                    ],
-                );
-            }
-        }
-        if task.status == crate::workflow::default_states::MERGING
-            && task
-                .blocked_json
-                .as_deref()
-                .is_some_and(is_recoverable_merge_gate_blocked_metadata)
-        {
-            if let Some(raw_blocked) = task.blocked_json.as_deref() {
-                return metadata_recovery_annotation(
-                    raw_blocked,
-                    &[
-                        api_types::RecoveryAction::RetryHook,
-                        api_types::RecoveryAction::OpenInteractive,
-                        api_types::RecoveryAction::CancelTask,
-                    ],
-                );
-            }
-        }
-        if task.status == crate::workflow::default_states::MERGE_FAILED
-            && task
-                .blocked_json
-                .as_deref()
-                .is_some_and(is_recoverable_merge_fix_blocked_metadata)
-        {
-            if let Some(raw_blocked) = task.blocked_json.as_deref() {
-                return metadata_recovery_annotation(
-                    raw_blocked,
-                    &[
-                        api_types::RecoveryAction::RetryHook,
-                        api_types::RecoveryAction::Reexecute,
-                        api_types::RecoveryAction::OpenInteractive,
-                        api_types::RecoveryAction::CancelTask,
-                    ],
-                );
-            }
-        }
-        if let Some(annotation) = typed_annotation {
-            return Ok(annotation);
-        }
-        if let Some(raw_blocked) = task.blocked_json.as_deref() {
-            return metadata_recovery_annotation(
-                raw_blocked,
-                &[
-                    api_types::RecoveryAction::ResumeSession,
-                    api_types::RecoveryAction::Reexecute,
-                    api_types::RecoveryAction::ResetToInitial,
-                    api_types::RecoveryAction::CancelTask,
-                ],
-            );
-        }
-        Err(ServiceError::invalid_operation(
-            "task has no blocking recovery annotation",
-        ))
-    }
-
-    fn validate_recovery_action(
-        &self,
-        annotation: &api_types::TaskBlockingAnnotation,
-        action: &api_types::RecoveryAction,
-    ) -> Result<()> {
-        if annotation.recovery_actions.contains(action) {
-            Ok(())
-        } else {
-            // Name the action the way the caller sent it, and say what this
-            // Task will actually accept — a rejection that only repeats the
-            // refused name leaves the caller guessing at the authority set.
-            let allowed = annotation
-                .recovery_actions
-                .iter()
-                .map(recovery_action_wire_name)
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(ServiceError::invalid_operation(format!(
-                "recovery action '{}' is not allowed for this task; allowed: {}",
-                recovery_action_wire_name(action),
-                if allowed.is_empty() {
-                    "none".to_owned()
-                } else {
-                    allowed
-                }
-            )))
-        }
+        task.condition.read().diagnostic
     }
 
     /// Clear the interruption projection using the exact Task snapshot that
@@ -830,7 +1190,14 @@ impl TaskService {
     /// a caller that loaded an older annotation must never clear a newer one
     /// that won a concurrent update.
     pub(crate) async fn clear_recovery_metadata_at_version(&self, task: &Task) -> Result<Task> {
-        let previous_reason = interruption_reason(task.blocked_json.as_deref());
+        if Self::is_replaying_recovery(&task.id) {
+            let mut cleared = task.clone();
+            cleared.error_annotation = None;
+            cleared.blocked_json = None;
+            cleared.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&cleared));
+            return Ok(cleared);
+        }
+        let previous_reason = task.condition.read().interruption.map(|i| i.reason);
         let updated = TaskRepo::update(
             &*self.db,
             UpdateTask {
@@ -850,7 +1217,7 @@ impl TaskService {
             },
         )
         .await?;
-        if task.blocked_json.is_some() {
+        if task.condition.read().interruption_present {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
                 entity_id: updated.id.clone(),
@@ -880,6 +1247,9 @@ impl TaskService {
         workspace_id: Option<&str>,
         execution_role: &str,
     ) {
+        if Self::is_replaying_recovery(&cleared_task.id) {
+            return;
+        }
         // Restore only if the clear is still the latest Task write and no
         // replacement execution was admitted in the clear-to-launch gap. The
         // DB boundary checks both facts under one write transaction; in
@@ -895,6 +1265,7 @@ impl TaskService {
             workspace_id,
             overlapping_execution_roles(execution_role),
             Vec::new(),
+            None,
         )
         .await;
         if let Err(error) = result {
@@ -906,53 +1277,6 @@ impl TaskService {
         }
     }
 
-    pub async fn unblock_task(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.blocked_json.is_none() {
-            return Err(ServiceError::invalid_operation("task is not blocked"));
-        }
-        let previous_reason = interruption_reason(task.blocked_json.as_deref());
-        let updated = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(None),
-                blocked_json: Some(None),
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        super::clear_execution_retry_metadata(&self.db, &updated).await?;
-        self.publish(ForgeEvent {
-            event_type: "task.unblocked".to_owned(),
-            entity_id: updated.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskUnblocked {
-                project_id: updated.project_id.clone(),
-                previous_reason: previous_reason.clone(),
-            },
-        });
-        tracing::info!(
-            task_id = %updated.id,
-            status = %updated.status,
-            previous_reason = ?previous_reason,
-            "task unblocked"
-        );
-        Ok(updated)
-    }
-
     pub async fn fail_task(
         &self,
         task_id: impl Into<String>,
@@ -960,11 +1284,22 @@ impl TaskService {
         kind: Option<api_types::FailureKind>,
         execution_id: Option<String>,
     ) -> Result<Task> {
-        let task_id = task_id.into();
+        let task_id: String = task_id.into();
+        let reason: String = reason.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "fail_task",
+                    serde_json::json!([task_id, reason, kind, execution_id]),
+                    false,
+                )
+                .await;
+        }
+
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let reason = reason.into();
         let failed_meta = json!({
             "reason": reason,
             "created_at": now_rfc3339(),
@@ -1010,528 +1345,6 @@ impl TaskService {
             "task marked as failed"
         );
         Ok(updated)
-    }
-
-    pub async fn restart_failed_task(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.failed_json.is_none() {
-            return Err(ServiceError::invalid_operation("task has not failed"));
-        }
-        let previous_reason = interruption_reason(task.failed_json.as_deref());
-        let updated = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(None),
-                blocked_json: None,
-                failed_json: Some(None),
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        self.publish(ForgeEvent {
-            event_type: "task.restarted".to_owned(),
-            entity_id: updated.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRestarted {
-                project_id: updated.project_id.clone(),
-                previous_reason: previous_reason.clone(),
-                new_execution_id: None,
-            },
-        });
-        tracing::info!(
-            task_id = %updated.id,
-            status = %updated.status,
-            previous_reason = ?previous_reason,
-            "failed task restarted"
-        );
-        Ok(updated)
-    }
-
-    async fn recover_resume_session(
-        &self,
-        task: Task,
-        annotation: &api_types::TaskBlockingAnnotation,
-        reason: Option<String>,
-        context: Option<String>,
-    ) -> Result<Task> {
-        let original_task = task.clone();
-        let blocked_execution_id = annotation.blocked_execution_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation("resume_session requires blocked_execution_id")
-        })?;
-        let blocked_execution = ExecutionRepo::get_by_id(&*self.db, blocked_execution_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("execution", blocked_execution_id.to_owned()))?;
-        let agent_id = blocked_execution
-            .agent_id
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ServiceError::invalid_operation("blocked execution has no assignee"))?;
-        let agent_session_id = blocked_execution.agent_session_id.clone().ok_or_else(|| {
-            ServiceError::invalid_operation("blocked execution has no resumable session")
-        })?;
-        let snapshot_json = blocked_execution
-            .executor_config_snapshot_json
-            .as_deref()
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "blocked execution missing executor config snapshot",
-                )
-            })?;
-        if blocked_execution.task_id != task.id {
-            return Err(ServiceError::invalid_operation(
-                "blocked execution does not belong to this task",
-            ));
-        }
-        // An annotation can outlive the Review settlement that produced it
-        // (for example when a worker finishes just before a coordinator
-        // retries the recovery call).  Do not clear Task recovery metadata or
-        // prepare a workspace for a session that the admission layer is
-        // guaranteed to reject because its exact Review is terminal.
-        if terminal_review_is_bound_to_execution(&self.db, &blocked_execution).await? {
-            return Err(ServiceError::invalid_operation(
-                "resume_session cannot resume a reviewer execution whose Review attempt is terminal; start a fresh review attempt",
-            ));
-        }
-        let updated_snapshot =
-            executor_snapshot_with_resume_thread(snapshot_json, &agent_session_id)?;
-        let updated_snapshot = if let Some(ctx) = context.as_deref() {
-            let mut snap: serde_json::Value =
-                serde_json::from_str(&updated_snapshot).map_err(|e| {
-                    ServiceError::invalid_operation(format!("failed to parse snapshot: {e}"))
-                })?;
-            if let Some(obj) = snap.as_object_mut() {
-                obj.insert(
-                    "resume_context".to_owned(),
-                    serde_json::Value::String(ctx.to_owned()),
-                );
-            }
-            serde_json::to_string(&snap).map_err(|e| {
-                ServiceError::invalid_operation(format!("failed to serialize snapshot: {e}"))
-            })?
-        } else {
-            updated_snapshot
-        };
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResumeSession,
-            )),
-        );
-        let effective_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "resume_session cannot resume a task in state {} with no effective workflow role",
-                    task.status
-                ))
-            })?;
-        if !execution_role_matches_effective_role(&blocked_execution.role, effective_role) {
-            return Err(ServiceError::invalid_operation(format!(
-                "resume_session execution role '{}' does not match current effective workflow role '{}'",
-                blocked_execution.role, effective_role
-            )));
-        }
-
-        // Validate all inputs that can reject a typed ResumeSession before the
-        // manual-stop annotation is touched. The annotation itself blocks
-        // ordered admission for coordination roots, so that guard runs again
-        // after the versioned clear below.
-        self.ensure_task_runnable(&task).await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
-            .await?;
-        let updated_task = self
-            .recover_task_transition_to_work_state(task, &workflow)
-            .await?;
-        let cleared_task = self
-            .clear_recovery_metadata_at_version(&updated_task)
-            .await?;
-        if let Err(error) = self
-            .ensure_ordered_execution_admission(&cleared_task, &blocked_execution.role)
-            .await
-        {
-            self.restore_recovery_metadata_after_failed_resume(
-                &cleared_task,
-                &original_task,
-                None,
-                &blocked_execution.role,
-            )
-            .await;
-            return Err(error);
-        }
-        if let Err(error) = self.ensure_task_runnable(&cleared_task).await {
-            self.restore_recovery_metadata_after_failed_resume(
-                &cleared_task,
-                &original_task,
-                None,
-                &blocked_execution.role,
-            )
-            .await;
-            return Err(error);
-        }
-        let now = now_rfc3339();
-        let execution = match self
-            .create_running_execution(
-                CreateExecution {
-                    id: new_uuid_v4(),
-                    task_id: cleared_task.id.clone(),
-                    agent_id: Some(agent_id),
-                    role: blocked_execution.role.clone(),
-                    status: ExecutionStatus::Running,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    parent_execution_id: Some(blocked_execution.id.clone()),
-                    agent_session_id: Some(agent_session_id),
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: match (
-                        context.as_deref(),
-                        blocked_execution
-                            .prompt
-                            .as_ref()
-                            .or(blocked_execution.summary.as_ref()),
-                    ) {
-                        (Some(ctx), Some(orig)) => Some(format!("[User context: {ctx}]\n\n{orig}")),
-                        (Some(ctx), None) => Some(format!("[User context: {ctx}]")),
-                        (None, s) => s.cloned(),
-                    },
-                    logs_path: None,
-                    before_sha: workspace.before_sha.clone(),
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json: Some(updated_snapshot),
-                    workspace_id: Some(workspace.id.clone()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-                workspace_created_by_attempt,
-            )
-            .await
-        {
-            Ok(execution) => execution,
-            Err(error) => {
-                self.restore_recovery_metadata_after_failed_resume(
-                    &cleared_task,
-                    &original_task,
-                    None,
-                    &blocked_execution.role,
-                )
-                .await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = self
-            .spawn_recovery_execution(
-                cleared_task.id.clone(),
-                execution.id.clone(),
-                "resume_session",
-            )
-            .await
-        {
-            self.restore_recovery_metadata_after_failed_resume(
-                &cleared_task,
-                &original_task,
-                None,
-                &blocked_execution.role,
-            )
-            .await;
-            return Err(error);
-        }
-        if let Err(error) = super::clear_execution_retry_metadata(&self.db, &cleared_task).await {
-            tracing::warn!(
-                task_id = %cleared_task.id,
-                %error,
-                "failed to clear execution retry metadata after session resume"
-            );
-        }
-        self.publish(ForgeEvent {
-            event_type: "task.execution_resumed".to_owned(),
-            entity_id: cleared_task.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRecovered {
-                project_id: cleared_task.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "resume_session".to_owned()),
-            },
-        });
-        Ok(cleared_task)
-    }
-
-    async fn recover_reexecute(
-        &self,
-        task: Task,
-        annotation: &api_types::TaskBlockingAnnotation,
-        reason: Option<String>,
-        context: Option<String>,
-    ) -> Result<Task> {
-        let recovered =
-            if let Some(blocked_execution_id) = annotation.blocked_execution_id.as_deref() {
-                // Keep the large re-execution future out of the enclosing
-                // coordination-tool recovery future.
-                let result =
-                    Box::pin(self.re_execute_execution_for_recovery(blocked_execution_id, context))
-                        .await?;
-                if let Err(error) = self
-                    .spawn_recovery_execution(
-                        result.task.id.clone(),
-                        result.execution.id.clone(),
-                        "reexecute",
-                    )
-                    .await
-                {
-                    // A Running row may already have been admitted even when
-                    // dispatch startup fails. The conditional restore refuses
-                    // to put the old blocker back over that live attempt.
-                    self.restore_recovery_metadata_after_failed_resume(
-                        &result.task,
-                        &task,
-                        None,
-                        &result.execution.role,
-                    )
-                    .await;
-                    return Err(error);
-                }
-                result.task
-            } else {
-                self.recover_reexecute_current_state(task, context).await?
-            };
-        self.publish(ForgeEvent {
-            event_type: "task.recovery_action".to_owned(),
-            entity_id: recovered.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRecovered {
-                project_id: recovered.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "reexecute".to_owned()),
-            },
-        });
-        Ok(recovered)
-    }
-
-    async fn recover_reexecute_current_state(
-        &self,
-        task: Task,
-        context: Option<String>,
-    ) -> Result<Task> {
-        super::ensure_plan_publication_transition_authority(&task, None)?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::Reexecute,
-            )),
-        );
-        let state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "cannot re-execute task in unknown state {}",
-                    task.status
-                ))
-            })?;
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
-            return Err(ServiceError::invalid_operation(format!(
-                "cannot re-execute a task in terminal status {}",
-                task.status
-            )));
-        }
-        let role_name = crate::workflow::effective_role(state).ok_or_else(|| {
-            ServiceError::invalid_operation(format!("state {} has no executable role", task.status))
-        })?;
-        self.ensure_ordered_execution_admission(&task, role_name)
-            .await?;
-        let assignment =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(format!(
-                        "task has no assignment for role {role_name}"
-                    ))
-                })?;
-        if assignment.assignee_type != Some(AssigneeKind::Agent) {
-            return Err(ServiceError::invalid_operation(format!(
-                "role {role_name} is not assigned to an agent"
-            )));
-        }
-        let agent_id = assignment.assignee_id.ok_or_else(|| {
-            ServiceError::invalid_operation(format!("role {role_name} has no assigned agent"))
-        })?;
-        let executions = ExecutionRepo::list_running_by_task(&*self.db, &task.id).await?;
-        if let Some(running) = executions
-            .iter()
-            .find(|execution| execution.role == role_name)
-        {
-            return Err(ServiceError::execution_already_running(
-                role_name,
-                running.id.clone(),
-            ));
-        }
-
-        let state_config = state.config.clone();
-        let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
-        let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
-        let dispatch_ctx = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &task.status,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            &workflow,
-        )
-        .await?;
-        let (prompt, _selection) =
-            build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
-        let summary = prompt.execution_input(context.as_deref());
-        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        self.ensure_task_runnable(&task).await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
-            .await?;
-        let executor_config_snapshot_json =
-            build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
-        // Keep the exact snapshot that authorized recovery.  Clear the
-        // interruption projection only after all preparatory work succeeds;
-        // if admission or dispatch then fails, restore it only while the
-        // clear is still current and no replacement is running.
-        let original_recovery_task = task.clone();
-        let recovered = self.clear_recovery_metadata_at_version(&task).await?;
-        // A reviewer execution durably binds the current Review attempt, and
-        // that binding only accepts a Running attempt. Entering `review`
-        // opens one through the transition hooks, but recovery re-executes
-        // inside the state -- so once a reviewer execution had died and
-        // settled its attempt, which is the normal shape after an executor
-        // failure, `reexecute` rejected every attempt as a bare
-        // `version_conflict` and the Task could not be recovered at all.
-        // Apply the rule dispatch already uses: reuse a live attempt,
-        // otherwise open one for the current candidate.
-        if role_name == crate::workflow::default_roles::REVIEWER {
-            if let Err(error) = self
-                .ensure_review_attempt_for_recovery(&recovered, &project)
-                .await
-            {
-                self.restore_recovery_metadata_after_failed_resume(
-                    &recovered,
-                    &original_recovery_task,
-                    None,
-                    role_name,
-                )
-                .await;
-                return Err(error);
-            }
-        }
-        let now = now_rfc3339();
-        let execution = match self
-            .create_running_execution(
-                CreateExecution {
-                    id: new_uuid_v4(),
-                    task_id: recovered.id.clone(),
-                    agent_id: Some(agent.id.clone()),
-                    role: role_name.to_owned(),
-                    status: ExecutionStatus::Running,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    parent_execution_id: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: Some(summary),
-                    logs_path: None,
-                    before_sha: workspace.before_sha.clone(),
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json,
-                    workspace_id: Some(workspace.id.clone()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-                workspace_created_by_attempt,
-            )
-            .await
-        {
-            Ok(execution) => execution,
-            Err(error) => {
-                self.restore_recovery_metadata_after_failed_resume(
-                    &recovered,
-                    &original_recovery_task,
-                    None,
-                    role_name,
-                )
-                .await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = self
-            .spawn_recovery_execution(
-                recovered.id.clone(),
-                execution.id.clone(),
-                "reexecute_current_state",
-            )
-            .await
-        {
-            self.restore_recovery_metadata_after_failed_resume(
-                &recovered,
-                &original_recovery_task,
-                None,
-                role_name,
-            )
-            .await;
-            return Err(error);
-        }
-        if let Err(error) = super::clear_execution_retry_metadata(&self.db, &recovered).await {
-            tracing::warn!(
-                task_id = %recovered.id,
-                %error,
-                "failed to clear execution retry metadata after current-state re-execute"
-            );
-        }
-        tracing::info!(
-            task_id = %task.id,
-            execution_id = %execution.id,
-            role = %role_name,
-            "recovery re-execute dispatched current state role"
-        );
-        Ok(recovered)
     }
 
     /// Reuse the Task's live Review attempt, or open one for the current
@@ -1611,31 +1424,29 @@ impl TaskService {
         Ok(())
     }
 
-    async fn spawn_recovery_execution(
+    pub(crate) async fn reset_task_retry_budget(
         &self,
-        _task_id: String,
-        execution_id: String,
-        _recovery_action: &'static str,
-    ) -> Result<()> {
-        self.start_execution(execution_id).await?;
-        Ok(())
-    }
-
-    async fn recover_reset_retry_window(&self, task: Task, reason: Option<String>) -> Result<Task> {
-        let reason = optional_recovery_reason(reason, "reset_retry_window");
-        let has_exhausted_annotation = self
-            .parse_blocking_annotation(&task)
-            .as_ref()
-            .is_some_and(crate::task_diagnostics::is_retry_budget_exhausted);
-        let (gate_state, budget, count) = self.current_gate_retry_budget(&task).await?;
-        if count < i64::from(budget) && !has_exhausted_annotation {
-            return Err(ServiceError::conflict(format!(
-                "retry window for state {gate_state} is not exhausted: {count}/{budget}"
-            )));
-        }
-        let resume_after_reset = if task.status == gate_state {
+        task: Task,
+        reason: Option<String>,
+    ) -> Result<Task> {
+        let reason = optional_recovery_reason(reason, "retry");
+        let (gate_state, _budget, _count) = self.current_gate_retry_budget(&task).await?;
+        // A coordination root has no implementation run to go back to: its
+        // retry is review-only. The aggregate review runs again in place,
+        // under the fresh budget, instead of moving the root to a working
+        // state where no role may run for it.
+        let review_only = task.parent_task_id.is_none()
+            && task.status == gate_state
+            && gate_state == crate::workflow::default_states::REVIEW
+            && crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
+        let resume_after_reset = if review_only {
+            None
+        } else if task.status == gate_state {
             let failed_review = if gate_state == crate::workflow::default_states::REVIEW {
-                self.latest_review_for_task(&task.id).await?.status == ReviewStatus::Failed
+                ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &[task.id.as_str()])
+                    .await?
+                    .first()
+                    .is_some_and(|review| review.status == ReviewStatus::Failed)
             } else {
                 false
             };
@@ -1652,21 +1463,32 @@ impl TaskService {
         } else {
             None
         };
-        let transition_log = recovery_marker(
+        let mut transition_log = recovery_marker(
             &task.id,
             &gate_state,
-            "reset_retry_window",
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResetRetryWindow,
+            "retry",
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
             )),
             &reason,
+        );
+        transition_log.bridge = api_types::TransitionBridge::recovery("retry", true);
+        transition_log.hook_results_json = Some(
+            serde_json::to_string(&vec![api_types::HookResultEntry {
+                action: "retry".to_owned(),
+                phase: "action".to_owned(),
+                outcome: "reset_budget".to_owned(),
+                duration_ms: None,
+                error: None,
+            }])
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
         );
         let updated = self
             .clear_retry_exhausted_blocking_metadata_with_marker(&task, transition_log.clone())
             .await?;
         self.publish_recovery_applied(
             &updated,
-            "reset_retry_window",
+            "retry",
             Some(&gate_state),
             Some(&transition_log.id),
         );
@@ -1677,36 +1499,82 @@ impl TaskService {
         // invalidates any dispatch disposition so the next scan reconsiders it.
         if let Some(plan) = resume_after_reset {
             return self
-                .recover_resume_process_with_plan(updated, Some(reason), None, plan, false)
+                .continue_task_process_with_plan(updated, Some(reason), None, plan, false)
                 .await;
+        }
+        if review_only {
+            let id = uuid::Uuid::parse_str(&updated.id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let (task, _) = Box::pin(self.rerun_review(id)).await?;
+            return Ok(task);
         }
         Ok(updated)
     }
 
-    async fn recover_proceed_once(
+    /// Clear a coordination root's exhausted review budget without running
+    /// anything: the first half of sending the root back for a corrective
+    /// subtask. The marker is the new counting boundary, so the aggregate
+    /// review that follows the corrective work starts a fresh budget.
+    pub(crate) async fn reset_root_review_budget_for_reopen(
+        &self,
+        task: &Task,
+        reason: &str,
+    ) -> Result<Task> {
+        let (gate_state, _budget, _count) = self.current_gate_retry_budget(task).await?;
+        let mut transition_log = recovery_marker(
+            &task.id,
+            &gate_state,
+            "retry",
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+            )),
+            reason,
+        );
+        transition_log.bridge = api_types::TransitionBridge::recovery("retry", true);
+        transition_log.hook_results_json = Some(
+            serde_json::to_string(&vec![api_types::HookResultEntry {
+                action: "retry".to_owned(),
+                phase: "action".to_owned(),
+                outcome: "reset_budget".to_owned(),
+                duration_ms: None,
+                error: None,
+            }])
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        );
+        self.clear_retry_exhausted_blocking_metadata_with_marker(task, transition_log)
+            .await
+    }
+
+    pub(crate) async fn permit_one_task_retry(
         &self,
         task: Task,
         reason: Option<String>,
         context: Option<String>,
     ) -> Result<Task> {
-        let reason = required_recovery_reason(reason, "proceed_once")?;
+        let reason = required_recovery_reason(reason, "retry")?;
 
-        if task.entry_barrier_json.is_some() {
+        if task.condition.read().entry_recorded {
             let transition_log = recovery_marker(
                 &task.id,
                 &task.status,
-                "proceed_once",
-                &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                    api_types::RecoveryAction::ProceedOnce,
+                "retry",
+                &TaskService::task_action_actor(api_types::Actor::user(
+                    api_types::UserActionSource::Action(api_types::TaskAction::Retry {
+                        reason: None,
+                        fresh_session: None,
+                        refresh_workspace: None,
+                        reset_budget: Some(false),
+                        guidance: None,
+                    }),
                 )),
                 &reason,
             );
             let recovered = self
-                .recover_skip_hook_once(task, Some(reason), Some(transition_log.clone()))
+                .override_entry_checks_once(task, Some(reason), Some(transition_log.clone()))
                 .await?;
             self.publish_recovery_applied(
                 &recovered,
-                "proceed_once",
+                "retry",
                 Some(&recovered.status),
                 Some(&transition_log.id),
             );
@@ -1719,10 +1587,10 @@ impl TaskService {
             .is_some_and(crate::task_diagnostics::is_retry_budget_exhausted);
         let (gate_state, budget, count) = self.current_gate_retry_budget(&task).await?;
         if gate_state != crate::workflow::default_states::REVIEW
-            || (count < i64::from(budget) && !has_exhausted_annotation)
+            || (db::budget::allows_retry(i64::from(budget), count) && !has_exhausted_annotation)
         {
             return Err(ServiceError::invalid_operation(format!(
-                "proceed_once is not supported for the current exception in state {}",
+                "retry without resetting the budget is not supported for the current exception in state {}",
                 task.status
             )));
         }
@@ -1733,9 +1601,15 @@ impl TaskService {
         let mut transition_log = recovery_marker(
             &task.id,
             &gate_state,
-            "proceed_once",
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ProceedOnce,
+            "retry",
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: Some(false),
+                    guidance: None,
+                }),
             )),
             &transition_reason,
         );
@@ -1752,7 +1626,7 @@ impl TaskService {
             crate::wake_task_dispatch(
                 &self.db,
                 &updated.id,
-                "proceed_once cleared an exhausted gate blocker",
+                "one retry cleared an exhausted gate blocker",
             )
             .await?;
             let recovered = TaskRepo::get_by_id(&*self.db, &updated.id, false)
@@ -1760,7 +1634,7 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("task", updated.id.clone()))?;
             self.publish_recovery_applied(
                 &recovered,
-                "proceed_once",
+                "retry",
                 Some(&gate_state),
                 Some(&transition_log.id),
             );
@@ -1773,8 +1647,14 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ProceedOnce,
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: Some(false),
+                    guidance: None,
+                }),
             )),
         );
         let target = workflow
@@ -1789,10 +1669,14 @@ impl TaskService {
                 task.id.clone(),
                 target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some(transition_reason),
-                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
-                        api_types::RecoveryAction::ProceedOnce,
+                    triggered_by: TaskService::task_action_actor(api_types::Actor::user(
+                        api_types::UserActionSource::Action(api_types::TaskAction::Approve {
+                            reason: None,
+                            override_checks: Some(true),
+                        }),
                     )),
                     rejection: true,
                     defer_dispatch_seconds: None,
@@ -1807,78 +1691,25 @@ impl TaskService {
         TransitionLogRepo::insert(&*self.db, transition_log.clone()).await?;
         self.publish_recovery_applied(
             &recovered,
-            "proceed_once",
+            "retry",
             Some(&gate_state),
             Some(&transition_log.id),
         );
         Ok(recovered)
     }
 
-    async fn recover_open_interactive(
-        &self,
-        task: Task,
-        annotation: Option<&api_types::TaskBlockingAnnotation>,
-        reason: Option<String>,
-        context: Option<String>,
-    ) -> Result<Task> {
-        let message = context
-            .or(reason.clone())
-            .unwrap_or_else(|| "open_interactive".to_owned());
-        if let Some(execution) = self
-            .interactive_follow_up_execution(&task, annotation)
-            .await?
-        {
-            let result = self
-                .follow_up_interactive_execution(execution.id, message, execution.agent_id, None)
-                .await?;
-            // `follow_up_interactive_execution` only creates the Running row;
-            // recovery owns the same dispatch boundary as the REST/MCP
-            // handlers and must start it before reporting success.
-            self.start_execution(result.execution.id.clone()).await?;
-            self.publish(ForgeEvent {
-                event_type: "task.recovery_action".to_owned(),
-                entity_id: result.task.id.clone(),
-                timestamp: event_timestamp(),
-                context: EventContext::TaskRecovered {
-                    project_id: result.task.project_id.clone(),
-                    reason: reason.unwrap_or_else(|| "open_interactive".to_owned()),
-                },
-            });
-            return Ok(result.task);
-        }
-
-        let agent_id = self.interactive_launch_agent(&task, annotation).await?;
-        let result = self
-            .launch_execution(&task.id, agent_id, Some(message), None)
-            .await?;
-        // `launch_execution` deliberately returns an unscheduled Running row
-        // for transport callers. OpenInteractive is a recovery action, so it
-        // must perform the start step itself or leave an orphaned lease.
-        self.start_execution(result.execution.id.clone()).await?;
-        self.publish(ForgeEvent {
-            event_type: "task.recovery_action".to_owned(),
-            entity_id: result.task.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRecovered {
-                project_id: result.task.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "open_interactive".to_owned()),
-            },
-        });
-        Ok(result.task)
-    }
-
-    async fn recover_resume_process(
+    pub(crate) async fn continue_task_process(
         &self,
         task: Task,
         reason: Option<String>,
         context: Option<String>,
     ) -> Result<Task> {
         let plan = self.resume_process_plan(&task).await?;
-        self.recover_resume_process_with_plan(task, reason, context, plan, true)
+        self.continue_task_process_with_plan(task, reason, context, plan, true)
             .await
     }
 
-    async fn recover_resume_process_with_plan(
+    async fn continue_task_process_with_plan(
         &self,
         task: Task,
         reason: Option<String>,
@@ -1886,14 +1717,15 @@ impl TaskService {
         plan: ResumeProcessPlan,
         require_interruption: bool,
     ) -> Result<Task> {
-        if plan.count >= i64::from(plan.budget) {
+        if !db::budget::allows_retry(i64::from(plan.budget), plan.count) {
             return Err(ServiceError::invalid_operation(format!(
                 "resume_process is not supported because retry budget is exhausted for state {}",
                 plan.gate_state
             )));
         }
 
-        let has_interruption = task.error_annotation.is_some() || task.blocked_json.is_some();
+        let has_interruption =
+            task.condition.read().diagnostic_present || task.condition.read().interruption_present;
         let has_failed_review = if task.status == crate::workflow::default_states::REVIEW {
             matches!(
                 self.latest_review_for_task(&task.id).await,
@@ -1908,7 +1740,7 @@ impl TaskService {
             ));
         }
 
-        let reason = optional_recovery_reason(reason, "resume_process");
+        let reason = optional_recovery_reason(reason, "retry");
         let transition_reason = match &context {
             Some(guidance) => format!("{reason}\n\nGuidance: {guidance}"),
             None => reason.clone(),
@@ -1916,9 +1748,9 @@ impl TaskService {
         let mut transition_log = recovery_marker(
             &task.id,
             &plan.gate_state,
-            "resume_process",
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResumeProcess,
+            "retry",
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
             )),
             &transition_reason,
         );
@@ -1927,9 +1759,12 @@ impl TaskService {
                 &task,
                 plan.target_state,
                 transition_reason,
-                &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                    api_types::RecoveryAction::ResumeProcess,
+                &TaskService::task_action_actor(api_types::Actor::user(
+                    api_types::UserActionSource::Action(api_types::TaskAction::retry()),
                 )),
+                // The same-state marker below is the recovery record; this
+                // gate->target move is an ordinary rejection, as in history.
+                Default::default(),
             )
             .await?;
         // The workflow transition owns the Task version CAS. Persist this
@@ -1942,7 +1777,7 @@ impl TaskService {
         TransitionLogRepo::insert(&*self.db, transition_log.clone()).await?;
         self.publish_recovery_applied(
             &recovered,
-            "resume_process",
+            "retry",
             Some(&plan.gate_state),
             Some(&transition_log.id),
         );
@@ -1955,6 +1790,7 @@ impl TaskService {
         target_state: String,
         reason: String,
         actor: &api_types::Actor,
+        bridge: api_types::TransitionBridge,
     ) -> Result<Task> {
         super::ensure_plan_publication_transition_authority(task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
@@ -1967,33 +1803,27 @@ impl TaskService {
             .is_some_and(|trigger| trigger.system_only());
 
         if uses_system_only_trigger && !actor.is_system() {
-            let engine = WorkflowEngine {
-                db: Arc::clone(&self.db),
-                event_bus: Arc::clone(&self.event_bus),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_service: self.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
-            };
+            let engine = self.workflow_execution();
             let recovered = engine
-                .manual_override_transition_with_authority(
-                    &task.id,
-                    &target_state,
+                .transition_inner(
+                    task.id.clone(),
+                    target_state,
                     task.version,
                     &workflow,
                     actor.clone(),
-                    &reason,
+                    reason,
                     true,
+                    true,
+                    None,
+                    None,
+                    None,
                     Some(crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
                         clear_review_passed_at_on_commit: false,
                     }),
+                    false,
+                    bridge,
                 )
                 .await?
                 .task;
@@ -2006,6 +1836,7 @@ impl TaskService {
                 task.id.clone(),
                 target_state,
                 TransitionOptions {
+                    bridge,
                     version: task.version,
                     reason: Some(reason),
                     triggered_by: actor.clone(),
@@ -2024,8 +1855,8 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResumeProcess,
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
             )),
         );
         let state = workflow
@@ -2058,14 +1889,19 @@ impl TaskService {
         })
     }
 
-    async fn current_gate_retry_budget(&self, task: &Task) -> Result<(String, i32, i64)> {
+    pub(crate) async fn current_gate_retry_budget(
+        &self,
+        task: &Task,
+    ) -> Result<(String, i32, i64)> {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Api),
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Api,
+            )),
         );
         let current = workflow
             .states
@@ -2081,9 +1917,8 @@ impl TaskService {
         // already rejected is the common one: `review` rejects into
         // `in_progress` and `merging` into `merge_failed`, so by the time the
         // retry-budget blocker is visible the Task has usually left the gate.
-        // Refusing to resolve a budget there made `reset_retry_window` and
-        // `proceed_once` return 409 in exactly the window where the Task's own
-        // `recovery_actions` advertise them, so resolve the originating gate
+        // A retry may reset the budget or permit one attempt from the reject
+        // target; resolve the originating gate for that accepted apply plan
         // through its `reject_target` as well.
         let state = if current.kind == api_types::StateKind::Gate {
             current
@@ -2111,27 +1946,25 @@ impl TaskService {
             origin
         };
 
-        let budget = if state.name == crate::workflow::default_states::REVIEW {
-            crate::task_service::config::runtime_retry_budget(
-                task,
-                crate::task_service::config::RetryBudgetKind::Review,
-                Some(&state.config),
-                state.gate_config.as_ref(),
-            )?
+        let kind = if state.name == crate::workflow::default_states::REVIEW {
+            db::budget::Kind::Review
         } else {
-            state
-                .gate_config
-                .as_ref()
-                .and_then(|gate_config| gate_config.max_rejections)
-                .unwrap_or(i32::MAX)
+            db::budget::Kind::GateRejection
         };
-        let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        let mut origin = task.clone();
+        origin.status = state.name.clone();
+        let budget = db::budget::limit(
+            &origin,
+            kind,
+            Some(&state.config),
+            state.gate_config.as_ref(),
+        )?;
         let count =
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, &state.name);
+            db::budget::spent(self.db.pool(), &task.id, &db::budget::gate_key(&state.name)).await?;
         Ok((state.name.clone(), budget, count))
     }
 
-    async fn clear_retry_exhausted_blocking_metadata_with_marker(
+    pub(crate) async fn clear_retry_exhausted_blocking_metadata_with_marker(
         &self,
         task: &Task,
         marker: db::CreateTransitionLog,
@@ -2167,97 +2000,7 @@ impl TaskService {
         .map_err(Into::into)
     }
 
-    async fn interactive_follow_up_execution(
-        &self,
-        task: &Task,
-        annotation: Option<&api_types::TaskBlockingAnnotation>,
-    ) -> Result<Option<Execution>> {
-        let Some(role_name) = self.current_effective_role_name(task).await? else {
-            return Ok(None);
-        };
-        if let Some(execution_id) = annotation.and_then(|annotation| {
-            annotation
-                .blocked_execution_id
-                .as_deref()
-                .map(str::to_owned)
-        }) {
-            if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? {
-                if execution.agent_session_id.is_some()
-                    && matches!(
-                        execution.status,
-                        ExecutionStatus::Completed
-                            | ExecutionStatus::Failed
-                            | ExecutionStatus::Cancelled
-                    )
-                    && execution_matches_role(&execution, &role_name)
-                {
-                    return Ok(Some(execution));
-                }
-            }
-        }
-
-        latest_resumable_interactive_role_execution(&self.db, &task.id, &role_name).await
-    }
-
-    async fn interactive_launch_agent(
-        &self,
-        task: &Task,
-        annotation: Option<&api_types::TaskBlockingAnnotation>,
-    ) -> Result<String> {
-        if let Some(role_name) = self.current_effective_role_name(task).await? {
-            if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &role_name)
-                    .await?
-            {
-                if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                    if let Some(agent_id) = assignment.assignee_id {
-                        return Ok(agent_id);
-                    }
-                }
-            }
-        }
-
-        if let Some(execution_id) = annotation.and_then(|annotation| {
-            annotation
-                .blocked_execution_id
-                .as_deref()
-                .map(str::to_owned)
-        }) {
-            if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? {
-                if let Some(agent_id) = execution.agent_id {
-                    return Ok(agent_id);
-                }
-            }
-        }
-
-        ExecutionRepo::latest_agent_execution_by_task(&*self.db, &task.id)
-            .await?
-            .and_then(|execution| execution.agent_id)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "open_interactive requires a blocked execution, assigned agent, or previous execution",
-                )
-            })
-    }
-
-    async fn current_effective_role_name(&self, task: &Task) -> Result<Option<String>> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Api),
-        );
-        Ok(workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-            .map(str::to_owned))
-    }
-
-    fn publish_recovery_applied(
+    pub(crate) fn publish_recovery_applied(
         &self,
         task: &Task,
         action: &str,
@@ -2278,29 +2021,28 @@ impl TaskService {
         });
     }
 
-    async fn recover_reset_to_initial(
+    pub(crate) async fn restart_task_condition(
         &self,
         task: Task,
         annotation: &api_types::TaskBlockingAnnotation,
         reason: Option<String>,
     ) -> Result<Task> {
-        let reason = optional_recovery_reason(reason, "reset_to_initial");
+        let reason = optional_recovery_reason(reason, "restart");
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::ResetToInitial,
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::Restart {
+                    reason: None,
+                }),
             )),
         );
         let initial_state = workflow_initial_state(&workflow)?;
-        let assignee_id = if should_clear_assignments_for_reset(annotation) {
-            Some(None)
-        } else {
-            None
-        };
+        self.reset_daemon_owner_workspace(&task).await?;
+        let assignee_id = should_clear_assignments_for_reset(annotation).then_some(None);
         let retry_gate_state = match self.current_gate_retry_budget(&task).await {
             Ok((gate_state, _, _)) => Some(gate_state),
             // A reset from a normal (non-gate) state does not need a retry
@@ -2314,6 +2056,11 @@ impl TaskService {
             }
             Err(error) => return Err(error),
         };
+        let actor = TaskService::task_action_actor(api_types::Actor::user(
+            api_types::UserActionSource::Action(api_types::TaskAction::Restart { reason: None }),
+        ));
+        // Reset is the base handler's atomic condition/status/budget boundary;
+        // it does not execute state-entry hooks or wait for dispatch admission.
         let reset_input = UpdateTaskStatus {
             id: task.id.clone(),
             expected_version: task.version,
@@ -2324,58 +2071,47 @@ impl TaskService {
             failed_json: Some(None),
             updated_at: now_rfc3339(),
         };
-        let retry_boundary_id = if let Some(gate_state) = retry_gate_state.as_deref() {
-            let marker = recovery_marker(
-                &task.id,
-                gate_state,
-                "reset_to_initial",
-                &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                    api_types::RecoveryAction::ResetToInitial,
-                )),
-                &reason,
-            );
-            let marker_id = marker.id.clone();
-            let recovered =
+        let (recovered, retry_boundary_id) = if let Some(gate_state) = retry_gate_state.as_deref() {
+            let marker = recovery_marker(&task.id, gate_state, "restart", &actor, &reason);
+            let id = marker.id.clone();
+            (
                 TaskRepo::update_status_with_recovery_marker(&*self.db, reset_input, marker)
-                    .await?;
-            (recovered, Some(marker_id))
+                    .await?,
+                Some(id),
+            )
         } else {
             (TaskRepo::update_status(&*self.db, reset_input).await?, None)
         };
-        let (recovered, retry_boundary_id) = retry_boundary_id;
+        crate::placement::admission::resolve_workspace_attention(&self.db, &recovered.id).await?;
         if let Some(boundary_id) = retry_boundary_id.as_deref() {
             self.publish_recovery_applied(
                 &recovered,
-                "reset_to_initial",
+                "restart",
                 retry_gate_state.as_deref(),
                 Some(boundary_id),
             );
         }
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            recovered.id, recovered.version
-        ))
-        .await;
+
         super::clear_execution_retry_metadata(&self.db, &recovered).await?;
-        if task.blocked_json.is_some() {
+        if task.condition.read().interruption_present {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
                 entity_id: recovered.id.clone(),
                 timestamp: event_timestamp(),
                 context: EventContext::TaskUnblocked {
                     project_id: recovered.project_id.clone(),
-                    previous_reason: interruption_reason(task.blocked_json.as_deref()),
+                    previous_reason: task.condition.read().interruption.map(|i| i.reason),
                 },
             });
         }
-        if task.failed_json.is_some() {
+        if task.condition.read().hard_failure {
             self.publish(ForgeEvent {
                 event_type: "task.restarted".to_owned(),
                 entity_id: recovered.id.clone(),
                 timestamp: event_timestamp(),
                 context: EventContext::TaskRestarted {
                     project_id: recovered.project_id.clone(),
-                    previous_reason: interruption_reason(task.failed_json.as_deref()),
+                    previous_reason: task.condition.read().interruption.map(|i| i.reason),
                     new_execution_id: None,
                 },
             });
@@ -2392,25 +2128,47 @@ impl TaskService {
         Ok(recovered)
     }
 
-    async fn recover_cancel_task(&self, task: Task, reason: Option<String>) -> Result<Task> {
-        self.clear_blocking_metadata(&task.id).await?;
-        let task = self.cancel_task(task.id).await?;
-        self.publish(ForgeEvent {
-            event_type: "task.recovery_action".to_owned(),
-            entity_id: task.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRecovered {
-                project_id: task.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "cancel_task".to_owned()),
-            },
-        });
-        Ok(task)
+    pub(crate) async fn reset_daemon_owner_workspace(&self, task: &Task) -> Result<()> {
+        let Some(placement) = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+        else {
+            return Ok(());
+        };
+        if placement.owner_kind != db::PlacementOwnerKind::Daemon {
+            return Ok(());
+        }
+        // A removed owner's workspace is already released; the next admission
+        // prepares a fresh one on another machine, so there is nothing to reset.
+        if let Some(daemon_id) = placement.daemon_id.as_deref() {
+            if self.db.daemon_removed(daemon_id).await? {
+                return Ok(());
+            }
+        }
+        if placement.task_id != task.id {
+            return Err(ServiceError::invalid_operation(
+                "reset the root's shared workspace instead",
+            ));
+        }
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, &placement.workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", &placement.workspace_id))?;
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        super::super::workspace::reset_daemon_workspace(&self.db, &workspace, &resolved).await?;
+        Ok(())
     }
 
-    async fn recover_mark_reviewed(&self, task: Task, reason: Option<String>) -> Result<Task> {
+    pub(crate) async fn recover_manual_review_pass(
+        &self,
+        task: Task,
+        owner_reason: String,
+        finding: Option<&api_types::TaskBlockingAnnotation>,
+        action: api_types::TaskAction,
+    ) -> Result<Task> {
         if task.status != crate::workflow::default_states::REVIEW {
             return Err(ServiceError::invalid_operation(format!(
-                "mark_reviewed is only supported from review state, got {}",
+                "{action} is only supported from review state, got {}",
                 task.status
             )));
         }
@@ -2420,20 +2178,19 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::MarkReviewed,
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(action.clone()),
             )),
         );
         let pass_target = workflow
             .auto_transition_target(&task.status)
             .unwrap_or(crate::workflow::default_states::MERGING)
             .to_owned();
-        let reason = required_recovery_reason(reason, "mark_reviewed")?;
         let latest_review = self.latest_review_for_task(&task.id).await?;
         if latest_review.status != ReviewStatus::Failed {
-            return Err(ServiceError::invalid_operation(
-                "mark_reviewed requires the latest review attempt to be failed",
-            ));
+            return Err(ServiceError::invalid_operation(format!(
+                "{action} requires the latest review attempt to be failed"
+            )));
         }
         let active_review_execution = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
             .await?
@@ -2452,37 +2209,154 @@ impl TaskService {
             )));
         }
         let finished_at = now_rfc3339();
+        let follow_up = finding
+            .map(|finding| {
+                let backlog = workflow
+                    .states
+                    .iter()
+                    .find(|state| state.kind == api_types::StateKind::Backlog)
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation("workflow has no backlog state")
+                    })?;
+                let message = finding
+                    .message
+                    .as_deref()
+                    .unwrap_or(&finding.blocking_reason);
+                let finding_reason = message
+                    .strip_prefix("fixable by owner: ")
+                    .or_else(|| message.strip_prefix("repeated finding: "))
+                    .unwrap_or(message);
+                let first_line = finding_reason.lines().next().unwrap_or_default();
+                let summary: String = first_line.chars().take(80).collect();
+                let summary = if first_line.chars().count() > 80 {
+                    format!("{summary}…")
+                } else {
+                    summary
+                };
+                Ok::<_, ServiceError>(db::CreateTask {
+                    id: new_uuid_v4(),
+                    project_id: task.project_id.clone(),
+                    parent_task_id: None,
+                    assignee_type: None,
+                    assignee_id: None,
+                    title: format!("Follow-up: {} — {summary}", task.title),
+                    description: Some(format!(
+                        "Follow-up of Task {}.\n\nParked finding ({}):\n{}\n\nOwner reason:\n{}",
+                        task.id, finding.blocking_reason, message, owner_reason
+                    )),
+                    task_type: "task".to_owned(),
+                    status: backlog.name.clone(),
+                    is_automation: false,
+                    priority: task.priority,
+                    subtask_order: None,
+                    task_state_config: None,
+                    merge_config: None,
+                    plan: None,
+                    created_at: finished_at.clone(),
+                    updated_at: finished_at.clone(),
+                })
+            })
+            .transpose()?;
+        let follow_up_governance = if let Some(follow_up) = &follow_up {
+            self.prepare_task_governance(&project, &follow_up.task_type, None)
+                .await?
+        } else {
+            None
+        };
+        let reason = match &follow_up {
+            Some(follow_up) => format!(
+                "deferred to follow-up {} ({}): {owner_reason}",
+                follow_up.id, follow_up.title
+            ),
+            None => owner_reason,
+        };
         let mut details = strict_review_details(&latest_review)?;
         details["manual_override"] = json!({
-            "action": "mark_reviewed",
+            "action": action.to_string(),
             "reason": reason.clone(),
             "actor_type": "user",
             "source_review_id": latest_review.id,
             "source_attempt_number": latest_review.attempt_number,
             "at": finished_at,
         });
-        let (review, task) = ReviewRepo::create_manual_pass_with_task_authority(
-            &*self.db,
-            db::CreateManualReviewPass {
-                id: new_uuid_v4(),
-                source_review_id: latest_review.id.clone(),
-                source_review_updated_at: latest_review.updated_at.clone(),
-                task_id: task.id.clone(),
-                candidate_execution_id: latest_review.execution_id.clone(),
-                step_results_json: details.to_string(),
-                expected_task_version: task.version,
-                expected_task_status: task.status.clone(),
-                expected_project_version: project.version,
-                expected_workflow_definition: project.workflow_definition.clone(),
-                occurred_at: finished_at.clone(),
-            },
-        )
-        .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+        let manual_pass = db::CreateManualReviewPass {
+            id: new_uuid_v4(),
+            source_review_id: latest_review.id.clone(),
+            source_review_updated_at: latest_review.updated_at.clone(),
+            task_id: task.id.clone(),
+            candidate_execution_id: latest_review.execution_id.clone(),
+            step_results_json: details.to_string(),
+            expected_task_version: task.version,
+            expected_task_status: task.status.clone(),
+            expected_project_version: project.version,
+            expected_workflow_definition: project.workflow_definition.clone(),
+            occurred_at: finished_at.clone(),
+        };
+        let (review, task) = if let Some(follow_up) = follow_up {
+            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+            let follow_up = self
+                .insert_created_task_in_tx(&mut transaction, follow_up, follow_up_governance)
+                .await?;
+            let linked = db::task_writer::TaskQuery::new(
+                &self.db,
+                &task.id,
+                "UPDATE task SET metadata_json = ?, version = version + 1
+                 WHERE id = ? AND version = ?",
+            )
+            .bind(json!({ "follow_up_of": task.id }).to_string())
+            .bind(&follow_up.id)
+            .bind(follow_up.version)
+            .execute_in_tx(&mut transaction)
+            .await?;
+            if linked.require_applied()? != 1 {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let (review, task) = ReviewRepo::create_manual_pass_with_task_authority_in_tx(
+                &*self.db,
+                &mut transaction,
+                manual_pass,
+            )
+            .await?;
+            let cleared = db::task_writer::TaskQuery::new(
+                &self.db,
+                &task.id,
+                "UPDATE task SET error_annotation = NULL, blocked_json = NULL,
+                 updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
+            )
+            .bind(&finished_at)
+            .bind(&task.id)
+            .bind(task.version)
+            .execute_in_tx(&mut transaction)
+            .await?;
+            if cleared.require_applied()? != 1 {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let task = TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            transaction.commit().await?;
+            self.publish(ForgeEvent {
+                event_type: "task.created".to_owned(),
+                entity_id: follow_up.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskCreated {
+                    project_id: follow_up.project_id,
+                    title: follow_up.title,
+                },
+            });
+            self.publish(ForgeEvent {
+                event_type: "task.updated".to_owned(),
+                entity_id: task.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskUpdated {
+                    project_id: task.project_id.clone(),
+                },
+            });
+            (review, task)
+        } else {
+            ReviewRepo::create_manual_pass_with_task_authority(&*self.db, manual_pass).await?
+        };
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -2510,17 +2384,19 @@ impl TaskService {
         tracing::info!(
             task_id = %task.id,
             reason = %reason,
-            "recovery action mark_reviewed logged"
+            action = %action,
+            "manual review recovery action logged"
         );
         let transitioned = self
             .transition(
                 task.id.clone(),
                 pass_target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some(reason),
-                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
-                        api_types::RecoveryAction::MarkReviewed,
+                    triggered_by: TaskService::task_action_actor(api_types::Actor::user(
+                        api_types::UserActionSource::Action(action),
                     )),
                     rejection: false,
                     defer_dispatch_seconds: None,
@@ -2530,116 +2406,69 @@ impl TaskService {
         Ok(transitioned.task)
     }
 
-    async fn recover_retry_hook(
+    pub(crate) async fn retry_entry_checks(
         &self,
         task: Task,
-        annotation: &api_types::TaskBlockingAnnotation,
         reason: Option<String>,
     ) -> Result<Task> {
-        if task.status == crate::workflow::default_states::MERGING
-            && crate::task_diagnostics::is_retry_budget_exhausted(annotation)
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let actor = if self
+            .parse_blocking_annotation(&task)
+            .is_some_and(|annotation| annotation.blocking_reason == "review_ci_infrastructure")
         {
-            return self.recover_reset_retry_window(task, reason).await;
-        }
-        if task.status == crate::workflow::default_states::MERGING
-            && is_manual_merge_repair_annotation(annotation)
-        {
-            return self
-                .recover_manual_merge_repair_for_review(task, reason)
-                .await;
-        }
-        if task.status == crate::workflow::default_states::MERGING
-            && is_human_merge_gate_annotation(annotation)
-        {
-            return self.recover_retry_current_state_hooks(task, reason).await;
-        }
-        if task.status == crate::workflow::default_states::MERGING
-            && is_recoverable_merge_gate_annotation(annotation)
-        {
-            return self.recover_resume_process(task, reason, None).await;
-        }
-        if task.status == crate::workflow::default_states::MERGE_FAILED
-            && is_recoverable_merge_fix_annotation(annotation)
-        {
-            let recovered = self.recover_reexecute_current_state(task, None).await?;
-            self.publish(ForgeEvent {
-                event_type: "task.recovery_action".to_owned(),
-                entity_id: recovered.id.clone(),
-                timestamp: event_timestamp(),
-                context: EventContext::TaskRecovered {
-                    project_id: recovered.project_id.clone(),
-                    reason: reason.unwrap_or_else(|| "retry_merge_fix".to_owned()),
+            api_types::Actor::system(api_types::SystemComponent::TaskDispatcher)
+        } else {
+            TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+            ))
+        };
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+        let engine = self.workflow_execution();
+        let recovered = engine
+            .retry_entry_barrier_with_authority(
+                &task.id,
+                task.version,
+                &workflow,
+                &actor,
+                reason.as_deref().unwrap_or("retry"),
+                crate::workflow::engine::WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
                 },
-            });
-            return Ok(recovered);
-        }
-        if task.entry_barrier_json.is_some() {
-            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-            let workflow = WorkflowEngine::resolve_workflow_for_task(
-                &task,
-                &project.workflow_definition,
-                &api_types::Actor::user(api_types::UserActionSource::RetryHook),
-            );
-            let engine = WorkflowEngine {
-                db: Arc::clone(&self.db),
-                event_bus: Arc::clone(&self.event_bus),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_service: self.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
-            };
-            let recovered = engine
-                .retry_entry_barrier_with_authority(
-                    &task.id,
-                    task.version,
-                    &workflow,
-                    &api_types::Actor::user(api_types::UserActionSource::RetryHook),
-                    reason.as_deref().unwrap_or("retry_hook"),
-                    crate::workflow::engine::WorkflowAuthority {
-                        project_version: project.version,
-                        workflow_definition: project.workflow_definition.clone(),
-                        clear_review_passed_at_on_commit: false,
-                    },
-                )
-                .await?
-                .task;
-            self.publish(ForgeEvent {
-                event_type: "task.recovery_action".to_owned(),
-                entity_id: recovered.id.clone(),
-                timestamp: event_timestamp(),
-                context: EventContext::TaskRecovered {
-                    project_id: recovered.project_id.clone(),
-                    reason: reason.unwrap_or_else(|| "retry_hook".to_owned()),
-                },
-            });
-            return Ok(recovered);
-        }
-        let recovered = self.clear_blocking_metadata(&task.id).await?;
+            )
+            .await?
+            .task;
         self.publish(ForgeEvent {
             event_type: "task.recovery_action".to_owned(),
             entity_id: recovered.id.clone(),
             timestamp: event_timestamp(),
             context: EventContext::TaskRecovered {
                 project_id: recovered.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "retry_hook".to_owned()),
+                reason: reason.unwrap_or_else(|| "retry".to_owned()),
             },
         });
+        if recovered
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_none_or(|barrier| barrier["status"] != "blocked")
+        {
+            crate::placement::admission::resolve_review_ci_attention(&self.db, &recovered.id)
+                .await?;
+        }
         Ok(recovered)
     }
 
-    async fn recover_retry_current_state_hooks(
+    pub(crate) async fn recover_retry_current_state_hooks(
         &self,
         task: Task,
         reason: Option<String>,
     ) -> Result<Task> {
-        let reason = optional_recovery_reason(reason, "retry_hook");
+        let reason = optional_recovery_reason(reason, "retry");
         super::ensure_plan_publication_transition_authority(&task, None)?;
         let cleared = self.clear_blocking_metadata(&task.id).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &cleared.project_id)
@@ -2648,28 +2477,20 @@ impl TaskService {
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &cleared,
             &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::RetryHook),
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+            )),
         );
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-        };
+        let engine = self.workflow_execution();
         let recovered = engine
             .manual_override_transition_with_authority(
                 &cleared.id,
                 &cleared.status,
                 cleared.version,
                 &workflow,
-                api_types::Actor::user(api_types::UserActionSource::RetryHook),
+                TaskService::task_action_actor(api_types::Actor::user(
+                    api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+                )),
                 &reason,
                 false,
                 Some(crate::workflow::engine::WorkflowAuthority {
@@ -2692,7 +2513,38 @@ impl TaskService {
         Ok(recovered)
     }
 
-    async fn recover_manual_merge_repair_for_review(
+    pub(crate) async fn recover_pull_request_merge_wait(
+        &self,
+        task: Task,
+        reason: Option<String>,
+    ) -> Result<Task> {
+        let cleared = TaskRepo::mutate_metadata_and_bump_version(
+            &*self.db,
+            &task.id,
+            task.version,
+            vec![TaskMetadataMutation::CompareAndMutate {
+                key: "awaiting_human_reason".to_owned(),
+                expected: Value::String("pull_request_merge".to_owned()),
+                mutations: vec![
+                    TaskMetadataMutation::Remove {
+                        key: "awaiting_human".to_owned(),
+                    },
+                    TaskMetadataMutation::Remove {
+                        key: "awaiting_human_reason".to_owned(),
+                    },
+                    TaskMetadataMutation::Remove {
+                        key: "awaiting_human_marker_id".to_owned(),
+                    },
+                ],
+            }],
+            &now_rfc3339(),
+        )
+        .await?;
+        self.recover_retry_current_state_hooks(cleared, reason)
+            .await
+    }
+
+    pub(crate) async fn recover_manual_merge_repair_for_review(
         &self,
         task: Task,
         reason: Option<String>,
@@ -2709,6 +2561,14 @@ impl TaskService {
         let actor = api_types::Actor::system(api_types::SystemComponent::Workflow);
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+        let review_state = workflow
+            .states
+            .iter()
+            .find(|state| state.canonical_phase == Some(api_types::CanonicalPhase::Review))
+            .map(|state| state.name.clone())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("manual merge repair has no review state")
+            })?;
         let reject_target = workflow
             .states
             .iter()
@@ -2716,23 +2576,39 @@ impl TaskService {
             .and_then(|state| state.gate_config.as_ref())
             .and_then(|gate| gate.reject_target.clone())
             .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "manual merge repair cannot find a reject route from {}",
-                    task.status
-                ))
+                ServiceError::invalid_operation("manual merge repair has no reject route")
             })?;
         let recovered = self
             .transition_recovery_rejection(
                 &task,
                 reject_target,
-                format!(
-                    "{} {}; fresh review required",
-                    crate::workflow::REVIEW_REFRESH_MARKER,
-                    recovery_reason
-                ),
+                format!("{recovery_reason}; fresh review required"),
                 &actor,
+                api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
             )
             .await?;
+        // The command defers execution hooks, including the repair bridge's
+        // worker dispatch. Complete its mechanical move to fresh review here.
+        let recovered = if recovered.status != review_state {
+            self.transition(
+                recovered.id.clone(),
+                review_state,
+                TransitionOptions {
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewRefresh,
+                    ),
+                    version: recovered.version,
+                    reason: Some("Fresh review after manual repair".to_owned()),
+                    triggered_by: actor.clone(),
+                    rejection: false,
+                    defer_dispatch_seconds: None,
+                },
+            )
+            .await?
+            .task
+        } else {
+            recovered
+        };
         self.publish(ForgeEvent {
             event_type: "task.recovery_action".to_owned(),
             entity_id: recovered.id.clone(),
@@ -2745,109 +2621,50 @@ impl TaskService {
         Ok(recovered)
     }
 
-    async fn recover_retry_review(&self, task: Task, reason: Option<String>) -> Result<Task> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                api_types::RecoveryAction::RetryHook,
-            )),
-        );
-        let state = workflow
-            .states
-            .iter()
-            .find(|s| s.name == task.status)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
-                    &task.status,
-                    &workflow,
-                ))
-            })?;
-        if state.kind != api_types::StateKind::Gate {
-            return Err(ServiceError::invalid_operation(format!(
-                "retry_hook without annotation is only supported in gate states, not {}",
-                task.status
-            )));
-        }
-        let reject_target = state
-            .gate_config
-            .as_ref()
-            .and_then(|gc| gc.reject_target.clone())
-            .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
-        let reason_text = reason.clone().unwrap_or_else(|| "retry review".to_owned());
-        let bounced = self
-            .transition_recovery_rejection(
-                &task,
-                reject_target,
-                format!("retry review: {reason_text}"),
-                &api_types::Actor::user(api_types::UserActionSource::Recovery(
-                    api_types::RecoveryAction::RetryHook,
-                )),
-            )
-            .await?;
-        let fresh = TaskRepo::get_by_id(&*self.db, &bounced.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", bounced.id.clone()))?;
-        let recovered = self
-            .transition(
-                fresh.id.clone(),
-                task.status.clone(),
-                TransitionOptions {
-                    version: fresh.version,
-                    reason: Some(format!("retry review: {reason_text}")),
-                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
-                        api_types::RecoveryAction::RetryHook,
-                    )),
-                    rejection: false,
-                    defer_dispatch_seconds: None,
-                },
-            )
-            .await?
-            .task;
-        self.publish(ForgeEvent {
-            event_type: "task.recovery_action".to_owned(),
-            entity_id: recovered.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRecovered {
-                project_id: recovered.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "retry_review".to_owned()),
-            },
-        });
-        Ok(recovered)
-    }
-
-    async fn recover_update_workspace_and_retry_hook(
+    pub(crate) async fn retry_review_entry(
         &self,
         task: Task,
-        annotation: &api_types::TaskBlockingAnnotation,
         reason: Option<String>,
     ) -> Result<Task> {
-        let workspace = prepare_workspace(
+        self.recover_retry_current_state_hooks(task, reason).await
+    }
+
+    pub(crate) async fn refresh_workspace_and_retry_entry(
+        &self,
+        task: Task,
+        reason: Option<String>,
+    ) -> Result<Task> {
+        let workspace = super::super::workspace::prepare_workspace(
             &self.db,
             &self.workspace_root,
             &task,
             &task.id,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
         )
         .await?;
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
         let target_branch = default_target_branch(&repo.default_branch);
-        let worktree_path = std::path::Path::new(&workspace.worktree_path);
-
-        if !git::is_worktree_clean(worktree_path).await? {
-            let files = git::status_porcelain(worktree_path).await?.join(", ");
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        let status = resolved
+            .git_query(api_types::WorkspaceGitQuery::StatusPorcelain, false)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("owner returned no workspace status"))?;
+        if !status.trim().is_empty() {
+            let files = status.lines().collect::<Vec<_>>().join(", ");
             return Err(ServiceError::invalid_operation(format!(
                 "cannot update workspace before retrying hook because the worktree is dirty: {files}"
             )));
         }
 
-        match git::rebase(worktree_path, &target_branch).await {
-            Ok(()) => {
+        match resolved.rebase_target(&target_branch, false).await? {
+            api_types::WorkspaceOwnerOperationOutcome::Rebased => {
+                resolved.record_head_best_effort(&self.db).await;
                 tracing::info!(
                     task_id = %task.id,
                     workspace_id = %workspace.id,
@@ -2855,24 +2672,33 @@ impl TaskService {
                     "workspace updated before retrying hook"
                 );
             }
-            Err(git::GitError::MergeConflict { stderr, .. }) => {
-                let _ = git::abort_rebase(worktree_path).await;
+            api_types::WorkspaceOwnerOperationOutcome::Conflict { details, .. }
+            | api_types::WorkspaceOwnerOperationOutcome::UnsupportedConflict { details } => {
                 return Err(ServiceError::invalid_operation(format!(
-                    "cannot update workspace before retrying hook because rebase onto {target_branch} conflicted: {stderr}"
+                    "cannot update workspace before retrying hook because rebase onto {target_branch} conflicted: {details}"
                 )));
             }
-            Err(error) => return Err(error.into()),
+            api_types::WorkspaceOwnerOperationOutcome::Dirty { files } => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "cannot update workspace before retrying hook because the worktree is dirty: {}",
+                    files.join(", ")
+                )));
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "owner returned an invalid rebase result",
+                ))
+            }
         }
 
-        self.recover_retry_hook(
-            task,
-            annotation,
-            Some(reason.unwrap_or_else(|| "update_workspace_and_retry_hook".to_owned())),
-        )
-        .await
+        if task.condition.read().entry_recorded {
+            self.retry_entry_checks(task, reason).await
+        } else {
+            self.recover_retry_current_state_hooks(task, reason).await
+        }
     }
 
-    async fn recover_skip_hook_once(
+    pub(crate) async fn override_entry_checks_once(
         &self,
         task: Task,
         reason: Option<String>,
@@ -2880,17 +2706,22 @@ impl TaskService {
     ) -> Result<Task> {
         tracing::info!(
             task_id = %task.id,
-            reason = %reason.clone().unwrap_or_else(|| "skip_hook_once".to_owned()),
-            "recovery action skip_hook_once logged"
+            reason = %reason.clone().unwrap_or_else(|| "approve".to_owned()),
+            "entry-check override recorded"
         );
-        let recovered = if task.entry_barrier_json.is_some() {
+        let recovered = if task.condition.read().entry_recorded {
             let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
             let workflow = WorkflowEngine::resolve_workflow_for_task(
                 &task,
                 &project.workflow_definition,
-                &api_types::Actor::user(api_types::UserActionSource::SkipHookOnce),
+                &TaskService::task_action_actor(api_types::Actor::user(
+                    api_types::UserActionSource::Action(api_types::TaskAction::Approve {
+                        reason: None,
+                        override_checks: Some(true),
+                    }),
+                )),
             );
             let barrier_state = task
                 .entry_barrier_json
@@ -2941,26 +2772,19 @@ impl TaskService {
                 )
                 .await?
             };
-            let engine = WorkflowEngine {
-                db: Arc::clone(&self.db),
-                event_bus: Arc::clone(&self.event_bus),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_service: self.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
-            };
+            let engine = self.workflow_execution();
             let recovered = engine
                 .retry_entry_barrier_with_authority(
                     &updated.id,
                     updated.version,
                     &workflow,
-                    &api_types::Actor::user(api_types::UserActionSource::SkipHookOnce),
-                    reason.as_deref().unwrap_or("skip_hook_once"),
+                    &TaskService::task_action_actor(api_types::Actor::user(
+                        api_types::UserActionSource::Action(api_types::TaskAction::Approve {
+                            reason: None,
+                            override_checks: Some(true),
+                        }),
+                    )),
+                    reason.as_deref().unwrap_or("approve"),
                     crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
@@ -2971,7 +2795,37 @@ impl TaskService {
                 .task;
             clear_skip_before_work_hook_once_override(&self.db, &recovered, &barrier_state).await?
         } else {
-            self.clear_blocking_metadata(&task.id).await?
+            let mut config = task
+                .task_state_config
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+                .unwrap_or_else(|| json!({}));
+            config[&task.status]["skip_before_work_hook_once"] = json!(true);
+            let updated = TaskRepo::update(
+                &*self.db,
+                UpdateTask {
+                    id: task.id.clone(),
+                    expected_version: task.version,
+                    title: None,
+                    description: None,
+                    priority: None,
+                    merge_config: None,
+                    plan: None,
+                    error_annotation: Some(None),
+                    blocked_json: Some(None),
+                    failed_json: None,
+                    task_state_config: Some(Some(config.to_string())),
+                    parent_task_id: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            let recovered = self
+                .recover_retry_current_state_hooks(updated, reason.clone())
+                .await?;
+            clear_skip_before_work_hook_once_override(&self.db, &recovered, &task.status).await?
         };
         self.publish(ForgeEvent {
             event_type: "task.recovery_action".to_owned(),
@@ -2979,45 +2833,10 @@ impl TaskService {
             timestamp: event_timestamp(),
             context: EventContext::TaskRecovered {
                 project_id: recovered.project_id.clone(),
-                reason: reason.unwrap_or_else(|| "skip_hook_once".to_owned()),
+                reason: reason.unwrap_or_else(|| "approve".to_owned()),
             },
         });
         Ok(recovered)
-    }
-
-    async fn recover_task_transition_to_work_state(
-        &self,
-        task: Task,
-        workflow: &api_types::WorkflowDefinition,
-    ) -> Result<Task> {
-        let kind = workflow.state_kind(&task.status);
-        if matches!(
-            kind,
-            Some(api_types::StateKind::Initial | api_types::StateKind::Custom)
-        ) {
-            let target = workflow
-                .outgoing_trigger_targets(&task.status)
-                .filter(|(trigger, _)| !trigger.system_only())
-                .find_map(|(_, target)| {
-                    matches!(
-                        workflow.state_kind(&target),
-                        Some(api_types::StateKind::Active | api_types::StateKind::Gate)
-                    )
-                    .then_some(target)
-                });
-            if let Some(target) = target {
-                let fresh = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                self.transition(task.id.clone(), target, fresh.version)
-                    .await
-                    .map(|result| result.task)
-            } else {
-                Ok(task)
-            }
-        } else {
-            Ok(task)
-        }
     }
 }
 
@@ -3092,54 +2911,6 @@ fn workflow_initial_state(workflow: &api_types::WorkflowDefinition) -> Result<St
         .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))
 }
 
-fn metadata_recovery_annotation(
-    raw_metadata: &str,
-    recovery_actions: &[api_types::RecoveryAction],
-) -> Result<api_types::TaskBlockingAnnotation> {
-    let metadata: Value = serde_json::from_str(raw_metadata).map_err(|error| {
-        ServiceError::invalid_operation(format!("failed to parse interruption metadata: {error}"))
-    })?;
-    let reason = metadata
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("interrupted")
-        .to_owned();
-    let execution_id = metadata
-        .get("execution_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let annotation_type = metadata
-        .get("kind")
-        .cloned()
-        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
-        .unwrap_or(api_types::FailureKind::Unknown);
-    // Unknown kinds are info-only: legacy rows the migration could not map
-    // must not offer actions the service cannot classify.
-    let recovery_actions = if annotation_type == api_types::FailureKind::Unknown {
-        Vec::new()
-    } else {
-        recovery_actions.to_vec()
-    };
-    Ok(api_types::TaskBlockingAnnotation {
-        annotation_type,
-        blocking_reason: reason.clone(),
-        blocked_by: Some(api_types::Actor::system(api_types::SystemComponent::Workflow).display()),
-        blocked_at: metadata
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        blocked_execution_id: execution_id.clone(),
-        artifact: execution_id.map(|id| api_types::BlockingArtifact {
-            kind: "execution".to_owned(),
-            id: Some(id),
-            log_path: None,
-        }),
-        message: Some(reason),
-        hook: None,
-        recovery_actions,
-    })
-}
-
 fn default_target_branch(repo_default_branch: &str) -> String {
     let trimmed = repo_default_branch.trim();
     if trimmed.is_empty() {
@@ -3147,63 +2918,6 @@ fn default_target_branch(repo_default_branch: &str) -> String {
     } else {
         trimmed.to_owned()
     }
-}
-
-fn interruption_reason(raw_metadata: Option<&str>) -> Option<String> {
-    raw_metadata
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|metadata| {
-            metadata
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-}
-
-async fn latest_resumable_interactive_role_execution(
-    db: &SqliteDb,
-    task_id: &str,
-    role: &str,
-) -> Result<Option<Execution>> {
-    if let Some(execution) = latest_resumable_interactive_exact_role(db, task_id, role).await? {
-        return Ok(Some(execution));
-    }
-    if role == crate::workflow::default_roles::CODER {
-        return latest_resumable_interactive_exact_role(db, task_id, "executor").await;
-    }
-    Ok(None)
-}
-
-async fn latest_resumable_interactive_exact_role(
-    db: &SqliteDb,
-    task_id: &str,
-    role: &str,
-) -> Result<Option<Execution>> {
-    ExecutionRepo::latest_resumable_by_task_and_role(db, task_id, role)
-        .await
-        .map_err(Into::into)
-}
-
-fn execution_matches_role(execution: &Execution, role: &str) -> bool {
-    execution.role == role
-        || (role == crate::workflow::default_roles::CODER && execution.role == "executor")
-}
-
-fn execution_role_matches_effective_role(execution_role: &str, effective_role: &str) -> bool {
-    execution_role == effective_role
-        || (effective_role == crate::workflow::default_roles::CODER && execution_role == "executor")
-}
-
-fn self_validating_recovery_action(action: api_types::RecoveryAction) -> bool {
-    matches!(
-        action,
-        api_types::RecoveryAction::ResetRetryWindow
-            | api_types::RecoveryAction::ProceedOnce
-            | api_types::RecoveryAction::OpenInteractive
-            | api_types::RecoveryAction::MarkReviewed
-            | api_types::RecoveryAction::RetryHook
-            | api_types::RecoveryAction::ResumeProcess
-    )
 }
 
 fn optional_recovery_reason(reason: Option<String>, action_kind: &str) -> String {
@@ -3236,6 +2950,13 @@ fn recovery_marker(
         to_state: state.to_owned(),
         trigger_name: Some(action.to_owned()),
         triggered_by: actor.display(),
+        bridge: api_types::TransitionBridge::recovery(
+            action,
+            matches!(
+                action,
+                "restart" | "reset_to_initial" | "reset_retry_window"
+            ),
+        ),
         trigger_reason: reason.to_owned(),
         hook_results_json: None,
         rejection: false,
@@ -3275,118 +2996,4 @@ fn blocked_metadata_kind(raw_metadata: &str) -> Option<api_types::FailureKind> {
 fn is_retry_exhausted_blocked_metadata(raw_metadata: &str) -> bool {
     blocked_metadata_kind(raw_metadata)
         .is_some_and(api_types::FailureKind::is_retry_exhausted_metadata)
-}
-
-fn is_recoverable_merge_gate_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    annotation.annotation_type.is_merge_recoverable()
-}
-
-fn is_human_merge_gate_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    annotation.annotation_type == api_types::FailureKind::TargetRepoDirty
-}
-
-fn is_manual_merge_repair_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    matches!(
-        annotation.blocked_by.as_deref(),
-        Some("coordination_root" | "manual_workspace_repair")
-    )
-}
-
-fn is_recoverable_merge_fix_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
-    annotation.annotation_type.is_merge_recoverable()
-}
-
-fn is_recoverable_merge_gate_blocked_metadata(raw_metadata: &str) -> bool {
-    blocked_metadata_kind(raw_metadata) == Some(api_types::FailureKind::TargetRepoDirty)
-}
-
-fn is_recoverable_merge_fix_blocked_metadata(raw_metadata: &str) -> bool {
-    blocked_metadata_kind(raw_metadata).is_some_and(api_types::FailureKind::is_merge_recoverable)
-}
-
-/// The snake_case name a client sends for a recovery action.
-///
-/// `serde_json::to_string` yields the JSON *value* — quotes included — which
-/// rendered inside a quoted error message as `'"retry_hook"'`.
-fn recovery_action_wire_name(action: &api_types::RecoveryAction) -> &'static str {
-    match action {
-        api_types::RecoveryAction::ResumeSession => "resume_session",
-        api_types::RecoveryAction::Reexecute => "reexecute",
-        api_types::RecoveryAction::ResetToInitial => "reset_to_initial",
-        api_types::RecoveryAction::CancelTask => "cancel_task",
-        api_types::RecoveryAction::MarkReviewed => "mark_reviewed",
-        api_types::RecoveryAction::RetryHook => "retry_hook",
-        api_types::RecoveryAction::ResumeProcess => "resume_process",
-        api_types::RecoveryAction::UpdateWorkspaceAndRetryHook => "update_workspace_and_retry_hook",
-        api_types::RecoveryAction::SkipHookOnce => "skip_hook_once",
-        api_types::RecoveryAction::ResetRetryWindow => "reset_retry_window",
-        api_types::RecoveryAction::ProceedOnce => "proceed_once",
-        api_types::RecoveryAction::OpenInteractive => "open_interactive",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    fn log(
-        from_state: &str,
-        to_state: &str,
-        trigger_name: Option<&str>,
-        rejection: bool,
-    ) -> db::TransitionLog {
-        db::TransitionLog {
-            id: db::new_uuid_v4(),
-            task_id: "task".to_owned(),
-            from_state: from_state.to_owned(),
-            to_state: to_state.to_owned(),
-            trigger_name: trigger_name.map(str::to_owned),
-            triggered_by: "system:test".to_owned(),
-            trigger_reason: "test".to_owned(),
-            hook_results_json: None,
-            rejection,
-            created_at: db::now_rfc3339(),
-        }
-    }
-
-    #[test]
-    fn review_refresh_exit_does_not_reset_rejection_window() {
-        let entries = vec![
-            log("review", "in_progress", Some("review_refresh"), false),
-            log("review", "in_progress", Some("reject"), true),
-        ];
-
-        assert_eq!(
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
-            1
-        );
-    }
-
-    #[test]
-    fn only_explicit_recovery_markers_reset_rejection_window() {
-        let entries = vec![
-            log("review", "in_progress", Some("reject"), true),
-            log("review", "review", Some("reset_retry_window"), false),
-            log("review", "in_progress", Some("reject"), true),
-        ];
-
-        assert_eq!(
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
-            1
-        );
-    }
-
-    #[test]
-    fn review_refresh_merge_bridge_preserves_prior_merge_rejection() {
-        let mut bridge = log("merging", "merge_failed", Some("retry"), false);
-        bridge.trigger_reason = format!(
-            "{} target advanced; re-review required",
-            crate::workflow::REVIEW_REFRESH_MARKER
-        );
-        let entries = vec![log("merging", "merge_failed", Some("retry"), true), bridge];
-
-        assert_eq!(
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "merging"),
-            1,
-            "a review-refresh bridge is not an explicit retry-window reset"
-        );
-    }
 }

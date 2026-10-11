@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use api_types::{Actor, SystemComponent};
 use api_types::{
@@ -15,11 +18,18 @@ use db::{
     AgentChatTurnJob, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
     AgentHandoffStatus as DbHandoffStatus, AgentListQuery, AgentProfileRepo, AgentRepo,
     AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
-    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectRepo, ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo,
-    TaskListQuery, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UserRepo,
+    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectRepo,
+    ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UserRepo,
 };
 use executors::ExecutionOverrides;
+use operation_registry::mcp::{
+    BindMainAgentParams, BindProjectAgentParams, CreateAgentHandoffParams, CreateProjectParams,
+    GetAgentChatParams, GetAgentHandoffParams, GetAgentSessionParams, GetMainAgentParams,
+    GetProjectAgentParams, ListAgentChatMessagesParams, ListAgentChatsParams,
+    ListAgentHandoffsParams, ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams,
+    ListProjectsParams, RegisterAgentParams, SendAgentChatMessageParams,
+};
 use serde_json::{json, Map, Value};
 use services::{
     workflow::engine::WorkflowEngine, DiffService, MemoryAccessContext, MemorySearchResult,
@@ -31,22 +41,17 @@ use crate::{
     error::McpToolError,
     params::{
         page_request, parse_params, task_page_request, AddTaskDependencyParams, AssignAgentParams,
-        BindMainAgentParams, BindProjectAgentParams, CreateAgentHandoffParams, CreateProjectParams,
-        CreateSubTasksParams, CreateTaskParams, GetAgentChatParams, GetAgentHandoffParams,
-        GetAgentSessionParams, GetProjectAgentParams, GetProjectParams, GetTaskParams,
-        ListAgentChatMessagesParams, ListAgentChatsParams, ListAgentHandoffsParams,
-        ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams, ListExecutionsParams,
-        ListProjectsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
-        MemoryGetParams, MemorySearchParams, PreviewPromptParams, RegisterAgentParams,
-        RemoveTaskDependencyParams, ReorderSubTasksParams, SendAgentChatMessageParams,
-        TransitionTaskParams, UpdateProjectLifecycleHooksParams, UpdateProjectParams,
-        UpdateTaskParams,
+        CreateSubTasksParams, CreateTaskParams, GetProjectParams, GetTaskParams,
+        ListExecutionsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
+        MemoryGetParams, MemorySearchParams, PreviewPromptParams, RemoveTaskDependencyParams,
+        ReorderSubTasksParams, TransitionTaskParams, UpdateProjectLifecycleHooksParams,
+        UpdateProjectParams, UpdateTaskParams,
     },
     protocol::McpContext,
     state::AppState,
     values::{
         agent_page_value_for_user, agent_profile_value, agent_session_value, agent_value_for_user,
-        execution_page_value, execution_value, project_page_value, project_value, task_page_value,
+        execution_page_value, execution_value, project_page_value, project_value,
         task_role_assignment_value, task_value,
     },
 };
@@ -144,7 +149,7 @@ pub(super) async fn forge_create_task(
             ),
             other => other.into(),
         })?;
-    let mut result = task_value(task);
+    let mut result = task_with_offers(state, task).await?;
     if let Some(object) = result.as_object_mut() {
         object.insert("depends_on_ids".to_owned(), json!(dependency_ids));
     }
@@ -178,10 +183,42 @@ async fn tasks_with_role_assignments(
     state: &AppState,
     tasks: Vec<db::Task>,
 ) -> Result<Vec<Value>, McpToolError> {
+    let ids = tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    let mut assignments_by_task = HashMap::<String, Vec<db::TaskRoleAssignment>>::new();
+    for assignment in TaskRoleAssignmentRepo::list_by_tasks(&*state.db, &ids).await? {
+        assignments_by_task
+            .entry(assignment.task_id.clone())
+            .or_default()
+            .push(assignment);
+    }
+    let mut budget_spent = db::budget::load_many(state.db.pool(), &ids).await?;
+    let mut projects = HashMap::<String, db::Project>::new();
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let assignments = TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id).await?;
+        if !projects.contains_key(&task.project_id) {
+            let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            projects.insert(task.project_id.clone(), project);
+        }
+        let project = &projects[&task.project_id];
+        let workflow = services::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::General),
+        );
+        let workflow = db::budget::with_project_defaults(&workflow, &project.settings);
+        let recovery_limit = db::budget::recovery_limit(&project.settings);
+        let counts = budget_spent.remove(&task.id).unwrap_or_default();
+        let remaining = db::budget::projection(&task, &workflow, &counts, recovery_limit)?;
+        let limits = db::budget::projection(&task, &workflow, &Default::default(), recovery_limit)?;
+        let assignments = assignments_by_task.remove(&task.id).unwrap_or_default();
         let mut value = task_value(task);
+        value["remaining_retries"] = json!(remaining);
+        value["retry_limits"] = json!(limits);
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "role_assignments".to_owned(),
@@ -402,15 +439,60 @@ pub(super) async fn forge_list_tasks(
         },
     )
     .await?;
-    Ok(task_page_value(page))
+    let has_more = page.next_cursor.is_some();
+    let items = tasks_with_role_assignments(state, page.items).await?;
+    Ok(
+        json!({ "items": items, "next_cursor": page.next_cursor, "has_more": has_more, "total_count": page.total_count }),
+    )
 }
 
-pub(super) async fn forge_get_task(state: &AppState, params: Value) -> Result<Value, McpToolError> {
+pub(super) async fn forge_get_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let task = TaskRepo::get_by_id(&*state.db, &params.task_id, false)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("task", params.task_id))?;
-    Ok(task_value(task))
+    let actor = Actor::delegated_user(
+        authenticated_user(context)?,
+        api_types::UserActionSource::Api,
+    );
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&params.task_id, &actor)
+        .await?;
+    task_snapshot_value(snapshot)
+}
+
+fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {
+    let offers = services::available_actions(&snapshot);
+    let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+    let remaining = db::budget::projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &snapshot.budget_spent,
+        snapshot.recovery_budget_limit,
+    )?;
+    let limits = db::budget::projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &Default::default(),
+        snapshot.recovery_budget_limit,
+    )?;
+    let mut value = task_value(snapshot.task);
+    value["remaining_retries"] = json!(remaining);
+    value["retry_limits"] = json!(limits);
+    value["available_actions"] = json!(offers);
+    value["workflow_exception"] = serde_json::to_value(exception)
+        .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
+    Ok(value)
+}
+
+async fn task_with_offers(state: &AppState, task: db::Task) -> Result<Value, McpToolError> {
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&task.id, &Actor::user(api_types::UserActionSource::Api))
+        .await?;
+    task_snapshot_value(snapshot)
 }
 
 pub(super) async fn forge_preview_prompt(
@@ -431,6 +513,7 @@ pub(super) async fn forge_preview_prompt(
 
     let prompt = services::preview_effective_prompt(
         Arc::clone(&state.db),
+        &state.workspace_backend_router,
         &params.task_id,
         params.role.trim(),
         params.trigger,
@@ -580,13 +663,47 @@ pub(super) async fn forge_assign_agent(
     }))
 }
 
-pub(super) async fn forge_cancel_task(
+pub(super) async fn task_action(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: GetTaskParams = parse_params(params)?;
-    let task = state.task_service.cancel_task(params.task_id).await?;
-    Ok(task_value(task))
+    // MCP credentials (PATs, sessions, OAuth tokens) all resolve to the user;
+    // none is agent-scoped, so an MCP-hosted Project Agent is indistinguishable
+    // from the owner. MCP actions keep owner action authority but spend budgets.
+    let actor = Actor::delegated_user(
+        authenticated_user(context)?,
+        api_types::UserActionSource::Api,
+    );
+    let task_id = params
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_field_error("task_id", "required", None))?;
+    let request: api_types::TaskActionRequest =
+        parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
+    let unblocking = services::project_escalation::is_unblocking_verb(request.action.verb());
+    let result = state
+        .task_service
+        .perform_task_action_as(task_id, request.action, request.version, actor.clone())
+        .await?;
+    if unblocking {
+        // An MCP Project Agent's recovery during its blocker turn is an outcome.
+        if let Some(identity) =
+            ProjectAgentBindingRepo::get_active_project_binding(&*state.db, &result.task.project_id)
+                .await?
+                .filter(|b| b.state == "active")
+                .and_then(|b| b.identity_id)
+        {
+            services::project_escalation::ProjectEscalationService::new(state.db.clone())
+                .record_unblocking_action(&result.task.project_id, &identity, &result.task.id)
+                .await?;
+        }
+    }
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&result.task.id, &actor)
+        .await?;
+    task_snapshot_value(snapshot)
 }
 
 pub(super) async fn forge_get_task_diff(
@@ -594,9 +711,12 @@ pub(super) async fn forge_get_task_diff(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let diff = DiffService::new(std::sync::Arc::clone(&state.db))
-        .task_diff(&params.task_id)
-        .await?;
+    let diff = DiffService::new_with_router(
+        std::sync::Arc::clone(&state.db),
+        std::sync::Arc::clone(&state.workspace_backend_router),
+    )
+    .task_diff(&params.task_id)
+    .await?;
     serde_json::to_value(diff)
         .map_err(|error| McpToolError::new(-32603, format!("failed to serialize diff: {error}")))
 }
@@ -639,7 +759,7 @@ pub(super) async fn forge_update_task(
         },
     )
     .await?;
-    Ok(task_value(task))
+    task_with_offers(state, task).await
 }
 
 pub(super) async fn forge_transition_task(
@@ -657,6 +777,7 @@ pub(super) async fn forge_transition_task(
             params.task_id,
             params.status.into(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: params.version,
                 reason: None,
                 triggered_by: Actor::system(SystemComponent::Mcp),
@@ -665,18 +786,32 @@ pub(super) async fn forge_transition_task(
             },
         )
         .await?;
-    Ok(task_value(task.task))
+    transition_task_value(state, task.task, task.pending_steps).await
+}
+
+async fn transition_task_value(
+    state: &AppState,
+    task: db::Task,
+    pending_steps: i64,
+) -> Result<Value, McpToolError> {
+    let snapshot = state
+        .task_service
+        .task_action_snapshot_for_task(task, &Actor::user(api_types::UserActionSource::Api))
+        .await?;
+    let mut value = task_snapshot_value(snapshot)?;
+    value["pending_steps"] = json!(pending_steps);
+    Ok(value)
 }
 
 pub(super) async fn forge_register_agent(
     state: &AppState,
-    params: Value,
+    params: RegisterAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
-    let params: RegisterAgentParams = parse_params(params)?;
     let user = authenticated_user_record(state, context).await?;
     let is_admin = user.is_admin;
+    // Effect-time re-check of the registry's conditional field authority:
+    // the administrator flag is read again here, next to the write.
     if !is_admin && params.daemon_id.is_some() {
         return Err(
             McpToolError::new(-32003, "Admin access required to pin an agent to a daemon")
@@ -696,7 +831,7 @@ pub(super) async fn forge_register_agent(
             "[]".to_owned(),
             "{}".to_owned(),
             None,
-            params.daemon_id.filter(|_| is_admin),
+            params.daemon_id,
             None,
             None,
             None,
@@ -710,17 +845,19 @@ pub(super) async fn forge_register_agent(
 
 pub(super) async fn forge_list_agents(
     state: &AppState,
-    params: Value,
+    params: ListAgentsParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
-    let params: ListAgentsParams = parse_params(params)?;
     let user = authenticated_user_record(state, context).await?;
     let page = AgentRepo::list_visible(
         &*state.db,
         &user.id,
         AgentListQuery {
-            status: params.status.map(Into::into),
+            status: params
+                .status
+                .map(|value| value.parse::<db::AgentStatus>())
+                .transpose()
+                .map_err(|error| McpToolError::new(-32602, error))?,
             executor_type: None,
             capabilities: Vec::new(),
             page: page_request(params.cursor, params.limit, None)?,
@@ -732,10 +869,20 @@ pub(super) async fn forge_list_agents(
 
 pub(super) async fn forge_list_projects(
     state: &AppState,
-    params: Value,
+    params: ListProjectsParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: ListProjectsParams = parse_params(params)?;
+    if let Some(project_id) = context.project_id.as_deref() {
+        let page = state
+            .db
+            .list_visible_bound_project(
+                project_id,
+                authenticated_user(context)?,
+                page_request(params.cursor, params.limit, None)?,
+            )
+            .await?;
+        return Ok(project_page_value(page));
+    }
     let page = ProjectRepo::list_visible(
         &*state.db,
         authenticated_user(context)?,
@@ -747,12 +894,10 @@ pub(super) async fn forge_list_projects(
 
 pub(super) async fn forge_create_project(
     state: &AppState,
-    params: Value,
+    params: CreateProjectParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
     let user = authenticated_user_record(state, context).await?;
-    let params: CreateProjectParams = parse_params(params)?;
     if params.name.trim().is_empty() {
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
@@ -886,14 +1031,24 @@ pub(super) async fn forge_follow_up_execution(
         .follow_up_interactive_execution(execution_id, message, agent_id, overrides)
         .await?;
 
+    let workspace = state
+        .workspace_backend_router
+        .resolve(&state.db, &launched.workspace)
+        .await
+        .map_err(services::ServiceError::from)?;
+    let workspace_handle = workspace
+        .handle()
+        .map_err(services::ServiceError::from)?
+        .to_owned();
+
     Ok(json!({
-        "task": task_value(launched.task),
+        "task": task_with_offers(state, launched.task).await?,
         "execution": execution_value(launched.execution),
         "workspace": {
             "id": launched.workspace.id,
             "task_id": launched.workspace.task_id,
             "repo_id": launched.workspace.repo_id,
-            "worktree_path": launched.workspace.worktree_path,
+            "worktree_path": workspace_handle,
             "branch": launched.workspace.branch,
             "status": launched.workspace.status.to_string(),
             "before_sha": launched.workspace.before_sha,
@@ -1185,11 +1340,9 @@ pub(super) async fn forge_reorder_sub_tasks(
 
 pub(super) async fn forge_list_agent_profiles(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentProfilesParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: ListAgentProfilesParams = parse_params(params)?;
-    require_owned_identity(state, context, &params.identity_id).await?;
     let profiles = AgentProfileRepo::list_profiles(&*state.db, &params.identity_id).await?;
     Ok(json!({
         "items": profiles.into_iter().map(agent_profile_value).collect::<Vec<_>>(),
@@ -1198,11 +1351,9 @@ pub(super) async fn forge_list_agent_profiles(
 
 pub(super) async fn forge_list_agent_sessions(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentSessionsParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: ListAgentSessionsParams = parse_params(params)?;
-    require_owned_identity(state, context, &params.identity_id).await?;
     let sessions = AgentSessionRepo::list_agent_sessions(&*state.db, &params.identity_id).await?;
     Ok(json!({
         "items": sessions.into_iter().map(agent_session_value).collect::<Vec<_>>(),
@@ -1211,23 +1362,20 @@ pub(super) async fn forge_list_agent_sessions(
 
 pub(super) async fn forge_get_agent_session(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: GetAgentSessionParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: GetAgentSessionParams = parse_params(params)?;
     let session = AgentSessionRepo::get_agent_session(&*state.db, &params.session_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("agent_session", params.session_id.clone()))?;
-    require_owned_identity(state, context, &session.identity_id).await?;
     Ok(agent_session_value(session))
 }
 
 pub(super) async fn forge_get_main_agent(
     state: &AppState,
-    _params: Value,
+    _params: GetMainAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
     let user_id = authenticated_user(context)?;
     let binding = AccountMainAgentBindingRepo::get_active_main_binding(&*state.db, user_id)
         .await?
@@ -1241,13 +1389,16 @@ pub(super) async fn forge_get_main_agent(
 
 pub(super) async fn forge_set_main_agent(
     state: &AppState,
-    params: Value,
+    params: BindMainAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
     let user_id = authenticated_user(context)?;
-    let params: BindMainAgentParams = parse_params(params)?;
-    let identity = require_owned_identity_for_user(state, user_id, &params.identity_id).await?;
+    // Effect-time ownership re-check on the decoded identity. A missing and
+    // a foreign identity are the same answer.
+    let identity = AgentRepo::get_by_id(&*state.db, &params.identity_id)
+        .await?
+        .filter(|identity| identity.owner_id.as_deref() == Some(user_id))
+        .ok_or_else(|| McpToolError::not_found("agent_identity", params.identity_id.clone()))?;
     let now = now_rfc3339();
     let replacement = CreateAccountMainAgentBinding {
         id: new_uuid_v4(),
@@ -1293,12 +1444,9 @@ pub(super) async fn forge_set_main_agent(
 
 pub(super) async fn forge_get_project_agent(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: GetProjectAgentParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: GetProjectAgentParams = parse_params(params)?;
-    require_project_member(state, &params.project_id, user_id).await?;
     let binding =
         ProjectAgentBindingRepo::get_active_project_binding(&*state.db, &params.project_id)
             .await?
@@ -1314,12 +1462,10 @@ pub(super) async fn forge_get_project_agent(
 
 pub(super) async fn forge_set_project_agent(
     state: &AppState,
-    params: Value,
+    params: BindProjectAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: BindProjectAgentParams = parse_params(params)?;
-    require_project_admin(state, &params.project_id, user_id).await?;
     if params.wake_budget < 0 {
         return Err(invalid_field_error(
             "wake_budget",
@@ -1354,11 +1500,10 @@ pub(super) async fn forge_set_project_agent(
 
 pub(super) async fn forge_list_agent_chats(
     state: &AppState,
-    params: Value,
+    params: ListAgentChatsParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: ListAgentChatsParams = parse_params(params)?;
     let _ = (params.cursor, params.limit);
     let chats = AgentChatRepo::list_agent_chats(&*state.db, user_id)
         .await?
@@ -1378,16 +1523,14 @@ pub(super) async fn forge_list_agent_chats(
 
 pub(super) async fn forge_get_agent_chat(
     state: &AppState,
-    params: Value,
+    params: GetAgentChatParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: GetAgentChatParams = parse_params(params)?;
     let chat = state
         .agent_chat_service
         .get_authorized_chat(user_id, &params.chat_id)
         .await?;
-    ensure_chat_scope(context, &chat)?;
     let main_binding = if chat.kind == "account_main" {
         AccountMainAgentBindingRepo::get_active_main_binding(&*state.db, user_id)
             .await?
@@ -1413,16 +1556,9 @@ pub(super) async fn forge_get_agent_chat(
 
 pub(super) async fn forge_list_agent_chat_messages(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentChatMessagesParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: ListAgentChatMessagesParams = parse_params(params)?;
-    let chat = state
-        .agent_chat_service
-        .get_authorized_chat(user_id, &params.chat_id)
-        .await?;
-    ensure_chat_scope(context, &chat)?;
     let page = AgentChatMessageRepo::list_agent_chat_messages(
         &*state.db,
         AgentChatMessageListQuery {
@@ -1451,11 +1587,10 @@ pub(super) async fn forge_list_agent_chat_messages(
 
 pub(super) async fn forge_send_agent_chat_message(
     state: &AppState,
-    params: Value,
+    params: SendAgentChatMessageParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: SendAgentChatMessageParams = parse_params(params)?;
     if params
         .dedupe_key
         .as_deref()
@@ -1467,11 +1602,6 @@ pub(super) async fn forge_send_agent_chat_message(
             Some(json!({ "type": "string", "non_empty": true })),
         ));
     }
-    let chat = state
-        .agent_chat_service
-        .get_authorized_chat(user_id, &params.chat_id)
-        .await?;
-    ensure_chat_scope(context, &chat)?;
     let admitted = state
         .agent_chat_service
         .send_message(services::SendAgentChatMessageInput {
@@ -1489,14 +1619,11 @@ pub(super) async fn forge_send_agent_chat_message(
 
 pub(super) async fn forge_list_agent_handoffs(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentHandoffsParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: ListAgentHandoffsParams = parse_params(params)?;
     let project_id = params.project_id;
     let _ = (params.cursor, params.limit);
-    require_project_member(state, &project_id, user_id).await?;
     let chat = AgentChatRepo::get_project_chat(&*state.db, &project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("agent_chat", project_id.clone()))?;
@@ -1511,18 +1638,12 @@ pub(super) async fn forge_list_agent_handoffs(
 
 pub(super) async fn forge_get_agent_handoff(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: GetAgentHandoffParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: GetAgentHandoffParams = parse_params(params)?;
     let handoff = AgentHandoffRepo::get_agent_handoff(&*state.db, &params.handoff_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("agent_handoff", params.handoff_id.clone()))?;
-    let target = authorized_chat(state, user_id, &handoff.target_chat_id).await?;
-    if target.project_id.as_deref() != Some(params.project_id.as_str()) {
-        return Err(McpToolError::not_found("agent_handoff", params.handoff_id));
-    }
     Ok(serialize_public(handoff_response(
         handoff,
         params.project_id,
@@ -1531,11 +1652,10 @@ pub(super) async fn forge_get_agent_handoff(
 
 pub(super) async fn forge_create_agent_handoff(
     state: &AppState,
-    params: Value,
+    params: CreateAgentHandoffParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: CreateAgentHandoffParams = parse_params(params)?;
     let project_id = params.project_id.clone();
     if params.dedupe_key.trim().is_empty() {
         return Err(invalid_field_error(
@@ -1544,7 +1664,6 @@ pub(super) async fn forge_create_agent_handoff(
             Some(json!({ "type": "string", "non_empty": true })),
         ));
     }
-    require_project_member(state, &project_id, user_id).await?;
     let source = state.agent_chat_service.ensure_main_chat(user_id).await?;
     let outcome = state
         .agent_chat_service
@@ -1581,129 +1700,6 @@ async fn authenticated_user_record(
     UserRepo::get_user_by_id(&*state.db, user_id)
         .await?
         .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))
-}
-
-async fn require_owned_identity(
-    state: &AppState,
-    context: &McpContext,
-    identity_id: &str,
-) -> Result<db::Agent, McpToolError> {
-    let actor_user_id = authenticated_user(context)?;
-    let identity = AgentRepo::get_by_id(&*state.db, identity_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent_identity", identity_id.to_owned()))?;
-    if identity.owner_id.as_deref() != Some(actor_user_id) {
-        // Do not reveal whether another account owns the identity.
-        return Err(McpToolError::not_found(
-            "agent_identity",
-            identity_id.to_owned(),
-        ));
-    }
-    Ok(identity)
-}
-
-async fn require_owned_identity_for_user(
-    state: &AppState,
-    user_id: &str,
-    identity_id: &str,
-) -> Result<db::Agent, McpToolError> {
-    require_owned_identity(
-        state,
-        &McpContext {
-            project_id: None,
-            user_id: Some(user_id.to_owned()),
-        },
-        identity_id,
-    )
-    .await
-}
-
-fn require_account_scope(context: &McpContext) -> Result<(), McpToolError> {
-    if context.project_id.is_some() {
-        return Err(McpToolError::new(
-            -32001,
-            "account-level Agent binding is unavailable in a project-scoped MCP session",
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_chat_scope(context: &McpContext, chat: &AgentChat) -> Result<(), McpToolError> {
-    let Some(project_id) = context.project_id.as_deref() else {
-        return Ok(());
-    };
-    if chat.kind != "project" || chat.project_id.as_deref() != Some(project_id) {
-        return Err(McpToolError::new(
-            -32602,
-            "Agent Chat is outside the scoped MCP project",
-        ));
-    }
-    Ok(())
-}
-
-async fn require_project_member(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> Result<(), McpToolError> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    if ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-    Err(McpToolError::new(-32001, "project not accessible"))
-}
-
-async fn require_project_admin(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> Result<(), McpToolError> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| McpToolError::new(-32001, "project not accessible"))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(McpToolError::new(
-            -32001,
-            "project owner or admin role is required",
-        ));
-    }
-    Ok(())
-}
-
-async fn authorized_chat(
-    state: &AppState,
-    user_id: &str,
-    chat_id: &str,
-) -> Result<AgentChat, McpToolError> {
-    let chat = AgentChatRepo::get_agent_chat(&*state.db, chat_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent_chat", chat_id.to_owned()))?;
-    match chat.kind.as_str() {
-        "account_main" if chat.account_id.as_deref() == Some(user_id) => Ok(chat),
-        "project" => {
-            let project_id = chat
-                .project_id
-                .as_deref()
-                .ok_or_else(|| McpToolError::not_found("agent_chat", chat_id.to_owned()))?;
-            require_project_member(state, project_id, user_id).await?;
-            Ok(chat)
-        }
-        _ => Err(McpToolError::not_found("agent_chat", chat_id.to_owned())),
-    }
 }
 
 fn setup_required(message: &str) -> McpToolError {
@@ -1843,6 +1839,7 @@ async fn message_response(
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
     let error = job.error_message.clone().or_else(|| job.error_code.clone());
+    let retry_action = job.retry_action();
     AgentChatTurnJobResponse {
         id: job.id,
         chat_id: job.chat_id,
@@ -1866,6 +1863,10 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         response_message_id: job.response_message_id,
         error_code: job.error_code,
         error_message: job.error_message,
+        failure_class: job.failure_class,
+        retry_decision: job.retry_decision,
+        pre_provider_failure_count: job.pre_provider_failure_count,
+        retry_action,
         error,
         correlation_id: job.correlation_id,
         version: job.version,
@@ -1924,4 +1925,89 @@ fn chat_status(value: &str) -> AgentChatStatus {
 
 fn parse_json(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| json!({}))
+}
+
+pub(super) async fn forge_project_escalate(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let project_id = context
+        .project_id
+        .as_deref()
+        .ok_or_else(|| McpToolError::new(-32602, "project scope is required"))?;
+    let owner = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .is_some_and(|p| p.owner_id.as_deref() == Some(user_id));
+    if !owner {
+        return Err(McpToolError::new(
+            -32602,
+            "Project owner authentication is required",
+        ));
+    }
+    let mut payload = params;
+    let key = payload
+        .get("dedupe_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpToolError::new(-32602, "dedupe_key is required"))?
+        .to_owned();
+    payload
+        .as_object_mut()
+        .ok_or_else(|| McpToolError::new(-32602, "object required"))?
+        .remove("dedupe_key");
+    let request: api_types::ProjectEscalateRequest = parse_params(payload)?;
+    Ok(serialize_public(
+        services::project_escalation::ProjectEscalationService::new(state.db.clone())
+            .escalate(
+                project_id,
+                services::project_escalation::EscalationAuthority::Owner(user_id),
+                request,
+                &key,
+            )
+            .await?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transition_response_keeps_committed_task_after_background_advance() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let state = AppState::new(db.clone(), Arc::new(events::EventBus::new(16)));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('t','p','task','todo',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let committed = TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE task SET status='done',version=version+1 WHERE id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let value = transition_task_value(&state, committed, 1).await.unwrap();
+        assert_eq!(value["status"], "todo");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["pending_steps"], 1);
+        assert!(value["available_actions"].is_array());
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, "t", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "done"
+        );
+    }
 }

@@ -35,9 +35,9 @@ use forge_agent_host::{
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -195,7 +195,7 @@ async fn fixture(with_task_service: bool) -> Fixture {
 
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
     if with_task_service {
-        provider.set_task_service(Arc::new(TaskService::new(
+        provider.set_task_service(Arc::new(TaskService::new_for_test(
             Arc::clone(&db),
             Arc::new(EventBus::new(32)),
         )));
@@ -351,7 +351,6 @@ async fn seed_project(db: &SqliteDb) {
             name: "Scope composition repository".to_owned(),
             remote_url: Some("file:///tmp/scope-composition-repo".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),
@@ -587,12 +586,11 @@ fn task_dependency_arguments(key: &str, action: &str, task_id: &str, depends_on:
 
 fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -> Value {
     json!({
-        "operation": TASK_CANCEL_OPERATION,
+        "operation": TASK_ACTION_OPERATION,
         "payload": {
-            "action": "cancel",
+            "action": {"verb":"cancel", "reason":"Cancel obsolete work"},
             "task_id": task_id,
-            "expected_task_version": expected_task_version,
-            "reason": "This Task is no longer needed."
+            "version": expected_task_version
         },
         "dedupe_key": key,
         "correlation_id": format!("correlation-{key}")
@@ -680,6 +678,11 @@ async fn invoke_tool(
         .into_iter()
         .find(|tool| tool.spec().name == tool_name)
         .unwrap_or_else(|| panic!("composed tool {tool_name} is missing"));
+    let mut registry = agent_runtime::tool::ToolRegistry::new();
+    registry.register(tool.clone())?;
+    let registry = registry.seal();
+    let arguments = tool.normalize_arguments(arguments)?;
+    registry.validate_arguments(tool_name, &arguments)?;
     let prepared = tool
         .prepare(arguments, &preparation_context(call_id))
         .await?;
@@ -825,11 +828,13 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         ),
         (
             MAIN_PROJECT_CREATE_OPERATION,
-            project_proposal_arguments(
-                MAIN_PROJECT_CREATE_OPERATION,
-                "create_from_approval",
-                "matrix-main-project",
-            ),
+            // A new Project-create call must name its Charter approval.
+            json!({
+                "operation": MAIN_PROJECT_CREATE_OPERATION,
+                "payload": {"action": "create_from_approval", "approval_id": "matrix-approval"},
+                "dedupe_key": "matrix-main-project",
+                "correlation_id": "correlation-matrix-main-project"
+            }),
         ),
     ];
     for (operation, arguments) in main_proposals {
@@ -862,10 +867,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .as_array()
         .expect("ready Project operation enum");
     assert!(
-        !ready_operations
+        ready_operations
             .iter()
             .any(|value| value == PROJECT_CHARTER_ADOPTION_OPERATION),
-        "setup-only adoption must be absent from a ready Project scope"
+        "amendment drafting must be present in a ready Project scope"
     );
 
     let project_proposals = [
@@ -914,7 +919,16 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             release_arguments("matrix-release"),
         ),
     ];
-    for (operation, arguments) in project_proposals {
+    let migrated_inputs: Value = serde_json::from_str(include_str!(
+        "../../operation-registry/tests/project_inputs.json"
+    ))
+    .unwrap();
+    for (operation, mut arguments) in project_proposals {
+        if operation_registry::project_proposals::IDS.contains(&operation)
+            && operation != PROJECT_DOCUMENT_OPERATION
+        {
+            arguments["payload"] = migrated_inputs[operation].clone();
+        }
         let outcome = invoke_tool(
             &project,
             FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
@@ -1049,18 +1063,18 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             cancellable_task_id,
             cancellable_task_version,
         ),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
-    .expect("task.cancel composition call");
-    assert_outcome_operation(&cancelled, TASK_CANCEL_OPERATION);
+    .expect("task.action composition call");
+    assert_outcome_operation(&cancelled, TASK_ACTION_OPERATION);
     assert!(
         !cancelled.is_error,
         "healthy Task cancellation should commit: {}",
         cancelled.value
     );
     assert_eq!(cancelled.value["result"]["task_status"], "cancelled");
-    covered_operations.insert(TASK_CANCEL_OPERATION.to_owned());
+    covered_operations.insert(TASK_ACTION_OPERATION.to_owned());
 
     let mut human_review_workflow = services::workflow::default_workflow::default_workflow();
     let review_state = human_review_workflow
@@ -1102,28 +1116,27 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         &project,
         "forge_scope_propose",
         json!({
-            "operation": TASK_REVIEW_OPERATION,
+            "operation": TASK_ACTION_OPERATION,
             "payload": {
                 "task_id": source_task_id,
-                "decision": "reject",
-                "expected_task_version": review_task_version,
-                "reason": "Exercise the Project Agent human-review decision."
+                "action": {"verb":"send_back","guidance":"Exercise the Project Agent human-review decision."},
+                "version": review_task_version
             },
             "dedupe_key": "matrix-task-review",
             "correlation_id": "correlation-matrix-task-review"
         }),
-        TASK_REVIEW_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("task.review composition call");
-    assert_outcome_operation(&review, TASK_REVIEW_OPERATION);
+    assert_outcome_operation(&review, TASK_ACTION_OPERATION);
     assert!(
         !review.is_error,
         "Task review should commit: {}",
         review.value
     );
     assert_eq!(review.value["result"]["task_status"], "cancelled");
-    covered_operations.insert(TASK_REVIEW_OPERATION.to_owned());
+    covered_operations.insert(TASK_ACTION_OPERATION.to_owned());
 
     let setup = ScopeToolComposition::for_scope_with_permissions_and_project_context(
         AGENT_ID,
@@ -1166,7 +1179,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     covered_operations.insert(PROJECT_CHARTER_ADOPTION_OPERATION.to_owned());
 
     // The remaining migrated contracts are asserted by composition exposure
-    // rather than by invocation. `project.observations` and `task.recover` are
+    // rather than by invocation. `project.observations` and `task.action` are
     // Project-scoped; `task.plan`, `task.worklog`, and `task.evidence` are
     // Task-scoped and need a leased Task session this fixture does not build.
     // Exposure is the property this test is named for: every migrated contract
@@ -1208,10 +1221,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     assert!(
         project_propose_operations
             .iter()
-            .any(|value| value == TASK_RECOVER_OPERATION),
-        "Project propose composition must expose {TASK_RECOVER_OPERATION}"
+            .any(|value| value == TASK_ACTION_OPERATION),
+        "Project propose composition must expose {TASK_ACTION_OPERATION}"
     );
-    covered_operations.insert(TASK_RECOVER_OPERATION.to_owned());
+    covered_operations.insert(TASK_ACTION_OPERATION.to_owned());
 
     let task_composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
         AGENT_ID,
@@ -1307,6 +1320,23 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         "Main Chat composition must expose {MAIN_INQUIRY_RUN_OPERATION}"
     );
     covered_operations.insert(MAIN_INQUIRY_RUN_OPERATION.to_owned());
+
+    let escalation = invoke_tool(&project, FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        json!({"operation":"project.escalate","payload":{"need":"Free disk before recovery","task_ids":[]},"dedupe_key":"matrix-escalation","correlation_id":"matrix-escalation"}),"matrix-escalation").await.expect("native Project escalation");
+    assert!(!escalation.is_error, "escalation: {}", escalation.value);
+    assert_eq!(
+        escalation.value["result"]["domain_result"]["need"],
+        "Free disk before recovery"
+    );
+    let notifications: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification WHERE project_id=? AND event_type='project.escalated'",
+    )
+    .bind(PROJECT_ID)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(notifications, 1);
+    covered_operations.insert("project.escalate".to_owned());
 
     let expected_operations = MIGRATED_OPERATION_CONTRACTS
         .iter()
@@ -1576,11 +1606,11 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-stale", &task_id, original_version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("stale cancellation is structured");
-    assert_structured_error(&stale, TASK_CANCEL_OPERATION, "version_conflict");
+    assert_structured_error(&stale, TASK_ACTION_OPERATION, "version_conflict");
     assert_eq!(
         stale.value["current_version_or_revision"]["resource_type"],
         "task"
@@ -1590,7 +1620,7 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         current_version
     );
     assert_eq!(
-        stale.value["retry"]["arguments"]["expected_task_version"],
+        stale.value["retry"]["arguments"]["version"],
         current_version
     );
 
@@ -1610,35 +1640,36 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
     )
     .await
     .expect("other Project");
-    let other_task = TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)))
-        .create_task(
-            other_project_id,
-            "Other Project Task",
-            None,
-            None,
-            None,
-            Some("planning_task".to_owned()),
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("other Project Task");
+    let other_task =
+        TaskService::new_for_test(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)))
+            .create_task(
+                other_project_id,
+                "Other Project Task",
+                None,
+                None,
+                None,
+                Some("planning_task".to_owned()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("other Project Task");
     let cross_project = invoke_tool(
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-cross-project", &other_task.id, other_task.version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("cross-Project cancellation is structured");
-    assert_structured_error(&cross_project, TASK_CANCEL_OPERATION, "not_found");
+    assert_structured_error(&cross_project, TASK_ACTION_OPERATION, "validation_error");
 
     let cancelled = invoke_tool(
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-current", &task_id, current_version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("current cancellation");
@@ -1649,12 +1680,35 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-current", &task_id, current_version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("response-loss retry");
-    assert!(!retry.is_error, "cancellation retry: {}", retry.value);
-    assert_eq!(retry.value["result"]["task_status"], "cancelled");
+    // An exact Task action version is still required after response loss. The
+    // cancelled outcome remains unchanged, and its fresh offer set is empty.
+    assert_structured_error(&retry, TASK_ACTION_OPERATION, "version_conflict");
+    let cancelled_task = db::TaskRepo::get_by_id(&*fixture.db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled_task.status, "cancelled");
+    assert_eq!(cancelled_task.version, current_version + 1);
+    let terminal = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments("cancel-terminal", &task_id, cancelled_task.version),
+        TASK_ACTION_OPERATION,
+    )
+    .await
+    .unwrap();
+    assert_structured_error(&terminal, TASK_ACTION_OPERATION, "action_unavailable");
+    assert_eq!(terminal.value["details"]["available_actions"], json!([]));
+    let unchanged = db::TaskRepo::get_by_id(&*fixture.db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.version, cancelled_task.version);
+    assert_eq!(unchanged.updated_at, cancelled_task.updated_at);
 }
 
 #[tokio::test]
@@ -1744,9 +1798,8 @@ async fn scope_composition_preserves_replay_approval_policy_version_and_idempote
     .expect("policy denial remains in-band");
     assert_structured_error(&denied, PROJECT_DOCUMENT_OPERATION, "policy_denied");
 
-    // Restore the binding for the version and idempotency cases.  The
-    // composition remains the same server-derived registry; only the durable
-    // policy row is changed between calls.
+    // Restoring live policy does not lift an operation-wide denial in its
+    // existing turn. Start a new turn composition for subsequent cases.
     sqlx::query(
         "UPDATE project_agent_binding SET permission_ceiling_json = ?
          WHERE project_id = ? AND state = 'active'",
@@ -1756,6 +1809,29 @@ async fn scope_composition_preserves_replay_approval_policy_version_and_idempote
     .execute(fixture.db.pool())
     .await
     .expect("restore Project policy");
+
+    let still_denied = invoke_tool(
+        &project,
+        FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        document_arguments(
+            "composition-restored",
+            "Restored policy",
+            "another-document",
+        ),
+        "composition-restored",
+    )
+    .await
+    .expect("same-turn denial remains in-band");
+    assert_eq!(still_denied.value, denied.value);
+    let project = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.project_scope.clone(),
+        None,
+        None,
+        &permissions,
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .expect("next-turn Project composition");
 
     let stale = invoke_tool(
         &project,
@@ -1913,6 +1989,7 @@ async fn fetch_needs_both_a_host_transport_and_the_scopes_web_permission() {
             ProjectChatToolContext::default(),
             Some(Arc::new(fixture.provider.clone())),
             ScopeToolRuntime {
+                environment: Default::default(),
                 command_allowlist: None,
                 fetch_transport: transport
                     .then(|| Arc::new(ForgeFetchTransport::new()) as Arc<dyn FetchTransport>),
@@ -1961,6 +2038,7 @@ async fn a_task_worker_reaches_documentation_only_with_its_read_permission() {
             ProjectChatToolContext::default(),
             Some(Arc::new(fixture.provider.clone())),
             ScopeToolRuntime {
+                environment: Default::default(),
                 command_allowlist: None,
                 fetch_transport: Some(Arc::new(ForgeFetchTransport::new())),
             },
@@ -1981,4 +2059,1353 @@ async fn a_task_worker_reaches_documentation_only_with_its_read_permission() {
         !compose(worker),
         "a Task without read authority does not get a network tool"
     );
+}
+
+#[tokio::test]
+async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path() {
+    let fixture = fixture(false).await;
+    let permissions = broad_permissions();
+    for (scope, operation, input, tool_name, expected_field, expected_value) in [
+        (
+            fixture.main_scope.clone(),
+            "account.summary",
+            json!({}),
+            "forge_scope_read",
+            "id",
+            AGENT_ID,
+        ),
+        (
+            CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: MAIN_CHAT_ID.to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+            "agent_chat.summary",
+            json!({}),
+            "forge_scope_read",
+            "id",
+            MAIN_CHAT_ID,
+        ),
+        (
+            fixture.project_scope.clone(),
+            "project.charter",
+            json!({}),
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            "charter_id",
+            PROJECT_CHARTER_ID,
+        ),
+        (
+            fixture.project_scope.clone(),
+            "skill.section",
+            json!({"section":"research"}),
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            "section",
+            "research",
+        ),
+    ] {
+        assert!(operation_registry::READ_CATALOG.lookup(operation).is_some());
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            AGENT_ID,
+            scope,
+            None,
+            None,
+            &permissions,
+            Some(Arc::new(fixture.provider.clone())),
+        )
+        .unwrap();
+        for arguments in [
+            json!({"operation":operation,"arguments":input}),
+            json!({"parameters":{"operation":operation,"arguments":input}}),
+        ] {
+            let outcome = invoke_tool(&composition, tool_name, arguments, operation)
+                .await
+                .unwrap();
+            assert!(!outcome.is_error, "{operation}: {}", outcome.value);
+            let result = if matches!(operation, "project.charter" | "skill.section") {
+                &outcome.value["result"]
+            } else {
+                &outcome.value
+            };
+            assert_eq!(
+                result[expected_field], expected_value,
+                "{operation}: {}",
+                outcome.value
+            );
+        }
+    }
+    // A contract violation is refused before any handler runs, as a tool
+    // error naming the operation and the field; the provider enforces the
+    // same contract if it is reached directly.
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.project_scope.clone(),
+        None,
+        None,
+        &permissions,
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .unwrap();
+    for (arguments, expected) in [
+        (
+            json!({"operation":"skill.section"}),
+            "skill.section: argument `section` is required",
+        ),
+        (
+            json!({"parameters":{"operation":"project.charter","arguments":{"limit":1}}}),
+            "project.charter: argument `limit` is not admitted",
+        ),
+    ] {
+        let error = invoke_tool(
+            &composition,
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            arguments,
+            "violation",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    let direct = forge_agent_host::ForgeToolProvider::read(
+        &fixture.provider,
+        AGENT_ID,
+        &fixture.project_scope,
+        "skill.section",
+        json!({"section":"everything"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{direct:?}").contains("skill.section: argument `section` must be one of"),
+        "{direct:?}"
+    );
+
+    assert!(operation_registry::READ_CATALOG
+        .lookup("inbox.read")
+        .is_none());
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.main_scope,
+        None,
+        None,
+        &permissions,
+        Some(Arc::new(fixture.provider)),
+    )
+    .unwrap();
+    let outcome = invoke_tool(
+        &composition,
+        "forge_scope_read",
+        json!({"operation":"inbox.read","arguments":{"limit":1}}),
+        "unmoved",
+    )
+    .await
+    .unwrap();
+    assert!(!outcome.is_error);
+    assert!(outcome.value["items"].is_array());
+}
+
+#[derive(Debug, Default)]
+struct RegistryInquiryRunner(std::sync::Mutex<Vec<services::InquiryRequest>>);
+#[async_trait::async_trait]
+impl services::InquiryRunner for RegistryInquiryRunner {
+    async fn dispatch(
+        &self,
+        request: services::InquiryRequest,
+        _: tokio_util::sync::CancellationToken,
+    ) -> services::Result<services::InquiryOutcome> {
+        self.0.lock().unwrap().push(request);
+        Ok(services::InquiryOutcome {
+            inquiry_id: "registry-inquiry".into(),
+            status: db::AgentInquiryStatus::Succeeded,
+            findings: "Bounded findings".into(),
+            findings_path: Some("inquiries/registry-inquiry/findings.md".into()),
+            input_tokens: 11,
+            output_tokens: 12,
+            cache_read_tokens: 13,
+            cache_write_tokens: 14,
+            duration_ms: 15,
+        })
+    }
+    async fn cancel_inquiry(&self, _: &str) -> bool {
+        false
+    }
+}
+
+fn main_registered_input(id: &str) -> Value {
+    match id {
+        "genesis.project_agents.read" => json!({"genesis_session_id":MAIN_GENESIS_ID}),
+        "charter.read" => {
+            json!({"charter_id":MAIN_CHARTER_ID,"revision_id":MAIN_REVISION_ID,"genesis_session_id":MAIN_GENESIS_ID})
+        }
+        "charter.readiness" | "charter.approval_target" => {
+            json!({"charter_id":MAIN_CHARTER_ID,"revision_id":MAIN_REVISION_ID,"content_digest":"main-content-1","render_digest":"main-render-1","expected_charter_version":1,"genesis_session_id":MAIN_GENESIS_ID})
+        }
+        "charter.diff" => {
+            json!({"charter_id":MAIN_CHARTER_ID,"base_revision_id":MAIN_REVISION_ID,"candidate_revision_id":MAIN_REVISION_ID,"genesis_session_id":MAIN_GENESIS_ID})
+        }
+        "discovery.read" | "portfolio.read" => json!({"limit":1}),
+        "inquiry.run" => {
+            json!({"title":"  Question  ","question":"  Find the answer  ","context":"  Supporting material  "})
+        }
+        _ => panic!("unexpected Main operation {id}"),
+    }
+}
+
+#[tokio::test]
+async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
+    use forge_agent_host::ForgeToolProvider;
+    let fixture = fixture(false).await;
+    let runner = Arc::new(RegistryInquiryRunner::default());
+    fixture.provider.set_inquiry_runner(runner.clone());
+    for scope in [
+        fixture.main_scope.clone(),
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: MAIN_CHAT_ID.to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        },
+    ] {
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            AGENT_ID,
+            scope.clone(),
+            None,
+            None,
+            &broad_permissions(),
+            Some(Arc::new(fixture.provider.clone())),
+        )
+        .unwrap();
+        for id in operation_registry::main_reads::IDS {
+            if *id == "inquiry.run" && scope.scope_type == CanonicalScopeType::Account {
+                continue;
+            }
+            let input = main_registered_input(id);
+            let tool_name = operation_registry::READ_CATALOG
+                .lookup(id)
+                .unwrap()
+                .surfaces[0]
+                .native_aggregate;
+            let direct = fixture
+                .provider
+                .read(AGENT_ID, &scope, id, input.clone())
+                .await
+                .unwrap();
+            // The only two values excluded from equality: the fresh server
+            // correlation id each read mints for its outcome envelope, and a
+            // readiness evaluation's wall-clock timestamp. Everything else in
+            // the envelope and the domain payload must be equal.
+            let comparable = |mut outcome: Value| {
+                if outcome.get("result").is_some() {
+                    assert!(outcome["correlation_id"].as_str().is_some(), "{id}");
+                    outcome.as_object_mut().unwrap().remove("correlation_id");
+                }
+                let payload = if outcome.get("result").is_some() {
+                    &mut outcome["result"]
+                } else {
+                    &mut outcome
+                };
+                if let Some(readiness) = payload.get_mut("readiness") {
+                    assert!(readiness["evaluated_at"].as_str().is_some(), "{id}");
+                    readiness.as_object_mut().unwrap().remove("evaluated_at");
+                }
+                outcome
+            };
+            // The domain payload inside the outcome envelope, where the
+            // operation has one.
+            let payload = |outcome: &Value| match outcome.get("result") {
+                Some(result) => result.clone(),
+                None => outcome.clone(),
+            };
+            // Call the same domain handlers the base dispatcher selected,
+            // independently of the registry's handler binding.
+            let queries = services::MainOrchestrationQueryService::new(fixture.db.clone());
+            let reference = match *id {
+                "genesis.project_agents.read" => Some(
+                    queries
+                        .project_agents(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.read" => Some(
+                    queries
+                        .charter_read(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.readiness" => Some(
+                    queries
+                        .charter_readiness(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.diff" => Some(
+                    queries
+                        .charter_diff(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.approval_target" => Some(
+                    queries
+                        .charter_approval_target(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "discovery.read" => {
+                    assert_eq!(direct["items"][0]["id"], MAIN_GENESIS_ID);
+                    None
+                }
+                "portfolio.read" => {
+                    assert_eq!(direct["items"][0]["id"], PROJECT_ID);
+                    None
+                }
+                "inquiry.run" => None,
+                _ => unreachable!(),
+            };
+            if let Some(reference) = reference {
+                assert_eq!(
+                    comparable(payload(&direct)),
+                    comparable(reference),
+                    "{id} handler parity"
+                );
+            }
+            for raw in [
+                json!({"operation":id,"arguments":input}),
+                json!({"parameters":{"operation":id,"arguments":input}}),
+            ] {
+                let outcome = invoke_tool(&composition, tool_name, raw, "main-registry")
+                    .await
+                    .unwrap();
+                assert!(!outcome.is_error, "{id}: {}", outcome.value);
+                assert_eq!(
+                    comparable(outcome.value),
+                    comparable(direct.clone()),
+                    "{id}"
+                );
+            }
+            for denied_scope in [
+                fixture.project_scope.clone(),
+                CanonicalScope {
+                    scope_type: CanonicalScopeType::Task,
+                    scope_id: "foreign-task".into(),
+                    workspace_access: WorkspaceAccess::Deny,
+                },
+            ] {
+                assert!(
+                    fixture
+                        .provider
+                        .read(AGENT_ID, &denied_scope, id, input.clone())
+                        .await
+                        .is_err(),
+                    "{id}"
+                );
+            }
+            // Same owner, but no active Main binding for this identity. The
+            // denial is the same whether or not the arguments satisfy the
+            // contract: a denied caller is told nothing about it.
+            let denial = |error: forge_agent_host::AgentHostError| match error {
+                forge_agent_host::AgentHostError::StructuredOutcome(outcome) => {
+                    let mut outcome = serde_json::to_value(&*outcome).unwrap();
+                    outcome.as_object_mut().unwrap().remove("correlation_id");
+                    outcome.to_string()
+                }
+                other => format!("{other:?}"),
+            };
+            let denied = denial(
+                fixture
+                    .provider
+                    .read(PROJECT_AGENT_CANDIDATE_ID, &scope, id, input.clone())
+                    .await
+                    .unwrap_err(),
+            );
+            for malformed in [json!({"foreign_project":"x"}), json!(null), json!([])] {
+                let probed = denial(
+                    fixture
+                        .provider
+                        .read(PROJECT_AGENT_CANDIDATE_ID, &scope, id, malformed)
+                        .await
+                        .unwrap_err(),
+                );
+                assert!(
+                    !probed.contains("expected") && !probed.contains("foreign_project"),
+                    "{id}: {probed}"
+                );
+                assert_eq!(probed, denied, "{id}");
+            }
+            let error = invoke_tool(
+                &composition,
+                tool_name,
+                json!({"operation":id,"arguments":{"foreign_project":"x"}}),
+                "invalid-registry",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(id)
+                    && error.contains("foreign_project")
+                    && error.contains("expected"),
+                "{error}"
+            );
+            let error = fixture
+                .provider
+                .read(AGENT_ID, &scope, id, json!({"foreign_project":"x"}))
+                .await
+                .unwrap_err();
+            let error = format!("{error:?}");
+            assert!(
+                error.contains(id)
+                    && error.contains("foreign_project")
+                    && error.contains("expected"),
+                "{error}"
+            );
+        }
+    }
+    // An integer sent as a string or a float reaches the real handler as the
+    // integer: one row, as `limit: 1` returns, not the default page.
+    for id in ["discovery.read", "portfolio.read"] {
+        let page = |limit: Value| {
+            let provider = fixture.provider.clone();
+            let scope = fixture.main_scope.clone();
+            async move {
+                provider
+                    .read(AGENT_ID, &scope, id, json!({"limit":limit}))
+                    .await
+            }
+        };
+        let one = page(json!(1)).await.unwrap();
+        assert_eq!(one["items"].as_array().unwrap().len(), 1, "{id}");
+        for spelling in [json!("1"), json!(1.0)] {
+            assert_eq!(page(spelling).await.unwrap(), one, "{id}");
+        }
+        for malformed in [json!("one"), json!(1.5), json!(-1), json!(true)] {
+            let error = format!("{:?}", page(malformed).await.unwrap_err());
+            assert!(
+                error.contains(id) && error.contains("limit") && error.contains("expected"),
+                "{error}"
+            );
+        }
+        // Clamping is the handler's: 0 and 1000 are admitted.
+        for clamped in [json!(0), json!(1000), json!(null)] {
+            page(clamped).await.unwrap();
+        }
+    }
+    {
+        let requests = runner.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert_eq!(request.chat_id, MAIN_CHAT_ID);
+            assert_eq!(request.identity_id, AGENT_ID);
+            assert_eq!(request.account_id, USER_ID);
+            assert_eq!(request.title, "Question");
+            assert_eq!(request.question, "Find the answer");
+            assert_eq!(request.context.as_deref(), Some("Supporting material"));
+        }
+    }
+    assert_eq!(
+        fixture
+            .provider
+            .read(
+                AGENT_ID,
+                &CanonicalScope {
+                    scope_type: CanonicalScopeType::AgentChat,
+                    scope_id: MAIN_CHAT_ID.into(),
+                    workspace_access: WorkspaceAccess::Deny
+                },
+                "inquiry.run",
+                main_registered_input("inquiry.run")
+            )
+            .await
+            .unwrap()["result"],
+        json!({
+            "inquiry_id":"registry-inquiry","status":"succeeded","findings":"Bounded findings",
+            "findings_path":"inquiries/registry-inquiry/findings.md","duration_ms":15,
+            "token_usage":{"input_tokens":11,"output_tokens":12,"cache_read_tokens":13,"cache_write_tokens":14}
+        })
+    );
+}
+
+/// The baseline is the unchanged command boundary called with the exact old
+/// adapter's decoded request/envelope (gate main_genesis_commands.rs:3482).
+/// The registry must replay that receipt, rather than create a second effect.
+#[tokio::test]
+async fn main_selection_registry_replays_base_command_receipt_and_preserves_effect() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let base = capture_base_selection(&f).await;
+    let frozen_base_receipt: String =
+        sqlx::query_scalar("SELECT outcome_json FROM command_receipt WHERE id = ?")
+            .bind(&base.receipt_id)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    // Written from the gate, not emitted by new normalization/preparation.
+    let stored: Value = serde_json::from_str(r#"{"operation":"genesis.project_agent.select","payload":{"action":"select","genesis_session_id":"scope-composition-genesis","expected_session_version":1,"project_agent_identity_id":"scope-composition-project-agent-candidate"},"dedupe_key":"pre-change-selection","correlation_id":"pre-change-correlation","causation_id":"pre-change-cause","causation_depth":1}"#).unwrap();
+    for prepared in [false, true] {
+        let outcome = if prepared {
+            ForgeToolProvider::propose_prepared(
+                &f.provider,
+                AGENT_ID,
+                &f.main_scope,
+                "session",
+                MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+                stored.clone(),
+            )
+            .await
+        } else {
+            ForgeToolProvider::propose(
+                &f.provider,
+                AGENT_ID,
+                &f.main_scope,
+                "session",
+                MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+                stored.clone(),
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(outcome["receipt_id"], base.receipt_id);
+        assert_eq!(outcome["result"]["event_id"], base.event_id);
+        let mut base_replay = base.result.clone();
+        base_replay["replayed"] = json!(true);
+        assert_eq!(outcome["result"]["domain_result"], base_replay);
+        let frozen: String =
+            sqlx::query_scalar("SELECT outcome_json FROM command_receipt WHERE id = ?")
+                .bind(&base.receipt_id)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(frozen, frozen_base_receipt);
+        assert_eq!(outcome["replayed"], true);
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'genesis.project_agent.select'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'product_genesis.project_agent_selected'").fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn main_proposal_dispatch_denies_unbound_and_forged_callers_before_contract_detail() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    for operation in operation_registry::main_proposals::IDS {
+        for actor in [AGENT_ID, PROJECT_AGENT_CANDIDATE_ID] {
+            for field in ["identity_id", "authority", "unexpected"] {
+                let mut args = json!({"operation":operation,"payload":{field:"forged"},"dedupe_key":"denial-key","correlation_id":"corr"});
+                if field == "unexpected" {
+                    args["payload"] = json!(null);
+                }
+                let composition = ScopeToolComposition::for_scope_with_permissions(
+                    actor,
+                    f.main_scope.clone(),
+                    None,
+                    None,
+                    &broad_permissions(),
+                    Some(Arc::new(f.provider.clone())),
+                )
+                .unwrap();
+                let tool = composition
+                    .tools()
+                    .into_iter()
+                    .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL)
+                    .unwrap();
+                let prepared_error = tool
+                    .prepare(args.clone(), &preparation_context("denial-order"))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    prepared_error.contains("expected "),
+                    actor == AGENT_ID && field == "unexpected",
+                    "{operation} {actor} {field}: {prepared_error}"
+                );
+                let error = ForgeToolProvider::propose(
+                    &f.provider,
+                    actor,
+                    &f.main_scope,
+                    "session",
+                    operation,
+                    args,
+                )
+                .await
+                .unwrap_err();
+                let text = format!("{error:?}");
+                if actor != AGENT_ID || field != "unexpected" {
+                    assert!(
+                        !text.contains("expected "),
+                        "{operation} {actor} {field}: {text}"
+                    );
+                    let forge_agent_host::AgentHostError::StructuredOutcome(outcome) = error else {
+                        panic!("{text}");
+                    };
+                    assert_eq!(
+                        serde_json::to_value(outcome).unwrap()["code"],
+                        "policy_denied"
+                    );
+                } else {
+                    assert!(
+                        text.contains(operation) && text.contains("expected "),
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+    // A revoked current policy also denies valid and malformed payloads equally.
+    sqlx::query("UPDATE agent_identity SET account_permission_ceiling = '{}' WHERE id = ?")
+        .bind(AGENT_ID)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    for operation in operation_registry::main_proposals::IDS {
+        let error = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            operation,
+            json!({"payload":{},"dedupe_key":"denial-key","correlation_id":"corr"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:?}").contains("expected "));
+    }
+}
+
+#[tokio::test]
+async fn main_create_registry_preserves_base_pending_proposal_and_exact_dedupe() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    // Capture the original enqueue boundary's values, without the registry.
+    let payload = r#"{"action":"create_from_approval","approval_id":"pre-change-approval"}"#;
+    let actions = services::AgentActionService::new(f.db.clone());
+    let base = actions
+        .propose(services::ProposeActionInput {
+            id: Some("pre-change-main-create-action".into()),
+            actor_identity_id: AGENT_ID.into(),
+            scope_type: "account".into(),
+            scope_id: USER_ID.into(),
+            operation: MAIN_PROJECT_CREATE_OPERATION.into(),
+            payload_json: payload.into(),
+            dedupe_key: "pre-change-create".into(),
+            correlation_id: "pre-change-correlation".into(),
+            causation_id: Some("pre-change-cause".into()),
+            causation_depth: 1,
+            requested_permission: "propose_project".into(),
+            policy_reason: None,
+            target_type: Some("account".into()),
+            target_id: Some(USER_ID.into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        base.policy_result,
+        db::AgentActionPolicyResult::ApprovalRequired
+    );
+    assert_eq!(base.status, db::AgentActionStatus::PendingApproval);
+    let stored: Value = serde_json::from_str(r#"{"operation":"project.create","payload":{"action":"create_from_approval","approval_id":"pre-change-approval"},"dedupe_key":"pre-change-create","correlation_id":"pre-change-correlation","causation_id":"pre-change-cause","causation_depth":1}"#).unwrap();
+    for prepared in [false, true] {
+        let outcome = if prepared {
+            ForgeToolProvider::propose_prepared(
+                &f.provider,
+                AGENT_ID,
+                &f.main_scope,
+                "session",
+                MAIN_PROJECT_CREATE_OPERATION,
+                stored.clone(),
+            )
+            .await
+        } else {
+            ForgeToolProvider::propose(
+                &f.provider,
+                AGENT_ID,
+                &f.main_scope,
+                "session",
+                MAIN_PROJECT_CREATE_OPERATION,
+                stored.clone(),
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(outcome["code"], "approval_required");
+        assert_eq!(outcome["status"], "approval_required");
+        assert_eq!(outcome["approval_target"]["target_id"], USER_ID);
+        assert!(outcome["receipt_id"].is_null());
+        let replay = db::AgentActionRepo::get_action(&*f.db, &base.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay, base);
+    }
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_action WHERE operation = 'project.create'")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    // There is no command receipt or domain creation from a direct proposal.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'project.create'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_charter_approval")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+async fn capture_base_selection(f: &Fixture) -> services::MainGenesisProjectAgentSelectResult {
+    services::MainGenesisCommandService::new(f.db.clone())
+        .select_project_agent(services::MainGenesisProjectAgentSelectCommandInput {
+            principal: services::MainGenesisDraftPrincipal::MainAgent {
+                identity_id: AGENT_ID.into(),
+                scope: f.main_scope.clone(),
+            },
+            request: services::MainGenesisProjectAgentSelectRequest {
+                genesis_session_id: Some(MAIN_GENESIS_ID.into()),
+                expected_session_version: 1,
+                project_agent_identity_id: PROJECT_AGENT_CANDIDATE_ID.into(),
+            },
+            idempotency_key: "pre-change-selection".into(),
+            correlation_id: "pre-change-correlation".into(),
+            causation_id: Some("pre-change-cause".into()),
+            causation_depth: 1,
+            policy_result: "allowed".into(),
+            requested_permission: "propose_discovery".into(),
+        })
+        .await
+        .unwrap()
+}
+
+#[path = "common/pre_change_main_runtime.rs"]
+mod pre_change_main_runtime;
+
+#[tokio::test]
+async fn main_selection_literal_checkpoints_resume_real_provider_and_same_base_receipt() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "common/main_proposal_checkpoints_pre_change.json"
+    ))
+    .unwrap();
+    for form in ["prepared", "approval_pending", "approval_edited"] {
+        let f = fixture(false).await;
+        let base = capture_base_selection(&f).await;
+        let original: (String, String, String) =
+            sqlx::query_as("SELECT id,event_id,outcome_json FROM command_receipt WHERE id = ?")
+                .bind(&base.receipt_id)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            AGENT_ID,
+            f.main_scope.clone(),
+            None,
+            None,
+            &BTreeSet::from(["propose_discovery".into()]),
+            Some(Arc::new(f.provider.clone())),
+        )
+        .unwrap();
+        pre_change_main_runtime::resume(
+            composition,
+            &fixtures[format!("genesis.project_agent.select:{form}")]["checkpoint"],
+        )
+        .await;
+        let replay: (String, String, String) =
+            sqlx::query_as("SELECT id,event_id,outcome_json FROM command_receipt WHERE id = ?")
+                .bind(&base.receipt_id)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(original, replay, "{form}: exact base receipt bytes");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = 'genesis.project_agent.select'",
+        )
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'product_genesis.project_agent_selected'").fetch_one(f.db.pool()).await.unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+/// The base provider read authority replacements only from payload. These
+/// envelope fields were ignored by direct provider callers; the registry's
+/// dispatch guard now rejects them, just as named native preparation already did.
+#[tokio::test]
+async fn main_proposal_root_authority_fields_are_denied_before_payload_contracts() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let fields = [
+        "actor_identity_id",
+        "identity_id",
+        "scope_type",
+        "scope_id",
+        "project_id",
+        "authority",
+        "permission",
+        "workspace",
+        "workspace_path",
+        "workspace_lease",
+        "repository_path",
+        "repository_url",
+        "credential",
+        "target_type",
+        "target_id",
+    ];
+    for operation in operation_registry::main_proposals::IDS {
+        for actor in [AGENT_ID, PROJECT_AGENT_CANDIDATE_ID] {
+            let composition = ScopeToolComposition::for_scope_with_permissions(
+                actor,
+                f.main_scope.clone(),
+                None,
+                None,
+                &broad_permissions(),
+                Some(Arc::new(f.provider.clone())),
+            )
+            .unwrap();
+            let tool = composition
+                .tools()
+                .into_iter()
+                .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL)
+                .unwrap();
+            for field in fields {
+                let mut arguments = json!({"operation":operation,"payload":null,"dedupe_key":"root-authority","correlation_id":"root-correlation"});
+                arguments[field] = json!("ignored-envelope-value");
+                // Even a malformed payload does not reveal contract details.
+                let error = tool
+                    .prepare(arguments.clone(), &preparation_context("root-authority"))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    !error.contains("expected "),
+                    "{operation} {actor} {field}: {error}"
+                );
+                let error = ForgeToolProvider::propose(
+                    &f.provider,
+                    actor,
+                    &f.main_scope,
+                    "session",
+                    operation,
+                    arguments,
+                )
+                .await
+                .unwrap_err();
+                let forge_agent_host::AgentHostError::StructuredOutcome(outcome) = error else {
+                    panic!("unexpected error");
+                };
+                assert_eq!(
+                    serde_json::to_value(&*outcome).unwrap()["code"],
+                    "policy_denied"
+                );
+                assert!(!outcome.safe_message.contains("expected "));
+            }
+        }
+    }
+}
+
+/// Selection through the provider: the former `action` is optional, an
+/// integer spelling of the session version reaches the command as the integer,
+/// both forms hit the one receipt, and a stale version is refused by the
+/// unchanged command service with no second receipt.
+#[tokio::test]
+async fn main_selection_dispatch_accepts_spellings_and_refuses_a_stale_version() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let call = |version: Value, action: Option<&str>, key: &str| {
+        let mut payload = json!({
+            "genesis_session_id": MAIN_GENESIS_ID,
+            "expected_session_version": version,
+            "project_agent_identity_id": PROJECT_AGENT_CANDIDATE_ID
+        });
+        if let Some(action) = action {
+            payload["action"] = json!(action);
+        }
+        json!({"operation":MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,"payload":payload,"dedupe_key":key,"correlation_id":"spelling-correlation"})
+    };
+    let mut receipts = Vec::new();
+    for (version, action) in [
+        (json!(1), None),
+        (json!("1"), Some("select")),
+        (json!(1.0), Some("anything")),
+    ] {
+        let outcome = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            call(version, action, "spelling-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome["code"], "ok", "{outcome}");
+        receipts.push((
+            outcome["receipt_id"].clone(),
+            outcome["result"]["event_id"].clone(),
+        ));
+    }
+    assert!(receipts[0].0.is_string());
+    assert!(receipts.iter().all(|receipt| receipt == &receipts[0]));
+    // The session moved to version 2. A new key at version 1 is stale.
+    let stale = ForgeToolProvider::propose(
+        &f.provider,
+        AGENT_ID,
+        &f.main_scope,
+        "session",
+        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+        call(json!("1"), None, "stale-key"),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{stale:?}");
+    assert!(
+        !text.contains("expected genesis.project_agent.select"),
+        "{text}"
+    );
+    for malformed in [json!("one"), json!(1.5), json!(true), json!(0)] {
+        let error = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            call(malformed, None, "malformed-key"),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("expected_session_version"), "{text}");
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'genesis.project_agent.select'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'product_genesis.project_agent_selected'").fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+/// A new Project-create call without a usable Charter approval reference is
+/// refused at preparation and at dispatch and queues nothing. A reference the
+/// caller invents still only queues a pending action: nothing executes.
+#[tokio::test]
+async fn main_create_requires_an_approval_reference_and_only_ever_queues() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        f.main_scope.clone(),
+        None,
+        None,
+        &broad_permissions(),
+        Some(Arc::new(f.provider.clone())),
+    )
+    .unwrap();
+    let tool = composition
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL)
+        .unwrap();
+    for payload in [
+        json!({}),
+        json!({"action":"create_from_approval"}),
+        json!({"approval_id":null}),
+        json!({"approval_id":""}),
+        json!({"approval_id":7}),
+    ] {
+        let arguments = json!({"operation":MAIN_PROJECT_CREATE_OPERATION,"payload":payload,"dedupe_key":"no-reference","correlation_id":"no-reference"});
+        let error = tool
+            .prepare(arguments.clone(), &preparation_context("no-reference"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("argument `approval_id`")
+                && error.ends_with("expected project.create: {approval_id}"),
+            "{error}"
+        );
+        let error = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            MAIN_PROJECT_CREATE_OPERATION,
+            arguments,
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("approval_id"), "{text}");
+    }
+    let queued = |f: &Fixture| {
+        let pool = f.db.pool().clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT status, policy_result FROM agent_action WHERE operation = 'project.create'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert!(queued(&f).await.is_empty());
+    // `project_id` is refused at preparation too, not only at dispatch.
+    let error = tool
+        .prepare(
+            json!({"operation":MAIN_PROJECT_CREATE_OPERATION,"payload":{"approval_id":"invented","project_id":"forged"},"dedupe_key":"forged","correlation_id":"forged"}),
+            &preparation_context("forged-project"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("server-derived"), "{error}");
+    let outcome = ForgeToolProvider::propose(
+        &f.provider,
+        AGENT_ID,
+        &f.main_scope,
+        "session",
+        MAIN_PROJECT_CREATE_OPERATION,
+        json!({"operation":MAIN_PROJECT_CREATE_OPERATION,"payload":{"approval_id":"invented"},"dedupe_key":"invented","correlation_id":"invented"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome["code"], "approval_required", "{outcome}");
+    assert_eq!(
+        queued(&f).await,
+        vec![(
+            "pending_approval".to_owned(),
+            "approval_required".to_owned()
+        )]
+    );
+    for query in [
+        "SELECT COUNT(*) FROM project_charter_approval",
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'project.create'",
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{query}");
+    }
+}
+
+/// Each case still uses the hand path when its literal fixture is captured.
+#[tokio::test]
+async fn project_registry_base_project_review_config() {
+    capture_project_proposal_case("project.review_config").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_document() {
+    capture_project_proposal_case("project.document").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_decision() {
+    capture_project_proposal_case("project.decision").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_milestone() {
+    capture_project_proposal_case("project.milestone").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_validation() {
+    capture_project_proposal_case("project.validation").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_release_request() {
+    capture_project_proposal_case("project.release.request").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_escalate() {
+    capture_project_proposal_case("project.escalate").await;
+}
+#[tokio::test]
+async fn project_registry_base_message_send() {
+    capture_project_proposal_case("message.send").await;
+}
+#[tokio::test]
+async fn project_registry_base_commitment_update() {
+    capture_project_proposal_case("commitment.update").await;
+}
+#[tokio::test]
+async fn project_registry_base_memory_publish() {
+    capture_project_proposal_case("memory.publish").await;
+}
+#[tokio::test]
+async fn project_registry_base_memory_supersede() {
+    capture_project_proposal_case("memory.supersede").await;
+}
+#[tokio::test]
+async fn project_registry_base_review_request() {
+    capture_project_proposal_case("review.request").await;
+}
+#[tokio::test]
+async fn project_registry_base_session_action() {
+    capture_project_proposal_case("session.action").await;
+}
+async fn capture_project_proposal_case(operation: &'static str) {
+    use forge_agent_host::ForgeToolProvider;
+    use sqlx::Row;
+    let f = fixture(false).await;
+    let project_version = ProjectRepo::get_by_id(&*f.db, PROJECT_ID)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    if matches!(
+        operation,
+        PROJECT_EVIDENCE_OPERATION | PROJECT_VALIDATION_OPERATION | PROJECT_READINESS_OPERATION
+    ) {
+        sqlx::query("INSERT INTO project_milestone (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at) VALUES ('registry-milestone', ?, 1, 'M001', 'active', ?, ?)").bind(PROJECT_ID).bind(NOW).bind(NOW).execute(f.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_milestone_revision (id, milestone_id, revision, lifecycle, outcome, display_label, schema_version, render_version, rendered_view, content_digest, rendered_digest, author_type, created_at) VALUES ('registry-definition','registry-milestone',1,'approved','Deliver the requirement','Delivery','milestone-v1','render-v1','Delivered','definition-content','definition-render','user',?)").bind(NOW).execute(f.db.pool()).await.unwrap();
+        sqlx::query("UPDATE project_milestone SET current_definition_revision_id = 'registry-definition' WHERE id = 'registry-milestone'").execute(f.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_milestone_check (id, project_id, milestone_id, definition_revision_id, check_key, description, source_kind, expected_result, created_at, updated_at) VALUES ('delivery',?,'registry-milestone','registry-definition','delivery','Observe delivery','task_validation','Delivered',?,?)").bind(PROJECT_ID).bind(NOW).bind(NOW).execute(f.db.pool()).await.unwrap();
+    }
+    let key = format!("registry-{operation}");
+    let payload = match operation {
+        PROJECT_REVIEW_CONFIG_OPERATION => {
+            json!({"action":"set_ci_steps","expected_project_version":project_version,"ci_steps":["cargo test --lib"]})
+        }
+        PROJECT_DOCUMENT_OPERATION => document_arguments(
+            "registry-document",
+            "Registry research",
+            "registry-document",
+        )["payload"]
+            .clone(),
+        PROJECT_DECISION_OPERATION => {
+            json!({"action":"record_effective","expected_project_version":project_version,"decision_id":"registry-decision","question":"Choose implementation","options":["A","B"],"selected_outcome":"A","rationale":"Keep the scope bounded","decision_class":"project_implementation"})
+        }
+        PROJECT_MILESTONE_OPERATION => {
+            json!({"action":"define","expected_milestone_version":project_version,"content":{"name":"Delivery","outcome":"Deliver the requirement"}})
+        }
+        PROJECT_CHARTER_ADOPTION_OPERATION => {
+            sqlx::query("UPDATE project SET charter_status='legacy_unverified',charter_setup_required=1,current_charter_id=NULL,current_charter_revision_id=NULL WHERE id=?").bind(PROJECT_ID).execute(f.db.pool()).await.unwrap();
+            sqlx::query("DELETE FROM project_charter WHERE project_id=?")
+                .bind(PROJECT_ID)
+                .execute(f.db.pool())
+                .await
+                .unwrap();
+            let mut payload = adoption_arguments("registry-adoption")["payload"].clone();
+            payload["expected_charter_version"] = json!(0);
+            payload
+        }
+        PROJECT_EVIDENCE_OPERATION => {
+            sqlx::query("INSERT INTO media_asset (id,project_id,display_filename,content_type,byte_size,storage_key,checksum,availability,gc_state,created_at,updated_at) VALUES ('registry-asset',?,'proof.txt','text/plain',5,'proof.txt','registry-checksum','available','referenced',?,?)").bind(PROJECT_ID).bind(NOW).bind(NOW).execute(f.db.pool()).await.unwrap();
+            json!({"action":"attach","milestone_id":"registry-milestone","expected_milestone_version":1,"asset_id":"registry-asset","checksum":"registry-checksum","acceptance_check_ids":["delivery"],"caption":"Observed requirement","kind":"report"})
+        }
+        PROJECT_VALIDATION_OPERATION => {
+            json!({"action":"record","milestone_id":"registry-milestone","milestone_version":1,"check_id":"delivery","definition_revision_id":"registry-definition","status":"unavailable","result":"Independent execution has not run","input_digest":"registry-input"})
+        }
+        PROJECT_READINESS_OPERATION => {
+            json!({"action":"evaluate","milestone_id":"registry-milestone","milestone_version":1})
+        }
+        PROJECT_RELEASE_OPERATION => release_arguments("registry-release")["payload"].clone(),
+        "project.escalate" => json!({"need":"Confirm the delivery requirement","task_ids":[]}),
+        "session.action" => json!({"action":"cancel","session_id":"pending-session"}),
+        _ => json!({"content":"Pending proposal"}),
+    };
+    let arguments = json!({"operation":operation,"payload":payload,"dedupe_key":key,"correlation_id":format!("correlation-{key}")});
+    let first = f
+        .provider
+        .propose(
+            AGENT_ID,
+            &f.project_scope,
+            "session",
+            operation,
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+    if operation == "project.escalate" {
+        let replay = f
+            .provider
+            .propose(
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                operation,
+                arguments.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_wake_escalation WHERE project_id = ?")
+                .bind(PROJECT_ID)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let snapshot = normalized_generated_values(
+            json!({"arguments":arguments,"first":first,"escalations":count}),
+        );
+        let fixtures: Value =
+            serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+        assert_eq!(
+            snapshot, fixtures[operation],
+            "{operation} hand-path fixture"
+        );
+        return;
+    }
+    if !first["receipt_id"].is_string() {
+        assert!(
+            matches!(
+                first["status"].as_str(),
+                Some("pending_approval" | "approval_required")
+            ),
+            "{operation}: {first}"
+        );
+        assert_ne!(first["status"], "succeeded");
+        let replay = f
+            .provider
+            .propose(
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                operation,
+                arguments.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        let row = sqlx::query("SELECT payload_json, payload_hash, policy_result, status FROM agent_action WHERE operation = ? AND dedupe_key = ?")
+                .bind(operation).bind(arguments["dedupe_key"].as_str().unwrap()).fetch_one(f.db.pool()).await.unwrap();
+        let snapshot = normalized_generated_values(
+            json!({"arguments":arguments,"first":first,"action":{"payload":serde_json::from_str::<Value>(&row.get::<String,_>("payload_json")).unwrap(),"payload_hash":row.get::<String,_>("payload_hash"),"policy_result":row.get::<String,_>("policy_result"),"status":row.get::<String,_>("status")}}),
+        );
+        let fixtures: Value =
+            serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+        assert_eq!(
+            snapshot, fixtures[operation],
+            "{operation} hand-path fixture"
+        );
+        return;
+    }
+    let receipt_id = first["receipt_id"].as_str().unwrap();
+    let row = sqlx::query("SELECT principal_type, principal_id, scope_type, scope_id, operation, idempotency_key, input_digest, policy_result, outcome_json FROM command_receipt WHERE id = ?")
+            .bind(receipt_id).fetch_one(f.db.pool()).await.unwrap();
+    let receipt = json!({
+        "principal_type":row.get::<String,_>("principal_type"), "principal_id":row.get::<String,_>("principal_id"),
+        "scope_type":row.get::<String,_>("scope_type"), "scope_id":row.get::<String,_>("scope_id"),
+        "operation":row.get::<String,_>("operation"), "idempotency_key":row.get::<String,_>("idempotency_key"),
+        "input_digest":row.get::<String,_>("input_digest"), "policy_result":row.get::<String,_>("policy_result"),
+        "outcome":serde_json::from_str::<Value>(&row.get::<String,_>("outcome_json")).unwrap()
+    });
+    let replay = f
+        .provider
+        .propose(
+            AGENT_ID,
+            &f.project_scope,
+            "session",
+            operation,
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["receipt_id"], replay["receipt_id"]);
+    assert_eq!(first["event_id"], replay["event_id"]);
+    assert_eq!(
+        first["result"]["domain_result"],
+        replay["result"]["domain_result"]
+    );
+    assert_eq!(replay["replayed"], true);
+    // UUIDs and commit time are generated by the same domain command.
+    // Preserve every other field (including every receipt digest).
+    let snapshot =
+        normalized_generated_values(json!({"arguments":arguments,"first":first,"receipt":receipt}));
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+    assert_eq!(
+        snapshot, fixtures[operation],
+        "{operation} hand-path fixture"
+    );
+}
+
+fn normalized_generated_values(value: Value) -> Value {
+    fn visit(value: &mut Value, ids: &mut std::collections::BTreeMap<String, String>) {
+        match value {
+            Value::String(text) if uuid::Uuid::parse_str(text).is_ok() => {
+                let next = format!("generated-id-{}", ids.len() + 1);
+                *text = ids.entry(text.clone()).or_insert(next).clone();
+            }
+            Value::String(text)
+                if text.contains('T') && text.ends_with('Z') && text.starts_with("2026-") =>
+            {
+                *text = "generated-time".into()
+            }
+            Value::Object(map) => {
+                for value in map.values_mut() {
+                    visit(value, ids);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = value;
+    visit(&mut value, &mut std::collections::BTreeMap::new());
+    value
+}
+
+#[tokio::test]
+async fn pending_legacy_replay_cannot_claim_a_receiptless_completed_effect() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let args = json!({"operation":"message.send","payload":{"content":"Pending intent"},"dedupe_key":"legacy-completion","correlation_id":"legacy-completion"});
+    let pending = f
+        .provider
+        .propose(
+            AGENT_ID,
+            &f.project_scope,
+            "session",
+            "message.send",
+            args.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending["status"], "pending_approval");
+    sqlx::query("UPDATE agent_action SET status='executed',version=version+1 WHERE id=?")
+        .bind(pending["id"].as_str().unwrap())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let error = f
+        .provider
+        .propose(AGENT_ID, &f.project_scope, "session", "message.send", args)
+        .await
+        .unwrap_err();
+    assert!(!format!("{error:?}").contains("status: Succeeded"));
 }

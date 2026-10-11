@@ -534,6 +534,7 @@ impl TaskService {
             .to_json()
         });
         let task = Task {
+            condition: Default::default(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             parent_task_id: payload.parent_task_id.clone(),
@@ -676,50 +677,6 @@ impl TaskService {
         })
     }
 
-    /// Resolve whether this exact proposal already committed before a
-    /// transport performs its mutable user/scope authorization.  Adapters
-    /// use this only as a replay gate; the command repeats the receipt lookup
-    /// inside its writer transaction before applying any domain mutation.
-    pub async fn task_proposal_replay_exists(
-        &self,
-        action: &AgentAction,
-        expected_action_version: i64,
-        executed_by_type: &str,
-        executed_by_id: &str,
-        idempotency_key: &str,
-    ) -> Result<bool> {
-        if action.operation != TASK_PROPOSE_COMMAND {
-            return Err(ServiceError::invalid_operation(
-                "action is not a task proposal",
-            ));
-        }
-        let payload: TaskProposalPayload =
-            serde_json::from_str(&action.payload_json).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "task proposal payload is invalid: {error}"
-                ))
-            })?;
-        let project_id = action
-            .target_id
-            .clone()
-            .filter(|_| action.target_type.as_deref() == Some("project"))
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("task proposal must target a Project explicitly")
-            })?;
-        let context = task_proposal_context(
-            action,
-            expected_action_version,
-            executed_by_type,
-            executed_by_id,
-            idempotency_key,
-            &payload,
-            &project_id,
-            None,
-            None,
-        )?;
-        Ok(self.replay_task_command(&context).await?.is_some())
-    }
-
     async fn replay_task_command(
         &self,
         context: &CommandContext,
@@ -806,20 +763,7 @@ impl TaskService {
         .fetch_optional(self.db.pool())
         .await?;
         if !permissions.as_deref().is_some_and(|permissions| {
-            serde_json::from_str::<Value>(permissions)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("allowed")
-                        .or_else(|| value.get("permissions"))
-                        .cloned()
-                })
-                .and_then(|value| value.as_array().cloned())
-                .is_some_and(|allowed| {
-                    allowed
-                        .iter()
-                        .any(|permission| permission.as_str() == Some("propose_task"))
-                })
+            operation_registry::authority::permission_set(permissions).contains("propose_task")
         }) {
             return Err(ServiceError::invalid_operation(
                 "task proposal actor is not an active Project binding",

@@ -77,11 +77,20 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(created_task.status, "todo".to_owned());
-    // Creation commits the Project's default role assignments too, and the
-    // response carries the Task as those writes left it -- a client's next
-    // optimistic write uses this version.
-    assert_eq!(created_task.version, 4);
+    // Creation writes the Project's default role assignments in the Task's
+    // birth transaction, so they spend no extra version. The response is the
+    // stored Task, not a pre-assignment snapshot: a client's next optimistic
+    // write uses this version (the second Task below cancels with it).
+    assert_eq!(created_task.version, 1);
     let task_id = created_task.id;
+    let persisted_task: TaskResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(persisted_task.version, created_task.version);
 
     let tasks: PaginatedResponse<api_types::TaskListItemResponse> = empty_request(
         &app,
@@ -101,19 +110,48 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(claimed_task.status, "in_progress".to_owned());
-    // The claim is the coder assignment, the transition, and the entry
-    // barrier its blocking before-work hook opens and closes.
-    assert_eq!(claimed_task.version, 5);
+    // The claim (coder assignment plus transition) commits as one versioned
+    // write.
+    assert_eq!(claimed_task.version, 2);
+    let live_condition = state.db.task_condition(&task_id).await.unwrap();
+    assert!(
+        matches!(
+            live_condition,
+            db::TaskCondition::Running { .. } | db::TaskCondition::Entering { .. }
+        ),
+        "real admission has a durable lifecycle owner: {live_condition:?}"
+    );
+    assert!(!live_condition.evidence().witnesses.is_empty());
+    let mut running = live_condition;
+    for _ in 0..50 {
+        if matches!(running, db::TaskCondition::Running { .. }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        running = state.db.task_condition(&task_id).await.unwrap();
+    }
+    assert!(
+        matches!(running, db::TaskCondition::Running { .. }),
+        "real run: {running:?}"
+    );
 
-    let cancelled_task: TaskResponse = empty_request(
+    let cancelled_task: TaskResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/cancel"),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({"action":{"verb":"cancel"},"version":claimed_task.version}),
         StatusCode::OK,
     )
     .await;
     assert_eq!(cancelled_task.status, "cancelled".to_owned());
-    assert_eq!(cancelled_task.version, 7);
+    assert_eq!(cancelled_task.version, 4);
+    assert!(matches!(
+        state.db.task_condition(&task_id).await.unwrap(),
+        db::TaskCondition::Settled {
+            outcome: db::TerminalOutcome::Cancelled,
+            ..
+        }
+    ));
 
     let terminal_error = raw_json_request(
         &app,
@@ -148,31 +186,54 @@ async fn forge_mvp_rest_api_flow() {
         StatusCode::OK,
     )
     .await;
-    let second_task_id = second_task.id;
+    let second_task_id = second_task.id.clone();
+    // A client's next optimistic write against the creation response's
+    // version applies.
+    assert_eq!(second_task.version, 1);
 
-    let cancelled_task: TaskResponse = empty_request(
+    let cancelled_task: TaskResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{second_task_id}/cancel"),
+        &format!("/api/v1/tasks/{second_task_id}/actions"),
+        json!({"action":{"verb":"cancel"},"version":second_task.version}),
         StatusCode::OK,
     )
     .await;
     assert_eq!(cancelled_task.status, "cancelled".to_owned());
 
-    let cancelled_again: TaskResponse = empty_request(
+    let cancelled_again: api_types::ErrorResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{second_task_id}/cancel"),
+        &format!("/api/v1/tasks/{second_task_id}/actions"),
+        json!({"action":{"verb":"cancel"},"version":cancelled_task.version}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(cancelled_again.code, "action_unavailable");
+    let current: TaskResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{second_task_id}"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(cancelled_again.status, "cancelled".to_owned());
-    assert_eq!(cancelled_again.version, cancelled_task.version);
+    assert_eq!(current.status, "cancelled");
+    assert_eq!(current.version, cancelled_task.version);
+    assert!(
+        state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn add_dependency_succeeds() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
 
@@ -185,11 +246,17 @@ async fn add_dependency_succeeds() {
     .await;
 
     assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn add_dependency_cycle_returns_unprocessable_entity() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
 
@@ -210,11 +277,17 @@ async fn add_dependency_cycle_returns_unprocessable_entity() {
     )
     .await;
     assert_eq!(cycle_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn remove_dependency_succeeds() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
 
@@ -243,11 +316,17 @@ async fn remove_dependency_succeeds() {
     )
     .await;
     assert!(dependencies.is_empty());
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let first: TaskResponse = json_request(
         &app,
@@ -319,6 +398,7 @@ async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() 
     assert_eq!(response.task.id, third.id);
     assert_eq!(response.operation_id, operation_id);
     assert!(response.board_revision > initial_page.board_revision);
+    common::assert_condition_readable(&state, &app, &third.id, "board move").await;
     assert!((response.task.board_position - 1.5).abs() < 1e-9);
     assert!(response.task.role_assignments.iter().any(|assignment| {
         assignment.role_name == "coder" && assignment.assignee_id.as_deref() == Some("test-user-id")
@@ -429,11 +509,17 @@ async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() 
     )
     .await;
     assert_eq!(removed_endpoint.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn project_task_pages_include_revision_tokens_for_pagination() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     for title in ["First", "Second", "Third"] {
         let _: TaskResponse = json_request(
@@ -480,11 +566,17 @@ async fn project_task_pages_include_revision_tokens_for_pagination() {
     )
     .await;
     assert!(changed_page.board_revision > first_page.board_revision);
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn list_dependencies_returns_task_dependencies() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
 
@@ -507,11 +599,17 @@ async fn list_dependencies_returns_task_dependencies() {
     assert_eq!(dependencies.len(), 1);
     assert_eq!(dependencies[0].task_id, task_id);
     assert_eq!(dependencies[0].depends_on_id, depends_on_id);
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn claim_blocked_by_dependency_gate_returns_conflict() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let daemon_id = existing_daemon_id(&app).await;
     let agent: AgentResponse = json_request(
@@ -542,6 +640,12 @@ async fn claim_blocked_by_dependency_gate_returns_conflict() {
     .await;
     let error: ErrorResponse = parse_response(response, StatusCode::CONFLICT).await;
     assert_eq!(error.code, "dependency_gate");
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -585,11 +689,21 @@ async fn agent_claim_succeeds() {
             && assignment.assignee_id.as_deref() == Some(agent.id.as_str())
     }));
     assert_eq!(claimed.assignee_id.as_deref(), Some(agent.id.as_str()));
+    assert!(
+        state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn shell_agent_availability_returns_active() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let agent: AgentResponse = json_request(
         &app,
         Method::POST,
@@ -609,11 +723,17 @@ async fn shell_agent_availability_returns_active() {
 
     assert!(availability.available);
     assert_eq!(availability.effective_status, "active");
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
 async fn scoped_mcp_endpoint_creates_task_without_project_id_argument() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let title = format!("Scoped MCP task {}", uuid::Uuid::new_v4());
 
@@ -653,10 +773,12 @@ async fn scoped_mcp_endpoint_creates_task_without_project_id_argument() {
     )
     .await;
     assert!(tasks.items.iter().any(|task| task.title == title));
-}
-
-async fn test_app() -> Router {
-    test_app_with_state().await.0
+    assert_eq!(
+        state.db.task_condition_violations().await.unwrap(),
+        Vec::<String>::new(),
+        "condition producer invariant"
+    );
+    common::assert_scheduler_clean(&state).await;
 }
 
 async fn test_app_with_state() -> (Router, AppState) {
@@ -688,6 +810,7 @@ async fn test_app_with_state() -> (Router, AppState) {
     db::DaemonRepo::upsert_by_machine_id(
         &db_instance,
         db::UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
@@ -708,6 +831,7 @@ async fn test_app_with_state() -> (Router, AppState) {
     db::DaemonRepo::update_report(
         &db_instance,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             last_report_at: now.clone(),
             status: db::DaemonStatus::Online,
@@ -743,7 +867,7 @@ async fn test_app_with_state() -> (Router, AppState) {
         db,
         event_bus,
         true,
-        Arc::new(cli_adapters::default_registry()),
+        Arc::new(cli_adapters::test_support::test_registry()),
     );
 
     let web_dist_dir = std::env::temp_dir().join(format!("forge-api-e2e-{}", uuid::Uuid::new_v4()));

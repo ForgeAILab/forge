@@ -12,12 +12,17 @@ import type { AgentChatTurnStatus } from '@/types/generated/bindings/AgentChatTu
 import type { AgentHandoffResponse } from '@/types/generated/bindings/AgentHandoffResponse'
 import type { CancelAgentChatTurnRequest } from '@/types/generated/bindings/CancelAgentChatTurnRequest'
 import type { CreateAgentHandoffRequest } from '@/types/generated/bindings/CreateAgentHandoffRequest'
+import type { RetryAgentChatTurnRequest } from '@/types/generated/bindings/RetryAgentChatTurnRequest'
 
 export type AgentChat = AgentChatResponse
 export type AgentChatEntry = AgentChatSwitcherItem
 export type AgentChatSwitcher = AgentChatSwitcherResponse
 export type AgentChatMessage = AgentChatMessageResponse
 export type AgentChatTurn = AgentChatTurnJobResponse
+
+export type AgentChatTurnRetryInput = Omit<RetryAgentChatTurnRequest, 'expected_version'> & {
+  expected_version: number
+}
 export type AgentChatTurnCancelInput = Omit<CancelAgentChatTurnRequest, 'expected_version'> & {
   expected_version: number
 }

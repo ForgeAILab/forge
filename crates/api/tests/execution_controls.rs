@@ -2,8 +2,7 @@
 mod common;
 
 use api_types::{
-    ErrorResponse, ExecutionResponse, LaunchExecutionResponse, RecoveryAction, TaskAnnotation,
-    TaskBlockingAnnotation, TaskResponse,
+    ErrorResponse, LaunchExecutionResponse, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
 };
 use axum::http::{Method, StatusCode};
 use chrono::{Duration, Utc};
@@ -47,8 +46,8 @@ async fn cancelled_task_rejects_recover() {
     let response = common::raw_json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/recover", task.id),
-        json!({ "action": "resume_session" }),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"retry","fresh_session":false} }),
     )
     .await;
     let status = response.status();
@@ -59,7 +58,7 @@ async fn cancelled_task_rejects_recover() {
 }
 
 #[tokio::test]
-async fn execution_stop_exposes_recovery_actions() {
+async fn execution_stop_exposes_task_action_offers() {
     let workspace_root = common::TestDir::new("ec-stop-actions");
     let harness = common::test_app(workspace_root.path(), "execution-controls-stop-actions").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
@@ -75,32 +74,17 @@ async fn execution_stop_exposes_recovery_actions() {
         StatusCode::OK,
     )
     .await;
-    let annotation = task
-        .get("error_annotation")
-        .expect("task includes error_annotation")
-        .as_object()
-        .expect("error_annotation is an object");
-    let recovery_actions = annotation
-        .get("recovery_actions")
-        .and_then(Value::as_array)
-        .expect("blocking annotation includes recovery_actions");
-
-    assert_eq!(
-        annotation.get("type").and_then(Value::as_str),
-        Some("manual_stop")
-    );
     assert!(
-        recovery_actions
-            .iter()
-            .any(|action| action.as_str() == Some("reexecute")),
-        "expected reexecute recovery action: {recovery_actions:?}"
+        task["condition"]["details"]["diagnostic"].is_null(),
+        "stopping a side session leaves the Task condition unchanged"
     );
-    assert!(
-        recovery_actions
-            .iter()
-            .any(|action| action.as_str() == Some("cancel_task")),
-        "expected cancel_task recovery action: {recovery_actions:?}"
-    );
+    let actions = task["available_actions"].as_array().expect("offers");
+    assert!(actions
+        .iter()
+        .any(|offer| offer["action"]["verb"] == "retry"));
+    assert!(actions
+        .iter()
+        .any(|offer| offer["action"]["verb"] == "cancel"));
 }
 
 #[tokio::test]
@@ -360,6 +344,7 @@ async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_inter
     .await
     .expect("reviewer execution creates");
 
+    let review_failed_at = db::now_rfc3339();
     ReviewRepo::create(
         &*harness.state.db,
         CreateReview {
@@ -369,9 +354,11 @@ async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_inter
             attempt_number: 1,
             status: ReviewStatus::Failed,
             step_results_json: "{}".to_owned(),
-            started_at: "2026-04-30T13:00:00+00:00".to_owned(),
-            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
-            updated_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            // The Review failed during the Task's current stay in `review`:
+            // one that predates the entry is history, not its exception.
+            started_at: review_failed_at.clone(),
+            created_at: review_failed_at.clone(),
+            updated_at: review_failed_at,
         },
     )
     .await
@@ -385,16 +372,13 @@ async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_inter
     )
     .await;
     assert_eq!(response["workflow_health"]["label"], json!("Interactive"));
-    let open_interactive = response["workflow_exception"]["actions"]
-        .as_array()
-        .expect("workflow exception actions")
-        .iter()
-        .find(|action| action["kind"] == json!("open_interactive"))
-        .expect("open interactive action");
-    assert_eq!(open_interactive["enabled"], json!(false));
-    assert_eq!(
-        open_interactive["disabled_reason"],
-        json!("An interactive execution is already running")
+    assert!(
+        response["workflow_exception"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|offer| offer["action"]["verb"] != "open_interactive"),
+        "session launch is separate from Task actions"
     );
     assert_task_list_diagnostics_match(&harness, &project_id, &response).await;
 }
@@ -408,7 +392,14 @@ async fn open_interactive_targets_current_role_resumable_session_not_newest_revi
     )
     .await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
-    let task = create_task(&harness, &project_id, "role-aware interactive target").await;
+    let task = create_task_with_role(
+        &harness,
+        &project_id,
+        "role-aware interactive target",
+        "coder",
+        &agent_id,
+    )
+    .await;
     let task = TaskRepo::update_status(
         &*harness.state.db,
         db::UpdateTaskStatus {
@@ -498,7 +489,6 @@ async fn open_interactive_targets_current_role_resumable_session_not_newest_revi
         artifact: None,
         message: None,
         hook: None,
-        recovery_actions: vec![RecoveryAction::OpenInteractive],
     });
     TaskRepo::update(
         &*harness.state.db,
@@ -530,21 +520,20 @@ async fn open_interactive_targets_current_role_resumable_session_not_newest_revi
         StatusCode::OK,
     )
     .await;
-    let open_interactive = response["workflow_exception"]["actions"]
+    let retry = response["workflow_exception"]["actions"]
         .as_array()
-        .expect("workflow exception actions")
+        .unwrap()
         .iter()
-        .find(|action| action["kind"] == json!("open_interactive"))
-        .expect("open interactive action");
+        .find(|offer| offer["action"]["verb"] == "retry")
+        .expect("workflow retry offer");
     assert_eq!(
         response["execution_observability"]["latest_execution_id"],
         json!(reviewer_execution_id)
     );
-    assert_eq!(open_interactive["enabled"], json!(true));
     assert_eq!(
-        open_interactive["target_execution_id"],
+        retry["target_execution_id"],
         json!(coder_execution_id),
-        "Open Interactive must target the current-role resumable session"
+        "retry selects the current-role thread"
     );
     assert_task_list_diagnostics_match(&harness, &project_id, &response).await;
 }
@@ -702,6 +691,11 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
     let workspace_root = common::TestDir::new("ec-blocked-actions");
     let harness = common::test_app(workspace_root.path(), "execution-controls-blocked").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
+    sqlx::query("UPDATE agent_identity SET paused = 0 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let task = create_task_with_role(
         &harness,
         &project_id,
@@ -793,27 +787,25 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
     )
     .await;
     let actions = task
-        .get("execution_actions")
+        .get("available_actions")
         .and_then(Value::as_array)
-        .expect("task includes execution actions");
-    let action = actions
+        .expect("task includes available offers");
+    let retry = actions
         .iter()
-        .find(|action| action.get("action").and_then(Value::as_str) == Some("re_execute"))
-        .expect("re_execute action exists");
-
-    assert_eq!(action.get("enabled").and_then(Value::as_bool), Some(false));
-    assert!(
-        action
-            .get("disabled_reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| reason.contains("Retry budget exhausted")),
-        "expected retry budget disabled reason: {action:?}"
-    );
+        .find(|offer| offer["action"]["verb"] == "retry")
+        .expect("budget retry offer");
+    assert_eq!(retry["action"]["reset_budget"], true);
+    assert_eq!(retry["reason"], "retry_budget_exhausted");
+    assert!(retry["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|parameter| parameter["name"] != "fresh_session"));
     assert_task_list_diagnostics_match(&harness, &project_id, &task).await;
 }
 
 #[tokio::test]
-async fn re_execute_endpoint_launches_replacement_execution() {
+async fn fresh_task_retry_queues_replacement_execution() {
     let workspace_root = common::TestDir::new("ec-reexecute-route");
     let harness = common::test_app(workspace_root.path(), "execution-controls-reexecute").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
@@ -866,32 +858,49 @@ async fn re_execute_endpoint_launches_replacement_execution() {
     .await
     .expect("parent execution creates");
 
-    let launched: LaunchExecutionResponse = common::empty_request(
+    let accepted: TaskResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/executions/{parent_execution_id}/re-execute"),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await,"action":{"verb":"retry","fresh_session":true}}),
         StatusCode::OK,
     )
     .await;
-
-    assert_ne!(launched.data.execution.id, parent_execution_id);
-    assert_eq!(launched.data.execution.role, "coder");
-    assert_eq!(
-        launched
-            .data
-            .execution_behavior
-            .as_ref()
-            .map(|behavior| behavior.kind),
-        Some(api_types::ExecutionBehaviorKind::ReExecute)
+    assert!(accepted.condition.details().diagnostic.is_none());
+    common::assert_condition_readable(&harness.state, &harness.app, &task.id, "retry").await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task.id)
+        .await
+        .unwrap();
+    common::assert_condition_readable(&harness.state, &harness.app, &task.id, "retry dispatch")
+        .await;
+    let executions = ExecutionRepo::list_running_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    let replacement = executions
+        .iter()
+        .find(|execution| execution.id != parent_execution_id)
+        .expect("replacement dispatched");
+    assert_eq!(replacement.role, "coder");
+    assert!(
+        replacement.agent_session_id.is_none(),
+        "fresh retry does not resume the old thread"
     );
 }
 
 #[tokio::test]
-async fn recover_request_accepts_context() {
+async fn retry_request_accepts_guidance() {
     let workspace_root = common::TestDir::new("ec-context");
     let harness = common::test_app(workspace_root.path(), "execution-controls-context").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
-    let task = create_task(&harness, &project_id, "sleep 30").await;
+    let task = create_task_with_role(&harness, &project_id, "sleep 30", "coder", &agent_id).await;
+    sqlx::query("UPDATE task SET status = 'in_progress' WHERE id = ?")
+        .bind(&task.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let launch = launch_task(&harness, &task.id, &agent_id).await;
 
     stop_execution(&harness, &launch.data.execution.id).await;
@@ -899,12 +908,9 @@ async fn recover_request_accepts_context() {
     let _: TaskResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/recover", task.id),
-        json!({
-            "action": "reexecute",
-            "reason": "test",
-            "context": "extra info"
-        }),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await,
+            "action": {"verb":"retry","fresh_session":true,"guidance":"Continue after repair"}}),
         StatusCode::OK,
     )
     .await;
@@ -998,8 +1004,8 @@ async fn cancel_task(harness: &common::Harness, task_id: &str) -> TaskResponse {
     common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/cancel"),
-        json!(null),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,"action":{"verb":"cancel"}}),
         StatusCode::OK,
     )
     .await
@@ -1021,45 +1027,25 @@ async fn launch_task(
 }
 
 async fn stop_execution(harness: &common::Harness, execution_id: &str) {
-    let stopped: ExecutionResponse = common::json_request(
+    let _: api_types::ExecutionResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/executions/{execution_id}/cancel"),
-        json!(null),
+        &format!("/api/v1/executions/{execution_id}/stop"),
+        json!({"reason":"Stop this execution"}),
         StatusCode::OK,
     )
     .await;
-    assert_ne!(
-        stopped.status,
-        api_types::ExecutionStatus::Running,
-        "cancel response: {stopped:?}"
-    );
-    for _ in 0..50 {
-        let execution: ExecutionResponse = common::empty_request(
-            &harness.app,
-            Method::GET,
-            &format!("/api/v1/executions/{execution_id}"),
-            StatusCode::OK,
-        )
-        .await;
-        if execution.status != api_types::ExecutionStatus::Running {
+    for _ in 0..100 {
+        let current = ExecutionRepo::get_by_id(&*harness.state.db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if current.status != ExecutionStatus::Running {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("execution {execution_id} did not stop");
-}
-
-fn assert_action_enabled(actions: &[Value], action_name: &str, expected_enabled: bool) {
-    let action = actions
-        .iter()
-        .find(|action| action.get("action").and_then(Value::as_str) == Some(action_name))
-        .unwrap_or_else(|| panic!("missing {action_name} action in {actions:?}"));
-    assert_eq!(
-        action.get("enabled").and_then(Value::as_bool),
-        Some(expected_enabled),
-        "unexpected enabled state for {action_name}: {action:?}"
-    );
 }
 
 async fn assert_task_list_diagnostics_match(
@@ -1080,16 +1066,100 @@ async fn assert_task_list_diagnostics_match(
         .iter()
         .find(|item| item["id"] == task["id"])
         .unwrap();
-    for field in [
-        "workflow_health",
-        "workflow_exception",
-        "remaining_retries",
-        "role_assignments",
-    ] {
+    for field in ["workflow_health", "remaining_retries", "role_assignments"] {
         assert_eq!(listed[field], task[field], "list/detail agree on {field}");
     }
+    let mut listed_exception = listed["workflow_exception"].clone();
+    let mut detail_exception = task["workflow_exception"].clone();
+    if let Some(exception) = listed_exception.as_object_mut() {
+        assert_eq!(
+            exception.remove("actions"),
+            Some(json!([])),
+            "list rows omit offers"
+        );
+    }
+    if let Some(exception) = detail_exception.as_object_mut() {
+        assert_eq!(
+            exception.remove("actions"),
+            Some(task["available_actions"].clone()),
+            "detail diagnostics use the shared live offers"
+        );
+    }
+    assert_eq!(
+        listed_exception, detail_exception,
+        "list/detail diagnostic facts agree"
+    );
     assert_eq!(
         listed["execution_observability"]["latest_execution_id"],
         task["execution_observability"]["latest_execution_id"]
     );
+}
+
+#[tokio::test]
+async fn stop_route_stops_only_the_selected_side_session() {
+    let root = common::TestDir::new("stop-side-session");
+    let harness = common::test_app(root.path(), "stop-side-session").await;
+    let (project, _, agent) = setup(&harness, root.path()).await;
+    let task = create_task(&harness, &project, "Two independent executions").await;
+    let now = db::now_rfc3339();
+    let mut ids = Vec::new();
+    for role in ["coder", "interactive"] {
+        let execution = ExecutionRepo::create(
+            &*harness.state.db,
+            db::CreateExecution {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent.clone()),
+                role: role.to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        ids.push(execution.id);
+    }
+    let before = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    stop_execution(&harness, &ids[1]).await;
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*harness.state.db, &ids[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
+    );
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*harness.state.db, &ids[1])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Cancelled
+    );
+    let after = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.error_annotation, before.error_annotation);
+    assert_eq!(after.status, before.status);
 }

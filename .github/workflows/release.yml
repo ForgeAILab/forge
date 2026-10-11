@@ -149,9 +149,9 @@ jobs:
   #     - name: Run Rust CI
   #       run: ./scripts/ci-rust.sh
 
-  #     - name: Test performance collector
+  #     - name: Test performance tooling
   #       if: ${{ !cancelled() }}
-  #       run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
+  #       run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
   verify-audit:
     name: Verify security audit

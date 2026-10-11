@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  blockedInterruption,
+  checkWait,
+  checkWaitNotice,
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
+  getTaskWaitNotice,
   getTaskWorkflowWarning,
+  isTaskBlocked,
+  matchesFilters,
   outgoingWorkflowEdges,
   taskTypes,
   taskHasError,
@@ -111,6 +117,34 @@ describe('outgoingWorkflowEdges', () => {
   })
 })
 
+describe('failed and blocked records', () => {
+  const record = { kind: 'executor_failed' as const, reason: 'stored reason', created_at: '2026-10-07T00:00:00Z' }
+  const withDetails = (failed: boolean, blocked: boolean) =>
+    taskListItem({
+      // A failure record does not make the condition kind `failed` while a run is live.
+      condition: {
+        kind: 'clear',
+        details: { failure_kind: 'executor_failed', diagnostic: null, interruption: record, failed, blocked, human_wait: blocked, entry_wait: false },
+      },
+    })
+
+  it('does not treat a failed-only Task as blocked', () => {
+    const failedOnly = withDetails(true, false)
+    expect(isTaskBlocked(failedOnly)).toBe(false)
+    expect(blockedInterruption(failedOnly)).toBeNull()
+    expect(matchesFilters(failedOnly, { types: [], blockedOnly: true })).toBe(false)
+    expect(taskHasError(failedOnly)).toBe(true)
+  })
+
+  it('keeps a blocked Task blocked, with or without a failure beside it', () => {
+    for (const task of [withDetails(false, true), withDetails(true, true)]) {
+      expect(isTaskBlocked(task)).toBe(true)
+      expect(blockedInterruption(task)?.reason).toBe('stored reason')
+      expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(true)
+    }
+  })
+})
+
 describe('task interruption annotations', () => {
   function taskWithExecutionIds(blockedExecutionId: string, latestExecutionId: string): Task {
     return {
@@ -123,10 +157,12 @@ describe('task interruption annotations', () => {
       priority: 0,
       board_position: 0,
       role_assignments: [],
+      effective_coder: null,
+      effective_coder_source: null,
       remaining_retries: {},
-      blocked: null,
-      failed: null,
-      error_annotation: {
+  retry_limits: {},
+      placement: null,
+      condition: { kind: 'clear', details: { failure_kind: 'executor_failed', interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false, diagnostic: {
         type: 'executor_failed',
         blocking_reason: 'executor_failed',
         blocked_by: 'system:executor',
@@ -134,8 +170,7 @@ describe('task interruption annotations', () => {
         blocked_execution_id: blockedExecutionId,
         artifact: null,
         message: 'Previous execution failed',
-        recovery_actions: ['reexecute'],
-      },
+      } } },
       execution_observability: {
         counts: {
           task_execution_count: 2,
@@ -167,7 +202,7 @@ describe('task interruption annotations', () => {
   it('uses compact list observability to identify stale annotations', () => {
     const fullTask = taskWithExecutionIds('execution-old', 'execution-new')
     const task = taskListItem({
-      error_annotation: fullTask.error_annotation,
+      condition: fullTask.condition,
       execution_observability: { latest_execution_id: 'execution-new' },
     })
     expect(taskHasError(task)).toBe(false)
@@ -193,7 +228,7 @@ describe('task interruption annotations', () => {
 
   it('warns when completed coder work cannot leave in-progress with an open plan', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
+    task.condition.details.diagnostic = null
     task.plan_progress = {
       total: 10,
       completed: 6,
@@ -207,7 +242,7 @@ describe('task interruption annotations', () => {
 
   it('does not warn while an execution is still running', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
+    task.condition.details.diagnostic = null
     task.plan_progress = {
       total: 10,
       completed: 6,
@@ -222,5 +257,110 @@ describe('task interruption annotations', () => {
     }
 
     expect(getTaskWorkflowWarning(task)).toBeNull()
+  })
+})
+
+
+describe('check wait conditions', () => {
+  const waiting = (phase: 'result' | 'slot' | 'infrastructure_exhausted') =>
+    taskListItem({
+      condition: {
+        kind: 'parked',
+        primary: { kind: 'check', wait: { phase, consumer_id: 'consumer', origin: 'entry' } },
+        additional: [], resume: { kind: 'reconcile' }, since: null,
+        details: {
+          failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false,
+          owner: phase === 'infrastructure_exhausted' ? 'user' : 'check_runner',
+          recovery: phase === 'infrastructure_exhausted' ? 'retry_check' : 'wait_for_check',
+        },
+      },
+    })
+
+  it('labels a result or slot wait as owned work, not a block or failure', () => {
+    for (const [phase, title] of [['result', 'Waiting for checks'], ['slot', 'Waiting for a check slot']] as const) {
+      const task = waiting(phase)
+      expect(checkWait(task)?.phase).toBe(phase)
+      expect(checkWaitNotice(task)).toMatchObject({ title, needsOwner: false })
+      expect(isTaskBlocked(task)).toBe(false)
+      expect(taskHasError(task)).toBe(false)
+      expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(false)
+    }
+  })
+
+  it('shows exhausted check retries as needing the owner without calling the change failed', () => {
+    const task = waiting('infrastructure_exhausted')
+    expect(checkWaitNotice(task)).toMatchObject({ title: 'Checks could not run', needsOwner: true })
+    expect(isTaskBlocked(task)).toBe(true)
+    expect(taskHasError(task)).toBe(false)
+    expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(true)
+  })
+
+  it('finds a check wait behind another owner and none on an ordinary Task', () => {
+    const held = waiting('result')
+    if (held.condition.kind !== 'parked') throw new Error('fixture')
+    held.condition.additional = [held.condition.primary]
+    held.condition.primary = { kind: 'held', actor: 'user' }
+    expect(checkWait(held)?.phase).toBe('result')
+    expect(checkWaitNotice(taskListItem({}))).toBeNull()
+  })
+})
+
+describe('integration conditions', () => {
+  it('reads queue ownership without a manual block or failure', () => {
+    const task = taskListItem({
+      condition: {
+        kind: 'parked',
+        primary: { kind: 'integration', reason: { kind: 'waiting', attempt_id: 'attempt' } },
+        additional: [], resume: { kind: 'integration', attempt_id: 'attempt' }, since: null,
+        details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false, owner: 'integration_worker', recovery: 'wait_for_integration' },
+      },
+    })
+    expect(isTaskBlocked(task)).toBe(false)
+    expect(taskHasError(task)).toBe(false)
+    expect(blockedInterruption(task)).toBeNull()
+    expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(false)
+  })
+
+  it('keeps another owner hold visible beside integration and shows real owner failures', () => {
+    const task = taskListItem({
+      condition: {
+        kind: 'parked', primary: { kind: 'held', actor: 'user' },
+        additional: [{ kind: 'integration', reason: { kind: 'deferred', attempt_id: 'attempt', cause: 'target_dirty', owner_id: 'owner', message: 'target dirty' } }],
+        resume: { kind: 'reconcile' }, since: null,
+        details: { failure_kind: 'manual_stop', diagnostic: null, interruption: { kind: 'manual_stop', reason: 'held', created_at: '' }, failed: false, blocked: true, human_wait: true, entry_wait: false },
+      },
+    })
+    expect(isTaskBlocked(task)).toBe(true)
+    expect(taskHasError(task)).toBe(true)
+    expect(blockedInterruption(task)?.reason).toBe('held')
+    if (task.condition.kind !== 'parked') throw new Error('fixture kind')
+    task.condition.primary = task.condition.additional[0]
+    task.condition.additional = []
+    task.condition.details.failure_kind = 'target_repo_dirty'
+    task.condition.details.interruption = { kind: 'target_repo_dirty', reason: 'target dirty', created_at: '' }
+    expect(blockedInterruption(task)?.reason).toBe('target dirty')
+    expect(isTaskBlocked(task)).toBe(true)
+  })
+  it('labels the waits on a parent task, an agent and unfinished dependencies', () => {
+    const details = { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false }
+    const parked = (primary: Record<string, unknown>) =>
+      taskListItem({
+        condition: { kind: 'parked', primary, additional: [], resume: { kind: 'reconcile' }, since: null, details },
+      } as never)
+    expect(getTaskWaitNotice(parked({ kind: 'parent', parent_id: 'root', cause: 'held' }))).toEqual({
+      title: 'Waiting for parent task',
+      message: 'The parent task is on hold. This subtask runs when the parent lets its subtasks run.',
+    })
+    expect(getTaskWaitNotice(parked({ kind: 'agent', agent_id: 'coder', status: 'paused' }))?.message).toBe(
+      'The assigned agent is paused. This task runs when the agent can take work.',
+    )
+    expect(getTaskWaitNotice(parked({ kind: 'agent', agent_id: 'coder', status: 'some_new_status' }))?.message).toContain(
+      'is some new status',
+    )
+    expect(
+      getTaskWaitNotice(parked({ kind: 'dependencies', cancelled: false, dependency_ids: ['a'] }))?.title,
+    ).toBe('Waiting for dependencies')
+    expect(getTaskWaitNotice(parked({ kind: 'dependencies', cancelled: true, dependency_ids: ['a'] }))).toBeNull()
+    expect(getTaskWaitNotice(parked({ kind: 'held', actor: 'user' }))).toBeNull()
   })
 })

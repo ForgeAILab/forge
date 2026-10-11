@@ -174,7 +174,6 @@ async fn find_or_create_demo_repo(db: &SqliteDb, project_id: &str, now: &str) ->
             name: "demo-repo".to_owned(),
             remote_url: Some("https://example.com/demo.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -235,6 +234,7 @@ async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
     let daemon = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: new_uuid_v4(),
             machine_id: "demo".to_owned(),
             hostname: "demo".to_owned(),
@@ -255,6 +255,7 @@ async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon.id,
             last_report_at: now.to_owned(),
             status: DaemonStatus::Online,

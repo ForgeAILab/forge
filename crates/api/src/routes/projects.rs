@@ -126,7 +126,7 @@ async fn create_direct_project(
         },
     });
 
-    let mut response = project_response(project)?;
+    let mut response = project_response(&state.db, project).await?;
     response.execution_setup = Some(
         services::load_project_execution_setup(&state.db, &response.id)
             .await
@@ -181,16 +181,35 @@ pub async fn list_projects(
     user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ProjectResponse>>> {
-    let page = ProjectRepo::list_visible(&*state.db, &user.user_id, page_request(&params)?).await?;
+    let page = state
+        .db
+        .list_visible_project_slot_reads(&user.user_id, page_request(&params)?)
+        .await
+        .map_err(ServiceError::from)?;
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
+    let mut slots = state
+        .project_slots_memo
+        .load(&state.db, &page.items)
+        .await?;
+    let projects: Vec<_> = page.items.iter().map(|read| read.project.clone()).collect();
+    let mut environment =
+        services::environment_surfaces::project_environments(&state.db, &projects).await?;
+    let mut items = Vec::with_capacity(page.items.len());
+    for read in page.items {
+        let counts = slots.remove(&read.project.id).expect("requested Project");
+        let environment = environment
+            .remove(&read.project.id)
+            .expect("requested Project");
+        items.push(super::project_response_from_environment(
+            read.project,
+            counts,
+            environment,
+        )?);
+    }
     let response = PaginatedResponse {
-        items: page
-            .items
-            .into_iter()
-            .map(project_response)
-            .collect::<ApiResult<Vec<_>>>()?,
+        items,
         next_cursor,
         has_more,
         total_count,
@@ -203,8 +222,24 @@ pub async fn get_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = require_project_visible(&state, &id, &user.user_id).await?;
-    Ok(Json(project_response(project)?))
+    let read = state
+        .db
+        .get_visible_project_slot_read(&id, &user.user_id)
+        .await
+        .map_err(ServiceError::from)?
+        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    let mut slots = state
+        .project_slots_memo
+        .load(&state.db, std::slice::from_ref(&read))
+        .await?;
+    Ok(Json(
+        super::project_response_with_slots(
+            &state.db,
+            read.project,
+            slots.remove(&id).expect("requested Project"),
+        )
+        .await?,
+    ))
 }
 
 pub async fn list_project_hook_runs(
@@ -365,8 +400,9 @@ pub async fn update_project_workflow(
 }
 
 /// `?force=true` is the caller's explicit decision to destroy in-flight agent
-/// work. Without it, a Project holding a running Execution or an active
-/// Workspace lease is refused with `409 project_in_use`.
+/// work. Without it, a Project holding a running Execution, an active
+/// Workspace lease or an unfinished check run is refused with
+/// `409 project_in_use`.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct DeleteProjectQuery {
     #[serde(default)]
@@ -385,6 +421,48 @@ pub async fn delete_project(
     require_project_admin(&state, &id, &user.user_id).await?;
 
     const MAX_FORCE_DELETE_ATTEMPTS: usize = 3;
+    /// What a forced delete waits, in all, for the check runs it stopped to
+    /// settle. A refusal answers within about this long.
+    const FORCE_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+    if query.force {
+        // Phase one changes nothing. A check run on a machine that cannot
+        // be reached cannot be stopped or confirmed, so the delete would be
+        // refused after everything else had been cancelled: refuse first.
+        let unreachable = state
+            .task_service
+            .project_deletion_unreachable_machines(&id)
+            .await?;
+        if !unreachable.is_empty() {
+            let (running_executions, active_leases, live_check_runs) =
+                match ProjectRepo::ensure_deletable(&*state.db, &id).await {
+                    Err(db::DbError::ProjectInUse {
+                        running_executions,
+                        active_leases,
+                        live_check_runs,
+                        ..
+                    }) => (running_executions, active_leases, live_check_runs),
+                    Err(error) => return Err(error.into()),
+                    Ok(()) => (0, 0, 0),
+                };
+            return Err(ApiError::conflict_with_code_and_details(
+                "project_in_use",
+                format!(
+                    "project {id} has a check run on {} which cannot be reached, so the run cannot be stopped; nothing was cancelled and deletion was not performed. Reconnect the machine or remove it, then delete again",
+                    unreachable.join(", ")
+                ),
+                serde_json::json!({
+                    "project_id": id,
+                    "running_executions": running_executions,
+                    "active_leases": active_leases,
+                    "live_check_runs": live_check_runs,
+                    "force_cancellation_incomplete": true,
+                    "unreachable_machines": unreachable,
+                    "cancelled": false,
+                }),
+            ));
+        }
+    }
+    let settle_until = tokio::time::Instant::now() + FORCE_SETTLE_BOUND;
     let mut attempt = 0;
     let late_project_paths = loop {
         // Force retries are bounded so a continuously-admitted execution or
@@ -393,19 +471,17 @@ pub async fn delete_project(
         if query.force {
             // Force is an active cancellation request, not merely permission
             // to cascade away a still-live execution row. Provider failures
-            // leave the Project intact and are surfaced to the caller.
-            state.task_service.prepare_project_deletion(&id).await?;
+            // leave the Project intact and are surfaced to the caller. Work
+            // admitted after this pass is handled by the next attempt or by
+            // the final in-use CAS below.
+            state
+                .task_service
+                .prepare_project_deletion(&id, settle_until)
+                .await?;
         } else {
             // Run the guarded DB decision before touching any path. The final
             // delete below repeats this check to close the admission race.
             ProjectRepo::ensure_deletable(&*state.db, &id).await?;
-        }
-
-        if query.force {
-            // Re-check immediately before the final DB boundary. A new
-            // execution or lease admitted after the first cancellation pass
-            // is handled by this pass or by the final in-use CAS below.
-            state.task_service.prepare_project_deletion(&id).await?;
         }
 
         // The service has already terminalized/revoked force-mode activity.
@@ -423,6 +499,7 @@ pub async fn delete_project(
                 project_id,
                 running_executions,
                 active_leases,
+                live_check_runs,
             }) if query.force => {
                 return Err(ApiError::conflict_with_code_and_details(
                     "project_in_use",
@@ -433,7 +510,10 @@ pub async fn delete_project(
                         "project_id": project_id,
                         "running_executions": running_executions,
                         "active_leases": active_leases,
+                        "live_check_runs": live_check_runs,
                         "force_cancellation_incomplete": true,
+                        "unreachable_machines": [],
+                        "cancelled": true,
                     }),
                 ));
             }
@@ -472,7 +552,7 @@ async fn cleanup_project_owned_paths(
         // reservation.
         match remove_confined_direct_child_if_unowned(
             state,
-            "SELECT 1 FROM task WHERE id = ? LIMIT 1",
+            Some("SELECT 1 FROM task WHERE id = ? LIMIT 1"),
             task_id,
             &workspace_root,
             &workspace_root.join(task_id),
@@ -508,7 +588,7 @@ async fn cleanup_project_owned_paths(
         // wins.
         match remove_confined_direct_child_if_unowned(
             state,
-            "SELECT 1 FROM workspace WHERE worktree_path = ? LIMIT 1",
+            None,
             path,
             &workspace_root,
             FsPath::new(path),
@@ -545,7 +625,7 @@ async fn cleanup_project_owned_paths(
             // and quarantine rename are serialized under BEGIN IMMEDIATE.
             match remove_confined_direct_child_if_unowned(
                 state,
-                "SELECT 1 FROM repo WHERE local_path = ? LIMIT 1",
+                Some("SELECT 1 FROM repo WHERE local_path = ? LIMIT 1"),
                 local_path,
                 &managed_root,
                 FsPath::new(local_path),
@@ -584,7 +664,7 @@ async fn cleanup_project_owned_paths(
         // ownership check and quarantine rename share the DB write lock.
         match remove_confined_direct_child_if_unowned(
             state,
-            "SELECT 1 FROM repo WHERE id = ? LIMIT 1",
+            Some("SELECT 1 FROM repo WHERE id = ? LIMIT 1"),
             &repository.id,
             &cache_root,
             &cache_root.join(&repository.id),
@@ -619,7 +699,7 @@ async fn cleanup_project_owned_paths(
     // the check and quarantine rename share the DB write lock.
     match remove_confined_direct_child_if_unowned(
         state,
-        "SELECT 1 FROM project WHERE id = ? LIMIT 1",
+        Some("SELECT 1 FROM project WHERE id = ? LIMIT 1"),
         project_id,
         &project_root,
         &project_root.join(project_id),
@@ -656,7 +736,7 @@ async fn cleanup_project_owned_paths(
 /// deleting another owner's path.
 async fn remove_confined_direct_child_if_unowned(
     state: &AppState,
-    ownership_query: &str,
+    ownership_query: Option<&str>,
     ownership_value: &str,
     root: &std::path::Path,
     candidate: &std::path::Path,
@@ -665,12 +745,23 @@ async fn remove_confined_direct_child_if_unowned(
     let mut transaction = db::begin_immediate(state.db.pool())
         .await
         .map_err(|error| ApiError::internal(format!("lock Project cleanup ownership: {error}")))?;
-    let live = sqlx::query_scalar::<_, i64>(ownership_query)
-        .bind(ownership_value)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|error| ApiError::internal(format!("recheck Project cleanup ownership: {error}")))?
-        .is_some();
+    let live = match ownership_query {
+        Some(query) => sqlx::query_scalar::<_, i64>(query)
+            .bind(ownership_value)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map(|row| row.is_some())
+            .map_err(db::DbError::from),
+        None => {
+            db::WorkspaceRepo::embedded_path_is_owned_in_tx(
+                &*state.db,
+                &mut transaction,
+                ownership_value,
+            )
+            .await
+        }
+    }
+    .map_err(|error| ApiError::internal(format!("recheck Project cleanup ownership: {error}")))?;
     if live {
         transaction.commit().await.map_err(|error| {
             ApiError::internal(format!("release Project cleanup lock: {error}"))
@@ -850,7 +941,7 @@ pub async fn pause_project(
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
     if project.paused_at.is_some() {
-        return Ok(Json(project_response(project)?));
+        return Ok(Json(project_response(&state.db, project).await?));
     }
 
     let paused_at = now_rfc3339();
@@ -866,7 +957,28 @@ pub async fn pause_project(
         context: EventContext::ProjectPaused { paused_at },
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
+}
+
+/// Run every Project environment check now, without filtering by Task role.
+pub async fn recheck_project_environment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    request: Option<Json<api_types::ProjectEnvironmentRecheckRequest>>,
+) -> ApiResult<Json<api_types::ProjectEnvironmentRecheckResponse>> {
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let (machines, project) = services::environment_surfaces::recheck(
+        &state.task_service,
+        &state.db,
+        &state.event_bus,
+        &id,
+        request.machine.as_deref(),
+    )
+    .await?;
+    Ok(Json(api_types::ProjectEnvironmentRecheckResponse {
+        machines,
+        project: project_response(&state.db, project).await?,
+    }))
 }
 
 pub async fn resume_project(
@@ -877,7 +989,7 @@ pub async fn resume_project(
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
     if project.paused_at.is_none() {
-        return Ok(Json(project_response(project)?));
+        return Ok(Json(project_response(&state.db, project).await?));
     }
 
     ProjectRepo::set_paused_at(&*state.db, &id, None).await?;
@@ -892,7 +1004,7 @@ pub async fn resume_project(
         context: EventContext::ProjectResumed {},
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn update_project(
@@ -949,7 +1061,7 @@ pub async fn update_project(
         context: EventContext::ProjectUpdated {},
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub(crate) async fn require_project_visible(

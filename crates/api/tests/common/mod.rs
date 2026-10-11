@@ -23,14 +23,96 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// Real asynchronous workflow execution for socket/provider integration tests.
+pub struct StepWorkerGuard {
+    stop: tokio::sync::watch::Sender<bool>,
+    job: tokio::task::JoinHandle<()>,
+    /// Review-entry CI is a check the durable runner executes: without its
+    /// worker a Task entering review would wait for a result forever.
+    checks: Option<tokio::task::JoinHandle<()>>,
+}
+impl StepWorkerGuard {
+    pub fn start(state: &AppState) -> Self {
+        let (stop, signal) = tokio::sync::watch::channel(false);
+        Self {
+            stop,
+            checks: state.task_service.check_worker().map(|worker| {
+                worker.start(
+                    &state.operator_status_service.periodic_workers(),
+                    signal.clone(),
+                )
+            }),
+            job: state.task_service.task_step_worker().start(signal),
+        }
+    }
+}
+impl StepWorkerGuard {
+    pub fn stop(&self) {
+        let _ = self.stop.send(true);
+        self.job.abort();
+        if let Some(checks) = &self.checks {
+            checks.abort();
+        }
+    }
+}
+impl StepWorkerGuard {
+    /// Stop only the check worker: a test that settles its check runs by
+    /// hand must not race the real one for them.
+    pub async fn stop_checks(&self) {
+        if let Some(checks) = &self.checks {
+            checks.abort();
+            while !checks.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+}
+impl Drop for StepWorkerGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub struct Harness {
+    pub step_worker: StepWorkerGuard,
     pub app: Router,
     pub state: Arc<AppState>,
     _web_dist_dir: TestDir,
 }
 
+impl Harness {
+    pub fn stop_step_worker(&self) {
+        self.step_worker.stop();
+    }
+}
+
+/// Settle queued workflow cascades deterministically before final-state assertions.
+pub async fn drain(state: &AppState, app: &Router, task_id: &str) -> TaskResponse {
+    state
+        .task_service
+        .drain(task_id)
+        .await
+        .expect("Task steps drain");
+    empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await
+}
+
 pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
-    let pool = db::create_sqlite_pool("sqlite::memory:")
+    test_app_on(workspace_root, prefix, "sqlite::memory:").await
+}
+
+/// `test_app` over the database at `database_url`. An in-memory database is
+/// one connection: a connection the pool discards (a query future dropped
+/// mid-flight by a `select!` or a timeout is enough) is replaced by a new,
+/// EMPTY database, and the next statement fails `no such table`. Tests that
+/// run workers on several threads against the harness use a file.
+pub async fn test_app_on(workspace_root: &Path, prefix: &str, database_url: &str) -> Harness {
+    let pool = db::create_sqlite_pool(database_url)
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
@@ -54,12 +136,12 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
     .await
     .expect("seed test user");
 
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(64));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -93,6 +175,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     Harness {
+        step_worker: StepWorkerGuard::start(&state),
         app,
         state,
         _web_dist_dir: web_dist_dir,
@@ -226,7 +309,7 @@ pub async fn configure_execution_test_setup(
         .expect("test worker lookup")
         .expect("test worker exists");
     assert_eq!(
-        services::agent_service::compute_effective_status(db, &worker)
+        services::agent_service::compute_effective_status(db, &worker, None)
             .await
             .expect("test worker effective status"),
         services::agent_service::EffectiveStatus::Active,
@@ -238,7 +321,7 @@ pub async fn configure_execution_test_setup(
             .expect("test reviewer lookup")
             .expect("test reviewer exists");
         assert_eq!(
-            services::agent_service::compute_effective_status(db, &reviewer)
+            services::agent_service::compute_effective_status(db, &reviewer, None)
                 .await
                 .expect("test reviewer effective status"),
             services::agent_service::EffectiveStatus::Active,
@@ -749,4 +832,89 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// Tests explicitly place this version in the command body. The transport
+/// helper never repairs missing command fields.
+/// Plan 3.1 stage 5a: an ordinary owner action on a healthy Task never
+/// leaves it parked as unreadable. The stored condition decodes, names no
+/// unreadable-condition park, the public Task does not report one, and the
+/// stored condition is what the background check would write.
+pub async fn assert_condition_readable(
+    state: &api::AppState,
+    app: &Router,
+    task_id: &str,
+    after: &str,
+) {
+    let stored = state
+        .db
+        .task_condition(task_id)
+        .await
+        .unwrap_or_else(|error| panic!("after {after}: stored condition does not decode: {error}"));
+    let unreadable = |reason: &db::ParkReason| {
+        matches!(
+            reason,
+            db::ParkReason::UnknownCondition { source, .. }
+                if source.field == db::LegacyConditionField::ConditionJson
+        )
+    };
+    assert!(
+        !stored
+            .reasons()
+            .chain(stored.evidence().observations.iter())
+            .any(unreadable),
+        "after {after}: {stored:?}"
+    );
+    let task: api_types::TaskResponse = parse_response(
+        raw_empty_request(app, Method::GET, &format!("/api/v1/tasks/{task_id}")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        task.condition
+            .details()
+            .diagnostic
+            .as_ref()
+            .is_none_or(|diagnostic| diagnostic.blocking_reason != "unknown_condition"),
+        "after {after}: {:?}",
+        task.condition
+    );
+    assert!(
+        !state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|id| id == task_id),
+        "after {after}: stored condition disagrees with the Task's durable state"
+    );
+}
+
+pub async fn task_action_version(app: &Router, uri: &str) -> i64 {
+    let response = raw_empty_request(app, Method::GET, uri).await;
+    let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
+    offers.version
+}
+
+/// Every Task that is not settled has a queued step, a live execution or a
+/// park once the committed kicks are reconciled. The runtime's own dispatcher
+/// proves it when there is one, so its stop fence and state are the ones used.
+pub async fn assert_scheduler_clean(state: &api::AppState) {
+    let fixture;
+    let dispatcher = match state.task_dispatcher.as_deref() {
+        Some(dispatcher) => dispatcher,
+        None => {
+            fixture = services::TaskDispatcher::new(
+                state.db.clone(),
+                state.event_bus.clone(),
+                state.task_service.clone(),
+            );
+            &fixture
+        }
+    };
+    dispatcher
+        .sweep_and_assert()
+        .await
+        .expect("every Task is owned or parked after reconciliation");
 }

@@ -16,9 +16,11 @@ dev-no-daemon:
 frontend:
 	cd web && pnpm run dev
 
-# Regenerate the web client's TypeScript bindings from api-types
+# Regenerate the web client's TypeScript bindings from api-types: the
+# `#[ts(export)]` types (ts-rs `export_bindings_*` tests) and the explicit
+# list in `export_typescript` (ignored by default).
 types:
-	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_bindings
+	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_ -- --include-ignored
 
 # Run all Rust tests
 test:

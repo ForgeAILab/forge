@@ -25,7 +25,6 @@ type RepoResponse = {
   name: string
   local_path: string | null
   remote_url: string
-  work_mode: 'direct_merge' | 'pull_request'
 }
 
 type AgentResponse = {
@@ -258,7 +257,11 @@ async function cleanupTask(request: APIRequestContext, taskId: string): Promise<
 
   const task = (await taskResponse.json()) as TaskResponse
   if (!['done', 'cancelled'].includes(task.status)) {
-    await request.post(`/api/v1/tasks/${taskId}/cancel`, { failOnStatusCode: false })
+    await request.get(`/api/v1/tasks/${taskId}/actions`).then(async (response) => {
+      const current = await response.json()
+      const offer = current.available_actions?.find((item: { action: { verb: string } }) => item.action.verb === 'cancel')
+      if (offer) await request.post(`/api/v1/tasks/${taskId}/actions`, { data: { action: offer.action, version: current.version }, failOnStatusCode: false })
+    })
     const cancelled = await waitForTaskStatus(request, taskId, ['done', 'cancelled'], 120000)
       .then(() => true)
       .catch(() => false)
@@ -354,7 +357,6 @@ test.describe('subtask flow (integration)', () => {
           name: `subtask-app-${runId}`,
           remote_url: fixturePath,
           local_path: fixturePath,
-          work_mode: 'direct_merge',
           default_branch: 'main',
         },
       )

@@ -105,7 +105,9 @@ async fn merge_fix_zero_blocks_first_conflict_without_follow_up() {
         "merge_fix = 0 should block at the merge gate without dispatching merge-fix work"
     );
     let blocked = task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(
@@ -197,6 +199,7 @@ impl CodingExecutorAdapter for CompletingCodexAdapter {
 }
 
 struct TestHarness {
+    _step_worker: common::StepWorkerGuard,
     app: Router,
     state: Arc<AppState>,
     _web_dist_dir: common::TestDir,
@@ -219,7 +222,7 @@ async fn test_app(
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -253,6 +256,7 @@ async fn test_app(
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     TestHarness {
+        _step_worker: common::StepWorkerGuard::start(&state),
         app,
         state,
         _web_dist_dir: web_dist_dir,
@@ -483,7 +487,7 @@ async fn poll_until_blocked_metadata(app: &Router, task_id: &str) -> TaskRespons
             StatusCode::OK,
         )
         .await;
-        if task.blocked.is_some() {
+        if task.condition.details().interruption.is_some() {
             return task;
         }
         last_task = Some(task);

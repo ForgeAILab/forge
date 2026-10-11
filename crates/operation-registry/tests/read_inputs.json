@@ -1,0 +1,53 @@
+{
+  "account.summary": {},
+  "agent_chat.summary": {},
+  "project.charter": {},
+  "skill.section": {
+    "section": "research"
+  },
+  "genesis.project_agents.read": {
+    "genesis_session_id": "genesis"
+  },
+  "charter.read": {
+    "charter_id": "charter",
+    "revision_id": "revision",
+    "genesis_session_id": "genesis"
+  },
+  "charter.readiness": {
+    "charter_id": "charter",
+    "revision_id": "revision",
+    "content_digest": "content",
+    "render_digest": "render",
+    "expected_charter_version": 1
+  },
+  "charter.diff": {
+    "charter_id": "charter",
+    "base_revision_id": "base",
+    "candidate_revision_id": "candidate"
+  },
+  "charter.approval_target": {
+    "charter_id": "charter",
+    "revision_id": "revision",
+    "content_digest": "content",
+    "render_digest": "render",
+    "expected_charter_version": 1
+  },
+  "discovery.read": {
+    "limit": 10
+  },
+  "portfolio.read": {
+    "limit": 20
+  },
+  "inquiry.run": {
+    "title": "Question",
+    "question": "Find the answer",
+    "context": null
+  },
+  "project.current_state": {
+    "limit": 10
+  },
+  "project.observations": {
+    "limit": 20,
+    "task_id": null
+  }
+}

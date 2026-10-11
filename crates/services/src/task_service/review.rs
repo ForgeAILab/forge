@@ -1,9 +1,141 @@
 use super::*;
-use api_types::{Actor, UserActionSource};
+use ::review::ReviewWorkspace;
+use api_types::Actor;
 
 impl TaskService {
+    pub(crate) async fn annotate_review_ci_interruption(
+        &self,
+        task: &Task,
+        ctx: &crate::workflow::HookContext,
+        reason: &str,
+        retry: bool,
+        reset: bool,
+    ) -> Result<Task> {
+        let now = now_rfc3339();
+        let mut barrier: Value = task
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        let disconnected = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+            .await?
+            .is_some_and(|placement| placement.state == db::PlacementState::Disconnected);
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        if let Some(version) = ctx.project_version {
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
+                .bind(&task.project_id).bind(version).bind(ctx.project_workflow_definition.as_deref())
+                .fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        // The episode window opened when this review entry began (or when a
+        // connected CI run last succeeded); entry retries keep it.
+        let attempts = if retry && !disconnected {
+            let identity = crate::workflow::engine::durable::current_hook(&task.id)
+                .map(|h| format!("{}:{}", h.step.id, h.index))
+                .unwrap_or_else(|| format!("ci:{}", task.version));
+            db::budget::charge(
+                &mut tx,
+                &task.id,
+                db::budget::Kind::ReviewCiInfrastructure.key(),
+                i64::from(db::budget::Kind::ReviewCiInfrastructure.default_limit()),
+                &identity,
+            )
+            .await?
+            .spent
+        } else {
+            sqlx::query_scalar(
+                "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure'),0)",
+            )
+            .bind(&task.id)
+            .fetch_one(&mut *tx)
+            .await?
+        };
+        let exhausted = retry
+            && !disconnected
+            && !db::budget::allows_retry(
+                i64::from(db::budget::Kind::ReviewCiInfrastructure.default_limit()),
+                attempts,
+            );
+        let retry = retry && !exhausted;
+        let kind = if reset {
+            "workspace_reset_required"
+        } else if retry {
+            "review_ci_infrastructure"
+        } else if exhausted {
+            "review_ci_infrastructure_exhausted"
+        } else {
+            "review_ci_unavailable"
+        };
+        barrier["state"] = json!(task.status);
+        barrier["status"] = json!("blocked");
+        barrier["updated_at"] = json!(now);
+        barrier["interrupted_at"] = json!(now);
+        barrier["blocking_reason"] = json!(reason);
+        let annotation = json!({"type":if reset {api_types::FailureKind::WorkspaceResetRequired} else {api_types::FailureKind::BeforeWorkHookFailed},"blocking_reason":kind,"blocked_at":now,"blocked_by":"system:workflow","message":reason});
+        let deferral = retry.then(|| json!({
+            "target_state": task.status, "reason": reason,
+            "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).clamp(0,4)))).to_rfc3339(),
+        }).to_string());
+        let changed = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
+            blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
+            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
+            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
+            updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL")
+            .bind(barrier.to_string()).bind(annotation.to_string())
+            .bind((!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()))
+            .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
+            .execute_in_tx(&mut tx).await?;
+        // Runs in the Task's review hook step; a queued write would make the
+        // attention and returned Task below untruthful.
+        if changed.require_applied()? != 1 {
+            return Err(DbError::VersionConflict.into());
+        }
+        if !retry {
+            crate::placement::admission::record_wait_attention_in_tx(
+                &self.db,
+                &mut tx,
+                task,
+                "execution_failed",
+                &format!("Review CI [{kind}] could not run: {reason}"),
+                &format!("review-ci:{}", task.id),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+    }
+
+    pub(crate) async fn review_workspace_io(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Arc<dyn ReviewWorkspace>> {
+        let workspace = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        Ok(Arc::new(workspace))
+    }
+
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
         let task_id = task_id.to_string();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "rerun_review",
+                    serde_json::json!([task_id]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -24,17 +156,22 @@ impl TaskService {
         Ok((task, review))
     }
 
-    pub async fn approve_review(&self, task_id: impl Into<String>) -> Result<(Task, Review)> {
-        self.approve_review_as(task_id, Actor::user(UserActionSource::Api))
-            .await
-    }
-
     pub async fn approve_review_as(
         &self,
         task_id: impl Into<String>,
         actor: Actor,
     ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "approve_review_as",
+                    serde_json::json!([task_id, actor]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -64,13 +201,10 @@ impl TaskService {
             &finished_at,
             task.version,
             Some(finished_at.clone()),
+            db::ReviewEventOrigin::for_human(&actor),
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -97,6 +231,7 @@ impl TaskService {
                 task_id,
                 "merging".to_owned(),
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: None,
                     triggered_by: actor,
@@ -108,15 +243,6 @@ impl TaskService {
         Ok((transitioned.task, review))
     }
 
-    pub async fn reject_review(
-        &self,
-        task_id: impl Into<String>,
-        reason: Option<String>,
-    ) -> Result<(Task, Review)> {
-        self.reject_review_as(task_id, reason, Actor::user(UserActionSource::Api))
-            .await
-    }
-
     pub async fn reject_review_as(
         &self,
         task_id: impl Into<String>,
@@ -124,6 +250,16 @@ impl TaskService {
         actor: Actor,
     ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "reject_review_as",
+                    serde_json::json!([task_id, reason, actor]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -157,13 +293,10 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
+            db::ReviewEventOrigin::for_human(&actor),
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -194,6 +327,7 @@ impl TaskService {
             task_id.clone(),
             "in_progress".to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 reason: Some(reason.clone()),
                 triggered_by: actor,
@@ -210,7 +344,10 @@ impl TaskService {
             crate::workflow::default_roles::CODER,
         )
         .await?;
-        if remaining_retries > 0 && !follow_up_already_dispatched {
+        if db::budget::allows_retry(i64::from(remaining_retries), 0)
+            && !follow_up_already_dispatched
+            && !Self::task_action_command_active()
+        {
             self.dispatch_follow_up(
                 &task_id,
                 ::review::ReviewOutcome::AuditorFailed { reason },
@@ -234,14 +371,17 @@ impl TaskService {
         execution.workspace_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("executor execution missing workspace_id")
         })?;
-        let workspace = prepare_workspace(
+        let workspace = super::workspace::prepare_workspace_for(
             &self.db,
             &self.workspace_root,
             task,
             &task.id,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
+            crate::workspace_manager::Purpose::Review,
         )
         .await?;
+        let workspace_io = self.review_workspace_io(&workspace).await?;
         let review_config = review_config_from_json(task.task_state_config.as_deref())?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
@@ -304,10 +444,11 @@ impl TaskService {
             ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
         })?;
         let result = review_runner
+            .with_workspace_io(workspace_io)
             .run(ReviewRequest {
                 task_id,
                 executor_execution_id,
-                workspace_path: workspace.worktree_path.into(),
+                workspace_path: PathBuf::new(),
                 ci_steps: review_config.ci_steps,
                 logs_path,
                 auditor_agent_id,

@@ -2,12 +2,20 @@
 import type { ActiveExecutionSummary } from "./ActiveExecutionSummary";
 import type { AgentPressureSummary } from "./AgentPressureSummary";
 import type { BlockedTaskSummary } from "./BlockedTaskSummary";
+import type { CheckRunStatus } from "./CheckRunStatus";
 import type { DaemonIssueSummary } from "./DaemonIssueSummary";
 import type { DaemonPressureSummary } from "./DaemonPressureSummary";
+import type { DatabaseStorageStatus } from "./DatabaseStorageStatus";
+import type { EventConsumerStatus } from "./EventConsumerStatus";
+import type { EventRelayStatus } from "./EventRelayStatus";
+import type { IntegrationQueueStatus } from "./IntegrationQueueStatus";
 import type { OperatorSeverity } from "./OperatorSeverity";
+import type { PeriodicWorkerStatus } from "./PeriodicWorkerStatus";
 import type { RecentErrorSummary } from "./RecentErrorSummary";
 import type { RetryPressureSummary } from "./RetryPressureSummary";
+import type { TaskStepQueueStatus } from "./TaskStepQueueStatus";
+import type { UsageIndexStatus } from "./UsageIndexStatus";
 import type { UsageSummary } from "./UsageSummary";
 import type { WorkspaceCleanupSummary } from "./WorkspaceCleanupSummary";
 
-export type OperatorStatusResponse = { overall_severity: OperatorSeverity, active_executions: Array<ActiveExecutionSummary>, blocked_tasks: Array<BlockedTaskSummary>, daemon_issues: Array<DaemonIssueSummary>, daemon_pressure: Array<DaemonPressureSummary>, agent_pressure: Array<AgentPressureSummary>, workspace_cleanup: Array<WorkspaceCleanupSummary>, retry_pressure: Array<RetryPressureSummary>, usage_summary: UsageSummary | null, recent_errors: Array<RecentErrorSummary>, computed_at: string, };
+export type OperatorStatusResponse = { overall_severity: OperatorSeverity, active_executions: Array<ActiveExecutionSummary>, blocked_tasks: Array<BlockedTaskSummary>, daemon_issues: Array<DaemonIssueSummary>, daemon_pressure: Array<DaemonPressureSummary>, agent_pressure: Array<AgentPressureSummary>, workspace_cleanup: Array<WorkspaceCleanupSummary>, retry_pressure: Array<RetryPressureSummary>, usage_summary: UsageSummary | null, usage_index: UsageIndexStatus, recent_errors: Array<RecentErrorSummary>, event_consumers: Array<EventConsumerStatus>, periodic_workers: Array<PeriodicWorkerStatus>, task_steps: TaskStepQueueStatus, integration_queues: IntegrationQueueStatus, check_runs: CheckRunStatus, pending_remote_cancels: number, event_relay: EventRelayStatus, database: DatabaseStorageStatus, computed_at: string, };

@@ -20,7 +20,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentContextScopeRepo, AgentRepo,
     AgentSessionRepo, AgentStatus, CreateAgentContextScope, CreateAgentIdentity,
     CreateAgentProfile, CreateAgentSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
-    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType, Message,
@@ -183,7 +183,9 @@ async fn inquiry_fixture(
         system_prompt: Some("Answer this inquiry only.".to_owned()),
         history: Vec::new(),
         input: "first-inquiry-question".to_owned(),
+        server_state_card: None,
         command_allowlist: None,
+        environment: Default::default(),
         cancellation: CancellationToken::new(),
     };
     (db, backend, provider, request, root)
@@ -432,11 +434,13 @@ async fn lcm_counts(db: &SqliteDb, timeline_id: &str) -> (i64, i64, i64) {
 
 /// The planner must fit the system prompt, tool schemas, and the new user
 /// input alongside conversation history, while LCM pressure counts only the
-/// timeline. This case sits in the former dead zone: history alone is far
-/// below the hard threshold of the full window, but the planned total
-/// overflows it. Before the host deducted non-conversation overhead from the
-/// coordinator's budget, this failed planner-side (`budget_exceeded`) without
-/// LCM ever compacting; now pressure trips early and the turn completes.
+/// timeline. This case sits in the dead zone: history alone is far below the
+/// hard threshold of the full window, but the planned total overflows it.
+/// The window is below the Main working-set target, so target and hard cap
+/// clamp to the same value, and the first turn is cold: the runtime has not
+/// measured the fixed overhead yet. Without the host's cold-start estimate
+/// this failed planner-side (`budget_exceeded`) without LCM ever compacting,
+/// on every retry; now pressure trips early and the turn completes.
 #[tokio::test]
 async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
     let db = sqlite_db().await;
@@ -549,7 +553,9 @@ async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    server_state_card: None,
                     command_allowlist: None,
+                    environment: Default::default(),
                     cancellation: CancellationToken::new(),
                 },
                 Arc::new(NoopSink),
@@ -714,7 +720,9 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    server_state_card: None,
                     command_allowlist: None,
+                    environment: Default::default(),
                     cancellation: CancellationToken::new(),
                 },
                 Arc::new(NoopSink),
@@ -773,15 +781,23 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
         "hard pressure over a 12k-token budget must condense the seeded history into LCM nodes",
     );
 
-    // The manifest-linked timeline is the canonical chat-scoped timeline.
-    let (stored_scope_type, stored_scope_id): (String, String) =
-        sqlx::query_as("SELECT scope_type, scope_id FROM agent_lcm_timeline WHERE id = ?")
-            .bind(&timeline_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("timeline row");
+    // The manifest-linked timeline is this topic's timeline: one per runtime
+    // session, keyed `<chat>#topic:<runtime session>`, with the chat itself
+    // as its canonical scope.
+    let (stored_scope_type, stored_scope_id, canonical_scope_id): (String, String, String) =
+        sqlx::query_as(
+            "SELECT scope_type, scope_id, canonical_scope_id FROM agent_lcm_timeline WHERE id = ?",
+        )
+        .bind(&timeline_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("timeline row");
     assert_eq!(stored_scope_type, "agent_chat");
-    assert_eq!(stored_scope_id, chat.id);
+    assert_eq!(
+        stored_scope_id,
+        format!("{}#topic:{runtime_session_id}", chat.id)
+    );
+    assert_eq!(canonical_scope_id, chat.id);
 
     let (entries, leaf_nodes, condensed_nodes) = lcm_counts(&db, &timeline_id).await;
     assert!(entries > 0, "canonical history is admitted as LCM entries");
@@ -805,7 +821,9 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                 ),
                 history: Vec::new(),
                 input: format!("turn {}: continue after compaction", compaction_turn + 1),
+                server_state_card: None,
                 command_allowlist: None,
+                environment: Default::default(),
                 cancellation: CancellationToken::new(),
             },
             Arc::new(NoopSink),
@@ -868,7 +886,6 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
             name: "repository".to_owned(),
             remote_url: Some("https://example.invalid/repository.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1011,7 +1028,9 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
                 system_prompt: Some("Implement the assigned Task.".to_owned()),
                 history,
                 input: "continue the implementation".to_owned(),
+                server_state_card: None,
                 command_allowlist: None,
+                environment: Default::default(),
                 cancellation: CancellationToken::new(),
             },
             Arc::new(NoopSink),

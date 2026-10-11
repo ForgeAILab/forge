@@ -51,7 +51,7 @@ async fn database() -> Arc<SqliteDb> {
     Arc::new(SqliteDb::new(pool))
 }
 
-async fn seed_identity(db: &SqliteDb) {
+async fn seed_identity(db: &SqliteDb, permissions: &str) {
     sqlx::query(
         "INSERT INTO user
          (id, email, password_hash, display_name, created_at, updated_at)
@@ -80,8 +80,7 @@ async fn seed_identity(db: &SqliteDb) {
             paused: false,
             owner_id: Some(USER_ID.to_owned()),
             visibility: "account".to_owned(),
-            account_permission_ceiling:
-                r#"{"permissions":["read_project","propose_project","propose_task","propose_commitment"]}"#.to_owned(),
+            account_permission_ceiling: permissions.to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),
         },
@@ -96,8 +95,7 @@ async fn seed_identity(db: &SqliteDb) {
             permission_policy: None,
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
-            tool_policy_json:
-                r#"{"permissions":["read_project","propose_project","propose_task","propose_commitment"]}"#.to_owned(),
+            tool_policy_json: permissions.to_owned(),
             config_json: "{}".to_owned(),
             credential_ref: None,
             daemon_id: None,
@@ -150,7 +148,6 @@ async fn seed_project(db: &SqliteDb, project_id: &str, repo_id: &str) {
             name: format!("{project_id}-repo"),
             remote_url: Some(format!("file:///tmp/{repo_id}")),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),
@@ -287,8 +284,15 @@ async fn seed_milestone(db: &SqliteDb) {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_permissions(
+        r#"{"permissions":["read_project","propose_project","propose_task","propose_commitment"]}"#,
+    )
+    .await
+}
+
+async fn fixture_with_permissions(permissions: &str) -> Fixture {
     let db = database().await;
-    seed_identity(&db).await;
+    seed_identity(&db, permissions).await;
     seed_project(&db, PROJECT_ID, REPO_ID).await;
     seed_project(&db, TASK_PROJECT_ID, TASK_REPO_ID).await;
     seed_charter(&db, PROJECT_ID, CHARTER_ID, CHARTER_REVISION_ID).await;
@@ -301,7 +305,7 @@ async fn fixture() -> Fixture {
     .await;
     seed_milestone(&db).await;
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
-    provider.set_task_service(Arc::new(TaskService::new(
+    provider.set_task_service(Arc::new(TaskService::new_for_test(
         Arc::clone(&db),
         Arc::new(EventBus::new(32)),
     )));
@@ -994,6 +998,88 @@ async fn approval_required_release_candidate_stays_pending_without_domain_result
     );
 }
 
+/// Before the release request was registered its queueing step wrote the
+/// action row first, so a request the policy denies stayed on the ledger as
+/// `denied`. The registered path refuses it at admission and must still
+/// leave that row; a refused call that was never queueable leaves none.
+#[tokio::test]
+async fn denied_release_request_is_recorded_on_the_action_ledger() {
+    let fixture = fixture().await;
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}'
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(PROJECT_ID)
+    .execute(fixture.db.pool())
+    .await
+    .expect("restrict Project policy");
+
+    let mut malformed = approval_required_release_arguments("denied-release-malformed");
+    malformed["payload"]["unexpected"] = json!(true);
+    for (arguments, rows) in [
+        (malformed, 0),
+        (approval_required_release_arguments("denied-release-key"), 1),
+        // A retry of the same denied call does not add a second row.
+        (approval_required_release_arguments("denied-release-key"), 1),
+    ] {
+        let denied = fixture
+            .provider
+            .propose(
+                AGENT_ID,
+                &fixture.project_scope,
+                RUNTIME_SESSION_ID,
+                "project.release.request",
+                arguments,
+            )
+            .await
+            .expect_err("a release request without propose_project is denied");
+        let denied = structured_error(denied);
+        assert_eq!(denied.code, api_types::OutcomeCode::PolicyDenied);
+        assert_eq!(
+            denied.denied_by,
+            Some(api_types::DeniedBy::PermissionMissing(
+                "propose_project".to_owned()
+            ))
+        );
+        assert_eq!(
+            count(
+                &fixture.db,
+                "SELECT COUNT(*) FROM agent_action WHERE operation = 'project.release.request'",
+            )
+            .await,
+            rows
+        );
+    }
+    let (status, policy_result, permission, target_type, target_id): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT status, policy_result, requested_permission, target_type, target_id
+         FROM agent_action WHERE dedupe_key = 'denied-release-key'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("denied release request row");
+    assert_eq!(
+        (
+            status.as_str(),
+            policy_result.as_str(),
+            permission.as_str(),
+            target_type.as_str(),
+            target_id.as_str()
+        ),
+        ("denied", "denied", "propose_project", "project", PROJECT_ID)
+    );
+    assert_eq!(
+        count(&fixture.db, "SELECT COUNT(*) FROM command_receipt").await,
+        0
+    );
+}
+
 #[tokio::test]
 async fn denied_operation_is_not_admitted_and_cannot_mutate() {
     let fixture = fixture().await;
@@ -1047,9 +1133,22 @@ async fn denied_operation_is_not_admitted_and_cannot_mutate() {
         !denied.safe_message.contains("read_project"),
         "policy details must not reach the model"
     );
-    assert!(
-        !denied.safe_message.contains("permission"),
-        "policy details must not reach the model"
+    assert_eq!(
+        denied
+            .denied_by
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("permission_missing(propose_project)")
+    );
+    assert!(denied.safe_message.contains("Do not retry"));
+    assert_eq!(
+        denied.retry.as_ref().unwrap().action,
+        api_types::RetryAction::None
+    );
+    assert_eq!(
+        denied.retry.as_ref().unwrap().scope,
+        Some(api_types::RetryScope::Session)
     );
     assert_eq!(
         count(
@@ -1185,4 +1284,831 @@ async fn idempotency_mismatch_has_no_current_state_disclosure() {
         1,
         "an idempotency mismatch must not create another revision"
     );
+}
+
+#[tokio::test]
+async fn terminal_native_denial_offers_only_a_held_owner_escalation_operation() {
+    let fixture =
+        fixture_with_permissions(r#"{"permissions":["read_project","propose_message"]}"#).await;
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\",\"propose_message\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    let deny = |key| {
+        fixture.provider.propose(
+            AGENT_ID,
+            &fixture.project_scope,
+            RUNTIME_SESSION_ID,
+            PROJECT_DOCUMENT_OPERATION,
+            document_arguments(key),
+        )
+    };
+    let held = structured_error(deny("held-alternative").await.unwrap_err());
+    assert_eq!(
+        held.denied_by.as_ref().map(ToString::to_string).as_deref(),
+        Some("permission_missing(propose_project)")
+    );
+    assert_eq!(held.alternatives, Some(vec!["message.send".to_owned()]));
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    let revoked = structured_error(deny("revoked-alternative").await.unwrap_err());
+    assert!(revoked.alternatives.is_none());
+}
+
+#[tokio::test]
+async fn terminal_native_task_commands_preserve_evaluator_permission_and_identity_denials() {
+    let fixture = fixture().await;
+    let task = db::TaskRepo::create(
+        &*fixture.db,
+        db::CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: PROJECT_ID.to_owned(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Blocked Task".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "blocked".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    // Revoke the canonical Task permission after catalog composition.
+    // Exercise the real evaluator rather than a fabricated adapter error.
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    let review = fixture.provider.propose(AGENT_ID, &fixture.project_scope, RUNTIME_SESSION_ID,
+        "task.action", json!({"operation":"task.action", "payload":{
+            "task_id":task.id, "action":{"verb":"approve","override":false,"reason":"Check refusal"}, "version":task.version}, "dedupe_key":"denied-review", "correlation_id":"denied-review"})
+    ).await.unwrap_err();
+    let review = structured_error(review);
+    assert_eq!(
+        review
+            .denied_by
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("permission_missing(propose_task)")
+    );
+    assert_eq!(review.retry.unwrap().action, api_types::RetryAction::None);
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\",\"propose_task\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(AGENT_ID)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let recover = fixture
+        .provider
+        .propose(
+            AGENT_ID,
+            &fixture.project_scope,
+            RUNTIME_SESSION_ID,
+            "task.action",
+            json!({"operation":"task.action", "payload":{
+            "task_id":task.id, "action":{"verb":"retry","fresh_session":true}, "version":task.version},
+            "dedupe_key":"denied-recover", "correlation_id":"denied-recover"}),
+        )
+        .await
+        .unwrap_err();
+    let recover = structured_error(recover);
+    assert_eq!(
+        recover
+            .denied_by
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("identity_paused")
+    );
+    assert_eq!(recover.retry.unwrap().action, api_types::RetryAction::None);
+    assert!(recover
+        .safe_message
+        .contains("repeating this call will be refused again"));
+}
+
+#[tokio::test]
+async fn terminal_native_charter_denial_preserves_evaluator_cause() {
+    let fixture = fixture().await;
+    let unadopted_project = "terminal-denial-unadopted-project";
+    seed_project(
+        &fixture.db,
+        unadopted_project,
+        "terminal-denial-unadopted-repo",
+    )
+    .await;
+    let scope = CanonicalScope {
+        scope_id: unadopted_project.to_owned(),
+        ..fixture.project_scope.clone()
+    };
+    let outcome = fixture
+        .provider
+        .propose(
+            AGENT_ID,
+            &scope,
+            RUNTIME_SESSION_ID,
+            PROJECT_DOCUMENT_OPERATION,
+            document_arguments("charter-denial"),
+        )
+        .await
+        .unwrap_err();
+    let outcome = structured_error(outcome);
+    assert_eq!(outcome.code, api_types::OutcomeCode::PolicyDenied);
+    assert_eq!(
+        outcome
+            .denied_by
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("charter_not_adopted")
+    );
+    assert_eq!(outcome.retry.unwrap().action, api_types::RetryAction::None);
+    assert!(outcome.safe_message.contains("Do not retry"));
+}
+
+// Exercise the actual host wrapper, provider and policy in one model turn.
+fn native_tool(
+    fixture: &Fixture,
+    scope: CanonicalScope,
+    project_chat: bool,
+    name: &str,
+) -> Arc<dyn agent_runtime::core::prelude::Tool> {
+    let permissions = [
+        "read_account",
+        "read_agent_chat",
+        "read_project",
+        "propose_project",
+        "propose_task",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    forge_agent_host::ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        AGENT_ID,
+        scope,
+        None,
+        None,
+        &permissions,
+        project_chat,
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .unwrap()
+    .tools()
+    .into_iter()
+    .find(|tool| tool.spec().name == name)
+    .unwrap()
+}
+
+async fn invoke_native(
+    tool: &dyn agent_runtime::core::prelude::Tool,
+    arguments: Value,
+    turn: &str,
+    call: &str,
+) -> agent_runtime::core::prelude::ToolOutcome {
+    use agent_runtime::core::{
+        cancel::Cancellation, clock::*, ids::*, prelude::*, workspace::DenyAllWorkspace,
+    };
+    let preparation = PreparationContext {
+        session: SessionId::new(RUNTIME_SESSION_ID),
+        turn: Some(TurnId::new(turn)),
+        call_id: ToolCallId::new(call),
+        request: RequestId::new(call),
+        workspace: Arc::new(DenyAllWorkspace),
+        clock: Arc::new(SystemClock),
+        cancel: Cancellation::new(),
+        deadline: Deadline::never(),
+    };
+    let invocation = InvocationContext {
+        session: preparation.session.clone(),
+        turn: preparation.turn.clone(),
+        call_id: preparation.call_id.clone(),
+        request: preparation.request.clone(),
+        workspace: preparation.workspace.clone(),
+        clock: preparation.clock.clone(),
+        cancel: preparation.cancel.clone(),
+        deadline: preparation.deadline,
+        output_limit: 4096,
+    };
+    tool.invoke(
+        tool.prepare(arguments, &preparation).await.unwrap(),
+        &invocation,
+    )
+    .await
+    .unwrap()
+}
+
+async fn project_chat_session(fixture: &Fixture) -> (CanonicalScope, String) {
+    let chat_id: String = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
+        .bind(PROJECT_ID)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let context_id = db::new_uuid_v4();
+    db::AgentContextScopeRepo::create_context_scope(
+        &*fixture.db,
+        db::CreateAgentContextScope {
+            id: context_id.clone(),
+            identity_id: AGENT_ID.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat_id.clone(),
+            project_id: Some(PROJECT_ID.to_owned()),
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: "{}".to_owned(),
+            workspace_path: None,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let session_id = db::new_uuid_v4();
+    db::AgentSessionRepo::create_agent_session(
+        &*fixture.db,
+        db::CreateAgentSession {
+            id: session_id.clone(),
+            identity_id: AGENT_ID.to_owned(),
+            profile_id: PROFILE_ID.to_owned(),
+            context_scope_id: context_id,
+            backend_kind: "native".to_owned(),
+            runtime_session_id: Some(RUNTIME_SESSION_ID.to_owned()),
+            status: "ready".to_owned(),
+            capabilities_json: "{}".to_owned(),
+            connection_status: "healthy".to_owned(),
+            predecessor_session_id: None,
+            last_activity_at: None,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    (
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: chat_id,
+            workspace_access: WorkspaceAccess::Deny,
+        },
+        session_id,
+    )
+}
+
+#[tokio::test]
+async fn terminal_denial_per_document_refusal_does_not_block_a_different_document_in_the_same_turn()
+{
+    let fixture = fixture().await;
+    let (scope, _) = project_chat_session(&fixture).await;
+    let tool = native_tool(
+        &fixture,
+        scope,
+        true,
+        forge_agent_host::FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+    );
+    let draft = invoke_native(
+        &*tool,
+        document_arguments("first-draft"),
+        "same-turn",
+        "draft",
+    )
+    .await;
+    assert!(!draft.is_error, "{draft:?}");
+    let (document_id, revision_id, version): (String, String, i64) = sqlx::query_as(
+        "SELECT id, current_draft_revision_id, version FROM project_document WHERE project_id = 'direct-classification-project'",
+    ).fetch_one(fixture.db.pool()).await.unwrap();
+    let (content_digest, render_digest): (String, String) = sqlx::query_as(
+        "SELECT content_digest, rendered_digest FROM project_document_revision WHERE id = ?",
+    )
+    .bind(&revision_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project_document SET approval_policy = 'user' WHERE id = ?")
+        .bind(&document_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let denied = invoke_native(&*tool, json!({"operation":"project.document", "payload":{
+        "action":"approve", "document_id":document_id, "revision_id":revision_id,
+        "content_digest":content_digest, "render_digest":render_digest,
+        "expected_document_version":version}, "dedupe_key":"forbidden-approval", "correlation_id":"forbidden-approval"}), "same-turn", "approve").await;
+    assert!(denied.is_error, "{denied:?}");
+    assert_eq!(denied.value["denied_by"], "unspecified");
+    assert_eq!(denied.value["retry"]["action"], "none");
+    assert!(!denied.value["safe_message"]
+        .as_str()
+        .unwrap()
+        .contains("Do not retry"));
+    let mut second = document_arguments("second-document");
+    second["payload"]["document_id"] = json!("different-document");
+    assert!(
+        !invoke_native(&*tool, second, "same-turn", "second")
+            .await
+            .is_error
+    );
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn terminal_denial_current_state_load_error_is_internal_and_not_recorded() {
+    // `native_tool` composes the Project Chat with `read_agent_chat`; the
+    // registered read enforces what that surface advertises, so the identity
+    // and binding must really hold it.
+    let fixture = fixture_with_permissions(
+        r#"{"permissions":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE project_agent_binding SET permission_ceiling_json = ?
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(r#"{"allowed":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#)
+    .bind(PROJECT_ID)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    let (scope, _) = project_chat_session(&fixture).await;
+    let tool = native_tool(
+        &fixture,
+        scope,
+        true,
+        forge_agent_host::FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+    );
+    // Authorization still succeeds; the state projection query fails.
+    sqlx::query("ALTER TABLE task RENAME COLUMN status TO unavailable_status")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let failed = invoke_native(
+        &*tool,
+        json!({"operation":"project.current_state"}),
+        "same-turn",
+        "failed-load",
+    )
+    .await;
+    assert!(failed.is_error);
+    assert_eq!(failed.value["code"], "internal_failure", "{failed:?}");
+    assert!(failed.value.get("denied_by").is_none());
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        0
+    );
+    sqlx::query("ALTER TABLE task RENAME COLUMN unavailable_status TO status")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert!(
+        !invoke_native(
+            &*tool,
+            json!({"operation":"project.current_state"}),
+            "same-turn",
+            "restored-load"
+        )
+        .await
+        .is_error
+    );
+}
+
+#[tokio::test]
+async fn terminal_denial_permission_grant_invalidates_reminder_and_next_turn_call_succeeds() {
+    use db::ChatSessionDenialRepo;
+    let fixture = fixture().await;
+    let (scope, session_id) = project_chat_session(&fixture).await;
+    let tool = native_tool(
+        &fixture,
+        scope.clone(),
+        true,
+        forge_agent_host::FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+    );
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    let denied = invoke_native(&*tool, document_arguments("denied"), "first-turn", "denied").await;
+    assert_eq!(
+        denied.value["denied_by"],
+        "permission_missing(propose_project)"
+    );
+    assert_eq!(
+        fixture
+            .provider
+            .chat_session_denials(AGENT_ID, PROFILE_ID, &scope.scope_id, Some(&session_id))
+            .await
+            .len(),
+        1
+    );
+    let created_at: String =
+        sqlx::query_scalar("SELECT created_at FROM chat_session_denied_operation")
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert!(!created_at.is_empty());
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\",\"propose_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    assert!(fixture
+        .provider
+        .chat_session_denials(AGENT_ID, PROFILE_ID, &scope.scope_id, Some(&session_id))
+        .await
+        .is_empty());
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        0
+    );
+    // Only a reminder read into this turn's card is cleared by success.
+    fixture
+        .db
+        .record_chat_session_denial(
+            AGENT_ID,
+            &scope.scope_id,
+            RUNTIME_SESSION_ID,
+            "project.document",
+            &api_types::DeniedBy::PermissionMissing("propose_project".to_owned()),
+        )
+        .await
+        .unwrap();
+    // The card still sees a refusal; authority changes before invocation.
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    assert_eq!(
+        fixture
+            .provider
+            .chat_session_denials(AGENT_ID, PROFILE_ID, &scope.scope_id, Some(&session_id))
+            .await
+            .len(),
+        1
+    );
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\",\"propose_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    assert!(
+        !invoke_native(
+            &*tool,
+            document_arguments("granted"),
+            "next-turn",
+            "granted"
+        )
+        .await
+        .is_error
+    );
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn terminal_denial_bad_project_summary_id_does_not_withdraw_operation() {
+    let fixture = fixture().await;
+    sqlx::query("INSERT INTO account_main_agent_binding (id, account_id, identity_id, profile_id, created_at, updated_at) VALUES ('summary-main', ?, ?, ?, ?, ?)")
+        .bind(USER_ID).bind(AGENT_ID).bind(PROFILE_ID).bind(NOW).bind(NOW).execute(fixture.db.pool()).await.unwrap();
+    let chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE kind = 'account_main' AND account_id = ?",
+    )
+    .bind(USER_ID)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::AgentChat,
+        scope_id: chat_id,
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let tool = native_tool(&fixture, scope, false, "forge_scope_read");
+    for (call, args) in [
+        ("missing", json!({"operation":"project.summary"})),
+        (
+            "wrong",
+            json!({"operation":"project.summary", "arguments":{"project_id":"deleted-or-wrong"}}),
+        ),
+    ] {
+        let failed = invoke_native(&*tool, args, "same-turn", call).await;
+        assert_eq!(failed.value["code"], "validation_error", "{failed:?}");
+        assert!(failed.value.get("denied_by").is_none());
+    }
+    let success = invoke_native(
+        &*tool,
+        json!({"operation":"project.summary", "arguments":{"project_id":PROJECT_ID}}),
+        "same-turn",
+        "corrected",
+    )
+    .await;
+    assert!(!success.is_error, "{success:?}");
+    assert_eq!(success.value["id"], PROJECT_ID);
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn terminal_denial_scope_permission_reminder_uses_real_policy_and_read_failures_are_advisory()
+{
+    use db::ChatSessionDenialRepo;
+    let fixture = fixture_with_permissions(
+        r#"{"permissions":["read_project","propose_project","propose_review"]}"#,
+    )
+    .await;
+    let (scope, session_id) = project_chat_session(&fixture).await;
+    // All editable ceilings allow propose_review. The static Project Chat
+    // scope set does not, so this cause must remain in the card.
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\",\"propose_project\",\"propose_review\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    fixture
+        .db
+        .record_chat_session_denial(
+            AGENT_ID,
+            &scope.scope_id,
+            RUNTIME_SESSION_ID,
+            "review.request",
+            &api_types::DeniedBy::PermissionMissing("propose_review".to_owned()),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            fixture
+                .provider
+                .chat_session_denials(AGENT_ID, PROFILE_ID, &scope.scope_id, Some(&session_id))
+                .await,
+            vec![(
+                "review.request".to_owned(),
+                api_types::DeniedBy::PermissionMissing("propose_review".to_owned())
+            )]
+        );
+    }
+    sqlx::query("DROP TABLE chat_session_denied_operation")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert!(fixture
+        .provider
+        .chat_session_denials(AGENT_ID, PROFILE_ID, &scope.scope_id, Some(&session_id))
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn terminal_denial_success_without_card_read_does_not_delete_and_unknown_permissions_are_not_recorded(
+) {
+    use db::ChatSessionDenialRepo;
+    let fixture = fixture().await;
+    let (scope, _) = project_chat_session(&fixture).await;
+    let tool = native_tool(
+        &fixture,
+        scope.clone(),
+        true,
+        forge_agent_host::FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+    );
+    fixture
+        .db
+        .record_chat_session_denial(
+            AGENT_ID,
+            &scope.scope_id,
+            RUNTIME_SESSION_ID,
+            "project.document",
+            &api_types::DeniedBy::OperationNotInScope,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !invoke_native(
+            &*tool,
+            document_arguments("no-card-read"),
+            "same-turn",
+            "success"
+        )
+        .await
+        .is_error
+    );
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        1
+    );
+    for permission in ["unknown", "invented_permission"] {
+        fixture
+            .provider
+            .record_terminal_denial(
+                AGENT_ID,
+                &scope,
+                RUNTIME_SESSION_ID,
+                "task.action",
+                &api_types::DeniedBy::PermissionMissing(permission.to_owned()),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM chat_session_denied_operation"
+        )
+        .await,
+        1
+    );
+}
+
+async fn recovery_fixture() -> (Fixture, tempfile::TempDir, String, String, String) {
+    let fixture = fixture().await;
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "Initial",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    sqlx::query("UPDATE repo SET local_path = ?, remote_url = NULL WHERE id = ?")
+        .bind(repo.to_string_lossy().as_ref())
+        .bind(REPO_ID)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let worker = db::new_uuid_v4();
+    let profile = db::new_uuid_v4();
+    AgentRepo::create_identity_with_profile(
+        &*fixture.db,
+        CreateAgentIdentity {
+            id: worker.clone(),
+            name: "Target worker".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(USER_ID.to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+        CreateAgentProfile {
+            id: profile,
+            identity_id: worker.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: None,
+            model: Some("test-model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut tasks = Vec::new();
+    for label in ["Task A", "Task B"] {
+        let task = db::new_uuid_v4();
+        sqlx::query("INSERT INTO task (id, project_id, title, status, task_type, blocked_json, created_at, updated_at) VALUES (?, ?, ?, 'planning', 'planning_task', '{\"reason\":\"execution stopped\",\"kind\":\"executor_failed\"}', ?, ?)")
+            .bind(&task).bind(PROJECT_ID).bind(label).bind(NOW).bind(NOW).execute(fixture.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_task_governance (task_id, project_id, charter_revision_id, capability_class, runnable, created_at, updated_at) VALUES (?, ?, ?, 'repository_read', 1, ?, ?)")
+            .bind(&task).bind(PROJECT_ID).bind(CHARTER_REVISION_ID).bind(NOW).bind(NOW).execute(fixture.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, 'planner', 'agent', ?, ?, ?)")
+            .bind(db::new_uuid_v4()).bind(&task).bind(&worker).bind(NOW).bind(NOW).execute(fixture.db.pool()).await.unwrap();
+        tasks.push(task);
+    }
+    fixture.provider.set_task_service(Arc::new(
+        TaskService::new_for_test(fixture.db.clone(), Arc::new(EventBus::new(32)))
+            .with_workspace_root(temp.path().join("workspaces")),
+    ));
+    (fixture, temp, worker, tasks.remove(0), tasks.remove(0))
+}
+
+async fn recovery_arguments(fixture: &Fixture, task: &str, action: &str, key: &str) -> Value {
+    let version = db::TaskRepo::get_by_id(&*fixture.db, task, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    json!({"operation":"task.action", "payload":{"task_id":task,"action":{"verb":action,"reason":"Repair or cancel this interrupted work"},"version":version},
+        "dedupe_key":key,"correlation_id":key})
+}
+
+#[tokio::test]
+async fn queued_retry_for_paused_worker_does_not_withdraw_cancellation_for_another_task() {
+    let (fixture, _temp, worker, task_a, task_b) = recovery_fixture().await;
+    let (scope, _) = project_chat_session(&fixture).await;
+    let tool = native_tool(&fixture, scope, true, "forge_scope_propose");
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(worker)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let refused = invoke_native(
+        &*tool,
+        recovery_arguments(&fixture, &task_a, "retry", "paused-worker").await,
+        "same-turn",
+        "paused-worker",
+    )
+    .await;
+    assert!(refused.is_error, "paused worker refuses retry: {refused:?}");
+    assert_eq!(refused.value["denied_by"], "target_agent_paused");
+    assert_eq!(refused.value["retry"]["scope"], "turn");
+    assert!(refused.value["details"]["available_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|offer| offer["action"]["verb"] != "retry"));
+    let recovered = invoke_native(
+        &*tool,
+        recovery_arguments(&fixture, &task_b, "cancel", "other-task").await,
+        "same-turn",
+        "other-task",
+    )
+    .await;
+    assert!(!recovered.is_error, "{recovered:?}");
+    assert_eq!(recovered.value["result"]["task_status"], "cancelled");
+}
+
+#[tokio::test]
+async fn queued_retry_for_paused_project_does_not_withdraw_cancellation() {
+    let (fixture, _temp, _worker, task_a, _) = recovery_fixture().await;
+    let (scope, _) = project_chat_session(&fixture).await;
+    let tool = native_tool(&fixture, scope, true, "forge_scope_propose");
+    sqlx::query("UPDATE project SET paused_at = 'now', system_pause_reason = 'environment_not_ready' WHERE id = ?")
+        .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
+    let refused = invoke_native(
+        &*tool,
+        recovery_arguments(&fixture, &task_a, "retry", "paused-project").await,
+        "same-turn",
+        "paused-project",
+    )
+    .await;
+    assert!(
+        refused.is_error,
+        "paused Project refuses retry: {refused:?}"
+    );
+    assert_eq!(
+        refused.value["denied_by"],
+        "project_paused(environment_not_ready)"
+    );
+    assert_eq!(refused.value["retry"]["scope"], "turn");
+    let recovered = invoke_native(
+        &*tool,
+        recovery_arguments(&fixture, &task_a, "cancel", "cancel-paused-task").await,
+        "same-turn",
+        "cancel-paused-task",
+    )
+    .await;
+    assert!(!recovered.is_error, "{recovered:?}");
+    assert_eq!(recovered.value["result"]["task_status"], "cancelled");
 }

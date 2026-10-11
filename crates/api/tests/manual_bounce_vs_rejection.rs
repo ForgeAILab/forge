@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use api::AppState;
-use api_types::RejectGateRequest;
+use api_types::TaskActionRequest;
 use axum::extract::{Json, Path, State};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AssigneeKind, CreateProject,
@@ -19,7 +19,7 @@ use services::{
 async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let service = TaskService::new_for_test(Arc::clone(&db), Arc::clone(&event_bus));
     let api_state = AppState::new(Arc::clone(&db), Arc::clone(&event_bus), false);
 
     let manual_task_id = seed_project_repo_and_task(&db, default_states::IN_PROGRESS).await;
@@ -55,11 +55,13 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     let rejected_review = drive_to_review(&service, &rejected_task_id).await;
     let retries_before_reject = remaining_review_retries(&db, &rejected_task_id).await;
 
-    let Json(rejection) = api::routes::tasks::reject_gate(
+    let Json(rejection) = api::routes::tasks::apply_task_action(
         State(api_state),
-        Path((rejected_task_id.clone(), default_states::REVIEW.to_owned())),
-        Json(RejectGateRequest {
-            reason: "failed CI".to_owned(),
+        Path(rejected_task_id.clone()),
+        Json(TaskActionRequest {
+            action: api_types::TaskAction::SendBack {
+                guidance: "failed CI".to_owned(),
+            },
             version: rejected_review.version,
         }),
     )
@@ -67,8 +69,7 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     .expect("gate reject endpoint succeeds");
 
     assert_eq!(rejection.status, default_states::IN_PROGRESS);
-    let rejection_log =
-        transition_log_for_reason(&db, &rejected_task_id, "gate rejected: failed CI").await;
+    let rejection_log = transition_log_for_reason(&db, &rejected_task_id, "failed CI").await;
     assert_eq!(rejection_log.from_state, default_states::REVIEW);
     assert_eq!(rejection_log.to_state, default_states::IN_PROGRESS);
     assert!(
@@ -77,8 +78,8 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     );
     assert_eq!(
         remaining_review_retries(&db, &rejected_task_id).await,
-        retries_before_reject - 1,
-        "gate rejection should decrement review retry budget"
+        retries_before_reject,
+        "owner gate rejection keeps its audit evidence without spending agent budget"
     );
 }
 
@@ -137,7 +138,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: Some("https://example.com/repo.git".to_owned()),
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -202,8 +202,15 @@ async fn drive_to_review(service: &TaskService, task_id: &str) -> db::Task {
             (1_i64, Some("ready for review".to_owned())),
         )
         .await
-        .expect("in_progress -> review succeeds")
-        .task
+        .expect("in_progress -> review succeeds");
+    // No step worker runs here: settle review's entry hooks the way
+    // production's worker would before the gate offers its decisions.
+    let task = service
+        .drain(task_id)
+        .await
+        .expect("review entry hooks settle");
+    assert_eq!(task.status, default_states::REVIEW);
+    task
 }
 
 async fn remaining_review_retries(db: &SqliteDb, task_id: &str) -> i64 {
@@ -218,14 +225,10 @@ async fn remaining_review_retries(db: &SqliteDb, task_id: &str) -> i64 {
         .as_ref()
         .and_then(|config| config.max_rejections)
         .expect("review retry budget exists");
-    let logs = TransitionLogRepo::list_by_task(db, task_id)
+    let used = db::budget::spent(db.pool(), task_id, db::budget::Kind::Review.key())
         .await
-        .expect("transition logs load");
-    let used = services::task_diagnostics::count_gate_rejections_since_boundary(
-        &logs,
-        default_states::REVIEW,
-    );
-    (i64::from(max_rejections) - used).max(0)
+        .expect("budget ledger loads");
+    db::budget::remaining(i64::from(max_rejections), used)
 }
 
 async fn transition_log_for_reason(db: &SqliteDb, task_id: &str, reason: &str) -> TransitionLog {

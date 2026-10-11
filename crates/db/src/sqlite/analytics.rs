@@ -266,7 +266,6 @@ impl ProjectAnalyticsRepo for SqliteDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WorkMode;
 
     async fn sqlite_db() -> SqliteDb {
         let pool = crate::create_sqlite_pool("sqlite::memory:")
@@ -306,7 +305,6 @@ mod tests {
                 name: "analytics-repo".to_owned(),
                 remote_url: Some("https://example.com/forge-analytics.git".to_owned()),
                 local_path: Some("/tmp/forge-analytics-test-repo".to_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),

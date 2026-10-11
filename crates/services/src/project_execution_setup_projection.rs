@@ -453,12 +453,6 @@ fn repo_response(repo: db::Repo) -> RepoResponse {
         local_path: repo.local_path,
         remote_url: repo.remote_url,
         default_branch: repo.default_branch,
-        work_mode: match repo.work_mode {
-            db::WorkMode::DirectMerge => api_types::WorkMode::DirectMerge,
-            db::WorkMode::PullRequest => api_types::WorkMode::PullRequest,
-        },
-        pr_provider: None,
-        pr_provider_status: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }

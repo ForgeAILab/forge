@@ -40,6 +40,16 @@ pub async fn validate_project_settings(
 ) -> Result<()> {
     let settings: ProjectSettings = serde_json::from_value(settings.clone())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid settings: {error}")))?;
+    if !(1..=86400).contains(&settings.placement.provision_timeout_seconds) {
+        return Err(ServiceError::invalid_operation(
+            "placement.provision_timeout_seconds must be between 1 and 86400",
+        ));
+    }
+    if settings.max_active_tasks > 1000 {
+        return Err(ServiceError::invalid_operation(
+            "max_active_tasks must be between 0 and 1000 (0 means unlimited)",
+        ));
+    }
     let role_names: HashSet<&str> = workflow
         .roles
         .iter()
@@ -155,4 +165,41 @@ pub async fn validate_project_settings(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn provision_timeout_defaults_to_thirty_minutes_and_is_bounded() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let db = SqliteDb::new(pool);
+        let default: ProjectSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.placement.provision_timeout_seconds, 1800);
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        for seconds in [0, 86401] {
+            let result = validate_project_settings(
+                &db,
+                &serde_json::json!({"placement":{"provision_timeout_seconds":seconds}}),
+                &workflow,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result,Err(ServiceError::InvalidOperation{message}) if message.contains("provision_timeout_seconds"))
+            );
+        }
+        for seconds in [1, 1800, 86400] {
+            validate_project_settings(
+                &db,
+                &serde_json::json!({"placement":{"provision_timeout_seconds":seconds}}),
+                &workflow,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
 }

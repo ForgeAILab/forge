@@ -2,6 +2,8 @@ import type { InterruptionMetadata, Task } from '@/types/generated'
 import {
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
+  checkWaitNotice,
+  getTaskWaitNotice,
   getTaskWorkflowWarning,
 } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
@@ -12,6 +14,7 @@ import { productTerm } from '@/lib/i18n'
 // only appears when that summary is absent.
 
 function humanizeBlockingReason(reason: string) {
+  if (reason === 'review_needs_owner') return 'Needs owner'
   const withSpaces = reason.replace(/_/g, ' ')
   return withSpaces.charAt(0).toUpperCase() + withSpaces.slice(1)
 }
@@ -54,12 +57,12 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
   const workflowWarning = getTaskWorkflowWarning(task)
   if (task.status === 'cancelled') return null
 
-  if (task.failed) {
-    return <InterruptionBanner title="Task Failed" metadata={task.failed} tone="failed" />
+  if (task.condition.details.failed && task.condition.details.interruption) {
+    return <InterruptionBanner title="Task Failed" metadata={task.condition.details.interruption} tone="failed" />
   }
 
-  if (task.blocked && !getBlockingAnnotation(task)) {
-    return <InterruptionBanner title="Task Blocked" metadata={task.blocked} tone="blocked" />
+  if (task.condition.details.blocked && task.condition.details.interruption && !getBlockingAnnotation(task)) {
+    return <InterruptionBanner title="Task Blocked" metadata={task.condition.details.interruption} tone="blocked" />
   }
 
   if (staleAnnotation) {
@@ -77,6 +80,36 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
               {staleAnnotation.blocked_execution_id}
             </p>
           ) : null}
+        </div>
+      </section>
+    )
+  }
+
+  const checkNotice = checkWaitNotice(task)
+  if (checkNotice) {
+    return (
+      <section
+        className={
+          checkNotice.needsOwner
+            ? 'rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'
+            : 'rounded-lg border border-border bg-muted/40 p-4 text-foreground'
+        }
+      >
+        <div className="space-y-1.5">
+          <p className="text-sm font-semibold">{checkNotice.title}</p>
+          <p className="text-sm">{checkNotice.message}</p>
+        </div>
+      </section>
+    )
+  }
+
+  const waitNotice = getTaskWaitNotice(task)
+  if (waitNotice) {
+    return (
+      <section className="rounded-lg border border-border bg-muted/40 p-4 text-foreground">
+        <div className="space-y-1.5">
+          <p className="text-sm font-semibold">{waitNotice.title}</p>
+          <p className="text-sm">{waitNotice.message}</p>
         </div>
       </section>
     )

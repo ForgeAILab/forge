@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+pub mod integration;
+#[cfg(all(test, unix))]
+mod process_tests;
+mod remote;
+pub use remote::{normalize_remote_url, redact_remote_credentials};
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("git command failed: {command}\nstdout: {stdout}\nstderr: {stderr}")]
@@ -36,14 +42,7 @@ pub struct BranchList {
 }
 
 async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+    let output = command_output(cwd, args).await?;
 
     if !output.status.success() {
         return Err(GitError::CommandFailed {
@@ -54,6 +53,35 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Raw Git output through the cancellation-owned process group. The caller may
+/// select a deadline or cancel token; dropping this future stops descendants.
+pub async fn command_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    Ok(process_supervisor::output(&mut command).await?)
+}
+
+/// Bounded raw output with the same group ownership as mutating Git commands.
+pub async fn command_output_bounded(
+    cwd: &Path,
+    args: &[&str],
+    limit: usize,
+) -> Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    Ok(process_supervisor::output_bounded(&mut command, Some(limit)).await?)
 }
 
 pub async fn is_git_repo(path: &Path) -> bool {
@@ -114,18 +142,175 @@ pub async fn create_worktree(
 }
 
 /// Remove a worktree.
+///
+/// A tree that holds read-only directories (a Go module cache, a vendored
+/// dependency tree) cannot be unlinked by Git, which then drops the
+/// registration and leaves the directory behind. For a path that was a
+/// linked worktree of `repo_path`, the tree is made owner-writable and the
+/// removal is finished, so one read-only directory does not make every later
+/// attempt fail the same way. Any other path keeps Git's own error: a path
+/// Git does not list as a linked worktree, the main working tree, and a
+/// symbolic link are never chmod-ed or deleted here.
 pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
-    run_git(
-        repo_path,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            &worktree_path.to_string_lossy(),
-        ],
-    )
-    .await?;
-    Ok(())
+    let path = worktree_path.to_string_lossy();
+    let args = ["worktree", "remove", "--force", path.as_ref()];
+    // Git resolves a link and removes the worktree it points at; the caller
+    // named the link, not that worktree.
+    let is_link = tokio::fs::symlink_metadata(worktree_path)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if is_link {
+        return Err(GitError::CommandFailed {
+            command: format!("git {}", args.join(" ")),
+            stdout: String::new(),
+            stderr: "worktree path is a symbolic link".to_owned(),
+        });
+    }
+    let was_registered = worktree_is_registered(repo_path, worktree_path).await;
+    let Err(error) = run_git(repo_path, &args).await else {
+        return Ok(());
+    };
+    let is_real_directory = tokio::fs::symlink_metadata(worktree_path)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir());
+    if !was_registered || !is_real_directory {
+        return Err(error);
+    }
+    // Best effort: the removal below reports whatever is still wrong.
+    let _ = make_tree_owner_writable(worktree_path).await;
+    if worktree_is_registered(repo_path, worktree_path).await {
+        run_git(repo_path, &args).await?;
+    }
+    match tokio::fs::remove_dir_all(worktree_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn worktree_is_registered(repo_path: &Path, worktree_path: &Path) -> bool {
+    let Ok(listed) = run_git(repo_path, &["worktree", "list", "--porcelain"]).await else {
+        return false;
+    };
+    let canonical = tokio::fs::canonicalize(worktree_path).await.ok();
+    listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        // The first entry is the main working tree (or the bare repository).
+        .skip(1)
+        .map(Path::new)
+        .any(|path| path == worktree_path || Some(path) == canonical.as_deref())
+}
+
+/// Give the owner full access (`u+rwx`) to every directory under `root`, so
+/// the tree can be deleted. On Unix a file's own mode does not matter for
+/// removing it, so files are never changed; elsewhere the read-only flag of
+/// files is cleared too.
+///
+/// Symbolic links are never followed and never changed: a link that points
+/// out of `root` leaves its target untouched. A `root` that is itself a link,
+/// or does not exist, is left alone. On Unix the mode is changed through a
+/// handle that is first checked to be the directory that was inspected, so an
+/// entry swapped for a link in between is refused, not followed. The walk
+/// itself goes by path: a process that still writes into the tree can redirect
+/// it by replacing a directory it has already been through, so callers run
+/// this only on a tree no execution is using. A directory its owner cannot
+/// read is reported and left. The walk continues past entries it cannot change
+/// and returns the first error it met.
+pub async fn make_tree_owner_writable(root: &Path) -> std::io::Result<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || make_tree_owner_writable_blocking(&root))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn make_tree_owner_writable_blocking(root: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let mut first_error = None;
+    let mut keep = |result: std::io::Result<()>| {
+        if let Err(error) = result {
+            if error.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    };
+    let mut pending = vec![(root.to_path_buf(), metadata)];
+    while let Some((path, metadata)) = pending.pop() {
+        // A directory must be writable and searchable before it is read. One
+        // that could not be repaired (it changed underneath, or its owner
+        // cannot read it) is not entered.
+        let granted = grant_owner_write(&path, &metadata);
+        let skip = granted.is_err() || !metadata.is_dir();
+        keep(granted);
+        if skip {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                keep(Err(error));
+                continue;
+            }
+        };
+        for entry in entries {
+            // `DirEntry::metadata` does not traverse symbolic links.
+            let child = match entry.and_then(|entry| Ok((entry.path(), entry.metadata()?))) {
+                Ok(child) => child,
+                Err(error) => {
+                    keep(Err(error));
+                    continue;
+                }
+            };
+            if !child.1.file_type().is_symlink() {
+                pending.push(child);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(unix)]
+fn grant_owner_write(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let mode = metadata.permissions().mode();
+    let wanted = mode | 0o700;
+    if wanted == mode {
+        return Ok(());
+    }
+    // `chmod` by path follows a link put there after `metadata` was read.
+    // Change the mode through a handle, and only when the handle is the
+    // directory that was inspected.
+    let directory = std::fs::File::open(path)?;
+    let opened = directory.metadata()?;
+    if !opened.is_dir() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(std::io::Error::other(format!(
+            "{} changed while its permissions were being repaired",
+            path.display()
+        )));
+    }
+    directory.set_permissions(std::fs::Permissions::from_mode(wanted))
+}
+
+#[cfg(not(unix))]
+fn grant_owner_write(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    let mut permissions = metadata.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)
 }
 
 /// Get the current HEAD SHA.
@@ -246,14 +431,14 @@ pub async fn abort_merge(worktree_path: &Path) -> Result<()> {
 pub async fn detect_interrupted_merge(worktree_path: &Path) -> Result<bool> {
     // For worktrees, .git is a file pointing to the actual git dir.
     // Check via git rev-parse instead.
-    let result = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--verify", "MERGE_HEAD"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let result = process_supervisor::output(&mut command).await?;
     Ok(result.status.success())
 }
 
@@ -408,15 +593,15 @@ pub async fn continue_rebase_keeping_conflicts(worktree_path: &Path) -> Result<V
                 });
             }
             run_git(worktree_path, &["add", "-A"]).await?;
-            let output = Command::new("git")
+            let mut command = Command::new("git");
+            command
                 .args(["-c", "core.editor=true", "rebase", "--continue"])
                 .current_dir(worktree_path)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE")
-                .env("GIT_EDITOR", "true")
-                .output()
-                .await?;
+                .env("GIT_EDITOR", "true");
+            let output = process_supervisor::output(&mut command).await?;
             let continued = if output.status.success() {
                 Ok(())
             } else {
@@ -565,14 +750,14 @@ fn diff_destination_path(header: &str) -> Option<String> {
 
 /// Detect if a rebase is in progress via `git rev-parse`.
 pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
-    let result = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--git-path", "rebase-merge"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let result = process_supervisor::output(&mut command).await?;
     if result.status.success() {
         let git_path = String::from_utf8_lossy(&result.stdout).trim().to_string();
         let abs = if Path::new(&git_path).is_absolute() {
@@ -585,14 +770,14 @@ pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
         }
     }
 
-    let result = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--git-path", "rebase-apply"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let result = process_supervisor::output(&mut command).await?;
     if result.status.success() {
         let git_path = String::from_utf8_lossy(&result.stdout).trim().to_string();
         let abs = if Path::new(&git_path).is_absolute() {
@@ -634,14 +819,14 @@ pub async fn detect_conflict_state(worktree_path: &Path) -> Result<ConflictOpera
 
 /// List paths with unresolved conflicts.
 pub async fn conflict_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let output = process_supervisor::output(&mut command).await?;
 
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -906,6 +1091,119 @@ mod tests {
         assert!(!repo_path.join("reviewer.tmp").exists());
         assert!(!repo_path.join("leftover.tmp").exists());
         assert!(is_worktree_clean(&repo_path).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_worktree_reclaims_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, repo_path) = setup_repo().await;
+        let worktree = dir.path().join("wt-read-only");
+        create_worktree(&repo_path, "read-only", &worktree)
+            .await
+            .unwrap();
+        let cache = worktree.join("pkg/mod");
+        fs::create_dir_all(&cache).await.unwrap();
+        fs::write(cache.join("module.go"), "package module\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(
+            cache.join("module.go"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(worktree.join("pkg"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        remove_worktree(&repo_path, &worktree).await.unwrap();
+
+        assert!(!worktree.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_worktree_never_finishes_the_main_working_tree_or_a_link() {
+        let (dir, repo_path) = setup_repo().await;
+        fs::write(repo_path.join("uncommitted"), "mine")
+            .await
+            .unwrap();
+
+        // The main working tree is listed by Git, and is not a linked worktree.
+        remove_worktree(&repo_path, &repo_path).await.unwrap_err();
+        assert_eq!(
+            fs::read_to_string(repo_path.join("uncommitted"))
+                .await
+                .unwrap(),
+            "mine"
+        );
+        assert!(repo_path.join(".git").exists());
+
+        // A link to a registered worktree is not that worktree.
+        let worktree = dir.path().join("wt-linked");
+        create_worktree(&repo_path, "linked", &worktree)
+            .await
+            .unwrap();
+        fs::write(worktree.join("uncommitted"), "mine")
+            .await
+            .unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&worktree, &link).unwrap();
+        remove_worktree(&repo_path, &link).await.unwrap_err();
+        assert!(fs::symlink_metadata(&link).await.is_ok());
+        assert_eq!(
+            fs::read_to_string(worktree.join("uncommitted"))
+                .await
+                .unwrap(),
+            "mine"
+        );
+        let listed = run_git(&repo_path, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(listed.contains("wt-linked"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn make_tree_owner_writable_never_follows_links_out_of_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).await.unwrap();
+        fs::write(outside.join("kept"), "kept").await.unwrap();
+        std::fs::set_permissions(outside.join("kept"), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("locked")).await.unwrap();
+        fs::write(root.join("locked/file"), "file").await.unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("locked/escape")).unwrap();
+        std::fs::set_permissions(
+            root.join("locked/file"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        make_tree_owner_writable(&root).await.unwrap();
+        // A second pass over an already writable tree, and a missing root.
+        make_tree_owner_writable(&root).await.unwrap();
+        make_tree_owner_writable(&dir.path().join("missing"))
+            .await
+            .unwrap();
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.join("locked")), 0o700);
+        // A file's mode does not stop its removal, so it is left as it was.
+        assert_eq!(mode(&root.join("locked/file")), 0o400);
+        assert_eq!(mode(&outside), 0o500);
+        assert_eq!(mode(&outside.join("kept")), 0o400);
+        fs::remove_dir_all(&root).await.unwrap();
+        assert!(outside.join("kept").exists());
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[tokio::test]

@@ -1,5 +1,11 @@
+pub const DEFAULT_CHECK_RUN_TIMEOUT_SECONDS: u32 = 1800;
+
+pub const DEFAULT_USAGE_INDEX_BUDGET_MB: u32 = 128;
+
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:0";
+pub const DEFAULT_EVENT_CONSUMER_STALL_SECONDS: u32 = 300;
 pub const DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS: u64 = 86_400;
+pub const DEFAULT_MAX_DISCONNECT_SECONDS: u64 = 86_400;
 pub const DEFAULT_AGENT_MAX_CONCURRENT_TASKS: u32 = 1;
 pub const DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 pub const DEFAULT_AGENT_MAX_MISSED_HEARTBEATS: u32 = 3;
@@ -10,3 +16,10 @@ pub const DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES: u64 = 104_857_600;
 /// Charter carries a scaffold. Pinned so a Project's first commit is
 /// reproducible; `bunx` resolves it, so `bun` is the only host dependency.
 pub const DEFAULT_SCAFFOLD_COMMAND: &str = "bunx @forgeailab/create-spark@0.4.5";
+/// Logs of a terminal Task are deleted after this many days.
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
+/// Free-space floor of the workspace root's filesystem: the larger of these.
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const DEFAULT_MIN_FREE_PERCENT: u8 = 5;
+/// Inode floor of the same filesystem, in percent of its inodes.
+pub const DEFAULT_MIN_FREE_INODE_PERCENT: u8 = 5;

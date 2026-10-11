@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NewSubtaskInput {
     pub title: String,
     pub description: Option<String>,
@@ -12,6 +13,16 @@ impl TaskService {
         parent_task_id: String,
         items: Vec<NewSubtaskInput>,
     ) -> Result<Vec<Task>> {
+        if !db::task_writer::owns_task(&parent_task_id) {
+            return self
+                .request_task_command(
+                    &parent_task_id,
+                    "create_subtasks",
+                    serde_json::json!([parent_task_id, items]),
+                    false,
+                )
+                .await;
+        }
         validate_required("parent_task_id", &parent_task_id)?;
         let parent = TaskRepo::get_by_id(&*self.db, &parent_task_id, false)
             .await?
@@ -19,6 +30,9 @@ impl TaskService {
         if parent.parent_task_id.is_some() {
             return Err(ServiceError::nested_subtask_unsupported());
         }
+        let (_, parent_workflow) =
+            crate::task_hierarchy::coordination_root_context(&self.db, &parent.id).await?;
+        crate::task_hierarchy::ensure_parent_accepts_subtasks(&parent, &parent_workflow)?;
         if !ExecutionRepo::list_running_by_task(&*self.db, &parent.id)
             .await?
             .is_empty()
@@ -68,31 +82,10 @@ impl TaskService {
                 .workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
         );
-        let implementation_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == crate::workflow::default_states::IN_PROGRESS)
-            .and_then(crate::workflow::effective_role)
-            .or_else(|| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.kind == api_types::StateKind::Active)
-                    .and_then(crate::workflow::effective_role)
-            });
-        let aggregate_review_roles = workflow
-            .states
-            .iter()
-            .filter(|state| {
-                state.kind == api_types::StateKind::Gate
-                    && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-            })
-            .filter_map(|state| state.role.as_deref())
-            .filter(|role| Some(*role) != implementation_role)
-            .collect::<std::collections::HashSet<_>>();
+        let root_role_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
         let mut current_parent = result.source_task.clone();
         for assignment in TaskRoleAssignmentRepo::list_by_task(&*self.db, &parent.id).await? {
-            if !aggregate_review_roles.contains(assignment.role_name.as_str()) {
+            if !root_role_policy.allows_assignment(&assignment.role_name) {
                 current_parent = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
                     &*self.db,
                     &assignment,

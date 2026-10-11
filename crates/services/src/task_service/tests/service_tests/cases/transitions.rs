@@ -258,6 +258,7 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
         )
         .await
         .expect("complete plan allows work stop");
+    let result = crate::test_support::drain_transition(&service, result).await;
 
     assert_eq!(result.task.status, crate::workflow::default_states::MERGING);
 }
@@ -299,7 +300,14 @@ async fn transition_to_review_runs_configured_review_runner() {
             .await
             .expect("workspace loads")
             .expect("workspace exists");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("temp worktree creates");
+    std::fs::create_dir_all(
+        service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("temp worktree creates");
     // Review reviews a finished attempt: the claimed execution is the
     // candidate, and it has to be terminal before the Task can enter review.
     sqlx::query("UPDATE execution SET status = 'completed', stopped_at = ? WHERE id = ?")
@@ -321,6 +329,7 @@ async fn transition_to_review_runs_configured_review_runner() {
         )
         .await
         .expect("task enters review and review runs");
+    let result = crate::test_support::drain_transition(&service, result).await;
 
     assert_eq!(
         result.task.status,
@@ -331,117 +340,6 @@ async fn transition_to_review_runs_configured_review_runner() {
     assert_eq!(
         result.review.as_ref().map(|review| review.status.clone()),
         Some(ReviewStatus::Passed)
-    );
-}
-
-#[tokio::test]
-async fn is_awaiting_human_stays_false_while_review_entry_barrier_is_running() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
-    let now = now_rfc3339();
-    let execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id),
-            role: default_roles::CODER.to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("completed coder execution creates");
-    ReviewRepo::create(
-        &*db,
-        db::CreateReview {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            execution_id: execution.id,
-            attempt_number: 1,
-            status: ReviewStatus::AwaitingHuman,
-            step_results_json: json!({ "ci_steps": [] }).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("awaiting_human review creates");
-
-    assert!(
-        service
-            .is_awaiting_human(task.id.clone())
-            .await
-            .expect("awaiting human resolves"),
-        "a settled review gate with an awaiting_human review is ready for a decision"
-    );
-
-    // Mirror the engine: a transition into review is persisted behind a running
-    // entry barrier while the blocking before_enter hooks execute, and the
-    // review record can already read awaiting_human before that barrier clears.
-    let running = TaskRepo::set_entry_barrier(
-        &*db,
-        &task.id,
-        task.version,
-        Some(
-            json!({
-                "state": "review",
-                "status": "running",
-                "started_at": now,
-            })
-            .to_string(),
-        ),
-        &now_rfc3339(),
-    )
-    .await
-    .expect("running entry barrier sets");
-    assert!(
-        !service
-            .is_task_awaiting_human(&running)
-            .await
-            .expect("awaiting human resolves"),
-        "the gate is not ready for a decision while its entry barrier is still running"
-    );
-
-    let cleared =
-        TaskRepo::set_entry_barrier(&*db, &task.id, running.version, None, &now_rfc3339())
-            .await
-            .expect("entry barrier clears");
-    assert_eq!(cleared.version, running.version + 1);
-    assert!(
-        !service
-            .is_task_awaiting_human(&running)
-            .await
-            .expect("stale snapshot readiness resolves"),
-        "a stale running-barrier snapshot must not be paired with readiness from a newer version"
-    );
-    assert!(
-        service
-            .is_task_awaiting_human(&cleared)
-            .await
-            .expect("awaiting human resolves"),
-        "the gate becomes ready once the entry barrier has cleared"
     );
 }
 
@@ -470,10 +368,19 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
         .await
         .unwrap()
         .unwrap();
-    let workspace = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
-        .await
-        .unwrap();
-    let worktree_path = std::path::Path::new(&workspace.worktree_path);
+    let workspace = prepare_workspace(
+        &db,
+        workspace_root.path(),
+        &task,
+        &task.id,
+        None,
+        &service.workspace_backend_router(),
+    )
+    .await
+    .unwrap();
+    let worktree_path_buf =
+        std::path::PathBuf::from(workspace.embedded_worktree_path_for_backend());
+    let worktree_path = worktree_path_buf.as_path();
     std::fs::write(
         worktree_path.join("candidate.txt"),
         "preserved candidate branch\n",
@@ -552,4 +459,135 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
     assert_eq!(recovered.id, workspace.id);
     assert_eq!(recovered.branch, workspace.branch);
     assert_eq!(git::get_current_sha(worktree_path).await.unwrap(), sha);
+}
+
+// While the current entry's hook step (CI, before-work scripts, dispatch) is
+// pending or running, the latest Review may be a stale one from an earlier
+// entry. Readiness and owner offers wait for the step, as they did for the
+// running entry barrier.
+#[tokio::test]
+async fn readiness_and_offers_wait_while_review_entry_hooks_run() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
+    crate::task_service::tests::helpers::seed_role_assignment(
+        &db,
+        &task.id,
+        "coder",
+        Some(&agent_id),
+    )
+    .await;
+    crate::task_service::tests::helpers::seed_role_assignment(
+        &db,
+        &task.id,
+        "reviewer",
+        Some(&agent_id),
+    )
+    .await;
+    let now = now_rfc3339();
+    let execution = crate::task_service::tests::helpers::seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        "coder",
+        ExecutionStatus::Completed,
+        Some("session"),
+        &now,
+    )
+    .await;
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: execution.id,
+            attempt_number: 1,
+            status: ReviewStatus::AwaitingHuman,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("stale review creates");
+    let actor = api_types::Actor::user(api_types::UserActionSource::Test);
+    let offers = |snapshot: &crate::TaskSnapshot| {
+        crate::available_actions(snapshot)
+            .into_iter()
+            .map(|offer| offer.action.verb().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(service.is_awaiting_human(&task.id).await.unwrap());
+    let settled = offers(
+        &service
+            .task_action_snapshot(&task.id, &actor)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        settled.iter().any(|verb| verb != "cancel"),
+        "a settled gate offers decisions: {settled:?}"
+    );
+
+    // The entry's hook step is queued behind CI.
+    let step_id = db::TaskStepRepo::enqueue_step(
+        &*db,
+        &db::EnqueueTaskStep {
+            kind: "hooks".into(),
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: "review-entry".into(),
+            chain_id: new_uuid_v4(),
+            chain_position: 1,
+            expected_status: "review".into(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "long".into(),
+            available_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !service.is_awaiting_human(&task.id).await.unwrap(),
+        "a stale Review is not a decision point while entry checks run"
+    );
+    let running = offers(
+        &service
+            .task_action_snapshot(&task.id, &actor)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        running.iter().all(|verb| verb == "cancel"),
+        "only cancellation while entry checks run: {running:?}"
+    );
+
+    // A hooks row of an earlier entry does not hold the current one.
+    sqlx::query("UPDATE task_step SET expected_epoch = expected_epoch - 1 WHERE id = ?")
+        .bind(&step_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
+    assert!(service.is_awaiting_human(&task.id).await.unwrap());
+    sqlx::query(
+        "UPDATE task_step SET expected_epoch = expected_epoch + 1, status = 'done' WHERE id = ?",
+    )
+    .bind(&step_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
+    assert!(service.is_awaiting_human(&task.id).await.unwrap());
 }

@@ -2,8 +2,9 @@ use crate::{
     default_data_dir, default_workspace_root, error::ConfigError,
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND,
-    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
+    DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT, DEFAULT_MIN_FREE_PERCENT,
+    DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -109,6 +110,26 @@ pub struct ForgePaths {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Passive stage-A setting; no execution reads this deadline yet.
+    #[serde(default = "default_check_run_timeout_seconds")]
+    pub check_run_timeout_seconds: u32,
+    #[serde(default = "default_main_working_set_target_tokens")]
+    pub main_working_set_target_tokens: u32,
+    #[serde(default = "default_main_working_set_hard_tokens")]
+    pub main_working_set_hard_tokens: u32,
+    #[serde(default = "default_project_working_set_target_tokens")]
+    pub project_working_set_target_tokens: u32,
+    #[serde(default = "default_project_working_set_hard_tokens")]
+    pub project_working_set_hard_tokens: u32,
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
+    #[serde(default)]
+    pub build_jobs_per_run: Option<u32>,
+    #[serde(default = "crate::default_run_nice")]
+    pub run_nice: u32,
+    /// Observation index budget in MiB; unset uses 128, zero disables indexing.
+    #[serde(default)]
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -121,12 +142,47 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
     #[serde(default = "default_media_upload_limit_bytes")]
     pub media_upload_limit_bytes: u64,
+    #[serde(default = "default_event_consumer_stall_seconds")]
+    pub event_consumer_stall_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
+    /// Whether the operator chose `root` (config file, `FORGE_WORKSPACE_ROOT`
+    /// or an override) rather than taking the default. A chosen root that
+    /// differs from the one the database recorded is a deliberate move; a
+    /// default never is.
+    #[serde(skip)]
+    pub root_explicit: bool,
     pub cleanup_delay_seconds: u64,
+    #[serde(default = "default_max_disconnect_seconds")]
+    pub max_disconnect_seconds: u64,
+    /// Days the logs of a terminal Task are kept under
+    /// `<root>/.forge/logs/<project>/<task>`. `0` keeps them forever.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// Free-space floor of the workspace root's filesystem: below the larger
+    /// of `min_free_bytes` and `min_free_percent` the sweep evicts the build
+    /// output of idle Tasks, least recently used first, and no new worktree
+    /// or check checkout starts on the machine.
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: u64,
+    #[serde(default = "default_min_free_percent")]
+    pub min_free_percent: u8,
+    /// The same floor for inodes, in percent of the filesystem's inodes.
+    /// `0` turns it off.
+    #[serde(default = "default_min_free_inode_percent")]
+    pub min_free_inode_percent: u8,
+    /// Free space under which the garbage collector runs at once instead of
+    /// on its timer: the larger of the two. Unset: twice the floor.
+    #[serde(default)]
+    pub gc_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub gc_free_percent: Option<u8>,
+    /// Opt-in shared compiler cache; off while `wrapper` is unset.
+    #[serde(default)]
+    pub compiler_cache: crate::CompilerCacheConfig,
 }
 
 /// Repository scaffolding run by Genesis provisioning when the approved
@@ -235,12 +291,18 @@ pub struct ProjectSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOverrides {
+    pub server_check_run_timeout_seconds: Option<u32>,
+    pub server_max_concurrent_runs: Option<u32>,
+    pub server_build_jobs_per_run: Option<u32>,
+    pub server_run_nice: Option<u32>,
+    pub server_usage_index_budget_mb: Option<u32>,
     pub server_bind: Option<String>,
     pub server_public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
     pub data_dir: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub workspace_cleanup_delay_seconds: Option<u64>,
+    pub workspace_max_disconnect_seconds: Option<u64>,
     pub agent_max_concurrent_tasks: Option<u32>,
     pub agent_heartbeat_interval_seconds: Option<u64>,
     pub agent_max_missed_heartbeats: Option<u32>,
@@ -248,6 +310,7 @@ pub struct ConfigOverrides {
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
     pub media_upload_limit_bytes: Option<u64>,
+    pub event_consumer_stall_seconds: Option<u32>,
 }
 
 impl ForgeConfig {
@@ -337,6 +400,64 @@ impl ForgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, target, hard) in [
+            (
+                "main",
+                self.server.main_working_set_target_tokens,
+                self.server.main_working_set_hard_tokens,
+            ),
+            (
+                "project",
+                self.server.project_working_set_target_tokens,
+                self.server.project_working_set_hard_tokens,
+            ),
+        ] {
+            if target == 0 || target > hard {
+                return Err(ConfigError::InvalidConfig {
+                    message: format!("server.{name}_working_set requires 0 < target <= hard"),
+                });
+            }
+        }
+
+        if self.server.check_run_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.check_run_timeout_seconds must be positive".to_owned(),
+            });
+        }
+        if self.server.run_nice > 19 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.run_nice must be between 0 and 19".to_owned(),
+            });
+        }
+        if self.server.event_consumer_stall_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.event_consumer_stall_seconds must be positive".to_owned(),
+            });
+        }
+        if self.workspace.min_free_percent > 100 {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.min_free_percent must be between 0 and 100".to_owned(),
+            });
+        }
+        if self.workspace.min_free_inode_percent > 100 {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.min_free_inode_percent must be between 0 and 100".to_owned(),
+            });
+        }
+        if self
+            .workspace
+            .gc_free_percent
+            .is_some_and(|percent| percent > 100)
+        {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.gc_free_percent must be between 0 and 100".to_owned(),
+            });
+        }
+        if self.workspace.max_disconnect_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.max_disconnect_seconds must be positive".to_owned(),
+            });
+        }
         self.terminal.validate()?;
         self.public_search.validate()?;
         self.providers.validate()
@@ -350,11 +471,28 @@ impl ForgeConfig {
 
 impl Default for ForgeConfig {
     fn default() -> Self {
+        Self::with_data_dir(default_data_dir())
+    }
+}
+
+impl ForgeConfig {
+    /// Construct defaults with an explicit data root, without resolving the user's directory.
+    #[must_use]
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             forge: ForgePaths {
-                data_dir: default_data_dir(),
+                data_dir: data_dir.clone(),
             },
             server: ServerConfig {
+                check_run_timeout_seconds: default_check_run_timeout_seconds(),
+                main_working_set_target_tokens: 48000,
+                main_working_set_hard_tokens: 64000,
+                project_working_set_target_tokens: 96000,
+                project_working_set_hard_tokens: 128000,
+                max_concurrent_runs: None,
+                build_jobs_per_run: None,
+                run_nice: crate::default_run_nice(),
+                usage_index_budget_mb: None,
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
                 mcp_enabled: true,
@@ -362,10 +500,20 @@ impl Default for ForgeConfig {
                 bcrypt_cost: DEFAULT_BCRYPT_COST,
                 cors_origins: vec![DEFAULT_CORS_ORIGIN.to_owned()],
                 media_upload_limit_bytes: DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
+                event_consumer_stall_seconds: default_event_consumer_stall_seconds(),
             },
             workspace: WorkspaceConfig {
-                root: default_workspace_root(),
+                root: default_workspace_root(&data_dir),
+                root_explicit: false,
                 cleanup_delay_seconds: DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+                max_disconnect_seconds: DEFAULT_MAX_DISCONNECT_SECONDS,
+                log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
+                min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+                min_free_percent: DEFAULT_MIN_FREE_PERCENT,
+                min_free_inode_percent: DEFAULT_MIN_FREE_INODE_PERCENT,
+                gc_free_bytes: None,
+                gc_free_percent: None,
+                compiler_cache: crate::CompilerCacheConfig::default(),
             },
             agent: AgentDefaults {
                 max_concurrent_tasks: DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
@@ -549,8 +697,49 @@ fn default_media_upload_limit_bytes() -> u64 {
     DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES
 }
 
+fn default_max_disconnect_seconds() -> u64 {
+    DEFAULT_MAX_DISCONNECT_SECONDS
+}
+
+fn default_log_retention_days() -> u32 {
+    DEFAULT_LOG_RETENTION_DAYS
+}
+
+fn default_min_free_bytes() -> u64 {
+    DEFAULT_MIN_FREE_BYTES
+}
+
+fn default_min_free_percent() -> u8 {
+    DEFAULT_MIN_FREE_PERCENT
+}
+
+fn default_min_free_inode_percent() -> u8 {
+    DEFAULT_MIN_FREE_INODE_PERCENT
+}
+
 fn parse_trusted_origin(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     let origin = url.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+fn default_event_consumer_stall_seconds() -> u32 {
+    crate::DEFAULT_EVENT_CONSUMER_STALL_SECONDS
+}
+
+fn default_main_working_set_target_tokens() -> u32 {
+    48000
+}
+fn default_main_working_set_hard_tokens() -> u32 {
+    64000
+}
+fn default_project_working_set_target_tokens() -> u32 {
+    96000
+}
+fn default_project_working_set_hard_tokens() -> u32 {
+    128000
+}
+
+fn default_check_run_timeout_seconds() -> u32 {
+    crate::DEFAULT_CHECK_RUN_TIMEOUT_SECONDS
 }

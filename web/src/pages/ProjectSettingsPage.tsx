@@ -35,10 +35,12 @@ import { ErrorBanner } from '@/components/error-banner'
 import { McpInstallControls } from '@/components/mcp-install-controls'
 import { AnalyticsTab } from '@/components/settings/AnalyticsTab'
 import { DangerTab } from '@/components/settings/DangerTab'
+import { ProjectEnvironmentReadiness } from '@/components/settings/ProjectEnvironmentReadiness'
 import { EnvironmentTab } from '@/components/settings/EnvironmentTab'
 import {
   parseEnvironmentText,
   useProjectEnvironmentText,
+  usePlacementProvision,
 } from '@/components/settings/environment-utils'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
@@ -95,6 +97,8 @@ interface ProjectFormState {
   defaultRoleSelections: Record<string, string>
   automaticRecoveryEnabled: boolean
   automaticRecoveryAgentId: string
+  maxActiveTasks: string
+  environmentRecheckMinutes: string
 }
 
 const EMPTY_PROJECT_FORM: ProjectFormState = {
@@ -104,6 +108,8 @@ const EMPTY_PROJECT_FORM: ProjectFormState = {
   defaultRoleSelections: {},
   automaticRecoveryEnabled: false,
   automaticRecoveryAgentId: '',
+  maxActiveTasks: '5',
+  environmentRecheckMinutes: '10',
 }
 
 function mergeProjectForm(
@@ -142,11 +148,32 @@ export function ProjectSettingsPage({
     defaultRoleSelections,
     automaticRecoveryEnabled,
     automaticRecoveryAgentId,
+    maxActiveTasks,
+    environmentRecheckMinutes,
   } = form
   const project = projectQuery.data
   const roles = workflowQuery.data?.roles ?? []
   const agents = agentsQuery.data?.items ?? []
   const [environmentText, setEnvironmentText] = useProjectEnvironmentText(project?.settings)
+  const [provision, setProvision] = usePlacementProvision(project?.settings)
+  const [projectSaveError, setProjectSaveError] = useState<string | null>(null)
+  const [environmentSaveError, setEnvironmentSaveError] = useState<string | null>(null)
+  const activeLimit = Number(maxActiveTasks)
+  const activeLimitError =
+    !maxActiveTasks.trim() ||
+    !Number.isInteger(activeLimit) ||
+    activeLimit < 0 ||
+    activeLimit > 1000
+      ? 'Active task limit must be an integer from 0 to 1000.'
+      : null
+  const recheckMinutes = Number(environmentRecheckMinutes)
+  const recheckIntervalError =
+    !environmentRecheckMinutes.trim() ||
+    !Number.isFinite(recheckMinutes) ||
+    recheckMinutes < 1 ||
+    recheckMinutes > 1440
+      ? 'Environment re-check interval must be from 1 to 1440 minutes.'
+      : null
 
   useEffect(() => {
     if (!project) return
@@ -168,6 +195,9 @@ export function ProjectSettingsPage({
       const rawRecovery = isRecord(project.settings?.automatic_recovery)
         ? project.settings.automatic_recovery
         : {}
+      const rawEnvironment = isRecord(project.settings?.environment)
+        ? project.settings.environment
+        : {}
       updateForm({
         name: project.name,
         ciSteps: ciStepsFromReviewConfig(project.default_review_config),
@@ -176,13 +206,19 @@ export function ProjectSettingsPage({
         automaticRecoveryEnabled: rawRecovery.enabled === true,
         automaticRecoveryAgentId:
           typeof rawRecovery.agent_id === 'string' ? rawRecovery.agent_id : '',
+        maxActiveTasks: String(project.settings?.max_active_tasks ?? 5),
+        environmentRecheckMinutes: String(
+          Number(rawEnvironment.recheck_interval_seconds ?? 600) / 60,
+        ),
       })
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [project])
+  }, [project?.id, project?.version])
 
   const saveProject = () => {
     if (!project || updateProject.isPending) return
+    if (activeLimitError) return
+    setProjectSaveError(null)
     const nextName = name.trim()
     if (!nextName) {
       toast.error('Project name is required')
@@ -234,6 +270,7 @@ export function ProjectSettingsPage({
     )
     const nextSettings: Record<string, unknown> = {
       ...settingsWithoutRolePrompts,
+      max_active_tasks: activeLimit,
       default_role_assignments: defaultRoleAssignmentsList,
       lifecycle_hooks: lifecycleHooks,
       automatic_recovery: {
@@ -256,7 +293,11 @@ export function ProjectSettingsPage({
         },
       },
       {
-        onError: (error) => toast.error(settingsErrorMessage(error, 'Project update failed')),
+        onError: (error) => {
+          const message = settingsErrorMessage(error, 'Project update failed')
+          setProjectSaveError(message)
+          if (initialTab !== 'general') toast.error(message)
+        },
         onSuccess: () => toast.success('Project settings saved'),
       },
     )
@@ -264,6 +305,8 @@ export function ProjectSettingsPage({
 
   const saveEnvironment = () => {
     if (!project || updateProject.isPending) return
+    if (recheckIntervalError) return
+    setEnvironmentSaveError(null)
     const environment = parseEnvironmentText(environmentText)
     if (!environment.ok) {
       toast.error(environment.error)
@@ -276,12 +319,17 @@ export function ProjectSettingsPage({
           version: project.version,
           settings: {
             ...(isRecord(project.settings) ? project.settings : {}),
-            environment: environment.value ?? { env: {}, assets: [], checks: [] },
+            placement: { ...(isRecord(project.settings?.placement) ? project.settings.placement : {}), provision },
+            environment: {
+              ...(environment.value ?? { env: {}, assets: [], checks: [] }),
+              recheck_interval_seconds: Math.round(recheckMinutes * 60),
+            },
           },
         },
       },
       {
-        onError: (error) => toast.error(settingsErrorMessage(error, 'Environment update failed')),
+        onError: (error) =>
+          setEnvironmentSaveError(settingsErrorMessage(error, 'Environment update failed')),
         onSuccess: () => toast.success('Project environment saved'),
       },
     )
@@ -378,6 +426,13 @@ export function ProjectSettingsPage({
               agentsIsError={agentsQuery.isError}
               automaticRecoveryEnabled={automaticRecoveryEnabled}
               automaticRecoveryAgentId={automaticRecoveryAgentId}
+              maxActiveTasks={maxActiveTasks}
+              activeLimitError={activeLimitError}
+              saveError={projectSaveError}
+              onMaxActiveTasksChange={(maxActiveTasks) => {
+                updateForm({ maxActiveTasks })
+                setProjectSaveError(null)
+              }}
               onNameChange={(name) => updateForm({ name })}
               onTogglePaused={toggleProjectPaused}
               onCiStepsChange={(ciSteps) => updateForm({ ciSteps })}
@@ -414,14 +469,34 @@ export function ProjectSettingsPage({
           )}
 
           {initialTab === 'environment' && (
-            <EnvironmentTab
-              projectIsLoading={projectQuery.isLoading}
-              canSave={Boolean(project)}
-              isSaving={updateProject.isPending}
-              environmentText={environmentText}
-              onEnvironmentTextChange={setEnvironmentText}
-              onSave={saveEnvironment}
-            />
+            <div>
+              <ProjectEnvironmentReadiness
+                projectId={projectId}
+                rows={project?.environment_readiness ?? []}
+                hasRepository={Boolean(project?.primary_repo_id)}
+                isLoading={projectQuery.isLoading}
+              />
+              <EnvironmentTab
+                projectIsLoading={projectQuery.isLoading}
+                canSave={Boolean(project)}
+                isSaving={updateProject.isPending}
+                environmentText={environmentText}
+                provision={provision}
+                onProvisionChange={setProvision}
+                recheckMinutes={environmentRecheckMinutes}
+                recheckIntervalError={recheckIntervalError}
+                saveError={environmentSaveError}
+                onRecheckMinutesChange={(environmentRecheckMinutes) => {
+                  updateForm({ environmentRecheckMinutes })
+                  setEnvironmentSaveError(null)
+                }}
+                onEnvironmentTextChange={(text) => {
+                  setEnvironmentText(text)
+                  setEnvironmentSaveError(null)
+                }}
+                onSave={saveEnvironment}
+              />
+            </div>
           )}
 
           {initialTab === 'analytics' && <AnalyticsTab projectId={projectId} />}
@@ -545,9 +620,6 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
         name: nextForm.name.trim() || null,
         local_path: nextForm.source_mode === 'local' ? localPath : null,
         default_branch: nextForm.default_branch.trim() || 'main',
-        work_mode: nextForm.work_mode,
-        pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-        pr_provider_config: null,
       },
       {
         onError: (error) => toast.error(settingsErrorMessage(error, 'Repository creation failed')),

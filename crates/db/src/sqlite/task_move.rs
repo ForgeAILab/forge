@@ -52,11 +52,12 @@ impl TaskBoardRepo for SqliteDb {
 
     async fn compare_and_move_task(
         &self,
-        input: CompareAndMoveTask,
+        mut input: CompareAndMoveTask,
     ) -> Result<MoveTaskPersistence> {
         validate_move_input(&input)?;
         let request_hash = normalized_request(&input)?;
         let mut tx = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
 
         let reserved = sqlx::query(
             "INSERT INTO task_move_operation (operation_id, project_id, task_id, request_hash, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'processing', ?, ?) ON CONFLICT(operation_id) DO NOTHING",
@@ -139,6 +140,9 @@ impl TaskBoardRepo for SqliteDb {
                 "task belongs to a different project".to_owned(),
             ));
         }
+        if crate::task_writer::owns_task(&input.task_id) {
+            input.task_version = task.version;
+        }
         if task.version != input.task_version {
             return Err(DbError::TaskVersionConflict {
                 expected: input.task_version,
@@ -207,7 +211,59 @@ impl TaskBoardRepo for SqliteDb {
                 actual,
             });
         }
+        // The same single writer the cancel transition uses: a board move
+        // into the cancellation state flags the Task's attempt here, or
+        // waits behind the protected result step. Nothing is written when
+        // the Task has no attempt.
+        if input.integration_cancel
+            && task.status != input.target_status
+            && crate::request_task_integration_cancel_in_tx(
+                &mut tx,
+                &input.task_id,
+                &input.updated_at,
+            )
+            .await?
+                == crate::TaskIntegrationCancel::Protected
+        {
+            let pending_steps: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_step WHERE task_id=? AND status IN ('pending','claimed')",
+            )
+            .bind(&input.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            return Err(DbError::TaskBusy {
+                pending_steps,
+                retry_after_ms: 250,
+            });
+        }
 
+        let transition_input = CreateTransitionLog {
+            id: input.transition_log_id.clone(),
+            task_id: input.task_id.clone(),
+            from_state: task.status.clone(),
+            to_state: input.target_status.clone(),
+            trigger_name: input.trigger_name.clone(),
+            triggered_by: input.triggered_by.display(),
+            bridge: input.bridge.clone(),
+            trigger_reason: input.trigger_reason.clone(),
+            hook_results_json: None,
+            rejection: input.rejection,
+            created_at: input.updated_at.clone(),
+        };
+        if input.entry_barrier_json.is_none() {
+            crate::budget::fresh_entry(&mut tx, &input.task_id, &input.transition_log_id).await?;
+        }
+        insert_transition_log(&mut tx, &transition_input, input.triggered_by.is_owner()).await?;
+        if let Some(step) = &input.post_commit_step {
+            crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
+        }
+        // State the entry after its receipt and hooks step exist, even for a
+        // same-status reorder.
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Entry)
+            .await?;
+        // Read the Task only now: the returned Task and the interruption
+        // event both state the condition this move produced, never the one
+        // stored before the block was cleared.
         let updated_task_row =
             sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
                 .bind(&input.task_id)
@@ -218,20 +274,6 @@ impl TaskBoardRepo for SqliteDb {
             let interruption_event = CreateDomainEvent::task_interruption_changed(&updated_task);
             DomainEventRepo::append_event_in_tx(self, &mut tx, &interruption_event).await?;
         }
-
-        let transition_input = CreateTransitionLog {
-            id: input.transition_log_id.clone(),
-            task_id: input.task_id.clone(),
-            from_state: task.status.clone(),
-            to_state: input.target_status.clone(),
-            trigger_name: input.trigger_name.clone(),
-            triggered_by: input.triggered_by.clone(),
-            trigger_reason: input.trigger_reason.clone(),
-            hook_results_json: None,
-            rejection: input.rejection,
-            created_at: input.updated_at.clone(),
-        };
-        insert_transition_log(&mut tx, &transition_input).await?;
         let transition_event = CreateDomainEvent::task_transition(
             transition_input.id.clone(),
             transition_input.task_id.clone(),
@@ -283,6 +325,7 @@ impl TaskBoardRepo for SqliteDb {
                 to_state: transition_input.to_state,
                 trigger_name: transition_input.trigger_name,
                 triggered_by: transition_input.triggered_by,
+                bridge: transition_input.bridge,
                 trigger_reason: transition_input.trigger_reason,
                 hook_results_json: None,
                 rejection: transition_input.rejection,
@@ -504,9 +547,22 @@ async fn renormalize_positions(
 async fn insert_transition_log(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreateTransitionLog,
+    owner: bool,
 ) -> Result<()> {
+    // Runs after the move's status update: record the epoch it entered.
+    crate::budget::transition(
+        tx,
+        &input.task_id,
+        &input.from_state,
+        owner,
+        &input.bridge,
+        input.rejection,
+        &input.id,
+        None,
+    )
+    .await?;
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -518,6 +574,9 @@ async fn insert_transition_log(
     .bind(input.hook_results_json.as_deref())
     .bind(if input.rejection { 1_i64 } else { 0_i64 })
     .bind(&input.created_at)
+    .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+    .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
+    .bind(&input.task_id)
     .execute(&mut **tx)
     .await?;
     Ok(())

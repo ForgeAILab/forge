@@ -136,7 +136,8 @@ impl CodingExecutorAdapter for OpencodeAdapter {
         };
 
         let mut cmd = Self::build_command(&config, &prompt);
-        crate::command::run_in_task_worktree(&mut cmd, &ctx);
+        // Owns the execution's temp directory until this execution returns.
+        let _run_scope = crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
         let mut child = cmd.spawn()?;
 
@@ -729,7 +730,37 @@ fn executable_in_path(name: &str) -> bool {
 }
 
 fn detect_opencode_availability() -> AvailabilityInfo {
-    if let Some(auth_path) = opencode_auth_path()
+    availability_from_indicators(
+        opencode_auth_path(),
+        || {
+            let config_file = first_existing_path(opencode_config_file_candidates());
+
+            let config_dir = opencode_config_dir().filter(|p| p.exists());
+            let data_dir = opencode_data_dir().filter(|p| p.exists());
+            let state_dir = opencode_state_dir().filter(|p| p.exists());
+            let custom_config_dir = env_path("OPENCODE_CONFIG_DIR").filter(|p| p.exists());
+            let home_opencode = dirs::home_dir()
+                .map(|home| home.join(".opencode"))
+                .filter(|p| p.exists());
+
+            config_file
+                .clone()
+                .or(config_dir)
+                .or(data_dir)
+                .or(state_dir)
+                .or(custom_config_dir)
+                .or(home_opencode)
+        },
+        || executable_in_path("opencode"),
+    )
+}
+
+fn availability_from_indicators(
+    auth_path: Option<PathBuf>,
+    installation_indicator: impl FnOnce() -> Option<PathBuf>,
+    binary_exists: impl FnOnce() -> bool,
+) -> AvailabilityInfo {
+    if let Some(auth_path) = auth_path
         && auth_path.exists()
     {
         return AvailabilityInfo {
@@ -739,25 +770,7 @@ fn detect_opencode_availability() -> AvailabilityInfo {
         };
     }
 
-    let config_file = first_existing_path(opencode_config_file_candidates());
-
-    let config_dir = opencode_config_dir().filter(|p| p.exists());
-    let data_dir = opencode_data_dir().filter(|p| p.exists());
-    let state_dir = opencode_state_dir().filter(|p| p.exists());
-    let custom_config_dir = env_path("OPENCODE_CONFIG_DIR").filter(|p| p.exists());
-    let home_opencode = dirs::home_dir()
-        .map(|home| home.join(".opencode"))
-        .filter(|p| p.exists());
-
-    let installation_indicator = config_file
-        .clone()
-        .or(config_dir)
-        .or(data_dir)
-        .or(state_dir)
-        .or(custom_config_dir)
-        .or(home_opencode);
-
-    if let Some(path) = installation_indicator {
+    if let Some(path) = installation_indicator() {
         return AvailabilityInfo {
             status: AvailabilityStatus::Installed,
             authenticated_at: None,
@@ -765,7 +778,7 @@ fn detect_opencode_availability() -> AvailabilityInfo {
         };
     }
 
-    if executable_in_path("opencode") {
+    if binary_exists() {
         return AvailabilityInfo {
             status: AvailabilityStatus::Installed,
             authenticated_at: None,
@@ -859,12 +872,42 @@ mod tests {
 
     #[test]
     fn detect_reports_not_found_when_no_indicators_present() {
-        let info = detect_opencode_availability();
-        match info.status {
-            AvailabilityStatus::Authenticated
-            | AvailabilityStatus::Installed
-            | AvailabilityStatus::NotFound => {}
-        }
+        let info = availability_from_indicators(None, || None, || false);
+        assert!(matches!(info.status, AvailabilityStatus::NotFound));
+        assert!(info.config_path.is_none());
+        assert!(info.authenticated_at.is_none());
+    }
+
+    #[test]
+    fn availability_prioritizes_fixture_auth_and_installation_indicators() {
+        let home = tempfile::tempdir().unwrap();
+        let auth = home.path().join("auth.json");
+        std::fs::write(&auth, "{}").unwrap();
+        let info = availability_from_indicators(
+            Some(auth.clone()),
+            || panic!("authenticated adapter must not probe installation"),
+            || panic!("authenticated adapter must not look up a binary"),
+        );
+        assert!(matches!(info.status, AvailabilityStatus::Authenticated));
+        assert_eq!(info.config_path, Some(auth.to_string_lossy().into_owned()));
+        assert!(info.authenticated_at.is_some());
+
+        let info = availability_from_indicators(
+            None,
+            || Some(home.path().to_path_buf()),
+            || panic!("installation indicator must precede binary lookup"),
+        );
+        assert!(matches!(info.status, AvailabilityStatus::Installed));
+        assert_eq!(
+            info.config_path,
+            Some(home.path().to_string_lossy().into_owned())
+        );
+        assert!(info.authenticated_at.is_none());
+
+        let info = availability_from_indicators(None, || None, || true);
+        assert!(matches!(info.status, AvailabilityStatus::Installed));
+        assert!(info.config_path.is_none());
+        assert!(info.authenticated_at.is_none());
     }
 
     #[test]

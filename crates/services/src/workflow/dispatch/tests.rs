@@ -33,6 +33,7 @@ fn execution_input_preserves_role_contract_and_user_request() {
 
 fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
     db::Task {
+        condition: Default::default(),
         id: id.to_string(),
         project_id: "project-1".to_string(),
         parent_task_id: None,
@@ -193,6 +194,9 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             // turns narrating instead of verifying.
             assert!(!prompt.system.contains(FAILURE_TAXONOMY_LINE));
             assert!(!prompt.system.contains("Before acting, restate objective"));
+            assert!(prompt
+                .system
+                .contains("owner-only or repeated findings may park for the owner"));
             continue;
         }
         assert!(
@@ -357,6 +361,7 @@ fn coder_prompt_merge_failed_follow_up_contains_rereview_directive() {
     ctx.continuation_of_execution_id = Some("parent-exec".to_string());
     ctx.task.review_passed_at = Some("2026-04-17T10:00:00Z".to_string());
     ctx.task.error_annotation = Some(json!({"type": "merge_conflict"}).to_string());
+    ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
 
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
 
@@ -381,10 +386,10 @@ fn merge_fix_prompts_hand_a_committed_conflict_to_the_worker() {
         to_state: default_states::MERGE_FAILED.to_owned(),
         trigger_name: None,
         triggered_by: "system:workflow".to_owned(),
-        trigger_reason: format!(
-            "{} rebased onto main; conflicts were committed with markers in: src/pkg/__init__.py, uv.lock",
-            crate::workflow::CONFLICT_HANDOFF_MARKER
-        ),
+        bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ConflictHandoff),
+        trigger_reason:
+            "rebased onto main; conflicts were committed with markers in: src/pkg/__init__.py, uv.lock"
+                .to_owned(),
         hook_results_json: None,
         rejection: true,
         created_at: "2026-09-22T10:00:00Z".to_owned(),
@@ -396,6 +401,7 @@ fn merge_fix_prompts_hand_a_committed_conflict_to_the_worker() {
         let mut ctx = fake_context(role);
         ctx.state_name = default_states::MERGE_FAILED.to_string();
         ctx.task.error_annotation = Some(json!({"type": "merge_conflict"}).to_string());
+        ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
         ctx.transition_log = vec![handoff.clone()];
 
         let prompt = resolve_prompt_builder(builder_id).build(&ctx);
@@ -446,6 +452,7 @@ fn coder_prompt_dirty_worktree_does_not_rebase_or_discard_changes() {
         })
         .to_string(),
     );
+    ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
 
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
 
@@ -627,6 +634,23 @@ fn planner_prompt_includes_parent_task_context() {
     assert!(prompt
         .user
         .contains("Parent description for planning context."));
+}
+
+#[test]
+fn planner_layout_guidance_is_shared_by_native_and_outbox_delivery() {
+    const RULE: &str = forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE;
+    for delivery in [TaskDelivery::NativeTools, TaskDelivery::Outbox] {
+        let mut ctx = fake_context(default_roles::PLANNER);
+        ctx.delivery = delivery;
+        let prompt = PlannerPromptBuilder.build(&ctx);
+        assert_eq!(prompt.system.matches(RULE).count(), 1);
+        assert!(prompt.system.contains("For sub-task planning:"));
+        assert!(prompt.user.contains("owned repository-relative paths"));
+        assert!(
+            !prompt.user.contains(RULE),
+            "doctrine is paid for once per run"
+        );
+    }
 }
 
 #[test]
@@ -852,7 +876,6 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
             name: "repo".to_owned(),
             remote_url: Some("https://example.com/repo.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1006,13 +1029,16 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         .expect("assessment persists");
 
     let context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
-        db.clone(),
-        &task.id,
-        default_roles::CODER,
-        default_states::IN_PROGRESS,
-        json!({}),
-        None,
-        &crate::workflow::default_workflow::default_workflow(),
+        crate::workflow::dispatch::loader::DispatchContextParams {
+            db: db.clone(),
+            router: &crate::diff::embedded_read_router_for_test(db.clone()),
+            task_id: &task.id,
+            role: default_roles::CODER,
+            state_name: default_states::IN_PROGRESS,
+            state_config: json!({}),
+            execution_policy: None,
+            workflow: &crate::workflow::default_workflow::default_workflow(),
+        },
     )
     .await
     .expect("dispatch context loads");

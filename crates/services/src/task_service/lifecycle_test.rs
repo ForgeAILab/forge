@@ -54,17 +54,17 @@ impl TaskService {
             &task,
             &task.id,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
         )
         .await?;
-        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await?;
-        let repo_path = repo
-            .and_then(|repo| repo.local_path)
-            .unwrap_or_else(|| workspace.worktree_path.clone());
-        let log_dir = std::env::temp_dir()
-            .join("forge")
-            .join("logs")
-            .join(&task.id)
-            .join("hooks");
+        let resolved = self.resolve_task_workspace(&workspace).await?;
+        let (repo_path, worktree_path) =
+            crate::lifecycle::context::workspace_context_paths(&self.db, &resolved).await?;
+        let log_dir = crate::task_service::logs::task_hook_logs_dir(
+            &self.workspace_root,
+            &task.project_id,
+            &task.id,
+        );
         let hook_ctx = LifecycleHookContext {
             env: crate::lifecycle::project_env(&project.settings),
             event,
@@ -75,14 +75,19 @@ impl TaskService {
             project_id: project.id,
             project_name: project.name,
             repo_path,
-            worktree_path: Some(workspace.worktree_path),
+            worktree_path: Some(worktree_path),
             agent_id: None,
             execution_id: None,
             log_dir: Some(log_dir),
         };
-        let run =
-            LifecycleHookRunner::test_script_hook(&hook_ctx, hook_index, command, timeout_seconds)
-                .await;
+        let run = LifecycleHookRunner::test_workspace_script_hook(
+            &hook_ctx,
+            hook_index,
+            command,
+            timeout_seconds,
+            &resolved,
+        )
+        .await?;
 
         Ok(api_types::LifecycleHookTestResponse {
             status: run.status,

@@ -21,7 +21,8 @@ use tokio::{
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const DEFAULT_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(10);
+/// How long `cancel` waits after SIGTERM before it SIGKILLs the process group.
+pub const DEFAULT_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct ShellExecutor {
@@ -118,6 +119,18 @@ impl TaskExecutor for ShellExecutor {
         for (key, value) in &plan.env_set {
             command.env(key, value);
         }
+        // Held until this execution returns: success, failure or cancel.
+        let run_scope = crate::sandbox::SandboxEnv::for_run(
+            std::path::Path::new(&ctx.worktree_path),
+            &ctx.execution_id,
+            crate::sandbox::RunPurpose::Execution,
+        )
+        .scoped();
+        crate::run_process::apply_sandboxed(
+            &mut command,
+            &crate::environment::task_environment(&ctx.agent_config),
+            run_scope.env(),
+        );
         configure_process_group(&mut command);
 
         let mut child = match command.spawn() {

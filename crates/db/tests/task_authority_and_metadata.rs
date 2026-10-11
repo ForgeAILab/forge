@@ -1,7 +1,7 @@
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
     CreateTask, CreateTaskRoleAssignment, DbError, ProjectRepo, RepoRepo, SqliteDb,
-    TaskMetadataMutation, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateRepo, WorkMode,
+    TaskMetadataMutation, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateRepo,
 };
 use serde_json::json;
 
@@ -9,6 +9,20 @@ async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
     SqliteDb::new(pool)
+}
+
+async fn settle_queued_wake(db: &SqliteDb, task_id: &str) {
+    db.run_task_mutation::<db::Task>(
+        task_id,
+        db::TaskMutation::TaskMutateMetadata {
+            id: task_id.to_owned(),
+            expected_version: None,
+            mutations: Vec::new(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("published per-Task wake settles under its lease");
 }
 
 async fn task(db: &SqliteDb, project_id: &str, task_id: &str, updated_at: &str) {
@@ -218,6 +232,7 @@ async fn project_wake_clears_dispatch_markers_atomically_but_keeps_pause_marker(
     let changed = TaskRepo::wake_dispatch_for_project(&db, &project_id, &now_rfc3339())
         .await
         .expect("project wake commits");
+    settle_queued_wake(&db, &task_id).await;
     assert_eq!(changed, 1);
     let current = TaskRepo::get_by_id(&db, &task_id, false)
         .await
@@ -386,6 +401,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     )
     .await
     .expect("settings update and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_settings = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads")
@@ -440,6 +456,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     )
     .await
     .expect("workflow update and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_workflow = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after workflow")
@@ -458,6 +475,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     ProjectRepo::set_paused_at(&db, &project_id, Some("2026-09-12T00:04:00Z".to_owned()))
         .await
         .expect("pause and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_pause = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after pause")
@@ -472,6 +490,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     ProjectRepo::set_paused_at(&db, &project_id, None)
         .await
         .expect("resume and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_resume = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after resume")
@@ -492,7 +511,6 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         name: "stale".to_owned(),
         remote_url: Some("https://example.test/stale.git".to_owned()),
         local_path: None,
-        work_mode: WorkMode::DirectMerge,
         default_branch: "main".to_owned(),
         created_at: "2026-09-12T00:05:00Z".to_owned(),
         updated_at: "2026-09-12T00:05:00Z".to_owned(),
@@ -501,7 +519,6 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     let stale_repo_result = RepoRepo::create_primary_for_project(
         &db,
         stale_repo,
-        None,
         project_after_workflow.version - 1,
         "2026-09-12T00:05:00Z".to_owned(),
     )
@@ -534,17 +551,16 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
             name: "primary".to_owned(),
             remote_url: Some("https://example.test/primary.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: "2026-09-12T00:06:00Z".to_owned(),
             updated_at: "2026-09-12T00:06:00Z".to_owned(),
         },
-        None,
         project_before_repo.version,
         "2026-09-12T00:06:00Z".to_owned(),
     )
     .await
     .expect("primary repo and link commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_repo_create = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after repo create")
@@ -563,13 +579,13 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
             name: Some("renamed".to_owned()),
             local_path: None,
             remote_url: None,
-            work_mode: None,
             default_branch: None,
             updated_at: "2026-09-12T00:07:00Z".to_owned(),
         },
     )
     .await
     .expect("repo update and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_repo_update = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after repo update")
@@ -588,6 +604,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     RepoRepo::delete(&db, &repo.id)
         .await
         .expect("repo delete and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let project_after_repo_delete = ProjectRepo::get_by_id(&db, &project_id)
         .await
         .expect("project reloads after repo delete")
@@ -841,4 +858,90 @@ async fn metadata_increment_and_compare_mutate_are_atomic_and_conditional() {
     .expect("stale marker clear is a no-op");
     assert_eq!(no_op.updated_at, cleared.updated_at);
     assert_eq!(no_op.metadata_json, cleared.metadata_json);
+}
+
+#[tokio::test]
+async fn latest_execution_claim_accepts_a_child_running_under_the_inherited_root_worker() {
+    let db = database().await;
+    let project_id = new_uuid_v4();
+    let root_id = new_uuid_v4();
+    let child_id = new_uuid_v4();
+    let standalone_id = new_uuid_v4();
+    let time = "2026-09-30T00:00:00Z";
+    project(&db, &project_id, time).await;
+    task(&db, &project_id, &root_id, time).await;
+    task(&db, &project_id, &child_id, time).await;
+    task(&db, &project_id, &standalone_id, time).await;
+    sqlx::query("UPDATE task SET parent_task_id = ?, status = 'in_progress' WHERE id = ?")
+        .bind(&root_id)
+        .bind(&child_id)
+        .execute(db.pool())
+        .await
+        .expect("child links to root");
+    TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: root_id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some("agent-root-worker".to_owned()),
+            created_at: time.to_owned(),
+            updated_at: time.to_owned(),
+        },
+    )
+    .await
+    .expect("root default worker assigns");
+
+    let project_version = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .version;
+    let completed_at = "2026-09-30T00:05:00Z";
+    let mut claims = Vec::new();
+    for task_id in [&child_id, &standalone_id] {
+        let execution_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO execution (id, task_id, role, status, created_at, updated_at)
+             VALUES (?, ?, 'coder', 'completed', ?, ?)",
+        )
+        .bind(&execution_id)
+        .bind(task_id)
+        .bind(time)
+        .bind(completed_at)
+        .execute(db.pool())
+        .await
+        .expect("execution seeds");
+        let task = TaskRepo::get_by_id(&db, task_id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        claims.push(
+            TaskRepo::claim_metadata_for_latest_execution(
+                &db,
+                db::LatestExecutionMetadataClaim {
+                    task_id: task_id.clone(),
+                    expected_task_version: task.version,
+                    authority: db::LatestExecutionAuthority {
+                        execution_id,
+                        role: "coder".to_owned(),
+                        agent_id: Some("agent-root-worker".to_owned()),
+                        execution_updated_at: completed_at.to_owned(),
+                        expected_project_version: project_version,
+                    },
+                    key: "plan_publication_claim".to_owned(),
+                    value: json!({"claimed": true}),
+                    updated_at: completed_at.to_owned(),
+                },
+            )
+            .await,
+        );
+    }
+
+    // The child has no coder of its own; the root's default worker admitted
+    // it, so its completed attempt keeps authority through settlement.
+    assert!(claims[0].is_ok(), "child claim failed: {:?}", claims[0]);
+    // A standalone Task has no inherited authority to fall back on.
+    assert!(matches!(claims[1], Err(DbError::VersionConflict)));
 }

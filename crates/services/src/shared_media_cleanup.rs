@@ -40,18 +40,8 @@ impl SharedMediaCleanupScheduler {
         }
     }
 
-    pub fn with_batch_size(mut self, batch_size: i64) -> Self {
-        self.batch_size = batch_size.clamp(1, 500);
-        self
-    }
-
     pub fn with_lease_owner(mut self, lease_owner: impl Into<String>) -> Self {
         self.lease_owner = lease_owner.into();
-        self
-    }
-
-    pub fn with_lease_seconds(mut self, lease_seconds: i64) -> Self {
-        self.lease_seconds = lease_seconds.max(1);
         self
     }
 
@@ -59,26 +49,23 @@ impl SharedMediaCleanupScheduler {
         &self.media_root
     }
 
-    pub fn spawn(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            if let Err(error) = self.cleanup_now().await {
-                warn!(%error, "shared media startup reconciliation failed");
-            }
-            let mut ticker = interval(TICK_INTERVAL);
-            // Tokio intervals tick immediately. Consume that initial tick so
-            // startup reconciliation is followed by a full interval rather
-            // than performing the same work twice in a row.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        if let Err(error) = self.cleanup_now().await {
-                            warn!(%error, "shared media cleanup tick failed");
-                        }
-                    }
-                    result = shutdown_rx.changed() => {
-                        if result.is_err() || *shutdown_rx.borrow() {
-                            break;
+    pub fn spawn(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        workers.worker("shared-media-cleanup").start(shutdown, || false, move |worker, mut shutdown_rx| {
+            let scheduler = Arc::clone(&self);
+            async move {
+                if let Err(error) = worker.tick(scheduler.cleanup_now()).await { warn!(worker = worker.name(), %error, "shared media startup reconciliation failed"); }
+                let mut ticker = interval(TICK_INTERVAL);
+                // Start the original Burst interval AFTER startup reconciliation.
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => { if let Err(error) = worker.tick(scheduler.cleanup_now()).await { warn!(worker = worker.name(), %error, "shared media cleanup tick failed"); } }
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() { return Ok(()); }
                         }
                     }
                 }

@@ -1,3 +1,139 @@
+/// Durable classification of a mechanical transition or accepted gate action.
+/// Human reason text is never an input to this classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TransitionBridgeKind {
+    ReviewRefresh,
+    TargetMovedRebase,
+    ConflictHandoff,
+    RetryWindowReset,
+    Recovery,
+    GateSkipped,
+    GateApproved,
+    GateRejected,
+    CiOnlyReviewPassed,
+    ReviewCarry,
+}
+
+impl TransitionBridgeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewRefresh => "review_refresh",
+            Self::TargetMovedRebase => "target_moved_rebase",
+            Self::ConflictHandoff => "conflict_handoff",
+            Self::RetryWindowReset => "retry_window_reset",
+            Self::Recovery => "recovery",
+            Self::GateSkipped => "gate_skipped",
+            Self::GateApproved => "gate_approved",
+            Self::GateRejected => "gate_rejected",
+            Self::CiOnlyReviewPassed => "ci_only_review_passed",
+            Self::ReviewCarry => "review_carry",
+        }
+    }
+    pub const fn is_review_refresh(self) -> bool {
+        matches!(self, Self::ReviewRefresh | Self::TargetMovedRebase)
+    }
+    pub const fn is_mechanical(self) -> bool {
+        matches!(
+            self,
+            Self::ReviewRefresh | Self::TargetMovedRebase | Self::ConflictHandoff
+        )
+    }
+}
+
+impl std::str::FromStr for TransitionBridgeKind {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "review_refresh" => Ok(Self::ReviewRefresh),
+            "target_moved_rebase" => Ok(Self::TargetMovedRebase),
+            "conflict_handoff" => Ok(Self::ConflictHandoff),
+            "retry_window_reset" => Ok(Self::RetryWindowReset),
+            "recovery" => Ok(Self::Recovery),
+            "gate_skipped" => Ok(Self::GateSkipped),
+            "gate_approved" => Ok(Self::GateApproved),
+            "gate_rejected" => Ok(Self::GateRejected),
+            "ci_only_review_passed" => Ok(Self::CiOnlyReviewPassed),
+            "review_carry" => Ok(Self::ReviewCarry),
+            _ => Err(format!("unknown transition bridge kind: {value}")),
+        }
+    }
+}
+
+/// Structured companion to audit prose; flattened in persisted command inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TransitionBridge {
+    pub bridge_kind: Option<TransitionBridgeKind>,
+    #[ts(type = "unknown | null")]
+    pub bridge_payload: Option<serde_json::Value>,
+}
+
+impl TransitionBridge {
+    pub fn new(kind: TransitionBridgeKind) -> Self {
+        Self {
+            bridge_kind: Some(kind),
+            bridge_payload: None,
+        }
+    }
+    pub fn conflict_handoff(paths: &[String]) -> Self {
+        Self {
+            bridge_kind: Some(TransitionBridgeKind::ConflictHandoff),
+            bridge_payload: Some(serde_json::json!({"paths": paths})),
+        }
+    }
+    pub fn recovery(verb: &str, reset: bool) -> Self {
+        Self {
+            bridge_kind: Some(if reset {
+                TransitionBridgeKind::RetryWindowReset
+            } else {
+                TransitionBridgeKind::Recovery
+            }),
+            bridge_payload: Some(serde_json::json!({"verb": verb})),
+        }
+    }
+    pub fn is_review_refresh(&self) -> bool {
+        self.bridge_kind
+            .is_some_and(TransitionBridgeKind::is_review_refresh)
+    }
+    pub fn is_mechanical(&self) -> bool {
+        self.bridge_kind
+            .is_some_and(TransitionBridgeKind::is_mechanical)
+    }
+    pub fn conflict_paths(&self) -> Option<Vec<String>> {
+        if self.bridge_kind != Some(TransitionBridgeKind::ConflictHandoff) {
+            return None;
+        }
+        serde_json::from_value(self.bridge_payload.as_ref()?.get("paths")?.clone()).ok()
+    }
+}
+
+/// Execution purpose is independent of mutable summary/prompt text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExecutionPurpose {
+    AutomaticReviewRecovery,
+}
+impl ExecutionPurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomaticReviewRecovery => "automatic_review_recovery",
+        }
+    }
+}
+
+impl std::str::FromStr for ExecutionPurpose {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "automatic_review_recovery" => Ok(Self::AutomaticReviewRecovery),
+            _ => Err(format!("unknown execution purpose: {value}")),
+        }
+    }
+}
+
 use crate::assignee::AssigneeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -93,6 +229,9 @@ pub type LifecycleHooks = std::collections::HashMap<LifecycleEvent, Vec<Lifecycl
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub struct ProjectSettings {
+    /// Maximum unparked Tasks in active/gate states; 0 disables the limit.
+    #[serde(default = "default_max_active_tasks")]
+    pub max_active_tasks: u32,
     #[serde(default)]
     pub retry_budgets: RetryBudgets,
     #[serde(default)]
@@ -103,6 +242,54 @@ pub struct ProjectSettings {
     pub automatic_recovery: AutomaticRecoverySettings,
     #[serde(default)]
     pub environment: ProjectEnvironment,
+    #[serde(default)]
+    pub placement: ProjectPlacementSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PlacementProvision {
+    #[default]
+    WhenVerified,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectPlacementSettings {
+    #[serde(default)]
+    pub provision: PlacementProvision,
+    #[serde(default = "default_provision_timeout_seconds")]
+    #[ts(type = "number")]
+    pub provision_timeout_seconds: u64,
+}
+
+/// Total clone/fetch budget; 1–86400 seconds, default 30 minutes.
+pub fn default_provision_timeout_seconds() -> u64 {
+    1800
+}
+impl Default for ProjectPlacementSettings {
+    fn default() -> Self {
+        Self {
+            provision: PlacementProvision::default(),
+            provision_timeout_seconds: default_provision_timeout_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EnvironmentCheckScope {
+    #[default]
+    Workspace,
+    Machine,
+}
+
+fn default_max_active_tasks() -> u32 {
+    5
 }
 
 fn default_environment_check_timeout() -> u64 {
@@ -115,9 +302,9 @@ fn default_environment_check_timeout() -> u64 {
 /// Forge applies it immediately before an execution launches: `env` is set on
 /// the executor process (and on review steps and lifecycle hooks), `assets`
 /// are copied into the worktree, and the `checks` for the execution's role
-/// must pass or the Task is parked as `environment_not_ready` without
+/// must pass or the Project is paused as `environment_not_ready` without
 /// spending an agent run.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export)]
 pub struct ProjectEnvironment {
@@ -127,6 +314,24 @@ pub struct ProjectEnvironment {
     pub assets: Vec<EnvironmentAsset>,
     #[serde(default)]
     pub checks: Vec<EnvironmentCheck>,
+    /// Seconds between automatic re-checks while environment-paused (60–86400).
+    #[serde(default = "default_environment_recheck_interval")]
+    pub recheck_interval_seconds: u64,
+}
+
+fn default_environment_recheck_interval() -> u64 {
+    600
+}
+
+impl Default for ProjectEnvironment {
+    fn default() -> Self {
+        Self {
+            env: BTreeMap::new(),
+            assets: Vec::new(),
+            checks: Vec::new(),
+            recheck_interval_seconds: default_environment_recheck_interval(),
+        }
+    }
 }
 
 impl ProjectEnvironment {
@@ -155,6 +360,8 @@ pub struct EnvironmentAsset {
 pub struct EnvironmentCheck {
     pub name: String,
     pub command: String,
+    #[serde(default)]
+    pub scope: EnvironmentCheckScope,
     /// Execution roles the check gates (`coder`, `reviewer`, ...). Empty
     /// gates every role.
     #[serde(default)]
@@ -187,6 +394,7 @@ pub struct LifecycleHookTestResponse {
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
+            max_active_tasks: default_max_active_tasks(),
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),
                 merge_fix: Some(default_merge_fix_retry_budget()),
@@ -196,6 +404,7 @@ impl Default for ProjectSettings {
             lifecycle_hooks: std::collections::HashMap::new(),
             automatic_recovery: AutomaticRecoverySettings::default(),
             environment: ProjectEnvironment::default(),
+            placement: ProjectPlacementSettings::default(),
         }
     }
 }
@@ -714,10 +923,47 @@ fn canonical_phase_for_legacy_state_name(name: &str) -> Option<CanonicalPhase> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn environment_scope_and_provision_defaults_and_validation() {
+        let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"cargo --version"}]}})).unwrap();
+        assert!(<super::ProjectPlacementSettings as ts_rs::TS>::decl()
+            .contains("provision_timeout_seconds: number"));
+        assert_eq!(
+            settings.environment.checks[0].scope,
+            super::EnvironmentCheckScope::Workspace
+        );
+        assert_eq!(
+            settings.placement.provision,
+            super::PlacementProvision::WhenVerified
+        );
+        for invalid in [
+            serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"true","scope":"host"}]}}),
+            serde_json::json!({"placement":{"provision":"always"}}),
+        ] {
+            assert!(serde_json::from_value::<super::ProjectSettings>(invalid).is_err());
+        }
+    }
+
     use super::{
         CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition,
         WorkflowTrigger, WorkflowTriggerDefinition,
     };
+
+    #[test]
+    fn project_settings_default_active_task_limit() {
+        let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({
+            "default_review_config": {"ci_steps": []},
+            "environment": {"env": {"TOKEN": "value"}}
+        }))
+        .expect("stored settings without a limit deserialize");
+        assert_eq!(settings.max_active_tasks, 5);
+        assert_eq!(super::ProjectSettings::default().max_active_tasks, 5);
+
+        let unlimited: super::ProjectSettings =
+            serde_json::from_value(serde_json::json!({"max_active_tasks": 0}))
+                .expect("unlimited settings deserialize");
+        assert_eq!(unlimited.max_active_tasks, 0);
+    }
 
     fn state(name: &str, kind: StateKind) -> StateDefinition {
         StateDefinition {
@@ -914,6 +1160,9 @@ pub struct InitialRoleAssignment {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct TransitionLogEntry {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub bridge: TransitionBridge,
     pub id: String,
     pub task_id: String,
     pub from_state: String,

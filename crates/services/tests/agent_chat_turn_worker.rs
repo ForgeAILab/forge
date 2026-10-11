@@ -569,3 +569,482 @@ async fn retry_reuses_frozen_runner_job_after_profile_and_binding_edits() {
     );
     assert_eq!(completed.profile_id.as_deref(), Some(PROFILE_ID));
 }
+
+struct TypedFailureRunner {
+    failure: api_types::TurnFailure,
+    calls: AtomicUsize,
+    admission_calls: AtomicUsize,
+    pre_provider: bool,
+}
+
+#[async_trait]
+impl AgentChatTurnRunner for TypedFailureRunner {
+    async fn validate_provider_availability(&self, _: &AgentChatTurnJob) -> services::Result<()> {
+        self.admission_calls.fetch_add(1, Ordering::SeqCst);
+        if self.pre_provider {
+            Err(ServiceError::Conflict("admission unavailable".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        _: &AgentChatTurnJob,
+        _: CancellationToken,
+    ) -> services::Result<CompletedAgentChatTurn> {
+        unreachable!("typed outcome is used")
+    }
+
+    async fn run_turn_with_usage(
+        &self,
+        job: &AgentChatTurnJob,
+        _: CancellationToken,
+    ) -> services::AgentChatTurnRunOutcome {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call > 0 && matches!(self.failure, api_types::TurnFailure::UsageLimit { .. }) {
+            services::AgentChatTurnRunOutcome::Completed {
+                turn: CompletedAgentChatTurn {
+                    identity_id: job.responder_identity_id.clone().unwrap(),
+                    profile_id: job.profile_id.clone().unwrap(),
+                    session_id: "typed-failure-session".into(),
+                    model: None,
+                    content: "resumed after reset".into(),
+                    token_usage_json: None,
+                    duration_ms: 1,
+                    context_manifest_id: None,
+                    pending_interaction_id: None,
+                },
+                usage_reports: Vec::new(),
+            }
+        } else {
+            services::AgentChatTurnRunOutcome::Failed {
+                failure: self.failure.clone(),
+                error: ServiceError::Conflict(
+                    "detail contains config usage limit credential but is not classified"
+                        .to_owned(),
+                ),
+                usage_reports: Vec::new(),
+            }
+        }
+    }
+}
+
+async fn admit_failure_test(db: &Arc<SqliteDb>) -> AgentChatTurnJob {
+    let chats = AgentChatService::new(db.clone());
+    chats
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: ACCOUNT_ID.into(),
+            account_id: ACCOUNT_ID.into(),
+            identity_id: IDENTITY_ID.into(),
+            autonomy_policy_json: "{}".into(),
+            tool_policy_revision: "typed-failure-policy".into(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
+    let chat = AgentChatRepo::get_main_chat(&**db, ACCOUNT_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    chats
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: ACCOUNT_ID.into(),
+            chat_id: chat.id,
+            content: "one request".into(),
+            dedupe_key: Some("typed-failure-test".into()),
+        })
+        .await
+        .unwrap()
+        .turn_job
+}
+
+fn failure_runner(failure: api_types::TurnFailure, pre_provider: bool) -> Arc<TypedFailureRunner> {
+    Arc::new(TypedFailureRunner {
+        failure,
+        calls: AtomicUsize::new(0),
+        admission_calls: AtomicUsize::new(0),
+        pre_provider,
+    })
+}
+
+async fn current_turn(db: &SqliteDb, id: &str) -> AgentChatTurnJob {
+    AgentChatTurnJobRepo::get_agent_chat_turn_job(db, id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn usage_limit_refunds_attempt_and_resumes_after_reset_with_new_invocation() {
+    let db = database().await;
+    let job = admit_failure_test(&db).await;
+    let reset = chrono::DateTime::from_timestamp_millis(
+        (chrono::Utc::now() + chrono::Duration::hours(2)).timestamp_millis(),
+    )
+    .unwrap();
+    let runner = failure_runner(
+        api_types::TurnFailure::UsageLimit {
+            resets_at: Some(reset.timestamp_millis() as u64),
+        },
+        false,
+    );
+    let worker = AgentChatTurnWorker::with_runner(db.clone(), runner.clone());
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+    let deferred = current_turn(&db, &job.id).await;
+    assert_eq!(deferred.status, AgentChatTurnState::RetryWait);
+    assert_eq!(deferred.attempt_count, 0);
+    assert_eq!(
+        deferred.retry_decision,
+        Some(api_types::TurnRetryDecision::Defer)
+    );
+    assert_eq!(deferred.invocation_count, 1);
+    assert_eq!(worker.run_once().await.unwrap(), 0);
+    let due =
+        chrono::DateTime::parse_from_rfc3339(deferred.next_attempt_at.as_deref().unwrap()).unwrap();
+    assert!(due >= reset);
+    assert_eq!(due.timestamp_millis(), reset.timestamp_millis());
+    assert_eq!(
+        worker
+            .run_once_at(reset - chrono::Duration::milliseconds(1))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(worker.run_once_at(reset).await.unwrap(), 1);
+    let succeeded = current_turn(&db, &job.id).await;
+    assert_eq!(succeeded.status, AgentChatTurnState::Succeeded);
+    assert_eq!(succeeded.attempt_count, 1);
+    assert_eq!(succeeded.invocation_count, 2);
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    let invocations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_invocation WHERE source_id = ?")
+            .bind(&job.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        invocations, 2,
+        "refunded budget must not reuse terminal accounting identity"
+    );
+}
+
+#[tokio::test]
+async fn pre_provider_admission_refunds_attempt_and_stops_at_separate_cap() {
+    let db = database().await;
+    let job = admit_failure_test(&db).await;
+    let runner = failure_runner(api_types::TurnFailure::Unclassified, true);
+    let worker = AgentChatTurnWorker::with_runner(db.clone(), runner.clone());
+    for count in 1..=3 {
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+        let current = current_turn(&db, &job.id).await;
+        assert_eq!(current.attempt_count, 0);
+        assert_eq!(current.pre_provider_failure_count, count);
+        assert_eq!(
+            current.status,
+            if count < 3 {
+                AgentChatTurnState::RetryWait
+            } else {
+                AgentChatTurnState::Failed
+            }
+        );
+        if count < 3 {
+            assert_eq!(worker.run_once().await.unwrap(), 0);
+            sqlx::query("UPDATE agent_chat_turn_job SET next_attempt_at = '2000-01-01T00:00:00Z' WHERE id = ?").bind(&job.id).execute(db.pool()).await.unwrap();
+        }
+    }
+    assert_eq!(worker.run_once().await.unwrap(), 0);
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runner.admission_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn expired_lease_persists_its_current_failure_decision() {
+    let db = database().await;
+    let job = admit_failure_test(&db).await;
+    let runner = failure_runner(api_types::TurnFailure::Configuration, false);
+    // The lease refunds are spent, so this expiry counts as the final attempt.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'expired-worker', leased_until = '2000-01-01T00:00:00Z', attempt_count = 3, invocation_count = 3, pre_provider_failure_count = 2, lease_refund_count = ?, failure_class_json = '{\"kind\":\"configuration\"}', retry_decision = 'retry' WHERE id = ?")
+        .bind(services::agent_chat_turn_policy::MAX_LEASE_REFUNDS).bind(&job.id).execute(db.pool()).await.unwrap();
+    let worker = AgentChatTurnWorker::with_runner(db.clone(), runner.clone());
+    assert_eq!(worker.run_once().await.unwrap(), 0);
+    let recovered = current_turn(&db, &job.id).await;
+    assert_eq!(recovered.status, AgentChatTurnState::Failed);
+    assert_eq!(
+        recovered.failure_class,
+        Some(api_types::TurnFailure::Unclassified)
+    );
+    assert_eq!(
+        recovered.retry_decision,
+        Some(api_types::TurnRetryDecision::Fail)
+    );
+    assert_eq!(recovered.pre_provider_failure_count, 2);
+    let refunds: i64 =
+        sqlx::query_scalar("SELECT lease_refund_count FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        refunds,
+        services::agent_chat_turn_policy::MAX_LEASE_REFUNDS,
+        "a counted expiry is not a refund"
+    );
+    assert!(recovered.retry_action().is_some());
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn manual_retry_admits_current_profile_is_versioned_idempotent_and_resolves_incident() {
+    use api_types::TurnFailure;
+    for failure in [
+        TurnFailure::Configuration,
+        TurnFailure::Authority,
+        TurnFailure::ProviderSchema,
+        TurnFailure::ProviderAuth,
+        // Stored by turns that failed before typed provider failures.
+        TurnFailure::ProviderRejected {
+            retryable: false,
+            retry_after: None,
+        },
+        TurnFailure::Unclassified,
+    ] {
+        let db = database().await;
+        let job = admit_failure_test(&db).await;
+        let runner = failure_runner(failure.clone(), false);
+        let worker = AgentChatTurnWorker::with_runner(db.clone(), runner);
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+        if !failure.requires_attention() {
+            // Finish the ordinary attempt budget first.
+            for _ in 0..2 {
+                sqlx::query("UPDATE agent_chat_turn_job SET next_attempt_at = '2000-01-01T00:00:00Z' WHERE id = ?").bind(&job.id).execute(db.pool()).await.unwrap();
+                worker.run_once().await.unwrap();
+            }
+        }
+        let failed = current_turn(&db, &job.id).await;
+        assert_eq!(failed.status, AgentChatTurnState::Failed);
+        assert!(failed.retry_action().is_some());
+        let attention = services::AttentionService::new(db.clone());
+        attention.project_once(100).await.unwrap();
+        attention.project_once(100).await.unwrap();
+        let items: Vec<(String, String, String)> = sqlx::query_as("SELECT summary, recommended_action, details_json FROM attention_projection WHERE source_event_id IN (SELECT id FROM domain_event WHERE entity_id = ? AND event_type = 'agent_chat.turn.failed')")
+            .bind(&job.id).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            items.len(),
+            usize::from(failure.requires_attention()),
+            "only deterministic failures raise an incident"
+        );
+        if failure.requires_attention() {
+            assert!(items[0].0.contains(failure.code()));
+            assert_eq!(items[0].1, "retry_turn");
+            let details: serde_json::Value = serde_json::from_str(&items[0].2).unwrap();
+            assert_eq!(details["retry_action"]["kind"], "retry_turn");
+            sqlx::query("UPDATE attention_projection SET snoozed_until = '2099-01-01T00:00:00Z' WHERE source_event_id IN (SELECT id FROM domain_event WHERE entity_id = ?)")
+                .bind(&job.id).execute(db.pool()).await.unwrap();
+        }
+        let chats = AgentChatService::new(db.clone());
+        let input = services::RetryAgentChatTurnInput {
+            actor_user_id: ACCOUNT_ID.into(),
+            chat_id: job.chat_id.clone(),
+            turn_job_id: job.id.clone(),
+            expected_version: failed.version,
+            idempotency_key: "manual-fix".into(),
+        };
+        let stale = services::RetryAgentChatTurnInput {
+            expected_version: failed.version - 1,
+            ..input.clone()
+        };
+        assert!(matches!(
+            chats.retry_turn(stale).await,
+            Err(ServiceError::Db(db::DbError::VersionConflict))
+        ));
+        let agent = AgentRepo::get_by_id(&*db, IDENTITY_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let updated = AgentRepo::update(
+            &*db,
+            db::UpdateAgent {
+                id: agent.id,
+                expected_version: agent.version,
+                model: Some(Some("corrected-model".into())),
+                name: None,
+                description: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: None,
+                config_json: None,
+                daemon_id: None,
+                max_concurrent_tasks: None,
+                heartbeat_interval_seconds: None,
+                max_missed_heartbeats: None,
+                status: None,
+                last_heartbeat_at: None,
+                is_default: None,
+                paused: None,
+                updated_at: db::now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(Some(updated.profile_id.as_str()), job.profile_id.as_deref());
+        let retried = chats.retry_turn(input.clone()).await.unwrap();
+        assert_ne!(retried.id, job.id);
+        assert_eq!(retried.status, AgentChatTurnState::Queued);
+        assert_eq!(retried.attempt_count, 0);
+        assert_eq!(retried.triggering_message_id, job.triggering_message_id);
+        assert_eq!(
+            retried.profile_id.as_deref(),
+            Some(updated.profile_id.as_str())
+        );
+        let incident: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, snoozed_until FROM attention_projection WHERE details_json LIKE ?",
+        )
+        .bind(format!("%{}%", job.id))
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(incident.is_some(), failure.requires_attention());
+        if let Some((status, snoozed)) = incident {
+            assert_eq!(status, "resolved");
+            assert!(snoozed.is_none());
+        }
+        assert_eq!(chats.retry_turn(input.clone()).await.unwrap(), retried);
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE entity_id = ? AND event_type = 'agent_chat.turn.retried'").bind(&retried.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(
+            AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*db, &job.chat_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let source = current_turn(&db, &job.id).await;
+        let fresh_key = services::RetryAgentChatTurnInput {
+            expected_version: source.version,
+            idempotency_key: "another-fix".into(),
+            ..input.clone()
+        };
+        assert!(matches!(
+            chats.retry_turn(fresh_key.clone()).await,
+            Err(ServiceError::Db(db::DbError::TurnNotRetryable))
+        ));
+        sqlx::query("UPDATE agent_chat_turn_job SET status = 'succeeded' WHERE id = ?")
+            .bind(&retried.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            chats.retry_turn(fresh_key).await,
+            Err(ServiceError::Db(db::DbError::TurnNotRetryable))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn newer_message_turn_supersedes_retry_and_resolves_snoozed_incident() {
+    for topic_divider in [false, true] {
+        let db = database().await;
+        let job = admit_failure_test(&db).await;
+        let worker = AgentChatTurnWorker::with_runner(
+            db.clone(),
+            failure_runner(api_types::TurnFailure::Configuration, false),
+        );
+        worker.run_once().await.unwrap();
+        let attention = services::AttentionService::new(db.clone());
+        attention.project_once(100).await.unwrap();
+        attention.project_once(100).await.unwrap();
+        sqlx::query(
+        "UPDATE attention_projection SET status = 'open', snoozed_until = '2099-01-01T00:00:00Z'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+        if topic_divider {
+            services::MainChatTopicService::new(
+                db.clone(),
+                Arc::new(AgentChatService::new(db.clone())),
+                services::ProductGenesisService::for_sqlite(db.clone()),
+            )
+            .start_topic(services::StartMainChatTopicInput {
+                actor_user_id: ACCOUNT_ID.into(),
+                chat_id: job.chat_id.clone(),
+                label: Some("new topic".into()),
+                summary: None,
+            })
+            .await
+            .unwrap();
+        } else {
+            AgentChatService::new(db.clone())
+                .send_message(SendAgentChatMessageInput {
+                    actor_user_id: ACCOUNT_ID.into(),
+                    chat_id: job.chat_id.clone(),
+                    content: "new topic".into(),
+                    dedupe_key: Some("new-topic".into()),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(current_turn(&db, &job.id).await.retry_action().is_none());
+        attention.project_once(100).await.unwrap();
+        let (status, snoozed): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, snoozed_until FROM attention_projection WHERE details_json LIKE ?",
+        )
+        .bind(format!("%{}%", job.id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "resolved");
+        assert!(snoozed.is_none());
+    }
+}
+
+#[tokio::test]
+async fn usage_limit_elapsed_budget_fails_before_another_provider_call() {
+    let db = database().await;
+    let job = admit_failure_test(&db).await;
+    let runner = failure_runner(
+        api_types::TurnFailure::UsageLimit { resets_at: None },
+        false,
+    );
+    let worker = AgentChatTurnWorker::with_runner(db.clone(), runner.clone());
+    worker.run_once().await.unwrap();
+    sqlx::query("UPDATE agent_chat_turn_job SET usage_limit_first_deferred_at = ?, next_attempt_at = '2000-01-01T00:00:00Z' WHERE id = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()).bind(&job.id).execute(db.pool()).await.unwrap();
+    worker.run_once().await.unwrap();
+    let failed = current_turn(&db, &job.id).await;
+    assert_eq!(failed.status, AgentChatTurnState::Failed);
+    assert_eq!(failed.attempt_count, 0);
+    assert_eq!(
+        failed.failure_class,
+        Some(api_types::TurnFailure::UsageLimit { resets_at: None })
+    );
+    assert!(failed.retry_action().is_some());
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn orphaned_parked_turn_records_typed_terminal_decision() {
+    let db = database().await;
+    let job = admit_failure_test(&db).await;
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'awaiting_input', pending_interaction_id = NULL WHERE id = ?")
+        .bind(&job.id).execute(db.pool()).await.unwrap();
+    let runner = failure_runner(api_types::TurnFailure::Unclassified, false);
+    let worker = AgentChatTurnWorker::with_runner(db.clone(), runner.clone());
+    assert_eq!(worker.run_once().await.unwrap(), 0);
+    let failed = current_turn(&db, &job.id).await;
+    assert_eq!(failed.status, AgentChatTurnState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("interaction_orphaned"));
+    assert_eq!(
+        failed.failure_class,
+        Some(api_types::TurnFailure::Unclassified)
+    );
+    assert_eq!(
+        failed.retry_decision,
+        Some(api_types::TurnRetryDecision::Fail)
+    );
+    assert!(failed.retry_action().is_some());
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+}

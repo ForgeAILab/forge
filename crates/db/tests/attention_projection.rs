@@ -1,7 +1,7 @@
 use db::{
     create_sqlite_pool, now_rfc3339, run_migrations, AttentionListQuery, AttentionRepo,
     CreateAttentionProjection, CreateDomainEvent, CreateProject, DomainEventRepo, PageRequest,
-    ProjectRepo, SortBy, SortOrder, UpdateAttentionLifecycle, UpsertAttentionConsumerHealth,
+    ProjectRepo, SortBy, SortOrder, UpdateAttentionLifecycle,
 };
 
 async fn database() -> db::SqliteDb {
@@ -151,51 +151,6 @@ async fn attention_lifecycle_is_optimistic_and_bounded() {
     .await
     .unwrap();
     assert_eq!(all_list.items.len(), 1);
-}
-
-#[tokio::test]
-async fn attention_consumer_health_is_durable_and_monotonic() {
-    let db = database().await;
-    let first = UpsertAttentionConsumerHealth {
-        consumer_name: "attention_projection".to_owned(),
-        last_sequence: 7,
-        last_started_at: Some("2026-01-01T00:00:00Z".to_owned()),
-        last_success_at: Some("2026-01-01T00:00:01Z".to_owned()),
-        last_error_at: None,
-        last_error_code: None,
-        last_error_message: None,
-        lease_owner: None,
-        lease_until: None,
-        processed_events_delta: 3,
-        updated_at: "2026-01-01T00:00:01Z".to_owned(),
-    };
-    let health = AttentionRepo::upsert_attention_consumer_health(&db, first)
-        .await
-        .unwrap();
-    assert_eq!(health.last_sequence, 7);
-    assert_eq!(health.processed_events, 3);
-
-    let health = AttentionRepo::upsert_attention_consumer_health(
-        &db,
-        UpsertAttentionConsumerHealth {
-            consumer_name: "attention_projection".to_owned(),
-            last_sequence: 4,
-            last_started_at: None,
-            last_success_at: None,
-            last_error_at: Some("2026-01-01T00:00:02Z".to_owned()),
-            last_error_code: Some("projection_error".to_owned()),
-            last_error_message: Some("bounded".to_owned()),
-            lease_owner: Some("worker".to_owned()),
-            lease_until: Some("2026-01-01T00:00:10Z".to_owned()),
-            processed_events_delta: 1,
-            updated_at: "2026-01-01T00:00:02Z".to_owned(),
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(health.last_sequence, 7);
-    assert_eq!(health.processed_events, 4);
-    assert_eq!(health.last_error_code.as_deref(), Some("projection_error"));
 }
 
 #[tokio::test]
