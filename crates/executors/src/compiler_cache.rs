@@ -55,6 +55,9 @@ const SCCACHE_LAUNCHER: &str = "rustc-wrapper";
 const MAX_SOCKET_BYTES: usize = 100;
 #[cfg_attr(not(unix), allow(dead_code))]
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a run start waits for its store's server at most: one start,
+/// and a moment for the starts ahead of it.
+pub(crate) const START_WAIT: Duration = Duration::from_secs(15);
 /// How long the wrapper may take to answer `--version` when it is resolved.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Failed starts of one store's sccache server in a row after which runs
@@ -280,19 +283,30 @@ impl CompilerCache {
                     if server_start_given_up(&dir) {
                         return None;
                     }
-                    if start == ServerStart::Detached {
-                        start_server_detached(&self.wrapper, &dir, &socket, &size);
+                    let started = match start {
+                        // Never on the caller's thread, whatever happens
+                        // to the server meanwhile.
+                        ServerStart::Detached => {
+                            start_server_detached(&self.wrapper, &dir, &socket, &size);
+                            return None;
+                        }
+                        ServerStart::Wait => {
+                            ensure_sccache_server(&self.wrapper, &dir, &socket, &size)
+                        }
+                    };
+                    note_server_start(&dir, started.is_ok());
+                    if let Err(error) = started {
+                        warn_once(&WARNED_SERVER, || {
+                            tracing::warn!(wrapper = %self.wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
+                        });
                         return None;
                     }
                 }
-                let started = ensure_sccache_server(&self.wrapper, &dir, &socket, &size)
-                    .and_then(|()| write_sccache_launcher(&self.wrapper, &dir));
-                note_server_start(&dir, started.is_ok());
-                let launcher = match started {
+                let launcher = match write_sccache_launcher(&self.wrapper, &dir) {
                     Ok(launcher) => launcher,
                     Err(error) => {
                         warn_once(&WARNED_SERVER, || {
-                            tracing::warn!(wrapper = %self.wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
+                            tracing::warn!(wrapper = %self.wrapper.display(), %error, "the sccache launcher could not be written: runs build without the wrapper");
                         });
                         return None;
                     }
@@ -416,7 +430,9 @@ fn note_server_start(store: &Path, started: bool) {
 fn sccache_running(socket: &Path) -> bool {
     #[cfg(unix)]
     {
-        std::os::unix::net::UnixStream::connect(socket).is_ok()
+        // Never a blocking connect: this is asked on async workers, and a
+        // server that accepts nothing would hold one for ever.
+        crate::fd_tree::unix_socket_answers(socket)
     }
     #[cfg(not(unix))]
     {
@@ -448,38 +464,32 @@ fn start_server_detached(wrapper: &Path, dir: &Path, socket: &Path, size: &str) 
         socket.to_path_buf(),
         size.to_owned(),
     );
-    let store = dir.clone();
-    let spawned = std::thread::Builder::new()
+    /// Takes the store out of [`STARTING`] however the start ends, also
+    /// when the thread cannot be spawned or panics.
+    struct InFlight(PathBuf);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            STARTING
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.0);
+        }
+    }
+    let in_flight = InFlight(dir.clone());
+    // A spawn that fails drops the closure, and the guard with it.
+    let _ = std::thread::Builder::new()
         .name("forge-sccache-start".to_owned())
         .spawn(move || {
+            let _in_flight = in_flight;
             let started = ensure_sccache_server(&wrapper, &dir, &socket, &size)
-                .and_then(|()| write_sccache_launcher(&wrapper, &dir))
-                .and_then(|_| {
-                    if sccache_running(&socket) {
-                        Ok(())
-                    } else {
-                        Err(io::Error::other(
-                            "--start-server returned but no server answers on the socket",
-                        ))
-                    }
-                });
+                .and_then(|()| write_sccache_launcher(&wrapper, &dir));
             note_server_start(&dir, started.is_ok());
             if let Err(error) = started {
                 warn_once(&WARNED_SERVER, || {
                     tracing::warn!(wrapper = %wrapper.display(), %error, "the sccache server could not be started: runs build without the wrapper");
                 });
             }
-            STARTING
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&dir);
         });
-    if spawned.is_err() {
-        STARTING
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&store);
-    }
 }
 
 /// Run `command` to its end, or kill it at `timeout`.
@@ -870,6 +880,34 @@ fn prepare_store(cache_dir: &Path, dir: &Path, kind: WrapperKind) -> io::Result<
     write_replacing(&dir.join(MARKER_FILE), kind.as_str(), false)
 }
 
+/// Take the lock that makes one process at a time start the server of the
+/// store `dir`, waiting for it `wait` at most. A run can write its store
+/// and so can hold this lock: it is never waited on without an end.
+#[cfg(unix)]
+fn lock_for_start(dir: &Path, wait: Duration) -> io::Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("start.lock"))?;
+    let give_up = Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another start of this store's server did not finish in time",
+                ));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
 /// Make sure the sccache server of one repository store runs, started by
 /// Forge and not by a run.
 ///
@@ -891,14 +929,16 @@ fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) 
         // One starter at a time across every Forge process on this store: a
         // second `--start-server` would take the socket over and leave the
         // first server running for ever.
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("start.lock"))?;
-        lock.lock()?;
+        let _lock = lock_for_start(dir, SERVER_START_TIMEOUT)?;
         if running() {
             return Ok(());
+        }
+        // The starts this one queued behind failed: it does not add its own
+        // wait to theirs.
+        if server_start_given_up(dir) {
+            return Err(io::Error::other(
+                "the server of this store failed to start repeatedly",
+            ));
         }
         let tmp = dir.join(SERVER_TMP_DIR);
         sandbox::create_private_dir(&tmp)?;
@@ -924,12 +964,18 @@ fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) 
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let status = run_bounded(&mut start, SERVER_START_TIMEOUT)?;
-        if status.success() {
-            Ok(())
-        } else {
+        if !status.success() {
             Err(io::Error::other(format!(
                 "--start-server exited with {status}"
             )))
+        } else if !running() {
+            // Counted as a failed start by every caller, so a wrapper that
+            // returns without serving stops being tried.
+            Err(io::Error::other(
+                "--start-server returned but no server answers on the socket",
+            ))
+        } else {
+            Ok(())
         }
     }
     #[cfg(not(unix))]
@@ -1285,6 +1331,7 @@ pub fn evict(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
 
     /// An executable shell script at `<dir>/<name>` that appends
     /// `arguments|SCCACHE_DIR|KACHE_CACHE_DIR|TMPDIR` to `<dir>/calls`, answers
@@ -1296,13 +1343,32 @@ pub(crate) mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
-                dir.join("calls").display()
+                "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\nif [ \"$1\" = --start-server ]; then\n  n=0\n  while [ -e '{}' ] && [ ! -S \"$SCCACHE_SERVER_UDS\" ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done\n  exit 0\nfi\nexec \"$@\"\n",
+                dir.join("calls").display(),
+                dir.join("serve").display()
             ),
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Make the [`fake_wrapper`] in `dir` start a server the way sccache
+    /// does: its `--start-server` returns once something listens on
+    /// `socket`, which the returned thread does as soon as the wrapper was
+    /// called. The listener lives as long as the value returned.
+    fn serving(dir: &Path, socket: &Path) -> std::thread::JoinHandle<Option<UnixListener>> {
+        fs::write(dir.join("serve"), "").unwrap();
+        let (calls, socket) = (dir.join("calls"), socket.to_path_buf());
+        std::thread::spawn(move || {
+            for _ in 0..1000 {
+                if calls.exists() {
+                    return UnixListener::bind(&socket).ok();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        })
     }
 
     /// A worktree at `<root>/<task>/repo` whose `.git` names the repository
@@ -1509,8 +1575,10 @@ pub(crate) mod tests {
         let worktree = linked_worktree(&root, "t1", "repo-a");
 
         let sccache = cache(&root, &fake_wrapper(&dir.path().join("a"), "sccache"));
-        let env = sccache.for_worktree(&worktree).unwrap();
         let store = root.join(CACHE_DIR).join("repo-a");
+        let server = serving(&dir.path().join("a"), &store.join(SCCACHE_SOCKET));
+        let env = sccache.for_worktree(&worktree).unwrap();
+        let _server = server.join().unwrap().expect("the server was started");
         assert_eq!(env.dir(), Some(store.as_path()));
         let vars: Vec<_> = env.variables().collect();
         assert_eq!(
@@ -1702,6 +1770,46 @@ pub(crate) mod tests {
         assert_eq!(cache(&root, &failing).for_worktree(&worktree), None);
         note_server_start(&store, true);
         assert!(!server_start_given_up(&store));
+    }
+
+    /// A wrapper whose `--start-server` returns without anything listening
+    /// has not started a server: counted like any failed start, on the
+    /// waiting path too, so it stops being tried. And the start lock, which
+    /// a run could hold, is waited on for a bounded time only.
+    #[test]
+    fn a_start_that_leaves_no_server_is_a_failed_start_and_a_held_lock_has_a_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let worktree = linked_worktree(&root, "t1", "repo-quiet");
+        let quiet = cache(&root, &fake_wrapper(&dir.path().join("quiet"), "sccache"));
+        let store = root.join(CACHE_DIR).join("repo-quiet");
+        let calls = || {
+            fs::read_to_string(dir.path().join("quiet").join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        for attempt in 1..=SERVER_START_ATTEMPTS {
+            assert!(!server_start_given_up(&store));
+            assert_eq!(quiet.for_worktree(&worktree), None);
+            assert_eq!(calls(), attempt as usize);
+        }
+        assert!(server_start_given_up(&store));
+        assert_eq!(quiet.for_worktree(&worktree), None);
+        assert_eq!(quiet.for_worktree_without_waiting(&worktree), None);
+        assert_eq!(calls(), SERVER_START_ATTEMPTS as usize, "not tried again");
+        // A start that queued behind the failed ones does not run its own.
+        assert!(ensure_sccache_server(&quiet.wrapper, &store, &store.join("s"), "1M").is_err());
+        assert_eq!(calls(), SERVER_START_ATTEMPTS as usize);
+        note_server_start(&store, true);
+
+        let held = lock_for_start(&store, Duration::from_millis(200)).unwrap();
+        let asked = Instant::now();
+        let error = lock_for_start(&store, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        drop(held);
+        lock_for_start(&store, Duration::from_millis(200)).unwrap();
     }
 
     #[test]

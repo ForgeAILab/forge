@@ -580,6 +580,59 @@ pub(crate) fn rename_under(base: &Path, relative: &Path, target: &Path) -> io::R
     rename_at(dir.as_fd(), &name, libc::AT_FDCWD, &target)
 }
 
+/// Whether something accepts connections on the Unix socket at `path`.
+/// Never waits: a listener whose queue is full counts as answering (it is
+/// there, and a blocking connect would wait on it for as long as it is
+/// stuck).
+pub(crate) fn unix_socket_answers(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is plain data for which all-zero is valid.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // Room for the terminating NUL the zeroed tail provides.
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return false;
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+        *to = *from as libc::c_char;
+    }
+    // SAFETY: plain system call; a descriptor it returns is owned by nobody.
+    let Ok(socket) = retry(|| unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) }) else {
+        return false;
+    };
+    // SAFETY: `socket` was just returned by `socket`.
+    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+    // SAFETY: `socket` is an open descriptor; `fcntl` with these commands
+    // reads and sets its flags only.
+    let non_blocking = unsafe {
+        let raw = socket.as_raw_fd();
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+            && flags >= 0
+            && libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if !non_blocking {
+        return false;
+    }
+    // SAFETY: `address` is an initialised `sockaddr_un` that outlives the
+    // call, and the length given is its size.
+    let connected = retry(|| unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    });
+    match connected {
+        Ok(_) => true,
+        // The listener's queue is full.
+        Err(error) => matches!(
+            error.raw_os_error(),
+            Some(libc::EAGAIN | libc::EINPROGRESS)
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1060,33 @@ mod tests {
         grant_owner_access_at(parent.as_fd(), c"locked", device);
         assert_eq!(mode(&base.join("locked")), 0o700);
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A socket nobody listens on, a missing one and a file do not answer;
+    /// a listener does, also one that accepts nothing and whose queue is
+    /// full, and the question never waits for it.
+    #[test]
+    fn a_socket_answers_only_while_something_listens_and_asking_never_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        // A short path: a socket address holds about a hundred bytes.
+        let short = fs::canonicalize(dir.path()).unwrap();
+        let path = short.join("s");
+        assert!(!unix_socket_answers(&path), "missing");
+        fs::write(short.join("file"), "x").unwrap();
+        assert!(!unix_socket_answers(&short.join("file")), "a file");
+        assert!(!unix_socket_answers(&short.join("n".repeat(200))), "too long");
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(unix_socket_answers(&path));
+        // Never accepted: the queue fills, and asking still returns at once.
+        let started = Instant::now();
+        let mut answers = 0;
+        for _ in 0..600 {
+            answers += usize::from(unix_socket_answers(&path));
+        }
+        assert!(answers > 0);
+        assert!(started.elapsed() < Duration::from_secs(20), "never waits");
+        drop(listener);
+        assert!(!unix_socket_answers(&path), "nobody listens any more");
     }
 }

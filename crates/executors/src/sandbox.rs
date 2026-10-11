@@ -194,8 +194,26 @@ pub async fn start_compiler_cache(worktree: &Path) {
     if crate::compiler_cache::none_installed() {
         return;
     }
+    /// Starts on the blocking pool at once, in the whole process. Runs
+    /// that start together wait here as futures, not as pool threads: once
+    /// a store's server runs each takes a moment, and a wrapper that never
+    /// starts is given up after a few tries.
+    static STARTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let worktree = worktree.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || start_compiler_cache_blocking(&worktree)).await;
+    let start = async move {
+        let Ok(permit) = STARTS.acquire().await else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            // Held until the start returns, also when the caller stopped
+            // waiting for it.
+            let _permit = permit;
+            start_compiler_cache_blocking(&worktree);
+        })
+        .await;
+    };
+    // The run then simply builds without the wrapper.
+    let _ = tokio::time::timeout(crate::compiler_cache::START_WAIT, start).await;
 }
 
 /// [`start_compiler_cache`] for a thread that may block (never an async
