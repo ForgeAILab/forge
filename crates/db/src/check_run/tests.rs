@@ -2143,7 +2143,10 @@ async fn operator_summary_counts_backlogs_with_ages_and_the_days_reuse() {
         db.check_operator_summary().await.unwrap(),
         CheckOperatorSummary::default()
     );
-    let ago = |seconds: i64| (chrono::Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339();
+    // One fixed instant: the rows are dated from it and the summary is read
+    // as of it, so the ages do not depend on how long the test takes.
+    let now = chrono::Utc::now();
+    let ago = |seconds: i64| (now - chrono::Duration::seconds(seconds)).to_rfc3339();
     for (id, state, created, wait, admitted) in [
         ("q1", "queued", ago(30), None, None),
         ("q2", "queued", ago(90), None, None),
@@ -2172,12 +2175,17 @@ async fn operator_summary_counts_backlogs_with_ages_and_the_days_reuse() {
     sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,awaited_consumer_id,suspended_until) VALUES('disk-step','t',1,'hooks','{}','k','k',1,'todo',1,'suspended',?,?,?,?,?)")
         .bind(ago(120)).bind(ago(120)).bind(ago(5)).bind(DISK_WAIT_SENTINEL).bind(ago(-30))
         .execute(db.pool()).await.unwrap();
-    let summary = db.check_operator_summary().await.unwrap();
+    let summary = db
+        .check_operator_summary_at(&now.to_rfc3339())
+        .await
+        .unwrap();
+    // Julian-day arithmetic is floating point: a whole number of seconds may
+    // truncate one short, never more.
     let near = |(count, age): CheckBacklogRow, expected: (i64, i64)| {
         assert_eq!(count, expected.0);
         let age = age.expect("an age");
         assert!(
-            (expected.1..expected.1 + 5).contains(&age),
+            (expected.1 - 1..=expected.1).contains(&age),
             "{age} vs {expected:?}"
         );
     };
