@@ -459,6 +459,45 @@ async fn prepare_of_a_new_worktree_is_refused_under_the_floor_and_an_existing_on
     gc::accept_floor(&root, Some(FreeFloor::of_bytes(0, 0)));
 }
 
+/// The store of a repository this daemon has neither a location nor a live
+/// handle for is removed a day after its last run start; the store of the
+/// fixture's own repository stays.
+#[tokio::test]
+async fn compiler_cache_store_of_a_repository_the_daemon_no_longer_has_is_removed() {
+    let fixture = Fixture::new().await;
+    let root = fixture.dir.path();
+    let worktree = root
+        .join(WORKTREE_DIRECTORY)
+        .join(&fixture.prepared.workspace.workspace_handle)
+        .join("repo");
+    let repository =
+        executors::compiler_cache::repository_id(&worktree).expect("a linked worktree");
+    let cache_dir = root.join(executors::compiler_cache::CACHE_DIR);
+    let store = |repository: &str| {
+        let store = cache_dir.join(repository);
+        std::fs::create_dir_all(store.join("0")).unwrap();
+        std::fs::write(store.join(executors::compiler_cache::MARKER_FILE), "kache").unwrap();
+        std::fs::write(store.join("0").join("entry"), "x").unwrap();
+        store
+    };
+    let (kept, gone) = (store(&repository), store("repo-gone"));
+    let floor = || FreeFloor::of_bytes(0, 0);
+    let hour = Duration::from_secs(60 * 60);
+
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now() + hour, floor())
+        .await;
+    assert_eq!(report.cache_stores_removed, 0, "inside the grace period");
+    assert!(gone.exists());
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now() + hour * 25, floor())
+        .await;
+    assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
+    assert!(!gone.exists() && kept.join("0").join("entry").exists());
+}
+
 /// Plan 3.4 F: under the floor a daemon's collector trims its shared
 /// compiler cache before any handle's build output, and its disk report
 /// carries the size its collector measured.

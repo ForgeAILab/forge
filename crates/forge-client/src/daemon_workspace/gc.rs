@@ -254,6 +254,41 @@ impl DaemonWorkspaceBackend {
     /// memory joined with what is persisted. A handle another runtime
     /// recorded since this one loaded is as real as its own, and a handle
     /// counts as cleaned only when nobody holds it live.
+    /// The compiler-cache store name of every repository this daemon still
+    /// has. `None` when the table cannot be read (nothing is then removed),
+    /// and when no cache exists (nothing is then looked at).
+    fn gc_repositories(
+        &self,
+        handles: &HashMap<String, OwnedWorkspace>,
+    ) -> Option<std::collections::HashSet<String>> {
+        executors::compiler_cache::collected(&self.workspace_root)?;
+        let mut locations: Vec<PathBuf> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .locations
+            .values()
+            .map(|location| location.path.clone())
+            .collect();
+        let persisted = self
+            .journal
+            .load_workspace_state::<WorkspaceRegistry>()
+            .ok()?;
+        locations.extend(persisted.locations.into_values().map(|location| location.path));
+        Some(
+            locations
+                .iter()
+                .filter_map(|path| executors::compiler_cache::repository_id_of(path))
+                .chain(
+                    handles
+                        .values()
+                        .filter(|owned| !owned.cleaned)
+                        .filter_map(|owned| executors::compiler_cache::repository_id(&owned.path)),
+                )
+                .collect(),
+        )
+    }
+
     fn gc_handles(&self) -> Option<HashMap<String, OwnedWorkspace>> {
         let mut handles = self
             .state
@@ -394,6 +429,9 @@ impl DaemonWorkspaceBackend {
         } else {
             Vec::new()
         };
+        // The repositories this daemon still has: every repository
+        // location in its table and the repository of every live handle.
+        let repositories = self.gc_repositories(&handles);
         let pass = sweep.clone();
         let done = blocking(move || {
             let mut report = GcReport::default();
@@ -406,6 +444,13 @@ impl DaemonWorkspaceBackend {
             // Before any Task's build output: a cache entry is cheaper to
             // lose than a Task's whole build.
             pass.evict_compiler_cache(&floor, live_commands > 0, &mut report);
+            if let Some(repositories) = &repositories {
+                pass.remove_cache_stores_of_deleted_repositories(
+                    repositories,
+                    live_commands > 0,
+                    &mut report,
+                );
+            }
             pass.evict_builds(&candidates, &floor, &mut report);
             report
         })

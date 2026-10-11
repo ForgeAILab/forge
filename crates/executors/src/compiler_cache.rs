@@ -783,7 +783,24 @@ pub fn repository_id(worktree: &Path) -> Option<String> {
     if back.canonicalize().ok()? != dot_git.canonicalize().ok()? {
         return None;
     }
-    let common = worktrees.parent()?;
+    store_name(worktrees.parent()?)
+}
+
+/// The store name [`repository_id`] gives every worktree of the repository
+/// at `repository`: a bare repository directory (Forge's own clones), or a
+/// checkout whose Git directory is its `.git`. What an owner lists as the
+/// repositories it still has.
+pub fn repository_id_of(repository: &Path) -> Option<String> {
+    let dot_git = repository.join(".git");
+    if sandbox::is_real_dir(&dot_git) {
+        store_name(&dot_git)
+    } else {
+        store_name(repository)
+    }
+}
+
+/// The store name of the repository whose Git directory is `common`.
+fn store_name(common: &Path) -> Option<String> {
     let name = common.file_name()?.to_str()?;
     let name = if name == ".git" {
         let checkout = common.parent()?.file_name()?.to_str()?;
@@ -997,6 +1014,133 @@ pub fn measure(cache_dir: &Path, deadline: Instant) -> Option<u64> {
         .try_fold(0_u64, |total, (store, _)| {
             Some(total.saturating_add(crate::gc::measure(store, deadline)?))
         })
+}
+
+/// Prefix of a store renamed aside for removal. Never a repository id: an
+/// id never starts with a dot.
+const REMOVED_PREFIX: &str = ".forge-removed-";
+/// How long `--stop-server` may take before a store is removed anyway.
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What one removal of dead repository stores did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoresRemoved {
+    pub stores: usize,
+    pub out_of_time: bool,
+}
+
+/// Remove the stores under `cache_dir` whose repository the owner no longer
+/// has: a marked store whose name is not in `known`, last handed to a run
+/// (its marker is rewritten at every run start) at least `grace` before
+/// `now`, and held by no run of this process.
+///
+/// The live-run check and a rename aside happen under the lock every run
+/// start takes, so a run either is seen or starts after the rename and gets
+/// a fresh store; the delete happens outside the lock, never follows a link
+/// and carries on in the next pass when `deadline` cuts it short. An
+/// sccache server still answering on the store's socket is stopped first
+/// through `wrapper` (it was started with no idle exit and would otherwise
+/// run for ever on a directory that is gone).
+pub fn remove_stores_of_deleted_repositories(
+    cache_dir: &Path,
+    wrapper: Option<&Path>,
+    known: &std::collections::HashSet<String>,
+    now: SystemTime,
+    grace: Duration,
+    deadline: Instant,
+) -> StoresRemoved {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut done = StoresRemoved::default();
+    if !sandbox::is_real_dir(cache_dir) {
+        return done;
+    }
+    let mut condemned = Vec::new();
+    // What an earlier pass renamed aside and could not finish deleting.
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        condemned.extend(
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(REMOVED_PREFIX))
+                })
+                .map(|entry| (entry.path(), false)),
+        );
+    }
+    for (store, kind) in stores(cache_dir) {
+        let Some(name) = store.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(REMOVED_PREFIX) || known.contains(name) {
+            continue;
+        }
+        let old = fs::symlink_metadata(store.join(MARKER_FILE))
+            .and_then(|marker| marker.modified())
+            .is_ok_and(|used| now.duration_since(used).is_ok_and(|age| age >= grace));
+        if !old {
+            continue;
+        }
+        let aside = cache_dir.join(format!(
+            "{REMOVED_PREFIX}{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let socket = store.join(SCCACHE_SOCKET);
+        let renamed = sandbox::unless_live_cache_run_in(&store, || {
+            if kind == WrapperKind::Sccache && sccache_running(&socket) {
+                // Not held by any run: nothing compiles through it.
+                stop_sccache_server(wrapper, &store, &socket);
+            }
+            fs::symlink_metadata(&aside).is_err() && fs::rename(&store, &aside).is_ok()
+        });
+        if renamed == Some(true) {
+            tracing::info!(store = %store.display(), "removing the compiler-cache store of a repository that no longer exists");
+            condemned.push((aside, true));
+        }
+    }
+    for (path, counted) in condemned {
+        if Instant::now() >= deadline {
+            done.out_of_time = true;
+            break;
+        }
+        if !sandbox::is_real_dir(&path) {
+            // A link or a file under the reserved name: removed as itself.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if !sandbox::remove_tree_until(&path, Some(deadline)) {
+            done.out_of_time = true;
+        }
+        done.stores += usize::from(counted);
+    }
+    done
+}
+
+/// Ask the sccache server of `store` to stop. Best effort and bounded.
+fn stop_sccache_server(wrapper: Option<&Path>, store: &Path, socket: &Path) {
+    let Some(wrapper) = wrapper.filter(|wrapper| WrapperKind::of(wrapper) == WrapperKind::Sccache)
+    else {
+        return;
+    };
+    let mut stop = std::process::Command::new(wrapper);
+    stop.arg("--stop-server")
+        .env_clear()
+        .envs(
+            ["PATH", "HOME"]
+                .into_iter()
+                .filter_map(|key| Some((key, std::env::var_os(key)?))),
+        )
+        .env("SCCACHE_DIR", store)
+        .env("SCCACHE_SERVER_UDS", socket)
+        .current_dir(store)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(error) = run_bounded(&mut stop, SERVER_STOP_TIMEOUT) {
+        tracing::warn!(store = %store.display(), %error, "the sccache server of a removed store could not be stopped");
+    }
 }
 
 /// What one eviction did.

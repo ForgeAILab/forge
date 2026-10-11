@@ -502,6 +502,34 @@ impl WorkspaceCleanupScheduler {
             .unwrap_or_default();
             report.merge(&evicted);
         }
+        // Stores of repositories this server no longer has a row for.
+        if !out_of_time(&sweep) && executors::compiler_cache::collected(&root).is_some() {
+            match sqlx::query_scalar::<_, String>("SELECT id FROM repo")
+                .fetch_all(self.db.pool())
+                .await
+            {
+                Ok(repositories) => {
+                    let known: HashSet<String> = repositories.into_iter().collect();
+                    let pass = sweep.clone();
+                    let removed = blocking(move || {
+                        let mut report = GcReport::default();
+                        pass.remove_cache_stores_of_deleted_repositories(
+                            &known,
+                            live_checks > 0,
+                            &mut report,
+                        );
+                        report
+                    })
+                    .await
+                    .unwrap_or_default();
+                    report.merge(&removed);
+                }
+                // An unreadable table proves nothing about any store.
+                Err(error) => {
+                    tracing::warn!(%error, "workspace gc: repositories unreadable; compiler-cache stores are left alone");
+                }
+            }
+        }
         if !out_of_time(&sweep) && live_checks == 0 {
             if let Err(error) = self
                 .gc_evict_builds(&sweep, &settings.free_floor, &mut report)

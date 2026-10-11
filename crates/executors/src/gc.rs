@@ -145,6 +145,8 @@ pub struct GcReport {
     pub builds_evicted: usize,
     /// Entries deleted from the shared compiler cache.
     pub cache_entries_evicted: usize,
+    /// Compiler-cache stores of deleted repositories removed whole.
+    pub cache_stores_removed: usize,
     pub errors: usize,
     /// The pass ran out of time; the caller keeps its cursor.
     pub out_of_time: bool,
@@ -158,6 +160,7 @@ impl GcReport {
         self.run_dirs_removed += other.run_dirs_removed;
         self.builds_evicted += other.builds_evicted;
         self.cache_entries_evicted += other.cache_entries_evicted;
+        self.cache_stores_removed += other.cache_stores_removed;
         self.errors += other.errors;
         self.out_of_time |= other.out_of_time;
     }
@@ -169,6 +172,7 @@ impl GcReport {
             + self.run_dirs_removed
             + self.builds_evicted
             + self.cache_entries_evicted
+            + self.cache_stores_removed
             + self.errors
             > 0
     }
@@ -681,6 +685,39 @@ impl Sweep {
         if let Some(bytes) = measured {
             compiler_cache::note_measured(&self.root, bytes);
         }
+    }
+
+    /// Remove the compiler-cache stores of repositories the owner no longer
+    /// has: `known` is every repository id in the owner's records (the
+    /// server's repository rows; a daemon's repository locations and the
+    /// repositories of its handles). A store goes [`ORPHAN_GRACE`] after it
+    /// was last handed to a run, like an orphaned Task root, and never while
+    /// a run of this process holds it or while `live_elsewhere` (the owner
+    /// runs something the live-run registry names no repository for).
+    /// Nothing is looked at on a root with no cache.
+    pub fn remove_cache_stores_of_deleted_repositories(
+        &self,
+        known: &HashSet<String>,
+        live_elsewhere: bool,
+        report: &mut GcReport,
+    ) {
+        if live_elsewhere {
+            return;
+        }
+        let Some(cache) = compiler_cache::collected(&self.root) else {
+            return;
+        };
+        let wrapper = compiler_cache::installed(&self.root).map(|cache| cache.wrapper.clone());
+        let done = compiler_cache::remove_stores_of_deleted_repositories(
+            &cache.dir,
+            wrapper.as_deref(),
+            known,
+            self.now,
+            ORPHAN_GRACE,
+            self.deadline,
+        );
+        report.cache_stores_removed += done.stores;
+        report.out_of_time |= done.out_of_time;
     }
 
     /// Take the build output of one Task root the caller proved idle: moved
@@ -1666,6 +1703,113 @@ mod tests {
         let report = pass(false);
         assert_eq!(report.cache_entries_evicted, 1);
         assert!(!oldest.exists() && kept_a.exists() && kept_b.exists());
+        compiler_cache::install(&root, None);
+    }
+
+    /// The store of a repository the owner no longer has goes a day after
+    /// its last run start: never a known repository's, never a fresh one,
+    /// never one a run holds, never a directory Forge did not mark, and its
+    /// sccache server is stopped first.
+    #[test]
+    fn compiler_cache_stores_of_deleted_repositories_are_removed_after_the_grace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let wrapper = dir.path().join("bin").join("sccache");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        let calls = dir.path().join("calls");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$SCCACHE_SERVER_UDS\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let cache_dir = root.join(compiler_cache::CACHE_DIR);
+        compiler_cache::install(
+            &root,
+            Some(compiler_cache::CompilerCache {
+                kind: compiler_cache::WrapperKind::of(&wrapper),
+                wrapper,
+                dir: cache_dir.clone(),
+                max_bytes: 1 << 30,
+            }),
+        );
+        let day = Duration::from_secs(24 * 60 * 60);
+        let store = |repository: &str, kind: Option<&str>, age: Duration| {
+            let store = cache_dir.join(repository);
+            fs::create_dir_all(store.join("0")).unwrap();
+            fs::write(store.join("0").join("entry"), "x").unwrap();
+            if let Some(kind) = kind {
+                let marker = store.join(compiler_cache::MARKER_FILE);
+                fs::write(&marker, kind).unwrap();
+                let then = SystemTime::now() - age;
+                fs::File::options()
+                    .write(true)
+                    .open(&marker)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_accessed(then).set_modified(then))
+                    .unwrap();
+            }
+            store
+        };
+        let known_old = store("repo-known", Some("kache"), day * 3);
+        let gone_fresh = store("repo-gone-fresh", Some("kache"), day / 2);
+        let gone_held = store("repo-gone-held", Some("kache"), day * 3);
+        let gone = store("repo-gone", Some("sccache"), day * 3);
+        let unmarked = store("not-forges", None, day * 3);
+        // The dead store's server still answers on its socket.
+        let server = std::os::unix::net::UnixListener::bind(gone.join("s")).unwrap();
+        let holder = root.join("holder").join("repo");
+        fs::create_dir_all(&holder).unwrap();
+        TaskRoot::reserve(holder.parent().unwrap()).unwrap();
+        let live = SandboxEnv::for_run(&holder, "holder", RunPurpose::Execution)
+            .with_compiler_cache(Some(compiler_cache::CacheEnv {
+                wrapper: PathBuf::from("/opt/kache"),
+                kind: compiler_cache::WrapperKind::Kache,
+                dir: Some(gone_held.clone()),
+                vars: Vec::new(),
+            }))
+            .prepared();
+        let known: HashSet<String> = ["repo-known".to_owned()].into();
+        let pass = |live_elsewhere: bool| {
+            let mut report = GcReport::default();
+            sweep(&root).remove_cache_stores_of_deleted_repositories(
+                &known,
+                live_elsewhere,
+                &mut report,
+            );
+            report
+        };
+
+        // The owner runs something the registry names no repository for.
+        assert_eq!(pass(true).cache_stores_removed, 0);
+        assert!(gone.exists());
+
+        let report = pass(false);
+        assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
+        assert!(!gone.exists(), "the dead repository's store is gone");
+        for kept in [&known_old, &gone_fresh, &gone_held, &unmarked] {
+            assert!(kept.join("0").join("entry").exists(), "{}", kept.display());
+        }
+        assert_eq!(
+            fs::read_dir(&cache_dir).unwrap().count(),
+            4,
+            "nothing is left renamed aside"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            format!("--stop-server|{}\n", gone.join("s").display())
+        );
+        drop(server);
+
+        // The run settles: its store goes on the next pass.
+        live.settle();
+        assert_eq!(pass(false).cache_stores_removed, 1);
+        assert!(!gone_held.exists() && known_old.exists() && gone_fresh.exists());
         compiler_cache::install(&root, None);
     }
 

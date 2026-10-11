@@ -3327,6 +3327,39 @@ mod tests {
         assert!(!entry.exists() && store.join("0").is_dir());
     }
 
+    /// The store of a repository whose row is gone is removed a day after
+    /// its last run start; a store whose repository still has a row stays.
+    #[tokio::test]
+    async fn gc_removes_the_compiler_cache_store_of_a_deleted_repository() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let repo_id = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .repo_id;
+        let cache_dir = root.join(executors::compiler_cache::CACHE_DIR);
+        let store = |repository: &str| {
+            let store = cache_dir.join(repository);
+            std::fs::create_dir_all(store.join("0")).unwrap();
+            std::fs::write(store.join(executors::compiler_cache::MARKER_FILE), "kache").unwrap();
+            std::fs::write(store.join("0").join("entry"), "x").unwrap();
+            store
+        };
+        let (kept, gone) = (store(&repo_id), store(&new_uuid_v4()));
+        let scheduler = gc_scheduler(&db, &root).await;
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(0, 0));
+
+        let report = gc_at(&scheduler, Duration::from_secs(60 * 60)).await;
+        assert_eq!(report.cache_stores_removed, 0, "inside the grace period");
+        assert!(gone.exists());
+        let report = gc_at(&scheduler, Duration::from_secs(25 * 60 * 60)).await;
+        assert_eq!((report.cache_stores_removed, report.errors), (1, 0));
+        assert!(!gone.exists() && kept.join("0").join("entry").exists());
+    }
+
     async fn gc_at(
         scheduler: &WorkspaceCleanupScheduler,
         after: Duration,
