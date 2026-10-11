@@ -753,6 +753,45 @@ async fn disconnected_remote_cancel_fences_workspace_until_reconnect_ack() {
     ));
 }
 
+/// The `done` cascade of a landed merge is put ahead of a waiting owner
+/// command (`priority` 2). A Cancel that asks for preemption while that
+/// cascade runs does not stop it: the Task whose change is on the target is
+/// reported done, not cancelled. A step the command outranks is still told.
+#[tokio::test]
+async fn a_preempting_cancel_does_not_stop_the_cascade_of_a_landed_merge() {
+    let (db, _worker) = fixture().await;
+    for (key, priority) in [("landed", 2), ("ordinary", 0)] {
+        sqlx::query("DELETE FROM task_step WHERE task_id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut cascade = step("done");
+        cascade.kind = "cascade".into();
+        cascade.causation_key = key.into();
+        let id = db.enqueue_step(&cascade).await.unwrap();
+        sqlx::query("UPDATE task_step SET priority=? WHERE id=?")
+            .bind(priority)
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_step("worker", Some("t"), &lease_deadline())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id);
+        let control = db.register_step_control(&claimed);
+        db.request_task_preemption("t").await.unwrap();
+        assert_eq!(
+            *control.preempt.borrow(),
+            priority == 0,
+            "{key}: preemption of a claimed step of priority {priority}"
+        );
+        db.release_step_control(&claimed);
+    }
+}
+
 #[tokio::test]
 async fn protected_merge_finishes_before_preempting_cancel_can_claim() {
     let (db, worker) = fixture().await;

@@ -188,6 +188,37 @@ impl World {
         .await
         .unwrap()
     }
+    /// What a Task that did not move is waiting on: its row, its attempts
+    /// and every step with its wake time and last error.
+    pub async fn stuck(&self, task: &str) -> String {
+        let now = db::now_rfc3339();
+        let row: (String, i64, Option<String>) =
+            sqlx::query_as("SELECT status,version,condition_json FROM task WHERE id=?")
+                .bind(task)
+                .fetch_one(self.db.pool())
+                .await
+                .unwrap();
+        let attempts: Vec<(String, i64, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT state,effect_seq,permit_json,effect_ack_json,cancel_requested_at FROM integration_attempt WHERE task_ref=? ORDER BY rowid")
+                .bind(task)
+                .fetch_all(self.db.pool())
+                .await
+                .unwrap();
+        let steps: Vec<(i64, String, String, String, i64, String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT seq,kind,causation_key,status,attempts,available_at,last_error,payload_json FROM task_step WHERE task_id=? ORDER BY seq")
+                .bind(task)
+                .fetch_all(self.db.pool())
+                .await
+                .unwrap();
+        let mut out = format!("now {now}\ntask {row:?}\n");
+        for attempt in attempts {
+            out.push_str(&format!("attempt {attempt:?}\n"));
+        }
+        for step in steps {
+            out.push_str(&format!("step {step:?}\n"));
+        }
+        out
+    }
     /// `(from, to, reason, bridge_kind, triggered_by, rejection)` rows.
     pub async fn transitions(
         &self,
@@ -977,11 +1008,22 @@ async fn race_once(world: &World, task: &'static str) -> bool {
     // test's, not the step queue's.
     let cancel = tokio::spawn(async move { service.cancel_task(task).await });
     let _ = tokio::spawn(async move { port.enqueue_step(&request).await }).await;
-    eventually("the race settled", || async {
-        let a = world.attempt(&a.id).await;
-        a.permit_json.is_some() || world.task(task).await.status == "cancelled"
-    })
-    .await;
+    // Bounded by what the race needs, not by the runner: a round that has
+    // not settled in a minute is stuck, and says on what.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let now = world.attempt(&a.id).await;
+        if now.permit_json.is_some() || world.task(task).await.status == "cancelled" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "the race did not settle in 60 s:\n{}",
+                world.stuck(task).await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let after = world.attempt(&a.id).await;
     let status = world.task(task).await.status;
     let permit = after.permit_json.is_some();
@@ -1000,10 +1042,16 @@ async fn race_once(world: &World, task: &'static str) -> bool {
             .set(&a.id, "state='applied',integrated_sha=candidate_sha")
             .await;
         world.port.ready_result_step(&a.id, 1).await.unwrap();
-        eventually("the permitted Task is done", || async {
-            world.task(task).await.status == "done"
-        })
-        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while world.task(task).await.status != "done" {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "the permitted Task is not done after 60 s:\n{}",
+                    world.stuck(task).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     } else {
         assert_eq!(status, "cancelled");
         assert!(after.cancel_requested_at.is_some());
