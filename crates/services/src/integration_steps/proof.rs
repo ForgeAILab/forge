@@ -146,11 +146,7 @@ pub(crate) fn recorded_commit(
     attempt: &IntegrationAttempt,
     queue: &IntegrationQueue,
 ) -> std::result::Result<String, String> {
-    let Some(integrated) = attempt
-        .integrated_sha
-        .clone()
-        .filter(|sha| !sha.is_empty())
-    else {
+    let Some(integrated) = attempt.integrated_sha.clone().filter(|sha| !sha.is_empty()) else {
         return Err("the attempt records no merged commit".into());
     };
     let receipts: Vec<IntegrationEffectReceipt> =
@@ -161,14 +157,14 @@ pub(crate) fn recorded_commit(
                 receipt.request.kind,
                 IntegrationOperationKind::FastForward | IntegrationOperationKind::Merge
             ))
-        .then(|| {
-            match serde_json::from_value::<OwnerMergeReceipt>(receipt.result.clone()) {
+        .then(
+            || match serde_json::from_value::<OwnerMergeReceipt>(receipt.result.clone()) {
                 Ok(OwnerMergeReceipt::Completed {
                     outcome: crate::MergeOutcome::Done { after_sha, .. },
                 }) => Some((&receipt.request.fence, after_sha)),
                 _ => None,
-            }
-        })
+            },
+        )
         .flatten()
     });
     if let Some((fence, after)) = merged {

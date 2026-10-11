@@ -1990,7 +1990,11 @@ async fn a_pre_queue_attempt_is_not_claimable_until_the_import_has_continued_it(
         ));
         step(&db, "a", "cont", "integration", &key, "pending").await;
         for live in ["pending", "claimed"] {
-            exec(&db, &format!("UPDATE task_step SET status='{live}' WHERE id='cont'")).await;
+            exec(
+                &db,
+                &format!("UPDATE task_step SET status='{live}' WHERE id='cont'"),
+            )
+            .await;
             assert!(listed(&db).await.is_empty(), "{live}");
             assert!(matches!(
                 claim(&db, &q.id, NOW, LATER).await,
@@ -2003,7 +2007,11 @@ async fn a_pre_queue_attempt_is_not_claimable_until_the_import_has_continued_it(
         step(&db, "a", "legacy", "hooks", "legacy", "pending").await;
         exec(&db, "INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES('legacy',0,'2026-10-08T00:00:00Z','{\"rebase_target\":\"\\\"abc\\\"\"}')").await;
         for live in ["pending", "claimed", "suspended"] {
-            exec(&db, &format!("UPDATE task_step SET status='{live}' WHERE id='legacy'")).await;
+            exec(
+                &db,
+                &format!("UPDATE task_step SET status='{live}' WHERE id='legacy'"),
+            )
+            .await;
             assert!(listed(&db).await.is_empty(), "legacy {live}");
             assert!(matches!(
                 claim(&db, &q.id, NOW, LATER).await,
@@ -2012,7 +2020,11 @@ async fn a_pre_queue_attempt_is_not_claimable_until_the_import_has_continued_it(
         }
         // A hooks step with no effect of the old merge path only admits: it
         // holds nothing.
-        exec(&db, "UPDATE task_hook_checkpoint SET effects_json='{}' WHERE step_id='legacy'").await;
+        exec(
+            &db,
+            "UPDATE task_hook_checkpoint SET effects_json='{}' WHERE step_id='legacy'",
+        )
+        .await;
         assert_eq!(listed(&db).await, vec![q.id.clone()]);
         exec(&db, "UPDATE task_hook_checkpoint SET effects_json='{\"merge_intent\":\"{}\"}' WHERE step_id='legacy'").await;
         assert!(listed(&db).await.is_empty());
@@ -2043,7 +2055,10 @@ async fn an_admitted_attempt_is_claimed_past_a_pre_queue_row_that_was_not_handed
     assert!(shadow.queue_seq < admitted.queue_seq);
     assert_eq!(listed(&db).await, vec![q.id.clone()]);
     let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
-    assert_eq!(claimed.head_attempt_id.as_deref(), Some(admitted.id.as_str()));
+    assert_eq!(
+        claimed.head_attempt_id.as_deref(),
+        Some(admitted.id.as_str())
+    );
 }
 
 /// An imported unknown result is a reserved head. The worker does not drive

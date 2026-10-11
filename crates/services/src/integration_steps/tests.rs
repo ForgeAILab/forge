@@ -552,14 +552,20 @@ async fn deliver_result(world: &World, attempt: &IntegrationAttempt) -> bool {
     let key = IntegrationQueueWorker::step_request(attempt, IntegrationStepAction::Result)
         .causation_key();
     let key = &key;
-    eventually("the result step answered or asks again later", || async move {
-        let steps = world.db.task_steps(&attempt.task_ref).await.unwrap();
-        let step = steps.iter().find(|step| &step.causation_key == key).unwrap();
-        step.status == "done"
-            || (step.status == "pending"
-                && step.attempts > 0
-                && step.available_at > db::now_rfc3339())
-    })
+    eventually(
+        "the result step answered or asks again later",
+        || async move {
+            let steps = world.db.task_steps(&attempt.task_ref).await.unwrap();
+            let step = steps
+                .iter()
+                .find(|step| &step.causation_key == key)
+                .unwrap();
+            step.status == "done"
+                || (step.status == "pending"
+                    && step.attempts > 0
+                    && step.available_at > db::now_rfc3339())
+        },
+    )
     .await;
     let steps = world.db.task_steps(&attempt.task_ref).await.unwrap();
     steps
@@ -604,7 +610,10 @@ async fn result_reports_done_only_when_the_target_owner_proves_the_commit() {
     assert!(deliver_result(&world, &a).await, "answered, not reported");
     assert_eq!(reads(a.candidate_sha.as_deref().unwrap()), 1);
     unresolved(&world, "forged").await;
-    assert!(world.comments("forged").await.is_empty(), "no merged comment");
+    assert!(
+        world.comments("forged").await.is_empty(),
+        "no merged comment"
+    );
     let answer = ack(&world.attempt(&a.id).await, IntegrationStepAction::Result).unwrap();
     assert_eq!(answer.outcome, IntegrationStepOutcome::NotLanded);
 
@@ -612,9 +621,7 @@ async fn result_reports_done_only_when_the_target_owner_proves_the_commit() {
     //    old tip), which is not the Task's commit.
     let b = world.add_task("mismatched", "f2", "two\n").await;
     let b = world.place(&b.id, "applied", 1).await;
-    world
-        .set(&b.id, &format!("integrated_sha='{base}'"))
-        .await;
+    world.set(&b.id, &format!("integrated_sha='{base}'")).await;
     let b = world.attempt(&b.id).await;
     let asked_before = reads(&base);
     assert!(deliver_result(&world, &b).await);
@@ -638,12 +645,14 @@ async fn result_reports_done_only_when_the_target_owner_proves_the_commit() {
         .unwrap()
         .unwrap();
     let owner = json!({"location_id":"l-r","owner_kind":"server","daemon_id":null,"runtime_id":null,"generation":1});
-    sqlx::query("UPDATE integration_queue SET target_location_id='l-r',target_owner_json=? WHERE id=?")
-        .bind(owner.to_string())
-        .bind(&queue.id)
-        .execute(world.db.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE integration_queue SET target_location_id='l-r',target_owner_json=? WHERE id=?",
+    )
+    .bind(owner.to_string())
+    .bind(&queue.id)
+    .execute(world.db.pool())
+    .await
+    .unwrap();
     let receipt = |attempt_id: &str, generation: i64, owner: Value, after: &str| {
         json!([{
             "request": {
@@ -659,7 +668,10 @@ async fn result_reports_done_only_when_the_target_owner_proves_the_commit() {
     };
     let other_owner = json!({"location_id":"l-r","owner_kind":"daemon","daemon_id":"d-other","runtime_id":"r","generation":1});
     for (seq, (key, forged)) in [
-        ("other-attempt", receipt("someone-else", 1, owner.clone(), &sha)),
+        (
+            "other-attempt",
+            receipt("someone-else", 1, owner.clone(), &sha),
+        ),
         ("later-generation", receipt(&c.id, 7, owner.clone(), &sha)),
         ("other-owner", receipt(&c.id, 1, other_owner, &sha)),
         ("other-commit", receipt(&c.id, 1, owner.clone(), &base)),

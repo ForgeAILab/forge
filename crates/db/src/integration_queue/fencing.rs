@@ -360,9 +360,13 @@ impl SqliteDb {
     /// ever report). `Ok(false)`: the attempt has no such operation.
     pub async fn settle_imported_integration_operation(&self, attempt_id: &str) -> Result<bool> {
         let mut tx = begin_immediate(self.pool()).await?;
-        let settled =
-            settle_imported_operations(&mut tx, "id=?1", attempt_id, "settled by the owner's Retry")
-                .await?;
+        let settled = settle_imported_operations(
+            &mut tx,
+            "id=?1",
+            attempt_id,
+            "settled by the owner's Retry",
+        )
+        .await?;
         tx.commit().await?;
         Ok(settled > 0)
     }

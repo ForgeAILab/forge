@@ -424,18 +424,39 @@ async fn the_live_queue_list_covers_targets_and_outstanding_intents() {
 #[test]
 fn nothing_on_the_head_side_can_recreate_a_worktree() {
     for (name, source) in [
-        ("integration_worker/mod", include_str!("../integration_worker/mod.rs")),
-        ("integration_worker/driver", include_str!("../integration_worker/driver.rs")),
-        ("integration_worker/ports", include_str!("../integration_worker/ports.rs")),
+        (
+            "integration_worker/mod",
+            include_str!("../integration_worker/mod.rs"),
+        ),
+        (
+            "integration_worker/driver",
+            include_str!("../integration_worker/driver.rs"),
+        ),
+        (
+            "integration_worker/ports",
+            include_str!("../integration_worker/ports.rs"),
+        ),
         ("integration_ports/mod", include_str!("mod.rs")),
         ("integration_ports/facts", include_str!("facts.rs")),
         ("integration_ports/owner", include_str!("owner.rs")),
         ("integration_ports/transfer", include_str!("transfer.rs")),
         ("integration_owner", include_str!("../integration_owner.rs")),
-        ("integration_effects/merge", include_str!("../integration_effects/merge.rs")),
-        ("integration_effects/rebase", include_str!("../integration_effects/rebase.rs")),
-        ("integration_effects/check", include_str!("../integration_effects/check.rs")),
-        ("integration_effects/rpc", include_str!("../integration_effects/rpc.rs")),
+        (
+            "integration_effects/merge",
+            include_str!("../integration_effects/merge.rs"),
+        ),
+        (
+            "integration_effects/rebase",
+            include_str!("../integration_effects/rebase.rs"),
+        ),
+        (
+            "integration_effects/check",
+            include_str!("../integration_effects/check.rs"),
+        ),
+        (
+            "integration_effects/rpc",
+            include_str!("../integration_effects/rpc.rs"),
+        ),
     ] {
         // Production code only: each file's own test module is below it.
         let code = source

@@ -720,10 +720,17 @@ async fn an_unresolved_merge_refuses_the_four_guarded_writes_until_its_machine_i
 
     let refused = |error: Value, what: &str| {
         assert_eq!(error["code"], "integration_unresolved", "{what}: {error}");
-        assert_eq!(error["details"]["task_id"], task_id.as_str(), "{what}: {error}");
+        assert_eq!(
+            error["details"]["task_id"],
+            task_id.as_str(),
+            "{what}: {error}"
+        );
         assert_eq!(error["details"]["machine"], "mac", "{what}: {error}");
         let message = error["message"].as_str().unwrap_or_default();
-        assert!(message.contains(&task_id) && message.contains("mac"), "{what}: {message}");
+        assert!(
+            message.contains(&task_id) && message.contains("mac"),
+            "{what}: {message}"
+        );
     };
     let app = &fixture.harness.app;
     let repo_path = format!("/api/v1/repos/{}", repo.id);
@@ -774,7 +781,11 @@ async fn an_unresolved_merge_refuses_the_four_guarded_writes_until_its_machine_i
         .await,
         "default location change",
     );
-    for (table, id) in [("repo", &repo.id), ("repo_location", &target.id), ("project", &repo.project_id)] {
+    for (table, id) in [
+        ("repo", &repo.id),
+        ("repo_location", &target.id),
+        ("project", &repo.project_id),
+    ] {
         let kept: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE id=?"))
             .bind(id)
             .fetch_one(db.pool())
@@ -789,8 +800,14 @@ async fn an_unresolved_merge_refuses_the_four_guarded_writes_until_its_machine_i
         .execute(db.pool())
         .await
         .expect("daemon goes offline");
-    let removed = common::raw_empty_request(app, Method::DELETE, &format!("/api/v1/daemons/{daemon_id}")).await;
-    assert!(removed.status().is_success(), "machine removal: {}", removed.status());
+    let removed =
+        common::raw_empty_request(app, Method::DELETE, &format!("/api/v1/daemons/{daemon_id}"))
+            .await;
+    assert!(
+        removed.status().is_success(),
+        "machine removal: {}",
+        removed.status()
+    );
     let settled = db
         .integration_attempt(&attempt.id)
         .await
@@ -810,11 +827,24 @@ async fn an_unresolved_merge_refuses_the_four_guarded_writes_until_its_machine_i
         StatusCode::OK,
     )
     .await;
-    assert!(updated.is_default, "the default changes once the merge is settled");
-    let response = common::raw_empty_request(app, Method::DELETE, &fixture.location_path(&target.id)).await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT, "old target location delete");
-    let response = common::raw_empty_request(app, Method::DELETE, &format!("{project_path}?force=true")).await;
-    assert!(response.status().is_success(), "Project delete: {}", response.status());
+    assert!(
+        updated.is_default,
+        "the default changes once the merge is settled"
+    );
+    let response =
+        common::raw_empty_request(app, Method::DELETE, &fixture.location_path(&target.id)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "old target location delete"
+    );
+    let response =
+        common::raw_empty_request(app, Method::DELETE, &format!("{project_path}?force=true")).await;
+    assert!(
+        response.status().is_success(),
+        "Project delete: {}",
+        response.status()
+    );
     let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id=?")
         .bind(&repo.id)
         .fetch_one(db.pool())

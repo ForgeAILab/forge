@@ -1253,7 +1253,10 @@ async fn the_importer_takes_nothing_from_a_workflow_with_no_merge_state() {
     world.seed_execution("t", "executor", None).await;
     let mut workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
     for state in &mut workflow.states {
-        state.hooks.on_enter.retain(|hook| hook.action != "run_merge");
+        state
+            .hooks
+            .on_enter
+            .retain(|hook| hook.action != "run_merge");
     }
     sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
         .bind(serde_json::to_string(&workflow).unwrap())
@@ -1317,9 +1320,11 @@ async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_mer
         )
         .await;
     world
-        .until("t", "the Task merges after the explicit settlement", || async {
-            world.task("t").await.status == "done"
-        })
+        .until(
+            "t",
+            "the Task merges after the explicit settlement",
+            || async { world.task("t").await.status == "done" },
+        )
         .await;
     assert_eq!(world.merges("t").await, 1);
     let old = world.attempt(&imported.id).await;
