@@ -662,7 +662,7 @@ pub fn with_project_defaults(workflow: &WorkflowDefinition, settings: &str) -> W
     workflow
 }
 /// Whether the Task step running now acts for the owner: a hook, cascade or
-/// request whose typed actor has owner authority, or a `rerun_review` command.
+/// request whose typed actor has owner authority.
 fn owner_step(task: &str) -> bool {
     crate::task_writer::current_task_step()
         .filter(|s| s.task_id == task)
@@ -673,7 +673,7 @@ fn owner_step(task: &str) -> bool {
                     serde_json::from_value::<api_types::Actor>(actor.clone())
                         .is_ok_and(|actor| actor.is_owner())
                 })
-            }) || p.get("operation").and_then(Value::as_str) == Some("rerun_review")
+            })
         })
 }
 
