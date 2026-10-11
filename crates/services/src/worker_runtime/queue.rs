@@ -26,6 +26,24 @@ const LONG_CONCURRENCY: usize = 4;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const LEASE_SECONDS: i64 = 60;
 
+#[cfg(test)]
+fn preemption_diagnostics() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
+{
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    STATES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn preemption_diagnostic(step_id: &str) -> Option<String> {
+    preemption_diagnostics()
+        .lock()
+        .unwrap()
+        .get(step_id)
+        .cloned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CascadePayload {
     #[serde(flatten)]
@@ -723,6 +741,11 @@ impl TaskStepWorker {
             }
         });
         let control = self.db.register_step_control(&step);
+        #[cfg(test)]
+        crate::integration_steps::preemption_tests::capture_preempt(
+            &step.task_id,
+            control.preempt.clone(),
+        );
         let integration: bool = sqlx::query_scalar(
             "SELECT integration_started_at IS NOT NULL FROM task_step WHERE id=?",
         )
@@ -767,7 +790,20 @@ impl TaskStepWorker {
         drop(work);
         let result = match result {
             Some(result) => result,
-            None => self.preempt_step(&step).await,
+            None => {
+                #[cfg(test)]
+                preemption_diagnostics()
+                    .lock()
+                    .unwrap()
+                    .insert(step.id.clone(), "preempt_step entered".into());
+                let result = self.preempt_step(&step).await;
+                #[cfg(test)]
+                preemption_diagnostics().lock().unwrap().insert(
+                    step.id.clone(),
+                    format!("preempt_step returned: {result:?}"),
+                );
+                result
+            }
         };
         self.db.release_step_control(&step);
         let _ = stop.send(true);

@@ -672,6 +672,8 @@ impl IntegrationSteps {
         };
 
         let now = db::now_rfc3339();
+        #[cfg(test)]
+        super::preemption_tests::interrupt_begin_if_armed(self.db.pool(), &task.id).await;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let current = db::integration_attempt_in_tx(&mut tx, &attempt.id).await?;
         if current.revision != attempt.revision {

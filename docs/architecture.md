@@ -8098,6 +8098,16 @@ other branches, and a stopped transaction keeps the write lock that call then
 waits for until the busy timeout. `FORGE_DB_BUSY_TIMEOUT_MS` shortens the
 timeout for diagnosis.
 
+Connection release rolls back any remaining SQLx transaction depth before the
+event-notification fast path or pool reuse. SQLx's custom `BEGIN IMMEDIATE`
+acknowledges BEGIN before awaiting its handle check and constructing the
+`Transaction` rollback guard. A Cancel/Hold that drops the future in that gap
+must not return an open write transaction to the pool. The release hook covers
+every integration action and owner command using the standard pool, including
+their decision-to-commit windows, while preserving the existing permit/result
+protection and owner-command ordering. The depth check is an atomic read; an
+ordinary connection release adds no SQLite worker round trip.
+
 The revised schema adds `account_main_agent_binding`,
 `project_agent_binding`, immutable `project_admission_receipt`, `agent_chat`,
 immutable `agent_chat_message`, bounded `agent_chat_turn_job`, and immutable

@@ -1,7 +1,7 @@
 use crate::{DbError, Result, SqliteStorageStatus};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    Connection, Sqlite, SqliteConnection, SqlitePool, Transaction,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteTransactionManager},
+    Connection, Sqlite, SqliteConnection, SqlitePool, Transaction, TransactionManager,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -261,6 +261,14 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
         .after_release(move |connection, _metadata| {
             let hooks = Arc::clone(&on_release);
             Box::pin(async move {
+                // A custom BEGIN is acknowledged before SQLx awaits its
+                // handle check and constructs the Transaction rollback guard.
+                // Dropping that future can return an open transaction here.
+                // Flush it (and any savepoints) before another owner gets the
+                // connection. The ordinary path is only an atomic depth read.
+                while SqliteTransactionManager::get_transaction_depth(connection) > 0 {
+                    SqliteTransactionManager::rollback(connection).await?;
+                }
                 // The common read/non-event-write path needs neither a ping nor
                 // a trip to the SQLite worker. A marker is published in the
                 // pre-commit hook; delivery waits for this committed release.
@@ -465,6 +473,50 @@ mod tests {
         sqlx::raw_sql("CREATE TABLE domain_event(id INTEGER PRIMARY KEY, v TEXT UNIQUE); CREATE TABLE other(v TEXT);")
             .execute(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn release_rolls_back_unowned_transaction_and_savepoints() {
+        // One connection forces reuse of the abandoned BEGIN, rather than
+        // hiding it behind a replacement. Committed data must survive.
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE other(v TEXT); INSERT INTO other VALUES ('committed');")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        // SQLx has acknowledged BEGIN, but no Transaction rollback guard
+        // owns it: the same state as cancellation during the handle check.
+        SqliteTransactionManager::begin(&mut connection, Some("BEGIN IMMEDIATE".into()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO other VALUES ('uncommitted')")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        SqliteTransactionManager::begin(&mut connection, None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO other VALUES ('savepoint')")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let mut reused = pool.acquire().await.unwrap();
+        assert_eq!(SqliteTransactionManager::get_transaction_depth(&reused), 0);
+        let rows: Vec<String> = sqlx::query_scalar("SELECT v FROM other")
+            .fetch_all(&mut *reused)
+            .await
+            .unwrap();
+        assert_eq!(rows, ["committed"]);
+        drop(reused);
+        let mut tx = begin_immediate(&pool).await.unwrap();
+        sqlx::query("INSERT INTO other VALUES ('next owner')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
     }
     // Ports W1-W5 without wall-clock performance thresholds. The fast-path
     // counter proves ordinary pool users take no additional worker round trip.
