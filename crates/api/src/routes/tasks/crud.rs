@@ -43,7 +43,7 @@ pub async fn create_task(
 }
 
 // Bump when the derived task-list projection changes across deployments.
-const TASK_LIST_PROJECTION_VERSION: u32 = 2;
+const TASK_LIST_PROJECTION_VERSION: u32 = 3;
 
 pub async fn list_tasks(
     State(state): State<AppState>,
@@ -72,6 +72,10 @@ pub async fn list_tasks(
         hex::encode(Sha256::digest(serde_json::to_vec(&(
             project_id.as_str(),
             snapshot.list_revision,
+            // The merge queue advances without a Task or Project write.
+            snapshot.integration_revision.as_str(),
+            // A pause is a wait cause of every member and writes no Task.
+            snapshot.project_paused,
             TASK_LIST_PROJECTION_VERSION,
             &params
         ))?))
@@ -192,6 +196,12 @@ pub async fn list_tasks(
     let mut budget_counts = snapshot.budgets(&task_ids).await?;
     let recovery_limit = db::budget::recovery_limit(&snapshot.project_settings);
     let links = snapshot.links(&task_ids).await?;
+    // One statement for the page, whatever its size.
+    let integration_rows = snapshot.integration(&task_ids).await?;
+    let mut integration = services::integration_reads::task_integration_summaries(
+        &integration_rows,
+        tasks.iter().map(|(task, _)| task),
+    );
     let reviews = reviews
         .into_iter()
         .map(|review| (review.task_id.clone(), review))
@@ -238,6 +248,7 @@ pub async fn list_tasks(
                     .expect("validated budget policy");
             let latest_review = reviews.get(&task.id);
             let external_link = links.get(&task.id);
+            let integration = integration.remove(&task.id);
             crate::routes::task_projection::task_list_response(
                 task,
                 &workflow,
@@ -251,6 +262,7 @@ pub async fn list_tasks(
                     running_executions: &running_executions,
                 },
                 external_link,
+                integration,
             )
         })
         .collect();

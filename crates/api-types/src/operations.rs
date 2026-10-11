@@ -91,7 +91,55 @@ pub struct OperatorStatusResponse {
     pub computed_at: String,
 }
 
-/// Passive queue/import observations; no integration worker is active.
+/// How many, and how long the oldest has been there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationBacklog {
+    #[ts(type = "number")]
+    pub count: i64,
+    /// Whole seconds; `null` when `count` is 0.
+    #[ts(type = "number | null")]
+    pub oldest_age_seconds: Option<i64>,
+}
+
+/// Nearest-rank percentiles of one duration over the sampled merges, in
+/// milliseconds. All `null` when no sampled merge measured it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationPercentiles {
+    /// Merges that measured this duration.
+    #[ts(type = "number")]
+    pub samples: i64,
+    #[ts(type = "number | null")]
+    pub p50_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub p95_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub max_ms: Option<i64>,
+}
+
+/// Where merges that completed in the window spent their time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationTimingStatus {
+    #[ts(type = "number")]
+    pub window_seconds: i64,
+    /// Completed merges read, newest first; at most `sample_limit`.
+    #[ts(type = "number")]
+    pub completed: i64,
+    #[ts(type = "number")]
+    pub sample_limit: i64,
+    /// From entering the queue to taking its head.
+    pub queue_wait: IntegrationPercentiles,
+    /// At the head, over every round of the merge.
+    pub head_time: IntegrationPercentiles,
+    /// The split of the head time: the three effects.
+    pub rebase: IntegrationPercentiles,
+    pub check: IntegrationPercentiles,
+    pub fast_forward: IntegrationPercentiles,
+}
+
+/// The merge queues, as counts, ages and timings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct IntegrationQueueStatus {
@@ -101,6 +149,17 @@ pub struct IntegrationQueueStatus {
     pub current_attempts_by_state: std::collections::BTreeMap<String, i64>,
     #[ts(type = "number")]
     pub quarantined_imports: i64,
+    /// Members in line, aged from when they entered the queue.
+    #[serde(default)]
+    pub waiting: IntegrationBacklog,
+    /// Members being merged, aged from when they took the head.
+    #[serde(default)]
+    pub heads: IntegrationBacklog,
+    /// Members whose merge stopped, aged from when it did.
+    #[serde(default)]
+    pub parked: IntegrationBacklog,
+    #[serde(default)]
+    pub timings: IntegrationTimingStatus,
 }
 
 /// Cascade queue health, separate from durable consumer dead letters.

@@ -1146,6 +1146,16 @@ impl RuntimeSupervisor {
                 },
             ),
         ));
+        // The queue worker has no event bus: this read-only projector turns
+        // what it wrote into `integration.updated` for SSE clients.
+        self.handles.push((
+            RuntimeWorker::IntegrationQueue,
+            Arc::new(crate::queue_invalidation::IntegrationUpdateProjector::new(
+                Arc::clone(&self.runtime.db),
+                Arc::clone(&self.runtime.event_bus),
+            ))
+            .start(&periodic_workers, shutdown.clone()),
+        ));
         self.handles.push((
             RuntimeWorker::TaskDispatcher,
             Arc::clone(&self.runtime.task_dispatcher).start(),
@@ -1397,7 +1407,7 @@ mod tests {
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
         assert_eq!(supervisor.workers().len(), 19);
-        assert_eq!(supervisor.worker_handle_count(), 18);
+        assert_eq!(supervisor.worker_handle_count(), 19);
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
@@ -1450,6 +1460,7 @@ mod tests {
             "environment-settings-observer",
             "check-runs",
             "integration-queue",
+            "integration-read-projection",
         ];
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1500,7 +1511,7 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 18);
+        assert_eq!(supervisor.worker_handle_count(), 19);
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }

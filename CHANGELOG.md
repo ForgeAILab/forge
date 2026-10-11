@@ -1238,6 +1238,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   without merging** (it was "Advance Task"): it ends the Task as done, merges
   nothing and cancels its place in the merge queue.
 
+- **Operator status shows where merges spend their time (3.2 stage D3a).**
+  `GET /api/v1/operations/status` `integration_queues` adds `waiting`,
+  `heads` and `parked` (`{ count, oldest_age_seconds }`: the head age is the
+  oldest `heads` age) and `timings`: over the merges completed in the last 24
+  hours (newest 500), nearest-rank `p50_ms` / `p95_ms` / `max_ms` of the queue
+  wait, the time at the head, and its split into rebase, check and
+  fast-forward. `forge-ctl operations status` prints them as a "Merge queue"
+  section. Additive: the existing counts are unchanged.
+- **The web says where a Task is in the merge queue (3.2 stage D3b).** Board
+  cards and Task detail label a Task from its `integration` summary: "In merge
+  queue (n ahead)", "Merging: rebasing / checking / fast-forwarding",
+  "Waiting for <machine>", "Waiting: project paused / held", "Merge stopped:
+  <cause>". "Fix merge" is shown only while the change is back with its coder
+  for a repair. Task detail adds what is known and the action that moves a
+  waiting merge. The labels read the summary, not the state's name, so a
+  custom workflow's merge states read the same; a state, phase or wait reason
+  a newer server adds reads neutrally. SSE `integration.updated` refetches the
+  named Task, the open details of members of that queue and the Task lists of
+  the Projects the event names.
+
 - **A review entry asks for its checks again by itself.** When the review
   commands of a Task or its Project change while the entry's checks run, the
   finished check is not applied (as before) and the entry now asks again for
@@ -2426,6 +2446,44 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- **Merge queue reads (3.2 stage D3a).** `GET
+  /api/v1/repos/{id}/integration-queues` lists a repository's merge queues,
+  one per target branch (`items`, opaque `cursor`, `has_more`): the queue's
+  state and why it is not open, the Task being merged, and the members in
+  queue order with their state, phase, position, typed wait reason and
+  timings. Task detail and every Task list item carry `integration`, a
+  `TaskIntegrationSummary` (`attempt_id`, queue and target branch, `state`,
+  `phase`, `position`, `wait`, `action_hint`, `timings`), or `null` when the
+  Task has no attempt in progress; MCP `forge_get_task` and `forge_list_tasks`
+  return the same field. The Task list reads a page's summaries in one
+  statement, and its `ETag` now changes when the queue advances or the Project
+  is paused. A queue read lists only members of the reader's Project; a member
+  of any other Project is counted and never listed. `action_hint: retry` is
+  hinted exactly when the Task offers `integration_retry`. The enums of these
+  reads are open: clients must tolerate values they do not know. New index
+  migration `V202610111630` (additive).
+- **Merge queue in `forge-ctl` and for agents (3.2 stage D3a).** `forge-ctl
+  repo queue <REPO_ID>` lists a repository's merge queues (table, or the
+  route's response with `--output json`). `forge-ctl task show` (a second name
+  for `task get`, which the documentation already used) prints the queue
+  target, phase, position and wait reason of a Task in the queue. A bound
+  Project Agent reads the same queues with the new registered read
+  `repo.integration_queue` (`{limit?, target_branch?}`) of the Project
+  orchestration read tool; the Project and `project_verify_solo` tool prefix
+  ceilings grow by 77 bytes for it. `POST /mcp` has the same read as the new
+  tool `forge_get_integration_queue` (`{project_id, target_branch?, limit?}`),
+  authorized like the REST route. `repo queue --output json` prints the
+  server's answer unchanged.
+- **SSE `integration.updated {repo_id, queue_id, task_id, project_ids}` (3.2
+  stage D3a).** A cache invalidation for the merge queue reads, ids only: at
+  most one event per queue and projector read, published when something a
+  reader of the summary sees changed. `task_id` is the one Task that changed,
+  or `null` when several did or the queue's own state or head did;
+  `project_ids` are the Projects concerned. Bus-only: it is not in the durable
+  event ledger, is not replayed on resume, and has no Attention category. An
+  idle queue, a lease renewal and a receipt publish nothing. New periodic
+  worker `integration-read-projection` (read-only).
 
 - **Operations status has a `checks` section.** `GET /api/v1/operations/status`
   reports what the check runner is doing now: `queued`, `running`,

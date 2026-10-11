@@ -11,6 +11,11 @@ pub struct TaskListRead {
     pub workflow_definition: String,
     pub project_settings: String,
     pub conditional_safe: bool,
+    /// The Project is paused (a merge-queue wait cause).
+    pub project_paused: bool,
+    /// Validator of the list's `integration` summaries: the merge queue
+    /// advances without writing a Task or the Project.
+    pub integration_revision: String,
 }
 
 impl SqliteDb {
@@ -18,7 +23,7 @@ impl SqliteDb {
         let mut transaction = self.pool.begin().await?;
         // The first SELECT fixes the snapshot. Conditional hits use this indexed row and the deferred-dispatch index.
         let row = sqlx::query(
-            "SELECT board_revision, list_revision, workflow_definition, settings FROM project WHERE id = ?",
+            "SELECT board_revision, list_revision, workflow_definition, settings, paused_at IS NOT NULL AS paused FROM project WHERE id = ?",
         )
         .bind(project_id)
         .fetch_optional(&mut *transaction)
@@ -29,6 +34,9 @@ impl SqliteDb {
             workflow_definition: row.try_get("workflow_definition")?,
             project_settings: row.try_get("settings")?,
             list_revision: row.try_get("list_revision")?,
+            project_paused: row.try_get("paused")?,
+            integration_revision: crate::integration_list_revision(&mut *transaction, project_id)
+                .await?,
             conditional_safe: !sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_extract(condition_json,'$.evidence.presentation.retry_recorded')=1 AND deleted_at IS NULL)",
             ).bind(project_id).fetch_one(&mut *transaction).await?,
@@ -71,6 +79,10 @@ impl TaskListRead {
     }
     pub async fn transitions(&mut self, ids: &[&str]) -> Result<Vec<crate::TransitionLog>> {
         workflow::transitions_for_tasks(&mut self.transaction, ids).await
+    }
+    /// The merge-queue attempt in progress of each Task, in one statement.
+    pub async fn integration(&mut self, ids: &[&str]) -> Result<Vec<crate::IntegrationMemberRead>> {
+        crate::integration_members_of_tasks(&mut *self.transaction, ids).await
     }
     pub async fn links(&mut self, ids: &[&str]) -> Result<Vec<TaskExternalLink>> {
         external_link::latest_links(&mut self.transaction, ids).await

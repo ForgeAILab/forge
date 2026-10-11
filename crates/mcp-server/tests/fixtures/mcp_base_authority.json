@@ -247,6 +247,13 @@
       "project_admin": true,
       "project_owner": true
     },
+    "forge_get_integration_queue": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
     "forge_list_agent_chats": {
       "account": true,
       "project_public": true,

@@ -593,6 +593,7 @@ fn task_response(
             details: Default::default(),
         },
         workflow_health: None,
+        integration: None,
         workflow_exception: None,
         execution_observability: TaskExecutionObservability {
             counts: ActivityCounts {

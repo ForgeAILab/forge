@@ -252,6 +252,26 @@ forge-ctl task prompt-preview <TASK_ID> --role coder
 forge-ctl task action <TASK_ID> cancel
 ```
 
+`task show` (also `task get`) prints the Task's row. For a Task in the merge
+queue the table output adds where it is and why it waits, from the Task's
+`integration` summary; `--output json` prints the whole Task, `integration`
+included:
+
+```text
+Merge queue: main
+  state     in merge queue (2 ahead)
+  position  2 ahead
+  wait      others are ahead
+  queued    2026-10-11T09:14:03+00:00 (round 0)
+```
+
+`state` reads `in merge queue (n ahead)`, `merging: rebasing` (or `validating`,
+`checking`, `fast-forwarding`, ...), `waiting: project paused` / `held` / `for
+<machine>`, `fix merge: sent back to its coder`, `sent back for a fresh
+review`, `merge check failed`, `merge stopped: <cause>` or `merged; closing
+the Task`. `wait` adds the server's message and, when Forge retries by itself,
+the time of the next try.
+
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
 to preview the prompt for a transition target instead of the task's current
 state.
@@ -317,6 +337,41 @@ report failure or unavailability. Inspect `passed` and `error` for those
 outcomes. Request/HTTP errors exit 1, and invalid CLI arguments exit 2. Authority
 is the same as the API. This command does not wait for the scheduled re-check
 interval (default 600 seconds).
+
+### Merge queue
+
+```bash
+forge-ctl repo queue <REPO_ID> [--limit 1..100] [--cursor <opaque>]
+```
+
+Reads `GET /api/v1/repos/{id}/integration-queues`: one section per target
+branch with the queue's state (and why it is not open) and its members in
+queue order, the head first. `--output json` prints the route's response as
+the server sent it (every field, including values a newer server adds), on
+stdout, whether or not stdout is a terminal. A repository with no queue prints
+`No merge queue: nothing has been queued for this repository.` and exits 0. A
+repository that does not exist, or whose Project you cannot see, is a request
+error (exit 1); an invalid argument exits 2.
+
+The table keeps each member on one line: a title longer than 60 characters is
+cut with `…`, line breaks in a title become spaces, and a member whose Task
+was deleted reads `(deleted)`. A state or wait reason this build does not know
+(a newer server) reads `in merge queue` and `see the message`. The table is
+plain text with no colour and no terminal-width detection, so it reads the
+same piped to a file.
+
+```text
+Queue main: open  members 3
++-------------+----------+------------+--------------------------+---------------------------+
+| Position    | Task     | Title      | State                    | Queued                    |
++-------------+----------+------------+--------------------------+---------------------------+
+| head        | 4f0c2a1e | Add login  | merging: rebasing        | 2026-10-11T09:12:40+00:00 |
++-------------+----------+------------+--------------------------+---------------------------+
+| 1 ahead     | 9b7d03c5 | Fix logout | in merge queue (1 ahead) | 2026-10-11T09:14:03+00:00 |
++-------------+----------+------------+--------------------------+---------------------------+
+| not in line | 2ce81f77 | Docs       | waiting: held            | 2026-10-11T09:02:11+00:00 |
++-------------+----------+------------+--------------------------+---------------------------+
+```
 
 ### Repository locations
 
@@ -835,8 +890,8 @@ forge-ctl operations status
 ```
 
 Reads `GET /api/v1/operations/status` (administrator login). `--output json`
-prints the whole status. Table output prints one summary line and the check
-runner's section:
+prints the whole status. Table output prints one summary line, the check
+runner's section and the merge queues' section:
 
 ```text
 Operations: healthy  active executions 2  blocked Tasks 0  recent errors 0
@@ -848,6 +903,16 @@ Checks:
   holding a slot: 1 (0 on their Task's own slot); reusable results: 4
   last 24 h: 12 run(s), 7 answered from a stored result
   last worker error: none
+Merge queue:
+  waiting               3  oldest 4 min
+  at the head           1  oldest 95 s
+  stopped               0
+  last 24 h: 12 merged
+    queue wait      p50 40 s    p95 6 min   max 15 min
+    at the head     p50 2 min   p95 9 min   max 10 min
+    - rebase        p50 3.2 s   p95 9.0 s   max 9.0 s
+    - check         p50 100 s   p95 8 min   max 8 min
+    - fast-forward  p50 0.8 s   p95 1.5 s   max 2.0 s
 ```
 
 `queued`, `running`, `waiting for slot` and `waiting for disk` are the
@@ -856,6 +921,12 @@ Checks:
 "reusable results" is `checks.reusable_results`.
 "Answered from a stored result" counts requests that reused a green result and
 ran nothing. A worker error is printed with its time.
+
+The merge queue section is `integration_queues` of the status: members in
+line, being merged (`at the head`, with the age of the oldest head) and
+stopped, then the timings of the merges completed in the last 24 hours. The
+three indented rows split the time at the head; a merge whose target had not
+moved has no rebase and no check, and a row no merge measured prints `-`.
 
 ## Operations dead letters
 

@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub trait ProjectReadContext<E>: Send + Sync {
     async fn current_state(&self, input: CurrentStateArguments) -> Result<Value, E>;
     async fn observations(&self, input: ObservationsArguments) -> Result<Value, E>;
+    async fn integration_queue(&self, input: IntegrationQueueArguments) -> Result<Value, E>;
     async fn project_charter(&self, input: NoArguments) -> Result<Value, E>;
     async fn skill_section(&self, input: SectionArguments) -> Result<Value, E>;
 }
@@ -24,6 +25,16 @@ pub struct CurrentStateArguments {
 pub struct ObservationsArguments {
     pub task_id: Option<String>,
     // The handler clamps to 1..=50, including zero and larger inputs.
+    pub limit: Option<u64>,
+}
+
+/// The bound Project's merge queues. The Project is the scope's; only the
+/// target branch can be chosen.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationQueueArguments {
+    pub target_branch: Option<String>,
+    // The handler clamps to 1..=100, including zero and larger inputs.
     pub limit: Option<u64>,
 }
 
@@ -79,6 +90,7 @@ pub const IDS: &[&str] = &[
     "skill.section",
     "project.current_state",
     "project.observations",
+    "repo.integration_queue",
 ];
 
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
@@ -89,6 +101,10 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
         OperationSpec::typed("project.observations", AUTHORITY, EffectClass::Query, AvailabilityRule::ReadyOnly, SURFACES,
             "Read scoped Task worklogs and captured artifacts; these are observations, not manual attestations.", "",
             &[StructuralConstraint::ClosedObject], |context, input| Box::pin(context.observations(input))),
+        OperationSpec::typed("repo.integration_queue", AUTHORITY, EffectClass::Query, AvailabilityRule::ReadyOnly, SURFACES,
+            "Read the merge queues of the bound Project's repository: who is merging, who waits, and why.",
+            "Returns the merge queue of each target branch of the bound Project's repository: the queue's state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position (members ahead), typed wait reason, action hint and timings. A Task in its merge state is in this queue; read it before retrying, holding or cancelling a Task that waits to merge. Read-only and scope-bound: it never accepts a Project or repository selector.",
+            &[StructuralConstraint::ClosedObject], |context, input| Box::pin(context.integration_queue(input))),
         OperationSpec::typed::<NoArguments>("project.charter", AUTHORITY, EffectClass::Query, AvailabilityRule::ReadyOnly, SURFACES,
             "Read the bound Project's approved Charter.",
             "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",

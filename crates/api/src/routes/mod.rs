@@ -40,6 +40,7 @@ pub mod executions;
 pub mod executor_types;
 pub mod external_links;
 pub mod fs;
+pub mod integration_queues;
 pub mod integrations;
 pub mod mcp_config;
 pub mod members;
@@ -446,6 +447,7 @@ async fn task_response_inner(
         },
         awaiting_human,
     );
+    let integration = services::integration_reads::task_integration(db, &task).await?;
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
     // Canonical execution evidence/blocker (D16/D17, F12): computed once here
     // so Task detail, banner, and chat context all render the same server-
@@ -498,6 +500,7 @@ async fn task_response_inner(
         retry_limits,
         available_actions: offers,
         condition,
+        integration,
         workflow_health,
         workflow_exception,
         execution_observability,

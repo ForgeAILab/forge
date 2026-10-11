@@ -2082,6 +2082,23 @@ impl CoordinationToolProvider {
         }))
     }
 
+    /// `repo.integration_queue`: the merge queues of the bound Project's
+    /// repository. Read-only; the Project is the admitted scope's.
+    async fn repo_integration_queue_read(
+        &self,
+        project_id: &str,
+        input: operation_registry::project_reads::IntegrationQueueArguments,
+    ) -> Result<Value, AgentHostError> {
+        crate::integration_reads::project_integration_queues(
+            &self.db,
+            project_id,
+            input.target_branch.as_deref(),
+            input.limit,
+        )
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)
+    }
+
     async fn project_observations_read(
         &self,
         _actor_identity_id: &str,

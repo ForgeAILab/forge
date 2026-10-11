@@ -108,6 +108,7 @@ database for historical provenance.
 | GET    | `/api/v1/repos/{id}` | Get repo |
 | PATCH  | `/api/v1/repos/{id}` | Update repo |
 | DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it, and `409 integration_unresolved` while a merge into it has an unknown result or an owner effect outstanding |
+| GET    | `/api/v1/repos/{id}/integration-queues` | The repository's merge queues, one per target branch, with their members in queue order (see [Merge queue reads](#merge-queue-reads)) |
 | GET    | `/api/v1/repos/{id}/locations` | Owner/admin lists visible repository locations with opaque cursor pagination |
 | POST   | `/api/v1/repos/{id}/locations` | Owner/admin registers and verifies a machine-local checkout |
 | PATCH  | `/api/v1/repos/{id}/locations/{location_id}` | Owner/admin changes the default location with a version check |
@@ -2786,6 +2787,180 @@ selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
 separate `release` command.
 
+### Merge queue reads
+
+A Task in its merge state is in the merge queue of its repository's target
+branch. Two reads show where it is and why it waits. Both are projections of
+the queue's own rows and of the Task's `condition`; neither is a command, and
+neither takes a write transaction.
+
+**`integration` on Task reads.** `TaskResponse` (`GET /api/v1/tasks/{id}`,
+Task detail) and every Task list item (`GET /api/v1/projects/{id}/tasks`) carry
+`integration`: a `TaskIntegrationSummary`, or `null` when the Task has no
+attempt in progress (it was never queued, its change merged, or it was
+cancelled). MCP `forge_get_task` and `forge_list_tasks` return the same field.
+
+| Field | Meaning |
+|---|---|
+| `attempt_id` | The attempt in progress; the same id the Task `condition`'s integration reason names |
+| `queue_id`, `repo_id`, `target_branch`, `queue_state` | The queue the attempt is in. `queue_state` is `open`, `suspended` (the target checkout is not ready), `quarantined` (another merge into the target has an unknown result) or `closed` |
+| `state` | `waiting` (in line, or stopped in line by its owner or its Project), `owned` (at the head: Forge is merging it), `repair` (sent back to its coder for a conflict or a dirty worktree), `review_required` (sent back for a fresh review), `candidate_check_failed` (the check of the rebased commit failed), `deferred` (the merge stopped and waits), `applied` (the commit is on the target; the Task is being closed) |
+| `phase` | Set while `state` is `owned`: `validating`, `rebasing`, `checking`, `awaiting_carry`, `awaiting_authorization`, `fast_forwarding`, `reconciling` |
+| `position` | Members ahead of this one: `0` at the head, `n` for a waiter with `n` ahead, `null` when the Task is not in line (sent back, deferred) |
+| `wait` | Why the merge is not moving, or `null`: `{ code, message, machine_id, machine_name, retry_at }` |
+| `action_hint` | `retry` (Task action `retry`, offered as `integration_retry`), `release` (Task action `release`), `resume_project` (the Project action `POST /api/v1/projects/{id}/resume`; never a Task offer), or `null`. A hint only: `available_actions` on Task detail is the authority. `retry` is computed by the function the `integration_retry` offer is built from, so it is hinted exactly when that offer exists: a merge the queue stopped a moment ago, whose Task the park step has not told yet, reads `deferred` with no hint |
+| `timings` | `{ enqueued_at, head_since, rounds, queued_ms, rebase_ms, check_ms, fast_forward_ms }`. `head_since` is `null` while the Task waits; durations are cumulative over the attempt's rounds and `null` until the phase has run |
+
+`wait.code` is one of `queue` (others are ahead), `queue_suspended`,
+`queue_quarantined`, `task_held`, `task_blocked`, `task_failed`,
+`task_entry_blocked`, `task_awaiting_human`, `project_paused`, `owner_offline`
+(the machine that owns the checkout is not connected: `machine_id` /
+`machine_name` name it), `target_dirty`, `infrastructure` (Forge retries by
+itself at `retry_at`), `budget_exhausted`, `owner_required`,
+`unresolved_result` and `cancel_requested`. A Task stopped by its owner (a
+Hold, a block, a failure) or by a paused Project reads `waiting` with that
+cause: the Task's own stop is the reason and carries the action that lifts
+it. The cause is the one that holds now: once the stop is lifted the summary
+stops naming it, even before the queue has put the Task back in line.
+
+**The enums are open.** `queue_state`, `state`, `phase`, `wait.code`,
+`action_hint` and a queue's `state` are stable snake_case strings, and the
+queue will add more of them. A client must tolerate a value it does not know:
+show it neutrally (the web reads an unknown state as "In merge queue" and an
+unknown wait as the server's `message`) and never fail the read. The Rust
+types end each enum with an `unknown` variant for that; the server never
+sends the literal `unknown`. Timestamps are RFC 3339. `machine_id` is the id
+of `GET /api/v1/daemons`; no lease owner, runtime id or machine path is part
+of these reads.
+
+A Task in its merge state that has no attempt yet (the queue admits it on its
+next pass) has `integration: null`, like a Task that is not merging.
+
+Example (`TaskIntegrationSummary`; a test reads this block into the type and
+back):
+
+<!-- example: task-integration-summary -->
+```json
+{
+  "attempt_id": "0b9c2a4e-6f1d-4c57-9d0a-3f5e8f1c2b7a",
+  "queue_id": "5d1e7c90-2a44-4b8e-8f0b-9a6c3d2e1f00",
+  "repo_id": "c1a2b3d4-0000-4e5f-8a9b-112233445566",
+  "target_branch": "main",
+  "queue_state": "open",
+  "state": "waiting",
+  "phase": null,
+  "position": 2,
+  "wait": {
+    "code": "queue",
+    "message": null,
+    "machine_id": null,
+    "machine_name": null,
+    "retry_at": null
+  },
+  "action_hint": null,
+  "timings": {
+    "enqueued_at": "2026-10-11T09:14:03+00:00",
+    "head_since": null,
+    "rounds": 0,
+    "queued_ms": null,
+    "rebase_ms": null,
+    "check_ms": null,
+    "fast_forward_ms": null
+  }
+}
+```
+
+The Task list reads the summaries of a page in one statement, whatever the
+page holds, and Task detail reads its summary in one. The list's `ETag` covers
+the queue: a queue that advances, and a Project that is paused or resumed,
+change the validator although neither writes a Task, and a lease renewal does
+not.
+
+**`GET /api/v1/repos/{id}/integration-queues`** lists the repository's queues
+by target branch. Query: `limit` (default 20, at most 100) and the opaque
+`cursor` of the page before. The response is `{ items, next_cursor, has_more }`.
+A caller who cannot see the repository's Project gets `404`, the same answer
+as for a repository that does not exist; an invalid cursor is `400`. The
+cursor is a place among this repository's target branches: clients must not
+decode it, a queue created or removed between two pages is neither repeated
+nor skips another, and a cursor sent to another repository reads only that
+repository's own queues.
+
+**Who is listed.** A queue belongs to a repository of one Project, and
+admission refuses a Task of any other Project, so the members are that
+Project's Tasks. The read does not rest on it: `members` lists only members of
+the Project the caller was admitted to. A member of any other Project is
+counted, in `member_count` and in every `position`, because it is really in
+the line, and it is never listed: no Task id, title, status or attempt id, and
+`head_task_id` / `head_attempt_id` are `null` for such a head (`head_since`
+still says the queue has one). A Task that was deleted while its attempt is
+still in the line keeps its place and its `task_id`; its `task_title` and
+`task_status` are `null`.
+
+Each item:
+
+| Field | Meaning |
+|---|---|
+| `id`, `repo_id`, `target_branch` | The queue |
+| `state` | `open`, `suspended`, `quarantined`, `closed` |
+| `state_reason` | `{ code, message }` when `state` is not `open` (`target_unconfigured`, `target_unavailable`, ...), else `null` |
+| `head_task_id`, `head_attempt_id`, `head_since` | The member being merged now, or `null` |
+| `member_count` | Members with an attempt in progress, including those sent back or deferred |
+| `members` | The head first, then queue order; at most 100. Each is `{ task_id, task_title, task_status, integration }` with the same `TaskIntegrationSummary` as the Task reads |
+| `members_truncated` | `true` when the queue has more members than the 100 a read returns |
+
+Example (a test reads this block into `IntegrationQueuesResponse` and back):
+
+<!-- example: integration-queues -->
+```json
+{
+  "items": [
+    {
+      "id": "5d1e7c90-2a44-4b8e-8f0b-9a6c3d2e1f00",
+      "repo_id": "c1a2b3d4-0000-4e5f-8a9b-112233445566",
+      "target_branch": "main",
+      "state": "open",
+      "state_reason": null,
+      "head_task_id": "4f0c2a1e-7b6d-4d0e-9c1a-0a1b2c3d4e5f",
+      "head_attempt_id": "a7e3d9c1-55aa-4f0e-b3c2-6d7e8f901234",
+      "head_since": "2026-10-11T09:15:10+00:00",
+      "member_count": 1,
+      "members": [
+        {
+          "task_id": "4f0c2a1e-7b6d-4d0e-9c1a-0a1b2c3d4e5f",
+          "task_title": "Add login",
+          "task_status": "merging",
+          "integration": {
+            "attempt_id": "a7e3d9c1-55aa-4f0e-b3c2-6d7e8f901234",
+            "queue_id": "5d1e7c90-2a44-4b8e-8f0b-9a6c3d2e1f00",
+            "repo_id": "c1a2b3d4-0000-4e5f-8a9b-112233445566",
+            "target_branch": "main",
+            "queue_state": "open",
+            "state": "owned",
+            "phase": "rebasing",
+            "position": 0,
+            "wait": null,
+            "action_hint": null,
+            "timings": {
+              "enqueued_at": "2026-10-11T09:12:40+00:00",
+              "head_since": "2026-10-11T09:15:10+00:00",
+              "rounds": 1,
+              "queued_ms": 150000,
+              "rebase_ms": null,
+              "check_ms": null,
+              "fast_forward_ms": null
+            }
+          }
+        }
+      ],
+      "members_truncated": false
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}
+```
+
 ### Transition responses and queued cascades
 
 `POST /api/v1/tasks/{id}/transition` returns the Task snapshot produced by the
@@ -3639,6 +3814,10 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `integration_queues.queues_by_state` | Passive integration queues counted by `open`, `suspended`, `quarantined`, `closed` (zero states included). |
 | `integration_queues.current_attempts_by_state` | Current membership counted by attempt state; terminal history is excluded. Zero states are included. |
 | `integration_queues.quarantined_imports` | Import rows with an explicit `quarantined` disposition, including rows with no resolvable queue. |
+| `integration_queues.waiting` | `{ count, oldest_age_seconds }`: members in line (`queued`), aged from when they entered the queue. `oldest_age_seconds` is `null` when `count` is 0. |
+| `integration_queues.heads` | The same shape for members being merged: the head age, from when the attempt took the head. |
+| `integration_queues.parked` | The same shape for members whose merge stopped (`parked`), aged from when it did. |
+| `integration_queues.timings` | Where the merges completed in the last `window_seconds` (86 400) spent their time: `completed` (merges read, newest first, at most `sample_limit` = 500) and five `{ samples, p50_ms, p95_ms, max_ms }` nearest-rank percentiles. `queue_wait` is entering the queue to taking its head; `head_time` is the time at the head over every round; `rebase`, `check` and `fast_forward` are its split. A merge whose target had not moved has no rebase and no check: `samples` says how many merges measured each. Percentiles are `null`, never `0`, when nothing measured them. |
 | `checks.by_state` | Check runs counted by `queued`, `running`, `cancelling`, `cleaning`, `uncertain`, `succeeded`, `failed`, `cancelled`; all zero states included. History older than `server.check_retention_days` is deleted, so the terminal counts cover that period. |
 | `checks.reusable_results` | Certified passing results with successful cleanup and cacheable attested inputs whose source run succeeded; exact-identity reuse only. Zero on a fresh or upgraded database; no legacy cache is seeded. |
 | `checks.admitted_runs`, `checks.borrowed_runs` | Runs that hold a machine slot (`running`, `cancelling`, `cleaning` or `uncertain` and admitted to one), and how many of those share the slot of their own Task's run or reservation. |
@@ -5109,6 +5288,39 @@ identified by the Task's status epoch: every status change starts a new one, as
 does a workflow self-transition (planning to planning on a gate reject). Edits,
 annotation changes, same-column reorders and same-state recovery markers do not.
 
+`integration.updated` says that a merge queue, or one member of it, changed:
+
+```json
+{ "event_type": "integration.updated", "entity_id": "<queue_id>", "timestamp": "...",
+  "repo_id": "<repo_id>", "queue_id": "<queue_id>", "task_id": "<task_id or null>",
+  "project_ids": ["<project_id>"] }
+```
+
+It is a cache invalidation and nothing else, and it carries ids only (no
+title, branch or machine name). `task_id` is the one Task whose summary
+changed; it is `null` when more than one member changed or the queue's own
+state or head did, and a client then refetches what it shows of that queue
+(`queue_id`). `project_ids` are the Projects of the members concerned: refetch
+their Task lists and no other Project's. Like every bus event it is delivered
+to every connected client of this local server (the stream has no per-Project
+filter); the ids it names read as `404` to a caller who may not see them. It
+is published on the event bus only. It is not in the durable ledger (no `id`,
+not replayed on resume: a client that reconnects refetches), it has no
+Attention category, raises no notification and wakes no Agent.
+
+At most one event is published per queue and read of the projector, whatever
+happened in between: a head that runs through six phases inside a read
+interval, or a line of fifty that moves up one place, is one event. An event
+is published only when something a reader of the summary sees changed (state,
+phase, position, wait, timings, the queue's state or head); a lease renewal or
+a receipt written on an attempt publishes nothing, and neither does a queue
+that is idle, however long its head runs. The events come from a read-only
+projector in the server process that compares two reads of the queues (one
+SELECT each; at most four a second, at least one a second, and promptly when
+an integration Task step settles). A process that starts publishes nothing
+for what it finds. The queue worker itself still writes nothing but queue,
+attempt and Task-step rows.
+
 Agent Chat events already committed to the durable outbox (message admission,
 response completion, awaiting-input, failure, cancellation, retry, and control
 transfer) are delivered by the existing post-commit relay as
@@ -5204,6 +5416,13 @@ role through that status alone:
 | Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
 | Project not visible to the user | No moved tools |
 
+`forge_get_integration_queue` is a nineteenth registry-built tool, added with
+the merge-queue reads rather than moved: Project-classified, and offered to
+every grant whose Project is visible to the user (the rule of `GET
+/api/v1/repos/{id}/integration-queues`), with or without owner/member
+authority. An account grant names the Project; a Project the user cannot see
+answers `-32004` like one that does not exist.
+
 The eight account-wide names above are never offered to a constrained grant.
 For an account grant, the referenced Project determines member/owner/admin
 permissions; an authorized reference is still required even though the tool
@@ -5284,6 +5503,7 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_set_main_agent` | Replace the singular Main Agent binding with optimistic concurrency |
 | `forge_get_project_agent` | Inspect the singular Project Agent binding |
 | `forge_set_project_agent` | Replace a Project Agent binding with optimistic concurrency |
+| `forge_get_integration_queue` | Read the merge queues of a Project's repository: `{project_id, target_branch?, limit?}` returns `{project_id, repo_id, items, has_more}` with `items` in the shape of `GET /api/v1/repos/{id}/integration-queues` (see [Merge queue reads](#merge-queue-reads)). Authorized like that route: the Project is visible to the caller; in a Project-constrained session `project_id` is the session's and any other is refused |
 | `forge_list_agent_chats` | List the authenticated Main Chat and authorized Project Agent Chats |
 | `forge_get_agent_chat` | Inspect one authorized Agent Chat and finite turn state |
 | `forge_list_agent_chat_messages` | List immutable Agent Chat messages and bounded provenance |
@@ -5951,6 +6171,22 @@ nullable `task_id` and unsigned `limit`, clamping its row limit to 1–50. Integ
 fields accept integer-valued strings or floats through normalization. Unknown
 read fields and malformed scalar values are refused with an in-turn contract
 error after the authority check.
+
+`repo.integration_queue` (3.2 stage D3a) is a registered read of the Project
+orchestration read tool, available to a bound Project Agent once setup is
+complete (`read_project`, or `read_agent_chat` in a Project Chat). It accepts
+an optional `target_branch` and an optional unsigned `limit` (clamped to
+1–100) and returns `{ project_id, repo_id, items, has_more }`, where `items`
+are the merge queues of the bound Project's repository in the shape of `GET
+/api/v1/repos/{id}/integration-queues` (see [Merge queue
+reads](#merge-queue-reads)), as the bound Project may see them: members of any
+other Project are counted and never listed. It never accepts a Project or
+repository selector, writes nothing, and returns an empty `items` for a
+Project without a repository. `POST /mcp` has the same read as
+`forge_get_integration_queue` (`{project_id, target_branch?, limit?}`, the same
+result from the same function). One spec generates its schema, validator, dispatch and the
+contract line the model is shown (`repo.integration_queue: {limit?,
+target_branch?}`).
 
 Project review configuration, Documents, Decisions, milestones, validation,
 release-candidate proposals and escalation now use typed registry contracts.

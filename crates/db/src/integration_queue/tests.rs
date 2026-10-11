@@ -668,18 +668,36 @@ async fn importer_crash_mid_slice_rolls_back_progress_and_resumes() {
 async fn additive_migration_preserves_every_status_and_legacy_marker_then_replays_as_noop() {
     let dir = tempfile::tempdir().unwrap();
     let source = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
+    // The migrations of the integration tables are the ones whose SQL names
+    // them: the set is read from the files, so the next migration of these
+    // tables (a column, an index) joins it without an edit here. A database
+    // of before the queue has none of them applied.
+    let integration_table = |sql: &str| {
+        ["integration_queue", "integration_attempt"]
+            .iter()
+            .any(|table| {
+                sql.match_indices(table).any(|(at, _)| {
+                    !sql[at + table.len()..]
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        && !sql[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                })
+            })
+    };
+    let mut held_back = Vec::new();
     for file in std::fs::read_dir(source).unwrap() {
         let file = file.unwrap();
-        if ![
-            "V202610080123__integration_queue.sql",
-            "V202610082317__integration_fencing.sql",
-            "V202610091612__integration_activation.sql",
-        ]
-        .contains(&file.file_name().to_str().unwrap())
-        {
+        if integration_table(&std::fs::read_to_string(file.path()).unwrap()) {
+            held_back.push(file.file_name().to_string_lossy().into_owned());
+        } else {
             std::fs::copy(file.path(), dir.path().join(file.file_name())).unwrap();
         }
     }
+    held_back.sort();
+    assert_eq!(
+        held_back.first().map(String::as_str),
+        Some("V202610080123__integration_queue.sql"),
+        "the migration that creates the tables is the first of the set"
+    );
     let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
     crate::run_migrations_from(&pool, dir.path()).await.unwrap();
     seed(&pool).await;
@@ -713,7 +731,7 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
             .fetch_one(&pool)
             .await
             .unwrap(),
-        migration_count + 3
+        migration_count + held_back.len() as i64
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM integration_queue")

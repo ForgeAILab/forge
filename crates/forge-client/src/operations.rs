@@ -62,6 +62,7 @@ impl OperationsArgs {
                             status.recent_errors.len()
                         );
                         print!("{}", checks_table(&status.checks));
+                        print!("{}", merge_queue_table(&status.integration_queues));
                         Ok(())
                     }
                 };
@@ -145,6 +146,54 @@ impl OperationsArgs {
         }
     }
 }
+/// The merge queues' section of the operations status, as text.
+fn merge_queue_table(queues: &api_types::IntegrationQueueStatus) -> String {
+    let backlog =
+        |label: &str, backlog: &api_types::IntegrationBacklog| match backlog.oldest_age_seconds {
+            Some(age) if backlog.count > 0 => {
+                format!(
+                    "  {label:<18}{:>5}  oldest {}\n",
+                    backlog.count,
+                    age_text(age)
+                )
+            }
+            _ => format!("  {label:<18}{:>5}\n", backlog.count),
+        };
+    let duration = |ms: Option<i64>| match ms {
+        // Under two minutes a merge is read in seconds, to one decimal
+        // below ten.
+        Some(ms) if ms < 10_000 => format!("{:.1} s", ms as f64 / 1000.0),
+        Some(ms) => age_text(ms / 1000),
+        None => "-".to_owned(),
+    };
+    let percentiles = |label: &str, value: &api_types::IntegrationPercentiles| {
+        format!(
+            "    {label:<16}p50 {:<8}p95 {:<8}max {}\n",
+            duration(value.p50_ms),
+            duration(value.p95_ms),
+            duration(value.max_ms)
+        )
+    };
+    let timings = &queues.timings;
+    let mut text = String::from("Merge queue:\n");
+    text.push_str(&backlog("waiting", &queues.waiting));
+    text.push_str(&backlog("at the head", &queues.heads));
+    text.push_str(&backlog("stopped", &queues.parked));
+    text.push_str(&format!(
+        "  last {} h: {} merged\n",
+        timings.window_seconds / 3600,
+        timings.completed
+    ));
+    if timings.completed > 0 {
+        text.push_str(&percentiles("queue wait", &timings.queue_wait));
+        text.push_str(&percentiles("at the head", &timings.head_time));
+        text.push_str(&percentiles("- rebase", &timings.rebase));
+        text.push_str(&percentiles("- check", &timings.check));
+        text.push_str(&percentiles("- fast-forward", &timings.fast_forward));
+    }
+    text
+}
+
 /// The check runner's section of the operations status, as text.
 fn checks_table(checks: &ChecksStatus) -> String {
     let backlog = |label: &str, backlog: &CheckBacklog| match backlog.oldest_age_seconds {
@@ -339,6 +388,52 @@ mod tests {
             "Checks:\n  queued                2  oldest 45 s\n  running               1  oldest 10 min\n  waiting for slot      3  oldest 2 h\n  waiting for disk      0\n  holding a slot: 1 (0 on their Task's own slot); reusable results: 4\n  last 24 h: 12 run(s), 7 answered from a stored result\n  last worker error (2026-10-11T00:00:00Z): database is locked\n"
         );
         assert!(checks_table(&ChecksStatus::default()).ends_with("last worker error: none\n"));
+    }
+
+    #[test]
+    fn status_prints_the_merge_queue_section() {
+        let percentiles = |samples, p50_ms, p95_ms, max_ms| api_types::IntegrationPercentiles {
+            samples,
+            p50_ms: Some(p50_ms),
+            p95_ms: Some(p95_ms),
+            max_ms: Some(max_ms),
+        };
+        let queues = api_types::IntegrationQueueStatus {
+            waiting: api_types::IntegrationBacklog {
+                count: 3,
+                oldest_age_seconds: Some(240),
+            },
+            heads: api_types::IntegrationBacklog {
+                count: 1,
+                oldest_age_seconds: Some(95),
+            },
+            parked: api_types::IntegrationBacklog::default(),
+            timings: api_types::IntegrationTimingStatus {
+                window_seconds: 86_400,
+                completed: 12,
+                sample_limit: 500,
+                queue_wait: percentiles(12, 40_000, 360_000, 900_000),
+                head_time: percentiles(12, 130_000, 540_000, 600_000),
+                rebase: percentiles(5, 3_200, 9_000, 9_000),
+                check: percentiles(5, 100_000, 480_000, 480_000),
+                fast_forward: percentiles(12, 800, 1_500, 2_000),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_queue_table(&queues),
+            "Merge queue:\n  waiting               3  oldest 4 min\n  at the head           1  oldest 95 s\n  stopped               0\n  last 24 h: 12 merged\n    queue wait      p50 40 s    p95 6 min   max 15 min\n    at the head     p50 2 min   p95 9 min   max 10 min\n    - rebase        p50 3.2 s   p95 9.0 s   max 9.0 s\n    - check         p50 100 s   p95 8 min   max 8 min\n    - fast-forward  p50 0.8 s   p95 1.5 s   max 2.0 s\n"
+        );
+        assert_eq!(
+            merge_queue_table(&api_types::IntegrationQueueStatus {
+                timings: api_types::IntegrationTimingStatus {
+                    window_seconds: 86_400,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            "Merge queue:\n  waiting               0\n  at the head           0\n  stopped               0\n  last 24 h: 0 merged\n"
+        );
     }
 
     #[tokio::test]

@@ -1031,6 +1031,28 @@
       "name": "forge_set_project_agent"
     },
     {
+      "description": "Read the merge queues of an authorized Project's repository, one per target branch: the queue state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position, wait reason, action hint and timings.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "target_branch": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "type": "object"
+      },
+      "name": "forge_get_integration_queue"
+    },
+    {
       "description": "List the authenticated account's Main chat and authorized Project Agent chats; no Room or arbitrary thread is exposed.",
       "inputSchema": {
         "properties": {
@@ -2197,6 +2219,26 @@
         "type": "object"
       },
       "name": "forge_set_project_agent"
+    },
+    {
+      "description": "Read the merge queues of an authorized Project's repository, one per target branch: the queue state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position, wait reason, action hint and timings.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "target_branch": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "forge_get_integration_queue"
     },
     {
       "description": "List the authenticated account's Main chat and authorized Project Agent chats; no Room or arbitrary thread is exposed.",

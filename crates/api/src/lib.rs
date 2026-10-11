@@ -540,6 +540,10 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/api/v1/repos/{id}/sync", post(routes::repos::sync_repo))
         .route(
+            "/api/v1/repos/{id}/integration-queues",
+            get(routes::integration_queues::list_integration_queues),
+        )
+        .route(
             "/api/v1/repos/{id}/locations",
             get(routes::repo_locations::list_locations)
                 .post(routes::repo_locations::register_location),

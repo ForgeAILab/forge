@@ -115,6 +115,24 @@ pub(crate) fn legacy_task_condition(task: &Task) -> Option<FailureKind> {
 
 /// The sole Task action advertiser. Every offer selects an apply path with a
 /// stable reason and defaults; handlers never re-derive state eligibility.
+/// Whether the action system offers `retry` (reason `integration_retry`) for
+/// the Task's merge attempt `attempt_id`: the park step has told the Task
+/// that this very attempt stopped (`deferred`). `available_actions` builds
+/// the offer from this function and the merge-queue summary its `retry` hint,
+/// so the hint never names an action that would be refused.
+pub fn integration_retry_offered(task: &Task, attempt_id: &str) -> bool {
+    task.archived_at.is_none()
+        && matches!(
+            &task.condition,
+            db::TaskCondition::Parked {
+                primary: db::ParkReason::Integration {
+                    reason: reason @ api_types::IntegrationReason::Deferred { .. },
+                },
+                ..
+            } if reason.attempt_id().as_str() == attempt_id
+        )
+}
+
 pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     use ActionAuthority::{Owner, ProjectAgent};
     let task = &snapshot.task;
@@ -446,7 +464,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         // A merge that stopped (`deferred`) always offers the action that
         // puts the Task back in line: the queue worker retries what it can
         // by itself, and this is the exit of every wait it cannot end.
-        if matches!(reason, api_types::IntegrationReason::Deferred { .. }) {
+        if integration_retry_offered(task, reason.attempt_id().as_str()) {
             offer(
                 TaskAction::Retry {
                     reason: None,

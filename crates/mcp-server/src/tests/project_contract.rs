@@ -216,6 +216,10 @@ async fn unscoped_mcp_authorizes_projects_tasks_executions_and_dependency_refere
             "forge_create_task",
             json!({"project_id": alice_project, "title": "unauthorized"}),
         ),
+        (
+            "forge_get_integration_queue",
+            json!({"project_id": alice_project}),
+        ),
         ("forge_get_task", json!({"task_id": alice_task.id})),
         (
             "forge_update_task",

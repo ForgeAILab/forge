@@ -115,6 +115,14 @@ fn forge_get_project_agent_contract() {
 }
 
 #[test]
+fn forge_get_integration_queue_contract() {
+    round_trip(
+        "forge_get_integration_queue",
+        json!({"project_id": "project", "target_branch": "main", "limit": 5}),
+    );
+}
+
+#[test]
 fn forge_set_project_agent_contract() {
     round_trip(
         "forge_set_project_agent",
@@ -181,7 +189,8 @@ fn complete_catalog_uses_only_portable_keywords_and_has_bounded_descriptions() {
         .iter()
         .map(|spec| spec.name)
         .collect::<BTreeSet<_>>();
-    assert_eq!(names.len(), 18);
+    // 18 moved tools and `forge_get_integration_queue`, born in the registry.
+    assert_eq!(names.len(), 19);
     assert_eq!(names.len(), CATALOG.len());
     fn portable(schema: &Value) {
         let object = schema.as_object().expect("portable schema object");

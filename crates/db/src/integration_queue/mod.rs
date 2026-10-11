@@ -82,7 +82,9 @@ mod audit_tests;
 mod fencing;
 pub use activation::*;
 mod importer;
+mod reads;
 mod steps;
+pub use reads::*;
 #[cfg(test)]
 mod steps_tests;
 pub use fencing::*;

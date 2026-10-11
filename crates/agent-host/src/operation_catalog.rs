@@ -36,6 +36,7 @@ pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
 /// artifacts it captured. This is how a Project Agent checks an observation
 /// before citing it, and how it decides whether the outcome needs a fix Task.
 pub const PROJECT_OBSERVATIONS_OPERATION: &str = "project.observations";
+pub const REPO_INTEGRATION_QUEUE_OPERATION: &str = "repo.integration_queue";
 /// Read the current approved Charter's full rendered text on demand. The
 /// Charter is Project data, not resident prompt content: the handoff packet
 /// and the operating skill carry only its identity and digests, so this read
@@ -371,6 +372,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     },
     OperationContract {
         operation: PROJECT_OBSERVATIONS_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedRead,
+        input: OperationInputContract::ReadArguments,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::Query,
+        permission: OperationPermission::ReadProjectOrAgentChat,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: REPO_INTEGRATION_QUEUE_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedRead,
         input: OperationInputContract::ReadArguments,

@@ -19,6 +19,7 @@ export function taskListItem(overrides: Partial<TaskListItem> = {}): TaskListIte
     remaining_retries: {},
   retry_limits: {},
     condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
+    integration: null,
     workflow_health: null,
     workflow_exception: null,
     review_passed_at: null,
