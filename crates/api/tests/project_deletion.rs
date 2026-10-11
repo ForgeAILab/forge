@@ -807,12 +807,27 @@ async fn force_delete_is_refused_before_cancelling_when_an_execution_is_on_an_un
         "project_delete_unreachable",
     )
     .await;
-    // Registered, never connected.
+    let server = common::fake_daemon::TestServer::start(harness.state.clone()).await;
+    let socket = common::fake_daemon::connect_daemon(
+        &server,
+        &registration.daemon_id,
+        Some(&registration.registration_token),
+    )
+    .await
+    .expect("daemon websocket upgrade succeeds");
+    common::fake_daemon::wait_until_connected(&harness.state, &registration.daemon_id).await;
     let execution = common::fake_daemon::seed_running_execution_for_daemon(
         &harness.state,
         &registration.daemon_id,
     )
     .await;
+    // The machine goes away while its execution is still running.
+    drop(socket);
+    harness
+        .state
+        .daemon_connections
+        .unregister(&registration.daemon_id);
+    common::fake_daemon::wait_until_disconnected(&harness.state, &registration.daemon_id).await;
     let project_id: String = sqlx::query_scalar(
         "SELECT project_id FROM task WHERE id = (SELECT task_id FROM execution WHERE id = ?)",
     )
