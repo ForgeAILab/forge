@@ -38,8 +38,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   placement generation; the purpose is not part of it). `check_run` rows of a
   queue head therefore carry the review-entry specification
   (`purpose` `entry_ci` in the stored spec) rather than a separate
-  `queue_head_ci` specification; a commit that already passed these commands
-  in the same worktree is not run again.
+  `queue_head_ci` specification, and a result of either is eligible for
+  reuse by the other for the same commit in the same worktree (a rebased
+  commit is another commit and still runs once).
 - **`merging` now means "in the merge queue" (3.2 stage D2b).** A Task
   entering `merging` is queued for its repository's target branch and stays
   in `merging` while Forge rebases it (only if the target moved), checks the
