@@ -881,9 +881,10 @@ There is no automatic replay, bulk command or dead-letter retention job.
 
 The server also accepts `--check-run-timeout-seconds N` (positive integer,
 1800 seconds by default), overriding `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`
-and `server.check_run_timeout_seconds` in `forge.yaml`. This defines the future
-whole-check bundle deadline; no execution reads it in 3.3 stage A. It does not
-change today's per-command review timeout or unbounded entry CI.
+and `server.check_run_timeout_seconds` in `forge.yaml`. Workspace garbage
+collection reads it (how long a check's build directory may be in use). It
+does not change the per-command review timeout; a review-entry run has its
+own 3,600-second wall limit.
 
 Check history retention has no flag: set `server.check_retention_days` in
 `forge.yaml` or `FORGE_SERVER_CHECK_RETENTION_DAYS` (default 30 days, `0`

@@ -8328,13 +8328,44 @@ switch all projections together, replace the visible park annotation with the
 condition's own park, preserve the material-blocker digest and slot
 classification, regenerate bindings and document the single public beta break.
 
-### Passive canonical checks (3.3 stage A)
+### Checks: the final state (3.3)
 
-**Nothing executes through this contract or these repositories yet.** Entry
-hooks, the manual review re-run, conformance, lifecycle scripts and environment probes
-retain their existing commands, scheduling, timeout, output and cleanup
-behavior. No legacy Review or check evidence is imported into a trusted cache.
-The new server timeout setting is defined but no execution reads it.
+There is one path for review CI. This overview is the map; the sections
+after it hold the detail and keep their stage names because the code comments
+cite them.
+
+| What | Where it is decided | Section |
+|---|---|---|
+| What runs | `review::check_spec::build_check_spec` builds a `CheckSpec` from the entry's effective configuration. Review entry asks for `canonical-ci/1` in a server-owned Task worktree; a daemon placement and a bundle with no worktree get the frozen `legacy-daemon/1` / `legacy-server/1` policies, which always run and are never reused | "Check contract", "Reusable results" |
+| Who runs it | `check-executor`, a persistence-free owner primitive, on the machine that owns the checkout (server or daemon) | "Owner check execution" |
+| When it runs | The `check-runs` worker: single-flight per identity, machine run-cap admission in the shared writer transaction, slot fairness with aging, recovery by operation id | "Durable check runner" |
+| Who asks | A Task step, through `TaskCheckConsumers`. Two families: review entry (`run_ci_steps`, in production) and the merge path (integration, passive until the queue is activated) | "Task-step consumer contract" |
+| How the Task waits | Its hooks step suspends on the consumer (or on the disk wait) and the Task states a typed condition (`check`, or `capacity` with scope `disk`); every wait has a deadline or a typed park | "Review-entry CI on the check runner", "Typed check conditions" |
+| What a re-run is | The same review entry again (`rerun_review`); there is no second review pipeline | "Manual review re-run through the review entry" |
+| What changes under a wait | Configuration: the entry asks again by itself (at most 3 times). A withdrawn check (refused forced delete): the same. Workflow: typed park | "Review-entry CI on the check runner" |
+| How long history lives | `server.check_retention_days` (30); deny-by-default predicate | "Retention of check history" |
+| What the operator sees | `GET /api/v1/operations/status`: `checks`, `check_runs`, per-machine `check_runs` / `borrowed_check_runs`, `recent_errors` (`task_check_exhausted`, `retired_review_auditor_config`) | docs/api.md |
+
+Not on the runner, and unchanged: conformance setup and required checks,
+before-work and other lifecycle scripts, environment preflight and readiness
+probes. They keep their inline orchestration, limits and verdicts; the
+contract below characterizes them so that a later move changes no behaviour.
+Deleted since the stages below were written: the manual `ReviewRunner` and
+its synthetic reviewer/auditor executions (stage E), `legacy_ci_bundle` and
+`review::auditor::render_auditor_prompt` (stage F; both had only test
+callers).
+
+### Check contract (3.3 stage A)
+
+`CheckSpec` and its builder describe every execution family. Review-entry CI
+(and so the manual review re-run) executes through this contract and the
+check tables; conformance, lifecycle scripts and environment probes are
+characterized here and still run inline, with their existing commands,
+scheduling, timeout, output and cleanup behavior. No legacy Review or check
+evidence is imported into a trusted cache. `server.check_run_timeout_seconds`
+is read by workspace garbage collection (how long a `check-*` build directory
+may be in use); a review-entry run executes under its own 3,600-second wall
+limit.
 
 `api-types::check_spec` is the shared, dependency-free contract location.
 `review::check_spec::build_check_spec` builds `CheckSpec` from the same review

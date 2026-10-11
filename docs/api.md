@@ -5968,4 +5968,5 @@ and `borrowed_check_runs` (informational). `active_runs` includes exclusive chec
 slots; borrowed checks add no second slot. Agent pressure excludes checks.
 The supervised worker appears as `check-runs` in `periodic_workers`. There is no
 new REST check execution or result-application route, and daemon protocol 5 is
-unchanged. Existing CI consumers have not moved to the runner in this slice.
+unchanged. Review-entry CI, and with it the review `retry` re-run, runs on this
+runner; the `checks` section of the status (above) is its operator summary.
