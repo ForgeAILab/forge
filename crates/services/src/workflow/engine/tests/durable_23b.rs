@@ -1917,6 +1917,25 @@ async fn an_entry_asks_again_at_most_three_times_then_parks_for_its_owner() {
         count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
         4
     );
+    // The count is durable and belongs to this entry: it is an effect of
+    // the entry's own hooks step (every round above ran on a new worker and
+    // read it back from there), so the step of a later entry starts at zero.
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint k JOIN task_step s ON s.id=k.step_id WHERE s.status='suspended' AND s.kind='hooks' AND CAST(json_extract(k.effects_json,'$.ci_rerequests') AS INTEGER)=3"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE json_extract(effects_json,'$.ci_rerequests') IS NOT NULL"
+        )
+        .await,
+        1
+    );
     set_project_review_commands(&fixture, "echo commands-4").await;
     let task = drain(fixture.engine.clone(), &fixture.task.id).await;
     let reviews = review_summaries(&fixture).await;

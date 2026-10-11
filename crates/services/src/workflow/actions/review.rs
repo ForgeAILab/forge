@@ -608,27 +608,65 @@ async fn ask_again(
     if rerequests >= ENTRY_CHECK_REREQUEST_LIMIT {
         return Ok(false);
     }
-    drop_entry_check(ctx, consumer_id, review, status, reason).await?;
-    for (key, value) in [
-        (ENTRY_CHECK_REREQUESTS_EFFECT, json!(rerequests + 1)),
-        // No attempt is recorded any more: the hook opens the next one.
-        (CI_REVIEW, Value::Null),
-    ] {
-        crate::workflow::engine::durable::record_hook_effect(&ctx.task_id, key, &value)
-            .await
-            .map_err(|error| error.to_string())?;
+    // Counted before anything is closed: a step that dies or fails between
+    // here and the new request has still used one of its three, so no
+    // sequence of failures asks again without bound.
+    crate::workflow::engine::durable::record_hook_effect(
+        &ctx.task_id,
+        ENTRY_CHECK_REREQUESTS_EFFECT,
+        &json!(rerequests + 1),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if !drop_entry_check(ctx, consumer_id, review, status, reason).await? {
+        return Ok(false);
     }
+    // No attempt is recorded any more: the hook opens the next one.
+    crate::workflow::engine::durable::record_hook_effect(&ctx.task_id, CI_REVIEW, &Value::Null)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(true)
 }
 
-/// Close a check this entry no longer waits for, with the attempt that asked.
+/// Close a check this entry no longer waits for: first the attempt that
+/// asked, then its consumer. `false` when the attempt is no longer the one
+/// this hook asked with (somebody else wrote the Review row meanwhile) and
+/// is still open: nothing is closed then and the entry does not ask again,
+/// so one entry never has two open attempts.
 async fn drop_entry_check(
     ctx: &HookContext,
     consumer_id: &str,
     review: &db::Review,
     status: &str,
     reason: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let mut details: Value = serde_json::from_str(&review.step_results_json)
+        .unwrap_or_else(|_| json!({ "ci_steps": [] }));
+    if !details.is_object() {
+        details = json!({ "ci_steps": [] });
+    }
+    let now = now_rfc3339();
+    details["execution_retry"] = json!({ "status": status, "reason": reason, "cancelled_at": now });
+    let closed = ReviewRepo::cancel_if_unchanged(
+        &*ctx.db,
+        &review.id,
+        review.status.clone(),
+        &review.updated_at,
+        details.to_string(),
+        &now,
+        &now,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if closed.is_none() {
+        // A redelivered step finds the attempt it already closed.
+        let current = ReviewRepo::get_by_id(&*ctx.db, &review.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if current.is_some_and(|current| current.status != ReviewStatus::Cancelled) {
+            return Ok(false);
+        }
+    }
     if !consumer_id.is_empty() {
         let step_id = crate::workflow::engine::durable::current_hook(&ctx.task_id)
             .map(|attempt| attempt.step.id.clone());
@@ -641,25 +679,7 @@ async fn drop_entry_check(
         .await
         .map_err(|error| error.to_string())?;
     }
-    let mut details: Value = serde_json::from_str(&review.step_results_json)
-        .unwrap_or_else(|_| json!({ "ci_steps": [] }));
-    if !details.is_object() {
-        details = json!({ "ci_steps": [] });
-    }
-    let now = now_rfc3339();
-    details["execution_retry"] = json!({ "status": status, "reason": reason, "cancelled_at": now });
-    ReviewRepo::cancel_if_unchanged(
-        &*ctx.db,
-        &review.id,
-        review.status.clone(),
-        &review.updated_at,
-        details.to_string(),
-        &now,
-        &now,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(true)
 }
 /// The wall limit of one review-entry CI run.
 pub const ENTRY_CHECK_WALL_SECONDS: u64 = 3600;
