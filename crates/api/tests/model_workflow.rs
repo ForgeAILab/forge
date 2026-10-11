@@ -43,7 +43,8 @@ mod common;
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    future::Future,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -486,8 +487,199 @@ fn lock_storm(dir: &Path) -> Option<LockStorm> {
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Hard deadlines
+// ---------------------------------------------------------------------------
+
+/// The longest one wait of the model may take: a drain, a dispatcher pass, a
+/// request, a start. Each of them takes well under a second when it works.
+const WAIT_LIMIT: Duration = Duration::from_secs(120);
+/// The longest a pre-queue fixture test may take, start to settlement.
+const TEST_LIMIT: Duration = Duration::from_secs(300);
+
+/// What a wait that never returns is reported from: where the model is, and
+/// enough of the stack to read its state without the `World` (which the
+/// stuck future borrows) and without the stack's own pool (which may be what
+/// is stuck).
+#[derive(Default)]
+struct Probe {
+    name: String,
+    waits: Mutex<Vec<(String, std::time::Instant)>>,
+    database: Mutex<Option<PathBuf>>,
+    script: Mutex<Option<Arc<Script>>>,
+}
+
+impl Probe {
+    fn new(name: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            ..Self::default()
+        })
+    }
+
+    /// Every table that says who owes a Task its next move, read on a
+    /// connection of its own, and the in-process state no table has.
+    async fn dump(&self) -> String {
+        let mut out = format!("==== STATE DUMP {} ====\n", self.name);
+        for (what, since) in self.waits.lock().unwrap().iter() {
+            out.push_str(&format!("waiting {:?} in: {what}\n", since.elapsed()));
+        }
+        out.push_str(&format!("run cap {:?}\n", run_cap()));
+        if let Some(script) = self.script.lock().unwrap().as_ref() {
+            out.push_str(&format!(
+                "scripted runs waiting for the model (task -> execution): {:?}\n",
+                script
+                    .waiting
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(task, (execution, _))| (task.clone(), execution.clone()))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        out.push_str(&format!(
+            "owner checkout locks of the whole test process (key, held, holders and waiters): {:?}\n",
+            db::integration_owner_locks()
+        ));
+        let Some(database) = self.database.lock().unwrap().clone() else {
+            return out + "no database yet\n";
+        };
+        match tokio::time::timeout(Duration::from_secs(30), Self::tables(&database)).await {
+            Ok(tables) => out.push_str(&tables),
+            Err(_) => out.push_str("the tables could not be read within 30 s\n"),
+        }
+        out
+    }
+
+    async fn tables(database: &Path) -> String {
+        use sqlx::{Column, Connection, Row, ValueRef};
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(2));
+        let mut connection = match sqlx::SqliteConnection::connect_with(&options).await {
+            Ok(connection) => connection,
+            Err(error) => return format!("the database could not be opened: {error}\n"),
+        };
+        let mut out = String::new();
+        for (title, query) in [
+            (
+                "machine slots",
+                "SELECT (SELECT COUNT(*) FROM execution WHERE status='running') AS running_executions,
+                        (SELECT COUNT(*) FROM execution WHERE status IN ('pending','queued')) AS pending_executions,
+                        (SELECT COUNT(*) FROM check_run WHERE admitted_at IS NOT NULL AND state IN ('running','cancelling','cleaning','uncertain')) AS admitted_checks,
+                        (SELECT COUNT(*) FROM check_run WHERE state='queued') AS queued_checks,
+                        (SELECT COUNT(*) FROM task_schedule_wait WHERE daemon_id='*') AS run_slot_waiters,
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now",
+            ),
+            ("task", "SELECT * FROM task ORDER BY created_at, rowid"),
+            ("task_step (open, failed, or the last 12)", "SELECT * FROM task_step WHERE status NOT IN ('done','completed','cancelled','superseded') OR last_error IS NOT NULL OR rowid IN (SELECT rowid FROM task_step ORDER BY rowid DESC LIMIT 12) ORDER BY rowid"),
+            ("integration_queue", "SELECT * FROM integration_queue"),
+            ("integration_attempt", "SELECT * FROM integration_attempt ORDER BY created_at, rowid"),
+            ("check_run", "SELECT * FROM check_run ORDER BY rowid"),
+            ("check_consumer", "SELECT * FROM check_consumer ORDER BY rowid"),
+            ("execution", "SELECT * FROM execution ORDER BY created_at, rowid"),
+            ("task_schedule_wait", "SELECT * FROM task_schedule_wait"),
+            ("task_schedule_park", "SELECT * FROM task_schedule_park"),
+            ("task_schedule_dirty", "SELECT * FROM task_schedule_dirty"),
+            ("project_schedule_dirty", "SELECT * FROM project_schedule_dirty"),
+            ("task_slot_wait_age", "SELECT * FROM task_slot_wait_age"),
+            ("task_budget", "SELECT * FROM task_budget"),
+            ("workspace_lease", "SELECT * FROM workspace_lease"),
+            ("worker_health", "SELECT * FROM worker_health"),
+            ("worker_item_failure", "SELECT * FROM worker_item_failure ORDER BY rowid DESC LIMIT 20"),
+            ("worker_dead_letter", "SELECT * FROM worker_dead_letter ORDER BY rowid DESC LIMIT 20"),
+            ("transition_log (last 30)", "SELECT task_id, from_state, to_state, triggered_by, bridge_kind, substr(trigger_reason,1,160) AS reason, created_at FROM transition_log ORDER BY created_at DESC, rowid DESC LIMIT 30"),
+        ] {
+            out.push_str(&format!("-- {title}\n"));
+            let rows = match sqlx::query(query).fetch_all(&mut connection).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    out.push_str(&format!("   unreadable: {error}\n"));
+                    continue;
+                }
+            };
+            for row in rows {
+                let mut line = String::new();
+                for (at, column) in row.columns().iter().enumerate() {
+                    if row.try_get_raw(at).map_or(true, |value| value.is_null()) {
+                        continue;
+                    }
+                    let value = row
+                        .try_get::<String, _>(at)
+                        .or_else(|_| row.try_get::<i64, _>(at).map(|n| n.to_string()))
+                        .or_else(|_| row.try_get::<f64, _>(at).map(|n| n.to_string()))
+                        .unwrap_or_else(|_| "<blob>".to_owned());
+                    if value.is_empty() || value == "{}" || value == "[]" {
+                        continue;
+                    }
+                    let short: String = value.chars().take(400).collect();
+                    line.push_str(&format!("{}={short} | ", column.name()));
+                }
+                out.push_str(&format!("   {line}\n"));
+            }
+        }
+        let _ = connection.close().await;
+        out
+    }
+
+    /// The dump, also straight to the process's stderr: libtest shows a
+    /// test's captured output only once the whole run ends.
+    async fn report(&self, what: &str) -> String {
+        use std::io::Write;
+        let report = format!("HANG {}: {what}\n{}", self.name, self.dump().await);
+        let _ = writeln!(std::io::stderr(), "{report}");
+        report
+    }
+
+    /// The backstop for a test thread that blocks (a lock, a child process)
+    /// where no timer of its own runtime can fire: another thread reports the
+    /// state and ends the test process.
+    fn watchdog(self: &Arc<Self>, limit: Duration) -> std::sync::mpsc::Sender<()> {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let probe = Arc::clone(self);
+        std::thread::spawn(move || {
+            if wait.recv_timeout(limit) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                return;
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the watchdog's runtime builds");
+            runtime.block_on(probe.report(&format!(
+                "the test did not end within {limit:?} and its own deadline did not fire; ending the test process"
+            )));
+            std::process::exit(101);
+        });
+        done
+    }
+}
+
+/// `wait`, or a panic with the state dump when it has not returned within
+/// `WAIT_LIMIT`. Nothing the model awaits may wait longer than that.
+async fn bounded<T>(probe: &Probe, what: &str, wait: impl Future<Output = T>) -> T {
+    probe
+        .waits
+        .lock()
+        .unwrap()
+        .push((what.to_owned(), std::time::Instant::now()));
+    match tokio::time::timeout(WAIT_LIMIT, wait).await {
+        Ok(value) => {
+            probe.waits.lock().unwrap().pop();
+            value
+        }
+        Err(_) => panic!(
+            "{}",
+            probe
+                .report(&format!("`{what}` did not return within {WAIT_LIMIT:?}"))
+                .await
+        ),
+    }
+}
+
 struct World {
     dir: tempfile::TempDir,
+    probe: Arc<Probe>,
     _storm: Option<LockStorm>,
     live: Option<Live>,
     shared: Arc<Shared>,
@@ -539,7 +731,17 @@ const INITIAL: [&str; 2] = ["backlog", "todo"];
 const TERMINAL: [&str; 2] = ["done", "cancelled"];
 
 impl World {
-    async fn boot(dir: &Path, shared: &Arc<Shared>) -> Live {
+    async fn boot(dir: &Path, shared: &Arc<Shared>, probe: &Arc<Probe>) -> Live {
+        *probe.database.lock().unwrap() = Some(dir.join("forge.db"));
+        bounded(
+            probe,
+            "booting the server",
+            Self::boot_unbounded(dir, shared, probe),
+        )
+        .await
+    }
+
+    async fn boot_unbounded(dir: &Path, shared: &Arc<Shared>, probe: &Arc<Probe>) -> Live {
         let url = format!("sqlite:{}?mode=rwc", dir.join("forge.db").display());
         let pool = db::create_sqlite_pool(&url).await.expect("pool creates");
         db::run_migrations(&pool).await.expect("migrations run");
@@ -553,6 +755,7 @@ impl World {
         });
         let mut registry = executors::AdapterRegistry::new();
         registry.register(Box::new(ScriptedAdapter(Arc::clone(&script))));
+        *probe.script.lock().unwrap() = Some(Arc::clone(&script));
         let registry = Arc::new(registry);
         services::ensure_default_agents(db.as_ref(), &registry)
             .await
@@ -616,7 +819,8 @@ impl World {
         git(&repo, &["commit", "-m", "shared file"]).unwrap();
 
         let shared = Arc::new(Shared::default());
-        let live = Self::boot(dir.path(), &shared).await;
+        let probe = Probe::new("model");
+        let live = Self::boot(dir.path(), &shared, &probe).await;
         sqlx::query(
             "INSERT INTO user(id,email,password_hash,display_name,is_admin,created_at,updated_at)
              VALUES ('test-user-id','test@example.com','$2b$04$placeholder',NULL,0,?,?)",
@@ -660,6 +864,7 @@ impl World {
         Self {
             _storm: lock_storm(dir.path()),
             dir,
+            probe,
             live: Some(live),
             shared,
             project_id,
@@ -735,8 +940,8 @@ impl World {
         }
         drop(old);
 
-        let live = Self::boot(self.dir.path(), &self.shared).await;
-        Self::start(&live).await?;
+        let live = Self::boot(self.dir.path(), &self.shared, &self.probe).await;
+        bounded(&self.probe, "starting after a crash", Self::start(&live)).await?;
         self.live = Some(live);
         Ok(())
     }
@@ -780,17 +985,21 @@ impl World {
             None => builder.body(Body::empty()),
         }
         .expect("request builds");
-        let response = self
-            .live()
-            .app
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("router responds");
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body reads");
+        let (status, bytes) = bounded(&self.probe, &format!("{method} {uri}"), async {
+            let response = self
+                .live()
+                .app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router responds");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body reads");
+            (status, bytes)
+        })
+        .await;
         let value = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         if status.is_server_error() {
@@ -957,13 +1166,17 @@ impl World {
                 .await
                 .map_err(|error| error.to_string())?;
                 if waits
-                    && self
-                        .live()
-                        .state
-                        .db
-                        .expedite_parked_integration_attempt(id, &db::now_rfc3339(), false)
-                        .await
-                        .map_err(|error| error.to_string())?
+                    && bounded(
+                        &self.probe,
+                        "expediting a parked attempt",
+                        self.live().state.db.expedite_parked_integration_attempt(
+                            id,
+                            &db::now_rfc3339(),
+                            false,
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
                 {
                     moved += 1;
                 }
@@ -1000,25 +1213,27 @@ impl World {
             // made obsolete is harmless.
             let mut attempt = 0;
             loop {
-                let written = db::TaskRepo::mutate_metadata(
-                    &*self.live().state.db,
-                    id,
-                    None,
-                    vec![db::TaskMetadataMutation::Set {
-                        key: "deferred_dispatch".to_owned(),
-                        value: deferral.clone(),
-                    }],
-                    &db::now_rfc3339(),
+                let now = db::now_rfc3339();
+                let written = bounded(
+                    &self.probe,
+                    "moving a deadline",
+                    db::TaskRepo::mutate_metadata(
+                        &*self.live().state.db,
+                        id,
+                        None,
+                        vec![db::TaskMetadataMutation::Set {
+                            key: "deferred_dispatch".to_owned(),
+                            value: deferral.clone(),
+                        }],
+                        &now,
+                    ),
                 )
                 .await;
                 match written {
                     Ok(_) => break,
                     Err(db::DbError::TaskBusy { .. }) if attempt < BUSY_RETRIES => {
                         attempt += 1;
-                        self.live()
-                            .state
-                            .task_service
-                            .drain(id)
+                        self.drain(id)
                             .await
                             .map_err(|error| format!("draining a busy Task failed: {error}"))?;
                     }
@@ -1287,6 +1502,29 @@ impl World {
         Ok((print, unowned))
     }
 
+    /// The step worker's drain of one Task, under the model's hard deadline.
+    async fn drain(&self, id: &str) -> Result<(), services::ServiceError> {
+        bounded(
+            &self.probe,
+            &format!("draining the steps of Task {id}"),
+            self.live().state.task_service.drain(id),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// One dispatcher pass, under the model's hard deadline.
+    async fn dispatcher_pass(&self) -> Result<(), String> {
+        bounded(
+            &self.probe,
+            "a dispatcher pass",
+            self.live().runtime.task_dispatcher.check_once(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("dispatcher pass failed: {error}"))
+    }
+
     /// Invariant (d): run the step worker and the dispatcher until nothing
     /// changes. Not settling within the bound is a livelock.
     async fn quiesce(&self) -> Result<(), String> {
@@ -1302,24 +1540,15 @@ impl World {
             }
             self.move_deadlines(false).await?;
             for (index, id) in self.tasks.iter().enumerate() {
-                self.live()
-                    .state
-                    .task_service
-                    .drain(id)
-                    .await
-                    .map_err(|error| {
-                        format!("draining the steps of task {index} failed: {error}")
-                    })?;
+                self.drain(id).await.map_err(|error| {
+                    format!("draining the steps of task {index} failed: {error}")
+                })?;
             }
-            self.live()
-                .runtime
-                .task_dispatcher
-                .check_once()
-                .await
-                .map_err(|error| format!("dispatcher pass failed: {error}"))?;
+            self.dispatcher_pass().await?;
             tokio::time::sleep(Duration::from_millis(if round < 20 { 5 } else { 25 })).await;
             let frozen = self.move_deadlines(false).await?;
-            let (mut print, running) = self.fingerprint().await?;
+            let (mut print, running) =
+                bounded(&self.probe, "reading the fingerprint", self.fingerprint()).await?;
             if frozen > 0 {
                 print.push_str(&format!("froze {frozen} at round {round}"));
             }
@@ -1398,12 +1627,13 @@ impl World {
     async fn check_quiescent(&mut self) -> Result<String, String> {
         self.check_committed().await?;
         // (a) the dispatcher's own "owned or parked" assertion.
-        self.live()
-            .runtime
-            .task_dispatcher
-            .sweep_and_assert()
-            .await
-            .map_err(|error| format!("(a) {error}"))?;
+        bounded(
+            &self.probe,
+            "the dispatcher's sweep and assertion",
+            self.live().runtime.task_dispatcher.sweep_and_assert(),
+        )
+        .await
+        .map_err(|error| format!("(a) {error}"))?;
         let mut line = String::new();
         for index in 0..self.tasks.len() {
             let task = self.task(index).await?;
@@ -3752,6 +3982,7 @@ impl World {
     async fn restore(
         name: &str,
         shadow: bool,
+        probe: Arc<Probe>,
     ) -> Result<
         (
             Self,
@@ -3839,7 +4070,7 @@ impl World {
         }
         // Later than every write of the run that made the fixture.
         shared.writes.store(1000, Ordering::SeqCst);
-        let live = Self::boot(dir.path(), &shared).await;
+        let live = Self::boot(dir.path(), &shared, &probe).await;
         let agent = |name: &'static str| {
             let pool = live.pool.clone();
             async move {
@@ -3851,10 +4082,11 @@ impl World {
             }
         };
         let (coder_id, reviewer_id) = (agent("model-coder").await?, agent("model-reviewer").await?);
-        let report = Self::start(&live).await?;
+        let report = bounded(&probe, "the first start on the fixture", Self::start(&live)).await?;
         let world = Self {
             _storm: lock_storm(dir.path()),
             dir,
+            probe,
             live: Some(live),
             shared,
             project_id: manifest["project_id"]
@@ -4000,19 +4232,11 @@ impl World {
         let rows = counts(self.live().pool.clone()).await;
         for _ in 0..rounds {
             for id in &self.tasks {
-                self.live()
-                    .state
-                    .task_service
-                    .drain(id)
+                self.drain(id)
                     .await
                     .map_err(|error| format!("draining an idle Task failed: {error}"))?;
             }
-            self.live()
-                .runtime
-                .task_dispatcher
-                .check_once()
-                .await
-                .map_err(|error| format!("dispatcher pass failed: {error}"))?;
+            self.dispatcher_pass().await?;
         }
         let after: i64 = sqlx::query_scalar("PRAGMA data_version")
             .fetch_one(&mut watch)
@@ -4152,13 +4376,42 @@ enum Upgraded {
     Parked,
 }
 
+/// One fixture test under its hard deadline. The body is not `Send` as a
+/// whole, so it is awaited here: the deadline fires at any await, and where
+/// the body blocks its thread (a lock, a child process) the watchdog thread
+/// reports and ends the process a minute later.
 async fn pre_queue_upgrade(
-    name: &str,
+    name: &'static str,
     shadow: bool,
     expected: Upgraded,
     take: Option<&'static str>,
 ) -> Result<(), String> {
-    let (mut world, manifest, report) = World::restore(name, shadow).await?;
+    let variant = if shadow { "shadow" } else { "bare" };
+    let probe = Probe::new(format!(
+        "pre-queue {name} {variant}{}",
+        take.map(|verb| format!(" {verb}")).unwrap_or_default()
+    ));
+    let _watchdog = probe.watchdog(TEST_LIMIT + Duration::from_secs(60));
+    let body = pre_queue_upgrade_unbounded(name, shadow, expected, take, Arc::clone(&probe));
+    match tokio::time::timeout(TEST_LIMIT, body).await {
+        Ok(outcome) => outcome,
+        Err(_) => panic!(
+            "{}",
+            probe
+                .report(&format!("the test did not end within {TEST_LIMIT:?}"))
+                .await
+        ),
+    }
+}
+
+async fn pre_queue_upgrade_unbounded(
+    name: &'static str,
+    shadow: bool,
+    expected: Upgraded,
+    take: Option<&'static str>,
+    probe: Arc<Probe>,
+) -> Result<(), String> {
+    let (mut world, manifest, report) = World::restore(name, shadow, probe).await?;
     let variant = if shadow { "shadow" } else { "bare" };
     match pre_queue_upgraded(
         name, variant, expected, take, &mut world, &manifest, &report,

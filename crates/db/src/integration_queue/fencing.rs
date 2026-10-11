@@ -65,10 +65,33 @@ pub struct IntegrationEffectGuard {
     _owner_locks: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
 
+type OwnerLocks =
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+static OWNER_LOCKS: std::sync::OnceLock<OwnerLocks> = std::sync::OnceLock::new();
+
+/// The owner checkouts this process serializes right now: each key with
+/// whether it is held and how many effects hold or wait for it. A diagnostic
+/// for a stuck queue: an effect that never returns shows as a held key.
+pub fn integration_owner_locks() -> Vec<(String, bool, usize)> {
+    let registry = OWNER_LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut locks: Vec<_> = registry
+        .iter()
+        .filter_map(|(key, lock)| {
+            let lock = lock.upgrade()?;
+            let held = lock.try_lock().is_err();
+            // This read holds one reference of its own.
+            Some((key.clone(), held, std::sync::Arc::strong_count(&lock) - 1))
+        })
+        .collect();
+    locks.sort();
+    locks
+}
+
 async fn lock_owner(request: &IntegrationEffectRequest) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
-    type OwnerLocks = Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
-    static LOCKS: OnceLock<OwnerLocks> = OnceLock::new();
+    use std::sync::{Arc, Weak};
     let owner = request.effect_owner();
     let prefix = format!(
         "{}:{}:{}",
@@ -89,7 +112,7 @@ async fn lock_owner(request: &IntegrationEffectRequest) -> Vec<tokio::sync::Owne
     keys.sort();
     keys.dedup();
     let locks = {
-        let mut registry = LOCKS
+        let mut registry = OWNER_LOCKS
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|p| p.into_inner());
