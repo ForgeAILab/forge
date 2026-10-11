@@ -192,6 +192,7 @@ impl World {
     /// and every step with its wake time and last error.
     pub async fn stuck(&self, task: &str) -> String {
         let now = db::now_rfc3339();
+        let writers = db::open_write_transactions();
         let row: (String, i64, Option<String>) =
             sqlx::query_as("SELECT status,version,condition_json FROM task WHERE id=?")
                 .bind(task)
@@ -210,12 +211,22 @@ impl World {
                 .fetch_all(self.db.pool())
                 .await
                 .unwrap();
-        let mut out = format!("now {now}\ntask {row:?}\n");
+        let mut out = format!("now {now}\nwrite transactions {writers:#?}\ntask {row:?}\n");
         for attempt in attempts {
             out.push_str(&format!("attempt {attempt:?}\n"));
         }
         for step in steps {
             out.push_str(&format!("step {step:?}\n"));
+        }
+        for step in self.db.task_steps(task).await.unwrap() {
+            out.push_str(&format!(
+                "ownership {} active={} owner={:?} lease={:?} preempt={:?}\n",
+                step.id,
+                self.db.step_is_active(&step),
+                step.claimed_by,
+                step.lease_until,
+                crate::worker_runtime::queue::preemption_diagnostic(&step.id),
+            ));
         }
         out
     }
