@@ -4938,6 +4938,13 @@ async fn integration_objects_move_between_daemon_and_server_owners_by_key() {
             "server-clone",
         ],
     );
+    // A clone does not copy the source's local identity.
+    for (key, value) in [
+        ("user.name", "Forge"),
+        ("user.email", "forge@example.invalid"),
+    ] {
+        git_sync(&server_clone, &["config", key, value]);
+    }
     let now = db::now_rfc3339();
     sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('server-clone',?,'server',?,'managed_clone',0,'ready',?,?)")
         .bind(&repo_id).bind(server_clone.to_str()).bind(&now).bind(&now)

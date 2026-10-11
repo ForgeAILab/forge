@@ -448,6 +448,14 @@ async fn transfer() -> Transfer {
     local_git(&clone, &["remote", "remove", "origin"])
         .await
         .unwrap();
+    // A clone does not copy the source's local identity, and a test host
+    // (CI) has no global one: commits made in the clone need their own.
+    for (key, value) in [
+        ("user.email", "test@forge.dev"),
+        ("user.name", "Forge Test"),
+    ] {
+        local_git(&clone, &["config", key, value]).await.unwrap();
+    }
     fixture
         .backend
         .handle(
