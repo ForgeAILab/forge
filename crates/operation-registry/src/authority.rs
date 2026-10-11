@@ -335,9 +335,6 @@ pub enum McpScopeRule {
     AccountInspection,
     BoundProject,
 }
-pub fn mcp_scope_rule(name: &str) -> Option<McpScopeRule> {
-    crate::mcp::lookup(name).map(|spec| spec.scope)
-}
 pub fn mcp_authority(user_id: &str, constrained_project: Option<&str>) -> EffectiveAuthority {
     EffectiveAuthority::resolve(AuthorityFacts {
         principal: Principal::DelegatedUser {

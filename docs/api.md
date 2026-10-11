@@ -5392,8 +5392,8 @@ role through that status alone:
 | Visible Project without owner/member authority | 26 names: the 24 Task/Project visibility APIs (including memory and integration queue), `forge_list_projects`, and `forge_list_agent_chats`; no escalation or member-only identity/Chat/handoff tools |
 | Project not visible to the user | No tools |
 
-`forge_get_integration_queue` is a nineteenth registry-built tool, added with
-the merge-queue reads rather than moved: Project-classified, and offered to
+`forge_get_integration_queue` was added with the merge-queue reads rather
+than moved from a hand-written descriptor: Project-classified, and offered to
 every grant whose Project is visible to the user (the rule of `GET
 /api/v1/repos/{id}/integration-queues`), with or without owner/member
 authority. An account grant names the Project; a Project the user cannot see
@@ -5463,14 +5463,22 @@ copy a currently offered `available_actions` command and its meaningful
 parameters. Hook discriminators remain `script` and `plugin`, and lifecycle
 event names remain the five existing names.
 
-`forge_transition_task` now records the authenticated delegated user rather
-than the MCP system component. It retains user action authority and spends retry
-budgets, without an interactive-owner exemption. A state move stops displaced
-running executions through the existing user-transition path. Both Project
-settings tools pass the authenticated user to shared validation, so assigned agents must be
-usable by that user in the Project, just as on REST. Task reads retain their
-typed integration summaries and current `available_actions`; queue and offer
-eligibility are unchanged.
+`forge_transition_task` keeps its MCP system attribution
+(`triggered_by="system"`) and the workflow policy that goes with it: only
+edges the workflow defines, with the dependency and conflict-marker gates
+enforced and no user override. `forge_task_action` keeps its delegated-user
+actor. Both Project settings tools pass the authenticated user to shared
+validation, so assigned agents must be usable by that user in the Project,
+just as on REST. Task reads retain their typed integration summaries and
+current `available_actions`; queue and offer eligibility are unchanged.
+
+A Task, parent, dependency, sub-task or Execution id outside what the
+credential may use answers `-32004` exactly like an id that does not exist,
+naming only the id that was sent: a Project-constrained credential cannot tell
+a Task of another Project from a missing one (even in a Project its user can
+see), and an Execution of such a Task is `execution not found`, never the Task
+behind it. A `project_id` other than the bound Project is refused the same way
+whether or not that Project exists.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and

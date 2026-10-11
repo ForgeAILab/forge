@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use api_types::Actor;
+use api_types::{Actor, SystemComponent};
 use api_types::{
     AgentBindingState, AgentChatDetailResponse, AgentChatKind, AgentChatListResponse,
     AgentChatMessageAuthorType, AgentChatMessageListResponse, AgentChatMessageResponse,
@@ -606,12 +606,12 @@ pub(super) async fn forge_update_task(
 pub(super) async fn forge_transition_task(
     state: &AppState,
     params: TransitionTaskParams,
-    context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let actor = Actor::delegated_user(
-        authenticated_user(context)?,
-        api_types::UserActionSource::Api,
-    );
+    // The transition runs under the workflow policy of the MCP system
+    // component, as it always has: defined edges only, dependency and
+    // conflict-marker gates enforced, no user override. Attributing it to the
+    // delegated user would also hand the caller the interactive user's
+    // override policy, which `Actor::is_user` selects throughout the engine.
     let task = state
         .task_service
         .transition(
@@ -621,24 +621,23 @@ pub(super) async fn forge_transition_task(
                 bridge: Default::default(),
                 version: params.version,
                 reason: None,
-                triggered_by: actor.clone(),
+                triggered_by: Actor::system(SystemComponent::Mcp),
                 rejection: false,
                 defer_dispatch_seconds: None,
             },
         )
         .await?;
-    transition_task_value(state, task.task, task.pending_steps, &actor).await
+    transition_task_value(state, task.task, task.pending_steps).await
 }
 
 async fn transition_task_value(
     state: &AppState,
     task: db::Task,
     pending_steps: i64,
-    actor: &Actor,
 ) -> Result<Value, McpToolError> {
     let snapshot = state
         .task_service
-        .task_action_snapshot_for_task(task, actor)
+        .task_action_snapshot_for_task(task, &Actor::user(api_types::UserActionSource::Api))
         .await?;
     let mut value = task_snapshot_value(snapshot)?;
     value["pending_steps"] = json!(pending_steps);
@@ -1855,6 +1854,15 @@ mod tests {
             };
             assert_eq!(task_action_input(params.action), expected);
         }
+        // The one acceptance difference, listed as a break: Serde ignores
+        // extra fields on an internally tagged unit variant, so REST accepts
+        // this `start`; the closed MCP contract refuses it.
+        let padded_start = json!({"verb":"start","reason":"now"});
+        assert!(serde_json::from_value::<api_types::TaskAction>(padded_start.clone()).is_ok());
+        assert!(operation_registry::mcp::lookup("forge_task_action")
+            .unwrap()
+            .decode(json!({"task_id":"t","action":padded_start,"version":1}))
+            .is_err());
         for action in [
             json!({"verb":"send_back"}),
             json!({"verb":"cancel","reset_budget":true}),
@@ -1892,14 +1900,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        let value = transition_task_value(
-            &state,
-            committed,
-            1,
-            &Actor::delegated_user("u", api_types::UserActionSource::Api),
-        )
-        .await
-        .unwrap();
+        let value = transition_task_value(&state, committed, 1).await.unwrap();
         assert_eq!(value["status"], "todo");
         assert_eq!(value["version"], 1);
         assert_eq!(value["pending_steps"], 1);

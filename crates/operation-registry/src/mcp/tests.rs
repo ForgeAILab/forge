@@ -238,7 +238,6 @@ fn complete_catalog_uses_only_portable_keywords_and_has_bounded_descriptions() {
         let description = descriptor["description"].as_str().unwrap();
         assert!(!description.contains('\n'));
         assert!(description.len() <= 200, "{} prefix", spec.name);
-        assert!(crate::authority::mcp_scope_rule(spec.name).is_some());
     }
 }
 #[test]

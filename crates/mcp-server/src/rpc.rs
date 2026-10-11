@@ -51,32 +51,19 @@ pub(crate) async fn dispatch_with_context(
             if operation_registry::mcp::lookup(&params.name).is_none() {
                 return Err(McpToolError::protocol(-32601, "method not found"));
             }
-            // Scope first, without loading domain facts or decoding arguments.
-            let grant = operation_registry::authority::mcp_authority(
-                context.user_id.as_deref().unwrap_or_default(),
-                context.project_id.as_deref(),
-            );
-            let rule = operation_registry::authority::mcp_scope_rule(&params.name)
-                .ok_or_else(|| McpToolError::protocol(-32601, "method not found"))?;
-            grant
-                .evaluate(rule)
-                .map_err(|_| {
-                    McpToolError::new(-32001, "tool is outside the delegated MCP grant")
-                        .with_data(json!({"code":"mcp_scope_denied"}))
-                })
-                .map_err(|error| {
-                    error.with_call_context(
-                        &params.name,
-                        context.project_id.as_deref(),
-                        context.user_id.as_deref(),
-                    )
-                })?;
+            // Authority first, before any argument is decoded. An account
+            // grant needs no stored fact for tool admission (references are
+            // authorized below); a Project-constrained grant loads its role
+            // in the bound Project.
             {
                 let admission = async {
                     let authority = if context.project_id.is_some() {
                         super::tools::registry::authority(state, context).await?
                     } else {
-                        grant
+                        operation_registry::authority::mcp_authority(
+                            context.user_id.as_deref().unwrap_or_default(),
+                            None,
+                        )
                     };
                     super::tools::registry::authorize(&authority, &params.name)
                 };
@@ -268,6 +255,7 @@ async fn apply_project_scope(
                 {
                     let _ = assert_task_access(
                         state,
+                        scoped_project_id.is_some(),
                         Some(project_id),
                         Some(project_id),
                         parent_id,
@@ -279,6 +267,7 @@ async fn apply_project_scope(
                     for dependency_id in string_array_arg(value, "depends_on_ids")? {
                         let _ = assert_task_access(
                             state,
+                            scoped_project_id.is_some(),
                             Some(project_id),
                             Some(project_id),
                             dependency_id,
@@ -297,7 +286,15 @@ async fn apply_project_scope(
             return Ok(arguments);
         };
         let task_id = required_string_arg(object, field_name)?;
-        let task = assert_task_access(state, scoped_project_id, None, task_id, user_id).await?;
+        let task = assert_task_access(
+            state,
+            scoped_project_id.is_some(),
+            scoped_project_id,
+            None,
+            task_id,
+            user_id,
+        )
+        .await?;
         let authorized_project_id = task.project_id.as_str();
         if resource == ResourceRule::DependencyMutation {
             let Some(_) = object.get("depends_on_id").and_then(Value::as_str) else {
@@ -306,6 +303,7 @@ async fn apply_project_scope(
             let depends_on_id = required_string_arg(object, "depends_on_id")?;
             let _ = assert_task_access(
                 state,
+                scoped_project_id.is_some(),
                 scoped_project_id,
                 Some(authorized_project_id),
                 depends_on_id,
@@ -317,6 +315,7 @@ async fn apply_project_scope(
             for depends_on_id in TaskDependencyRepo::list_dependencies(&*state.db, task_id).await? {
                 let _ = assert_task_access(
                     state,
+                    scoped_project_id.is_some(),
                     scoped_project_id,
                     Some(authorized_project_id),
                     &depends_on_id,
@@ -329,6 +328,7 @@ async fn apply_project_scope(
             for dependent_id in TaskDependencyRepo::list_dependents(&*state.db, task_id).await? {
                 let _ = assert_task_access(
                     state,
+                    scoped_project_id.is_some(),
                     scoped_project_id,
                     Some(authorized_project_id),
                     &dependent_id,
@@ -342,6 +342,7 @@ async fn apply_project_scope(
                 if subtask.project_id != authorized_project_id {
                     let _ = assert_task_access(
                         state,
+                        scoped_project_id.is_some(),
                         scoped_project_id,
                         Some(authorized_project_id),
                         &subtask.id,
@@ -367,6 +368,7 @@ async fn apply_project_scope(
                 if !sibling_ids.contains(subtask_id) {
                     let _ = assert_task_access(
                         state,
+                        scoped_project_id.is_some(),
                         scoped_project_id,
                         Some(authorized_project_id),
                         subtask_id,
@@ -440,14 +442,18 @@ fn string_array_arg<'a>(value: &'a Value, field_name: &str) -> Result<Vec<&'a st
         .collect()
 }
 
-/// Resolve a Task the caller may act on. `scope` is the request's MCP Project
-/// scope (a Task outside it is refused); `proven` is a Project whose
+/// Resolve a Task the caller may act on. `scope` is the Project the Task must
+/// belong to: the bound Project of a constrained grant (`constrained`, where a
+/// Task outside it is reported as not found), or the Project an account grant
+/// named for a new Task (where a visible Task elsewhere is named as a
+/// mismatch); `proven` is a Project whose
 /// visibility this request already established, so a Task in it skips the
 /// repeat visibility read. Any other Task gets the full check, which keeps
 /// references into other visible Projects (legacy cross-Project dependencies)
 /// working for unscoped requests and invisible ones reported as not found.
 async fn assert_task_access(
     state: &AppState,
+    constrained: bool,
     scope: Option<&str>,
     proven: Option<&str>,
     task_id: &str,
@@ -457,6 +463,11 @@ async fn assert_task_access(
         .await?
         .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
     let project_id = task.project_id.as_str();
+    // A Project-constrained grant learns nothing about another Project: a
+    // Task outside the bound Project answers exactly like a missing one.
+    if constrained && scope.is_some_and(|scope| project_id != scope) {
+        return Err(McpToolError::not_found("task", task_id.to_owned()));
+    }
     let visibility_proven = scope == Some(project_id) || proven == Some(project_id);
     if !visibility_proven
         && ProjectRepo::get_visible_by_id(&*state.db, project_id, user_id)
@@ -484,10 +495,29 @@ async fn assert_execution_access(
     execution_id: &str,
     user_id: &str,
 ) -> Result<Task, McpToolError> {
+    // Every refusal names only the id the caller sent: an Execution of a Task
+    // the caller may not use answers like a missing one, and never names that
+    // Task.
+    let hidden = || McpToolError::not_found("execution", execution_id.to_owned());
     let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
         .await?
-        .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
-    assert_task_access(state, project_id, None, &execution.task_id, user_id).await
+        .ok_or_else(hidden)?;
+    assert_task_access(
+        state,
+        project_id.is_some(),
+        project_id,
+        None,
+        &execution.task_id,
+        user_id,
+    )
+    .await
+    .map_err(|error| {
+        if error.code == -32004 {
+            hidden()
+        } else {
+            error
+        }
+    })
 }
 
 async fn assert_project_access(

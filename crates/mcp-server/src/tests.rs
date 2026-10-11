@@ -1928,7 +1928,8 @@ fn scoped_mcp_rejects_task_id_tool_for_other_project() {
         .await
         .expect_err("cross-project task handle errors");
 
-        assert_eq!(error.code, -32602);
+        // Outside the bound Project answers exactly like a missing id.
+        assert_eq!(error.code, -32004);
     });
 }
 
@@ -1960,7 +1961,8 @@ fn scoped_mcp_rejects_parent_task_id_tool_for_other_project() {
         .await
         .expect_err("cross-project parent task handle errors");
 
-        assert_eq!(error.code, -32602);
+        // Outside the bound Project answers exactly like a missing id.
+        assert_eq!(error.code, -32004);
     });
 }
 
@@ -1990,7 +1992,8 @@ fn scoped_mcp_rejects_execution_id_tool_for_other_project() {
         .await
         .expect_err("cross-project execution handle errors");
 
-        assert_eq!(error.code, -32602);
+        // Outside the bound Project answers exactly like a missing id.
+        assert_eq!(error.code, -32004);
     });
 }
 

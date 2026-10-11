@@ -322,9 +322,7 @@ pub(crate) async fn dispatch(
         McpInput::AddTaskDependency(params) => {
             handlers::forge_add_task_dependency(state, params).await
         }
-        McpInput::TransitionTask(params) => {
-            handlers::forge_transition_task(state, params, context).await
-        }
+        McpInput::TransitionTask(params) => handlers::forge_transition_task(state, params).await,
         McpInput::UpdateTask(params) => handlers::forge_update_task(state, params).await,
         McpInput::TaskAction(params) => handlers::task_action(state, params, context).await,
         McpInput::AssignAgent(params) => handlers::forge_assign_agent(state, params).await,

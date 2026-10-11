@@ -1882,11 +1882,14 @@ status filters, opaque policy/settings JSON, numeric bounds, and the accepted
 `board_position` sort now reflect handler acceptance. Handler/domain checks
 retain state, CAS, graph, content, and transaction-time authority invariants.
 
-Task transitions attribute the authenticated user as delegated rather than as
-`SystemComponent::Mcp`; delegated actions keep user action authority, stop
-running executions displaced by state moves, and spend retry budgets. Both
-Project settings paths pass that user into shared validation,
-including assigned-agent usability checks. Task reads continue consuming the
+`forge_transition_task` keeps `SystemComponent::Mcp` as its workflow actor:
+`Actor::is_user` selects the interactive override policy throughout the engine
+(undefined edges, dependency and conflict-marker gates, displaced runs), so a
+delegated MCP credential is not given it. `forge_task_action` keeps its
+delegated-user actor, which spends retry budgets. Both Project settings paths
+pass the authenticated user into shared validation, including assigned-agent
+usability checks. Under a Project-constrained grant a Task or Execution
+outside the bound Project is reported exactly like a missing one. Task reads continue consuming the
 existing typed integration summary and `available_actions`; merge states,
 queue-owned eligibility, integration commands, and Task-step writing are
 unchanged. Effect-time identity ownership and daemon-admin rechecks remain

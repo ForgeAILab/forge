@@ -472,11 +472,27 @@ fn contract_corrections_do_not_echo_argument_values_and_need_an_object() {
 }
 
 #[test]
-fn task_transition_records_authenticated_delegation_in_the_durable_hook() {
+fn task_transition_keeps_the_mcp_system_policy_and_gains_no_user_override() {
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task(&state).await;
         let execution_id = seed_execution(&state, task.id.clone()).await;
+        // No edge leads from the initial state straight to `done`. An
+        // interactive user may override that; an MCP credential may not.
+        let error = call_tool_error(
+            &state,
+            "forge_transition_task",
+            json!({"task_id":task.id,"status":"done","version":task.version}),
+        )
+        .await;
+        assert_eq!(error.code, -32010, "{}", error.message);
+        let unchanged = TaskRepo::get_by_id(&*state.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, task.status);
+        assert_eq!(unchanged.version, task.version);
+
         call_tool(
             &state,
             "forge_transition_task",
@@ -487,32 +503,20 @@ fn task_transition_records_authenticated_delegation_in_the_durable_hook() {
             .bind(&task.id).fetch_one(state.db.pool()).await.unwrap();
         let payload: Value = serde_json::from_str(&payload).unwrap();
         let actor: api_types::Actor = serde_json::from_value(payload["actor"].clone()).unwrap();
-        let api_types::Actor::User {
-            user_id,
-            source,
-            delegated,
-        } = &actor
-        else {
-            panic!("delegated user, not a system actor")
-        };
-        assert_eq!(user_id.as_deref(), Some("mcp-test-user"));
-        assert!(delegated);
-        let source = match source {
-            api_types::UserActionSource::Override(source) => source.as_ref(),
-            source => source,
-        };
-        assert_eq!(source, &api_types::UserActionSource::Api);
+        assert_eq!(
+            actor,
+            api_types::Actor::system(api_types::SystemComponent::Mcp),
+            "the transition runs under the MCP system policy"
+        );
         let execution = ExecutionRepo::get_by_id(&*state.db, &execution_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             execution.status,
             ExecutionStatus::Cancelled,
-            "delegated user transitions stop the displaced run"
+            "only an interactive user's state move stops the displaced run"
         );
-        assert!(actor.is_user());
-        assert!(!actor.is_owner(), "delegation never exempts retry budgets");
     });
 }
 
@@ -616,5 +620,205 @@ fn unknown_nested_fields_fail_before_any_handler_effect() {
                 .unwrap();
             assert_eq!(before, after);
         }
+    });
+}
+
+/// Every id-taking Task/Project tool, with the id at the root and nested. The
+/// reference is refused before the handler, so the other arguments only have
+/// to satisfy nothing: the answer must not depend on whether the id exists.
+fn reference_calls(own_project: &str, own_task: &str, id: &str) -> Vec<(&'static str, Value)> {
+    let mut calls = vec![
+        ("forge_preview_prompt", json!({"task_id":id,"role":"coder"})),
+        ("forge_assign_agent", json!({"task_id":id,"agent_id":"a"})),
+        (
+            "forge_task_action",
+            json!({"task_id":id,"action":{"verb":"start"},"version":1}),
+        ),
+        ("forge_list_executions", json!({"task_id":id})),
+        ("forge_update_task", json!({"task_id":id,"version":1})),
+        (
+            "forge_transition_task",
+            json!({"task_id":id,"status":"in_progress","version":1}),
+        ),
+        (
+            "forge_add_task_dependency",
+            json!({"task_id":id,"depends_on_id":own_task}),
+        ),
+        (
+            "forge_add_task_dependency",
+            json!({"task_id":own_task,"depends_on_id":id}),
+        ),
+        (
+            "forge_remove_task_dependency",
+            json!({"task_id":id,"depends_on_id":own_task}),
+        ),
+        (
+            "forge_remove_task_dependency",
+            json!({"task_id":own_task,"depends_on_id":id}),
+        ),
+        (
+            "forge_create_sub_tasks",
+            json!({"parent_task_id":id,"subtasks":[{"title":"child"}]}),
+        ),
+        (
+            "forge_reorder_sub_tasks",
+            json!({"parent_task_id":id,"ordered_ids":[]}),
+        ),
+        (
+            "forge_reorder_sub_tasks",
+            json!({"parent_task_id":own_task,"ordered_ids":[id]}),
+        ),
+        (
+            "forge_create_task",
+            json!({"project_id":own_project,"title":"t","parent_task_id":id}),
+        ),
+        (
+            "forge_create_task",
+            json!({"project_id":own_project,"title":"t","depends_on_ids":[id]}),
+        ),
+        (
+            "forge_follow_up_execution",
+            json!({"execution_id":id,"message":"continue"}),
+        ),
+    ];
+    for name in [
+        "forge_get_task",
+        "forge_get_task_diff",
+        "forge_list_task_dependencies",
+        "forge_list_task_dependents",
+    ] {
+        calls.push((name, json!({"task_id":id})));
+    }
+    calls.push(("forge_list_sub_tasks", json!({"parent_task_id":id})));
+    for name in ["forge_get_project", "forge_list_tasks"] {
+        calls.push((name, json!({"project_id":id})));
+    }
+    calls.push(("forge_update_project", json!({"project_id":id,"version":1})));
+    calls.push((
+        "forge_update_project_lifecycle_hooks",
+        json!({"project_id":id,"version":1,"lifecycle_hooks":{}}),
+    ));
+    calls.push(("forge_memory_search", json!({"project_id":id,"query":"q"})));
+    calls
+}
+
+#[test]
+fn a_foreign_task_execution_or_project_answers_exactly_like_a_missing_one() {
+    run_async(async {
+        let state = sqlite_state().await;
+        seed_chat_account(&state).await;
+        let own = seed_task(&state).await;
+        let foreign = seed_task(&state).await;
+        let foreign_execution = seed_execution(&state, foreign.id.clone()).await;
+        let before: (i64, i64) = (
+            sqlx::query_scalar("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_dependency")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+        );
+        // A grant constrained to `own`'s Project while the other Project is
+        // visible to the user; then an account grant while it is not.
+        for constrained in [true, false] {
+            if !constrained {
+                sqlx::query("UPDATE project SET owner_id='chat-user' WHERE id=?")
+                    .bind(&foreign.project_id)
+                    .execute(state.db.pool())
+                    .await
+                    .unwrap();
+            }
+            let context = McpContext {
+                user_id: Some("mcp-test-user".into()),
+                project_id: constrained.then(|| own.project_id.clone()),
+            };
+            let missing = new_uuid_v4();
+            let mut compared = BTreeSet::new();
+            for (kind, existing) in [
+                ("task", foreign.id.as_str()),
+                ("execution", foreign_execution.as_str()),
+                ("project", foreign.project_id.as_str()),
+            ] {
+                let answers = |id: &str| {
+                    reference_calls(&own.project_id, &own.id, id)
+                        .into_iter()
+                        .filter(|(name, arguments)| match kind {
+                            "execution" => *name == "forge_follow_up_execution",
+                            "project" => arguments.get("project_id") == Some(&json!(id)),
+                            _ => {
+                                *name != "forge_follow_up_execution"
+                                    && arguments.get("project_id") != Some(&json!(id))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for ((name, there), (_, absent)) in
+                    answers(existing).into_iter().zip(answers(&missing))
+                {
+                    let mut seen = Vec::new();
+                    for (id, arguments) in [(existing, there), (missing.as_str(), absent)] {
+                        let error = dispatch_with_context(
+                            &state,
+                            &context,
+                            "tools/call",
+                            json!({"name":name,"arguments":arguments}),
+                        )
+                        .await
+                        .expect_err("a reference outside the grant is refused");
+                        let error = error.into_response(Value::Null).error.unwrap();
+                        seen.push((
+                            error.code,
+                            error.message.replace(id, "<id>"),
+                            error.data.map(|data| data.to_string().replace(id, "<id>")),
+                        ));
+                    }
+                    assert_eq!(seen[0], seen[1], "constrained={constrained} {name} {kind}");
+                    assert!(
+                        !format!("{:?}", seen[0]).contains(&foreign.id)
+                            && !format!("{:?}", seen[0]).contains(&foreign.project_id),
+                        "{name} names nothing but the id the caller sent"
+                    );
+                    compared.insert(name);
+                }
+            }
+            // Every Task/Project tool that takes an id is in the table.
+            let id_taking = operation_registry::mcp::CATALOG
+                .iter()
+                .filter(|spec| {
+                    let fields = spec.input.schema["properties"].as_object().unwrap();
+                    spec.resource != operation_registry::mcp::ResourceRule::None
+                        && ["task_id", "parent_task_id", "execution_id"]
+                            .iter()
+                            .any(|field| fields.contains_key(*field))
+                        || matches!(
+                            spec.name,
+                            "forge_get_project"
+                                | "forge_list_tasks"
+                                | "forge_update_project"
+                                | "forge_update_project_lifecycle_hooks"
+                                | "forge_memory_search"
+                        )
+                })
+                .map(|spec| spec.name)
+                .collect::<BTreeSet<_>>();
+            assert!(
+                id_taking.is_subset(&compared),
+                "untested id-taking tools: {:?}",
+                id_taking.difference(&compared).collect::<Vec<_>>()
+            );
+        }
+        let after: (i64, i64) = (
+            sqlx::query_scalar("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_dependency")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(before, after, "no refused reference had an effect");
     });
 }
