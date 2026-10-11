@@ -93,6 +93,28 @@ impl TransitionBridge {
             bridge_payload: Some(serde_json::json!({"verb": verb})),
         }
     }
+    /// A review re-run: the Task re-enters `review` on request. The entry is
+    /// routed as the workflow's own, so who asked travels here; an owner's
+    /// request makes the entry spend no review retry budget.
+    pub fn review_rerun(requested_by: &crate::Actor) -> Self {
+        Self {
+            bridge_kind: Some(TransitionBridgeKind::Recovery),
+            bridge_payload: Some(
+                serde_json::json!({"verb": Self::REVIEW_RERUN, "requested_by": requested_by}),
+            ),
+        }
+    }
+    pub const REVIEW_RERUN: &'static str = "review_rerun";
+    /// Who asked for the review re-run this bridge records, if it is one.
+    pub fn review_rerun_requester(&self) -> Option<crate::Actor> {
+        let payload = self.bridge_payload.as_ref()?;
+        if self.bridge_kind != Some(TransitionBridgeKind::Recovery)
+            || payload.get("verb").and_then(serde_json::Value::as_str) != Some(Self::REVIEW_RERUN)
+        {
+            return None;
+        }
+        serde_json::from_value(payload.get("requested_by")?.clone()).ok()
+    }
     pub fn is_review_refresh(&self) -> bool {
         self.bridge_kind
             .is_some_and(TransitionBridgeKind::is_review_refresh)

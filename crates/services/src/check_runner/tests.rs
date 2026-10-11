@@ -541,6 +541,80 @@ async fn worker_records_intent_receipt_result_and_delivery_then_acknowledges_onc
     assert_eq!(owner.runs.load(Ordering::SeqCst), 1);
 }
 
+/// An owner that, like the server owner recording its receipt, is inside a
+/// write transaction of its own when the worker's one-second look at the
+/// run's consumers comes due.
+struct WritesWhileRunning {
+    store: Arc<SqliteDb>,
+}
+#[async_trait::async_trait]
+impl CheckOwnerPort for WritesWhileRunning {
+    async fn prepare(&self, _run: &StoredCheckRun) -> Result<CheckDispatchIntent> {
+        Ok(intent())
+    }
+    async fn run(
+        &self,
+        record: &CheckWorkerRecord,
+        _cancel: &CancellationToken,
+    ) -> Result<DaemonCheckResult> {
+        let mut transaction = db::begin_immediate(self.store.pool()).await?;
+        sqlx::query("UPDATE check_run SET updated_at=updated_at WHERE id=?")
+            .bind(&record.run.id)
+            .execute(&mut *transaction)
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        transaction.commit().await?;
+        Ok(DaemonCheckResult::Completed {
+            receipt: Box::new(receipt(record)),
+        })
+    }
+    async fn lookup(&self, record: &CheckWorkerRecord) -> Result<DaemonCheckResult> {
+        Ok(DaemonCheckResult::Completed {
+            receipt: Box::new(receipt(record)),
+        })
+    }
+    async fn cancel(&self, record: &CheckWorkerRecord) -> Result<DaemonCheckResult> {
+        Ok(DaemonCheckResult::Unknown {
+            operation_id: record.run.operation_id.clone(),
+        })
+    }
+    async fn owner_gone(&self, _record: &CheckWorkerRecord) -> Result<bool> {
+        Ok(false)
+    }
+    async fn acknowledge(&self, _record: &CheckWorkerRecord) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The worker looks after the lease and the consumers beside the owner's
+/// operation, never instead of it. A store write awaited while the operation
+/// was not polled waited for the write lock the operation held, and the
+/// operation could not go on to release it: every writer of the database
+/// stood still until SQLite gave up after its busy timeout (30 s), and the
+/// run failed with "database is locked".
+#[tokio::test]
+async fn the_worker_keeps_polling_an_operation_that_is_inside_a_write_transaction() {
+    let (_temp, store, runner) = fixture().await;
+    let run = scheduled(runner.request(cacheable_request("held")).await.unwrap());
+    let owner = Arc::new(WritesWhileRunning {
+        store: store.clone(),
+    });
+    let worker = Arc::new(CheckRunWorker::new(store.clone(), owner));
+    let started = std::time::Instant::now();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        worker.drive(admit(&store, &run).await),
+    )
+    .await
+    .expect("the operation finishes while the worker looks at its consumers")
+    .expect("the run settles");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(
+        store.check_worker_record(&run.id).await.unwrap().run.state,
+        CheckRunState::Succeeded
+    );
+}
+
 #[tokio::test]
 async fn restart_at_intent_dispatch_and_receipt_boundaries_uses_the_same_operation_key() {
     for boundary in ["intent", "dispatch", "receipt"] {

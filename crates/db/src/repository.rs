@@ -1855,17 +1855,6 @@ pub trait ReviewRepo: Send + Sync {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)>;
-    /// Atomically reserve the next Review attempt with its Running execution
-    /// and initial lease. The attempt number is allocated under the same
-    /// writer transaction as both inserts, so a failed Review insert cannot
-    /// leave an orphan Running execution or lease behind.
-    async fn create_attempt_with_execution_and_lease(
-        &self,
-        review: CreateReview,
-        execution: CreateExecution,
-        lease: ClaimExecutionLease,
-        admission: Option<ExecutionAdmission>,
-    ) -> Result<(Review, Execution)>;
     async fn update_status(
         &self,
         id: &str,

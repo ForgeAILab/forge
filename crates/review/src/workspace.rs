@@ -220,6 +220,53 @@ impl<T: AsRef<Path> + Send + Sync + ?Sized> ReviewWorkspace for T {
     }
 }
 
+const MAX_DIFF_BYTES: usize = 64 * 1024;
+
+pub async fn read_git_diff(
+    workspace_path: &std::path::Path,
+    default_branch: &str,
+) -> Result<String, crate::ReviewError> {
+    let branch_ref = format!("{default_branch}...HEAD");
+    let output = tokio::process::Command::new("git")
+        .arg("diff")
+        .arg(branch_ref)
+        .current_dir(workspace_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await?;
+    let stdout = if output.status.success() {
+        output.stdout
+    } else {
+        tokio::process::Command::new("git")
+            .arg("diff")
+            .current_dir(workspace_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .await?
+            .stdout
+    };
+    Ok(truncate_utf8_bytes(&stdout, MAX_DIFF_BYTES))
+}
+
+fn truncate_utf8_bytes(bytes: &[u8], max_bytes: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= max_bytes {
+        return text.into_owned();
+    }
+
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = text[..end].to_owned();
+    truncated.push_str("[truncated]");
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

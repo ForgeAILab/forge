@@ -112,8 +112,8 @@ pub fn build_check_spec(
         purpose
     };
     // The canonical policy is defined for the CI bundle in a server-owned
-    // Task worktree. The manual ReviewRunner, conformance and every other
-    // family keep the frozen policy of their own execution path: asking for
+    // Task worktree. Conformance and every other family keep the frozen
+    // policy of their own execution path: asking for
     // the canonical one there is a caller error. A daemon owner attests no
     // inputs yet, and without a worktree there is nothing to scope a result
     // to: both are ordinary placements and fall back to the frozen policy.

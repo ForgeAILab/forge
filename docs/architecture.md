@@ -30,7 +30,7 @@ crates/
 ├── git/           # Low-level git operations
 ├── process-supervisor/ # Process-group ownership, kill sequence, drained bounded output
 ├── check-executor/ # Persistence-free owner execution of a CheckSpec, typed receipt
-├── review/        # CI runner, auditor orchestration
+├── review/        # review contract, conformance checks, review workspace
 ├── events/        # In-memory event bus (tokio broadcast)
 ├── mcp-server/    # MCP JSON-RPC tools for agent integration
 └── config/        # Configuration loading, defaults
@@ -4210,7 +4210,7 @@ launch (`claimed_path`: a filesystem-only confirmation that the worktree the
 claim just checked is still there and confined, no Git process, falling back
 to `Execute` when it is not), the native executor at the start of a turn (`Execute`, with the
 Task service's workspace root and repository-cache locks), reassignment reset
-(`Reset`), review entry CI (`Check`), review rerun (`Review`), blocking
+(`Reset`), review entry CI (`Check`, which a review re-run also is), blocking
 `before_work` hooks (`Hook`), merge delivery and target-moved rebase
 (`Integrate`), and two read-only users (`Inspect`): the lifecycle emitter and evidence
 capture from a worktree file. The terminal does not go through the manager: it
@@ -4221,7 +4221,7 @@ with one coding execution and one review makes about seven to ten manager
 calls, each one Git process on a healthy worktree: claim (1, replacing the
 three Git processes of the backend `describe` it used before), runner launch
 (0), native turn start (1 per turn, native executors only), a blocking
-`before_work` hook (1), entry CI (1), review rerun or reviewer cascade (1),
+`before_work` hook (1), entry CI (1), the reviewer cascade (1),
 delivery (1), a rebase when the target moved (1), and one `Inspect` per
 lifecycle event that has script hooks.
 
@@ -7025,8 +7025,8 @@ A registered notification, checked before waiting, bounds the predecessor wait
 without polling: one deadline of five seconds, or fifteen for Cancel/Hold (five
 plus the ten-second remote acknowledgment). Once that command claims the lease,
 its result describes its own committed Task; running its own step is not counted
-as waiting (claim with environment checks and `rerun_review` are bounded only by
-their checks' timeouts). A timeout returns HTTP 409 `task_busy` with
+as waiting (claim with environment checks is bounded only by its checks'
+timeouts; `rerun_review` only re-enters `review` and runs no check itself). A timeout returns HTTP 409 `task_busy` with
 `pending_steps`, `retry_after_ms` and a retry hint; the accepted command remains
 durable. Hooks and cascades remain asynchronous, and responses retain
 `pending_steps`. Claim and its execution startup share one command; dispatch
@@ -7643,7 +7643,19 @@ To recover a refused host, compare `SELECT version, name FROM _migration` with
 missing, then update that row's `name` to the build's file name.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
-`busy_timeout=5000` per connection.
+`busy_timeout=30000` per connection.
+
+SQLite has one writer. Every transaction that writes begins with
+`db::begin_immediate`, which records where it began until it commits or rolls
+back. A write transaction held for more than five seconds, and one that waited
+that long for a connection and the lock, is logged at `warn` with its call
+site; a statement refused as busy (`database is locked`) is logged with the
+write transactions open at that moment (`db::open_write_transactions`). Code
+that waits for a future which may be inside a write transaction must keep
+polling it: a store call awaited in the body of a `select!` branch stops the
+other branches, and a stopped transaction keeps the write lock that call then
+waits for until the busy timeout. `FORGE_DB_BUSY_TIMEOUT_MS` shortens the
+timeout for diagnosis.
 
 The revised schema adds `account_main_agent_binding`,
 `project_agent_binding`, immutable `project_admission_receipt`, `agent_chat`,
@@ -7741,8 +7753,13 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   projection, and `WorkspaceCleanupScheduler`.
 - **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
   asks the durable check runner for the configured checks before ordinary
-  reviewer dispatch; its hooks step waits `suspended` for the result. `ReviewRunner`
-  owns explicit reviewer/auditor reruns. Task configuration
+  reviewer dispatch; its hooks step waits `suspended` for the result. An
+  explicit review re-run (`TaskService::rerun_review`, reached from the Task
+  action's review `retry`) is that same entry again: it re-enters `review` for
+  the current candidate under the workflow's authority, closing the attempt it
+  replaces, and is refused `task_busy` while an entry or reviewer still runs.
+  The entry records who asked; one the owner asked for spends no review budget.
+  There is no second review pipeline. Task configuration
   overrides the Project's `default_review_config`; otherwise the Project
   defaults are inherited. A ready Project Agent can replace both
   default lists through the versioned, receipt-atomic `project.review_config`
@@ -8086,11 +8103,11 @@ all earlier carries automatically. A stored workflow change (such as migration
 `V148`) forces a fresh v1 review; for v2, only a change to review authority
 invalidates the source digest.
 
-The manual review-rerun endpoint consumes the same result categories as automatic
-review completion. Passed reruns cascade into merging, failed reruns use the
-review-remediation budget and target, and human-required passes remain in review
-as `awaiting_human`; the endpoint returns the Task after that workflow work has
-settled.
+The manual review re-run is a review entry and settles as one: a pass cascades
+into merging, a failure goes to the review-remediation target without spending
+the review budget (the owner asked for it), and a human-required pass remains
+in review as `awaiting_human`. The action returns the re-entered Task; the
+entry's work settles afterwards in the Task's own steps.
 
 Review outcome and conformance are separate projections. Old PASS/done records
 are retained with `not_assessed`; CI-only and manual reviews also lack automated
@@ -8294,7 +8311,7 @@ classification, regenerate bindings and document the single public beta break.
 ### Passive canonical checks (3.3 stage A)
 
 **Nothing executes through this contract or these repositories yet.** Entry
-hooks, `ReviewRunner`, conformance, lifecycle scripts and environment probes
+hooks, the manual review re-run, conformance, lifecycle scripts and environment probes
 retain their existing commands, scheduling, timeout, output and cleanup
 behavior. No legacy Review or check evidence is imported into a trusted cache.
 The new server timeout setting is defined but no execution reads it.
@@ -8333,7 +8350,7 @@ using `declared_controlled_inputs`.
 | Execution family | Characterized bundle, cwd, environment and timeout |
 |---|---|
 | Review-entry CI | Effective workflow/Project/Task CI in order; Task root; Project keys; no per-command limit; stop at first failure. |
-| Manual `ReviewRunner` CI | Same effective CI resolution and command semantics, hence the same spec and digest as review-entry CI; only the consumer's purpose (`review_ci`) differs. |
+| Manual review re-run CI | Characterized as the same effective CI resolution and command semantics as review-entry CI under the `review_ci` purpose. Since the re-run re-enters the review entry (3.3 stage E), it is review-entry CI and no producer asks with `review_ci`. |
 | Conformance | Effective setup followed by CI-derived and requirement-linked checks, using the admitted governing context; Task root; Project keys; configured 1–14,400-second per-command limit, default 1800. Setup failure stops the bundle; required-check failure does not stop later checks. |
 | Blocking before-work | Selected event's blocking scripts only, original hook indices; Task root or existing lifecycle fallback; Project keys plus the eleven `FORGE_*` context keys; configured limit or legacy 30-second zero fallback; stop at failure. |
 | Other lifecycle / hook test | Selected script hooks; the asynchronous before-work path excludes blocking scripts; existing workspace/fallback cwd and context keys; same timeout fallback; continue between scripts. Plugins have no shell-check contract. Owner hook tests select an original hook index and bypass the asynchronous blocking-hook filter. |
@@ -8715,9 +8732,9 @@ Upgrade the server first, then every daemon from that release and restart using
 the same workspace root. Revision-4 and older daemons are refused before dispatch.
 
 The inline `integration_effects::check::CheckRun` adapter is deleted with the
-review-entry cutover. Review-entry CI (now one check run per entry) and manual
-`ReviewRunner` CI retain command order, cwd, inherited env, verdicts and
-comments/events. No extra setup or managed checkout is enabled. Required
+review-entry cutover. Review-entry CI (now one check run per entry, which a
+manual review re-run also is) retains command order, cwd, inherited env,
+verdicts and comments/events. No extra setup or managed checkout is enabled. Required
 conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
 and agent-selected families retain their existing orchestration and check policy.
 
@@ -9007,9 +9024,9 @@ Rules:
 (`TaskService::compose_checks`, used by the production runtime and by every
 test): review entry (`entry`, requested in production, see "Review-entry CI on
 the check runner") and the merge path (`integration`, passive until the
-integration queue is activated).** Manual `ReviewRunner`, conformance,
-before-work and other checks retain their current inline orchestration,
-limits and verdicts. The 3.2 integration queue stays inactive. Still pending:
+integration queue is activated).** A manual review re-run is a review entry
+and asks through the `entry` family. Conformance, before-work and other checks
+retain their current inline orchestration, limits and verdicts. The 3.2 integration queue stays inactive. Still pending:
 the merge-queue cutover and managed-checkout activation. The
 owners execute the frozen legacy policies and the canonical CI policy below;
 only the canonical one attests its inputs and may be reused. A reusable result
@@ -9325,3 +9342,104 @@ The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death
 between OS spawn and durable process-tree evidence, and escaped descendants,
 are not proven by the runner; the stage-B process-supervisor limits still apply.
+
+#### Manual review re-run through the review entry (3.3 stage E)
+
+There is one review path. The owner's review `retry` (offer reason
+`review_checks_retry`, labels "Re-run Review" and "Recheck Review") and the
+internal `rerun_review` command call `TaskService::rerun_review`, which does
+not run anything itself:
+
+1. It refuses unless the Task is in `review` and has a completed
+   implementation candidate. It refuses `task_busy` when a review entry of the
+   Task is still running (a hooks step is pending, claimed or suspended on its
+   check) or a `reviewer`/`auditor` execution is running. The action system
+   refuses earlier for the same states: it offers no `retry`, so the public
+   request gets `action_unavailable`.
+2. It closes the attempt it replaces. The newest Review, when still `running`
+   or `awaiting_human`, is cancelled with
+   `execution_retry.status = "superseded_by_rerun"`, so a human gate or a late
+   reviewer cannot settle an attempt the owner asked to run again.
+3. It re-enters `review` with a same-state transition
+   (`review_rerun_entry_with_authority`, exit hooks skipped) under
+   `Actor::system(Workflow)` and the current Project workflow snapshot. This is
+   a new status entry: a new hooks step, so a new review attempt and a new
+   check request key (`status epoch | review id`). The entry's transition row
+   and hooks payload carry `TransitionBridge::review_rerun(requested_by)`
+   (`bridge_kind = recovery`, `bridge_payload = {"verb": "review_rerun",
+   "requested_by": <Actor>}`): the workflow routes the entry, the bridge says
+   who asked.
+
+A Task whose `task_state_config` still names an auditor
+(`review.auditor_agent_id`, read only by the retired pipeline) and has no
+reviewer Agent assigned is refused with a conflict before step 2: the re-run
+would otherwise pass on its checks where the old one refused. The key is
+refused at Task create and update, and operator status reports open Tasks
+that still carry it (`retired_review_auditor_config`).
+
+**Budget.** `rerun_review` takes the requesting actor. The Task action passes
+the owner (only the owner is offered the action); the budget-reset retry of a
+coordination root passes its action actor; recovery passes
+`system(CrashRecovery)`; a `rerun_review` command queued before v0.14 names no
+requester and is the owner's. An entry the owner asked for spends no review
+retry budget: `db::budget::review_rerun_entry` reads the latest entry into
+`review` (the transition row with a status epoch; a recovery marker has none)
+and the three charge points ask it. `failed_review_entry` (a failed entry
+hook) charges nothing and decides the bounce from the budget as it stands;
+`budget::transition` (the move out of `review` with `rejection`) admits neither
+the review debit nor the `gate:review` debit, excluding its own row;
+`review_verdict` (a failing reviewer) skips a Review that the entry opened
+(created at or after the entry). An entry retry
+(`retry_entry_barrier_with_authority`) is the same entry run again and keeps
+the bridge. Every other requester's entry, and every later automatic entry,
+spends as before.
+
+**Stale verdicts.** A re-run reviews the same candidate again, so the failed
+attempt it was asked to replace still names the current candidate.
+`auto_cascade_on_review_pass` does not take a failed Review created before a
+re-run entry for that entry's verdict. When the entry has nothing to run (no
+checks, no reviewer, no user-approval gate), `auto_cascade_on_unconfigured_review`
+first records the re-run as an empty passed attempt (`{"ci_steps": []}`), once
+per entry, so the Task's latest Review is the re-run's.
+
+From there the entry is the ordinary one: `run_before_work_hooks`,
+`run_ci_steps` through the check runner (reuse of a certified green result for
+an unchanged commit, worktree and environment; never of a red one; the
+3,600-second wall limit and per-command timeouts; machine run-cap admission),
+`carry_review_authority` (always skipped: a same-state entry is not a
+merge-contention bridge), `dispatch_role_agent` for an assigned reviewer, and
+the `after_enter` cascades. Because the entry runs under the workflow's
+authority and not the user's, it is routed as an automatic entry: failed CI
+settles through `review_failure_target` (remediation, or the exhausted-budget
+blocker when the budget was already spent) instead of parking a user-managed
+entry barrier, a Task without a reviewer passes on its checks instead of
+waiting for a manual review, and a gate that requires user approval still
+waits. Cancel, hold, a paused Project and a paused Agent act on it as on any
+entry.
+
+The retired pipeline (`review::ReviewRunner`) created a `reviewer` execution
+with no Agent and a `review-owner:<uuid>` lease, ran CI under it without a
+time limit, optionally ran an `auditor` child and wrote Review and Task
+authority itself. Nothing creates such executions now. One left `running` by
+an upgrade is recognised by that lease owner, which the reviewer execution and
+its `auditor` child both carry (or, once the lease is released, by the
+reviewer's `review-<candidate>.jsonl` log name and missing executor snapshot).
+They are settled at start: `CrashRecovery::run_recovery` queues one
+`settle_retired_review_rerun` command per Task that has any (identity-fenced,
+not stacked by a second start), whatever the leases say, and the command stops
+them (`stop_retired_review_reruns`) and settles the Task. One found later is
+terminalized by `HeartbeatMonitor` when its lease expires. Either way, instead
+of the reviewer failure cascade, `TaskService::settle_retired_review_rerun`
+writes an error on the execution that says what it was and, once no other
+leftover of the Task is still running, calls `rerun_review` (requested by
+recovery, so it spends as an automatic entry). A Task whose entry is already
+running needs nothing more (`task_busy` is not a failure here). If the entry
+cannot run at all (no candidate), the Task is blocked on the stopped execution
+(`internal_command_failed`, with the reason) and offers its recovery actions.
+
+The reservation that pipeline made, `ReviewRepo::create_attempt_with_execution_and_lease`
+(Task mutation `ReviewCreateAttemptWithExecution`), and the admission
+exception for a `reviewer` execution without an Agent are deleted. A queued
+mutation step of that kind left by an upgrade is closed as `superseded` by
+`V202610110112`. The `review_runner` actor type on historical review events is
+kept for reading.

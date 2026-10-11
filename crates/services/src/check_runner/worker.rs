@@ -74,7 +74,13 @@ impl CheckRunWorker {
                 loop {
                     tokio::select! {
                         _=async { if !*shutdown.borrow_and_update() { while shutdown.changed().await.is_ok() && !*shutdown.borrow_and_update() {} } }=> { jobs.abort_all(); while jobs.join_next().await.is_some() {} return Ok(()); },
-                        Some(result)=jobs.join_next(), if !jobs.is_empty()=> { if let Err(error)=result { tracing::warn!(%error,"check worker job stopped; lease recovery will reconcile"); } },
+                        Some(result)=jobs.join_next(), if !jobs.is_empty()=> {
+                            match result {
+                                Ok(Ok(()))=>{}
+                                Ok(Err(error))=>tracing::warn!(%error,"check worker job failed; lease recovery will reconcile"),
+                                Err(error)=>tracing::warn!(%error,"check worker job stopped; lease recovery will reconcile"),
+                            }
+                        },
                         _=interval.tick()=> {
                             worker.tick(this.sweep(&mut jobs)).await?;
                         }
@@ -277,41 +283,79 @@ impl CheckRunWorker {
             let deadline = settlement_deadline(&record)?;
             let operation = self.owners.run(&record, &cancel);
             tokio::pin!(operation);
-            let mut renew = tokio::time::interval(Duration::from_secs(15));
-            renew.tick().await;
-            // A run nobody waits for any more is stopped within about a
-            // second, not at the next lease renewal: it holds a machine slot.
-            let mut liveness = tokio::time::interval(CONSUMER_LIVENESS_INTERVAL);
-            liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            liveness.tick().await;
-            loop {
-                tokio::select! {
-                    result=&mut operation=>break result,
-                    _=tokio::time::sleep_until(deadline)=>break Err(ServiceError::invalid_operation("check dispatch reply uncertain")),
-                    _=renew.tick()=> {
-                        run=self.store.renew_check_run(&fence(&run),&db::now_rfc3339(),&lease_until()).await?;
-                    }
-                    _=liveness.tick()=> {
-                        if self.store.active_check_consumers(&run.id,&db::now_rfc3339()).await?.is_empty() {
-                            // Nobody waits for this result any more. The run
-                            // is `cancelling` for the length of the bounded
-                            // cancel exchange: its reply settles it, anything
-                            // else leaves it uncertain for reconciliation.
-                            cancel.cancel();
-                            run=match self.store.transition_check_run(&fence(&run),CheckRunState::Cancelling,&db::now_rfc3339()).await {
-                                Ok(run)=>run,
-                                Err(error)=> {
-                                    // The run row is gone (its Project was
-                                    // deleted) or no longer this worker's.
-                                    // Nobody waits either way: the owner is
-                                    // still told to stop, once, bounded.
-                                    let _=tokio::time::timeout(OWNER_RPC_BOUND,self.owners.cancel(&record)).await;
-                                    return Err(error.into());
+            // The lease and the consumers are looked after beside the
+            // operation, never instead of it. A store call awaited in the
+            // body of a `select!` branch stops polling the operation, and an
+            // operation stopped inside a write transaction of its own (the
+            // server owner records its receipt in one) keeps the database
+            // write lock that call then waits for: every writer stands still
+            // until SQLite gives up after its busy timeout.
+            let watched = {
+                let watch = async {
+                    let mut renew = tokio::time::interval(Duration::from_secs(15));
+                    renew.tick().await;
+                    // A run nobody waits for any more is stopped within about
+                    // a second, not at the next lease renewal: it holds a
+                    // machine slot.
+                    let mut liveness = tokio::time::interval(CONSUMER_LIVENESS_INTERVAL);
+                    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    liveness.tick().await;
+                    loop {
+                        tokio::select! {
+                            _=renew.tick()=> {
+                                match self.store.renew_check_run(&fence(&run),&db::now_rfc3339(),&lease_until()).await {
+                                    Ok(renewed)=>run=renewed,
+                                    Err(error)=>break Err(ServiceError::from(error)),
                                 }
-                            };
-                            break self.bounded_cancel(&mut run,&record).await;
+                            }
+                            _=liveness.tick()=> {
+                                match self.store.active_check_consumers(&run.id,&db::now_rfc3339()).await {
+                                    Ok(consumers) if consumers.is_empty()=>break Ok(()),
+                                    Ok(_)=>{}
+                                    Err(error)=>break Err(ServiceError::from(error)),
+                                }
+                            }
                         }
                     }
+                };
+                tokio::pin!(watch);
+                tokio::select! {
+                    result=&mut operation=>Watched::Finished(result),
+                    _=tokio::time::sleep_until(deadline)=>Watched::Finished(Err(ServiceError::invalid_operation("check dispatch reply uncertain"))),
+                    unwatched=&mut watch=>Watched::Unwatched(unwatched),
+                }
+            };
+            match watched {
+                Watched::Finished(result) => result,
+                Watched::Unwatched(Err(error)) => return Err(error),
+                Watched::Unwatched(Ok(())) => {
+                    // Nobody waits for this result any more. The run is
+                    // `cancelling` for the length of the bounded cancel
+                    // exchange: its reply settles it, anything else leaves it
+                    // uncertain for reconciliation.
+                    cancel.cancel();
+                    run = match self
+                        .store
+                        .transition_check_run(
+                            &fence(&run),
+                            CheckRunState::Cancelling,
+                            &db::now_rfc3339(),
+                        )
+                        .await
+                    {
+                        Ok(run) => run,
+                        Err(error) => {
+                            // The run row is gone (its Project was deleted)
+                            // or no longer this worker's. Nobody waits either
+                            // way: the owner is still told to stop, once,
+                            // bounded.
+                            let _ =
+                                tokio::time::timeout(OWNER_RPC_BOUND, self.owners.cancel(&record))
+                                    .await;
+                            return Err(error.into());
+                        }
+                    };
+                    self.bounded_cancel(&mut run, &record).await
                 }
             }
         } else {
@@ -418,14 +462,27 @@ impl CheckRunWorker {
         tokio::pin!(operation);
         let timeout = tokio::time::sleep(bound);
         tokio::pin!(timeout);
-        let mut renew = tokio::time::interval(Duration::from_secs(15));
-        renew.tick().await;
-        loop {
-            tokio::select! {
-                result=&mut operation=>return result,
-                _=&mut timeout=>return Err(ServiceError::invalid_operation("check owner reply uncertain")),
-                _=renew.tick()=> { *run=self.store.renew_check_run(&fence(run),&db::now_rfc3339(),&lease_until()).await?; }
+        // Renewed beside the owner's call, for the reason given in `drive`.
+        let renewal = async {
+            let mut renew = tokio::time::interval(Duration::from_secs(15));
+            renew.tick().await;
+            loop {
+                renew.tick().await;
+                match self
+                    .store
+                    .renew_check_run(&fence(run), &db::now_rfc3339(), &lease_until())
+                    .await
+                {
+                    Ok(renewed) => *run = renewed,
+                    Err(error) => break ServiceError::from(error),
+                }
             }
+        };
+        tokio::pin!(renewal);
+        tokio::select! {
+            result=&mut operation=>result,
+            _=&mut timeout=>Err(ServiceError::invalid_operation("check owner reply uncertain")),
+            error=&mut renewal=>Err(error),
         }
     }
     async fn bounded_lookup(
@@ -521,6 +578,14 @@ impl CheckRunWorker {
         self.store.enqueue_check_result_steps(100).await?;
         Ok(())
     }
+}
+/// How the wait for a dispatched operation ended.
+enum Watched {
+    /// The operation answered, or its settlement deadline passed.
+    Finished(Result<DaemonCheckResult>),
+    /// The watch beside it ended first: `Ok` when no consumer waits for the
+    /// run any more, `Err` when the store refused the look or the renewal.
+    Unwatched(Result<()>),
 }
 pub(super) fn fence(run: &StoredCheckRun) -> CheckRunFence {
     CheckRunFence {

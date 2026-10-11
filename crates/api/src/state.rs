@@ -62,7 +62,6 @@ pub struct AppState {
     pub operator_status_service: Arc<OperatorStatusService>,
     pub operator_status_emitter: Arc<OperatorStatusEmitter>,
     pub cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
-    pub review_runner: Arc<review::ReviewRunner>,
     pub adapter_registry: Arc<AdapterRegistry>,
     pub task_executor: Arc<dyn TaskExecutor>,
     pub task_dispatcher: Option<Arc<services::TaskDispatcher>>,
@@ -125,11 +124,6 @@ impl AppState {
             Arc::clone(&event_bus),
             workspace_root,
         ));
-        let review_runner = Arc::new(review::ReviewRunner::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-            Arc::clone(&adapter_registry),
-        ));
         Self::with_adapter_registry_services_and_shutdown(
             db,
             event_bus,
@@ -137,7 +131,6 @@ impl AppState {
             adapter_registry,
             merge_service,
             cleanup_scheduler,
-            review_runner,
             shutdown_signal,
             workflows_dir,
             test_jwt_secret(),
@@ -153,7 +146,6 @@ impl AppState {
         adapter_registry: Arc<AdapterRegistry>,
         merge_service: Arc<MergeService>,
         cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
-        review_runner: Arc<review::ReviewRunner>,
         shutdown_signal: ShutdownSignal,
         workflows_dir: PathBuf,
         jwt_secret: Vec<u8>,
@@ -167,7 +159,6 @@ impl AppState {
             .with_adapter_registry(adapter_registry)
             .with_cleanup_scheduler(cleanup_scheduler)
             .with_merge_service(merge_service)
-            .with_review_runner(review_runner)
             .with_shutdown_signal(shutdown_signal)
             .with_workflows_dir(workflows_dir)
             .with_jwt_secret(jwt_secret)
@@ -231,7 +222,6 @@ impl AppState {
             operator_status_service: Arc::clone(&runtime.operator_status_service),
             operator_status_emitter: Arc::clone(&runtime.operator_status_emitter),
             cleanup_scheduler: Arc::clone(&runtime.cleanup_scheduler),
-            review_runner: Arc::clone(&runtime.review_runner),
             adapter_registry: Arc::clone(&runtime.adapter_registry),
             task_executor: Arc::clone(&runtime.task_executor),
             task_dispatcher: Some(Arc::clone(&runtime.task_dispatcher)),

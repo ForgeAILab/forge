@@ -515,7 +515,7 @@ async fn cancel_while_review_ci_runs_supersedes_the_suspended_step_and_stops_the
     check_worker.await.unwrap();
 }
 
-async fn enter_review(
+pub(super) async fn enter_review(
     fixture: &FailedCiFixture,
     reason: &str,
 ) -> crate::workflow::engine::TransitionResult {
@@ -539,7 +539,7 @@ async fn enter_review(
         .await
         .unwrap()
 }
-async fn count(fixture: &FailedCiFixture, sql: &str) -> i64 {
+pub(super) async fn count(fixture: &FailedCiFixture, sql: &str) -> i64 {
     sqlx::query_scalar(sql)
         .fetch_one(fixture.db.pool())
         .await
@@ -943,7 +943,7 @@ async fn re_review_of_an_unchanged_commit_runs_no_ci() {
 
 /// A fixture whose review entry stays in `review` after green CI (the gate
 /// asks for the owner's approval), with the given CI steps.
-async fn approval_ci_fixture(ci_steps: serde_json::Value) -> FailedCiFixture {
+pub(super) async fn approval_ci_fixture(ci_steps: serde_json::Value) -> FailedCiFixture {
     let mut fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
     fixture
         .workflow
@@ -1655,7 +1655,7 @@ async fn log_policy_effect_failure_settles_step_failed_without_blocking_task() {
 }
 
 /// Suspend the hooks step on its queued check, with no check worker running.
-async fn suspend_on_entry_check(fixture: &FailedCiFixture) {
+pub(super) async fn suspend_on_entry_check(fixture: &FailedCiFixture) {
     let result = enter_review(fixture, "CI entry").await;
     assert_eq!(result.pending_steps, 1);
     let _ = fixture.engine.check_worker_or_embedded();

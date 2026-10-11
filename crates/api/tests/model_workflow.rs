@@ -26,6 +26,9 @@
 //! runs longer sequences (`FORGE_MODEL_STEPS` sets the length).
 //! `FORGE_MODEL_NO_SHRINK=1` reports a failure as found, without replaying
 //! shorter sequences (each replay of a stall costs its full patience).
+//! `FORGE_MODEL_CASE=<text>` runs only the cases whose name contains it,
+//! `FORGE_MODEL_LOG=<level>` prints the stack's log with timestamps, and
+//! `FORGE_MODEL_LOCK_STORM=<ms>` adds a second writer to every model database.
 //!
 //! The server's run cap is pinned (`MODEL_RUN_CAP`, or `FORGE_MODEL_RUN_CAP=<n>`)
 //! instead of derived from the host's cores, so a 4-core CI runner and a
@@ -433,8 +436,59 @@ struct Live {
     script: Arc<Script>,
 }
 
+/// `FORGE_MODEL_LOCK_STORM=<ms>`: another writer on the model's database,
+/// taking the write lock for that long and leaving it for as long, for the
+/// whole run. A transaction that reads before it writes without having begun
+/// immediate is refused under it almost every time, where it otherwise is
+/// refused only when a second writer happens to be there; everything that
+/// takes the lock up front merely waits.
+struct LockStorm(tokio::task::JoinHandle<()>);
+impl Drop for LockStorm {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+fn lock_storm(dir: &Path) -> Option<LockStorm> {
+    let hold = Duration::from_millis(env_number("FORGE_MODEL_LOCK_STORM")?);
+    let path = dir.join("forge.db");
+    Some(LockStorm(tokio::spawn(async move {
+        use sqlx::Connection;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .busy_timeout(Duration::from_secs(30));
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("the lock storm connects");
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS model_lock_storm(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)",
+            "INSERT OR IGNORE INTO model_lock_storm VALUES (1, 0)",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .expect("the lock storm table creates");
+        }
+        loop {
+            // A committed change each round: a reader's snapshot goes stale too.
+            if sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut connection)
+                .await
+                .is_ok()
+            {
+                let _ = sqlx::query("UPDATE model_lock_storm SET n = n + 1")
+                    .execute(&mut connection)
+                    .await;
+                tokio::time::sleep(hold).await;
+                let _ = sqlx::query("COMMIT").execute(&mut connection).await;
+            }
+            tokio::time::sleep(hold).await;
+        }
+    })))
+}
+
 struct World {
     dir: tempfile::TempDir,
+    _storm: Option<LockStorm>,
     live: Option<Live>,
     shared: Arc<Shared>,
     project_id: String,
@@ -525,11 +579,6 @@ impl World {
                 Arc::clone(&event_bus),
                 workspaces,
             )))
-            .with_review_runner(Arc::new(review::ReviewRunner::new(
-                Arc::clone(&db),
-                Arc::clone(&event_bus),
-                Arc::clone(&registry),
-            )))
             .with_workflows_dir(api::state::test_workflows_dir())
             .with_jwt_secret(api::state::test_jwt_secret())
             .with_bcrypt_cost(api::state::test_bcrypt_cost())
@@ -609,6 +658,7 @@ impl World {
             .await
             .expect("project settings update");
         Self {
+            _storm: lock_storm(dir.path()),
             dir,
             live: Some(live),
             shared,
@@ -858,7 +908,6 @@ impl World {
         if !state_config["review"].is_object() {
             state_config["review"] = json!({ "review_prompt": "Review the model deliverable." });
         }
-        state_config["review"]["auditor_agent_id"] = json!(self.reviewer_id);
         sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
             .bind(state_config.to_string())
             .bind(&id)
@@ -1912,7 +1961,27 @@ async fn run_cases(cases: Vec<(String, Vec<Step>)>) {
     run_all(cases, false).await;
 }
 
-async fn run_all(cases: Vec<(String, Vec<Step>)>, avoid: bool) {
+/// `FORGE_MODEL_LOG=<level>` prints the stack's own log at that level
+/// (`warn`, `info`, `debug`) with timestamps: what waited for the database,
+/// who held it, what a worker gave up on.
+fn log_to_stderr() {
+    if let Some(level) = std::env::var("FORGE_MODEL_LOG")
+        .ok()
+        .and_then(|level| level.parse::<tracing::Level>().ok())
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+}
+
+async fn run_all(mut cases: Vec<(String, Vec<Step>)>, avoid: bool) {
+    log_to_stderr();
+    // `FORGE_MODEL_CASE=<text>` runs only the cases whose name contains it.
+    if let Ok(only) = std::env::var("FORGE_MODEL_CASE") {
+        cases.retain(|(name, _)| name.contains(&only));
+    }
     let mut passed = Vec::new();
     let mut failed = Vec::new();
     // Cases are independent stacks; a few at a time keeps the wall time low.

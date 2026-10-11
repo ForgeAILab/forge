@@ -5544,6 +5544,131 @@ async fn daemon_disk_facts_migration_is_additive_and_keeps_existing_daemons() {
     let _ = fs::remove_dir_all(migration_dir);
 }
 
+/// `V202610110112` closes the queued Task mutations of the retired inline
+/// review re-run (`ReviewCreateAttemptWithExecution`), which no operation can
+/// apply any more, and nothing else: the rows stay, with their payload, and
+/// every other step, settled or queued, is exactly as it was.
+#[tokio::test]
+async fn retired_inline_review_rerun_steps_are_superseded_and_every_other_step_is_kept() {
+    let migration_dir = unique_temp_path("retired-rerun-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir creates");
+    copy_migrations_up_to(202610101906, &migration_dir);
+    let db_path = unique_temp_path("retired-rerun-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("migrations before the retirement apply");
+    let now = "2026-10-10T00:00:00Z";
+    sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','Project',?,?)")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("project inserts");
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t','p','Task','review',?,?)")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("task inserts");
+    let retired = r#"{"ReviewCreateAttemptWithExecution":{"review":{"id":"r"},"execution":{"id":"e"},"lease":{"owner":"review-owner:x"},"admission":null}}"#;
+    let live = r#"{"ReviewCreateManualPass":{"input":{}}}"#;
+    for (seq, id, kind, status, payload, claimed_by) in [
+        (1, "retired-pending", "mutation", "pending", retired, None),
+        (
+            2,
+            "retired-claimed",
+            "mutation",
+            "claimed",
+            retired,
+            Some("worker"),
+        ),
+        (3, "retired-done", "mutation", "done", retired, None),
+        (4, "live-pending", "mutation", "pending", live, None),
+        (
+            5,
+            "command-pending",
+            "command",
+            "pending",
+            r#"{"operation":"rerun_review","arguments":["t"],"preempt":false}"#,
+            None,
+        ),
+    ] {
+        sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,created_at,updated_at) VALUES(?,'t',?,?,?,?,?,1,'review',1,?,?,?,?,?,?)")
+            .bind(id)
+            .bind(seq)
+            .bind(kind)
+            .bind(payload)
+            .bind(id)
+            .bind(id)
+            .bind(status)
+            .bind(claimed_by)
+            .bind(claimed_by.map(|_| "2026-10-10T00:05:00Z"))
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("step inserts before the migration");
+    }
+    let snapshot = |pool: db::SqlitePool, filter: &'static str| async move {
+        sqlx::query_scalar::<_, String>(&format!(
+            "SELECT group_concat(quote(id)||quote(status)||quote(payload_json)||quote(claimed_by)||quote(lease_until)||quote(last_error)||quote(updated_at), ';') FROM (SELECT * FROM task_step WHERE {filter} ORDER BY seq)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("steps read")
+    };
+    let untouched = "id NOT IN ('retired-pending','retired-claimed')";
+    let before = snapshot(pool.clone(), untouched).await;
+
+    let all = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &all)
+        .await
+        .expect("the retirement migration applies to a database with queued steps");
+
+    assert_eq!(snapshot(pool.clone(), untouched).await, before);
+    type ClosedStep = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let closed: Vec<ClosedStep> = sqlx::query_as(
+        "SELECT id,status,claimed_by,lease_until,last_error,payload_json FROM task_step WHERE id IN ('retired-pending','retired-claimed') ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("closed steps read");
+    assert_eq!(closed.len(), 2, "the rows are kept");
+    for (id, status, claimed_by, lease_until, last_error, payload) in closed {
+        assert_eq!(status, "superseded", "{id}");
+        assert_eq!((claimed_by, lease_until), (None, None), "{id}");
+        assert!(
+            last_error.is_some_and(|error| error.contains("inline review re-run was retired")),
+            "{id}"
+        );
+        assert_eq!(payload, retired, "{id}");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task_step WHERE task_id='t' AND status IN ('pending','claimed')"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("queue reads"),
+        2,
+        "the live mutation and the queued re-run command still wait"
+    );
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}
+
 /// V202610100820 rebuilds `task_step` for the `suspended` status on a
 /// populated database: every row survives as it was (pending, leased,
 /// superseded, done, with its causation link), the new columns start empty,

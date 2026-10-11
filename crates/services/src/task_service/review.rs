@@ -2,7 +2,101 @@ use super::*;
 use ::review::ReviewWorkspace;
 use api_types::Actor;
 
+/// Until v0.14 a manual review re-run ran inline: Forge created a reviewer
+/// execution that no role ran, leased it to itself (`review-owner:<uuid>`,
+/// logs in `review-<candidate>.jsonl`) and ran CI under it. That pipeline is
+/// gone. A server upgraded while one was in flight still finds its execution
+/// `running`; this names it, so recovery can settle it instead of treating it
+/// as a reviewer that died.
+pub(crate) fn retired_review_rerun(execution: &Execution) -> bool {
+    execution
+        .lease_owner
+        .as_deref()
+        .is_some_and(|owner| owner.starts_with("review-owner:"))
+        || (execution.role == crate::workflow::default_roles::REVIEWER
+            && execution.executor_config_snapshot_json.is_none()
+            && execution
+                .logs_path
+                .as_deref()
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("review-")))
+}
+
 impl TaskService {
+    /// Settle an execution of the retired inline review re-run that recovery
+    /// just stopped: say on the execution why it ended, then run the Task's
+    /// review entry again through the durable path. The re-entry closes the
+    /// review attempt the old pipeline left open.
+    ///
+    /// The old pipeline ran an auditor child beside its reviewer execution;
+    /// the Task is settled once, when the last of them has stopped. A Task
+    /// whose review entry is already running needs nothing more. When the
+    /// entry cannot run at all (the Task has no candidate), the Task is
+    /// blocked on the stopped execution with the owner's recovery actions.
+    pub(crate) async fn settle_retired_review_rerun(&self, execution: &Execution) -> Result<()> {
+        const REASON: &str = "this execution belonged to the inline review re-run, \
+             which this Forge version no longer has; it was stopped at upgrade";
+        sqlx::query(
+            "UPDATE execution SET error = ?, updated_at = ? WHERE id = ? AND status <> 'running'",
+        )
+        .bind(REASON)
+        .bind(now_rfc3339())
+        .bind(&execution.id)
+        .execute(self.db.pool())
+        .await
+        .map_err(DbError::from)?;
+        let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? else {
+            return Ok(());
+        };
+        if task.status != "review" {
+            return Ok(());
+        }
+        if ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+            .await?
+            .iter()
+            .any(retired_review_rerun)
+        {
+            return Ok(());
+        }
+        let id = Uuid::parse_str(&task.id)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let requested_by = Actor::system(api_types::SystemComponent::CrashRecovery);
+        match Box::pin(self.rerun_review(id, requested_by)).await {
+            Ok(_) | Err(ServiceError::TaskBusy { .. }) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    %error,
+                    "the review entry could not be re-run after the retired inline re-run was stopped"
+                );
+                let mut stopped = execution.clone();
+                stopped.error = Some(format!(
+                    "{REASON}, and the review entry could not be run again: {error}"
+                ));
+                let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                self.block_task_after_executor_failure(&task, &stopped)
+                    .await
+            }
+        }
+    }
+
+    /// Start-time half of [`Self::settle_retired_review_rerun`]: a server
+    /// restarted quickly still holds the old pipeline's unexpired leases, so
+    /// its executions are stopped here instead of waiting for them to expire.
+    pub(crate) async fn stop_retired_review_reruns(&self, task_id: &str) -> Result<()> {
+        let stopped = crate::recovery::stop_retired_review_reruns(&self.db, task_id).await?;
+        for execution_id in &stopped {
+            if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? {
+                self.settle_retired_review_rerun(&execution).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn annotate_review_ci_interruption(
         &self,
         task: &Task,
@@ -124,14 +218,31 @@ impl TaskService {
         Ok(Arc::new(workspace))
     }
 
-    pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
+    /// Re-run the review of a Task that sits in `review`: the Task re-enters
+    /// its current state, so the ordinary durable review entry runs again for
+    /// the current candidate (before-work hooks, entry CI through the check
+    /// runner, then reviewer dispatch). Nothing runs inline: the returned Task
+    /// is the re-entered one and its hooks step is queued behind this step.
+    ///
+    /// The entry runs under the workflow's own authority, exactly as an
+    /// automatic entry does: failed CI goes to remediation, a Task without a
+    /// reviewer passes on its checks, and a gate that requires a person still
+    /// waits for one. A same-state entry is never a mechanical merge bridge,
+    /// so a carried approval cannot stand in for the review that was asked for.
+    ///
+    /// `requested_by` is who asked. It does not route the entry; it is
+    /// recorded on the entry, and an entry the owner asked for spends no
+    /// review retry budget whatever it finds (red checks, a failing reviewer,
+    /// the bounce to remediation). Any other requester's entry spends as an
+    /// automatic one does.
+    pub async fn rerun_review(&self, task_id: Uuid, requested_by: Actor) -> Result<Task> {
         let task_id = task_id.to_string();
         if !db::task_writer::owns_task(&task_id) {
             return self
                 .request_task_command(
                     &task_id,
                     "rerun_review",
-                    serde_json::json!([task_id]),
+                    serde_json::json!([task_id, requested_by]),
                     false,
                 )
                 .await;
@@ -146,14 +257,118 @@ impl TaskService {
                 task.status
             )));
         }
-        let (review, outcome) = self
-            .run_review_for_task(&task)
+        // A review needs something to review.
+        self.latest_executor_execution(&task.id).await?;
+        // A Task configured before v0.14 may still name an auditor. The
+        // review it expects is the reviewer's: without an Agent in that role
+        // the re-run would pass on its checks alone, so it is refused, as the
+        // inline re-run refused it.
+        if super::update::names_retired_auditor(task.task_state_config.as_deref())
+            && !TaskRoleAssignmentRepo::get_by_task_and_role(
+                &*self.db,
+                &task.id,
+                crate::workflow::default_roles::REVIEWER,
+            )
             .await?
-            .ok_or_else(|| ServiceError::invalid_operation("review runner is not configured"))?;
-        let task = self
-            .settle_rerun_review_outcome(&task, &review, outcome)
+            .is_some_and(|assignment| {
+                assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            })
+        {
+            return Err(ServiceError::conflict(format!(
+                "task {task_id} names an auditor and has no reviewer Agent: {}",
+                super::update::RETIRED_AUDITOR_CONFIG
+            )));
+        }
+        // One review pipeline per Task. An entry that is still running (its
+        // hooks step is queued, claimed or suspended on a check) or a
+        // reviewer that is still working is not replaced by a second one.
+        let reviewing = ExecutionRepo::list_running_by_task(&*self.db, &task_id)
+            .await?
+            .iter()
+            .filter(|execution| matches!(execution.role.as_str(), "reviewer" | "auditor"))
+            .count() as i64;
+        if reviewing > 0 || db::TaskStepRepo::entry_hooks_pending(&*self.db, &task_id).await? {
+            return Err(ServiceError::TaskBusy {
+                pending_steps: db::TaskStepRepo::pending_steps(&*self.db, &task_id)
+                    .await?
+                    .max(reviewing)
+                    .max(1),
+                retry_after_ms: 250,
+            });
+        }
+        // The attempt this re-run replaces is closed first, so the Task never
+        // has two open attempts: neither a human gate nor a reviewer can
+        // settle an attempt the owner asked to run again.
+        let superseded = ReviewRepo::list_by_task(&*self.db, &task_id)
+            .await?
+            .into_iter()
+            .max_by_key(|review| (review.attempt_number, review.id.clone()))
+            .filter(|review| {
+                matches!(
+                    review.status,
+                    ReviewStatus::Running | ReviewStatus::AwaitingHuman
+                )
+            });
+        if let Some(review) = superseded {
+            let now = now_rfc3339();
+            let mut details: Value = serde_json::from_str(&review.step_results_json)
+                .unwrap_or_else(|_| json!({ "ci_steps": [] }));
+            if !details.is_object() {
+                details = json!({ "ci_steps": details });
+            }
+            details["execution_retry"] = json!({
+                "status": "superseded_by_rerun",
+                "reason": "a review re-run was requested",
+                "cancelled_at": now,
+            });
+            ReviewRepo::cancel_if_unchanged(
+                &*self.db,
+                &review.id,
+                review.status.clone(),
+                &review.updated_at,
+                details.to_string(),
+                &now,
+                &now,
+            )
             .await?;
-        Ok((task, review))
+        }
+        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let actor = Actor::system(api_types::SystemComponent::Workflow);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+        let reason = "review re-run requested";
+        let entered = self
+            .workflow_execution()
+            .review_rerun_entry_with_authority(
+                &task,
+                &workflow,
+                actor,
+                reason,
+                crate::workflow::engine::WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
+                },
+                api_types::TransitionBridge::review_rerun(&requested_by),
+            )
+            .await?
+            .task;
+        self.publish(ForgeEvent {
+            event_type: "task.recovery_action".to_owned(),
+            entity_id: entered.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskRecovered {
+                project_id: entered.project_id.clone(),
+                reason: reason.to_owned(),
+            },
+        });
+        Ok(entered)
     }
 
     pub async fn approve_review_as(
@@ -359,170 +574,5 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         Ok((latest_task, review))
-    }
-    async fn run_review_for_task(
-        &self,
-        task: &Task,
-    ) -> Result<Option<(Review, ::review::ReviewOutcome)>> {
-        let Some(review_runner) = &self.review_runner else {
-            return Ok(None);
-        };
-        let execution = self.latest_executor_execution(&task.id).await?;
-        execution.workspace_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation("executor execution missing workspace_id")
-        })?;
-        let workspace = super::workspace::prepare_workspace_for(
-            &self.db,
-            &self.workspace_root,
-            task,
-            &task.id,
-            self.repo_cache_locks.clone(),
-            &self.workspace_backend_router,
-            crate::workspace_manager::Purpose::Review,
-        )
-        .await?;
-        let workspace_io = self.review_workspace_io(&workspace).await?;
-        let review_config = review_config_from_json(task.task_state_config.as_deref())?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let effective_review_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role);
-        let reviewer_assignment = if effective_review_role
-            .map(|role| role == crate::workflow::default_roles::REVIEWER)
-            .unwrap_or(false)
-        {
-            TaskRoleAssignmentRepo::get_by_task_and_role(
-                &*self.db,
-                &task.id,
-                crate::workflow::default_roles::REVIEWER,
-            )
-            .await?
-        } else {
-            None
-        };
-        let reviewer_agent_id = reviewer_assignment.and_then(|assignment| {
-            (assignment.assignee_type == Some(db::AssigneeKind::Agent))
-                .then_some(assignment.assignee_id)
-                .flatten()
-        });
-        // The Task-role assignment is the sole reviewer/auditor authority.
-        // A configured auditor id without that materialized assignment is a
-        // stale legacy configuration, not permission to synthesize a
-        // reviewer principal at rerun time.  Assignment materialization is
-        // therefore a prerequisite for the configured-auditor path.
-        if review_config.auditor_agent_id.is_some() && reviewer_agent_id.is_none() {
-            return Err(ServiceError::conflict(
-                "configured auditor requires a reviewer role assignment",
-            ));
-        }
-        let auditor_agent_id = reviewer_agent_id;
-        let requires_user_approval = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(|state| state.gate_config.as_ref())
-            .is_some_and(|gate| gate.requires_user_approval());
-        let logs_path = execution_logs_path(
-            &self.workspace_root,
-            &task.project_id,
-            &task.id,
-            &format!("review-{}", execution.id),
-        );
-        let task_id = Uuid::parse_str(&task.id).map_err(|error| {
-            ServiceError::invalid_operation(format!("invalid task id for review: {error}"))
-        })?;
-        let executor_execution_id = Uuid::parse_str(&execution.id).map_err(|error| {
-            ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
-        })?;
-        let result = review_runner
-            .with_workspace_io(workspace_io)
-            .run(ReviewRequest {
-                task_id,
-                executor_execution_id,
-                workspace_path: PathBuf::new(),
-                ci_steps: review_config.ci_steps,
-                logs_path,
-                auditor_agent_id,
-                review_prompt: review_config.review_prompt,
-                executor_thread_id: execution.agent_session_id,
-                requires_user_approval,
-            })
-            .await;
-        match result {
-            Ok(result) => Ok(Some(result)),
-            Err(::review::ReviewError::Conformance {
-                execution_id,
-                reason,
-            }) => {
-                let mut failed = ExecutionRepo::get_by_id(&*self.db, &execution_id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
-                failed.error = Some(reason.clone());
-                // Explicit auditor reruns are synchronous. Leave a durable recovery
-                // action on protocol failure instead of bouncing the coder.
-                self.block_task_after_executor_failure(task, &failed)
-                    .await?;
-                Err(ServiceError::invalid_operation(reason))
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn settle_rerun_review_outcome(
-        &self,
-        task: &Task,
-        review: &Review,
-        outcome: ::review::ReviewOutcome,
-    ) -> Result<Task> {
-        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        match outcome {
-            ::review::ReviewOutcome::Passed | ::review::ReviewOutcome::PassedCiOnly => {
-                self.cascade_completed_review_task(
-                    &current,
-                    crate::workflow::default_states::MERGING,
-                    "review rerun passed",
-                    false,
-                )
-                .await?;
-            }
-            ::review::ReviewOutcome::AwaitingHuman => {}
-            ::review::ReviewOutcome::AuditorFailed { .. }
-            | ::review::ReviewOutcome::CiFailed { .. }
-            | ::review::ReviewOutcome::MergeConflict { .. } => {
-                let current = if current.review_passed_at.is_some() {
-                    TaskRepo::set_review_passed_at_cas(
-                        &*self.db,
-                        &current.id,
-                        current.version,
-                        None,
-                        &now_rfc3339(),
-                    )
-                    .await?
-                } else {
-                    current
-                };
-                let (current, target, reason) = self
-                    .review_failure_target(&current, Some(&review.execution_id))
-                    .await?;
-                if let Some(target) = target {
-                    self.cascade_completed_review_task(&current, &target, &reason, true)
-                        .await?;
-                }
-            }
-        }
-        TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
     }
 }

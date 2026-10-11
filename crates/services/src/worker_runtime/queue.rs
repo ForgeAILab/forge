@@ -180,7 +180,7 @@ impl TaskStepWorker {
             }
         }
         if command.preempt {
-            let hooks: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed','suspended') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','rerun_review','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
+            let hooks: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed','suspended') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
                 .bind(task_id).fetch_one(self.db.pool()).await?;
             payload["preempting_hooks"] = serde_json::json!(hooks);
         }
@@ -210,18 +210,7 @@ impl TaskStepWorker {
                         expected_status: task.status.clone(),
                         expected_version: task.version,
                         expected_epoch: None,
-                        lane: if startup_checks
-                            || command.operation == "rerun_review"
-                            || (command.operation == "dispatch_queued_recovery"
-                                && crate::deferred_dispatch::queued_recovery(&task).is_some_and(
-                                    |q| q.request.offer.reason == "review_checks_retry",
-                                ))
-                        {
-                            "long"
-                        } else {
-                            "fast"
-                        }
-                        .to_owned(),
+                        lane: if startup_checks { "long" } else { "fast" }.to_owned(),
                         available_at: db::now_rfc3339(),
                     },
                 )
@@ -428,12 +417,42 @@ impl TaskStepWorker {
                 })
             {
                 if self.db.awaited_check_is_open(task_id).await? {
-                    let mut jobs = JoinSet::new();
-                    checks.sweep(&mut jobs).await?;
-                    while let Some(job) = jobs.join_next().await {
-                        job.map_err(|_| {
-                            ServiceError::invalid_operation("check job stopped during drain")
-                        })??;
+                    // A busy database is not a failed drain here either: the
+                    // sweep wrote nothing, and a run whose job gave up keeps
+                    // its lease and is taken up again when that lapses, as
+                    // the production check worker does it. Both are waited
+                    // out within the drain's own deadline.
+                    let swept = async {
+                        let mut jobs = JoinSet::new();
+                        checks.sweep(&mut jobs).await?;
+                        let mut first = Ok(());
+                        // Every job is joined: one that failed must not
+                        // abort the others in the middle of their effects.
+                        while let Some(job) = jobs.join_next().await {
+                            let job = job
+                                .map_err(|_| {
+                                    ServiceError::invalid_operation(
+                                        "check job stopped during drain",
+                                    )
+                                })
+                                .and_then(|result| result);
+                            if first.is_ok() {
+                                first = job;
+                            }
+                        }
+                        first
+                    }
+                    .await;
+                    match swept {
+                        Ok(()) => {}
+                        Err(error)
+                            if database_busy(&error) && tokio::time::Instant::now() < deadline =>
+                        {
+                            tracing::warn!(task_id, %error, "check sweep in a task step drain found the database busy; trying again");
+                            tokio::time::sleep(BUSY_BACKOFF_START).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                     // The sweep just tried to admit the run. One still queued
                     // behind a full machine is answered only when a run ends

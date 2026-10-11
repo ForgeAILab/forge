@@ -104,7 +104,7 @@ forge-cli → api → services → db
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
 - **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.
-- **Review** — workflow entry hooks run configured checks and dispatch ordinary reviewers; `ReviewRunner` owns explicit reviewer/auditor reruns.
+- **Review** — workflow entry hooks run configured checks on the durable check runner and dispatch ordinary reviewers; an explicit review re-run re-enters that same entry (`TaskService::rerun_review`). There is no separate review runner.
 - **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.
 - **Workspace** — no lock files: keyed in-process locks serialize repository-cache/integration and Workspace execution operations; path validation prevents traversal escapes. The `workspace` crate owns Task-root reclamation (permission repair, exact worktree removal, delivered-branch deletion) for the server and the daemon.
 - **Config precedence** — CLI flags > env vars > config file > defaults. Default bind `127.0.0.1:8080`.
@@ -113,7 +113,7 @@ forge-cli → api → services → db
 
 SQLite with WAL mode. Schema in `crates/db/migrations/V001__initial_schema.sql`. Migrations are named `V{version}__{name}.sql` (sequential up to V149, UTC timestamps `VYYYYMMDDHHMM` after that) and tracked by version and name in the `_migration` table. All primary keys are app-generated UUID v4; all timestamps are app-generated RFC3339.
 
-Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=5000` per connection.
+Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=30000` per connection.
 
 Enum serialization uses `Display`/`FromStr` (in `db::models`) for SQLite TEXT columns. Row mapping is manual via `sqlx::Row::get()`, not compile-time checked macros — so a renamed column will fail at runtime, not at `cargo check`. Update both the migration and the row-mapper together.
 

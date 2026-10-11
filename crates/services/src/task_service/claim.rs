@@ -455,7 +455,6 @@ impl TaskService {
                 agent_id: task.assignee_id.clone().unwrap_or_default(),
                 execution_id: Some(execution_id.to_owned()),
             },
-            review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
             task_service: self.clone(),

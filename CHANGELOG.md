@@ -8,6 +8,81 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A manual review re-run goes through the ordinary review entry; the
+  separate review runner is gone (3.3 stage E).** The review `retry` Task
+  action ("Re-run Review" / "Recheck Review") keeps its verb and payload, but
+  it no longer runs CI and an auditor inline:
+  - **It is asynchronous and durable.** The action only re-enters `review`;
+    the checks and the review run afterwards in the Task's own steps and
+    survive a restart. Read the Task and its Reviews for the outcome.
+  - **Its CI is bounded.** The checks run on the durable check runner: each
+    command under `check_timeout_seconds` and the whole run under the
+    3,600-second wall limit of a review-entry check run (they ran unbounded
+    before). The run is admitted against the machine's run cap. An unchanged
+    commit, worktree and environment reuse a certified green result instead of
+    running again; the review itself is always asked for again.
+  - **No synthetic reviewer executions.** A re-run no longer creates a
+    `reviewer` execution that no Agent ran (nor an `auditor` child), so these
+    stop appearing in execution history and in Agent and machine occupancy.
+    Existing rows stay readable. One found still `running` after the upgrade
+    is stopped by recovery with an error naming it, and the Task's review
+    entry runs again.
+  - **The reviewer is an ordinary reviewer.** It is dispatched as on any
+    review entry, under the ordinary read-only policy: a reviewer that changes
+    the worktree fails. The re-run no longer restores the worktree to the
+    pre-auditor commit and carries on.
+  - **An owner's re-run still spends no review retry budget.** The re-entry
+    is routed as the workflow's own (failed checks go to remediation, a Task
+    without a reviewer passes on its checks), but it records who asked for it
+    (`transition_log.bridge_kind = "recovery"`, `bridge_payload = {"verb":
+    "review_rerun", "requested_by": ...}`). Nothing an entry the owner asked
+    for causes is charged: red checks, a failing reviewer, the bounce to
+    remediation. Any number of failed owner re-runs leaves the budget where
+    it was. A re-entry Forge asks for itself (settling an upgraded install)
+    spends as an automatic entry does.
+  - **One attempt per entry.** The open attempt a re-run replaces is closed as
+    `cancelled` (`execution_retry.status = "superseded_by_rerun"`), and the
+    new attempt reviews the Task's current candidate. A failed attempt the
+    re-run was asked to replace is never taken for the re-run's own verdict.
+    A Task with neither checks nor a reviewer still records the re-run as an
+    empty passed attempt (`{"ci_steps": []}`) before it goes on to merging.
+  - **Busy Tasks are refused.** While a review entry or a reviewer is still
+    running no review `retry` is offered (`409 action_unavailable`); the
+    internal `rerun_review` command answers `409 task_busy`.
+  - **`review.auditor_agent_id` is refused.** The key (in a Task's
+    `task_state_config`, under `review` or at the top level) asked the inline
+    re-run for a second, "auditor" pass run by the Task's reviewer Agent.
+    There is no auditor pass any more: the review is the one done by the
+    Agent assigned to the Task's `reviewer` role. Creating or updating a Task
+    with a configuration that names an auditor now fails with
+    `invalid_operation`. A Task that still carries the key from an earlier
+    version keeps working, with two differences so the review it expects is
+    not dropped silently: operator status lists such open Tasks
+    (`recent_errors`, `entity_type = "retired_review_auditor_config"`), and a
+    review re-run on one that has no reviewer Agent assigned is refused with
+    `409 conflict` (as the inline re-run refused it) instead of passing on its
+    checks alone. **What to do:** assign the reviewing Agent to the Task's
+    `reviewer` role and remove the key from `task_state_config`.
+  - **After an upgrade.** A re-run the previous version left in flight is
+    settled when the server starts, without waiting for its lease to expire:
+    its reviewer execution, and its auditor child if it had one, are stopped
+    with an error that names them, and the Task's review entry runs again
+    once. If the entry cannot run at all, the Task is blocked on the stopped
+    execution with its recovery actions. A `rerun_review` step queued by the
+    previous version still runs, as the owner's re-run it was. A queued
+    reservation of the inline re-run that nothing can apply any more is
+    closed (`superseded`) by migration `V202610110112`; its row is kept.
+  - Review details of a re-run without a reviewer are now the object every
+    entry writes (`{"ci_steps": [...]}`), not a bare step array.
+  - Rust API: `review::ReviewRunner`, `review::ReviewRequest`,
+    `TaskService::with_review_runner`, `ForgeRuntimeBuilder::with_review_runner`
+    and the `review_runner` fields of `AppState`, `ForgeRuntime` and
+    `HookContext` are removed; `TaskService::rerun_review` takes the
+    requesting `Actor` and returns the re-entered `Task`;
+    `ReviewRepo::create_attempt_with_execution_and_lease` and
+    `TaskMutation::ReviewCreateAttemptWithExecution` are removed, and an
+    execution admission no longer accepts a `reviewer` execution without an
+    Agent.
 - **New installs keep the workspace root in the data directory (3.4 D1).**
   A server that never set `workspace.root` / `FORGE_WORKSPACE_ROOT` now uses
   `<data dir>/worktrees` (`~/.forge/worktrees`) instead of
@@ -2448,6 +2523,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   without a server answering counts as a failed start on every path, run
   starts share two blocking threads under a 15-second deadline, and the
   liveness probe never blocks.
+- **A review check that ran longer than a second could stop every database
+  write for 30 seconds.** The check worker looked at the run's consumers
+  (every second) and renewed its lease from the body of a `select!` branch,
+  which stopped polling the owner's operation. The server owner records its
+  receipt in a write transaction inside that operation; when the look came
+  due while that transaction was open, the worker waited for a write lock its
+  own stopped operation held, until SQLite gave up (`database is locked`,
+  code 5) and the run was left to lease recovery. The lease and the consumers
+  are now looked after beside the operation. The same wait in the bounded
+  lookup and cancel exchanges is fixed the same way.
+- **A database refused as busy now says who held it.** Every write
+  transaction records where it began; one held, or waited for, longer than
+  five seconds is logged with its call site, and a `database is locked`
+  refusal is logged with the write transactions open at that moment.
+  `FORGE_DB_BUSY_TIMEOUT_MS` shortens SQLite's busy timeout for diagnosis.
+- **A failed check job is logged.** The check worker dropped a job that
+  returned an error without a line; it now logs it before lease recovery
+  takes the run up again.
 
 - **Garbage collection could take a build directory from a run that had just
   started, and other collector safety gaps (3.4 stage E).** Build eviction is

@@ -60,7 +60,6 @@ fn effects_have_no_persistence_or_task_capability_imports() {
                     "WorkspaceBackend",
                     "DaemonWorkspaceBackend",
                     "EmbeddedWorkspaceBackend",
-                    "ReviewRunner",
                 ]
                 .contains(&token)
                     && !token.ends_with("Repo")

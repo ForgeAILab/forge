@@ -3529,6 +3529,13 @@ root), `recent_errors` carries one entry with `entity_type` `workspace_gc`,
 `entity_id` the root path and severity `attention`; it goes away when the
 root is owned (`forge --reclaim-workspace-gc`). No response field changed.
 
+While open Tasks still carry the retired `review.auditor_agent_id` key in
+their `task_state_config`, `recent_errors` carries one entry with
+`entity_type` `retired_review_auditor_config`, severity `attention`, `entity_id`
+the first such Task and an `error` that lists up to ten of them and says what
+to do (assign the Agent to the `reviewer` role and remove the key). It goes
+away when no open Task names an auditor.
+
 While the server's workspace root is inside the system temp directory (an
 install of a release that kept the default there), `recent_errors` carries
 one entry with `entity_type` `workspace_root`, `entity_id` the root path and
@@ -5504,32 +5511,83 @@ the Task with `review_blocked` rather than dispatching another reviewer. Read-on
 suppress both lists. A Project Agent sets them through `project.review_config`;
 this keeps repository-specific preparation and check selection at Project scope.
 
-An offered `retry` through `POST /api/v1/tasks/{id}/actions` queues a re-run of
-the configured CI and auditor review, then routes its result through the normal workflow. A pass enters
-merging, a failure returns to remediation or records the exhausted-budget blocker,
-and a passing gate configured for user approval remains in review with an
-`awaiting_human` review. The action response contains the Task snapshot with the queued action;
-read the Task and Review resources for the settled outcome. Attempt allocation and the Running reviewer execution/lease
-are one database admission boundary; the selected Task role assignment, Agent
-identity, workflow snapshot, and current candidate execution must still match
-when that boundary commits. Reviewer capacity counts live Running executions,
-plus the machine's effective run cap.
-The candidate must be a completed implementation execution at the insert
-boundary. Failed or cancelled remediation executions do not displace the last
-completed candidate, but a newer running implementation still fences review
-admission. For a coordination-root Task, that candidate may be a completed
-direct-child implementation execution; an unrelated Task execution is
-rejected. If Task/Project/workflow authority changes after reservation, Forge
-terminalizes the reviewer execution and uses an exact Review status/timestamp
-CAS to cancel the still-running Review; it never leaves a stale running
-attempt or lease as the apparent current authority.
-The persisted reviewer/auditor execution binding identifies the exact Review
+An offered review `retry` (labelled "Re-run Review", or "Recheck Review" while
+an attempt awaits the owner) through `POST /api/v1/tasks/{id}/actions` re-enters
+`review` for the Task's current candidate. There is one review path: the retried
+entry is the ordinary durable review entry, run by the Task's own steps, with the
+conditions, machine capacity, cancel/hold/pause behaviour and evidence of an
+automatic entry.
+
+- **It is asynchronous.** The action response is the Task snapshot with the
+  queued action; nothing has run yet. Read the Task and its Reviews (or wait for
+  `task.updated` / the review events) for the settled outcome.
+- **The entry's checks run on the durable check runner**, in the Task worktree,
+  each command under its `check_timeout_seconds` and the whole run under the
+  3,600-second wall limit of a review-entry check run. When the commit, the
+  worktree and the environment are unchanged since a certified green run, that
+  result is reused and no command runs; a red, timed-out or unfinished result
+  is never reused, so a retry after a failure always runs. No action asks
+  specifically for fresh checks.
+- **The review itself is always asked for again.** A reused check result never
+  stands in for it: an assigned reviewer is dispatched again as an ordinary
+  reviewer execution, and a gate configured for user approval waits for the
+  owner again in a new `awaiting_human` attempt. A carried approval is not
+  used; carries apply only to Forge's own merge-contention entries.
+- **One attempt per entry.** The attempt the retry replaces, if it is still
+  open (`running` or `awaiting_human`), is closed as `cancelled` with
+  `execution_retry.status = "superseded_by_rerun"` before the new one opens.
+- **Outcome.** A pass enters merging; failed checks or a failed review return to
+  remediation (or, when the budget was already spent, record the
+  exhausted-budget blocker); a passing gate configured for user approval
+  remains in review. A failed attempt the retry was asked to replace is never
+  taken for the retry's own verdict. A Task with neither checks nor a reviewer
+  records the retry as an empty passed attempt (`{"ci_steps": []}`) and goes on
+  to merging.
+- **It spends no review retry budget.** Only the owner is offered this action,
+  and an owner's action spends no retry budget: red checks, a failing reviewer
+  and the bounce to remediation of an entry the owner asked for are not
+  charged, so any number of failed retries leaves `retry_budgets.review` where
+  it was. The transition row of the re-entry records who asked
+  (`bridge_kind: "recovery"`, `bridge_payload: {"verb": "review_rerun",
+  "requested_by": ...}`). The next automatic entry spends as usual.
+- **`review.auditor_agent_id` is not supported.** Earlier versions ran a second,
+  auditor pass on a retry when a Task's `task_state_config` named one. There is
+  no auditor pass: the review is done by the Agent assigned to the Task's
+  `reviewer` role. Writing a `task_state_config` that names an auditor is
+  refused (`invalid_operation`). A Task that still carries the key and has no
+  reviewer Agent assigned is refused the retry with `409 conflict` rather than
+  passing on its checks alone; assign the reviewer and remove the key.
+- **A reviewer must not change the worktree.** The ordinary read-only policy
+  applies: authored changes by the reviewer are detected and fail its
+  execution.
+- **Busy Tasks.** While a review entry is still running (its hooks step is
+  queued, running or waiting for its check) or a reviewer execution is running,
+  no review `retry` is offered and submitting one is refused with
+  `409 action_unavailable`; an internal request for the same re-run is refused
+  with `409 task_busy`. No second pipeline starts.
+
+Forge creates no reviewer execution of its own for a retry: every reviewer
+execution in the Task's history was run by an assigned Agent, and a retry holds
+no Agent slot while its checks run (the check run holds a machine run slot).
+Reviewer executions that earlier versions created for a retry (no Agent, parent
+set to the candidate, logs in `review-<execution>.jsonl`) and their `auditor`
+children stay readable. Any that an upgrade finds still `running` are stopped
+when the server starts (and, for one found later, when its lease expires) with
+an error that names them, and the Task's review entry runs again once; if the
+entry cannot run, the Task is blocked on that execution with the ordinary
+recovery actions.
+
+The candidate must be a completed implementation execution. Failed or cancelled
+remediation executions do not displace the last completed candidate. For a
+coordination-root Task, that candidate may be a completed direct-child
+implementation execution. If Task/Project/workflow authority changes while the
+entry's checks run, the settlement is refused and the still-running Review is
+cancelled; it never leaves a stale running attempt as the apparent current
+authority.
+The persisted reviewer execution binding identifies the exact Review
 attempt; a shared candidate parent or timestamp is not used to associate an
 execution with a newer attempt. Unbound legacy reviewer executions require an
 explicit retry or recovery action.
-When review configuration names an auditor, the Task's reviewer role
-assignment must already materialize that authority; configuration alone does
-not synthesize an Agent-backed reviewer during a rerun.
 
 Review reruns recover a deleted or unusable Task checkout from its existing
 branch before running checks. Review-entry CI and reviewer conformance checks
@@ -5617,10 +5675,10 @@ retry hint. MCP exposes the same code and details as a tool error.
 
 Running the command's own step does not count as waiting, and most own steps are
 short. These are bounded only by their own work: `claim`/start with Project
-environment checks (each check at most 300 seconds), `rerun_review` (runs every
-review check inline, each bounded by `check_timeout_seconds`, default 30 minutes,
-at most 4 hours), and Cancel/Hold of remote work (the 10-second acknowledgment
-bound per preemption). An accepted claim owns execution startup in its step, so a
+environment checks (each check at most 300 seconds) and Cancel/Hold of remote
+work (the 10-second acknowledgment bound per preemption). A review `retry` is
+not among them: its step only re-enters `review`, and the checks run afterwards
+on the check runner. An accepted claim owns execution startup in its step, so a
 busy HTTP response cannot leave a reserved execution without dispatch.
 
 **Cancel and Hold.** Cancel/Hold preempt scripts, CI and agent startup at a safe
