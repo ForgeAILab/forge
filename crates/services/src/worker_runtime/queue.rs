@@ -615,35 +615,48 @@ impl TaskStepWorker {
     /// `Some` while `task_id` is in the integration queue with work the
     /// queue worker can do now: the Task whose attempt holds (or will take)
     /// the slot of its queue. `None` once the Task left the entry it was
-    /// admitted in, or its attempt waits on time or its owner.
+    /// admitted in and its attempt holds no slot, or its attempt waits on
+    /// time or its owner.
+    ///
+    /// An attempt that holds the slot is the worker's work whether or not its
+    /// Task is still in that entry, and whether or not its cancel was asked
+    /// for: only a head driver releases it (it cancels the attempt of a Task
+    /// that left). A drain that returned there would stop the driver it
+    /// started itself and never pump again; the Task's next entry into the
+    /// queue would then retry against that attempt until its lease lapsed
+    /// and something else swept the queue.
     ///
     /// The flag: the Task is a queued member of a queue that is not open.
     async fn integration_head_task(&self, task_id: &str) -> Result<(Option<String>, bool)> {
-        let row: Option<(String, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        let row: Option<(String, Option<String>, Option<String>, bool, bool, bool)> = sqlx::query_as(
             "SELECT a.state, \
                     (SELECT q.state FROM integration_queue q WHERE q.id=a.queue_id), \
                     (SELECT h.task_ref FROM integration_queue q JOIN integration_attempt h ON h.id=q.head_attempt_id WHERE q.id=a.queue_id), \
-                    (a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday('now'))) \
+                    (a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday('now'))), \
+                    EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=a.queue_id AND q.head_attempt_id=a.id), \
+                    (t.status=a.expected_status AND t.status_epoch=a.expected_epoch) \
              FROM integration_attempt a JOIN task t ON t.id=a.task_ref \
-             WHERE a.task_ref=? AND a.current=1 AND a.queue_id IS NOT NULL AND t.deleted_at IS NULL \
-               AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch",
+             WHERE a.task_ref=? AND a.current=1 AND a.queue_id IS NOT NULL AND t.deleted_at IS NULL",
         )
         .bind(task_id)
         .fetch_optional(self.db.pool())
         .await?;
-        let Some((state, queue_state, head_task, claimable)) = row else {
+        let Some((state, queue_state, head_task, claimable, holds_slot, in_entry)) = row else {
             return Ok((None, false));
         };
+        if !in_entry && !holds_slot {
+            return Ok((None, false));
+        }
         let open = queue_state.as_deref() == Some("open");
         let live = match state.as_str() {
-            "queued" => open && claimable,
+            "queued" => holds_slot || (open && claimable),
             "validating" | "rebasing" | "checking" | "awaiting_task_step" | "ready_ff"
             | "ff_inflight" | "applied" | "reconciling" => true,
             _ => false,
         };
         Ok((
             live.then(|| head_task.unwrap_or_else(|| task_id.to_owned())),
-            state == "queued" && !open && claimable,
+            in_entry && state == "queued" && !open && claimable,
         ))
     }
     async fn execute(&self, step: TaskStep) -> Result<()> {

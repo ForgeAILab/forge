@@ -1239,3 +1239,76 @@ async fn an_imported_paused_integration_merges_when_the_project_is_resumed() {
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     assert_eq!(world.merges("t").await, 1);
 }
+
+/// A drain starts the head driver itself and stops it when it returns. One
+/// stopped right after its claim leaves the attempt in the slot; when the
+/// Task has left the entry by then, only a head driver ends that attempt.
+/// The next drain is not done while it holds the slot: it pumps the worker,
+/// whose driver cancels the attempt of a Task that left. (The model's
+/// `pre_queue_bare_p14_merge_failed_on_a_locked_index` waited here forever:
+/// the Task's next entry into the queue retried against the stale attempt
+/// with nothing sweeping the queue.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_drain_ends_the_slot_of_a_task_that_left_its_entry() {
+    let world = World::new().await;
+    let attempt = world.reconciled("left", "left.txt").await;
+    let worker = world.service.integration_worker_or_embedded();
+    // The drain's driver, stopped before its first pass.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let driver = loop {
+        if let Some(driver) = worker.sweep_once().await.unwrap().pop() {
+            break driver;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no queue to claim");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let stop = tokio_util::sync::CancellationToken::new();
+    stop.cancel();
+    driver.run(stop).await;
+    let held = world.attempt(&attempt.id).await;
+    assert_eq!(held.state, S::Queued, "{}", world.dump("left").await);
+    let queue = held.queue_id.clone().expect("in a queue");
+    let head: Option<String> =
+        sqlx::query_scalar("SELECT head_attempt_id FROM integration_queue WHERE id=?")
+            .bind(&queue)
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        head.as_deref(),
+        Some(attempt.id.as_str()),
+        "it holds the slot"
+    );
+    // The Task leaves the entry (as the old build's queued cascade moved a
+    // Task to `merge_failed` under the imported attempt), and the stopped
+    // driver's lease lapses.
+    sqlx::query("UPDATE task SET status='merge_failed',status_epoch=status_epoch+1,version=version+1 WHERE id='left'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.touch("left").await;
+    sqlx::query("UPDATE integration_queue SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?")
+        .bind(&queue)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), world.service.drain("left"))
+        .await
+        .expect("the drain returns")
+        .unwrap();
+    let ended = world.attempt(&attempt.id).await;
+    assert_eq!(
+        ended.state,
+        S::Cancelled,
+        "the drain left the attempt of a Task that left its entry in the slot\n{}",
+        world.dump("left").await
+    );
+    let head: Option<String> =
+        sqlx::query_scalar("SELECT head_attempt_id FROM integration_queue WHERE id=?")
+            .bind(&queue)
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(head, None, "the slot is free");
+}
