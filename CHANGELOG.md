@@ -2695,6 +2695,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A Task is reported merged only when the target's owner confirms it.**
+  Before the merge queue moves a Task to `done` (and before a merge that had
+  landed before an upgrade is reported), the owner of the repository's default
+  checkout is asked whether the target branch contains the merged commit: one
+  `git merge-base --is-ancestor` on the server, or the read-only
+  `integration.target_facts` of the daemon that holds the checkout. A recorded
+  merge receipt never replaces that read; a receipt of another attempt, of a
+  later claim, of another owner or naming another commit refuses the report
+  without reading Git. If the target does not contain the commit (it was
+  rewound after the fast-forward, or the row was wrong) the Task stays in its
+  merge state with the typed reason `integration` / `deferred` /
+  `unresolved_result`, its attempt leaves the queue slot
+  (`target_missing_commit`) and is validated again on the retry timer, so it
+  merges again against the target as it is. If the owner cannot be asked, the
+  Task says so and the question is repeated every 30 seconds; nothing is
+  reported meanwhile. The attempt graph gains `applied → parked`.
+
 - A Task that was merging on a daemon when the daemon dropped off, on an
   install upgraded to the merge queue, merges when the daemon reconnects with
   no owner action. Its stored retry time no longer puts a row the queue

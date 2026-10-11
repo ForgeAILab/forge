@@ -165,7 +165,7 @@ pub const HEAD_TABLE: &[HeadStateRow] = &[
         state: S::Applied,
         action: HeadAction::AwaitResult,
         success: &[S::Completed],
-        failure: &[],
+        failure: &[S::Parked],
         timeout: HeadTimeout::None,
         on_timeout: None,
         cancel: CancelRule::Refused,

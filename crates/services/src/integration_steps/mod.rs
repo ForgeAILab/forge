@@ -15,7 +15,7 @@
 //! |---|---|---|---|
 //! | `request_check` | `checking` | asks the check runner for the rebased commit, states `owned/checking` | none; the check's delivery writes the `settle` answer |
 //! | `settle` | `awaiting_task_step` | review authority, carry by attempt lineage, states `owned/fast_forwarding`, pre-enqueues the protected `result` step | `settle` ack + permit |
-//! | `result` | `applied` | execution evidence, "Changes merged" comment, states `applied`, enqueues the `done` cascade | `result` ack |
+//! | `result` | `applied` | asks the target's owner whether the target contains the merged commit (`proof`); then execution evidence, "Changes merged" comment, states `applied`, enqueues the `done` cascade. Not contained: nothing is reported, the Task states `deferred/unresolved_result` | `result` ack (`done`, or `not_landed`: the worker takes the attempt off the slot and queues it again) |
 //! | `send_back` | `ejected`, `needs_review` | today's conflict handoff / merge failure / review refresh, states the typed reason and the handoff | `send_back` ack |
 //! | `park` | `parked`, `quarantined`, or `queued` | states `deferred` (or `waiting` once the queue is open again), `task.interruption_changed` for an intervention | `park` ack |
 //! | `clear` | `cancelled` | clears this attempt's integration statement | none (the attempt is terminal) |
@@ -45,6 +45,7 @@ pub(crate) mod admission;
 pub(crate) mod gate;
 pub mod import;
 mod port;
+mod proof;
 pub(crate) mod reconcile;
 mod send_back;
 mod settle;
@@ -52,6 +53,7 @@ mod settle;
 mod tests;
 
 pub use port::TaskStepIntegrationPort;
+pub use proof::{TargetOwnerProof, TargetProof, TargetProofSource};
 pub use settle::{HeadCheck, HeadCheckSource, IntegrationCheckFamily, ReviewCiHeadCheck};
 
 /// The Task-step kind this module consumes.
@@ -144,6 +146,9 @@ pub struct IntegrationSteps {
     pub(crate) task_service: crate::TaskService,
     pub(crate) engine: Arc<WorkflowEngine>,
     pub(crate) head_check: Arc<dyn HeadCheckSource>,
+    /// Asked before a Task is reported merged: the target's owner says
+    /// whether the target contains the commit.
+    pub(crate) target_proof: Arc<dyn TargetProofSource>,
     pub(crate) timers: IntegrationStepTimers,
 }
 
@@ -153,6 +158,10 @@ impl IntegrationSteps {
         Self {
             db: Arc::clone(&engine.db),
             head_check: Arc::new(ReviewCiHeadCheck::new(Arc::clone(&engine.db))),
+            target_proof: Arc::new(TargetOwnerProof::new(
+                Arc::clone(&engine.db),
+                task_service.daemon_connections.clone(),
+            )),
             engine,
             task_service,
             timers: IntegrationStepTimers::default(),
@@ -168,6 +177,12 @@ impl IntegrationSteps {
     /// stage that shares the review-entry builder).
     pub fn with_head_check(mut self, source: Arc<dyn HeadCheckSource>) -> Self {
         self.head_check = source;
+        self
+    }
+    /// Replace who is asked whether the target contains a merged commit
+    /// (tests).
+    pub fn with_target_proof(mut self, source: Arc<dyn TargetProofSource>) -> Self {
+        self.target_proof = source;
         self
     }
 
@@ -540,7 +555,7 @@ impl IntegrationSteps {
     /// Never returns an error and never settles the step `failed`: whatever
     /// goes wrong, the step stays pending and the Task says why.
     async fn result_step(&self, step: &TaskStep, request: &IntegrationStepRequest) -> Result<()> {
-        let outcome = match self.result(step, request).await {
+        let outcome = match self.result(step, request, false).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(target: "services::integration_steps", task_id = %step.task_id, attempt_id = %request.attempt_id, %error, "integration result could not be applied; it stays queued");
@@ -614,10 +629,14 @@ impl IntegrationSteps {
         }
     }
 
-    async fn result(
+    /// `imported`: the attempt is a landed merge of before the queue, reported
+    /// by its import continuation. No worker holds a slot for it, so nothing
+    /// would read a `not_landed` answer: an unproven one is asked again.
+    pub(crate) async fn result(
         &self,
         step: &TaskStep,
         request: &IntegrationStepRequest,
+        imported: bool,
     ) -> Result<StepOutcome> {
         let Some(attempt) = self.db.integration_attempt(&request.attempt_id).await? else {
             return Ok(StepOutcome::Skip("attempt is gone".into()));
@@ -706,21 +725,28 @@ impl IntegrationSteps {
             tx.commit().await?;
             return Ok(StepOutcome::Settled);
         };
-        let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let queue = match attempt.queue_id.as_deref() {
             Some(id) => self.db.integration_queue(id).await?,
             None => None,
         };
+        // The proof. Nothing below is written, and the Task is not reported
+        // merged, unless the owner of the target says now that the target
+        // contains the commit. One read on that owner, outside of any
+        // transaction.
+        let after_sha = match self.prove_landed(&attempt, queue.as_ref()).await {
+            Ok(sha) => sha,
+            Err(unproven) => {
+                return self
+                    .result_unproven(step, request, &attempt, unproven, imported)
+                    .await
+            }
+        };
+        let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let branch = queue
             .map(|queue| queue.target_branch)
             .unwrap_or_else(|| "the target branch".into());
-        let after_sha = attempt
-            .integrated_sha
-            .clone()
-            .or_else(|| attempt.candidate_sha.clone())
-            .unwrap_or_default();
         // What today's merge success leaves behind, in today's order. Both
         // writes are idempotent, so a redelivered step repeats neither.
         if let (Some(merge_service), Some(execution)) = (
@@ -836,6 +862,133 @@ impl IntegrationSteps {
             .await?;
         tx.commit().await?;
         self.task_service.dispatch_wake.notify_one();
+        Ok(StepOutcome::Settled)
+    }
+
+    /// The commit the target's owner confirms the target contains, or why
+    /// the attempt's merge is not proven.
+    async fn prove_landed(
+        &self,
+        attempt: &IntegrationAttempt,
+        queue: Option<&db::IntegrationQueue>,
+    ) -> std::result::Result<String, TargetProof> {
+        let Some(queue) = queue else {
+            return Err(TargetProof::Unknown(
+                "the attempt has no queue, so no target to ask".into(),
+            ));
+        };
+        let integrated = proof::recorded_commit(attempt, queue).map_err(TargetProof::Absent)?;
+        // The Task's own commit. After a fast-forward it is the integrated
+        // commit itself (one read). A merge of before the queue made a merge
+        // commit: then both are asked for.
+        let candidate = attempt
+            .candidate_sha
+            .clone()
+            .filter(|sha| *sha != integrated);
+        for sha in std::iter::once(integrated.clone()).chain(candidate) {
+            match self.target_proof.target_contains(queue, &sha).await {
+                TargetProof::Contains => {}
+                unproven => return Err(unproven),
+            }
+        }
+        Ok(integrated)
+    }
+
+    /// The merge the attempt records is not proven. The Task is not reported
+    /// merged and says so, typed (`deferred/unresolved_result`).
+    ///
+    /// - The owner answered "not contained" (the target was rewound, or the
+    ///   row names a commit that never merged): the step answers `not_landed`
+    ///   and ends, so the worker takes the attempt off the slot and queues it
+    ///   again; validation then reads the target as it is.
+    /// - No answer, or an imported row: the step stays and asks again at
+    ///   `result_park`; the worker re-arms it on every sweep.
+    async fn result_unproven(
+        &self,
+        step: &TaskStep,
+        request: &IntegrationStepRequest,
+        attempt: &IntegrationAttempt,
+        unproven: TargetProof,
+        imported: bool,
+    ) -> Result<StepOutcome> {
+        let (answered, why) = match unproven {
+            TargetProof::Absent(why) => (true, why),
+            TargetProof::Unknown(why) => (false, why),
+            TargetProof::Contains => unreachable!("a proven merge is reported"),
+        };
+        let message = bounded(&format!(
+            "the merge of this Task is not confirmed on its target: {why}"
+        ));
+        tracing::warn!(target: "services::integration_steps", task_id = %attempt.task_ref, attempt_id = %attempt.id, %message, "integration result not reported");
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        if !Self::entry_live_in_tx(&mut tx, attempt).await? {
+            return Ok(StepOutcome::Retry("Task moved while applying".into()));
+        }
+        let reason = IntegrationReason::Deferred {
+            attempt_id: attempt_ref(&attempt.id),
+            cause: IntegrationDeferralCause::UnresolvedResult,
+            owner_id: None,
+            message: message.clone(),
+        };
+        let already = self
+            .db
+            .get_task_in_tx(&mut tx, &attempt.task_ref)
+            .await?
+            .is_some_and(|task| task.condition.integration_reason() == Some(&reason));
+        if !already
+            && self
+                .state_in_tx(
+                    &mut tx,
+                    &attempt.task_ref,
+                    &ConditionStatement::Integration { reason },
+                )
+                .await?
+        {
+            let task = self
+                .db
+                .get_task_in_tx(&mut tx, &attempt.task_ref)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            self.raise_interruption_in_tx(&mut tx, &task).await?;
+        }
+        if !answered || imported {
+            tx.commit().await?;
+            return Ok(StepOutcome::RetryAt(
+                message,
+                chrono::Utc::now() + self.timers.result_park,
+            ));
+        }
+        match db::acknowledge_integration_step_in_tx(
+            &mut tx,
+            &IntegrationStepAckWrite {
+                attempt_id: attempt.id.clone(),
+                generation: request.generation,
+                effect_seq: request.effect_seq,
+                bind_generation: false,
+                states: vec![S::Applied],
+                ack: ack_value(
+                    request,
+                    IntegrationStepAction::Result,
+                    IntegrationStepOutcome::NotLanded,
+                    None,
+                    Some(message.clone()),
+                ),
+                permit: None,
+                acknowledged_at: db::now_rfc3339(),
+            },
+        )
+        .await?
+        {
+            IntegrationStepAckOutcome::Written(_)
+            | IntegrationStepAckOutcome::AlreadyAcknowledged(_) => {}
+            IntegrationStepAckOutcome::Stale(_) | IntegrationStepAckOutcome::NotYet(_) => {
+                return Ok(StepOutcome::Retry("attempt moved while applying".into()));
+            }
+        }
+        self.db
+            .finish_step_in_tx(&mut tx, step, "done", Some(&message))
+            .await?;
+        tx.commit().await?;
         Ok(StepOutcome::Settled)
     }
 

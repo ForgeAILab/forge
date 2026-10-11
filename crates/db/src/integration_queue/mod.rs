@@ -644,7 +644,13 @@ pub const INTEGRATION_TRANSITIONS: &[(IntegrationAttemptState, &[IntegrationAtte
     ),
     (
         IntegrationAttemptState::Applied,
-        &[IntegrationAttemptState::Completed],
+        &[
+            IntegrationAttemptState::Completed,
+            // The settle-time proof failed: the owner of the target says the
+            // target does not contain the commit. The attempt leaves the
+            // slot and is validated again from the target as it is.
+            IntegrationAttemptState::Parked,
+        ],
     ),
     (
         IntegrationAttemptState::Ejected,

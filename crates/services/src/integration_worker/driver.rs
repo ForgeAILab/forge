@@ -60,6 +60,11 @@ pub enum ParkReason {
     RoundsExhausted,
     /// A deciding Task step settled without answering, again after re-asks.
     StepFailed,
+    /// The `result` step's proof failed: the owner of the target says the
+    /// target does not contain the commit this attempt recorded as merged
+    /// (the target was rewound after the fast-forward). The attempt is
+    /// validated again from the target as it is, on the counted retry timer.
+    NotLanded,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retry {
@@ -85,19 +90,23 @@ impl ParkReason {
             Self::ExternalMovesExhausted => "external_target_moves_exhausted",
             Self::RoundsExhausted => "rounds_exhausted",
             Self::StepFailed => "task_step_failed",
+            Self::NotLanded => "target_missing_commit",
         }
     }
     fn kind(self) -> IntegrationFailureKind {
         match self {
             Self::Infrastructure | Self::StepFailed => IntegrationFailureKind::Infrastructure,
             Self::Timeout => IntegrationFailureKind::Timeout,
+            Self::NotLanded => IntegrationFailureKind::NeedsFact,
             Self::TargetNotReady | Self::OwnerOffline => IntegrationFailureKind::TargetUnavailable,
             _ => IntegrationFailureKind::OwnerRequired,
         }
     }
     fn retry(self) -> Retry {
         match self {
-            Self::Infrastructure | Self::Timeout | Self::StepFailed => Retry::Counted,
+            Self::Infrastructure | Self::Timeout | Self::StepFailed | Self::NotLanded => {
+                Retry::Counted
+            }
             Self::Gate(_) | Self::TargetNotReady | Self::OwnerOffline => Retry::Soon,
             _ => Retry::Owner,
         }
@@ -1540,6 +1549,7 @@ impl HeadDriver {
             IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
             IntegrationStepOutcome::Permit
             | IntegrationStepOutcome::NeedsReview
+            | IntegrationStepOutcome::NotLanded
             | IntegrationStepOutcome::Done => {
                 // The same acknowledgment is the settle decision; the next
                 // state consumes it.
@@ -1643,7 +1653,9 @@ impl HeadDriver {
             }
             IntegrationStepOutcome::CandidateCheckFailed => self.check_failed(&a, &ack).await,
             IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
-            IntegrationStepOutcome::Infrastructure | IntegrationStepOutcome::Done => {
+            IntegrationStepOutcome::Infrastructure
+            | IntegrationStepOutcome::NotLanded
+            | IntegrationStepOutcome::Done => {
                 // The step refused the permit under the Task gate.
                 if let Some(pass) = self.gated(&a).await? {
                     return Ok(pass);
@@ -2066,7 +2078,27 @@ impl HeadDriver {
             self.w.steps.ready_result_step(&a.id, a.effect_seq).await?;
         }
         let now = self.w.clock.now();
-        let mut done = IntegrationStepAck::current(&a, action).is_some();
+        let answer = IntegrationStepAck::current(&a, action);
+        if let Some(answer) = answer
+            .as_ref()
+            .filter(|answer| answer.outcome == IntegrationStepOutcome::NotLanded)
+        {
+            // The Task was not reported merged. The recorded result is
+            // dropped with the slot; the next validation reads the target.
+            let detail = answer
+                .message
+                .clone()
+                .unwrap_or_else(|| "the target does not contain the merged commit".into());
+            let a = self
+                .w
+                .advance(&a.id, S::Applied, |a| {
+                    a.integrated_sha = None;
+                    a.integrated_before_sha = None;
+                })
+                .await?;
+            return self.park(&a, ParkReason::NotLanded, &detail).await;
+        }
+        let mut done = answer.is_some();
         let due = self
             .result_checked
             .is_none_or(|at| now >= later(at, self.w.config.sweep_interval));

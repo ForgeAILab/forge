@@ -459,7 +459,7 @@ impl IntegrationSteps {
             generation: attempt.slot_generation,
             ..request.clone()
         };
-        let outcome = self.result(step, &result).await?;
+        let outcome = self.result(step, &result, true).await?;
         if outcome == StepOutcome::Settled {
             complete_applied(&self.db, &attempt.id).await;
         }
