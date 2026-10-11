@@ -1256,12 +1256,18 @@ pub async fn load_selection_context(
                 .flatten();
             super::capacity::effective_machine_cap(reported, admin)
         };
+        let embedded_machine_id = db.server_run_cap.embedded_machine_id();
+        let machine_capacity =
+            count_machine_capacity(transaction, machine_id, cap, &embedded_machine_id).await?;
+        // An aged run-slot waiter is admitted ahead of the checks queued
+        // since it began to wait (`db::machine_capacity::capacity_for_task`).
         let machine_capacity = Some(
-            count_machine_capacity(
+            db::machine_capacity::capacity_for_task(
                 transaction,
+                machine_capacity,
                 machine_id,
-                cap,
-                &db.server_run_cap.embedded_machine_id(),
+                &input.task.id,
+                &embedded_machine_id,
             )
             .await?,
         );

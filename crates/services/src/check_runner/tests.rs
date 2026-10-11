@@ -1149,6 +1149,228 @@ async fn only_real_run_slot_waiters_hold_checks_to_their_share() {
     assert!(waiters(None).await && waiters(Some("another-machine")).await);
 }
 
+/// A Task that holds one slot (an interactive session) and needs a second
+/// one for its coder run, on a machine with two slots where checks keep
+/// queuing. `holder` has its worktree on the server.
+struct SecondSlotTask {
+    store: Arc<SqliteDb>,
+}
+impl SecondSlotTask {
+    async fn new(store: &Arc<SqliteDb>, temp: &tempfile::TempDir) -> Self {
+        let now = db::now_rfc3339();
+        let path = temp.path().to_str();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('holder','p','holder','in_progress',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('session','holder','interactive','running',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES('hw','holder','r',?,'task/holder','ready',?,?)").bind(path).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('hl','r','server',?,'primary_checkout',1,'ready',?,?)").bind(path).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES('hp','hw','holder','server','hl',?,1,'ready','scheduler','{}',?,?)").bind(path).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+        Self {
+            store: store.clone(),
+        }
+    }
+    async fn aged(&self) -> bool {
+        db::machine_capacity::aged_slot_wait(self.store.pool(), "holder")
+            .await
+            .unwrap()
+            .is_some()
+    }
+    /// The coder dispatch asks as the reserve and start transactions ask.
+    async fn dispatch(&self) -> bool {
+        let admitted = {
+            let mut tx = db::begin_immediate(self.store.pool()).await.unwrap();
+            let capacity = db::machine_capacity::count_machine_capacity(
+                &mut tx,
+                None,
+                Some(2),
+                "server-machine",
+            )
+            .await
+            .unwrap();
+            assert!(capacity.active_runs() <= 2, "the cap was exceeded");
+            db::machine_capacity::capacity_for_task(
+                &mut tx,
+                capacity,
+                None,
+                "holder",
+                "server-machine",
+            )
+            .await
+            .unwrap()
+            .admits_execution()
+        };
+        if !admitted {
+            self.store
+                .schedule_wait("holder", ("p", false), None, Some("*"), None)
+                .await
+                .unwrap();
+            return false;
+        }
+        // The dispatch attempt drops the wait row before the run starts.
+        self.store
+            .schedule_wait("holder", ("p", false), None, None, None)
+            .await
+            .unwrap();
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('coder-run','holder','coder','running',?,?)").bind(&now).bind(&now).execute(self.store.pool()).await.unwrap();
+        true
+    }
+}
+
+/// Slot-wait aging. Without it the Task below is refused at every release
+/// for as long as checks keep queuing (rule 1 keeps the freed slot for the
+/// queued check). After three releases it was woken for and refused, it is
+/// admitted ahead of the check queued since; the cap holds throughout and
+/// the check runs as soon as a slot is free again.
+#[tokio::test]
+async fn a_task_waiting_for_a_second_slot_is_admitted_ahead_of_newer_checks_once_aged() {
+    let (temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(2), 2, "server-machine");
+    let stream = SlotStream {
+        store: store.clone(),
+        started: 0,
+    };
+    let holder = SecondSlotTask::new(&store, &temp).await;
+    let mut running = admit(
+        &store,
+        &queue_check(&runner, "check-0", CheckConsumerOrigin::Entry).await,
+    )
+    .await;
+    assert!(!holder.dispatch().await, "the machine is full");
+    // Releases 1 and 2: a check queued meanwhile takes the freed slot.
+    for round in 1..=2 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let next = queue_check(
+            &runner,
+            &format!("check-{round}"),
+            CheckConsumerOrigin::Entry,
+        )
+        .await;
+        finish_check(&store, &running).await;
+        assert!(!holder.aged().await, "aged after {round} release(s)");
+        assert!(
+            !holder.dispatch().await,
+            "release {round}: the slot is kept for the queued check"
+        );
+        running = stream
+            .try_admit(&next)
+            .await
+            .expect("the queued check takes the slot");
+    }
+    // Release 3: the wait is aged. The check queued since stands back even
+    // when the check runner asks first, and the Task is admitted.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let newer = queue_check(&runner, "check-3", CheckConsumerOrigin::Entry).await;
+    finish_check(&store, &running).await;
+    assert!(holder.aged().await);
+    assert!(
+        stream.try_admit(&newer).await.is_none(),
+        "a newly queued check took the aged waiter's slot"
+    );
+    assert!(holder.dispatch().await, "the aged waiter is admitted");
+    assert_eq!(stream.capacity().await.active_runs(), 2);
+    assert!(stream.try_admit(&newer).await.is_none(), "cap exceeded");
+    // The check is not starved: it runs at the next release.
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='coder-run'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(stream.try_admit(&newer).await.is_some());
+    assert_eq!(stream.capacity().await.active_runs(), 2);
+}
+
+/// What aging does not do: an aged waiter stays behind a check that was
+/// queued before it began to wait, and a check stands back for an aged
+/// waiter for a bounded time only. The age survives the dispatch attempt's
+/// gap and starts afresh after it.
+#[tokio::test]
+async fn an_aged_waiter_stays_behind_older_checks_and_holds_newer_ones_for_a_bounded_time() {
+    let (temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(2), 2, "server-machine");
+    let stream = SlotStream {
+        store: store.clone(),
+        started: 0,
+    };
+    let holder = SecondSlotTask::new(&store, &temp).await;
+    let running = admit(
+        &store,
+        &queue_check(&runner, "running", CheckConsumerOrigin::Entry).await,
+    )
+    .await;
+    let older = queue_check(&runner, "older", CheckConsumerOrigin::Entry).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert!(!holder.dispatch().await);
+    assert!(!holder.aged().await);
+    // Two minutes of waiting age it as three releases do.
+    sqlx::query("UPDATE task_slot_wait_age SET since=strftime('%Y-%m-%dT%H:%M:%fZ','now','-119 seconds') WHERE task_id='holder'").execute(store.pool()).await.unwrap();
+    assert!(!holder.aged().await);
+    sqlx::query("UPDATE task_slot_wait_age SET since=strftime('%Y-%m-%dT%H:%M:%fZ','now','-121 seconds'), releases=0 WHERE task_id='holder'").execute(store.pool()).await.unwrap();
+    assert!(holder.aged().await);
+    // Put the start of the wait back after the older check, aged by count.
+    sqlx::query("UPDATE task_slot_wait_age SET since=strftime('%Y-%m-%dT%H:%M:%fZ','now'), releases=3 WHERE task_id='holder'").execute(store.pool()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let newer = queue_check(&runner, "newer", CheckConsumerOrigin::Entry).await;
+
+    // A release: the check that was queued first goes first.
+    finish_check(&store, &running).await;
+    assert!(
+        !holder.dispatch().await,
+        "an aged waiter jumped a check older than its wait"
+    );
+    assert!(stream.try_admit(&newer).await.is_none());
+    let older = stream.try_admit(&older).await.expect("older check first");
+
+    // The next release is the waiter's; the newer check stands back.
+    finish_check(&store, &older).await;
+    assert!(stream.try_admit(&newer).await.is_none());
+    let yielded: Option<String> =
+        sqlx::query_scalar("SELECT yielded_since FROM check_run WHERE id=?")
+            .bind(&newer.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert!(yielded.is_some());
+    // The waiter does not take the slot. After 90 seconds of standing back
+    // the check takes it: a waiter that cannot run never starves a check.
+    sqlx::query("UPDATE check_run SET yielded_since=? WHERE id=?")
+        .bind((chrono::Utc::now() - chrono::Duration::seconds(91)).to_rfc3339())
+        .bind(&newer.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(stream.try_admit(&newer).await.is_some());
+    assert_eq!(stream.capacity().await.active_runs(), 2);
+
+    // The wait row dropped by a dispatch attempt keeps its age for 30 s.
+    store
+        .schedule_wait("holder", ("p", false), None, None, None)
+        .await
+        .unwrap();
+    assert!(holder.aged().await);
+    store
+        .schedule_wait("holder", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(holder.aged().await, "the gap reset the age");
+    // A wait that ended longer ago starts afresh.
+    store
+        .schedule_wait("holder", ("p", false), None, None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task_slot_wait_age SET lapsed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-31 seconds') WHERE task_id='holder'").execute(store.pool()).await.unwrap();
+    assert!(!holder.aged().await);
+    store
+        .schedule_wait("holder", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(!holder.aged().await);
+    let releases: i64 =
+        sqlx::query_scalar("SELECT releases FROM task_slot_wait_age WHERE task_id='holder'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(releases, 0);
+}
+
 /// A check that stops holding or reserving a slot is a release for the Tasks
 /// that wait for a run slot: its end, the cancellation of a queued one, and
 /// its last consumer giving up each mark those waiters. Before, only the end

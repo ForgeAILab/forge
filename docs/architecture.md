@@ -8836,7 +8836,7 @@ counts; per-machine `active_runs` includes exclusive check slots.
 **Who gets a freed slot.** Work closer to done goes first. On a machine with a
 run cap `C`, let `k` be the checks that hold a slot of their own, `q` the
 queued checks a consumer still waits for, and `S = max(C - 1, 1)` the checks'
-share. Three rules, all evaluated in the admission transactions on the shared
+share. Four rules, all evaluated in the admission transactions on the shared
 occupancy query (`db::machine_capacity`):
 
 1. **An execution leaves room for queued checks.** A reservation, an execution
@@ -8873,14 +8873,47 @@ wait left on it is retired. Any other running execution of the Task (an
 interactive session, a run of another role) is not that: a dispatch then needs
 a second slot, the reserve and start transactions count the first one against
 it, and the Task waits for a run slot. Fairness is per slot, not per Task:
-such a Task already fills one slot, so under rule 1 it is admitted only at a
-release where no queued check is kept a slot (with the machine otherwise full
-of checks, `active = C - 1` and one kept slot refuse it). While checks keep
-queuing it keeps waiting, visibly, until its other run ends; it is not one of
-the waiters the bound below speaks of. A review-entry check never needs a
+such a Task already fills one slot, so under rule 1 it is refused at a
+release where a queued check is kept a slot (with the machine otherwise full
+of checks, `active = C - 1` and one kept slot refuse it). Rule 4 below ends
+that wait. A review-entry check never needs a
 second slot while its Task's run or reservation holds one: it borrows that
 slot and takes it over when the run ends, so the machine's count does not
 change.
+
+4. **An aged waiter goes ahead of checks queued since it began to wait.** A
+   wait for a run slot has an age (`task_slot_wait_age`, kept by triggers
+   since `V202610110650`): when it began, and how many capacity releases the
+   Task was woken for and still refused. The wait is *aged* after 3 releases
+   or 120 seconds, whichever comes first (`SLOT_WAIT_AGED_RELEASES`,
+   `SLOT_WAIT_AGED_SECONDS`). Both sides order an aged waiter and a queued
+   check by time:
+   - *Execution side* (the precheck, the placement selection and the
+     reserve/start transaction, through `machine_capacity::capacity_for_task`
+     and `machine_precheck::snapshot_for_task`): for an aged waiter, rule 1
+     keeps slots only for the checks queued **no later than** the start of
+     its wait. Checks queued since reserve nothing against it.
+   - *Check side* (`admit_check_run`): a queued check counts the aged waiters
+     whose wait began **before** the check was queued as ahead of it in the
+     queue (`aged_waiters_ahead`), so a sweep that reaches the freed slot
+     first does not take it. Counted are Tasks that wait for nothing but a
+     run slot (`daemon_id = '*'`, no Project-limit wait), have their worktree
+     on this machine, and are not the check's own Task. A waiter without a
+     worktree can run on any machine and holds no machine's checks back.
+
+   The age belongs to the wait, not to the row: a dispatch attempt drops the
+   wait row before its start transaction decides, so the age survives a gap
+   of up to 30 seconds (`lapsed_at`) and a wait that ended longer ago starts
+   afresh. It ends when the Task starts a run. The release count is the
+   number of external dirty marks the waiter received; a mark for another
+   reason counts too, which only ages the wait sooner and never moves it
+   ahead of a check older than the wait.
+
+   A check stands back for aged waiters for at most 90 seconds in total
+   (`check_run.yielded_since`, `CHECK_YIELD_SECONDS`): one dispatcher wake
+   plus the 60 s recheck backstop. A waiter that cannot use the slot after
+   all (it also waits for disk, its Agent is busy elsewhere) therefore never
+   starves a check.
 
 One approximation, on the cautious side. Rule 1 counts a queued check that
 will borrow its own Task's slot when the worker next looks at it, so a slot
@@ -8921,6 +8954,21 @@ waits for at most the checks queued at that moment plus the one a running job
 can still produce, because a check is only ever requested by a Task entering
 review or its integration attempt, and no new run means no new check. Among
 executions the dispatcher's existing order is unchanged.
+
+Aging (rule 4) keeps both bounds and closes the one case they did not cover.
+*The cap*: rule 4 changes how many free slots are kept for whom, never the
+test `active < C` that every admission still passes in its own writer
+transaction. *The waiter*: a Task that needs a second slot was refused for as
+long as checks kept queuing. Once aged it waits only for the checks queued
+before its wait began, a set that is fixed at that moment and shrinks by one
+at each release it loses; every later check stands back for it. It is
+admitted at the first release after those checks ran, unless its other run
+ended first. *The checks*: a check is held back only by aged waiters older
+than itself, again a set fixed when the check is queued, each of which takes
+one slot once (starting its run ends its age); and for no more than 90
+seconds of standing back in total, after which the existing argument applies
+to it unchanged. Two parties never wait for each other: the order between an
+aged waiter and a check is their timestamps (a tie goes to the check).
 
 Result delivery enqueues an entry-fenced `apply_check_result` Task command with
 consumer/result/run identities, exact commit and spec digest. The consumer's

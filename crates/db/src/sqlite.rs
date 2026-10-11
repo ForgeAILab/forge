@@ -1594,19 +1594,26 @@ impl SqliteDb {
                     .flatten(),
             )
         };
-        if !crate::machine_capacity::count_machine_capacity(
+        let machine = if server_host {
+            None
+        } else {
+            daemon_id.as_deref()
+        };
+        let embedded = self.server_run_cap.embedded_machine_id();
+        let capacity =
+            crate::machine_capacity::count_machine_capacity(transaction, machine, cap, &embedded)
+                .await?;
+        // An aged run-slot waiter stays behind the checks queued before it
+        // began to wait, and no longer behind the ones queued since.
+        let capacity = crate::machine_capacity::capacity_for_task(
             transaction,
-            if server_host {
-                None
-            } else {
-                daemon_id.as_deref()
-            },
-            cap,
-            &self.server_run_cap.embedded_machine_id(),
+            capacity,
+            machine,
+            &input.task_id,
+            &embedded,
         )
-        .await?
-        .admits_execution()
-        {
+        .await?;
+        if !capacity.admits_execution() {
             return Err(DbError::MachineAtCapacity);
         }
         Ok(())

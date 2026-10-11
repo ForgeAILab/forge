@@ -20,7 +20,40 @@ pub(crate) async fn snapshot(
     .await?)
 }
 
-/// `None` includes unknown verification/probe facts and non-capacity refusals.
+/// The machines as `task_id` is admitted against them: an aged run-slot
+/// waiter stays behind the checks queued before it began to wait only.
+pub(crate) async fn snapshot_for_task(
+    db: &db::SqliteDb,
+    task_id: &str,
+) -> Result<Vec<db::machine_capacity::MachineCapacityRow>> {
+    let mut rows = snapshot(db).await?;
+    if rows
+        .iter()
+        .all(|row| row.capacity.slots_kept_for_checks() == 0)
+    {
+        return Ok(rows);
+    }
+    let Some(since) = db::machine_capacity::aged_slot_wait(db.pool(), task_id).await? else {
+        return Ok(rows);
+    };
+    let before = db::machine_capacity::queued_checks_before(
+        db.pool(),
+        &since,
+        &db.server_run_cap.embedded_machine_id(),
+    )
+    .await?;
+    for row in &mut rows {
+        let key = row
+            .daemon_id
+            .as_deref()
+            .unwrap_or(db::machine_capacity::SERVER_MACHINE_KEY);
+        row.capacity = row
+            .capacity
+            .for_aged_waiter(before.get(key).copied().unwrap_or(0));
+    }
+    Ok(rows)
+}
+
 /// Current environment failures exclude a machine from the usable set.
 pub(crate) async fn task_blocked(
     db: &db::SqliteDb,
@@ -34,7 +67,7 @@ pub(crate) async fn task_blocked(
     if agent.paused || agent.status == db::AgentStatus::Error {
         return Ok(None);
     }
-    if snapshot(db)
+    if snapshot_for_task(db, &task.id)
         .await?
         .iter()
         .all(|row| row.capacity.admits_execution())
