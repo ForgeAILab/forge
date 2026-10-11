@@ -3081,6 +3081,7 @@ pub(crate) mod tests {
                         | 202610100137
                         | 202610100820
                         | 202610101906
+                        | 202610110650
                 ))
                 .then_some((version, path))
             })
@@ -3111,6 +3112,13 @@ pub(crate) mod tests {
         // The check slot-release triggers write the scheduler's tables.
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610101906__check_slot_release.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // So do the slot-wait age triggers.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610110650__slot_wait_age.sql"
         ))
         .execute(&pool)
         .await
