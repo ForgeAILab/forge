@@ -674,6 +674,8 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
             "V202610080123__integration_queue.sql",
             "V202610082317__integration_fencing.sql",
             "V202610091612__integration_activation.sql",
+            // An index on `integration_attempt`: it is applied with the table.
+            "V202610111630__integration_read_index.sql",
         ]
         .contains(&file.file_name().to_str().unwrap())
         {
@@ -713,7 +715,7 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
             .fetch_one(&pool)
             .await
             .unwrap(),
-        migration_count + 3
+        migration_count + 4
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM integration_queue")
