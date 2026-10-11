@@ -9237,8 +9237,13 @@ this definition, so the policy revision stays `1`.
    infrastructure, see below) makes the hook ask the engine to suspend the
    step (`durable::suspend_hook`). A consumer nothing will answer any more
    (cancelled under a step nobody superseded, or its run or result row is
-   gone) cancels the review attempt and fails the hook with `review check was
-   lost before it produced a result` instead of suspending again.
+   gone) is asked for again: the attempt is closed
+   (`superseded_by_withdrawn_check`) and the hook asks once more, by the
+   mechanism and under the bound of a changed configuration (below). The
+   same holds for a result whose outcome is `cancelled` (the entry joined a
+   run that was being stopped for someone else). Past the bound the review
+   attempt is cancelled and the hook fails with `review check was lost
+   before it produced a result` instead of suspending again.
 
 **A suspended hooks step is its own durable state.** `task_step.status =
 'suspended'` (V202610100820) with `suspended_until` (the latest time it looks
@@ -9316,9 +9321,16 @@ run: the delete guard counts unfinished runs (`project_in_use`,
 anything, it looks for a run dispatched to a daemon that is not connected and
 not removed (`TaskService::project_deletion_unreachable_machines`): such a
 run cannot be stopped now, so the request is refused naming the machine and
-nothing is cancelled. Only then does it cancel the consumers, settle queued
+nothing is cancelled. The same look covers the running executions: one whose
+provider is a machine that cannot be reached would refuse the delete in phase
+two after earlier executions had already been cancelled, so it refuses here.
+Only then does it cancel the consumers, settle queued
 runs and wait (four seconds for the whole request) for the worker to stop
-running ones. A machine that is gone for good is removed by its owner: the
+running ones. Phase two is all-or-nothing for the Tasks: when the delete is
+refused after it cancelled (a run did not settle within the bound, a provider
+refused, new work was admitted), `TaskService::resume_project_check_waits`
+wakes every review entry whose consumer was cancelled, and each asks again
+for its check instead of failing as lost. A machine that is gone for good is removed by its owner: the
 worker settles the runs of a removed machine and the delete goes through. Should a run row disappear under its worker anyway,
 the worker finds no consumer at its next look, tells the owner to stop (best
 effort) and drops the run.
@@ -9384,7 +9396,7 @@ resume or a typed condition, never a silent wait:
 | What happens | Outcome |
 |---|---|
 | check worker not running | the Task shows the typed check wait (`check`, phase `result` or `slot`) stated when it asked; the step looks again at `suspended_until` and re-suspends while the run is still pending |
-| run or result row lost, consumer cancelled under a live step | the woken step fails the hook (`review check was lost...`) and cancels the attempt |
+| run or result row lost, consumer cancelled under a live step | the woken step asks again (at most three re-requests per entry); past that it fails the hook (`review check was lost...`) and cancels the attempt |
 | delivery step dead-lettered or never enqueued | the step wakes at `suspended_until` and reads the verdict itself |
 | daemon unreachable | the run stays `uncertain`; on reconnect the daemon's journaled result is looked up (the command is not run again) and the step resumes. Past the disconnected-owner bound the run is an infrastructure failure: retried, then the Task parks on `check` / `infrastructure_exhausted` (offers `retry`, `cancel`) |
 | restart after the request, before the suspend | the redelivered step asks again with the same request key and gets the same consumer |

@@ -447,7 +447,7 @@ pub async fn delete_project(
             return Err(ApiError::conflict_with_code_and_details(
                 "project_in_use",
                 format!(
-                    "project {id} has a check run on {} which cannot be reached, so the run cannot be stopped; nothing was cancelled and deletion was not performed. Reconnect the machine or remove it, then delete again",
+                    "project {id} has a check run or a running execution on {} which cannot be reached, so it cannot be stopped; nothing was cancelled and deletion was not performed. Reconnect the machine or remove it, then delete again",
                     unreachable.join(", ")
                 ),
                 serde_json::json!({
@@ -464,62 +464,83 @@ pub async fn delete_project(
     }
     let settle_until = tokio::time::Instant::now() + FORCE_SETTLE_BOUND;
     let mut attempt = 0;
-    let late_project_paths = loop {
-        // Force retries are bounded so a continuously-admitted execution or
-        // lease produces a truthful 409 instead of an unbounded cancellation
-        // loop.
-        if query.force {
-            // Force is an active cancellation request, not merely permission
-            // to cascade away a still-live execution row. Provider failures
-            // leave the Project intact and are surfaced to the caller. Work
-            // admitted after this pass is handled by the next attempt or by
-            // the final in-use CAS below.
-            state
-                .task_service
-                .prepare_project_deletion(&id, settle_until)
-                .await?;
-        } else {
-            // Run the guarded DB decision before touching any path. The final
-            // delete below repeats this check to close the admission race.
-            ProjectRepo::ensure_deletable(&*state.db, &id).await?;
-        }
+    let deletion: ApiResult<ProjectDeletionPaths> = async {
+        loop {
+            // Force retries are bounded so a continuously-admitted execution or
+            // lease produces a truthful 409 instead of an unbounded cancellation
+            // loop.
+            if query.force {
+                // Force is an active cancellation request, not merely permission
+                // to cascade away a still-live execution row. Provider failures
+                // leave the Project intact and are surfaced to the caller. Work
+                // admitted after this pass is handled by the next attempt or by
+                // the final in-use CAS below.
+                state
+                    .task_service
+                    .prepare_project_deletion(&id, settle_until)
+                    .await?;
+            } else {
+                // Run the guarded DB decision before touching any path. The final
+                // delete below repeats this check to close the admission race.
+                ProjectRepo::ensure_deletable(&*state.db, &id).await?;
+            }
 
-        // The service has already terminalized/revoked force-mode activity.
-        // The DB method repeats the in-use guard under BEGIN IMMEDIATE for
-        // both modes, so a new execution or lease cannot be silently deleted.
-        match ProjectRepo::delete_with_workspace_paths(&*state.db, &id).await {
-            Ok(project_paths) => break project_paths,
-            Err(db::DbError::ProjectInUse { .. })
-                if query.force && attempt + 1 < MAX_FORCE_DELETE_ATTEMPTS =>
-            {
-                attempt += 1;
-                continue;
+            // The service has already terminalized/revoked force-mode activity.
+            // The DB method repeats the in-use guard under BEGIN IMMEDIATE for
+            // both modes, so a new execution or lease cannot be silently deleted.
+            match ProjectRepo::delete_with_workspace_paths(&*state.db, &id).await {
+                Ok(project_paths) => return Ok(project_paths),
+                Err(db::DbError::ProjectInUse { .. })
+                    if query.force && attempt + 1 < MAX_FORCE_DELETE_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    continue;
+                }
+                Err(db::DbError::ProjectInUse {
+                    project_id,
+                    running_executions,
+                    active_leases,
+                    live_check_runs,
+                }) if query.force => {
+                    return Err(ApiError::conflict_with_code_and_details(
+                        "project_in_use",
+                        format!(
+                            "project {project_id} remains in use after force-delete cancellation; deletion was not performed"
+                        ),
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "running_executions": running_executions,
+                            "active_leases": active_leases,
+                            "live_check_runs": live_check_runs,
+                            "force_cancellation_incomplete": true,
+                            "unreachable_machines": [],
+                            "cancelled": true,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
             }
-            Err(db::DbError::ProjectInUse {
-                project_id,
-                running_executions,
-                active_leases,
-                live_check_runs,
-            }) if query.force => {
-                return Err(ApiError::conflict_with_code_and_details(
-                    "project_in_use",
-                    format!(
-                        "project {project_id} remains in use after force-delete cancellation; deletion was not performed"
-                    ),
-                    serde_json::json!({
-                        "project_id": project_id,
-                        "running_executions": running_executions,
-                        "active_leases": active_leases,
-                        "live_check_runs": live_check_runs,
-                        "force_cancellation_incomplete": true,
-                        "unreachable_machines": [],
-                        "cancelled": true,
-                    }),
-                ));
+        }
+    }
+    .await;
+    let late_project_paths = match deletion {
+        Ok(project_paths) => project_paths,
+        Err(error) => {
+            // Refused after phase two cancelled the Project's checks: from
+            // the Tasks' point of view nothing happened. The review entries
+            // that lost their check ask for it again.
+            if query.force {
+                if let Err(resume) = state.task_service.resume_project_check_waits(&id).await {
+                    tracing::warn!(
+                        project_id = %id,
+                        error = %resume,
+                        "review entries were not re-requested after a refused Project deletion"
+                    );
+                }
             }
-            Err(error) => {
-                return Err(error.into());
-            }
+            return Err(error);
         }
     };
     // No Project-owned filesystem path is mutated before the authoritative DB

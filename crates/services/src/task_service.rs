@@ -909,7 +909,39 @@ impl TaskService {
                 machines.insert(hostname);
             }
         }
+        // The same for running executions. Phase two stops them one by one
+        // and asks each provider first: an execution on a machine that
+        // cannot be reached would refuse the delete after earlier ones had
+        // already been cancelled.
+        for execution in ExecutionRepo::list_running_for_project(&*self.db, project_id).await? {
+            let daemon_id = match self.execution_provider_for_execution(&execution).await {
+                Err(ServiceError::DaemonUnavailable { daemon_id }) => daemon_id,
+                // Reachable, or a failure phase two reports as it does today.
+                _ => continue,
+            };
+            let hostname: Option<String> =
+                sqlx::query_scalar("SELECT hostname FROM daemon WHERE id = ?")
+                    .bind(&daemon_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+            machines.insert(hostname.unwrap_or(daemon_id));
+        }
         Ok(machines.into_iter().collect())
+    }
+
+    /// A forced deletion that is refused after its phase two leaves nothing
+    /// failed behind: the review entries whose checks it cancelled are woken,
+    /// and each asks again for its check (`run_ci_steps`, the mechanism of a
+    /// changed configuration). Returns how many entries were woken.
+    pub async fn resume_project_check_waits(&self, project_id: &str) -> Result<usize> {
+        validate_required("project_id", project_id)?;
+        let mut woken = 0;
+        for (task_id, consumer_id) in self.db.cancelled_project_check_waits(project_id).await? {
+            if self.db.wake_suspended_hooks(&task_id, &consumer_id).await? != 0 {
+                woken += 1;
+            }
+        }
+        Ok(woken)
     }
 
     /// Phase two of a forced Project deletion: make it safe to commit. Every

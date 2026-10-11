@@ -792,6 +792,64 @@ async fn project_delete_collects_workspace_paths_at_the_final_db_boundary() {
     std::fs::remove_dir_all(repository_cache).expect("late repository cache cleanup fixture");
 }
 
+/// Phase one of a forced delete also looks at the running executions: one
+/// whose machine cannot be reached cannot be stopped, and phase two would
+/// refuse at it after cancelling whatever came before. The request is refused
+/// first, naming the machine, and nothing is cancelled.
+#[tokio::test]
+async fn force_delete_is_refused_before_cancelling_when_an_execution_is_on_an_unreachable_machine()
+{
+    let workspace = common::TestDir::new("project-delete-unreachable-execution");
+    let harness = common::test_app(workspace.path(), "project-delete-unreachable-execution").await;
+    let registration = common::fake_daemon::register_daemon(
+        &harness.app,
+        "project-delete-unreachable-machine",
+        "project_delete_unreachable",
+    )
+    .await;
+    // Registered, never connected.
+    let execution = common::fake_daemon::seed_running_execution_for_daemon(
+        &harness.state,
+        &registration.daemon_id,
+    )
+    .await;
+    let project_id: String = sqlx::query_scalar(
+        "SELECT project_id FROM task WHERE id = (SELECT task_id FROM execution WHERE id = ?)",
+    )
+    .bind(&execution.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("execution project lookup");
+    let unreachable = harness
+        .state
+        .task_service
+        .project_deletion_unreachable_machines(&project_id)
+        .await
+        .expect("phase one reads");
+    assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+    let forced = common::raw_empty_request(
+        &harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}?force=true"),
+    )
+    .await;
+    let body: Value = common::parse_response(forced, StatusCode::CONFLICT).await;
+    assert_eq!(body["code"], "project_in_use");
+    assert_eq!(body["details"]["cancelled"], false);
+    assert_eq!(body["details"]["force_cancellation_incomplete"], true);
+    assert_eq!(body["details"]["unreachable_machines"], json!(unreachable));
+    assert_eq!(body["details"]["running_executions"], 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM execution WHERE id = ?")
+            .bind(&execution.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("execution reads"),
+        "running",
+        "nothing was cancelled"
+    );
+}
+
 #[tokio::test]
 async fn force_delete_retries_provider_failure_instead_of_deleting_on_retry() {
     let workspace = common::TestDir::new("project-delete-provider-failure");

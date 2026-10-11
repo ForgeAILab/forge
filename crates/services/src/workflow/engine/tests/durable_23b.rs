@@ -1263,10 +1263,13 @@ async fn hold_while_review_ci_is_suspended_closes_the_wait_and_frees_the_slot() 
 
 // A wait nothing will answer does not last: when the consumer is cancelled
 // under a suspended step (and nobody superseded the step), the step's
-// deadline wakes it, it finds the consumer lost, cancels the review attempt
-// and fails the hook instead of suspending again.
+// deadline wakes it and it finds the consumer lost. It closes the attempt
+// that asked and asks again for its check instead of waiting on the lost
+// consumer (the bound on asking again is tested by
+// `an_entry_whose_check_keeps_being_withdrawn_stops_asking_after_three_times`,
+// where the hook then fails with "review check was lost").
 #[tokio::test]
-async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_forever() {
+async fn a_suspended_step_whose_consumer_is_lost_asks_again_instead_of_waiting_forever() {
     let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
     enter_review(&fixture, "CI entry").await;
     // Composed, but no check worker runs: the run stays queued.
@@ -1308,8 +1311,13 @@ async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_foreve
             let reviews = db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
                 .await
                 .unwrap();
-            if count(&fixture, suspended).await == 0
-                && reviews[0].status == db::ReviewStatus::Cancelled
+            if reviews.len() == 2
+                && count(
+                    &fixture,
+                    "SELECT COUNT(*) FROM task_step s JOIN check_consumer c ON c.id=s.awaited_consumer_id WHERE s.status='suspended' AND c.cancelled_at IS NULL",
+                )
+                .await
+                    == 1
             {
                 break;
             }
@@ -1317,16 +1325,19 @@ async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_foreve
         }
     })
     .await
-    .expect("the woken step gives up on the lost consumer");
-    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 1);
+    .expect("the woken step asks again for the lost check");
+    let mut reviews = db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    reviews.sort_by_key(|review| review.attempt_number);
+    assert_eq!(reviews[0].status, db::ReviewStatus::Cancelled);
+    assert!(reviews[0]
+        .step_results_json
+        .contains("superseded_by_withdrawn_check"));
+    assert_eq!(reviews[1].status, db::ReviewStatus::Running);
     assert_eq!(
-        count(
-            &fixture,
-            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json LIKE '%review check was lost%'"
-        )
-        .await,
-        1,
-        "the failure is on the Task's history"
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        2
     );
     stop.send(true).unwrap();
     worker.await.unwrap();
@@ -1946,6 +1957,136 @@ async fn an_entry_asks_again_at_most_three_times_then_parks_for_its_owner() {
         }
         other => panic!("retry on a parked review entry: {:?}", other.map(|_| ())),
     }
+}
+
+// A forced Project deletion cancels the Project's check consumers and is
+// then refused (a run did not settle in time). From the Task's point of view
+// nothing happened: the review entry that lost its check is woken and asks
+// again, instead of failing with "review check was lost".
+#[tokio::test]
+async fn a_refused_project_deletion_re_requests_the_entry_checks_it_cancelled() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let first = awaited_consumer(&fixture).await.unwrap();
+    // Phase two of the forced delete, then the refusal.
+    assert_eq!(
+        fixture
+            .db
+            .cancel_project_check_consumers(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .resume_project_check_waits(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        1
+    );
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(reviews[0].1.contains("superseded_by_withdrawn_check"));
+    assert_eq!(
+        reviews[1].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[1].1.contains("entry-commands"), "{reviews:?}");
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_consumer WHERE cancelled_at IS NULL"
+        )
+        .await,
+        1
+    );
+    let second: String =
+        sqlx::query_scalar("SELECT id FROM check_consumer WHERE cancelled_at IS NULL")
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
+            .await
+            .unwrap(),
+        0
+    );
+    // Nothing is left to wake.
+    assert_eq!(
+        fixture
+            .engine
+            .resume_project_check_waits(&fixture.task.project_id)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+// A check that keeps being withdrawn does not make the entry ask forever:
+// after three re-requests the hook fails as an unanswered check always did.
+#[tokio::test]
+async fn an_entry_whose_check_keeps_being_withdrawn_stops_asking_after_three_times() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let mut awaited = awaited_consumer(&fixture).await.unwrap();
+    for _ in 0..3 {
+        fixture
+            .db
+            .cancel_project_check_consumers(&fixture.task.project_id)
+            .await
+            .unwrap();
+        awaited = wake_and_resuspend(&fixture, &awaited).await;
+    }
+    fixture
+        .db
+        .cancel_project_check_consumers(&fixture.task.project_id)
+        .await
+        .unwrap();
+    fixture
+        .db
+        .wake_suspended_hooks(&fixture.task.id, &awaited)
+        .await
+        .unwrap();
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 4, "{reviews:?}");
+    assert!(reviews
+        .iter()
+        .all(|review| review.0 == db::ReviewStatus::Cancelled));
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        4
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE kind='hooks' AND status='suspended'"
+        )
+        .await,
+        0,
+        "the entry does not wait for a check nobody will answer"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json LIKE '%review check was lost%'"
+        )
+        .await,
+        1,
+        "the failure is on the Task's history"
+    );
 }
 
 // The Project environment changes while the entry check is pending (with

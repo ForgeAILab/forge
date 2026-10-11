@@ -545,6 +545,17 @@ impl SqliteDb {
             .rows_affected()
             == 1)
     }
+    /// Hooks steps of this Project that still wait, suspended, for a check
+    /// consumer that was cancelled under them: `(task_id, consumer_id)`.
+    pub async fn cancelled_project_check_waits(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as("SELECT s.task_id,s.awaited_consumer_id FROM task_step s JOIN task t ON t.id=s.task_id JOIN check_consumer c ON c.id=s.awaited_consumer_id WHERE t.project_id=? AND s.status='suspended' AND c.cancelled_at IS NOT NULL ORDER BY s.seq")
+            .bind(project_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
     /// Project deletion: nobody waits for this Project's unfinished check
     /// runs any more. The check worker stops a run without consumers (a
     /// queued one is cancelled, a running one is cancelled on its owner).

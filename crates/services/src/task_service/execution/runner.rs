@@ -2181,7 +2181,7 @@ impl TaskService {
         Ok(())
     }
 
-    async fn execution_provider_for_execution(
+    pub(in crate::task_service) async fn execution_provider_for_execution(
         &self,
         execution: &Execution,
     ) -> Result<Arc<dyn crate::daemon_transport::ExecutionProvider>> {
