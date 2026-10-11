@@ -2483,6 +2483,121 @@ async fn a_task_whose_entry_check_runs_offers_cancel_and_no_hold() {
     }
 }
 
+/// A hold COMMAND during the running entry check. It is not on offer (see
+/// above) and is accepted all the same, because a hold may stop hooks in
+/// flight: the hooks step is superseded, the check stopped, the attempt
+/// closed. The release runs the review entry again by itself. Before, the
+/// released Task had no check, and its reviewer was given the review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_command_during_the_entry_check_is_resumed_by_its_release() {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        world.apply(&Action::Create).await?;
+        world.quiesce().await?;
+        sqlx::query("UPDATE task SET task_state_config=json_set(task_state_config,'$.review.ci_steps',json_array(?)) WHERE id=?")
+            .bind(format!("sleep 4 && test -f {}", deliverable(0)))
+            .bind(&world.tasks[0])
+            .execute(&world.live().pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        world.apply(&Action::Finish(0, Outcome::Success)).await?;
+        let drain = |world: &World| {
+            let service = world.live().state.task_service.clone();
+            let id = world.tasks[0].clone();
+            tokio::spawn(async move { service.drain(&id).await.map(|_| ()) })
+        };
+        let mut steps = drain(&world);
+        let mut looked = 0;
+        loop {
+            if steps.is_finished() {
+                steps = drain(&world);
+            }
+            let task = world.task(0).await?;
+            let runs = world.check_runs(0).await?;
+            if task["status"] == "review" && runs == ["running"] {
+                break;
+            }
+            looked += 1;
+            if looked > 400 {
+                return Err(format!("no running check: {} {runs:?}", task["status"]));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let count = |world: &World, sql: &'static str| {
+            let (pool, id) = (world.live().pool.clone(), world.tasks[0].clone());
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        };
+        const REVIEWER_RUNS: &str =
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'";
+        let (version, _) = world.offers(0).await?;
+        let (status, body) = world
+            .request(
+                Method::POST,
+                &format!("/api/v1/tasks/{}/actions", world.tasks[0]),
+                Some(json!({ "version": version, "action": { "verb": "hold" } })),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("the hold command was refused: {status} {body}"));
+        }
+        let _ = steps.await;
+        world.quiesce().await?;
+        let held = world.task(0).await?;
+        let runs = world.check_runs(0).await?;
+        world.trace.push(format!(
+            "held: {} runs {runs:?} {}",
+            held["status"], held["condition"]
+        ));
+        if held["status"] != "review" || runs.iter().any(|state| state == "succeeded") {
+            return Err(format!(
+                "the hold did not stop the entry check: {} {runs:?}",
+                held["status"]
+            ));
+        }
+        if count(&world, REVIEWER_RUNS).await? != 0 {
+            return Err("a reviewer ran while the Task was held".to_owned());
+        }
+        let (version, offers) = world.offers(0).await?;
+        let release = offers
+            .iter()
+            .find(|offer| offer["action"]["verb"] == "release")
+            .ok_or_else(|| format!("the held Task offers no release: {offers:?}"))?;
+        world.apply_offer(0, version, release).await?;
+        world.quiesce().await?;
+        let runs = world.check_runs(0).await?;
+        let released = world.task(0).await?;
+        world.trace.push(format!(
+            "released: {} runs {runs:?} {}",
+            released["status"], released["condition"]
+        ));
+        if runs.last().map(String::as_str) != Some("succeeded") || runs.len() != 2 {
+            return Err(format!(
+                "the release did not run the entry check again (once): {runs:?} {} {}",
+                released["status"], released["condition"]
+            ));
+        }
+        let applied = count(
+            &world,
+            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+        )
+        .await?;
+        if applied != 1 {
+            return Err(format!("{applied} check result(s) were applied, expected one"));
+        }
+        world.drive_to_settlement().await
+    }
+    .await;
+    if let Err(violation) = outcome {
+        panic!("{violation}\ntrace:\n{}", world.trace.join("\n"));
+    }
+}
+
 /// A held Task in `review` and a system re-entry of its review (recovery, a
 /// queued command). The re-entry is refused while the hold stands and changes
 /// nothing. With the real dispatcher nothing has to ask again after the

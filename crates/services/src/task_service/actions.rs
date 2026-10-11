@@ -296,6 +296,12 @@ impl TaskService {
             } else {
                 None
             };
+        // The hold stopped this Task's review entry before its hooks
+        // finished. Its release runs the entry again instead of putting a
+        // role back: there is no check result yet for a reviewer to review.
+        let review_entry_preempted = matches!(&action, TaskAction::Release { .. })
+            && task.status == crate::workflow::default_states::REVIEW
+            && self.db.entry_hooks_preempted(&task.id).await?;
         let updated = TASK_ACTION_ACTOR
             .scope(
                 actor.clone(),
@@ -355,9 +361,13 @@ impl TaskService {
                         TaskAction::Hold { reason } if offer.reason == "dispatch_wait" => {
                             self.hold_waiting_task(&snapshot, reason.as_deref()).await?
                         }
-                        TaskAction::Release { reason } if offer.reason == "held_waiting" => {
-                            self.release_to_dispatch_queue(&snapshot, reason.as_deref())
-                                .await?
+                        TaskAction::Release { reason }
+                            if offer.reason == "held_waiting" || review_entry_preempted =>
+                        {
+                            let released = self
+                                .release_to_dispatch_queue(&snapshot, reason.as_deref())
+                                .await?;
+                            self.resume_review_entry_after_release(released).await?
                         }
                         TaskAction::Release { reason } if held_completion.is_some() => {
                             let execution_id = held_completion.as_deref().expect("held completion");
@@ -843,6 +853,56 @@ impl TaskService {
             return Ok(None);
         }
         Ok(Some(execution.id))
+    }
+
+    /// A release gives a Task in `review` its review entry back when the
+    /// hold took it away. Two things do that. A hold that reaches the Task
+    /// while its entry hooks wait (for the entry check, or for free disk to
+    /// make the worktree again) supersedes the hooks step: without this the
+    /// released Task sat in `review` with its entry never run: no check, no
+    /// attempt, and the gate's decision on offer. And recovery does not
+    /// re-enter a held Task after stopping a retired inline review re-run
+    /// ([`Self::settle_retired_review_rerun`]): it runs here instead.
+    /// The entry is the automatic one (it spends as one). When it cannot run
+    /// the Task stays released and its owner is offered the retry.
+    async fn resume_review_entry_after_release(&self, released: Task) -> Result<Task> {
+        if released.status != crate::workflow::default_states::REVIEW {
+            return Ok(released);
+        }
+        let deferred: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM execution WHERE task_id = ? AND status <> 'running' AND error = ?",
+        )
+        .bind(&released.id)
+        .bind(super::review::RETIRED_REVIEW_RERUN_HELD)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(DbError::from)?;
+        if !deferred.is_empty() {
+            for execution_id in &deferred {
+                if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? {
+                    Box::pin(self.settle_retired_review_rerun(&execution)).await?;
+                }
+            }
+        } else if self.db.entry_hooks_preempted(&released.id).await? {
+            let id = uuid::Uuid::parse_str(&released.id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let requested_by = Actor::system(api_types::SystemComponent::Workflow);
+            match Box::pin(self.rerun_review(id, requested_by)).await {
+                Ok(_) | Err(ServiceError::TaskBusy { .. }) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %released.id,
+                        %error,
+                        "the review entry a hold stopped could not be run again at the release"
+                    );
+                }
+            }
+        } else {
+            return Ok(released);
+        }
+        TaskRepo::get_by_id(&*self.db, &released.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", released.id.clone()))
     }
 
     async fn release_to_dispatch_queue(

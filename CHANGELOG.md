@@ -1138,6 +1138,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   sent back to parks `blocked` (`review_gate_failed`, "review failed and the
   workflow has no remediation state") instead of failing its cascade. A gate
   without `reject_target` still sends the Task to `in_progress`.
+- **Releasing a Task whose review entry a hold stopped runs the entry again.**
+  A `hold` sent while a Task's entry check was pending, or while its entry
+  waited for free disk, is accepted (it is not on offer there) and stops the
+  entry. Its release used to leave the Task in `review` with no check and no
+  review attempt: parked on a refused reviewer dispatch, or with the gate's
+  approval on offer. The release now runs the review entry again by itself.
+  A Task whose entry waits for free disk offers `cancel` only, as a Task
+  waiting for its entry check does. A refused forced Project deletion whose
+  check run is still stopping no longer costs the entry two of its three
+  re-requests: the entry waits for the run to end and asks once.
+- **A wait for a run slot ages by slots given back, not by wake-ups.** The
+  three "capacity releases" are runs of other Tasks and admitted checks that
+  ended; a Task cannot age its own wait.
 - **Tasks that still name `review.auditor_agent_id` say so to their owner.**
   At start, each open Task with the retired key gets one non-blocking
   Attention item (`review_risk`); it resolves when the key is removed.

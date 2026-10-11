@@ -556,6 +556,19 @@ impl SqliteDb {
             .fetch_all(self.pool())
             .await?)
     }
+    /// Whether the entry of the Task's current status was stopped before its
+    /// hooks finished: the hooks step of this status entry is `superseded`
+    /// and no other step of the entry finished or still runs. A hold that
+    /// reaches a Task while its entry hooks wait does this.
+    pub async fn entry_hooks_preempted(&self, task_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.task_id=?1 AND s.kind='hooks' AND s.status='superseded' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch)
+                AND NOT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.task_id=?1 AND s.kind='hooks' AND s.status<>'superseded' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch)",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
     /// Whether the run of a consumer that was cancelled in the last
     /// `within_seconds` is still being stopped. A request for the same check
     /// would join that run and receive its cancellation.

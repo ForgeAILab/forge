@@ -443,7 +443,10 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if !held
         && !running_live
         && (queued
-            || (snapshot.wait_cause.is_some() && condition.is_none() && task.failed_json.is_none()))
+            || (snapshot.wait_cause.is_some()
+                && condition.is_none()
+                && task.failed_json.is_none()
+                && !snapshot.entry_hooks_running))
     {
         offer(
             TaskAction::Hold { reason: None },
@@ -526,7 +529,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                     },
                 ));
     if placement_wait {
-        if !queued && snapshot.wait_cause.is_none() {
+        if !queued && snapshot.wait_cause.is_none() && !snapshot.entry_hooks_running {
             offer(
                 TaskAction::Hold { reason: None },
                 &[],
