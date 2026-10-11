@@ -3,4 +3,4 @@
 /**
  * The state of one target branch's queue.
  */
-export type IntegrationQueueState = "open" | "suspended" | "quarantined" | "closed";
+export type IntegrationQueueState = "open" | "suspended" | "quarantined" | "closed" | "unknown";

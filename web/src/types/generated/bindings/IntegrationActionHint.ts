@@ -2,6 +2,8 @@
 
 /**
  * The action that moves a waiting merge, as a hint: the Task's
- * `available_actions` is the authority on what the caller may do.
+ * `available_actions` is the authority on what the caller may do. `retry`
+ * is hinted exactly when the action system offers `integration_retry` for
+ * the Task (the hint is computed by the function the offer is built from).
  */
-export type IntegrationActionHint = "retry" | "release" | "resume_project";
+export type IntegrationActionHint = "retry" | "release" | "resume_project" | "unknown";

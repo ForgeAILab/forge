@@ -1,5 +1,14 @@
 //! Public reads of the per-target merge queue: where a Task is in line and
 //! why it waits. Every type here is a projection; none is a command.
+//!
+//! The enums are open. They are stable snake_case strings and the queue will
+//! grow more of them (states, wait codes, hints), so a client must tolerate a
+//! value it does not know: show it neutrally, never fail the read. Rust
+//! clients get that from the `unknown` variant every enum here ends with
+//! (`#[serde(other)]`); the server never sends the literal `unknown`.
+//! Timestamps are RFC 3339 strings. No lease owner, runtime id or machine
+//! path is part of any type here; `machine_id` is the public id of
+//! `GET /api/v1/daemons`.
 use crate::IntegrationPhase;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -18,6 +27,9 @@ pub enum IntegrationQueueState {
     /// its machine answers or is removed.
     Quarantined,
     Closed,
+    /// A value this build does not know (a newer server). Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a queue is not `open`.
@@ -49,6 +61,9 @@ pub enum IntegrationMemberState {
     Deferred,
     /// The change is on the target; the Task is being closed.
     Applied,
+    /// A value this build does not know (a newer server). Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The typed cause of a wait.
@@ -83,6 +98,9 @@ pub enum IntegrationWaitCode {
     UnresolvedResult,
     /// A cancel was requested and is being applied.
     CancelRequested,
+    /// A value this build does not know (a newer server). Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a Task's merge is not moving.
@@ -99,7 +117,9 @@ pub struct IntegrationWait {
 }
 
 /// The action that moves a waiting merge, as a hint: the Task's
-/// `available_actions` is the authority on what the caller may do.
+/// `available_actions` is the authority on what the caller may do. `retry`
+/// is hinted exactly when the action system offers `integration_retry` for
+/// the Task (the hint is computed by the function the offer is built from).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -108,8 +128,12 @@ pub enum IntegrationActionHint {
     Retry,
     /// Task action `release`.
     Release,
-    /// Resume the Project.
+    /// Resume the Project (`POST /api/v1/projects/{id}/resume`): a Project
+    /// action, so it is never in a Task's `available_actions`.
     ResumeProject,
+    /// A value this build does not know (a newer server). Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Times of one attempt. Durations are cumulative over its rounds and absent
@@ -192,4 +216,43 @@ pub struct IntegrationQueuesResponse {
     pub items: Vec<IntegrationQueueResponse>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client built today reads a summary a later server sends: values it
+    /// does not know become `unknown`, and the read does not fail.
+    #[test]
+    fn unknown_enum_values_are_read_not_refused() {
+        let summary: TaskIntegrationSummary = serde_json::from_value(serde_json::json!({
+            "attempt_id": "a", "queue_id": "q", "repo_id": "r", "target_branch": "main",
+            "queue_state": "draining", "state": "speculating", "phase": null, "position": null,
+            "wait": {"code": "merge_train", "message": null, "machine_id": null, "machine_name": null, "retry_at": null},
+            "action_hint": "reorder",
+            "timings": {"enqueued_at": "2026-10-01T00:00:00+00:00", "head_since": null, "rounds": 0, "queued_ms": null, "rebase_ms": null, "check_ms": null, "fast_forward_ms": null}
+        }))
+        .unwrap();
+        assert_eq!(summary.queue_state, Some(IntegrationQueueState::Unknown));
+        assert_eq!(summary.state, IntegrationMemberState::Unknown);
+        assert_eq!(summary.wait.unwrap().code, IntegrationWaitCode::Unknown);
+        assert_eq!(summary.action_hint, Some(IntegrationActionHint::Unknown));
+        // Known values are the stable snake_case strings.
+        assert_eq!(
+            serde_json::to_value((
+                IntegrationQueueState::Quarantined,
+                IntegrationMemberState::CandidateCheckFailed,
+                IntegrationWaitCode::TaskAwaitingHuman,
+                IntegrationActionHint::ResumeProject,
+            ))
+            .unwrap(),
+            serde_json::json!([
+                "quarantined",
+                "candidate_check_failed",
+                "task_awaiting_human",
+                "resume_project"
+            ])
+        );
+    }
 }

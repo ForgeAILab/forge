@@ -4,4 +4,4 @@
  * Where one Task stands in the merge of its change. The same vocabulary as
  * the Task condition's integration reason.
  */
-export type IntegrationMemberState = "waiting" | "owned" | "repair" | "review_required" | "candidate_check_failed" | "deferred" | "applied";
+export type IntegrationMemberState = "waiting" | "owned" | "repair" | "review_required" | "candidate_check_failed" | "deferred" | "applied" | "unknown";

@@ -3,4 +3,4 @@
 /**
  * The typed cause of a wait.
  */
-export type IntegrationWaitCode = "queue" | "queue_suspended" | "queue_quarantined" | "task_held" | "task_blocked" | "task_failed" | "task_entry_blocked" | "task_awaiting_human" | "project_paused" | "owner_offline" | "target_dirty" | "infrastructure" | "budget_exhausted" | "owner_required" | "unresolved_result" | "cancel_requested";
+export type IntegrationWaitCode = "queue" | "queue_suspended" | "queue_quarantined" | "task_held" | "task_blocked" | "task_failed" | "task_entry_blocked" | "task_awaiting_human" | "project_paused" | "owner_offline" | "target_dirty" | "infrastructure" | "budget_exhausted" | "owner_required" | "unresolved_result" | "cancel_requested" | "unknown";

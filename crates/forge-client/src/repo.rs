@@ -90,12 +90,16 @@ impl RepoArgs {
                 cursor,
                 limit,
             } => {
-                let response: api_types::IntegrationQueuesResponse = client
+                // `--json` is the API's own answer, field for field: it is
+                // not read into this build's types and written back.
+                let raw: serde_json::Value = client
                     .get(&queue_path(repo_id, cursor.as_deref(), *limit))
                     .await?;
                 match output {
-                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Json => print_json(&raw),
                     OutputFormat::Table => {
+                        let response: api_types::IntegrationQueuesResponse =
+                            serde_json::from_value(raw)?;
                         print!("{}", crate::integration_queue::queues_text(&response.items));
                         if let Some(cursor) = &response.next_cursor {
                             println!("More queues: --cursor {cursor}");

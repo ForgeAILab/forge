@@ -45,6 +45,8 @@ pub fn wait_text(wait: &IntegrationWait) -> String {
             format!("merge result unknown on {}", machine())
         }
         IntegrationWaitCode::CancelRequested => "cancelling".to_owned(),
+        // A cause a newer server names: the server's own words say it.
+        IntegrationWaitCode::Unknown => "see the message".to_owned(),
     }
 }
 
@@ -71,6 +73,7 @@ pub fn integration_label(summary: &TaskIntegrationSummary) -> String {
             None => "merge stopped".to_owned(),
         },
         IntegrationMemberState::Applied => "merged; closing the Task".to_owned(),
+        IntegrationMemberState::Unknown => "in merge queue".to_owned(),
     }
 }
 
@@ -80,6 +83,7 @@ fn queue_state_text(state: IntegrationQueueState) -> &'static str {
         IntegrationQueueState::Suspended => "suspended",
         IntegrationQueueState::Quarantined => "quarantined",
         IntegrationQueueState::Closed => "closed",
+        IntegrationQueueState::Unknown => "not open",
     }
 }
 
@@ -123,6 +127,24 @@ pub fn task_integration_text(summary: &TaskIntegrationSummary) -> String {
     text
 }
 
+/// A Task title as one table cell: one line, at most 60 characters.
+fn title_cell(title: Option<&str>) -> String {
+    const WIDTH: usize = 60;
+    let Some(title) = title else {
+        return "(deleted)".to_owned();
+    };
+    let line = title
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    if line.chars().count() <= WIDTH {
+        return line;
+    }
+    let mut cut = line.chars().take(WIDTH - 1).collect::<String>();
+    cut.push('\u{2026}');
+    cut
+}
+
 /// `repo queue`: each queue's line, then its members in queue order.
 pub fn queues_text(queues: &[IntegrationQueueResponse]) -> String {
     if queues.is_empty() {
@@ -157,7 +179,7 @@ pub fn queues_text(queues: &[IntegrationQueueResponse]) -> String {
                 vec![
                     position_text(member.integration.position),
                     member.task_id.chars().take(8).collect(),
-                    member.task_title.clone().unwrap_or_default(),
+                    title_cell(member.task_title.as_deref()),
                     integration_label(&member.integration),
                     member.integration.timings.enqueued_at.clone(),
                 ]
@@ -430,6 +452,42 @@ mod tests {
             *lines.last().unwrap(),
             "Queue release: suspended (target_unavailable: the default checkout is not ready)  members 0"
         );
+    }
+
+    #[test]
+    fn a_long_or_deleted_title_and_an_unknown_state_keep_the_table_readable() {
+        let mut queue = queue();
+        queue.members[0].task_title = Some(format!("{}\nsecond line", "x".repeat(200)));
+        queue.members[1].task_title = None;
+        queue.members[2].integration.state = IntegrationMemberState::Unknown;
+        queue.members[2].integration.wait = Some(IntegrationWait {
+            code: IntegrationWaitCode::Unknown,
+            message: Some("the merge train is forming".into()),
+            machine_id: None,
+            machine_name: None,
+            retry_at: None,
+        });
+        queue.state = IntegrationQueueState::Unknown;
+        let text = queues_text(&[queue.clone()]);
+        // One line a member, whatever its title holds; no line runs away.
+        assert_eq!(text.lines().count(), 9, "{text}");
+        assert!(
+            text.lines().all(|line| line.chars().count() < 200),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{}\u{2026}", "x".repeat(59))),
+            "{text}"
+        );
+        assert!(text.contains("(deleted)"), "{text}");
+        assert!(
+            text.starts_with("Queue main: not open  members 3"),
+            "{text}"
+        );
+        assert!(text.contains("in merge queue"), "{text}");
+        // `task show` says what the server said about a wait it cannot name.
+        assert!(task_integration_text(&queue.members[2].integration)
+            .contains("wait      see the message: the merge train is forming"),);
     }
 
     #[test]
