@@ -4568,6 +4568,15 @@ async fn pre_queue_upgraded(
                     subject["condition"]
                 ));
             }
+            // Done means merged: main moved to a commit that carries the
+            // Task's own branch tip.
+            let branch = format!("refs/heads/task/{}", &world.tasks[last][..8]);
+            let tip = git(&world.dir.path().join("repo"), &["rev-parse", &branch])?;
+            if !world.on_main(&tip) {
+                return Err(format!(
+                    "{name}: the Task is done and its branch {tip} is not on main {main_after_start}"
+                ));
+            }
         }
         Upgraded::Repaired => {
             if TERMINAL.contains(&status.as_str()) {

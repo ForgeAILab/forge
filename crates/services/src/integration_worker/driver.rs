@@ -136,6 +136,22 @@ fn intent_owner(intent: &serde_json::Value) -> &serde_json::Value {
         .filter(|owner| owner.is_object())
         .unwrap_or(&request["fence"]["target_owner"])
 }
+/// The Git witness that the head's candidate has landed: the target contains
+/// the commit the Task's checkout stands on, and that commit is the one the
+/// attempt names. A checkout that stands anywhere else in the target's
+/// history (HEAD on the target tip while another writer rebases it, a
+/// checkout reset to the target) proves nothing about the reviewed commit,
+/// and a stopped rebase's HEAD is not a candidate at all. Only an attempt
+/// that names no commit (an imported row) is read from HEAD alone.
+fn landed(a: &IntegrationAttempt, facts: &HeadFacts) -> bool {
+    facts.candidate_in_target
+        && !facts.rebase_in_progress
+        && a.candidate_sha
+            .as_deref()
+            .or(a.original_candidate_sha.as_deref())
+            .is_none_or(|sha| sha == facts.candidate_head)
+}
+
 fn receipts(attempt: &IntegrationAttempt) -> Vec<IntegrationEffectReceipt> {
     serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap_or_default()
 }
@@ -1020,7 +1036,7 @@ impl HeadDriver {
                 .await?;
             return Ok(Pass::Progress);
         }
-        if facts.candidate_in_target {
+        if landed(&a, &facts) {
             // Landed witness: the candidate is already in the target.
             let head = facts.candidate_head.clone();
             let tip = facts.target_tip.clone();
@@ -1885,10 +1901,7 @@ impl HeadDriver {
         ) {
             match &facts {
                 Ok(facts) => {
-                    let landed = facts.candidate_in_target
-                        && a.candidate_sha
-                            .as_deref()
-                            .is_none_or(|sha| sha == facts.candidate_head);
+                    let landed = landed(&a, facts);
                     let head = facts.candidate_head.clone();
                     a = self
                         .w
@@ -1976,7 +1989,7 @@ impl HeadDriver {
                     .await
             }
         };
-        if facts.candidate_in_target && a.candidate_sha.as_deref() == Some(&facts.candidate_head) {
+        if a.candidate_sha.is_some() && landed(&a, &facts) {
             let head = facts.candidate_head.clone();
             self.w
                 .advance(&a.id, S::Applied, |a| {

@@ -55,6 +55,36 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The identity of commits Forge itself writes where Git has none: the one
+/// the agent commit of a run carries.
+const FORGE_IDENTITY: [&str; 4] = [
+    "-c",
+    "user.name=Forge Agent",
+    "-c",
+    "user.email=agent@forge.local",
+];
+
+/// Leading arguments for a Git command that writes commits (a rebase replays
+/// them under the committer, a merge may write one). A checkout whose Git
+/// has a committer identity keeps it. One that has none (a service account
+/// with no global configuration, a CI runner) would fail the command with
+/// "Committer identity unknown" in the middle of a rebase: there the commits
+/// are written as Forge.
+async fn committer_args(cwd: &Path) -> Result<&'static [&'static str]> {
+    let known = command_output(cwd, &["var", "GIT_COMMITTER_IDENT"])
+        .await?
+        .status
+        .success();
+    Ok(if known { &[] } else { &FORGE_IDENTITY })
+}
+
+/// `run_git` for a command that writes commits.
+async fn run_git_committing(cwd: &Path, args: &[&str]) -> Result<String> {
+    let mut full = committer_args(cwd).await?.to_vec();
+    full.extend_from_slice(args);
+    run_git(cwd, &full).await
+}
+
 /// Raw Git output through the cancellation-owned process group. The caller may
 /// select a deadline or cancel token; dropping this future stops descendants.
 pub async fn command_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -396,7 +426,7 @@ pub async fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<()> 
 
 /// Attempt to merge a branch into the current worktree HEAD.
 pub async fn merge(worktree_path: &Path, target_branch: &str) -> Result<()> {
-    let result = run_git(worktree_path, &["merge", target_branch, "--no-edit"]).await;
+    let result = run_git_committing(worktree_path, &["merge", target_branch, "--no-edit"]).await;
     match result {
         Ok(_) => Ok(()),
         Err(GitError::CommandFailed { stdout, stderr, .. })
@@ -478,7 +508,7 @@ pub async fn count_commits_between(path: &Path, before_sha: &str, after_sha: &st
 
 /// Rebase the current branch onto `onto_branch`.
 pub async fn rebase(worktree_path: &Path, onto_branch: &str) -> Result<()> {
-    let result = run_git(worktree_path, &["rebase", onto_branch]).await;
+    let result = run_git_committing(worktree_path, &["rebase", onto_branch]).await;
     match result {
         Ok(_) => Ok(()),
         Err(GitError::CommandFailed { stdout, stderr, .. })
@@ -508,7 +538,7 @@ pub async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 
 /// Continue a paused rebase (after conflict resolution).
 pub async fn continue_rebase(worktree_path: &Path) -> Result<()> {
-    run_git(worktree_path, &["rebase", "--continue"]).await?;
+    run_git_committing(worktree_path, &["rebase", "--continue"]).await?;
     Ok(())
 }
 
@@ -595,6 +625,7 @@ pub async fn continue_rebase_keeping_conflicts(worktree_path: &Path) -> Result<V
             run_git(worktree_path, &["add", "-A"]).await?;
             let mut command = Command::new("git");
             command
+                .args(committer_args(worktree_path).await?)
                 .args(["-c", "core.editor=true", "rebase", "--continue"])
                 .current_dir(worktree_path)
                 .env_remove("GIT_DIR")
@@ -1487,6 +1518,59 @@ mod tests {
 
         assert!(!detect_rebase_in_progress(&wt).await.unwrap());
         assert!(wt.join("feature.txt").exists());
+
+        remove_worktree(&repo_path, &wt).await.unwrap();
+    }
+
+    /// A checkout whose Git has no identity (a service account, a CI
+    /// runner): the commits a rebase replays and a merge writes are Forge's,
+    /// and the command does not stop on "Committer identity unknown".
+    #[tokio::test]
+    async fn rebase_and_merge_write_commits_where_git_has_no_identity() {
+        let (dir, repo_path) = setup_repo().await;
+        let wt = dir.path().join("wt_no_identity");
+        create_worktree(&repo_path, "feature", &wt).await.unwrap();
+        fs::write(wt.join("feature.txt"), "feature work")
+            .await
+            .unwrap();
+        commit_all(&wt, "feature commit").await.unwrap();
+        fs::write(repo_path.join("main_file.txt"), "main work")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "main commit").await.unwrap();
+        fs::write(wt.join("second.txt"), "second").await.unwrap();
+        commit_all(&wt, "second commit").await.unwrap();
+        // No identity in the repository, and Git may not guess one from the
+        // machine's account. (A developer's global identity still applies;
+        // CI has none.)
+        run_git(&repo_path, &["config", "--unset", "user.name"])
+            .await
+            .unwrap();
+        run_git(&repo_path, &["config", "--unset", "user.email"])
+            .await
+            .unwrap();
+        run_git(&repo_path, &["config", "user.useConfigOnly", "true"])
+            .await
+            .unwrap();
+
+        rebase(&wt, "main").await.unwrap();
+        assert!(!detect_rebase_in_progress(&wt).await.unwrap());
+        assert_eq!(
+            run_git(&wt, &["rev-list", "--count", "main..HEAD"])
+                .await
+                .unwrap(),
+            "2"
+        );
+        // A true merge (the histories diverge) writes a merge commit.
+        fs::write(repo_path.join("later.txt"), "later")
+            .await
+            .unwrap();
+        run_git(&repo_path, &["add", "later.txt"]).await.unwrap();
+        run_git_committing(&repo_path, &["commit", "-m", "later on main"])
+            .await
+            .unwrap();
+        merge(&wt, "main").await.unwrap();
+        assert!(wt.join("later.txt").exists());
 
         remove_worktree(&repo_path, &wt).await.unwrap();
     }

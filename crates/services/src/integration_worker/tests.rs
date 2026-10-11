@@ -725,6 +725,44 @@ async fn unchanged_target_merges_the_reviewed_commit_without_a_check() {
     pump.worker.notify_enqueued(&queue.id);
 }
 
+/// The Task's checkout stands on a commit of the target that is not the
+/// admitted candidate (another writer is rebasing it and HEAD is on the
+/// target tip, or it was reset there). That HEAD is in the target, the
+/// reviewed commit is not: nothing landed, and the Task is not reported
+/// merged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkout_standing_on_the_target_is_not_read_as_the_candidate_landed() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    let candidate = a.original_candidate_sha.clone().unwrap();
+    world.external_commit("r", "other.txt").await;
+    let tip = world.tip("r").await;
+    git_out(&world.tree("a"), &["checkout", "--detach", &tip])
+        .await
+        .expect("detach");
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    let end = world.attempt(&a.id).await;
+    assert!(
+        !matches!(end.state, S::Applied | S::Completed),
+        "reported landed: {:?}",
+        end.state
+    );
+    assert_eq!(end.integrated_sha, None);
+    assert_eq!(world.tip("r").await, tip);
+    assert!(git_out(
+        &world.repo("r"),
+        &["merge-base", "--is-ancestor", &candidate, &tip]
+    )
+    .await
+    .is_none());
+    assert!(!world
+        .steps
+        .actions("a")
+        .contains(&IntegrationStepAction::Result));
+    assert_eq!(end.state, S::NeedsReview);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn moved_target_is_rebased_checked_and_fast_forwarded_in_one_pass_per_receipt() {
     let world = World::new().await;
