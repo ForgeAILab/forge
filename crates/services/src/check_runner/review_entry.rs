@@ -138,6 +138,27 @@ pub async fn abandon_superseded_waits(
     Ok(())
 }
 
+/// A live hooks step stops waiting for `consumer_id` (it asks again under
+/// another identity): the consumer is cancelled, so its late delivery is
+/// stale and the worker stops a run nobody else waits for, and a run still
+/// executing on a daemon is fenced as for a superseded step. The Task's check
+/// wait is not cleared here: the request that follows replaces it.
+pub(crate) async fn withdraw_consumer(
+    db: &Arc<SqliteDb>,
+    daemons: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    step_id: Option<&str>,
+    consumer_id: &str,
+) -> Result<()> {
+    let Some(state) = CheckDeliveryRepo::check_consumer_delivery(&**db, consumer_id).await? else {
+        return Ok(());
+    };
+    db.cancel_abandoned_check_consumer(consumer_id).await?;
+    if let Some(step_id) = step_id {
+        fence_remote_run(db, daemons, step_id, &state.consumer).await?;
+    }
+    Ok(())
+}
+
 /// The run `consumer` waits for may still execute on a daemon. When this
 /// consumer is the only one waiting, its operation is put under the remote
 /// cancellation fence: stopped now if the daemon answers, or marked so the

@@ -618,6 +618,13 @@ impl SqliteDb {
         Ok(sqlx::query_scalar("SELECT json_extract(effects_json,?) FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?")
             .bind(format!("$.{key}")).bind(&step.id).bind(index).fetch_one(self.pool()).await?)
     }
+    /// One recorded effect of any hook of this step (the newest checkpoint
+    /// that has it). The step reads what one of its hooks recorded before
+    /// the step was suspended.
+    pub async fn step_hook_effect(&self, step_id: &str, key: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT json_extract(effects_json,?1) FROM task_hook_checkpoint WHERE step_id=?2 AND json_extract(effects_json,?1) IS NOT NULL ORDER BY hook_index DESC LIMIT 1")
+            .bind(format!("$.{key}")).bind(step_id).fetch_optional(self.pool()).await?.flatten())
+    }
     pub async fn record_hook_effect(
         &self,
         step: &TaskStep,

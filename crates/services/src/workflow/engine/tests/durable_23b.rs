@@ -1700,13 +1700,50 @@ async fn set_project_review_commands(fixture: &FailedCiFixture, command: &str) {
         .unwrap();
 }
 
+/// Wake the suspended hooks step as its deadline would and run the step
+/// worker (no check worker) until it waits on another consumer than `before`.
+async fn wake_and_resuspend(fixture: &FailedCiFixture, before: &str) -> String {
+    fixture
+        .db
+        .wake_suspended_hooks(&fixture.task.id, before)
+        .await
+        .unwrap();
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    let awaited = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let awaited = awaited_consumer(fixture).await;
+            if awaited.as_deref().is_some_and(|id| id != before) {
+                break awaited.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hooks step asks again and suspends");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    awaited
+}
+
+async fn awaited_consumer(fixture: &FailedCiFixture) -> Option<String> {
+    fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|step| step.kind == "hooks" && step.status == "suspended")
+        .and_then(|step| step.awaited_consumer_id)
+}
+
 // The Project's review commands change while the entry check of the old
 // commands is pending. The finished check answers a question nobody asks any
-// more: its verdict is applied to nothing, the attempt is closed, and the
-// Task parks for its owner. (It does not ask again by itself: see the pause
-// decisions in docs/architecture.md.)
+// more: its verdict is applied to nothing and its attempt is closed. The
+// woken step asks again for the current commands inside the same review
+// entry, without the owner and without spending review budget.
 #[tokio::test]
-async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verdict() {
+async fn a_review_config_change_while_the_entry_check_is_pending_asks_again_for_the_new_commands() {
     let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
     sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
         .bind(json!({"retry_budgets":{"review":3}}).to_string())
@@ -1716,24 +1753,181 @@ async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verd
         .unwrap();
     set_project_review_commands(&fixture, "echo first-commands").await;
     suspend_on_entry_check(&fixture).await;
+    let entered: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
     set_project_review_commands(&fixture, "echo other-commands").await;
     let task = drain(fixture.engine.clone(), &fixture.task.id).await;
     let reviews = review_summaries(&fixture).await;
-    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
     assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(reviews[0].1.contains("superseded_by_config_change"));
     assert!(
         !reviews[0].1.contains("first-commands"),
         "the old commands' verdict was written to the attempt: {reviews:?}"
     );
+    assert_eq!(
+        reviews[1].0,
+        db::ReviewStatus::AwaitingHuman,
+        "{reviews:?} {:?}",
+        task.error_annotation
+    );
+    assert!(reviews[1].1.contains("other-commands"), "{reviews:?}");
+    assert!(!reviews[1].1.contains("first-commands"), "{reviews:?}");
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.condition.check_witness().is_none());
+    // One new consumer and one new run, in the same status entry.
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 2);
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        2
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(DISTINCT status_epoch) FROM check_consumer"
+        )
+        .await,
+        1
+    );
+    let now: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(now, entered, "the Task did not leave and re-enter review");
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE kind='hooks'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
+            .await
+            .unwrap(),
+        0,
+        "asking again spends no review budget"
+    );
+}
+
+// The Task's own review commands change while the entry check is pending. No
+// Project version moves, so nothing but the comparison of what the check was
+// asked under notices. The stale run is still queued: its consumer is
+// cancelled (the run is stopped by the worker) and the entry asks again.
+#[tokio::test]
+async fn a_task_review_config_change_while_the_entry_check_is_pending_asks_again() {
+    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
+    suspend_on_entry_check(&fixture).await;
+    let first = awaited_consumer(&fixture).await.unwrap();
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(
+            json!({"retry_budgets":{"review":3},"review":{"ci_steps":["echo other-commands"]}})
+                .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let second = wake_and_resuspend(&fixture, &first).await;
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_consumer WHERE cancelled_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "the stale consumer is cancelled"
+    );
+    let waiting = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        waiting
+            .condition
+            .check_witness()
+            .map(|(wait, _)| wait.consumer_id.clone()),
+        Some(second),
+        "the Task states the wait for the check it asked for now"
+    );
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
+    assert!(!reviews[0].1.contains("first-commands"), "{reviews:?}");
+    assert_eq!(reviews[1].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+    assert!(reviews[1].1.contains("other-commands"), "{reviews:?}");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_run WHERE state='succeeded'"
+        )
+        .await,
+        1,
+        "only the current commands ran to a verdict"
+    );
+}
+
+// A configuration that keeps changing does not make the entry ask forever:
+// after three re-requests the next change ends the step as before. The
+// verdict is applied to nothing and the Task parks typed, with its actions.
+#[tokio::test]
+async fn an_entry_asks_again_at_most_three_times_then_parks_for_its_owner() {
+    let fixture = approval_ci_fixture(json!(["echo commands-0"])).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"retry_budgets":{"review":3}}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    set_project_review_commands(&fixture, "echo commands-0").await;
+    suspend_on_entry_check(&fixture).await;
+    let mut awaited = awaited_consumer(&fixture).await.unwrap();
+    for round in 1..=3 {
+        set_project_review_commands(&fixture, &format!("echo commands-{round}")).await;
+        awaited = wake_and_resuspend(&fixture, &awaited).await;
+    }
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        4
+    );
+    set_project_review_commands(&fixture, "echo commands-4").await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 4, "{reviews:?}");
+    assert!(
+        reviews
+            .iter()
+            .all(|review| review.0 == db::ReviewStatus::Cancelled),
+        "{reviews:?}"
+    );
+    assert!(reviews.iter().all(|review| !review.1.contains("commands-")));
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        4,
+        "no fifth request"
+    );
     assert_eq!(task.status, "review");
     assert!(task.review_passed_at.is_none());
-
     assert!(task
         .error_annotation
         .as_deref()
         .is_some_and(|annotation| annotation.contains("cascade_failed")));
-    // The owner is not left without an action: the Task can be restarted,
-    // sent back, advanced by override or cancelled.
     match fixture
         .engine
         .perform_task_action(&task.id, api_types::TaskAction::retry(), task.version)
@@ -1752,31 +1946,6 @@ async fn a_review_config_change_while_the_entry_check_is_pending_applies_no_verd
         }
         other => panic!("retry on a parked review entry: {:?}", other.map(|_| ())),
     }
-    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
-}
-
-// The Task's own review commands change while the entry check is pending. No
-// Project version moves, so nothing but the comparison of what the entry was
-// admitted under notices: the verdict of the old commands is applied to
-// nothing, as for a Project edit.
-#[tokio::test]
-async fn a_task_review_config_change_while_the_entry_check_is_pending_applies_no_verdict() {
-    let fixture = approval_ci_fixture(json!(["echo first-commands"])).await;
-    suspend_on_entry_check(&fixture).await;
-    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
-        .bind(
-            json!({"retry_budgets":{"review":3},"review":{"ci_steps":["echo other-commands"]}})
-                .to_string(),
-        )
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    drain(fixture.engine.clone(), &fixture.task.id).await;
-    let reviews = review_summaries(&fixture).await;
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].0, db::ReviewStatus::Cancelled, "{reviews:?}");
-    assert!(!reviews[0].1.contains("first-commands"), "{reviews:?}");
 }
 
 // The Project environment changes while the entry check is pending (with

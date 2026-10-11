@@ -98,6 +98,19 @@ impl HookAction for RunCiSteps {
                     }
                 }
             };
+        // The entry configuration changed while this step waited for its
+        // check: the check that ran answers commands the entry no longer has.
+        // Its consumer and the attempt that asked are closed, and the hook
+        // asks again below for the current configuration.
+        let asked = match asked {
+            Some(asked) => match supersede_stale_ask(ctx, &asked).await {
+                Ok(true) => None,
+                Ok(false) => Some(asked),
+                Err(reason) => return HookResult::Failed { reason },
+            },
+            None => None,
+        };
+        let reasked = asked.is_none();
         let had_review_passed = task.review_passed_at.is_some();
         let reviewer_assignment =
             match get_role_assignment(ctx, crate::workflow::default_roles::REVIEWER).await {
@@ -177,22 +190,33 @@ impl HookAction for RunCiSteps {
         };
         let consumer_id =
             match crate::workflow::engine::durable::hook_effect(&ctx.task_id, CI_CONSUMER).await {
-                Ok(Some(consumer_id)) => {
+                // A consumer recorded for an attempt this invocation did not
+                // open belongs to that attempt.
+                Ok(Some(consumer_id)) if !reasked => {
                     serde_json::from_str::<String>(&consumer_id).unwrap_or_default()
                 }
-                Ok(None) => match request_entry_check(ctx, &task, &review, &consumers).await {
-                    Ok(EntryCheck::NothingToRun) => String::new(),
-                    Ok(EntryCheck::Asked(consumer_id)) => {
-                        if let Err(error) = crate::workflow::engine::durable::record_hook_effect(
-                            &ctx.task_id,
-                            CI_CONSUMER,
-                            &json!(consumer_id),
-                        )
-                        .await
-                        {
-                            return HookResult::Failed {
-                                reason: error.to_string(),
-                            };
+                Ok(_) => match request_entry_check(ctx, &task, &review, &consumers).await {
+                    Ok(asked) => {
+                        let consumer_id = match asked {
+                            EntryCheck::NothingToRun => String::new(),
+                            EntryCheck::Asked(consumer_id) => consumer_id,
+                        };
+                        for (key, value) in [
+                            (ENTRY_CHECK_CONFIG_EFFECT, ctx.state_config.clone()),
+                            (CI_CONSUMER, json!(consumer_id)),
+                        ] {
+                            if let Err(error) =
+                                crate::workflow::engine::durable::record_hook_effect(
+                                    &ctx.task_id,
+                                    key,
+                                    &value,
+                                )
+                                .await
+                            {
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
                         }
                         consumer_id
                     }
@@ -464,6 +488,126 @@ impl HookAction for RunCiSteps {
 /// consumer it asked with. They make a woken or redelivered step continue.
 const CI_REVIEW: &str = "ci_review";
 const CI_CONSUMER: &str = "ci_consumer";
+/// The entry state configuration the recorded consumer was asked under, and
+/// how often this entry dropped a stale check and asked again.
+pub(crate) const ENTRY_CHECK_CONFIG_EFFECT: &str = "ci_config";
+pub(crate) const ENTRY_CHECK_REREQUESTS_EFFECT: &str = "ci_rerequests";
+/// An entry asks again at most this often (a configuration that keeps
+/// changing, or a check that keeps being withdrawn); then it parks typed.
+pub(crate) const ENTRY_CHECK_REREQUEST_LIMIT: u32 = 3;
+
+async fn entry_check_rerequests(task_id: &str) -> Result<u32, String> {
+    Ok(
+        crate::workflow::engine::durable::hook_effect(task_id, ENTRY_CHECK_REREQUESTS_EFFECT)
+            .await
+            .map_err(|error| error.to_string())?
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// Whether the check this hook asked for is stale because the entry's state
+/// configuration is no longer the one it was asked under. If so (and the
+/// entry may still ask again), the stale consumer is cancelled, a run it
+/// alone waited for on a daemon is fenced, the attempt that asked is closed
+/// as superseded and the re-request is counted. No budget is charged: the
+/// attempt never produced a verdict. Returns `true` when the caller must ask
+/// again.
+async fn supersede_stale_ask(ctx: &HookContext, asked: &AskedReview) -> Result<bool, String> {
+    let durable_effect = |key: &'static str| async move {
+        crate::workflow::engine::durable::hook_effect(&ctx.task_id, key)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let Some(consumer_id) = durable_effect(CI_CONSUMER)
+        .await?
+        .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
+    else {
+        return Ok(false);
+    };
+    // A step whose authority was withdrawn (the workflow changed, or the
+    // bound was reached) settles as before and asks for nothing.
+    if ctx.project_version.is_some_and(|version| version < 0) {
+        return Ok(false);
+    }
+    let asked_under = durable_effect(ENTRY_CHECK_CONFIG_EFFECT)
+        .await?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    if asked_under.as_ref() == Some(&ctx.state_config) {
+        return Ok(false);
+    }
+    let Some(review) = ReviewRepo::get_by_id(&*ctx.db, &asked.review_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    // An attempt that already has its verdict is not asked again.
+    if settled_ci_result(&review).is_some() {
+        return Ok(false);
+    }
+    let rerequests = entry_check_rerequests(&ctx.task_id).await?;
+    if rerequests >= ENTRY_CHECK_REREQUEST_LIMIT {
+        return Ok(false);
+    }
+    drop_entry_check(
+        ctx,
+        &consumer_id,
+        &review,
+        "superseded_by_config_change",
+        "the review configuration changed while its checks ran",
+    )
+    .await?;
+    crate::workflow::engine::durable::record_hook_effect(
+        &ctx.task_id,
+        ENTRY_CHECK_REREQUESTS_EFFECT,
+        &json!(rerequests + 1),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Close a check this entry no longer waits for, with the attempt that asked.
+async fn drop_entry_check(
+    ctx: &HookContext,
+    consumer_id: &str,
+    review: &db::Review,
+    status: &str,
+    reason: &str,
+) -> Result<(), String> {
+    if !consumer_id.is_empty() {
+        let step_id = crate::workflow::engine::durable::current_hook(&ctx.task_id)
+            .map(|attempt| attempt.step.id.clone());
+        crate::check_runner::review_entry::withdraw_consumer(
+            &ctx.db,
+            ctx.daemon_connections.clone(),
+            step_id.as_deref(),
+            consumer_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let mut details: Value = serde_json::from_str(&review.step_results_json)
+        .unwrap_or_else(|_| json!({ "ci_steps": [] }));
+    if !details.is_object() {
+        details = json!({ "ci_steps": [] });
+    }
+    let now = now_rfc3339();
+    details["execution_retry"] = json!({ "status": status, "reason": reason, "cancelled_at": now });
+    ReviewRepo::cancel_if_unchanged(
+        &*ctx.db,
+        &review.id,
+        review.status.clone(),
+        &review.updated_at,
+        details.to_string(),
+        &now,
+        &now,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
 /// The wall limit of one review-entry CI run.
 pub const ENTRY_CHECK_WALL_SECONDS: u64 = 3600;
 static ENTRY_CHECK_WALL_OVERRIDE: std::sync::Mutex<Vec<(String, u64)>> =

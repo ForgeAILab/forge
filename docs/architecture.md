@@ -9299,12 +9299,36 @@ What changed while the step waited decides what happens to the result:
 |---|---|
 | Nothing the entry was admitted under (a pause, a resume, a rename, a limit) | applied; the attempt settles |
 | The Project environment | applied: the run that ran is the run that was asked for. Its result answers the old environment only (the environment is part of the check identity), so the next entry runs again |
-| The Project workflow, or the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it | not applied. The attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
-| The Task's own state configuration (`task_state_config`, with its `ci_steps`) | not applied, as above. No Project version moves for this, so the step compares what it froze whenever it waited for a check |
+| The entry's state configuration: the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it, or the Task's own (`task_state_config`; no Project version moves for this) | not applied. The woken step asks again for the current configuration, in the same review entry (below) |
+| The Project workflow | not applied. The hook list the step froze may no longer be the workflow's: the attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
 
-The verdict of commands the entry no longer has is never written to the
-review attempt. The Task does not ask for a new check by itself: its owner
-restarts it or sends it back, and the next entry runs the current commands.
+**A changed configuration asks again by itself.** `run_ci_steps` records the
+merged configuration of the entered state it asked under (hook effect
+`ci_config`). A woken step runs under the Project's current version and the
+state's CURRENT merged configuration (`execute_hook_step`), and the hook
+compares the two. When they differ and the attempt has no verdict yet
+(`supersede_stale_ask`):
+
+1. the stale consumer is cancelled (`review_entry::withdraw_consumer`): a late
+   delivery is `Stale`, the worker stops a run nobody else waits for, and a
+   run still executing on a daemon is put under the remote-cancellation fence
+   as for a superseded step;
+2. the attempt that asked is closed `cancelled` with
+   `execution_retry.status = "superseded_by_config_change"`; the verdict of
+   commands the entry no longer has is never written to it;
+3. the re-request is counted (hook effect `ci_rerequests`) and the hook opens
+   a new review attempt and asks once for the current configuration: one new
+   consumer (request key `status epoch | new review id`), at most one new run
+   (a certified pass of the same identity is a `Hit`, a run in flight is
+   joined). The Task's check wait is replaced by the new consumer's.
+
+The Task does not leave `review`, its status epoch and its hooks step are
+unchanged, and no review budget is charged (no verdict was produced). The
+change is noticed when the step is next woken: by the stale check's delivery,
+or at the step's deadline. An entry asks again at most three times
+(`ENTRY_CHECK_REREQUEST_LIMIT`); the next change ends the step as a workflow
+change does (the typed `cascade_failed` park with its actions), so a
+configuration that keeps changing cannot keep a Task asking forever.
 
 **Liveness of the wait.** Every way the answer can fail to arrive ends in a
 resume or a typed condition, never a silent wait:
