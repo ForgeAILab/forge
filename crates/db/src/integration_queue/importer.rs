@@ -908,7 +908,10 @@ pub struct IntegrationImportPass {
 ///   ever made: copying each one's evidence at the first start after the
 ///   upgrade would hold every worker back for the length of the history.
 ///   A `cancelled` Task is still read (a merge that was in flight when it
-///   was cancelled may have an unknown result).
+///   was cancelled may have an unknown result), unless the queue itself
+///   cancelled the attempt of the entry the Task was cancelled out of: that
+///   attempt (a passive-stage `shadow:` row included) is the record of that
+///   entry, as it was while the Task was still in it.
 ///
 /// A crash rolls back a whole bounded slice, and the next pass starts at its
 /// first uncommitted entry. No third cursor table, Task mutation, step
@@ -933,7 +936,7 @@ impl SqliteDb {
             role_names.insert(project_id, serde_json::json!(names));
         }
         let role_names = serde_json::Value::Object(role_names).to_string();
-        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR (t.status IN ('cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR l.to_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%')) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?2")
+        let mut tasks=sqlx::query_scalar::<_,String>("SELECT t.id FROM task t WHERE (t.status IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR (t.status IN ('cancelled','review') AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=t.id AND (l.from_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))) OR l.to_state IN (SELECT value FROM json_each(COALESCE(json_extract(?1,'$.\"'||t.project_id||'\"'),'[\"merging\",\"merge_failed\"]'))))) OR t.metadata_json LIKE '%paused_integration%' OR EXISTS(SELECT 1 FROM task_hook_checkpoint h JOIN task_step s ON s.id=h.step_id WHERE s.task_id=t.id AND h.effects_json LIKE '%merge_intent%')))) AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND (a.expected_epoch=t.status_epoch OR a.import_source_json IS NOT NULL OR a.admission_key LIKE 'admit:%' OR (t.status='cancelled' AND a.state='cancelled' AND a.expected_epoch=t.status_epoch-1))) ORDER BY COALESCE((SELECT l.created_at FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),t.updated_at),COALESCE((SELECT l.id FROM transition_log l WHERE l.task_id=t.id AND l.to_state=t.status ORDER BY l.created_at DESC,l.id DESC LIMIT 1),''),t.id LIMIT ?2")
             .bind(&role_names)
             .bind(limit+1).fetch_all(&mut *tx).await?;
         let mut pass = IntegrationImportPass {
