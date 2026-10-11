@@ -627,6 +627,81 @@ async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
     assert_eq!(db.import_integration_pass(100).await.unwrap().examined, 0);
 }
 
+/// A cancelled Task whose merge entry is behind it, at any distance, is not
+/// imported again: its newest attempt is the record of that entry once it is
+/// terminal, whatever epoch it was admitted in (an attempt that never joined
+/// a queue can only be an imported row, which already stands for its Task).
+/// A start after the Cancel writes no history row for it. While the
+/// newest attempt still has an effect outstanding the Task is imported, so
+/// an unproved merge is never dropped.
+#[tokio::test]
+async fn a_cancelled_task_is_not_imported_again_at_any_epoch_distance() {
+    for (name, epochs_since, state, intent, in_queue, imported) in [
+        // Cancelled out of `merging`: one epoch back (the old rule).
+        ("from merging", 1, "cancelled", false, true, 0),
+        // Cancelled out of `merge_failed`: the attempt is of the `merging`
+        // entry before it, two epochs back.
+        ("from merge_failed", 2, "cancelled", false, true, 0),
+        // Repaired and re-reviewed several times before the Cancel.
+        ("many entries later", 7, "superseded", false, true, 0),
+        // Still in a queue and not terminal: the worker has not ended it.
+        ("not ended yet", 2, "ejected", false, true, 1),
+        // An outstanding effect is never dropped.
+        ("effect outstanding", 2, "cancelled", true, true, 1),
+    ] {
+        let db = fixture().await;
+        sqlx::raw_sql("DELETE FROM integration_attempt; DELETE FROM integration_queue;")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM task WHERE id<>'a'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        seed_delivery(&db, "a").await;
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let admitted = db
+            .admit_integration_attempt(admission(&q, "a", "admit:a:0"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('left','a','merging','merge_failed','workflow','conflict',?)").bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET status='cancelled',status_epoch=status_epoch+? WHERE id='a'")
+            .bind(epochs_since)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // The admission identity is left out of the question: only the rule
+        // for a cancelled Task decides.
+        sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE integration_attempt SET admission_key='entry:a',state=?,current=0,\
+               effect_intent_json=CASE WHEN ? THEN '{\"kind\":\"merge\"}' ELSE NULL END,\
+               queue_id=CASE WHEN ? THEN queue_id ELSE NULL END WHERE id=?",
+        )
+        .bind(state)
+        .bind(intent)
+        .bind(in_queue)
+        .bind(&admitted.id)
+        .execute(db.pool())
+        .await
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let pass = db.import_integration_pass(100).await.unwrap();
+        assert_eq!(pass.imported, imported, "{name}: {pass:?}");
+        // A second start changes nothing either way.
+        assert_eq!(
+            db.import_integration_pass(100).await.unwrap().imported,
+            0,
+            "{name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn claim_refreshes_default_location_and_recovers_a_suspended_queue_under_cas() {
     let db = fixture().await;

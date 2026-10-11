@@ -91,6 +91,9 @@ impl db::task_writer::TaskStepExecutor for TaskStepWorker {
             })
     }
 }
+/// How long `drain` waits for the head drivers it stopped.
+const DRAIN_DRIVER_JOIN: Duration = Duration::from_secs(30);
+
 impl TaskStepWorker {
     pub fn new(task_service: crate::TaskService) -> Self {
         let engine = task_service.workflow_engine();
@@ -420,7 +423,18 @@ impl TaskStepWorker {
         let mut drivers = JoinSet::new();
         let drained = self.drain_with(task_id, &mut drivers, &stop).await;
         stop.cancel();
-        while drivers.join_next().await.is_some() {}
+        // A stopped driver ends at its next await; one that does not (a Git
+        // child or an owner call that never returns) is aborted instead of
+        // holding the drain open for ever.
+        let joined = tokio::time::timeout(DRAIN_DRIVER_JOIN, async {
+            while drivers.join_next().await.is_some() {}
+        })
+        .await;
+        if joined.is_err() {
+            tracing::warn!(target: "services::worker_runtime", task_id, left = drivers.len(), "integration head drivers did not stop within the drain's deadline; aborted");
+            drivers.abort_all();
+            while drivers.join_next().await.is_some() {}
+        }
         drained
     }
     async fn drain_with(
