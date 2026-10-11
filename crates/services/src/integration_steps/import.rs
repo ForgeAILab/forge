@@ -489,6 +489,21 @@ impl IntegrationSteps {
             Err(error) if crate::worker_runtime::queue::retryable(&error) => {
                 return Ok(StepOutcome::Retry(bounded(&error.to_string())))
             }
+            // The worktree would have to be recreated under the disk floor:
+            // the Task waits for disk and the continuation asks again at
+            // the recheck.
+            Err(error)
+                if crate::placement::capacity_wait_of(&error)
+                    == Some(crate::placement::CapacityWait::Disk) =>
+            {
+                self.task_service
+                    .defer_placement_refusal(task, &error)
+                    .await?;
+                return Ok(StepOutcome::RetryAt(
+                    bounded(&error.to_string()),
+                    chrono::Utc::now() + chrono::Duration::seconds(30),
+                ));
+            }
             // The candidate cannot be named (its workspace or implementation
             // run is gone): the approval evidence is kept and no other commit
             // is declared reviewed. The owner decides.

@@ -1558,3 +1558,79 @@ async fn renamed_done_cancelled_and_review_states_are_followed_by_role() {
     assert!(!world.on_main("c.txt").await);
     assert_eq!(world.task("c").await.status, "dropped");
 }
+
+/// Disk pressure at admission. The Task's worktree is gone and the disk is
+/// under its floor: making it again is refused. That is a wait, typed on the
+/// Task as its disk capacity wait: the Task is not blocked, not failed and
+/// not sent to repair, no attempt exists and nothing is charged. When the
+/// disk recovers the same sweep admits the Task and it merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn admission_under_the_disk_floor_waits_for_disk_and_merges_when_it_recovers() {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", "merging").await;
+    world.seed_execution("t", "executor", None).await;
+    world.touch("t").await;
+    std::fs::remove_dir_all(world.tree("t")).unwrap();
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    world.db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: Some("unclaimed".to_owned()),
+                compiler_cache_bytes: None,
+            })
+        }),
+    );
+    let admitted = world
+        .service
+        .reconcile_integration_admission(&world.task("t").await)
+        .await
+        .unwrap();
+    assert!(!admitted, "nothing is admitted under the disk floor");
+    let waiting = world.task("t").await;
+    assert_eq!(waiting.status, "merging");
+    assert!(
+        waiting.blocked_json.is_none() && waiting.failed_json.is_none(),
+        "a wait, not a block: {:?}",
+        waiting.blocked_json
+    );
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&waiting).is_some_and(|wait| {
+            wait.capability == "machine_capacity"
+                && wait.capacity_scope.as_deref() == Some(api_types::CAPACITY_SCOPE_DISK)
+        }),
+        "the Task states its disk wait: {:?}",
+        waiting.metadata_json
+    );
+    assert!(world
+        .db
+        .current_integration_attempt("t")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!world.tree("t").exists(), "no worktree under the floor");
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    let production = Production::new(&world);
+    let running = production.run();
+    let dispatcher = dispatcher(&world).await;
+    world
+        .until("t", "the Task merges once the disk recovered", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            let _ = world
+                .service
+                .reconcile_integration_admission(&world.task("t").await)
+                .await;
+            world.task("t").await.status == "done"
+        })
+        .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(world.merges("t").await, 1);
+}

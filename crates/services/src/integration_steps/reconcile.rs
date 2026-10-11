@@ -282,6 +282,16 @@ impl crate::TaskService {
         {
             Ok(attempt) => attempt,
             Err(error) if crate::worker_runtime::queue::retryable(&error) => return Err(error),
+            // The worktree would have to be recreated under the disk floor:
+            // the Task waits for disk (its typed capacity wait, with the
+            // recheck that asks again). Not a block, and nothing is charged.
+            Err(error)
+                if crate::placement::capacity_wait_of(&error)
+                    == Some(crate::placement::CapacityWait::Disk) =>
+            {
+                self.defer_placement_refusal(&task, &error).await?;
+                return Ok(false);
+            }
             // No candidate can be named (no workspace, no implementation
             // run, the repository is gone). The Task says so, typed, and its
             // owner's Retry asks again; nothing is declared reviewed.

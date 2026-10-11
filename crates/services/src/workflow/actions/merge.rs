@@ -117,9 +117,25 @@ impl HookAction for RunMerge {
         )
         .await
         {
-            Ok(attempt) => attempt,
+            Ok(attempt) => {
+                super::common::disk_wait_over(ctx, &task).await;
+                attempt
+            }
             Err(error) if crate::worker_runtime::queue::retryable(&error) => {
                 return failed(ctx, error)
+            }
+            // The Task's worktree would have to be made again under the
+            // disk floor. That is a wait, not a merge failure: the Task
+            // states its disk capacity wait, the entry's step suspends on
+            // it and asks again at the recheck. Nothing is charged.
+            Err(error)
+                if crate::placement::capacity_wait_of(&error)
+                    == Some(crate::placement::CapacityWait::Disk) =>
+            {
+                return match super::common::wait_for_disk(ctx, &task, &error).await {
+                    Some(waiting) => waiting,
+                    None => failed(ctx, error),
+                };
             }
             // No candidate can be named (no implementation run, the
             // workspace or its repository is gone): the same failure the
