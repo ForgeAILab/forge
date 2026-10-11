@@ -198,13 +198,13 @@ impl World {
                 .fetch_one(self.db.pool())
                 .await
                 .unwrap();
-        let attempts: Vec<(String, i64, Option<String>, Option<String>, Option<String>)> =
+        let attempts: Vec<StuckAttempt> =
             sqlx::query_as("SELECT state,effect_seq,permit_json,effect_ack_json,cancel_requested_at FROM integration_attempt WHERE task_ref=? ORDER BY rowid")
                 .bind(task)
                 .fetch_all(self.db.pool())
                 .await
                 .unwrap();
-        let steps: Vec<(i64, String, String, String, i64, String, Option<String>, Option<String>)> =
+        let steps: Vec<StuckStep> =
             sqlx::query_as("SELECT seq,kind,causation_key,status,attempts,available_at,last_error,payload_json FROM task_step WHERE task_id=? ORDER BY seq")
                 .bind(task)
                 .fetch_all(self.db.pool())
@@ -231,6 +231,21 @@ impl World {
             .unwrap()
     }
 }
+
+/// `state, effect_seq, permit, ack, cancel_requested_at` of an attempt.
+type StuckAttempt = (String, i64, Option<String>, Option<String>, Option<String>);
+/// `seq, kind, causation_key, status, attempts, available_at, last_error,
+/// payload` of a Task step.
+type StuckStep = (
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 /// Poll until `check` holds; the real step worker runs in the background.
 pub(super) async fn eventually<F, Fut>(what: &str, mut check: F)
