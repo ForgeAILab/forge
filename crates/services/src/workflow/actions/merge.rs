@@ -687,6 +687,14 @@ impl HookAction for RequireConflictMarkersResolved {
     }
 }
 
+/// Where an outcome of the merge state this hook runs in goes, by the role
+/// the target plays in the Task's workflow (`reconcile::role_target`): a
+/// workflow that renamed `done` or its repair state is followed, one that
+/// kept the default names keeps them.
+fn merge_role_target(ctx: &HookContext, default_name: &str) -> String {
+    crate::integration_steps::reconcile::role_target(&ctx.workflow, &ctx.to_state, default_name)
+}
+
 /// Test seam: queue errors for a Task's next `run_merge` attempts.
 #[cfg(test)]
 pub(crate) mod test_faults {
@@ -718,12 +726,4 @@ pub(crate) mod test_faults {
             .get_mut(task_id)
             .and_then(VecDeque::pop_front)
     }
-}
-
-/// Where an outcome of the merge state this hook runs in goes, by the role
-/// the target plays in the Task's workflow (`reconcile::role_target`): a
-/// workflow that renamed `done` or its repair state is followed, one that
-/// kept the default names keeps them.
-fn merge_role_target(ctx: &HookContext, default_name: &str) -> String {
-    crate::integration_steps::reconcile::role_target(&ctx.workflow, &ctx.to_state, default_name)
 }
