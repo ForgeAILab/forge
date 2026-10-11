@@ -98,6 +98,24 @@ pub fn apply_sandboxed(
     sandbox.apply_to(command, project);
 }
 
+/// [`apply_sandboxed`] for a command whose environment was cleared
+/// (`env_clear`): the child inherits nothing of the operator's process
+/// environment, so nothing there can outrank what the Task root gives it.
+///
+/// The precedence rule lets the operator's `CARGO_TARGET_DIR` (and a
+/// compiler wrapper or cache variable of the operator's) win over Forge's
+/// because the child would inherit it. A cleared child does not: deferring
+/// to it left the child with neither value, and it built inside the
+/// worktree. Project and command values keep their precedence.
+pub fn apply_sandboxed_cleared(
+    command: &mut Command,
+    project: &BTreeMap<String, String>,
+    sandbox: &SandboxEnv,
+) {
+    apply_budget(command, machine_policy().get(), project);
+    sandbox.apply_with(command, project, |_| None);
+}
+
 pub fn apply_budget(command: &mut Command, budget: RunBudget, project: &BTreeMap<String, String>) {
     // A non-empty value already set on the command (an Agent profile's env,
     // a shell plan, or the inherited environment) wins over the budget.

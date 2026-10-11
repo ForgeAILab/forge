@@ -1427,6 +1427,61 @@ mod tests {
         compiler_cache::install(&root, None);
     }
 
+    /// A command with a cleared environment inherits nothing, so an
+    /// operator `CARGO_TARGET_DIR` or compiler-cache variable that would win
+    /// for an inheriting child does not hold Forge's back: the child gets
+    /// the Task root's build directory and the cache's whole set.
+    #[tokio::test]
+    async fn a_cleared_command_gets_forges_build_dir_and_cache_whatever_the_operator_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let worktree = cache_tests::linked_worktree(&root, "t1", "repo-a");
+        let wrapper = cache_tests::fake_wrapper(&dir.path().join("bin"), "kache");
+        let env = SandboxEnv::for_run(&worktree, "run-1", RunPurpose::Command)
+            .with_compiler_cache(cache_tests::cache(&root, &wrapper).for_worktree(&worktree));
+        let build = root.join("t1").join(TASK_DIR_NAME).join("build").join("cargo");
+        let operator = |key: &str| {
+            matches!(key, "CARGO_TARGET_DIR" | "KACHE_CACHE_DIR")
+                .then(|| OsString::from("/operator/value"))
+        };
+        let set = |command: &Command, key: &str| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(key))
+                .and_then(|(_, value)| value.map(OsStr::to_owned))
+        };
+
+        // Inheriting child: the operator's values reach it, Forge sets none.
+        let mut inheriting = Command::new("true");
+        env.apply_with(&mut inheriting, &BTreeMap::new(), operator);
+        assert_eq!(set(&inheriting, "CARGO_TARGET_DIR"), None);
+        assert_eq!(set(&inheriting, WRAPPER_KEY), None);
+
+        // Cleared child: it would get neither. Forge's apply.
+        let mut cleared = Command::new("true");
+        cleared.env_clear();
+        crate::run_process::apply_sandboxed_cleared(&mut cleared, &BTreeMap::new(), &env);
+        assert_eq!(set(&cleared, "CARGO_TARGET_DIR"), Some(build.into_os_string()));
+        assert_eq!(set(&cleared, WRAPPER_KEY), Some(wrapper.clone().into_os_string()));
+        assert_eq!(
+            set(&cleared, "KACHE_CACHE_DIR"),
+            Some(root.join(CACHE_DIR).join("repo-a").into_os_string())
+        );
+
+        // The Project's value and the command's own still win.
+        let project = BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/project".to_owned())]);
+        let mut cleared = Command::new("true");
+        cleared.env_clear().env(WRAPPER_KEY, "/command/wrapper");
+        crate::run_process::apply_sandboxed_cleared(&mut cleared, &project, &env);
+        assert_eq!(set(&cleared, "CARGO_TARGET_DIR"), None);
+        assert_eq!(
+            set(&cleared, WRAPPER_KEY),
+            Some(OsString::from("/command/wrapper"))
+        );
+        assert_eq!(set(&cleared, "KACHE_CACHE_DIR"), None);
+    }
+
     #[tokio::test]
     async fn compiler_cache_yields_to_the_project_the_command_and_the_operator() {
         let dir = tempfile::tempdir().unwrap();

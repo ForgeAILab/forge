@@ -3391,7 +3391,12 @@ field.
     of the wrapper's own variables, Forge sets none of the set and the store
     is not a writable root. A process whose own environment names a wrapper
     would hand out nothing, so `install_configured` installs nothing for it
-    and warns once.
+    and warns once. "The operator's process environment" counts only for a
+    child that inherits it. A command started with a cleared environment
+    (the native command tool, an isolated check) inherits nothing, so for it
+    the operator's `CARGO_TARGET_DIR` and cache variables do not outrank
+    Forge's (`run_process::apply_sandboxed_cleared`): it gets the Task's
+    build directory and the cache, never a build inside the worktree.
   - A cache that cannot be used never fails a run. A known wrapper that
     does not answer `--version` in five seconds when it is resolved: the
     feature is off for the process. Per run: wrapper not executable, store

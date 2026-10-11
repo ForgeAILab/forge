@@ -2386,6 +2386,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Native command tool and isolated checks built inside the worktree when
+  the server had `CARGO_TARGET_DIR` set.** Those commands clear the child's
+  environment, yet Forge still deferred to the server's own
+  `CARGO_TARGET_DIR` (and compiler-wrapper variables), so the child got
+  neither. For a cleared environment nothing is inherited: the Task's build
+  directory and the shared compiler cache apply.
+
 - **`forge --migrate-workspace-root` no longer waits for integration
   attempts that are at rest.** An attempt in `needs_review` or `ejected`
   (the Task is back with a reviewer or coder) does not block the move any

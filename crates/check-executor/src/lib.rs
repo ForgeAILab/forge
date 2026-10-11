@@ -343,7 +343,8 @@ fn sandboxed_command(
         return Err("missing declared check environment key".into());
     }
     let mut command = Command::new("bash");
-    if !legacy(policy) && !canonical(policy) {
+    let cleared = !legacy(policy) && !canonical(policy);
+    if cleared {
         command.env_clear().arg("--noprofile");
     }
     command
@@ -351,7 +352,13 @@ fn sandboxed_command(
         .arg(&spec.shell_text)
         .current_dir(path)
         .envs(&env);
-    executors::run_process::apply_sandboxed(&mut command, &env, sandbox);
+    if cleared {
+        // Nothing of this process's environment reaches the child, so its
+        // `CARGO_TARGET_DIR` cannot stand in for the Task root's.
+        executors::run_process::apply_sandboxed_cleared(&mut command, &env, sandbox);
+    } else {
+        executors::run_process::apply_sandboxed(&mut command, &env, sandbox);
+    }
     // Legacy unbounded server CI inherited these; bounded CI and daemon did not.
     if policy != LEGACY_SERVER || spec.timeout_seconds.is_some() {
         command
