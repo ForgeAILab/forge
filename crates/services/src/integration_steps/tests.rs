@@ -1581,6 +1581,82 @@ async fn review_ci(world: &World, task: &str, steps: &[&str]) {
         .unwrap();
 }
 
+/// The cost of the head check, measured. Each Task has a real `ci_steps`
+/// command. (a) Three Tasks that each reach the head with the target where
+/// their review left it merge with no head-check run at all. (b) Three Tasks
+/// reviewed on one base, with the target moved once from outside: every one
+/// of them is rebased (by the outside commit, then by the members ahead of
+/// it) and checked exactly once: one run per rebased commit, none repeated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn head_check_runs_are_zero_on_an_unchanged_target_and_one_per_rebased_task() {
+    let world = World::new().await;
+    let runs = || async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
+        )
+        .fetch_all(world.db.pool())
+        .await
+        .unwrap()
+    };
+    let production = Production::new(&world);
+    let running = production.run();
+    // (a) One at a time: each Task is cut from the tip it merges into.
+    for name in ["a1", "a2", "a3"] {
+        let file = format!("{name}.txt");
+        world.add_task(name, &file, "x\n").await;
+        review_ci(&world, name, &[&format!("test -f {file}")]).await;
+        production.worker.notify_answered();
+        eventually("an unrebased Task merges", || async {
+            world.task(name).await.status == "done"
+        })
+        .await;
+    }
+    assert_eq!(runs().await, vec![], "no head check on an unchanged target");
+
+    // (b) Three Tasks on one base, and the target moves once.
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let mut attempts = Vec::new();
+    for name in ["b1", "b2", "b3"] {
+        let file = format!("{name}.txt");
+        attempts.push(world.add_task(name, &file, "x\n").await);
+        review_ci(
+            &world,
+            name,
+            &[&format!("test -f {file}"), "test -f outside.txt"],
+        )
+        .await;
+    }
+    std::fs::write(world.repo().join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&world.repo(), "outside").await.unwrap();
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the rebased Tasks merge", || async {
+        let mut done = true;
+        for name in ["b1", "b2", "b3"] {
+            done &= world.task(name).await.status == "done";
+        }
+        done
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let ran = runs().await;
+    let mut expected = Vec::new();
+    for attempt in &attempts {
+        let merged = world.attempt(&attempt.id).await;
+        assert_ne!(merged.integrated_sha, merged.original_candidate_sha);
+        expected.push((merged.integrated_sha.clone().unwrap(), "pass".to_owned()));
+    }
+    let mut sorted = ran.clone();
+    sorted.sort();
+    expected.sort();
+    assert_eq!(
+        sorted, expected,
+        "exactly one run per rebased Task: {ran:?}"
+    );
+}
+
 /// D2 checklist item 11. Three Tasks through the real worker, the production
 /// ports and the real check runner on a server-owned target, each with a real
 /// `ci_steps` command. The first merges as reviewed (no check: the target did
