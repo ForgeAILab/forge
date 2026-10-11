@@ -674,6 +674,20 @@ impl IntegrationQueueWorker {
                 if attempt.cancel_requested_at.is_some() {
                     continue;
                 }
+                // A row the importer wrote names no candidate and no
+                // placement, so no head can drive it: a stored deadline on
+                // it (the old build's retry time) re-queues nothing. Its
+                // Task is admitted again by its continuation step, by the
+                // reconciler or by its owner machine's reconnect
+                // (`TaskService::integration_owner_ready`), which supersedes
+                // the row.
+                if attempt.import_source_json.is_some()
+                    && (attempt.workspace_id.is_none()
+                        || attempt.placement_id.is_none()
+                        || attempt.original_candidate_sha.is_none())
+                {
+                    continue;
+                }
                 // A counted retry (infrastructure, timeout) is over: one
                 // `park` step restates `waiting` on the Task (the handler
                 // reads the attempt as it is then). It gets a fresh

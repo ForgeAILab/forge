@@ -810,6 +810,88 @@ async fn imported_owner_waits_are_admitted_by_the_sweep_once_their_block_is_lift
     }
 }
 
+/// Importer rows P16 (the workspace's owner is lost) and P17 (an accepted
+/// owner command or a sticky disposition was still to run): each ends in a
+/// typed condition its owner sees (`deferred` / `owner_required`), nothing
+/// merges by itself, and the action the Task offers for it (Retry) works:
+/// the Task is admitted again and merges, once. The legacy state is left as
+/// the old build wrote it; no sweep of the dispatcher runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn imported_lost_owner_and_accepted_command_rows_state_owner_required_and_retry_works() {
+    let rows: [(u64, &str); 2] = [
+        (
+            16,
+            "UPDATE workspace SET error='machine_removed' WHERE task_id='t'",
+        ),
+        (
+            17,
+            "UPDATE task SET metadata_json='{\"queued_recovery\":{\"id\":\"accepted\"}}' WHERE id='t'",
+        ),
+    ];
+    for (priority, seed) in rows {
+        let world = World::new().await;
+        world.legacy_task("t", "t.txt", "merging").await;
+        world.seed_execution("t", "executor", None).await;
+        sqlx::query(seed).execute(world.db.pool()).await.unwrap();
+        // The stored condition follows the row, as its writer left it.
+        let mut tx = db::begin_immediate(world.db.pool()).await.unwrap();
+        world
+            .db
+            .produce_condition_in_tx(&mut tx, "t", db::ConditionChange::Full)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let (imported, row) = world.imported("t").await;
+        assert_eq!(row, priority);
+        let production = Production::new(&world);
+        let running = production.run();
+        world
+            .until("t", &format!("P{priority}: the owner is told"), || async {
+                integration(&world.task("t").await)["kind"] == "deferred"
+            })
+            .await;
+        let stated = integration(&world.task("t").await);
+        assert_eq!(stated["cause"], "owner_required", "P{priority}: {stated}");
+        // Nothing moves it but its owner.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(world.task("t").await.status, "merging", "P{priority}");
+        assert_eq!(world.merges("t").await, 0, "P{priority}");
+        assert_eq!(world.attempt(&imported.id).await.state, S::Parked);
+        let offers = world.offers("t").await;
+        assert!(
+            offers.iter().any(|(verb, _)| verb == "retry"),
+            "P{priority}: the Task offers Retry: {offers:?}"
+        );
+        world
+            .act(
+                "t",
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+            )
+            .await;
+        world
+            .until(
+                "t",
+                &format!("P{priority}: the retried merge lands"),
+                || async { world.task("t").await.status == "done" },
+            )
+            .await;
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        assert_eq!(world.merges("t").await, 1, "P{priority}");
+        assert_eq!(
+            world.attempt(&imported.id).await.state,
+            S::Superseded,
+            "P{priority}: the imported row is history"
+        );
+    }
+}
+
 /// A merge that stopped for its owner (`retries_exhausted`, a dirty checkout,
 /// ...) states `deferred` on the Task and offers Retry; the Retry puts the
 /// same attempt back in line with its counted retries started again, and it

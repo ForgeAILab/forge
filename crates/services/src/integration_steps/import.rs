@@ -70,6 +70,14 @@ const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
 
 use super::reconcile::merge_state;
 
+/// The machine a pre-queue owner wait named (`metadata.owner_wait.daemon_id`).
+fn owner_wait(task: &db::Task) -> Option<String> {
+    let metadata: serde_json::Value = serde_json::from_str(task.metadata_json.as_deref()?).ok()?;
+    metadata["owner_wait"]["daemon_id"]
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn import_priority(attempt: &IntegrationAttempt) -> Option<u64> {
     attempt
         .import_source_json
@@ -234,6 +242,15 @@ impl IntegrationSteps {
             crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, marker).await?;
         }
 
+        // Row P15 (the old path was waiting for the machine that holds the
+        // Task's checkout): the machine it names, and whether that wait is
+        // already over.
+        let waited_owner = (priority == Some(15)).then(|| owner_wait(&task)).flatten();
+        let owner_back = priority == Some(15)
+            && attempt.state == S::Parked
+            && in_merge_state
+            && self.owner_back(&task).await?;
+
         match attempt.state {
             S::Applied if in_merge_state => self.import_applied(step, request, &attempt).await,
             // Not in a merge state (a conflict repair, a re-review, or the
@@ -252,6 +269,9 @@ impl IntegrationSteps {
             // command, a lost workspace): the importer leaves the candidate
             // of every row unnamed, so "has no owner fields" would take all
             // of those into the queue and merge a Task its owner stopped.
+            // The machine a P15 row waited for is back: admitted, whatever
+            // retry time the old build had stored.
+            S::Parked if owner_back => self.import_readmit(step, &attempt, &task).await,
             S::Queued | S::Parked
                 if attempt.available_at.is_none()
                     && ((attempt.import_source_json.is_none()
@@ -297,11 +317,13 @@ impl IntegrationSteps {
                     } else {
                         IntegrationDeferralCause::OwnerRequired
                     }
-                } else if attempt.available_at.is_some() {
-                    // A stored deadline: the worker's sweep re-queues it.
-                    IntegrationDeferralCause::Infrastructure
                 } else if priority == Some(15) {
+                    // Ends when the machine is back, whatever retry time
+                    // the old build had stored for its own polling.
                     IntegrationDeferralCause::OwnerOffline
+                } else if attempt.available_at.is_some() {
+                    // A stored deadline: the Task is admitted again at it.
+                    IntegrationDeferralCause::Infrastructure
                 } else {
                     IntegrationDeferralCause::OwnerRequired
                 };
@@ -309,7 +331,7 @@ impl IntegrationSteps {
                 let reason = (!paused).then(|| IntegrationReason::Deferred {
                     attempt_id: attempt_ref(&attempt.id),
                     cause,
-                    owner_id: None,
+                    owner_id: waited_owner.clone(),
                     message: bounded(&message),
                 });
                 self.import_state(step, &attempt, reason).await
@@ -322,6 +344,52 @@ impl IntegrationSteps {
                 "the queue worker drives this attempt".into(),
             )),
         }
+    }
+
+    /// The wait of importer row P15 is over: the Task's placement is `ready`
+    /// and its machine (if it is a daemon's) is connected, no daemon upgrade
+    /// is refused and no cancellation is still to be confirmed on that
+    /// workspace. Anything else keeps the wait; the reconnect makes it due
+    /// (`TaskService::integration_owner_ready`).
+    async fn owner_back(&self, task: &db::Task) -> Result<bool> {
+        let metadata = task
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or_default();
+        if metadata.get("daemon_upgrade_refusal").is_some() {
+            return Ok(false);
+        }
+        let placement: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT workspace_id,state,daemon_id FROM workspace_placement WHERE task_id=? \
+             ORDER BY generation DESC,updated_at DESC LIMIT 1",
+        )
+        .bind(&task.id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        let Some((workspace_id, state, daemon_id)) = placement else {
+            return Ok(false);
+        };
+        if state != "ready" {
+            return Ok(false);
+        }
+        // The placement's machine, and the machine the old wait named.
+        for daemon_id in daemon_id.into_iter().chain(owner_wait(task)) {
+            let connected = self
+                .task_service
+                .daemon_connections
+                .as_ref()
+                .is_some_and(|registry| registry.get(&daemon_id).is_some());
+            if !connected {
+                return Ok(false);
+            }
+        }
+        Ok(self
+            .db
+            .pending_remote_cancels(None, Some(&workspace_id))
+            .await?
+            .is_empty())
     }
 
     /// State `reason` for the imported attempt and finish the step. An

@@ -47,6 +47,11 @@ pub enum ParkReason {
     /// The Task's owner, Project or Agent stopped it (`TaskGate::Gated`).
     Gate(GateCause),
     TargetNotReady,
+    /// The machine that owns the Task's checkout is not connected, or its
+    /// placement is not `ready` again yet. No retry is counted: the wait ends
+    /// when the owner is back (`TaskService::integration_owner_ready` makes
+    /// the attempt due at once), and the sweep asks again meanwhile.
+    OwnerOffline,
     TargetDirty,
     WorktreeDirty,
     UnsupportedConflict,
@@ -72,6 +77,7 @@ impl ParkReason {
             Self::Timeout => "timeout",
             Self::Gate(cause) => cause.code(),
             Self::TargetNotReady => "target_not_ready",
+            Self::OwnerOffline => "owner_offline",
             Self::TargetDirty => "target_dirty",
             Self::WorktreeDirty => "worktree_dirty",
             Self::UnsupportedConflict => "unsupported_conflict",
@@ -85,15 +91,26 @@ impl ParkReason {
         match self {
             Self::Infrastructure | Self::StepFailed => IntegrationFailureKind::Infrastructure,
             Self::Timeout => IntegrationFailureKind::Timeout,
-            Self::TargetNotReady => IntegrationFailureKind::TargetUnavailable,
+            Self::TargetNotReady | Self::OwnerOffline => IntegrationFailureKind::TargetUnavailable,
             _ => IntegrationFailureKind::OwnerRequired,
         }
     }
     fn retry(self) -> Retry {
         match self {
             Self::Infrastructure | Self::Timeout | Self::StepFailed => Retry::Counted,
-            Self::Gate(_) | Self::TargetNotReady => Retry::Soon,
+            Self::Gate(_) | Self::TargetNotReady | Self::OwnerOffline => Retry::Soon,
             _ => Retry::Owner,
+        }
+    }
+    /// A failure to reach an owner machine is a wait for that machine, not
+    /// an infrastructure failure of the merge: it spends no counted retry.
+    fn unreached(error: &ServiceError) -> Self {
+        match error {
+            ServiceError::DaemonUnavailable { .. }
+            | ServiceError::DaemonTimeout { .. }
+            | ServiceError::DaemonNotReady { .. }
+            | ServiceError::DaemonUpgradeRequired { .. } => Self::OwnerOffline,
+            _ => Self::Infrastructure,
         }
     }
 }
@@ -982,7 +999,7 @@ impl HeadDriver {
             }
             Err(error) => {
                 return self
-                    .park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .park(&a, ParkReason::unreached(&error), &error.to_string())
                     .await
             }
         };
@@ -1137,7 +1154,7 @@ impl HeadDriver {
             Ok(facts) => facts,
             Err(error) => {
                 return self
-                    .park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .park(&a, ParkReason::unreached(&error), &error.to_string())
                     .await
             }
         };
@@ -1197,7 +1214,7 @@ impl HeadDriver {
                     return self
                         .park(
                             &a,
-                            ParkReason::Infrastructure,
+                            ParkReason::OwnerOffline,
                             "the Task's checkout is not ready on its machine",
                         )
                         .await;
@@ -1291,7 +1308,7 @@ impl HeadDriver {
                 // on; left in `rebasing` it would be re-claimed at every
                 // lease expiry for as long as the cause lasts.
                 return self
-                    .park(&now, ParkReason::Infrastructure, &error.to_string())
+                    .park(&now, ParkReason::unreached(&error), &error.to_string())
                     .await;
             }
         };
@@ -1331,7 +1348,7 @@ impl HeadDriver {
                         return self
                             .park(
                                 &a,
-                                ParkReason::Infrastructure,
+                                ParkReason::OwnerOffline,
                                 "the Task's checkout is not ready on its machine",
                             )
                             .await;

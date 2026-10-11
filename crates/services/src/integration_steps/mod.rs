@@ -424,10 +424,16 @@ impl IntegrationSteps {
                     _ => IntegrationDeferralCause::OwnerRequired,
                 }
             };
+            // A wait for the machine that holds the Task's checkout names
+            // that machine.
+            let owner_id = message
+                .starts_with("owner_offline")
+                .then(|| attempt.daemon_id.clone())
+                .flatten();
             Some(IntegrationReason::Deferred {
                 attempt_id: attempt_ref(&attempt.id),
                 cause,
-                owner_id: None,
+                owner_id,
                 message: bounded(&message),
             })
         };

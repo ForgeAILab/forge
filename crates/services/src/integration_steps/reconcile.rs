@@ -122,6 +122,37 @@ impl crate::TaskService {
         Ok(())
     }
 
+    /// The machine that owns the Task's checkout is back and the Task's
+    /// placement is `ready` again (`recovery::reconcile_workspace_placement`).
+    /// An attempt the worker parked for that machine (`owner_offline`, or a
+    /// counted retry it was still waiting out) is due now and the worker is
+    /// woken. A Task whose merge was waiting for the machine before the
+    /// queue existed (importer row P15: its attempt names no candidate, so
+    /// the worker cannot drive it) is admitted here, as the reconciler's
+    /// sweep would admit it at its next pass. No owner action is involved.
+    pub async fn integration_owner_ready(&self, task_id: &str) -> Result<()> {
+        let Some(current) = self.db.current_integration_attempt(task_id).await? else {
+            return Ok(());
+        };
+        if current.state.terminal() {
+            return Ok(());
+        }
+        if matches!(current.state, S::Parked | S::Queued) && admission::unbound(&current) {
+            if let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? {
+                self.reconcile_integration_admission(&task).await?;
+            }
+            return Ok(());
+        }
+        if self
+            .db
+            .expedite_parked_integration_attempt(task_id, &db::now_rfc3339(), false)
+            .await?
+        {
+            self.wake_integration_worker();
+        }
+        Ok(())
+    }
+
     /// A Project was resumed: its Tasks' waiting attempts are due now.
     pub async fn integration_project_resumed(&self, project_id: &str) -> Result<()> {
         if self

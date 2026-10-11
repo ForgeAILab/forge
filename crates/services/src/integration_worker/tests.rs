@@ -1447,7 +1447,9 @@ async fn a_paused_project_parks_with_backoff_and_one_task_step() {
 /// meanwhile is refused for good. A head whose rebase is done waits in
 /// `rebasing` until the placement is ready: the receipt is kept and adopted,
 /// the rebase is not repeated, and no check is asked for. The wait is
-/// bounded by the Task-step wait; then the head parks as infrastructure.
+/// bounded by the Task-step wait; then the head leaves the slot waiting for
+/// its owner machine (`owner_offline`): no retry is counted, however long
+/// the machine is away, and the attempt always has a time it is asked again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check() {
     let rebases = |attempt: &IntegrationAttempt| {
@@ -1499,19 +1501,27 @@ async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check
             assert_eq!(parked.state, S::Parked);
             assert_eq!(
                 parked.failure_kind,
-                Some(IntegrationFailureKind::Infrastructure)
+                Some(IntegrationFailureKind::TargetUnavailable)
             );
             assert!(
-                parked
-                    .failure_message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("not ready on its machine")),
+                parked.failure_message.as_deref().is_some_and(|message| {
+                    message.starts_with("owner_offline")
+                        && message.contains("not ready on its machine")
+                }),
                 "{:?}",
                 parked.failure_message
             );
             assert!(parked.available_at.is_some(), "retried by the sweep");
             // Parked means out of the slot: the queue goes on without it.
             assert!(world.queue_of(&a).await.head_attempt_id.is_none());
+            let journal = parked.operation_receipts_json.as_array().unwrap();
+            assert!(
+                journal
+                    .iter()
+                    .filter(|entry| entry["kind"] == "worker_park")
+                    .all(|entry| entry["counted"] == false),
+                "an owner wait counts no retry: {journal:?}"
+            );
         }
     }
 }
