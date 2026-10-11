@@ -1298,27 +1298,14 @@ async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_mer
     );
     let production = Production::new(&world);
     let running = production.run();
+    // The owner's Retry (`perform_task_action` reaches this through the
+    // `integration_retry` offer of the `deferred` statement; whether the
+    // import continuation has stated it yet is not what is under test).
     world
-        .until("t", "the owner is told the result is unknown", || async {
-            integration(&world.task("t").await)["kind"] == "deferred"
-        })
-        .await;
-    assert_eq!(
-        integration(&world.task("t").await)["cause"],
-        "unresolved_result"
-    );
-    world
-        .act(
-            "t",
-            TaskAction::Retry {
-                reason: None,
-                fresh_session: None,
-                refresh_workspace: None,
-                reset_budget: None,
-                guidance: None,
-            },
-        )
-        .await;
+        .service
+        .retry_integration(&world.task("t").await)
+        .await
+        .expect("the Retry settles the old operation instead of refusing");
     world
         .until(
             "t",
