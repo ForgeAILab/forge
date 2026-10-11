@@ -816,9 +816,11 @@ pub struct IntegrationImportPass {
 ///   ever made: copying each one's evidence at the first start after the
 ///   upgrade would hold every worker back for the length of the history.
 ///   A `cancelled` Task is still read (a merge that was in flight when it
-///   was cancelled may have an unknown result). A crash rolls back a whole bounded
-/// slice, and the next pass starts at its first uncommitted entry. No third
-/// cursor table, Task mutation, step enqueue, condition statement or Git I/O.
+///   was cancelled may have an unknown result).
+///
+/// A crash rolls back a whole bounded slice, and the next pass starts at its
+/// first uncommitted entry. No third cursor table, Task mutation, step
+/// enqueue, condition statement or Git I/O.
 impl SqliteDb {
     pub async fn import_integration_pass(&self, limit: u32) -> Result<IntegrationImportPass> {
         let mut tx = begin_immediate(self.pool()).await?;
