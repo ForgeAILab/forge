@@ -2089,6 +2089,144 @@ async fn an_entry_whose_check_keeps_being_withdrawn_stops_asking_after_three_tim
     );
 }
 
+/// The Task's worktree directory is gone and the disk is under its floor:
+/// whoever needs the worktree would have to make it again and may not.
+/// Returns the injected free-bytes reading.
+async fn worktree_gone_under_the_disk_floor(
+    fixture: &FailedCiFixture,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    let path: String = sqlx::query_scalar("SELECT worktree_path FROM workspace WHERE task_id=?")
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&path).expect("the worktree directory is removed");
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    fixture.db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: now_rfc3339(),
+                gc_state: Some("unclaimed".to_owned()),
+                compiler_cache_bytes: None,
+            })
+        }),
+    );
+    free
+}
+
+/// Run the step worker (no check worker) until the hooks step is suspended
+/// on the disk wait.
+async fn suspend_on_disk(fixture: &FailedCiFixture) {
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while awaited_consumer(fixture).await.as_deref() != Some("disk") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hooks step suspends on the disk wait");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+/// The disk recheck passes: the running step worker wakes the step at its
+/// deadline (nobody delivers anything to a disk wait), the hook runs again
+/// and the entry goes on to ask for its check.
+async fn resume_after_the_disk_recheck(fixture: &FailedCiFixture) {
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            fixture.db.domain_event_notify().notify_waiters();
+            if awaited_consumer(fixture)
+                .await
+                .is_some_and(|awaited| awaited != "disk")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the step leaves the disk wait and asks for its check");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+async fn waits_for_disk(fixture: &FailedCiFixture) -> bool {
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none() && task.entry_barrier_json.is_none());
+    crate::deferred_dispatch::dispatch_disposition_for_test(&task).is_some_and(|wait| {
+        wait.capability == "machine_capacity"
+            && wait.capacity_scope.as_deref() == Some(api_types::CAPACITY_SCOPE_DISK)
+    })
+}
+
+// The review entry's check needs the Task worktree, which is gone, and the
+// disk is under its floor. That is a wait, never a failed review: the hooks
+// step suspends on the disk wait, the Task shows the disk capacity wait, no
+// review attempt and no check exist. When the disk recovers the step's
+// recheck runs the hook again and the entry settles with its verdict.
+#[tokio::test]
+async fn a_review_entry_whose_worktree_cannot_be_recreated_under_the_disk_floor_waits_for_disk() {
+    let fixture = approval_ci_fixture(json!(["echo entry-commands"])).await;
+    let free = worktree_gone_under_the_disk_floor(&fixture).await;
+    let entered = enter_review(&fixture, "CI entry").await;
+    assert_eq!(entered.pending_steps, 1);
+    let _ = fixture.engine.check_worker_or_embedded();
+    suspend_on_disk(&fixture).await;
+    assert!(
+        waits_for_disk(&fixture).await,
+        "the Task states the disk wait"
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM review").await, 0);
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_consumer").await,
+        0
+    );
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT attempts FROM task_step WHERE kind='hooks' AND task_id=?")
+            .bind(&fixture.task.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(attempts, 0, "the wait is not charged to the step");
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    resume_after_the_disk_recheck(&fixture).await;
+    let task = drain(fixture.engine.clone(), &fixture.task.id).await;
+    let reviews = review_summaries(&fixture).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?} {:?}", task.error_annotation);
+    assert_eq!(reviews[0].0, db::ReviewStatus::AwaitingHuman, "{reviews:?}");
+    assert!(reviews[0].1.contains("entry-commands"));
+    assert_eq!(task.status, "review");
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&task).is_none(),
+        "the disk wait is over"
+    );
+}
+
 // The Project environment changes while the entry check is pending (with
 // the pause, the rename or the limit change that moves the Project version).
 // The run that ran is the run that was asked for: its verdict is applied.

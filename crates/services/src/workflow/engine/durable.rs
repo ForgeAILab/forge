@@ -128,6 +128,25 @@ pub(crate) fn note_hook_failure(task_id: &str, error: &ServiceError) {
 
 /// Suspend the running hooks step once this hook returns: the hook asked for
 /// a check and its result arrives later. `false` outside a hooks step.
+/// What a hooks step that waits for free disk (and not for a check) records
+/// as the thing it awaits. No check consumer has this id, so nothing is
+/// delivered to it: the step is woken by its deadline only.
+pub(crate) const DISK_WAIT: &str = "disk";
+/// How long a step that waits for disk sleeps before it looks again: the
+/// dispatcher's period for the same wait (`DISK_WAIT_RECHECK`).
+const DISK_WAIT_RECHECK_SECONDS: i64 = if cfg!(test) { 1 } else { 30 };
+
+/// The current hook cannot have its worktree made (again) while the disk is
+/// under its free-space floor. Its step waits, suspended and uncharged, and
+/// runs the hook again in 30 seconds. `false` outside a durable hooks step.
+pub(crate) fn suspend_hook_for_disk(task_id: &str) -> bool {
+    suspend_hook(
+        task_id,
+        DISK_WAIT,
+        (chrono::Utc::now() + chrono::Duration::seconds(DISK_WAIT_RECHECK_SECONDS)).to_rfc3339(),
+    )
+}
+
 pub(crate) fn suspend_hook(task_id: &str, consumer_id: &str, until: String) -> bool {
     match current_hook(task_id) {
         Some(attempt) => {

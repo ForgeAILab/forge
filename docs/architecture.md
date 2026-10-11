@@ -3771,18 +3771,38 @@ Under the floor a machine starts no new disk-consuming work:
   work is how space comes back. A ready placement whose directory is gone
   would be made again at claim, which is new disk: that recreate is refused
   with the same code. The same holds for the other callers that turn the
-  refusal into the Task's disk wait, a before-work hook and a reassignment
-  reset: they ask with `WorkspaceManager::waiting_for_disk()`, and
+  refusal into the Task's disk wait (a before-work hook, the review entry's
+  check request, a launch after its claim and a reassignment reset): they
+  ask with `WorkspaceManager::waiting_for_disk()`, and
   `ensure_valid` then returns the typed outcome
   `WorkspaceUnavailable::DiskPressure` when the worktree would have to be
   made again under the floor (directory gone, or there and unusable so that
   it would be moved aside and checked out again), and changes nothing. It
   converts to the `disk_pressure` placement refusal a claim gets
-  (`placement::capacity_wait_of` reads it as the disk wait). Callers that
-  do not ask (a launch after its claim, review, check, merge and rebase)
-  are not refused: they would report a failed step, so a missing worktree
-  is made again under the floor for them until their owners map the typed
-  outcome. A worktree that is there and valid is never refused,
+  (`placement::capacity_wait_of` reads it as the disk wait). What each
+  caller does with it:
+  - *A hook of a Task step* (`run_before_work_hooks`, `run_ci_steps`): the
+    hook waits (`workflow::actions::common::wait_for_disk`). The Task takes
+    the disk wait and the hooks step suspends on it (`awaited_consumer_id =
+    'disk'`, uncharged), to run the hook again every 30 s until the disk
+    recovers. Nothing is recorded as a hook result. A hook that reported the
+    refusal as a failure instead sent the entry down its failure path: a
+    blocking `before_enter` failure settles the step `failed` and annotates
+    the Task "Transition committed; hook failed", which parks it for its
+    owner, and the annotation moves the Task version, so the disk wait
+    recorded a moment earlier was stale at once.
+  - *A launch after its claim* (`run_execution`, the provider's
+    `owner_execution_path`, the embedded executor's turn start):
+    `TaskService::defer_launch_for_disk` ends the execution before dispatch
+    (error prefix `waiting for free disk before launch:`, `resume_policy =
+    auto`, the Task is not blocked) and records the Task's disk wait; the
+    next claim waits for disk like any other.
+  - *A reassignment reset*: records the wait and returns the typed refusal.
+
+  Callers that do not ask (merge and rebase) are not refused: they would
+  report a failed step, so a missing worktree is made again under the floor
+  for them until their owner maps the typed outcome. A worktree that is
+  there and valid is never refused,
   and neither is the in-place relink of one whose Git link broke (`git
   worktree repair`: two pointer files). A running execution is never stopped
   for disk.
@@ -9244,6 +9264,23 @@ this definition, so the policy revision stays `1`.
    run that was being stopped for someone else). Past the bound the review
    attempt is cancelled and the hook fails with `review check was lost
    before it produced a result` instead of suspending again.
+
+**A worktree that cannot be made again is a wait.** The entry check runs in
+the Task worktree. When that directory is gone and the disk is under its
+free-space floor, `prepare_workspace_for(.., Purpose::Check)` returns the
+typed disk refusal (`WorkspaceUnavailable::DiskPressure`,
+`placement::capacity_wait_of(..) == Some(CapacityWait::Disk)`) instead of
+recreating it. `run_ci_steps` then discards the attempt it had opened (no
+command ran), records the Task's disk capacity wait
+(`Capacity{disk}`, the wait a claim takes) and suspends its hooks step on the
+disk wait (`durable::suspend_hook_for_disk`: `awaited_consumer_id = 'disk'`,
+`suspended_until` 30 s ahead, uncharged). No check consumer has that id, so
+nothing is delivered to it: `wake_due_suspended` wakes the step at its
+deadline, the hook runs again, and it either waits another 30 s or proceeds
+(clearing the Task's disk wait) and asks for its check. It is never a failed
+review. The readers below treat this step like any suspended step; the
+queries that join `check_consumer` on the awaited id simply do not match it.
+`run_before_work_hooks` waits the same way (see "Disk-pressure admission").
 
 **A suspended hooks step is its own durable state.** `task_step.status =
 'suspended'` (V202610100820) with `suspended_until` (the latest time it looks

@@ -1,5 +1,9 @@
 use super::*;
 
+/// The error an execution carries when its launch was deferred for free
+/// disk ([`TaskService::defer_launch_for_disk`]).
+pub(crate) const DISK_PRE_DISPATCH_ERROR_PREFIX: &str = "waiting for free disk before launch: ";
+
 impl TaskService {
     /// Refuse paused Projects before placement or launch side effects. The
     /// execution INSERT still rechecks admission atomically for concurrent pauses.
@@ -322,6 +326,58 @@ impl TaskService {
     /// Terminalize a pre-dispatch execution while leaving its Task projection
     /// to the caller. Environment failures pause the Project and must not
     /// publish a generic executor-failed Task blocker.
+    /// A launch found its worktree gone and may not make it again while the
+    /// disk is under its free-space floor. That is the wait a claim takes
+    /// for the same reason, not a failed run: the execution ends before
+    /// dispatch without blocking the Task and auto-resumable, and the Task
+    /// takes the disk capacity wait (`Capacity{disk}`), which the
+    /// dispatcher looks at again every 30 s. `false` for any other error:
+    /// the caller handles it as before.
+    pub(crate) async fn defer_launch_for_disk(
+        &self,
+        execution_id: &str,
+        error: &ServiceError,
+    ) -> bool {
+        if crate::placement::capacity_wait_of(error) != Some(crate::placement::CapacityWait::Disk) {
+            return false;
+        }
+        let ended = match self
+            .fail_execution_before_dispatch_without_task_block(
+                execution_id,
+                format!("{DISK_PRE_DISPATCH_ERROR_PREFIX}{error}"),
+            )
+            .await
+        {
+            Ok(execution) => Some(execution),
+            Err(mark_error) => {
+                tracing::warn!(%execution_id, %mark_error, "failed to end an execution that waits for disk before launch");
+                None
+            }
+        };
+        let task_id = match ended {
+            Some(execution) => Some(execution.task_id),
+            None => ExecutionRepo::get_by_id(&*self.db, execution_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|execution| execution.task_id),
+        };
+        if let Some(task_id) = task_id {
+            match TaskRepo::get_by_id(&*self.db, &task_id, false).await {
+                Ok(Some(task)) => {
+                    if let Err(defer_error) = self.defer_placement_refusal(&task, error).await {
+                        tracing::warn!(%task_id, %defer_error, "the disk wait of a launch could not be recorded");
+                    }
+                }
+                Ok(None) => {}
+                Err(read_error) => {
+                    tracing::warn!(%task_id, %read_error, "the Task of a launch that waits for disk could not be read");
+                }
+            }
+        }
+        true
+    }
+
     pub(super) async fn fail_execution_before_dispatch_without_task_block(
         &self,
         execution_id: &str,
@@ -348,11 +404,15 @@ impl TaskService {
         // than a Task recovery action or execution retry budget.
         let environment_pre_dispatch =
             error.starts_with(crate::project_environment::ENVIRONMENT_PRE_DISPATCH_ERROR_PREFIX);
-        let resume_policy = if transient_authority_race || environment_pre_dispatch {
-            db::ResumePolicy::Auto
-        } else {
-            db::ResumePolicy::Manual
-        };
+        // So does a launch that waits for free disk: the Task's disk
+        // capacity wait is its recovery.
+        let disk_pre_dispatch = error.starts_with(DISK_PRE_DISPATCH_ERROR_PREFIX);
+        let resume_policy =
+            if transient_authority_race || environment_pre_dispatch || disk_pre_dispatch {
+                db::ResumePolicy::Auto
+            } else {
+                db::ResumePolicy::Manual
+            };
         let current = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;

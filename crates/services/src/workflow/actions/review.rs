@@ -801,8 +801,34 @@ async fn request_entry_check(
     )
     .await
     {
-        Ok(workspace) => workspace,
+        Ok(workspace) => {
+            super::common::disk_wait_over(ctx, task).await;
+            workspace
+        }
         Err(error) => {
+            // The worktree would have to be made again under the disk
+            // floor: the entry waits for disk and asks again. No command
+            // ran and no attempt exists; the woken hook opens its own.
+            if crate::placement::capacity_wait_of(&error)
+                == Some(crate::placement::CapacityWait::Disk)
+            {
+                let _ = ctx.db.discard_unstarted_review(&review.id).await;
+                if let Err(effect) = crate::workflow::engine::durable::record_hook_effect(
+                    &ctx.task_id,
+                    CI_REVIEW,
+                    &Value::Null,
+                )
+                .await
+                {
+                    return Err(failed(effect.to_string()));
+                }
+                return Err(
+                    match super::common::wait_for_disk(ctx, task, &error).await {
+                        Some(waiting) => waiting,
+                        None => failed(error.to_string()),
+                    },
+                );
+            }
             let reset = matches!(error, crate::ServiceError::WorkspaceResetRequired { .. });
             let retry = matches!(
                 error,
