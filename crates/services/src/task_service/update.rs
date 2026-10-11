@@ -156,8 +156,9 @@ pub(crate) fn retired_auditor_notice_key(task_id: &str) -> String {
 
 /// State on each open Task that still names an auditor that it does, as an
 /// owner notice in the Project's Attention feed (category `review_risk`,
-/// which the Task and Project views already render). It blocks nothing and
-/// changes no Task. Operator status reports the same Tasks for the operator;
+/// which the Task and Project views already render), in status
+/// `acknowledged`: listed, and never a wake of the Project Agent. It blocks
+/// nothing and changes no Task. Operator status reports the same Tasks for the operator;
 /// this is for the Task's owner. Run at start: such a configuration can only
 /// predate v0.14 (new ones are refused), so one pass after an upgrade finds
 /// them all. Notices of Tasks that no longer name one, or are closed, are
@@ -195,6 +196,16 @@ pub(crate) async fn state_retired_auditor_notices(db: &db::SqliteDb) -> Result<u
             &key,
         )
         .await?;
+        // A notice, not an incident. An `open` item of this category is a
+        // blocker the wake sweep gives to the Project Agent (one turn of its
+        // blocker budget per Task, with the instruction to recover a Task
+        // that needs no recovery). `acknowledged` items are listed to the
+        // owner like open ones and are no wake source.
+        sqlx::query("UPDATE attention_projection SET status = 'acknowledged', acknowledged_at = updated_at WHERE dedupe_key = ? AND status = 'open'")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db::DbError::from)?;
         tx.commit().await.map_err(db::DbError::from)?;
         opened += 1;
     }

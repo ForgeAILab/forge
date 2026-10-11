@@ -1692,8 +1692,8 @@ mod tests {
             assert!(!reported[0].error.contains(id), "{}", reported[0].error);
         }
 
-        // The same Tasks state it to their owner: one open, non-blocking
-        // notice each in the Project's Attention feed, stated once.
+        // The same Tasks state it to their owner: one non-blocking notice
+        // each in the Project's Attention feed, stated once.
         let notices = || async {
             sqlx::query_as::<_, (String, String, String, String)>(
                 "SELECT dedupe_key, attention_type, status, json_extract(details_json,'$.task.id') FROM attention_projection WHERE dedupe_key LIKE 'retired-auditor:%' ORDER BY dedupe_key",
@@ -1714,10 +1714,29 @@ mod tests {
             ["names-auditor", "names-auditor-flat"].map(|id| (
                 crate::task_service::retired_auditor_notice_key(id),
                 "review_risk".to_owned(),
-                "open".to_owned(),
+                "acknowledged".to_owned(),
                 id.to_owned()
             ))
         );
+        // Listed to the owner like an open item, and no wake source: the
+        // wake sweep reads `status = 'open'` only, so the Project Agent is
+        // not woken for it and none of its wake budget is spent.
+        // (The Attention list reads `status <> 'resolved'`.)
+        let listed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attention_projection WHERE status <> 'resolved' AND (snoozed_until IS NULL OR snoozed_until <= ?)",
+        )
+        .bind(db::now_rfc3339())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(listed, 2);
+        let wake_sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attention_projection WHERE status = 'open'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(wake_sources, 0);
         assert_eq!(
             crate::task_service::state_retired_auditor_notices(&db)
                 .await
