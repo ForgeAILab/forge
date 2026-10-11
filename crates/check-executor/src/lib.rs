@@ -860,30 +860,6 @@ pub fn legacy_ci_spec(
     }
 }
 
-/// Preserve the legacy consumer's configured indexes (including blank result
-/// rows); execution of a blank command is dropped by legacy_ci_spec above.
-pub fn legacy_ci_bundle(
-    commands: &[String],
-    env: &BTreeMap<String, String>,
-    seconds: u64,
-    daemon: bool,
-) -> CheckSpec {
-    let mut spec = legacy_ci_spec("template", env, seconds, daemon);
-    let template = spec.commands[0].clone();
-    spec.commands = commands
-        .iter()
-        .enumerate()
-        .map(|(index, text)| {
-            let mut command = template.clone();
-            command.id = format!("ci:{index}");
-            command.shell_text = text.clone();
-            command
-        })
-        .collect();
-    spec.configured_commands = spec.commands.len();
-    spec
-}
-
 /// Ordered bundle policy, usable by phased legacy owners that retain/ack each
 /// command before requesting the next. No execution or storage in this cursor.
 pub struct CheckSequence {

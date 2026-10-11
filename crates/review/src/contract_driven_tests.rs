@@ -5,7 +5,7 @@
 //! to that attempt, hands the reviewer the frozen prompt, and has Forge
 //! evaluate the reply. Everything asserted here is the contract's behaviour
 //! (`prepare_prompt`, `evaluate`, `review_source`).
-use crate::{auditor, ReviewOutcome, ReviewWorkspace};
+use crate::{ReviewOutcome, ReviewWorkspace};
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
@@ -241,12 +241,18 @@ impl ContractDriver {
         .expect("the reviewer execution is admitted for the attempt");
 
         let diff = workspace.diff(&repo.default_branch).await.unwrap();
-        let prompt = auditor::render_auditor_prompt(
-            &task.title,
-            task.description.as_deref(),
-            &diff,
-            review_prompt.as_deref(),
-        );
+        // The base text the review contract is assembled around: the
+        // Project's own prompt when it has one.
+        let prompt = review_prompt.clone().unwrap_or_else(|| {
+            format!(
+                "Review this task implementation.\n\nTask title:\n{}\n\nTask description:\n{}\n\nGit diff:\n```diff\n{diff}\n```",
+                task.title,
+                task.description
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("(no description)"),
+            )
+        });
         let unverified = |reason: String| Unverified {
             execution_id: execution.id.clone(),
             reason,

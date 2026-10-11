@@ -2960,7 +2960,19 @@ impl Canonical {
     async fn request_in(&self, key: &str, workspace: &str, steps: &[&str]) -> CheckRunRequest {
         let project = self.project_environment().await;
         let steps = steps.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        let mut spec = check_executor::legacy_ci_bundle(&steps, &project, 0, false);
+        let mut spec = check_executor::legacy_ci_spec("template", &project, 0, false);
+        let template = spec.commands[0].clone();
+        spec.commands = steps
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut command = template.clone();
+                command.id = format!("ci:{index}");
+                command.shell_text = text.clone();
+                command
+            })
+            .collect();
+        spec.configured_commands = spec.commands.len();
         spec.execution_policy = CANONICAL_CI_POLICY.into();
         spec.scope = CheckScope::Workspace {
             workspace_id: workspace.into(),
