@@ -7,16 +7,65 @@ pushes do not trigger it, so a PR runs the suite once. A newer run cancels an
 unfinished pull-request run for the same PR. Every `main` commit keeps its own
 run, because a release tag needs a successful run on its exact commit.
 
+## Rust jobs
+
+The Rust gates run as five parallel jobs, then one job that sums them up:
+
+| Job | Runs |
+| --- | --- |
+| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
+| `Rust test (services)` | `cargo test -p services --all-targets --no-fail-fast` |
+| `Rust test (api)` | `cargo test -p api --all-targets --no-fail-fast` |
+| `Rust test (db)` | `cargo test -p db --all-targets --no-fail-fast` |
+| `Rust test (rest)` | `cargo test --workspace --exclude services --exclude api --exclude db --all-targets --no-fail-fast` |
+| `Rust` | no work of its own; succeeds only if the five jobs above succeeded |
+
+`Rust` is the name to use in branch protection. It also runs when a job it
+needs failed, was cancelled or was skipped, and fails in each of those cases.
+The matrix sets `fail-fast: false` and every shard keeps `--no-fail-fast`, so
+one red run still lists every failure.
+
+Each test job runs `./scripts/ci-rust.sh test <shard>`. The packages of a shard
+are written down once, in `scripts/ci_rust_shards.py`. `rest` is defined by
+exclusion, so a new crate is tested there without an edit. The lint job runs
+`python3 scripts/ci_rust_shards.py check`, which reads `cargo metadata` and
+fails unless every workspace package is tested by exactly one shard, every
+package a shard names exists (cargo only warns about an unknown `--exclude`),
+and the workflow matrix lists exactly the shards the script defines. It prints
+the package-to-shard table and compiles nothing, so it also runs locally.
+
+Run locally, `./scripts/ci-rust.sh` without arguments is unchanged: fmt, clippy
+and `cargo test --workspace --all-targets --no-fail-fast` in one pass.
+
+A shard resolves Cargo features for its own packages, where the single
+workspace run unified them across all members. The workspace's own test
+features are unaffected: `services/test-support`, `cli-adapters/test-support`
+and `db/test-template` are requested by the dev-dependencies of each crate
+that needs them. Third-party crates can be built with fewer features in a shard
+(for example `tokio` without `test-util` outside `services`, and without `full`
+in `services` and `db`). A crate must therefore declare the features of each
+dependency it uses in its own `Cargo.toml`; a missing one fails that crate's
+shard at compile time, as it already does for a local `cargo test -p <crate>`.
+
+While `CI_RUST_TIMINGS` is set in the workflow, each test job first builds its
+test binaries with `--no-run --timings` as a separate stage and uploads
+`target/cargo-timings/` as the `cargo-timings-<shard>` artifact. This is a
+temporary measurement for balancing the shards.
+
 `.cargo/config.toml` sets `RUST_MIN_STACK` to 16 MiB for every `cargo`
 invocation, local and CI, so test threads have the same stack as the server's
 runtime threads. With the default 2 MiB a deep dispatch future aborts the whole
 test binary on Linux, and the tests after it never run.
 
-`scripts/ci-rust.sh` builds with `CARGO_PROFILE_DEV_DEBUG=line-tables-only`
-(and the same for the test profile). The workspace links more than 150
-integration-test binaries; with full debug info they fill the hosted runner's
-disk and the linker fails with `ld terminated with signal 7 [Bus error]`.
-Panics and backtraces still show file and line. Local builds are unaffected;
+CI builds with `CARGO_PROFILE_DEV_DEBUG=line-tables-only` (and the same for
+the test profile). The workspace links about 200 integration-test binaries;
+with full debug info they fill the hosted runner's disk and the linker fails
+with `ld terminated with signal 7 [Bus error]`. Panics and backtraces still
+show file and line. The two variables are set in the job-level `env:` of the
+Rust jobs in `ci.yml`, so every cargo invocation of a job, `make types`
+included, builds with the same fingerprints and reuses the same artifacts.
+`scripts/ci-rust.sh` falls back to the same values when they are unset, so a
+local run of the script behaves as before. Other local builds are unaffected;
 export the same two variables to shrink a local `target/` directory.
 
 `.cargo/config.toml` also sets `FORGE_TEST_FORBID_DEFAULT_DATA_DIR=1` for local
@@ -46,15 +95,21 @@ the failed jobs.
 
 ## Rust dependency cache
 
-CI uses `Swatinem/rust-cache` with `shared-key: rust`. The action
-automatically includes the runner platform, Rust toolchain, build environment,
-and Cargo dependency manifests in its keys; a dependency change can restore a
-previous cache and rebuild the affected dependencies.
+CI uses `Swatinem/rust-cache` with one key per Rust job: `shared-key:
+rust-lint` for the lint job and `rust-test-<shard>` for each test job. The
+jobs build different artifacts (clippy metadata, and a different set of
+dependencies and features per shard); a single key would be saved by whichever
+job finished first and miss for the others. The action automatically includes
+the runner platform, Rust toolchain, build environment (including the
+`CARGO_PROFILE_*` variables above), and Cargo dependency manifests in its
+keys; a dependency change can restore a previous cache and rebuild the
+affected dependencies.
 
-Only default-branch CI runs save this shared cache, including runs whose
-checks fail. Pull-request runs restore it without uploading large
-branch-scoped copies. This reduces competition for GitHub Actions cache
-storage.
+Only default-branch CI runs save these caches, including runs whose checks
+fail. Pull-request runs restore them without uploading large branch-scoped
+copies. This reduces competition for GitHub Actions cache storage. A new or
+renamed key therefore has no entry until a `main` run has saved it: pull
+requests build their dependencies from scratch until then.
 
 Native release builds retain a separate cache key for each target triple.
 GitHub caches are scoped to a branch or tag: a release can restore its own
@@ -68,7 +123,7 @@ The Rust cache stores dependency build artifacts, not workspace crates or
 test results. Project code still needs to compile, and the full test suite
 still executes on every run.
 
-The Rust job also runs `make types`, which executes only the api-types
+The `Rust lint` job also runs `make types`, which executes only the api-types
 export tests (the ts-rs `export_bindings_*` test of every `#[ts(export)]` type
 and the ignored `export_typescript` list), then checks `web/src/types/generated/` for changed
 or untracked bindings. After changing Rust API types, run `make types` locally
@@ -202,9 +257,10 @@ gh run view <run-id> --repo ForgeAILab/forge --job <rust-job-id> --log
 gh cache list --repo ForgeAILab/forge
 ```
 
-In the Rust log, compare `cargo clippy` and the `Finished ... test profile`
-timestamp with the final `cargo test: ok` timestamp. Time after the test
-profile finishes is spent executing tests; build caching cannot remove it.
+CI wall time is the slowest Rust job, not their sum. In a test job's log,
+compare the `Finished ... test profile` timestamp with the final
+`cargo test: ok` timestamp. Time after the test profile finishes is spent
+executing tests; build caching cannot remove it.
 
 GitHub evicts caches when storage fills or entries expire. Default-branch
 cache hits are the useful baseline for pull requests.

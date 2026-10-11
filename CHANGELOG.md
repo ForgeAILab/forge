@@ -1092,6 +1092,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **CI runs the Rust gates as parallel jobs.** The single `Rust` job is split
+  into `Rust lint` (fmt, clippy, the `make types` drift check, the script
+  tests) and four test jobs by crate (`services`, `api`, `db`, and every other
+  crate). The same commands and checks run as before; CI wall time is now the
+  slowest job, not the sum. `Rust` remains as the check that is green only
+  when all five are, so branch protection and the release gate need no change.
+  Each job has its own dependency cache, still saved only by default-branch
+  runs. `scripts/ci-rust.sh` without arguments still runs everything locally;
+  `scripts/ci_rust_shards.py check` fails CI if a workspace crate is not
+  covered by exactly one test job. See [docs/ci.md](docs/ci.md#rust-jobs).
 - **A freed machine slot goes to a queued review check before a new run.**
   A queued check reserved nothing, so under sustained load the dispatcher
   could give every freed slot to a new execution and a Task in `review` waited

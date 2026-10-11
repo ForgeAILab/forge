@@ -59,7 +59,7 @@ exports to `web/src/types/generated/bindings/` from any crate directory or
 worktree location; there is no separate Rust-side copy to synchronize.
 
 Do not edit or format these bindings by hand. ESLint and Prettier exclude them.
-The Rust CI job regenerates them and fails on changed or untracked output with
+The `Rust lint` CI job regenerates them and fails on changed or untracked output with
 a reminder to run `make types`.
 
 ## Code Standards
@@ -73,7 +73,8 @@ a reminder to run `make types`.
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes with tests where appropriate
-3. Ensure CI passes: `./scripts/ci-rust.sh`
+3. Ensure CI passes: `./scripts/ci-rust.sh` (CI runs the same checks split
+   into parallel jobs; see [docs/ci.md](docs/ci.md#rust-jobs))
 4. For frontend changes: `./scripts/ci-web.sh` and the Playwright smoke test
 5. Open a PR with a clear description of what changed and why
 
