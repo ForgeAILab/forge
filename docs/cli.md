@@ -878,8 +878,8 @@ forge-ctl operations status
 ```
 
 Reads `GET /api/v1/operations/status` (administrator login). `--output json`
-prints the whole status. Table output prints one summary line and the check
-runner's section:
+prints the whole status. Table output prints one summary line, the check
+runner's section and the merge queues' section:
 
 ```text
 Operations: healthy  active executions 2  blocked Tasks 0  recent errors 0
@@ -891,6 +891,16 @@ Checks:
   holding a slot: 1 (0 on their Task's own slot); reusable results: 4
   last 24 h: 12 run(s), 7 answered from a stored result
   last worker error: none
+Merge queue:
+  waiting               3  oldest 4 min
+  at the head           1  oldest 95 s
+  stopped               0
+  last 24 h: 12 merged
+    queue wait      p50 40 s    p95 6 min   max 15 min
+    at the head     p50 2 min   p95 9 min   max 10 min
+    - rebase        p50 3.2 s   p95 9.0 s   max 9.0 s
+    - check         p50 100 s   p95 8 min   max 8 min
+    - fast-forward  p50 0.8 s   p95 1.5 s   max 2.0 s
 ```
 
 `queued`, `running`, `waiting for slot` and `waiting for disk` are the
@@ -899,6 +909,12 @@ Checks:
 "reusable results" is `checks.reusable_results`.
 "Answered from a stored result" counts requests that reused a green result and
 ran nothing. A worker error is printed with its time.
+
+The merge queue section is `integration_queues` of the status: members in
+line, being merged (`at the head`, with the age of the oldest head) and
+stopped, then the timings of the merges completed in the last 24 hours. The
+three indented rows split the time at the head; a merge whose target had not
+moved has no rebase and no check, and a row no merge measured prints `-`.
 
 ## Operations dead letters
 

@@ -1201,6 +1201,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Operator status shows where merges spend their time (3.2 stage D3a).**
+  `GET /api/v1/operations/status` `integration_queues` adds `waiting`,
+  `heads` and `parked` (`{ count, oldest_age_seconds }`: the head age is the
+  oldest `heads` age) and `timings`: over the merges completed in the last 24
+  hours (newest 500), nearest-rank `p50_ms` / `p95_ms` / `max_ms` of the queue
+  wait, the time at the head, and its split into rebase, check and
+  fast-forward. `forge-ctl operations status` prints them as a "Merge queue"
+  section. Additive: the existing counts are unchanged.
+
 - **A review entry asks for its checks again by itself.** When the review
   commands of a Task or its Project change while the entry's checks run, the
   finished check is not applied (as before) and the entry now asks again for
