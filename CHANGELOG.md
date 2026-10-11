@@ -2218,6 +2218,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Operations status has a `checks` section.** `GET /api/v1/operations/status`
+  reports what the check runner is doing now: `queued`, `running`,
+  `waiting_for_slot` and `waiting_for_disk`, each with a count and the age of
+  its oldest entry; `runs_24h` against `reuse_hits_24h` (requests a stored
+  green result answered with no run); and `last_worker_error`. `forge-ctl
+  operations status` prints it, and the Operations page shows it as one line.
+  The existing `check_runs` counts are unchanged.
+
 - **Daemon-owned workspaces report their disk usage.** A daemon's garbage
   collector now measures the Task roots of its live handles (bounded, like
   the server's) and sends the sizes in its report (`workspace_disk`, an

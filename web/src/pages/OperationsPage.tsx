@@ -783,6 +783,15 @@ export function OperationsPage() {
         <StatCard label="Database free pages" value={status.database.free_pages} />
       </div>
       <p className="text-xs text-muted-foreground">
+        Checks {status.checks.queued.count} queued · {status.checks.running.count} running ·{' '}
+        {status.checks.waiting_for_slot.count} waiting for a slot ·{' '}
+        {status.checks.waiting_for_disk.count} waiting for disk · last 24 h{' '}
+        {status.checks.runs_24h} run(s), {status.checks.reuse_hits_24h} reused
+        {status.checks.last_worker_error
+          ? ` · worker error: ${status.checks.last_worker_error.error}`
+          : ''}
+      </p>
+      <p className="text-xs text-muted-foreground">
         Event relay {status.event_relay.running ? 'Running' : 'Stopped'} · Position{' '}
         {status.event_relay.position ?? '-'} · Head {status.event_relay.head ?? '-'}
         {status.event_relay.last_error ? ` · ${status.event_relay.last_error}` : ''}

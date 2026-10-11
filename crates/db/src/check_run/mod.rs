@@ -7,9 +7,11 @@ use sqlx::{sqlite::SqliteRow, Row};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
 mod delivery;
+mod operator;
 mod retention;
 mod worker_store;
 pub use delivery::*;
+pub use operator::*;
 pub use retention::*;
 pub use worker_store::*;
 

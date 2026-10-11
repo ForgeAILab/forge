@@ -498,6 +498,28 @@ impl OperatorStatusService {
             waiting_for_capacity: check_counts.waiting_for_capacity,
             borrowed_runs: check_counts.borrowed_runs,
         };
+        let check_summary = self.db.check_operator_summary().await?;
+        let backlog = |(count, oldest_age_seconds): db::CheckBacklogRow| api_types::CheckBacklog {
+            count,
+            oldest_age_seconds,
+        };
+        let checks = api_types::ChecksStatus {
+            queued: backlog(check_summary.queued),
+            running: backlog(check_summary.running),
+            waiting_for_slot: backlog(check_summary.waiting_for_slot),
+            waiting_for_disk: backlog(check_summary.waiting_for_disk),
+            reuse_hits_24h: check_summary.reuse_hits_24h,
+            runs_24h: check_summary.runs_24h,
+            last_worker_error: periodic_workers
+                .iter()
+                .find(|worker| worker.worker_name == crate::check_runner::worker::WORKER_NAME)
+                .and_then(|worker| {
+                    Some(api_types::CheckWorkerError {
+                        error: worker.last_error.clone()?,
+                        occurred_at: worker.last_error_at.clone()?,
+                    })
+                }),
+        };
         Ok(OperatorStatusResponse {
             overall_severity,
             active_executions,
@@ -515,6 +537,7 @@ impl OperatorStatusService {
             task_steps,
             integration_queues,
             check_runs,
+            checks,
             pending_remote_cancels,
             event_relay,
             database,
@@ -1749,6 +1772,75 @@ mod tests {
         assert!(status.workspace_cleanup.is_empty());
         assert!(status.retry_pressure.is_empty());
         assert!(status.recent_errors.is_empty());
+    }
+
+    /// The `checks` section: zero and silent on an idle server; a run that
+    /// waits for a slot and the check worker's last error are reported.
+    #[tokio::test]
+    async fn checks_section_reports_backlog_and_the_check_workers_last_error() {
+        let (db, service) = test_service().await;
+        sync_fixtures(&service).await;
+        let idle = service
+            .compute_status()
+            .await
+            .expect("status computes")
+            .checks;
+        assert_eq!(idle.queued, api_types::CheckBacklog::default());
+        assert_eq!(idle.running, api_types::CheckBacklog::default());
+        assert_eq!(idle.waiting_for_slot, api_types::CheckBacklog::default());
+        assert_eq!(idle.waiting_for_disk, api_types::CheckBacklog::default());
+        assert_eq!((idle.runs_24h, idle.reuse_hits_24h), (0, 0));
+        assert!(idle.last_worker_error.is_none());
+
+        let now = db::now_rfc3339();
+        let waiting_since = (Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        sqlx::raw_sql("INSERT INTO project(id,name,created_at,updated_at) VALUES('checks-p','p','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('checks-r','checks-p','repo','main','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at,capacity_wait_since) VALUES('waiting','checks-p','checks-r','c','d','i','{}',1,'queued','op',?,?,?)")
+            .bind(&waiting_since).bind(&now).bind(&waiting_since)
+            .execute(db.pool()).await.unwrap();
+        // The supervised worker has failed a tick.
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let _handle = service
+            .periodic_workers()
+            .worker(crate::check_runner::worker::WORKER_NAME)
+            .start(rx, || false, {
+                let entered = Arc::clone(&entered);
+                move |worker, _| {
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        let _ = worker
+                            .tick(async {
+                                Err::<(), _>(ServiceError::invalid_operation("owner port refused"))
+                            })
+                            .await;
+                        entered.notify_one();
+                        std::future::pending::<crate::Result<()>>().await
+                    }
+                }
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let checks = service
+            .compute_status()
+            .await
+            .expect("status computes")
+            .checks;
+        assert_eq!(checks.waiting_for_slot.count, 1);
+        assert!(checks
+            .waiting_for_slot
+            .oldest_age_seconds
+            .is_some_and(|age| (300..310).contains(&age)));
+        assert_eq!(checks.queued.count, 0);
+        assert_eq!(checks.runs_24h, 1);
+        let error = checks.last_worker_error.expect("the worker's last error");
+        assert!(
+            error.error.contains("owner port refused"),
+            "{}",
+            error.error
+        );
+        assert!(!error.occurred_at.is_empty());
     }
 
     #[tokio::test]

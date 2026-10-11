@@ -1,6 +1,7 @@
 use anyhow::Result;
 use api_types::{
-    DeadLetterActionResponse, DeadLetterListResponse, DeadLetterOutcome, DismissDeadLetterRequest,
+    CheckBacklog, ChecksStatus, DeadLetterActionResponse, DeadLetterListResponse,
+    DeadLetterOutcome, DismissDeadLetterRequest, OperatorStatusResponse,
 };
 use clap::Subcommand;
 
@@ -13,6 +14,9 @@ pub struct OperationsArgs {
 }
 #[derive(Subcommand)]
 enum OperationsCmd {
+    /// Show the server's operations status, with the check runner's backlog
+    /// (admin only). `--output json` prints the whole status.
+    Status,
     /// Inspect or resolve durable consumer failures (admin only).
     DeadLetters {
         #[command(subcommand)]
@@ -43,7 +47,27 @@ enum DeadLettersCmd {
 }
 impl OperationsArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
-        let OperationsCmd::DeadLetters { cmd } = &self.cmd;
+        let cmd = match &self.cmd {
+            OperationsCmd::Status => {
+                let status: OperatorStatusResponse =
+                    client.get("/api/v1/operations/status").await?;
+                return match output {
+                    OutputFormat::Json => print_json(&status),
+                    OutputFormat::Table => {
+                        println!(
+                            "Operations: {}  active executions {}  blocked Tasks {}  recent errors {}",
+                            status.overall_severity,
+                            status.active_executions.len(),
+                            status.blocked_tasks.len(),
+                            status.recent_errors.len()
+                        );
+                        print!("{}", checks_table(&status.checks));
+                        Ok(())
+                    }
+                };
+            }
+            OperationsCmd::DeadLetters { cmd } => cmd,
+        };
         match cmd {
             DeadLettersCmd::List {
                 consumer,
@@ -121,6 +145,45 @@ impl OperationsArgs {
         }
     }
 }
+/// The check runner's section of the operations status, as text.
+fn checks_table(checks: &ChecksStatus) -> String {
+    let backlog = |label: &str, backlog: &CheckBacklog| match backlog.oldest_age_seconds {
+        Some(age) if backlog.count > 0 => {
+            format!(
+                "  {label:<18}{:>5}  oldest {}\n",
+                backlog.count,
+                age_text(age)
+            )
+        }
+        _ => format!("  {label:<18}{:>5}\n", backlog.count),
+    };
+    let mut text = String::from("Checks:\n");
+    text.push_str(&backlog("queued", &checks.queued));
+    text.push_str(&backlog("running", &checks.running));
+    text.push_str(&backlog("waiting for slot", &checks.waiting_for_slot));
+    text.push_str(&backlog("waiting for disk", &checks.waiting_for_disk));
+    text.push_str(&format!(
+        "  last 24 h: {} run(s), {} answered from a stored result\n",
+        checks.runs_24h, checks.reuse_hits_24h
+    ));
+    match &checks.last_worker_error {
+        Some(error) => text.push_str(&format!(
+            "  last worker error ({}): {}\n",
+            error.occurred_at, error.error
+        )),
+        None => text.push_str("  last worker error: none\n"),
+    }
+    text
+}
+
+fn age_text(seconds: i64) -> String {
+    match seconds {
+        ..=119 => format!("{seconds} s"),
+        120..=7199 => format!("{} min", seconds / 60),
+        _ => format!("{} h", seconds / 3600),
+    }
+}
+
 fn action_path(id: &str, action: &str) -> String {
     // Encode the ID as one path segment, including arbitrary user input.
     let mut url =
@@ -234,6 +297,40 @@ mod tests {
             action_path("a/b", "replay"),
             "/api/v1/operations/dead-letters/a%2Fb/replay"
         );
+    }
+
+    #[test]
+    fn status_prints_the_check_runner_section() {
+        assert!(matches!(
+            Cli::try_parse_from(["ctl", "status"]).unwrap().args.cmd,
+            OperationsCmd::Status
+        ));
+        let checks = ChecksStatus {
+            queued: CheckBacklog {
+                count: 2,
+                oldest_age_seconds: Some(45),
+            },
+            running: CheckBacklog {
+                count: 1,
+                oldest_age_seconds: Some(600),
+            },
+            waiting_for_slot: CheckBacklog {
+                count: 3,
+                oldest_age_seconds: Some(9000),
+            },
+            waiting_for_disk: CheckBacklog::default(),
+            reuse_hits_24h: 7,
+            runs_24h: 12,
+            last_worker_error: Some(api_types::CheckWorkerError {
+                error: "database is locked".into(),
+                occurred_at: "2026-10-11T00:00:00Z".into(),
+            }),
+        };
+        assert_eq!(
+            checks_table(&checks),
+            "Checks:\n  queued                2  oldest 45 s\n  running               1  oldest 10 min\n  waiting for slot      3  oldest 2 h\n  waiting for disk      0\n  last 24 h: 12 run(s), 7 answered from a stored result\n  last worker error (2026-10-11T00:00:00Z): database is locked\n"
+        );
+        assert!(checks_table(&ChecksStatus::default()).ends_with("last worker error: none\n"));
     }
 
     #[tokio::test]

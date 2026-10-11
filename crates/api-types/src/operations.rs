@@ -84,6 +84,7 @@ pub struct OperatorStatusResponse {
     pub task_steps: TaskStepQueueStatus,
     pub integration_queues: IntegrationQueueStatus,
     pub check_runs: CheckRunStatus,
+    pub checks: ChecksStatus,
     #[ts(type = "number")]
     pub pending_remote_cancels: i64,
     pub event_relay: EventRelayStatus,
@@ -463,6 +464,50 @@ impl std::fmt::Display for DeadLetterState {
             Self::Resolved => "resolved",
         })
     }
+}
+
+/// What the check runner is doing now, for an operator: how much waits where
+/// and for how long, how much work reuse saved in the last day, and whether
+/// the worker is failing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChecksStatus {
+    /// Queued runs the worker has not refused a slot: about to be admitted.
+    pub queued: CheckBacklog,
+    /// Admitted runs: running, being cancelled, cleaning up, or uncertain
+    /// (their owner did not answer). The age is that of the oldest admission.
+    pub running: CheckBacklog,
+    /// Queued runs waiting behind a full machine, by the start of the wait.
+    pub waiting_for_slot: CheckBacklog,
+    /// Review entries whose check has not been asked for yet because the
+    /// Task worktree cannot be made again under the disk floor, by the time
+    /// the entry was queued.
+    pub waiting_for_disk: CheckBacklog,
+    /// Requests of the last 24 hours answered by a stored result: no run.
+    #[ts(type = "number")]
+    pub reuse_hits_24h: i64,
+    /// Runs scheduled in the last 24 hours.
+    #[ts(type = "number")]
+    pub runs_24h: i64,
+    /// The `check-runs` worker's most recent error, if it has one.
+    pub last_worker_error: Option<CheckWorkerError>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckBacklog {
+    #[ts(type = "number")]
+    pub count: i64,
+    /// Age of the oldest one, in seconds. Absent when there is none.
+    #[ts(type = "number | null")]
+    pub oldest_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckWorkerError {
+    pub error: String,
+    pub occurred_at: String,
 }
 
 /// Durable check worker evidence and machine admission counts.

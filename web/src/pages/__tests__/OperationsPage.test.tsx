@@ -88,6 +88,15 @@ const degradedStatus: OperatorStatusResponse = {
     waiting_for_capacity: 0,
     borrowed_runs: 0,
   },
+  checks: {
+    queued: { count: 0, oldest_age_seconds: null },
+    running: { count: 0, oldest_age_seconds: null },
+    waiting_for_slot: { count: 0, oldest_age_seconds: null },
+    waiting_for_disk: { count: 0, oldest_age_seconds: null },
+    reuse_hits_24h: 0,
+    runs_24h: 0,
+    last_worker_error: null,
+  },
   integration_queues: {
     queues_by_state: {},
     current_attempts_by_state: {},

@@ -131,7 +131,7 @@ pub(crate) fn note_hook_failure(task_id: &str, error: &ServiceError) {
 /// What a hooks step that waits for free disk (and not for a check) records
 /// as the thing it awaits. No check consumer has this id, so nothing is
 /// delivered to it: the step is woken by its deadline only.
-pub(crate) const DISK_WAIT: &str = "disk";
+pub(crate) const DISK_WAIT: &str = db::DISK_WAIT_SENTINEL;
 /// How long a step that waits for disk sleeps before it looks again: the
 /// dispatcher's period for the same wait (`DISK_WAIT_RECHECK`).
 const DISK_WAIT_RECHECK_SECONDS: i64 = if cfg!(test) { 1 } else { 30 };
