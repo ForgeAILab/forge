@@ -70,6 +70,7 @@ mod reorder_subtasks;
 mod repository_authority;
 mod review;
 pub(crate) use review::retired_review_rerun;
+pub(crate) use update::RETIRED_AUDITOR_CONFIG;
 mod roles;
 pub(crate) use roles::RoleSweepEvent;
 mod subtask;

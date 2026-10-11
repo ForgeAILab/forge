@@ -693,6 +693,221 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
     assert_eq!(result.status, "in_progress");
     assert!(result.review_passed_at.is_none());
     assert_no_synthetic_reviewer_execution(&harness.state.db, &task_id).await;
+    // The owner asked for this entry through the Task action: its failure
+    // and its bounce to remediation spend no review retry budget.
+    assert_eq!(
+        review_budget_spent(&harness.state.db, &task_id).await,
+        (0, 0),
+        "an owner's failed review re-run spends nothing"
+    );
+    let requested_by: serde_json::Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT bridge_payload FROM transition_log WHERE task_id = ? AND from_state = 'review' AND to_state = 'review'",
+        )
+        .bind(&task_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("the re-entry is logged"),
+    )
+    .expect("bridge payload parses");
+    assert_eq!(requested_by["verb"], "review_rerun");
+    assert!(
+        serde_json::from_value::<api_types::Actor>(requested_by["requested_by"].clone())
+            .expect("the requester is recorded")
+            .is_owner(),
+        "{requested_by}"
+    );
+}
+
+async fn review_budget_spent(db: &db::SqliteDb, task_id: &str) -> (i64, i64) {
+    (
+        db::budget::spent(db.pool(), task_id, "review")
+            .await
+            .expect("review budget reads"),
+        db::budget::spent(db.pool(), task_id, db::budget::REVIEW_GATE_KEY)
+            .await
+            .expect("review gate budget reads"),
+    )
+}
+
+// The owner retries the review of an unchanged commit whose checks already
+// passed. The checks are answered by that certified result (no second run),
+// but the review that was asked for is: the assigned reviewer Agent is
+// dispatched for the new attempt. A cache hit never stands in for a reviewer.
+#[tokio::test]
+async fn review_retry_on_an_unchanged_commit_reuses_green_ci_and_dispatches_the_reviewer_again() {
+    // The reviewer Agent is paused for the first retry: its checks run and no
+    // reviewer starts, so the Task is idle in `review` with a green result.
+    let (harness, task_id, reviewer, _dirs) =
+        seed_rerun_task("forge-rerun-review-hit-reviewer", Some(true)).await;
+    let reviewer = reviewer.unwrap();
+    let db = &harness.state.db;
+    let dispatcher = harness
+        .state
+        .task_dispatcher
+        .as_ref()
+        .expect("the harness composes a dispatcher");
+    post_retry(&harness, &task_id, StatusCode::OK).await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    common::drain(&harness.state, &harness.app, &task_id).await;
+    dispatcher.check_once().await.expect("dispatcher pass");
+    common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_run WHERE ? IS NOT NULL",
+            &task_id
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+            &task_id
+        )
+        .await,
+        0
+    );
+
+    AgentRepo::set_paused(&**db, &reviewer, false)
+        .await
+        .expect("reviewer resumes");
+    harness
+        .state
+        .task_service
+        .rerun_review(
+            task_id.parse().expect("Task id is a UUID"),
+            api_types::Actor::user(api_types::UserActionSource::Api),
+        )
+        .await
+        .expect("the idle review entry can be asked for again");
+    common::drain(&harness.state, &harness.app, &task_id).await;
+    dispatcher.check_once().await.expect("dispatcher pass");
+    let settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(settled.status, "review");
+
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ?",
+            &task_id
+        )
+        .await,
+        2,
+        "each retried entry asked the check runner"
+    );
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_run WHERE ? IS NOT NULL",
+            &task_id
+        )
+        .await,
+        1,
+        "the second was answered by the first one's result: nothing ran again"
+    );
+    let reviewers: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT agent_id, status FROM execution WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(&task_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        reviewers.len(),
+        1,
+        "the reviewer is dispatched: {reviewers:?}"
+    );
+    assert_eq!(reviewers[0].0.as_deref(), Some(reviewer.as_str()));
+    let mut reviews = ReviewRepo::list_by_task(&**db, &task_id).await.unwrap();
+    reviews.sort_by_key(|review| review.attempt_number);
+    assert_eq!(reviews.len(), 3);
+    assert_eq!(
+        reviews[1].status,
+        ReviewStatus::Cancelled,
+        "the replaced attempt is closed"
+    );
+    assert_eq!(reviews[2].status, ReviewStatus::Running);
+    assert!(
+        reviews[2].reviewer_execution_id.is_some(),
+        "the new attempt is the one the reviewer works on"
+    );
+    let details: serde_json::Value = serde_json::from_str(&reviews[2].step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0);
+    assert_no_synthetic_reviewer_execution(db, &task_id).await;
+}
+
+// The retried entry with an assigned reviewer that passes: checks, then the
+// reviewer's verdict on the new attempt, then merging and done, exactly as an
+// automatic entry ends. Nothing is spent.
+#[tokio::test]
+async fn review_retry_with_an_assigned_reviewer_that_passes_goes_on_to_merge() {
+    let (harness, task_id, reviewer, _dirs) =
+        seed_rerun_task_with_reviewer("forge-rerun-review-reviewer-pass", Some(false), true).await;
+    let reviewer = reviewer.unwrap();
+    let db = &harness.state.db;
+
+    post_retry(&harness, &task_id, StatusCode::OK).await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    let dispatcher = harness
+        .state
+        .task_dispatcher
+        .as_ref()
+        .expect("the harness composes a dispatcher");
+    // The reviewer runs on its own task; its verdict comes back as a step.
+    let mut settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    for _ in 0..300 {
+        if settled.status == "done" {
+            break;
+        }
+        dispatcher.check_once().await.expect("dispatcher pass");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    }
+    assert_eq!(settled.status, "done", "{:?}", settled.condition);
+
+    let mut reviews = ReviewRepo::list_by_task(&**db, &task_id).await.unwrap();
+    reviews.sort_by_key(|review| review.attempt_number);
+    assert_eq!(reviews.len(), 2, "one new attempt for the retried entry");
+    assert_eq!(reviews[1].status, ReviewStatus::Passed);
+    let details: serde_json::Value = serde_json::from_str(&reviews[1].step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0);
+    assert_eq!(details["conformance"]["status"], "passed", "{details}");
+    let reviewers: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT agent_id, status FROM execution WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(&task_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        reviewers,
+        vec![(Some(reviewer), "completed".to_owned())],
+        "the reviewer ran once, as the Agent assigned"
+    );
+    assert_eq!(
+        count(
+            db,
+            "SELECT COUNT(*) FROM check_run WHERE ? IS NOT NULL",
+            &task_id
+        )
+        .await,
+        1
+    );
+    assert_eq!(review_budget_spent(db, &task_id).await, (0, 0));
+    assert_no_synthetic_reviewer_execution(db, &task_id).await;
 }
 
 /// A Task in `review` with a worktree, green-able checks and, when asked, a
@@ -700,6 +915,14 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
 async fn seed_rerun_task(
     name: &str,
     reviewer_paused: Option<bool>,
+) -> (TestHarness, String, Option<String>, Vec<common::TestDir>) {
+    seed_rerun_task_with_reviewer(name, reviewer_paused, false).await
+}
+
+async fn seed_rerun_task_with_reviewer(
+    name: &str,
+    reviewer_paused: Option<bool>,
+    reviewer_passes: bool,
 ) -> (TestHarness, String, Option<String>, Vec<common::TestDir>) {
     let temp = common::TestDir::new(name);
     let repo_path = temp.path().join("repo");
@@ -727,7 +950,7 @@ async fn seed_rerun_task(
     run_git(&worktree_path, &["add", "."]);
     run_git(&worktree_path, &["commit", "-m", "feature"]);
     let workspace_root = common::TestDir::new(&format!("{name}-workspaces"));
-    let harness = test_app(workspace_root.path()).await;
+    let harness = test_app_with_reviewer(workspace_root.path(), reviewer_passes).await;
     let (task_id, _) = seed_awaiting_human_review_with_workspace(
         &harness.state.db,
         &task_id,
@@ -1012,6 +1235,10 @@ struct TestHarness {
 }
 
 async fn test_app(workspace_root: &Path) -> TestHarness {
+    test_app_with_reviewer(workspace_root, false).await
+}
+
+async fn test_app_with_reviewer(workspace_root: &Path, reviewer_passes: bool) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
@@ -1019,7 +1246,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
 
     let db = Arc::new(db::SqliteDb::new(pool));
     let mut registry = executors::AdapterRegistry::new();
-    registry.register(Box::new(DelayedCodexAdapter));
+    registry.register(Box::new(DelayedCodexAdapter { reviewer_passes }));
     let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
@@ -1059,7 +1286,11 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     }
 }
 
-struct DelayedCodexAdapter;
+/// Every run takes 30 seconds, except, when `reviewer_passes`, a reviewer's:
+/// it reports a passing assessment at once.
+struct DelayedCodexAdapter {
+    reviewer_passes: bool,
+}
 
 impl CodingExecutorAdapter for DelayedCodexAdapter {
     fn kind(&self) -> ExecutorKind {
@@ -1087,13 +1318,44 @@ impl CodingExecutorAdapter for DelayedCodexAdapter {
 
     fn execute<'life0, 'async_trait>(
         &'life0 self,
-        _ctx: ExecutionContext,
+        ctx: ExecutionContext,
     ) -> Pin<Box<dyn Future<Output = Result<ExecutionResult, ExecutorError>> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         Self: 'async_trait,
     {
+        let reviewer_passes = self.reviewer_passes;
         Box::pin(async move {
+            if reviewer_passes && common::is_conformance_review_prompt(&ctx.description) {
+                if let Some(parent) = Path::new(&ctx.logs_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut writer = executors::LogWriter::new(
+                    &ctx.logs_path,
+                    ctx.execution_id.clone(),
+                    1024 * 1024,
+                );
+                writer
+                    .write(
+                        executors::LogKind::Assistant,
+                        executors::LogStream::Main,
+                        json!({
+                            "text": common::passing_review_assessment(
+                                &ctx.description,
+                                Path::new(&ctx.worktree_path),
+                            )
+                        }),
+                    )
+                    .await?;
+                return Ok(ExecutionResult {
+                    status: ExecutionOutcome::Completed,
+                    after_sha: None,
+                    agent_session_id: Some("manual-review-reviewer-session".to_owned()),
+                    summary: Some("reviewer passed the implementation".to_owned()),
+                    error: None,
+                    ..Default::default()
+                });
+            }
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,

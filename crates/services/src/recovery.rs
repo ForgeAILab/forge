@@ -259,6 +259,68 @@ impl CrashRecovery {
             .await?;
         }
 
+        // The inline review re-run of earlier versions left reviewer and
+        // auditor executions `running` under leases only that pipeline
+        // renewed. Nothing runs them now: stop them at start, whatever their
+        // lease says, and let each Task's review entry run again.
+        let leftover_tasks: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM execution WHERE status = 'running' AND role IN ('reviewer','auditor')",
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        for task_id in leftover_tasks {
+            let mut leftovers = ExecutionRepo::list_running_by_task(&*self.db, &task_id)
+                .await?
+                .into_iter()
+                .filter(crate::task_service::retired_review_rerun)
+                .map(|execution| execution.id)
+                .collect::<Vec<_>>();
+            if leftovers.is_empty() {
+                continue;
+            }
+            leftovers.sort();
+            let Some(task) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? else {
+                continue;
+            };
+            let key = format!("settle_retired_review_rerun:{}", leftovers.join(","));
+            let prefix = format!("{key}:");
+            let queued: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND substr(causation_key,1,length(?))=?)")
+                .bind(&task.id)
+                .bind(&prefix)
+                .bind(&prefix)
+                .fetch_one(self.db.pool())
+                .await?;
+            if queued {
+                continue;
+            }
+            let id = db::new_uuid_v4();
+            db::TaskStepRepo::enqueue_step(
+                &*self.db,
+                &db::EnqueueTaskStep {
+                    id: id.clone(),
+                    task_id: task.id.clone(),
+                    kind: "command".into(),
+                    payload_json: crate::task_service::commands::TaskCommand {
+                        operation: "settle_retired_review_rerun".into(),
+                        arguments: json!([task.id]),
+                        preempt: false,
+                    }
+                    .payload_json()?,
+                    causation_step_id: None,
+                    causation_key: format!("{key}:{id}"),
+                    chain_id: id,
+                    chain_position: 1,
+                    expected_status: task.status,
+                    expected_version: task.version,
+                    expected_epoch: None,
+                    lane: "fast".into(),
+                    available_at: now_rfc3339(),
+                },
+            )
+            .await?;
+        }
+
         recovered += sweep_stale_recovery_annotations(&self.db).await?;
 
         tracing::info!(recovered_tasks = recovered, "crash recovery completed");
@@ -1507,6 +1569,28 @@ pub(crate) async fn cancel_running_executions(
     .await
 }
 
+/// Stop every execution of the retired inline review re-run still `running`
+/// for the Task (its reviewer execution and, if it had one, the auditor
+/// child), whatever their leases say. Returns the ids it stopped.
+pub(crate) async fn stop_retired_review_reruns(
+    db: &SqliteDb,
+    task_id: &str,
+) -> Result<Vec<String>> {
+    Ok(cancel_running_executions_matching(
+        db,
+        task_id,
+        StopReason::CrashRecovery,
+        &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
+        ResumePolicy::Manual,
+        false,
+        true,
+    )
+    .await?
+    .into_iter()
+    .map(|execution| execution.execution_id)
+    .collect())
+}
+
 async fn cancel_running_executions_for_recovery(
     db: &SqliteDb,
     task_id: &str,
@@ -1515,10 +1599,37 @@ async fn cancel_running_executions_for_recovery(
     resume_policy: ResumePolicy,
     preserve_healthy_owner: bool,
 ) -> Result<Vec<CancelledExecution>> {
+    cancel_running_executions_matching(
+        db,
+        task_id,
+        stop_reason,
+        stopped_by,
+        resume_policy,
+        preserve_healthy_owner,
+        false,
+    )
+    .await
+}
+
+/// `only_retired_review_reruns` narrows the stop to executions of the retired
+/// inline review re-run, which are settled on their own
+/// ([`crate::TaskService::settle_retired_review_rerun`]).
+async fn cancel_running_executions_matching(
+    db: &SqliteDb,
+    task_id: &str,
+    stop_reason: StopReason,
+    stopped_by: &api_types::Actor,
+    resume_policy: ResumePolicy,
+    preserve_healthy_owner: bool,
+    only_retired_review_reruns: bool,
+) -> Result<Vec<CancelledExecution>> {
     let executions = ExecutionRepo::list_running_by_task(db, task_id).await?;
     let mut cancelled = Vec::new();
     let now = now_rfc3339();
     for execution in executions {
+        if only_retired_review_reruns && !crate::task_service::retired_review_rerun(&execution) {
+            continue;
+        }
         if matches!(
             stop_reason,
             StopReason::CrashRecovery | StopReason::AgentTimeout

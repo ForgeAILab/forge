@@ -617,7 +617,47 @@ impl Fixture {
             .daemon_connections
             .get(&self.daemon_id)
             .unwrap();
-        ReviewRepo::create_attempt_with_execution_and_lease(
+        // The fixture states the rows a dispatched reviewer leaves (a running
+        // reviewer execution leased to this daemon connection, and the
+        // attempt bound to it); dispatch admission is not its subject.
+        sqlx::query(
+            "INSERT INTO execution (id, task_id, agent_id, role, status, parent_execution_id, workspace_id, created_at, updated_at)
+             VALUES (?, ?, ?, 'reviewer', 'running', ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(input.agent_id.as_deref())
+        .bind(input.parent_execution_id.as_deref())
+        .bind(input.workspace_id.as_deref())
+        .bind(&now)
+        .bind(&now)
+        .execute(self.harness.state.db.pool())
+        .await
+        .expect("the reviewer execution row inserts");
+        let created = ExecutionRepo::get_by_id(&*self.harness.state.db, &reviewer_id)
+            .await
+            .expect("reviewer reads")
+            .expect("reviewer exists");
+        let leased = ExecutionRepo::claim_lease(
+            &*self.harness.state.db,
+            db::ClaimExecutionLease {
+                execution_id: reviewer_id.clone(),
+                expected_version: created.execution_version,
+                owner: services::daemon_transport::execution_lease_owner(
+                    &self.daemon_id,
+                    connection.id(),
+                ),
+                lease_expires_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+                hard_deadline_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+                ),
+                now: now.clone(),
+            },
+        )
+        .await
+        .expect("the owner lease is claimed");
+        assert!(matches!(leased, db::ExecutionLeaseMutation::Updated(_)));
+        let review = ReviewRepo::create(
             &*self.harness.state.db,
             CreateReview {
                 id: db::new_uuid_v4(),
@@ -628,26 +668,27 @@ impl Fixture {
                 step_results_json: "{}".into(),
                 started_at: now.clone(),
                 created_at: now.clone(),
-                updated_at: now.clone(),
+                updated_at: now,
             },
-            input,
-            db::ClaimExecutionLease {
-                execution_id: reviewer_id,
-                expected_version: 1,
-                owner: services::daemon_transport::execution_lease_owner(
-                    &self.daemon_id,
-                    connection.id(),
-                ),
-                lease_expires_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
-                hard_deadline_at: Some(
-                    (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
-                ),
-                now,
-            },
-            None,
         )
         .await
-        .expect("review attempt and owner lease admit together")
+        .expect("review attempt opens");
+
+        sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+            .bind(&reviewer_id)
+            .bind(&review.id)
+            .execute(self.harness.state.db.pool())
+            .await
+            .expect("the attempt binds its reviewer");
+        let review = ReviewRepo::get_by_id(&*self.harness.state.db, &review.id)
+            .await
+            .expect("review reads")
+            .expect("review exists");
+        let reviewer = ExecutionRepo::get_by_id(&*self.harness.state.db, &reviewer_id)
+            .await
+            .expect("reviewer reads")
+            .expect("reviewer exists");
+        (review, reviewer)
     }
 
     async fn approve_candidate(&self) -> ReviewContract {
@@ -3069,7 +3110,10 @@ async fn a_review_rerun_on_a_daemon_owned_task_runs_remote_ci_under_the_cancel_f
     // asked of the check runner, which runs it on the daemon that owns the
     // worktree.
     let entered = service
-        .rerun_review(task_id.parse().expect("the Task id is a UUID"))
+        .rerun_review(
+            task_id.parse().expect("the Task id is a UUID"),
+            api_types::Actor::user(api_types::UserActionSource::Api),
+        )
         .await
         .unwrap();
     assert_eq!(entered.status, "review");

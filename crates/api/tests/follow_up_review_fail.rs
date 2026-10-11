@@ -204,14 +204,160 @@ async fn auditor_failure_dispatches_follow_up_executor_with_thread_reuse() {
     }
 }
 
+// The reviewer role is read-only. A reviewer whose process edits a tracked
+// file anyway (a CLI executor cannot be confined to a read-only worktree) and
+// then reports a passing review does not pass the Task: its execution fails
+// with the read-only reason, the edit is discarded, and no Review passes.
+// This is the only review path there is; the retired inline re-run handled
+// the same case with a restore of its own.
+#[tokio::test]
+async fn a_reviewer_that_writes_to_the_worktree_fails_and_its_changes_are_discarded() {
+    let repo_dir = common::TestDir::new("forge-review-write-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
+    let workspaces_root = common::TestDir::new("forge-review-write-workspaces");
+    let worktrees = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let harness = test_app(
+        workspaces_root.path(),
+        ReviewFailCodexAdapter::with_writing_reviewer(Arc::clone(&worktrees)),
+    )
+    .await;
+
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "Review Write" }),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "repo",
+            "local_path": repo_path.to_string_lossy(),
+            "remote_url": repo_path.to_string_lossy(),
+            "default_branch": default_branch
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
+    let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
+    let reviewer_agent = create_agent(&harness.app, "reviewer", &daemon_id).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &executor_agent.id,
+        &reviewer_agent.id,
+    )
+    .await;
+    let created_task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({ "title": "Review write task",
+            "description": "make a small implementation",
+            "role_assignments": [{"role_name": "reviewer", "assignee_type": "agent", "assignee_id": reviewer_agent.id}],
+            "review_config": { "review_prompt": "Review the implementation." }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", created_task.id),
+        json!({ "agent_id": executor_agent.id, "overrides": null }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let mut failed_reviewer = None;
+    for _ in 0..400 {
+        failed_reviewer = executions_for_task(&harness.app, &created_task.id)
+            .await
+            .into_iter()
+            .find(|execution| {
+                execution.role == "reviewer" && execution.status == ExecutionStatus::Failed
+            });
+        if failed_reviewer.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let failed_reviewer = failed_reviewer.expect("the writing reviewer's execution fails");
+    let reviewer: ExecutionResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{}", failed_reviewer.id),
+        StatusCode::OK,
+    )
+    .await;
+    let error = reviewer.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("read-only execution produced worktree changes")
+            && error.contains("role 'reviewer' never receives write access"),
+        "{error}"
+    );
+
+    let worktree = worktrees.lock().expect("worktree list locks")[0].clone();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).expect("README reads"),
+        "# Review Fail\n",
+        "the reviewer's edit is discarded"
+    );
+    assert_eq!(
+        run_git(
+            &worktree,
+            &["status", "--porcelain", "--untracked-files=no"]
+        ),
+        ""
+    );
+
+    let passed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ? AND status = 'passed'")
+            .bind(&created_task.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("reviews count");
+    assert_eq!(passed, 0, "a review by a reviewer that wrote does not pass");
+    let task: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", created_task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        !matches!(task.status.as_str(), "merging" | "done"),
+        "the Task does not advance on that review: {}",
+        task.status
+    );
+}
+
 struct ReviewFailCodexAdapter {
     executor_calls: Arc<AtomicUsize>,
+    /// Set: the reviewer passes the work but edits a tracked file first. The
+    /// worktree it ran in is recorded here.
+    writing_reviewer: Option<Arc<std::sync::Mutex<Vec<PathBuf>>>>,
 }
 
 impl ReviewFailCodexAdapter {
     fn new() -> Self {
         Self {
             executor_calls: Arc::new(AtomicUsize::new(0)),
+            writing_reviewer: None,
+        }
+    }
+
+    fn with_writing_reviewer(worktrees: Arc<std::sync::Mutex<Vec<PathBuf>>>) -> Self {
+        Self {
+            executor_calls: Arc::new(AtomicUsize::new(0)),
+            writing_reviewer: Some(worktrees),
         }
     }
 }
@@ -249,7 +395,46 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
         Self: 'async_trait,
     {
         let executor_calls = Arc::clone(&self.executor_calls);
+        let writing_reviewer = self.writing_reviewer.clone();
         Box::pin(async move {
+            if let Some(worktrees) =
+                writing_reviewer.filter(|_| common::is_conformance_review_prompt(&ctx.description))
+            {
+                let worktree = PathBuf::from(&ctx.worktree_path);
+                let first = {
+                    let mut seen = worktrees.lock().expect("worktree list locks");
+                    seen.push(worktree.clone());
+                    seen.len() == 1
+                };
+                if !first {
+                    // A later reviewer run stays out of the worktree.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                std::fs::write(worktree.join("README.md"), "# Rewritten by the reviewer\n")?;
+                if let Some(parent) = Path::new(&ctx.logs_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut writer =
+                    LogWriter::new(&ctx.logs_path, ctx.execution_id.clone(), 1024 * 1024);
+                writer
+                    .write(
+                        LogKind::Assistant,
+                        LogStream::Main,
+                        json!({
+                            "text": common::passing_review_assessment(&ctx.description, &worktree)
+                        }),
+                    )
+                    .await?;
+                return Ok(ExecutionResult {
+                    status: ExecutionOutcome::Completed,
+                    after_sha: None,
+                    agent_session_id: Some("writing-reviewer-session".to_owned()),
+                    summary: Some("reviewer passed the implementation".to_owned()),
+                    error: None,
+                    usage_reports: Vec::new(),
+                    ..Default::default()
+                });
+            }
             if common::is_conformance_review_prompt(&ctx.description) {
                 write_auditor_failure(&ctx).await?;
                 return Ok(ExecutionResult {

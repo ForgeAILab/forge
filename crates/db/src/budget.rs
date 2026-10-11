@@ -488,6 +488,9 @@ pub async fn review_verdict(
     if latest.as_deref() != Some(review.id.as_str()) || details.get("execution_failure").is_some() {
         return Ok(());
     }
+    if owner_requested_review_entry(tx, &task.id, None, Some(&review.created_at)).await? {
+        return Ok(());
+    }
     if let Some(c) = details.get("conformance").filter(|v| !v.is_null()) {
         let conformance: api_types::ReviewConformance =
             serde_json::from_value(c.clone()).map_err(|e| DbError::Check(e.to_string()))?;
@@ -570,6 +573,9 @@ pub async fn transition(
         return Ok(());
     }
     if from == "review" && rejection {
+        if owner_requested_review_entry(tx, task, Some(step), None).await? {
+            return Ok(());
+        }
         let latest:Option<(String,String)>=sqlx::query_as("SELECT id,status FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1").bind(task).fetch_optional(&mut **tx).await?;
         // Failed verdict settlement is the charge point for failures. This branch
         // retains only the already-existing gate-outcome debit (or a gate with no Review).
@@ -677,6 +683,57 @@ fn owner_step(task: &str) -> bool {
         })
 }
 
+/// Whether the owner asked for the review entry the Task is in, or the one it
+/// is leaving: a review re-run records who requested it on the entry's
+/// transition row. Such an entry is routed as the workflow's own, but nothing
+/// it causes (red checks, a failing reviewer, the bounce to remediation)
+/// spends review retry budget. `leaving` is the transition row being written
+/// by the move out of `review`; `since` limits the answer to a Review the
+/// entry itself opened.
+pub async fn owner_requested_review_entry(
+    tx: &mut Transaction<'_, Sqlite>,
+    task: &str,
+    leaving: Option<&str>,
+    since: Option<&str>,
+) -> Result<bool> {
+    Ok(review_rerun_entry(&mut **tx, task, leaving)
+        .await?
+        .is_some_and(|(requested_by, entered_at)| {
+            requested_by.is_owner() && since.is_none_or(|opened| opened >= entered_at.as_str())
+        }))
+}
+
+/// The latest entry of the Task into `review`, when it is a review re-run:
+/// who asked for it and when it began. `leaving` excludes the transition row
+/// a move out of `review` is writing. A Review created before that time is
+/// not this entry's.
+pub async fn review_rerun_entry<'e, E>(
+    executor: E,
+    task: &str,
+    leaving: Option<&str>,
+) -> Result<Option<(api_types::Actor, String)>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    // Only an entry logs its epoch; a recovery marker written while the Task
+    // sits in `review` has none.
+    let entry: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT id,bridge_kind,bridge_payload,created_at FROM transition_log
+         WHERE task_id=? AND to_state='review' AND status_epoch IS NOT NULL AND id IS NOT ?
+         ORDER BY status_epoch DESC,created_at DESC,rowid DESC LIMIT 1",
+    )
+    .bind(task)
+    .bind(leaving)
+    .fetch_optional(executor)
+    .await?;
+    Ok(entry.and_then(|(id, kind, payload, entered_at)| {
+        crate::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref())
+            .ok()?
+            .review_rerun_requester()
+            .map(|requested_by| (requested_by, entered_at))
+    }))
+}
+
 /// Honor routing only when the reviewer verdict caused the failure. Forge
 /// replaces the assessment reason when setup, checks, or reproduction fail.
 pub fn owner_review_failure_message(
@@ -728,7 +785,9 @@ pub fn owner_review_failure_message(
 }
 
 /// A failed review-entry hook with no failed Review consumes one Review
-/// attempt, owner-entered or not, exactly as base counted the bounce. Its
+/// attempt, owner-entered or not, exactly as base counted the bounce; only an
+/// entry the owner asked for as a review re-run
+/// ([`owner_requested_review_entry`]) consumes none. Its
 /// receipt ([`entry_charge_step`]) and either the exhausted barrier or the
 /// cleared barrier commit together; the bounce cascade reuses the receipt.
 pub async fn failed_review_entry(
@@ -748,15 +807,27 @@ pub async fn failed_review_entry(
     if current.status != task.status {
         return Err(DbError::VersionConflict);
     }
-    let charged = charge(
-        &mut tx,
-        &task.id,
-        Kind::Review.key(),
-        limit,
-        &entry_charge_step(hook_step),
-    )
-    .await?;
-    let allowed = allows_retry(limit, charged.spent);
+    let spent_now = if owner_requested_review_entry(&mut tx, &task.id, None, None).await? {
+        // The owner asked for this entry: it leaves the budget where it was.
+        sqlx::query_scalar(
+            "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind=?),0)",
+        )
+        .bind(&task.id)
+        .bind(Kind::Review.key())
+        .fetch_one(&mut *tx)
+        .await?
+    } else {
+        charge(
+            &mut tx,
+            &task.id,
+            Kind::Review.key(),
+            limit,
+            &entry_charge_step(hook_step),
+        )
+        .await?
+        .spent
+    };
+    let allowed = allows_retry(limit, spent_now);
     let barrier = (!allowed).then(|| exhausted_review_barrier(&task.status, started_at));
     sqlx::query("UPDATE task SET entry_barrier_json=?,updated_at=?,version=version+1 WHERE id=?")
         .bind(barrier)
@@ -1099,6 +1170,136 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    async fn log_review_entry(
+        db: &SqliteDb,
+        id: &str,
+        epoch: i64,
+        at: &str,
+        by: Option<api_types::Actor>,
+    ) {
+        let bridge = by
+            .map(|actor| api_types::TransitionBridge::review_rerun(&actor))
+            .unwrap_or_default();
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload,status_epoch) VALUES(?,'t','review','review','system','entry',?,?,?,?)")
+            .bind(id)
+            .bind(at)
+            .bind(bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+            .bind(bridge.bridge_payload.map(|payload| payload.to_string()))
+            .bind(epoch)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    async fn review_spent(db: &SqliteDb) -> (i64, i64) {
+        (
+            spent(db.pool(), "t", Kind::Review.key()).await.unwrap(),
+            spent(db.pool(), "t", REVIEW_GATE_KEY).await.unwrap(),
+        )
+    }
+
+    // Every charge a review entry can cause is skipped when the owner asked
+    // for that entry as a review re-run, and only then: a failing reviewer and
+    // the bounce out of `review` here; the failed entry hook asks the same
+    // question under its step lease (services `rerun_review` tests).
+    #[tokio::test]
+    async fn an_owner_requested_review_rerun_entry_spends_nothing_and_any_other_entry_spends() {
+        let (db, task) = fixture().await;
+        let owner = api_types::Actor::user(api_types::UserActionSource::Api);
+        let workflow = api_types::Actor::system(api_types::SystemComponent::Workflow);
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('e','t','coder','completed','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        let fail = |id: &'static str, attempt: i64, at: &'static str| {
+            let db = &db;
+            let task = &task;
+            async move {
+                sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES(?,'t','e',?,'running','{}',?,?,?)").bind(id).bind(attempt).bind(at).bind(at).bind(at).execute(db.pool()).await.unwrap();
+                let review = crate::ReviewRepo::get_by_id(db, id).await.unwrap().unwrap();
+                let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+                review_verdict(
+                    &mut tx,
+                    task,
+                    &review,
+                    &ReviewStatus::Failed,
+                    &json!({}),
+                    false,
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE review SET status='failed' WHERE id=?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            }
+        };
+        let bounce = |log: &'static str| {
+            let db = &db;
+            async move {
+                let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+                transition(
+                    &mut tx,
+                    "t",
+                    "review",
+                    false,
+                    &Default::default(),
+                    true,
+                    log,
+                    None,
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        };
+
+        // The owner's re-runs: three entries, each fails every way it can.
+        for (n, (entry, review, at, out)) in [
+            ("o1", "r1", "2026-01-01T00:00:01Z", "x1"),
+            ("o2", "r2", "2026-01-01T00:00:02Z", "x2"),
+            ("o3", "r3", "2026-01-01T00:00:03Z", "x3"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            log_review_entry(&db, entry, n as i64 + 1, at, Some(owner.clone())).await;
+            fail(review, n as i64 + 1, at).await;
+            bounce(out).await;
+            assert_eq!(review_spent(&db).await, (0, 0), "owner re-run {entry}");
+        }
+
+        // A marker written while the Task sits in `review` is not an entry.
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload) VALUES('m','t','review','review','user','note','2026-01-01T00:00:04Z','recovery','{\"verb\":\"retry\"}')").execute(db.pool()).await.unwrap();
+        bounce("x4").await;
+        assert_eq!(review_spent(&db).await, (0, 0));
+
+        // A Review the entry did not open is not covered by it.
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(
+            !owner_requested_review_entry(&mut tx, "t", None, Some("2026-01-01T00:00:00Z"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            owner_requested_review_entry(&mut tx, "t", None, Some("2026-01-01T00:00:03Z"))
+                .await
+                .unwrap()
+        );
+        drop(tx);
+
+        // The same re-run asked for by the workflow itself spends, everywhere.
+        log_review_entry(&db, "s1", 4, "2026-01-01T00:00:05Z", Some(workflow)).await;
+        fail("r4", 4, "2026-01-01T00:00:05Z").await;
+        assert_eq!(review_spent(&db).await, (1, 0), "the reviewer's verdict");
+        bounce("x5").await;
+        assert_eq!(review_spent(&db).await, (1, 1), "the bounce's gate debit");
+        // And so does an ordinary entry.
+        log_review_entry(&db, "a1", 5, "2026-01-01T00:00:06Z", None).await;
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(!owner_requested_review_entry(&mut tx, "t", None, None)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

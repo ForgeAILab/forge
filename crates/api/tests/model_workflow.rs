@@ -853,7 +853,6 @@ impl World {
         if !state_config["review"].is_object() {
             state_config["review"] = json!({ "review_prompt": "Review the model deliverable." });
         }
-        state_config["review"]["auditor_agent_id"] = json!(self.reviewer_id);
         sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
             .bind(state_config.to_string())
             .bind(&id)

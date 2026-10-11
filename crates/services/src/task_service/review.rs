@@ -27,11 +27,15 @@ impl TaskService {
     /// Settle an execution of the retired inline review re-run that recovery
     /// just stopped: say on the execution why it ended, then run the Task's
     /// review entry again through the durable path. The re-entry closes the
-    /// review attempt the old pipeline left open. When the entry cannot run
-    /// (the Task is busy or has no candidate), the Task is parked on the
-    /// stopped execution with the owner's ordinary recovery actions.
+    /// review attempt the old pipeline left open.
+    ///
+    /// The old pipeline ran an auditor child beside its reviewer execution;
+    /// the Task is settled once, when the last of them has stopped. A Task
+    /// whose review entry is already running needs nothing more. When the
+    /// entry cannot run at all (the Task has no candidate), the Task is
+    /// blocked on the stopped execution with the owner's recovery actions.
     pub(crate) async fn settle_retired_review_rerun(&self, execution: &Execution) -> Result<()> {
-        const REASON: &str = "this reviewer execution belonged to the inline review re-run, \
+        const REASON: &str = "this execution belonged to the inline review re-run, \
              which this Forge version no longer has; it was stopped at upgrade";
         sqlx::query(
             "UPDATE execution SET error = ?, updated_at = ? WHERE id = ? AND status <> 'running'",
@@ -48,20 +52,47 @@ impl TaskService {
         if task.status != "review" {
             return Ok(());
         }
+        if ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+            .await?
+            .iter()
+            .any(retired_review_rerun)
+        {
+            return Ok(());
+        }
         let id = Uuid::parse_str(&task.id)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        if let Err(error) = Box::pin(self.rerun_review(id)).await {
-            tracing::warn!(
-                task_id = %task.id,
-                execution_id = %execution.id,
-                %error,
-                "the review entry could not be re-run after the retired inline re-run was stopped"
-            );
-            let mut stopped = execution.clone();
-            stopped.error = Some(format!(
-                "{REASON}, and the review entry could not be run again: {error}"
-            ));
-            self.annotate_executor_failure_block(&stopped).await?;
+        let requested_by = Actor::system(api_types::SystemComponent::CrashRecovery);
+        match Box::pin(self.rerun_review(id, requested_by)).await {
+            Ok(_) | Err(ServiceError::TaskBusy { .. }) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    %error,
+                    "the review entry could not be re-run after the retired inline re-run was stopped"
+                );
+                let mut stopped = execution.clone();
+                stopped.error = Some(format!(
+                    "{REASON}, and the review entry could not be run again: {error}"
+                ));
+                let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                self.block_task_after_executor_failure(&task, &stopped)
+                    .await
+            }
+        }
+    }
+
+    /// Start-time half of [`Self::settle_retired_review_rerun`]: a server
+    /// restarted quickly still holds the old pipeline's unexpired leases, so
+    /// its executions are stopped here instead of waiting for them to expire.
+    pub(crate) async fn stop_retired_review_reruns(&self, task_id: &str) -> Result<()> {
+        let stopped = crate::recovery::stop_retired_review_reruns(&self.db, task_id).await?;
+        for execution_id in &stopped {
+            if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? {
+                self.settle_retired_review_rerun(&execution).await?;
+            }
         }
         Ok(())
     }
@@ -198,14 +229,20 @@ impl TaskService {
     /// reviewer passes on its checks, and a gate that requires a person still
     /// waits for one. A same-state entry is never a mechanical merge bridge,
     /// so a carried approval cannot stand in for the review that was asked for.
-    pub async fn rerun_review(&self, task_id: Uuid) -> Result<Task> {
+    ///
+    /// `requested_by` is who asked. It does not route the entry; it is
+    /// recorded on the entry, and an entry the owner asked for spends no
+    /// review retry budget whatever it finds (red checks, a failing reviewer,
+    /// the bounce to remediation). Any other requester's entry spends as an
+    /// automatic one does.
+    pub async fn rerun_review(&self, task_id: Uuid, requested_by: Actor) -> Result<Task> {
         let task_id = task_id.to_string();
         if !db::task_writer::owns_task(&task_id) {
             return self
                 .request_task_command(
                     &task_id,
                     "rerun_review",
-                    serde_json::json!([task_id]),
+                    serde_json::json!([task_id, requested_by]),
                     false,
                 )
                 .await;
@@ -222,6 +259,27 @@ impl TaskService {
         }
         // A review needs something to review.
         self.latest_executor_execution(&task.id).await?;
+        // A Task configured before v0.14 may still name an auditor. The
+        // review it expects is the reviewer's: without an Agent in that role
+        // the re-run would pass on its checks alone, so it is refused, as the
+        // inline re-run refused it.
+        if super::update::names_retired_auditor(task.task_state_config.as_deref())
+            && !TaskRoleAssignmentRepo::get_by_task_and_role(
+                &*self.db,
+                &task.id,
+                crate::workflow::default_roles::REVIEWER,
+            )
+            .await?
+            .is_some_and(|assignment| {
+                assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            })
+        {
+            return Err(ServiceError::conflict(format!(
+                "task {task_id} names an auditor and has no reviewer Agent: {}",
+                super::update::RETIRED_AUDITOR_CONFIG
+            )));
+        }
         // One review pipeline per Task. An entry that is still running (its
         // hooks step is queued, claimed or suspended on a check) or a
         // reviewer that is still working is not replaced by a second one.
@@ -287,19 +345,17 @@ impl TaskService {
         let reason = "review re-run requested";
         let entered = self
             .workflow_execution()
-            .manual_override_transition_with_authority(
-                &task.id,
-                &task.status,
-                task.version,
+            .review_rerun_entry_with_authority(
+                &task,
                 &workflow,
                 actor,
                 reason,
-                false,
-                Some(crate::workflow::engine::WorkflowAuthority {
+                crate::workflow::engine::WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
                     clear_review_passed_at_on_commit: false,
-                }),
+                },
+                api_types::TransitionBridge::review_rerun(&requested_by),
             )
             .await?
             .task;

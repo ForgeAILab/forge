@@ -1051,7 +1051,7 @@ impl TaskService {
         let id = Uuid::parse_str(&task.id)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let updated = TASK_ACTION_COMMAND
-            .scope((), Box::pin(self.rerun_review(id)))
+            .scope((), Box::pin(self.rerun_review(id, actor.clone())))
             .await?;
         self.queue_deferred_action_role(updated, offer, action, actor)
             .await

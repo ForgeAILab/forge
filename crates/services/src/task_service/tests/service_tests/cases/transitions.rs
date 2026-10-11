@@ -420,7 +420,10 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
         .unwrap());
 
     let entered = service
-        .rerun_review(Uuid::parse_str(&task.id).unwrap())
+        .rerun_review(
+            Uuid::parse_str(&task.id).unwrap(),
+            api_types::Actor::user(api_types::UserActionSource::Api),
+        )
         .await
         .unwrap();
     assert_eq!(entered.status, "review", "the retry only re-enters review");

@@ -43,6 +43,7 @@ impl TaskService {
         } = request;
         let merge_config = serialize_config(merge_config)?;
         let requested_state_config = serialize_config(task_state_config)?;
+        reject_retired_auditor_config(requested_state_config.as_deref())?;
         let task_state_config = if let Some(requirement_ids) = review_requirement_ids.as_deref() {
             let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
@@ -117,6 +118,39 @@ impl TaskService {
     }
 }
 
+/// `review.auditor_agent_id` belonged to the inline review re-run, which ran a
+/// second, "auditor" pass. There is one review path now and it has no
+/// auditor: the review is done by the Agent assigned to the Task's `reviewer`
+/// role. A Task configuration that names an auditor would be believed to
+/// require a review that nothing runs, so it is not accepted.
+pub(crate) const RETIRED_AUDITOR_CONFIG: &str =
+    "review.auditor_agent_id is no longer supported: there is no separate auditor pass. \
+     Assign the Agent to the Task's `reviewer` role and remove the key";
+
+/// Whether a Task state configuration still names an auditor.
+pub(crate) fn names_retired_auditor(config: Option<&str>) -> bool {
+    config
+        .and_then(|config| serde_json::from_str::<Value>(config).ok())
+        .is_some_and(|config| {
+            ["/review/auditor_agent_id", "/auditor_agent_id"]
+                .into_iter()
+                .any(|pointer| {
+                    config
+                        .pointer(pointer)
+                        .is_some_and(|value| !value.is_null())
+                })
+        })
+}
+
+pub(super) fn reject_retired_auditor_config(config: Option<&str>) -> Result<()> {
+    if names_retired_auditor(config) {
+        return Err(ServiceError::invalid_operation(format!(
+            "task_state_config.{RETIRED_AUDITOR_CONFIG}"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn review_requirement_ids_from_config(
     config: Option<&str>,
 ) -> Result<Option<Vec<String>>> {
@@ -141,6 +175,34 @@ pub(super) fn review_requirement_ids_from_config(
 #[cfg(test)]
 mod tests {
     use super::review_requirement_ids_from_config;
+    use super::{names_retired_auditor, reject_retired_auditor_config};
+
+    #[test]
+    fn a_configuration_that_names_an_auditor_is_refused_and_any_other_is_accepted() {
+        for named in [
+            r#"{"review":{"auditor_agent_id":"a"}}"#,
+            r#"{"auditor_agent_id":"a"}"#,
+            r#"{"review":{"ci_steps":["true"],"auditor_agent_id":"a"}}"#,
+        ] {
+            assert!(names_retired_auditor(Some(named)), "{named}");
+            let refused = reject_retired_auditor_config(Some(named)).unwrap_err();
+            assert!(
+                matches!(&refused, crate::ServiceError::InvalidOperation { message }
+                    if message.contains("review.auditor_agent_id is no longer supported")
+                        && message.contains("`reviewer` role")),
+                "{refused:?}"
+            );
+        }
+        for accepted in [
+            None,
+            Some(r#"{"review":{"ci_steps":["true"]}}"#),
+            Some(r#"{"review":{"auditor_agent_id":null}}"#),
+            Some("{}"),
+        ] {
+            assert!(!names_retired_auditor(accepted), "{accepted:?}");
+            reject_retired_auditor_config(accepted).expect("accepted");
+        }
+    }
 
     #[test]
     fn reads_explicit_empty_review_scope() {
