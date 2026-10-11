@@ -3063,11 +3063,12 @@ async fn a_task_rebased_after_merge_contention_runs_its_review_entry_again() {
     .await;
 }
 
-/// The second review entry, directly. Two Tasks branch from the same target.
-/// The first merges; the second passed its review on the old target, fails
-/// its merge because the target moved, is rebased and enters `review` again.
-/// That second entry requests its own entry check for the rebased commit,
-/// the check runs, settles, and the Task merges.
+/// The check of a rebased commit, directly. Two Tasks branch from the same
+/// target. The first merges; the second passed its review on the old target,
+/// and the merge queue rebases it because the target moved. A check runs on
+/// the rebased commit and settles before it merges (the queue's head check,
+/// or the entry check of a second review when the review cannot carry), and
+/// the Task merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_second_review_entry_after_a_rebase_requests_runs_and_settles_its_check() {
     // Pinned: both Tasks run side by side and branch from the same target.
@@ -3099,27 +3100,26 @@ async fn second_review_entry_after_a_rebase() {
                 return Err(format!("task {index} ended in {}", task["status"]));
             }
         }
-        // Whichever Task merged second is the one that was rebased.
-        let rebased: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT task_id FROM transition_log WHERE from_state = 'merge_failed' AND to_state = 'review'",
+        // Whichever Task merged second is the one the queue rebased: it stays
+        // in `merging` (a clean rebase no longer bounces through
+        // `merge_failed` and `review`), and the commit that landed is not the
+        // one its review passed.
+        let rebased: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT task_ref, integrated_sha FROM integration_attempt
+             WHERE integrated_sha IS NOT NULL AND original_candidate_sha IS NOT NULL
+               AND original_candidate_sha <> integrated_sha",
         )
         .fetch_all(&pool)
         .await
         .map_err(sql)?;
-        let [task_id] = rebased.as_slice() else {
+        let [(task_id, landed)] = rebased.as_slice() else {
             return Err(format!(
-                "expected exactly one Task to re-enter review from merge_failed, got {rebased:?}"
+                "expected exactly one Task to be rebased by the merge queue, got {rebased:?}"
             ));
         };
-        let entries: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM transition_log WHERE task_id = ? AND to_state = 'review'",
-        )
-        .bind(task_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(sql)?;
-        // One consumer per entry, each with its own run on its own commit,
-        // each run finished and its result applied to that entry.
+        // Every check the Task asked for ran, finished and was applied, and
+        // one of them ran on the rebased commit that landed: the entry check
+        // of a second review entry, or the queue's head check.
         let checks: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(
             "SELECT c.origin, r.commit_sha, r.state, c.applied_at, c.status_epoch
              FROM check_consumer c JOIN check_run r ON r.id = c.run_id
@@ -3129,18 +3129,15 @@ async fn second_review_entry_after_a_rebase() {
         .fetch_all(&pool)
         .await
         .map_err(sql)?;
-        if entries != 2 || checks.len() != 2 {
-            return Err(format!("{entries} review entries with checks {checks:?}; expected two of each"));
+        if checks
+            .iter()
+            .any(|(_, _, state, applied, _)| state != "succeeded" || applied.is_none())
+        {
+            return Err(format!("a check did not run and settle: {checks:?}"));
         }
-        let (first, second) = (&checks[0], &checks[1]);
-        if checks.iter().any(|(origin, _, state, applied, _)| {
-            origin != "entry" || state != "succeeded" || applied.is_none()
-        }) {
-            return Err(format!("an entry check did not run and settle: {checks:?}"));
-        }
-        if first.1 == second.1 || first.4 == second.4 {
+        if !checks.iter().any(|(_, commit, ..)| commit == landed) {
             return Err(format!(
-                "the second entry did not ask for the rebased commit under its own entry: {checks:?}"
+                "no check ran on the rebased commit {landed} before it merged: {checks:?}"
             ));
         }
         let reviews: Vec<String> =
@@ -3149,8 +3146,8 @@ async fn second_review_entry_after_a_rebase() {
                 .fetch_all(&pool)
                 .await
                 .map_err(sql)?;
-        if reviews.len() != 2 || reviews.iter().any(|status| status != "passed") {
-            return Err(format!("review attempts {reviews:?}; expected two that passed"));
+        if reviews.is_empty() || reviews.iter().any(|status| status != "passed") {
+            return Err(format!("review attempts {reviews:?}; expected every one passed"));
         }
         Ok(())
     }
