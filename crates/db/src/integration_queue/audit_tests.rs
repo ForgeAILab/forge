@@ -1148,3 +1148,63 @@ async fn start_time_import_of_a_large_history_is_bounded() {
     assert!(second < std::time::Duration::from_secs(2), "{second:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A merge the importer took over with an unknown result records the old
+/// path's operation as `uncertain` on the machine that ran it, without a
+/// fenced intent. Removing that machine settles it (it used to stay unknown
+/// for good, refusing every deletion of its repository), and the owner can
+/// settle it explicitly.
+#[tokio::test]
+async fn an_imported_unknown_operation_is_settled_by_machine_removal_or_explicitly() {
+    use crate::RepoRepo;
+    for by_owner in [false, true] {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('d','remote-machine','host','linux','aarch64','offline',?,?)").bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let attempt = db
+            .admit_integration_attempt(admission(&q, "a", "import:a:0"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET import_source_json='{\"version\":1,\"priority\":2}',state='reconciling',current_operation_state='uncertain',operation_id='old-merge',daemon_id='d' WHERE id=?")
+            .bind(&attempt.id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE integration_queue SET state='quarantined',head_attempt_id=?,revision=revision+1 WHERE id=?")
+            .bind(&attempt.id).bind(&q.id).execute(db.pool()).await.unwrap();
+        match RepoRepo::delete(&db, "r").await {
+            Err(DbError::IntegrationUnresolved { task_id, machine }) => {
+                assert_eq!((task_id.as_str(), machine.as_str()), ("a", "host"));
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        if by_owner {
+            assert!(db
+                .settle_imported_integration_operation(&attempt.id)
+                .await
+                .unwrap());
+            // Once: a settled operation is not settled again.
+            assert!(!db
+                .settle_imported_integration_operation(&attempt.id)
+                .await
+                .unwrap());
+        } else {
+            db.remove_daemon("d", "admin", true, "local-host", false)
+                .await
+                .unwrap();
+        }
+        let settled = db.integration_attempt(&attempt.id).await.unwrap().unwrap();
+        assert_eq!(
+            settled.current_operation_state,
+            Some(IntegrationOperationState::Failed)
+        );
+        assert_eq!(settled.state, IntegrationAttemptState::Quarantined);
+        assert_eq!(
+            settled.operation_receipts_json[0]["kind"],
+            "imported_operation_settled"
+        );
+        // The queue's head is still this attempt: the worker's next look
+        // reads Git and decides. Nothing refuses the deletion any more.
+        RepoRepo::delete(&db, "r").await.unwrap();
+    }
+}

@@ -45,6 +45,37 @@ pub(crate) fn role_target(
     default_name: &str,
 ) -> String {
     use crate::workflow::default_states;
+    let target = |from: &str, trigger: api_types::WorkflowTrigger| {
+        workflow
+            .outgoing_trigger_targets(from)
+            .find(|(candidate, _)| *candidate == trigger)
+            .map(|(_, to)| to)
+    };
+    // A landed merge goes where THIS merge state's `accept` leads. A
+    // workflow with two merge states gives each its own target; the state
+    // named `done` is only the answer for a merge state that leads there (or
+    // names no `accept` target at all).
+    if default_name == default_states::DONE {
+        if let Some(own) = target(merge_state, api_types::WorkflowTrigger::Accept) {
+            return own;
+        }
+    }
+    // Likewise the repair state: this merge state's own `reject` target
+    // when that state carries the repair role's exit guard.
+    if default_name == default_states::MERGE_FAILED {
+        if let Some(own) = target(merge_state, api_types::WorkflowTrigger::Reject).filter(|own| {
+            workflow.states.iter().any(|state| {
+                state.name == *own
+                    && state
+                        .hooks
+                        .before_exit
+                        .iter()
+                        .any(|hook| hook.action == "require_conflict_markers_resolved")
+            })
+        }) {
+            return own;
+        }
+    }
     if workflow
         .states
         .iter()
@@ -52,12 +83,6 @@ pub(crate) fn role_target(
     {
         return default_name.to_owned();
     }
-    let target = |from: &str, trigger: api_types::WorkflowTrigger| {
-        workflow
-            .outgoing_trigger_targets(from)
-            .find(|(candidate, _)| *candidate == trigger)
-            .map(|(_, to)| to)
-    };
     // The repair state is the one that carries the conflict-marker exit
     // guard (the hook that belongs to that role), else the merge state's
     // `reject` target.
@@ -181,6 +206,27 @@ impl crate::TaskService {
                             | db::IntegrationOperationState::Uncertain
                     )
                 )
+        };
+        // An unknown result the importer took over (a merge that was in
+        // flight the old way at the upgrade): it has no fenced intent, so no
+        // owner receipt will ever settle it. The owner's Retry is the
+        // explicit settlement: the old operation is closed as failed, and
+        // Git decides from here (the commit is in the target: reported after
+        // the target owner's proof; it is not: queued again). Nothing is
+        // merged twice: validation and the fast-forward are of the exact
+        // commit.
+        let current = match current {
+            Some(attempt)
+                if unsettled(&attempt)
+                    && attempt.effect_intent_json.is_none()
+                    && attempt.import_source_json.is_some() =>
+            {
+                self.db
+                    .settle_imported_integration_operation(&attempt.id)
+                    .await?;
+                self.db.current_integration_attempt(&task.id).await?
+            }
+            other => other,
         };
         match current {
             Some(attempt) if unsettled(&attempt) => {

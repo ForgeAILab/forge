@@ -972,6 +972,17 @@ pub(crate) async fn refuse_unresolved_integration(
     }
 }
 
+/// The guard of [`refuse_unresolved_integration`] for a writer outside this
+/// crate that moves a repository's default location inside its own
+/// transaction (`services::repo_location`): the repository of `location_id`
+/// has no merge with an unknown result or an outstanding owner effect.
+pub async fn refuse_default_change_while_integration_unresolved(
+    tx: &mut Transaction<'_, Sqlite>,
+    location_id: &str,
+) -> Result<()> {
+    refuse_unresolved_integration(tx, IntegrationGuardScope::RepoOfLocation(location_id)).await
+}
+
 pub(crate) async fn suspend_queues_for_deleted_location(
     tx: &mut Transaction<'_, Sqlite>,
     location_id: &str,

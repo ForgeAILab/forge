@@ -1234,6 +1234,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- The owner's override on a Task in its merge state is labelled **Mark done
+  without merging** (it was "Advance Task"): it ends the Task as done, merges
+  nothing and cancels its place in the merge queue.
+
 - **A review entry asks for its checks again by itself.** When the review
   commands of a Task or its Project change while the entry's checks run, the
   finished check is not applied (as before) and the entry now asks again for
@@ -2694,6 +2698,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **Changing a repository's default location is refused over the API while a
+  merge is unresolved.** The `409 integration_unresolved` guard for the
+  default change sat on a storage method the `PATCH` route does not use, so
+  the route moved the default (and with it every merge queue's target) while
+  a merge had an unknown result. The guard is now in the transaction of the
+  write the route makes.
+- **A forced Project delete that is refused for an unresolved merge no longer
+  cancels the Project's work first.** `DELETE /api/v1/projects/{id}?force=true`
+  checks `integration_unresolved` before it stops any execution, lease or
+  check.
+- **A merge with an unknown result from before the merge queue can be
+  settled.** Such a merge is recorded against the machine that ran it, with no
+  queue-era effect to settle. Removing that machine now settles it (it used to
+  stay unknown, refusing every deletion of its repository and its owner's
+  Retry for good), and the owner's **Retry Merge** on such a Task settles it
+  explicitly: the old operation is closed as failed and Git decides (the
+  commit is in the target: reported once the target's owner has proven it;
+  it is not: the Task is queued again). Nothing is merged twice.
+- **A workflow with two merge states** reports a landed merge to the `accept`
+  target of the merge state the Task was in (it went to the state named
+  `done` whenever the workflow still had one), and sends a repair to that
+  state's own repair state. **A workflow in which no state merges** is no
+  longer scanned by the upgrade import for Tasks in a state that happens to
+  be called `merging`.
 
 - **One writer per merge while an install is upgraded to the merge queue.**
   The queue worker no longer takes an attempt that was recorded before the

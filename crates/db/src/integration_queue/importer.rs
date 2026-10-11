@@ -161,7 +161,16 @@ pub(crate) fn merge_roles(workflow_definition: Option<&str>) -> MergeRoles {
         .map(|state| state.name.clone())
         .collect();
     if merge.is_empty() {
-        return defaults();
+        // A workflow of the Project's own in which no state merges
+        // (`run_merge` is on no entry): nothing of it was ever merging, so
+        // nothing is selected for import, whatever its states are called.
+        return MergeRoles {
+            merge: Vec::new(),
+            repair: Vec::new(),
+            done: Vec::new(),
+            cancelled: Vec::new(),
+            review: Vec::new(),
+        };
     }
     // The repair role's own exit guard marks its state; a workflow without
     // that hook names it as the merge state's `reject` target.

@@ -666,3 +666,159 @@ async fn list_locations_filters_daemon_visibility_before_pagination_and_counts()
     assert!(!page.has_more);
     assert_eq!(page.next_cursor, None);
 }
+
+/// `409 integration_unresolved` over HTTP, for all four guarded writes, and
+/// the whole way out. A merge that was in flight the old way when the server
+/// was upgraded has an unknown result, recorded against the machine that ran
+/// it. While it is unknown: deleting the repository, deleting its target
+/// location, deleting the Project (also with `force`, and without cancelling
+/// anything first) and changing the repository's default location are refused
+/// with the typed error that names the Task and the machine. Removing that
+/// machine settles the merge, and each write then works.
+#[tokio::test]
+async fn an_unresolved_merge_refuses_the_four_guarded_writes_until_its_machine_is_removed() {
+    use db::IntegrationQueueRepo;
+    let fixture = Fixture::new("forge-api-integration-unresolved").await;
+    let target = fixture
+        .register_server(&fixture.checkout.to_string_lossy(), true)
+        .await;
+    let other = fixture
+        .register_server(&fixture.checkout.to_string_lossy(), false)
+        .await;
+    let db = &*fixture.harness.state.db;
+    let repo = RepoRepo::get_by_id(db, &fixture.repo_id)
+        .await
+        .expect("repo loads")
+        .expect("repo exists");
+    let (daemon_id, _) = fixture.daemon_runtime().await;
+    let task_id = db::new_uuid_v4();
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Merging Task', 'merging', ?, ?)")
+        .bind(&task_id).bind(&repo.project_id).bind(&now).bind(&now)
+        .execute(db.pool()).await.expect("task inserts");
+    let queue = db
+        .create_or_get_integration_queue(&repo.id, "main")
+        .await
+        .expect("queue creates");
+    let attempt = db
+        .admit_integration_attempt(db::IntegrationAttempt::new(
+            Some(queue.id.clone()),
+            task_id.clone(),
+            repo.project_id.clone(),
+            format!("import:{task_id}:0"),
+            "merging".to_owned(),
+            0,
+            1,
+        ))
+        .await
+        .expect("attempt admits");
+    // As the importer leaves a merge whose old operation never reported.
+    sqlx::query("UPDATE integration_attempt SET import_source_json='{\"version\":1,\"priority\":2}',state='reconciling',current_operation_state='uncertain',operation_id='old-merge',daemon_id=? WHERE id=?")
+        .bind(&daemon_id).bind(&attempt.id).execute(db.pool()).await.expect("attempt is unknown");
+    sqlx::query("UPDATE integration_queue SET state='quarantined',head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&attempt.id).bind(&queue.id).execute(db.pool()).await.expect("queue is quarantined");
+
+    let refused = |error: Value, what: &str| {
+        assert_eq!(error["code"], "integration_unresolved", "{what}: {error}");
+        assert_eq!(error["details"]["task_id"], task_id.as_str(), "{what}: {error}");
+        assert_eq!(error["details"]["machine"], "mac", "{what}: {error}");
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&task_id) && message.contains("mac"), "{what}: {message}");
+    };
+    let app = &fixture.harness.app;
+    let repo_path = format!("/api/v1/repos/{}", repo.id);
+    let project_path = format!("/api/v1/projects/{}", repo.project_id);
+    refused(
+        empty_request(app, Method::DELETE, &repo_path, StatusCode::CONFLICT).await,
+        "repository delete",
+    );
+    refused(
+        empty_request(
+            app,
+            Method::DELETE,
+            &fixture.location_path(&target.id),
+            StatusCode::CONFLICT,
+        )
+        .await,
+        "target location delete",
+    );
+    refused(
+        empty_request(app, Method::DELETE, &project_path, StatusCode::CONFLICT).await,
+        "Project delete",
+    );
+    refused(
+        empty_request(
+            app,
+            Method::DELETE,
+            &format!("{project_path}?force=true"),
+            StatusCode::CONFLICT,
+        )
+        .await,
+        "forced Project delete",
+    );
+    // The forced delete stopped nothing on its way to the refusal.
+    let status: String = sqlx::query_scalar("SELECT status FROM task WHERE id=?")
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task reads");
+    assert_eq!(status, "merging", "a refused forced delete cancels nothing");
+    refused(
+        json_request(
+            app,
+            Method::PATCH,
+            &fixture.location_path(&other.id),
+            json!({ "version": other.version, "is_default": true }),
+            StatusCode::CONFLICT,
+        )
+        .await,
+        "default location change",
+    );
+    for (table, id) in [("repo", &repo.id), ("repo_location", &target.id), ("project", &repo.project_id)] {
+        let kept: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE id=?"))
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("row counts");
+        assert_eq!(kept, 1, "{table} is kept");
+    }
+
+    // The way out the error names: remove the machine.
+    sqlx::query("UPDATE daemon SET status='offline' WHERE id=?")
+        .bind(&daemon_id)
+        .execute(db.pool())
+        .await
+        .expect("daemon goes offline");
+    let removed = common::raw_empty_request(app, Method::DELETE, &format!("/api/v1/daemons/{daemon_id}")).await;
+    assert!(removed.status().is_success(), "machine removal: {}", removed.status());
+    let settled = db
+        .integration_attempt(&attempt.id)
+        .await
+        .expect("attempt loads")
+        .expect("attempt exists");
+    assert_eq!(
+        settled.current_operation_state,
+        Some(db::IntegrationOperationState::Failed)
+    );
+    assert_eq!(settled.state, db::IntegrationAttemptState::Quarantined);
+
+    let updated: RepoLocationResponse = json_request(
+        app,
+        Method::PATCH,
+        &fixture.location_path(&other.id),
+        json!({ "version": other.version, "is_default": true }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(updated.is_default, "the default changes once the merge is settled");
+    let response = common::raw_empty_request(app, Method::DELETE, &fixture.location_path(&target.id)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "old target location delete");
+    let response = common::raw_empty_request(app, Method::DELETE, &format!("{project_path}?force=true")).await;
+    assert!(response.status().is_success(), "Project delete: {}", response.status());
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id=?")
+        .bind(&repo.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("repo counts");
+    assert_eq!(left, 0, "the repository went with its Project");
+}

@@ -1195,6 +1195,146 @@ fn merge_outcome_targets_follow_the_workflows_own_state_names() {
     assert_eq!(role_target(&renamed, "landing", "review"), "inspection");
 }
 
+/// A workflow with TWO merge states: each reports a landed merge to its own
+/// `accept` target, also when the workflow still has a state named `done`,
+/// and each sends a repair to its own repair state.
+#[test]
+fn each_of_two_merge_states_has_its_own_outcome_targets() {
+    use super::super::reconcile::{merge_state, role_target};
+    let default = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
+    let mut two = default.clone();
+    let copy = |name: &str, as_name: &str| {
+        let mut state = default
+            .states
+            .iter()
+            .find(|state| state.name == name)
+            .unwrap_or_else(|| panic!("the default workflow has `{name}`"))
+            .clone();
+        state.name = as_name.into();
+        state
+    };
+    // A second line: `hotfix_merging` lands in `released` and is repaired in
+    // `hotfix_failed`.
+    let mut merging = copy("merging", "hotfix_merging");
+    for trigger in merging.triggers.values_mut() {
+        match trigger.to.as_str() {
+            "done" => trigger.to = "released".into(),
+            "merge_failed" => trigger.to = "hotfix_failed".into(),
+            _ => {}
+        }
+    }
+    two.states.push(merging);
+    two.states.push(copy("done", "released"));
+    two.states.push(copy("merge_failed", "hotfix_failed"));
+    assert!(merge_state(&two, "merging") && merge_state(&two, "hotfix_merging"));
+    assert_eq!(role_target(&two, "merging", "done"), "done");
+    assert_eq!(role_target(&two, "hotfix_merging", "done"), "released");
+    assert_eq!(role_target(&two, "merging", "merge_failed"), "merge_failed");
+    // Only where the default workflow's merge state names its repair by a
+    // `reject` trigger is the second line's own repair state found by it.
+    let own_reject = default
+        .outgoing_trigger_targets("merging")
+        .any(|(trigger, to)| trigger == api_types::WorkflowTrigger::Reject && to == "merge_failed");
+    if own_reject {
+        assert_eq!(
+            role_target(&two, "hotfix_merging", "merge_failed"),
+            "hotfix_failed"
+        );
+    }
+}
+
+/// A workflow of the Project's own in which NO state merges (`run_merge` is
+/// on no entry): a Task in a state that happens to be called `merging` was
+/// never merging, and the importer does not take it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_importer_takes_nothing_from_a_workflow_with_no_merge_state() {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", "merging").await;
+    world.seed_execution("t", "executor", None).await;
+    let mut workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
+    for state in &mut workflow.states {
+        state.hooks.on_enter.retain(|hook| hook.action != "run_merge");
+    }
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let pass = world.db.import_integration_pass(100).await.unwrap();
+    assert_eq!((pass.examined, pass.imported), (0, 0));
+    assert!(world
+        .db
+        .current_integration_attempt("t")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// An imported merge with an unknown result that nobody will ever report
+/// (its old operation is recorded `uncertain`, with no fenced intent) used
+/// to refuse its owner's Retry for good ("reconnect the machine or remove
+/// it") and, with it, every deletion of its repository. The owner's Retry
+/// now settles it explicitly: Git decides, and the Task merges once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_merges_once() {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", "merging").await;
+    world.seed_execution("t", "executor", None).await;
+    let (imported, _) = world.imported("t").await;
+    // As the importer and the worker leave a merge whose old operation never
+    // reported and whose checkouts could not be read then.
+    sqlx::query("UPDATE integration_attempt SET state='quarantined',current_operation_state='uncertain',operation_id='old-merge',failure_kind='needs_fact',failure_message='integration result unknown',available_at=NULL,revision=revision+1 WHERE id=?")
+        .bind(&imported.id)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let refused = db::RepoRepo::delete(&*world.db, "r").await;
+    assert!(
+        matches!(&refused, Err(db::DbError::IntegrationUnresolved { task_id, .. }) if task_id == "t"),
+        "{refused:?}"
+    );
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .until("t", "the owner is told the result is unknown", || async {
+            integration(&world.task("t").await)["kind"] == "deferred"
+        })
+        .await;
+    assert_eq!(
+        integration(&world.task("t").await)["cause"],
+        "unresolved_result"
+    );
+    world
+        .act(
+            "t",
+            TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+        )
+        .await;
+    world
+        .until("t", "the Task merges after the explicit settlement", || async {
+            world.task("t").await.status == "done"
+        })
+        .await;
+    assert_eq!(world.merges("t").await, 1);
+    let old = world.attempt(&imported.id).await;
+    assert_eq!(
+        old.current_operation_state,
+        Some(db::IntegrationOperationState::Failed)
+    );
+    assert_eq!(
+        old.operation_receipts_json[0]["kind"],
+        "imported_operation_settled"
+    );
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
 /// A workflow whose merge and repair states have other names, and whose
 /// merge state has another entry hook: a Task in that merge state is
 /// admitted by role, merges through the queue and ends done. A subtask in
