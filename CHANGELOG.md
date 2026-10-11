@@ -2695,6 +2695,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **One writer per merge while an install is upgraded to the merge queue.**
+  The queue worker no longer takes an attempt that was recorded before the
+  queue was active (an imported row, or a `shadow:` row of the passive stage)
+  until that Task's import continuation step has settled, and never while the
+  old merge's own hooks step is still live (a pending, claimed or suspended
+  hooks step that recorded a `merge_intent`, `merge_outcome` or
+  `rebase_target`): it could start a rebase in a checkout that step was still
+  rebasing. The same rule holds a reserved imported head (an unknown result).
+  The old step now hands over through admission only: a merge it had finished
+  is no longer reported by that step beside the queue. The Task is admitted,
+  the head finds its commit in the target, and the `result` step reports it
+  after the target's owner has proven it (if the candidate can no longer be
+  named, the step reports it itself, after the same proof). The import
+  continuation waits for an earlier, suspended hooks step of the entry instead
+  of admitting beside it.
+
 - **A Task is reported merged only when the target's owner confirms it.**
   Before the merge queue moves a Task to `done` (and before a merge that had
   landed before an upgrade is reported), the owner of the repository's default

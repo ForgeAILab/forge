@@ -234,6 +234,29 @@ impl IntegrationSteps {
         );
         let in_merge_state = merge_state(&workflow, &attempt.expected_status);
         let priority = import_priority(&attempt);
+        // One writer per merge. A hooks step of this entry that ran before
+        // this step and is suspended (on its disk wait, on a check) is the
+        // old merge itself: it finishes what it recorded before it hands
+        // over through admission. This step neither admits beside it nor
+        // settles (a settled continuation is what makes a pre-queue row
+        // claimable): it waits. Only an earlier, suspended step is waited
+        // for: a pending one runs before this step anyway, and a later one
+        // could not run until this step is settled.
+        let suspended_entry_hooks: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step h JOIN task t ON t.id=h.task_id \
+             WHERE h.task_id=? AND h.kind='hooks' AND h.status='suspended' AND h.seq<? \
+               AND h.expected_status=t.status AND h.expected_epoch=t.status_epoch)",
+        )
+        .bind(&task.id)
+        .bind(step.seq)
+        .fetch_one(self.db.pool())
+        .await?;
+        if in_merge_state && suspended_entry_hooks {
+            return Ok(StepOutcome::RetryAt(
+                "the entry's own hooks step continues this merge first".into(),
+                chrono::Utc::now() + chrono::Duration::seconds(2),
+            ));
+        }
 
         // The pause marker of a merging Task is obsolete: the queue worker
         // parks and re-queues such a Task across a Project pause itself.
@@ -252,7 +275,18 @@ impl IntegrationSteps {
             && self.owner_back(&task).await?;
 
         match attempt.state {
-            S::Applied if in_merge_state => self.import_applied(step, request, &attempt).await,
+            S::Applied if in_merge_state => {
+                // The one thing this step does to a merge itself: it reports
+                // one that landed before the queue. No worker holds a slot
+                // for such a row. Everything else it does is a statement or
+                // the hand-over (admission).
+                let _hold = crate::integration_worker::holders::hold(
+                    &self.db,
+                    &task.id,
+                    crate::integration_worker::holders::MergeHolder::ImportContinuation,
+                );
+                self.import_applied(step, request, &attempt).await
+            }
             // Not in a merge state (a conflict repair, a re-review, or the
             // old clean-rebase bounce between `merging` and `review`): the
             // Task's own flow continues exactly as before the upgrade, and

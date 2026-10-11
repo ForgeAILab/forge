@@ -36,27 +36,27 @@ impl HookAction for RunMerge {
             return failed(ctx, error);
         }
         // A hooks step that was already merging when the server was upgraded
-        // recorded its effects on the step. A merge it finished is reported
-        // here, once, as that step would have; nothing is merged again.
-        match legacy_merge_result(ctx, merge_service).await {
-            Ok(Some((branch, after_sha))) => {
-                if let Err(error) = create_system_comment(
-                    ctx,
-                    format!("Changes merged to {branch} (SHA: {after_sha})"),
-                )
-                .await
-                {
-                    return failed(ctx, error);
-                }
-                return HookResult::Cascade {
-                    to: merge_role_target(ctx, default_states::DONE),
-                    reason: "merge succeeded".to_string(),
-                    bridge: Default::default(),
-                };
-            }
-            Ok(None) => {}
+        // recorded its effects on the step. It is the old merge itself: while
+        // it lives the worker cannot claim the attempt the old build left
+        // (`integration_queue` claim predicate), and it hands over through
+        // admission below, the one way an attempt becomes the worker's.
+        let legacy_hold = match legacy_step(ctx).await {
+            Ok(true) => Some(crate::integration_worker::holders::hold(
+                &ctx.db,
+                &ctx.task_id,
+                crate::integration_worker::holders::MergeHolder::LegacyHooksStep,
+            )),
+            Ok(false) => None,
             Err(error) => return failed(ctx, error),
-        }
+        };
+        // A merge that step finished is not reported here beside the queue:
+        // the Task is admitted like any other, the head's validation finds
+        // its candidate in the target and the `result` step reports it once
+        // its owner has proven that. Nothing is merged again.
+        let landed = match legacy_merge_result(ctx, merge_service).await {
+            Ok(landed) => landed,
+            Err(error) => return failed(ctx, error),
+        };
         let task = match task(ctx).await {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
@@ -109,6 +109,8 @@ impl HookAction for RunMerge {
             // Unreadable here is unreadable for admission too, which reports it.
             Err(_) => {}
         }
+        // The hand-over: from here the merge is the worker's.
+        drop(legacy_hold);
         let attempt = match crate::integration_steps::admission::admit_released(
             &ctx.db,
             merge_service,
@@ -123,6 +125,38 @@ impl HookAction for RunMerge {
             }
             Err(error) if crate::worker_runtime::queue::retryable(&error) => {
                 return failed(ctx, error)
+            }
+            // The old merge landed and its candidate can no longer be named
+            // for the queue (its checkout is gone). It is reported as the
+            // old step would have, once the owner of the target has proven
+            // that the target contains it. Not proven: the step fails and
+            // is retried; the Task is never moved to its merge failure for a
+            // merge that may have landed.
+            Err(error) if landed.is_some() => {
+                let (branch, after_sha) = landed.expect("checked");
+                return match legacy_landed_proof(ctx, &branch, &after_sha).await {
+                    Ok(()) => {
+                        if let Err(error) = create_system_comment(
+                            ctx,
+                            format!("Changes merged to {branch} (SHA: {after_sha})"),
+                        )
+                        .await
+                        {
+                            return failed(ctx, error);
+                        }
+                        HookResult::Cascade {
+                            to: merge_role_target(ctx, default_states::DONE),
+                            reason: "merge succeeded".to_string(),
+                            bridge: Default::default(),
+                        }
+                    }
+                    Err(unproven) => failed(
+                        ctx,
+                        crate::ServiceError::invalid_operation(format!(
+                            "the merge this Task recorded before the upgrade is not confirmed on `{branch}` ({unproven}) and its candidate cannot be queued: {error}"
+                        )),
+                    ),
+                };
             }
             // The Task's worktree would have to be made again under the
             // disk floor. That is a wait, not a merge failure: the Task
@@ -164,6 +198,53 @@ impl HookAction for RunMerge {
             worker.notify_enqueued(queue_id);
         }
         HookResult::Ok
+    }
+}
+
+/// Whether the running hooks step is one the old merge path left: it
+/// recorded a merge intent, a merge outcome or a rebase target.
+async fn legacy_step(ctx: &HookContext) -> crate::Result<bool> {
+    use crate::workflow::engine::durable::{current_hook, hook_effect};
+    if current_hook(&ctx.task_id).is_none() {
+        return Ok(false);
+    }
+    for key in ["merge_intent", "merge_outcome", "rebase_target"] {
+        if hook_effect(&ctx.task_id, key).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The owner of the target says `branch` contains `sha` (the settle-time
+/// proof of `integration_steps::proof`, for a landed pre-queue merge whose
+/// candidate cannot be admitted). `Err`: why it is not proven.
+async fn legacy_landed_proof(
+    ctx: &HookContext,
+    branch: &str,
+    sha: &str,
+) -> std::result::Result<(), String> {
+    use crate::integration_steps::{TargetOwnerProof, TargetProof, TargetProofSource};
+    use db::IntegrationQueueRepo;
+    let repo_id: Option<String> =
+        sqlx::query_scalar("SELECT repo_id FROM workspace WHERE task_id=? ORDER BY created_at DESC LIMIT 1")
+            .bind(&ctx.task_id)
+            .fetch_optional(ctx.db.pool())
+            .await
+            .map_err(|error| error.to_string())?;
+    let repo_id = repo_id.ok_or("the Task has no workspace row")?;
+    let queue = ctx
+        .db
+        .create_or_get_integration_queue(&repo_id, branch)
+        .await
+        .map_err(|error| error.to_string())?;
+    let proof = TargetOwnerProof::new(
+        std::sync::Arc::clone(&ctx.db),
+        ctx.task_service.daemon_connections.clone(),
+    );
+    match proof.target_contains(&queue, sha).await {
+        TargetProof::Contains => Ok(()),
+        TargetProof::Absent(why) | TargetProof::Unknown(why) => Err(why),
     }
 }
 

@@ -6,6 +6,7 @@
 //! attempt rows only. Git runs behind the fenced owner; Task state is written
 //! by Task steps it asks for through [`IntegrationStepPort`].
 mod driver;
+pub mod holders;
 mod ports;
 mod table;
 #[cfg(test)]

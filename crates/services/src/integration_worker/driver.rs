@@ -213,6 +213,8 @@ pub struct HeadDriver {
     /// Location verifications this session requested after the owner refused
     /// the claim's target.
     verifications: u32,
+    /// Test instrumentation: this session holds the head Task's merge.
+    holding: Option<(String, super::holders::MergeHold)>,
     stop: CancellationToken,
 }
 
@@ -234,6 +236,7 @@ impl HeadDriver {
             reconcile_at: None,
             owner_link: None,
             verifications: 0,
+            holding: None,
             stop: CancellationToken::new(),
         }
     }
@@ -288,6 +291,7 @@ impl HeadDriver {
         match self.step().await {
             Err(error) if is_conflict(&error) => Ok(Pass::Wait(self.w.config.conflict_backoff)),
             Ok(pass @ (Pass::Released | Pass::Lost)) => {
+                self.holding = None;
                 if pass == Pass::Released {
                     // A session that took the head over (a restart, a lost
                     // lease) made no transfer itself, but the head it
@@ -354,6 +358,21 @@ impl HeadDriver {
         };
         self.head_seen = Some(head.clone());
         let a = w.attempt(&head).await?;
+        if self
+            .holding
+            .as_ref()
+            .is_none_or(|(task, _)| *task != a.task_ref)
+        {
+            self.holding = None;
+            self.holding = Some((
+                a.task_ref.clone(),
+                super::holders::hold(
+                    &w.db,
+                    &a.task_ref,
+                    super::holders::MergeHolder::WorkerDriver,
+                ),
+            ));
+        }
         let now = w.clock.now();
         if self.since.map(|(state, _)| state) != Some(a.state) {
             self.since = Some((a.state, now));
