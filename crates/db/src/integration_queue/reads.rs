@@ -282,13 +282,16 @@ pub struct IntegrationWatchRow {
     pub task_ref: Option<String>,
     pub attempt_state: Option<String>,
     pub attempt_revision: Option<i64>,
+    /// A waiter carrying a cancel request is never claimed: it is ahead of
+    /// nobody (the same rule as the summary's position).
+    pub cancel_requested: bool,
 }
 
 impl SqliteDb {
     /// Every queue with its members in progress, in queue order. The SSE
     /// projector compares two of these reads; it is one statement.
     pub async fn integration_watch_rows(&self) -> Result<Vec<IntegrationWatchRow>> {
-        sqlx::query("SELECT q.id AS queue_id,q.repo_id,q.state AS queue_state,q.head_attempt_id,a.id AS attempt_id,a.task_ref,a.state AS attempt_state,a.revision AS attempt_revision FROM integration_queue q LEFT JOIN integration_attempt a ON a.queue_id=q.id AND a.current=1 ORDER BY q.id,a.queue_seq,a.id")
+        sqlx::query("SELECT q.id AS queue_id,q.repo_id,q.state AS queue_state,q.head_attempt_id,a.id AS attempt_id,a.task_ref,a.state AS attempt_state,a.revision AS attempt_revision,a.cancel_requested_at IS NOT NULL AS cancel_requested FROM integration_queue q LEFT JOIN integration_attempt a ON a.queue_id=q.id AND a.current=1 ORDER BY q.id,a.queue_seq,a.id")
             .fetch_all(self.pool())
             .await?
             .into_iter()
@@ -302,6 +305,9 @@ impl SqliteDb {
                     task_ref: row.try_get("task_ref")?,
                     attempt_state: row.try_get("attempt_state")?,
                     attempt_revision: row.try_get("attempt_revision")?,
+                    cancel_requested: row
+                        .try_get::<Option<bool>, _>("cancel_requested")?
+                        .unwrap_or(false),
                 })
             })
             .collect()

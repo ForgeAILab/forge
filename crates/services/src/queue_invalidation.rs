@@ -73,8 +73,13 @@ fn views(rows: Vec<IntegrationWatchRow>) -> HashMap<String, QueueView> {
             Some(0)
         } else if matches!(state.as_str(), "queued" | "path_wait") {
             let seen = waiting.entry(row.queue_id.clone()).or_default();
-            *seen += 1;
-            Some(*seen - 1 + has_head)
+            let ahead = *seen + has_head;
+            // As in the summary's position: a waiter with a cancel request
+            // is never claimed, so it is ahead of nobody.
+            if !row.cancel_requested {
+                *seen += 1;
+            }
+            Some(ahead)
         } else {
             None
         };
@@ -494,5 +499,42 @@ mod tests {
             0
         );
         assert!(drain(&mut receiver).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_request_on_a_waiter_moves_the_members_behind_it() {
+        let fixture = fixture().await;
+        let mut watch = IntegrationWatch::default();
+        project_integration_changes(&fixture.db, &mut watch, &fixture.bus)
+            .await
+            .unwrap();
+        let mut receiver = fixture.bus.subscribe();
+        // The first waiter is being cancelled: it will never be claimed, so
+        // the two behind it each have one fewer ahead, before any of them
+        // (or the cancelled attempt's state) is written.
+        sql(
+            &fixture,
+            "UPDATE integration_attempt SET cancel_requested_at=updated_at,revision=revision+1 WHERE id=?",
+            &fixture.attempts[0],
+        )
+        .await;
+        project_integration_changes(&fixture.db, &mut watch, &fixture.bus)
+            .await
+            .unwrap();
+        let queue = fixture.queue.clone();
+        assert_eq!(
+            drain(&mut receiver),
+            [
+                (queue.clone(), Some("t1".to_owned())),
+                (queue.clone(), Some("t2".to_owned())),
+                (queue.clone(), Some("t3".to_owned())),
+            ]
+        );
+        // The summary agrees: the second waiter is next.
+        let rows = db::integration_members_of_tasks(fixture.db.pool(), &["t2", "t3"])
+            .await
+            .unwrap();
+        let ahead = |task: &str| rows.iter().find(|row| row.task_ref == task).unwrap().ahead;
+        assert_eq!((ahead("t2"), ahead("t3")), (Some(0), Some(1)));
     }
 }

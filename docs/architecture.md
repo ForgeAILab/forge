@@ -4961,7 +4961,8 @@ changes none of these.
 (`integration-read-projection`) of the runtime supervisor. Each tick is one
 SELECT of every queue with its members in progress; the projector keeps the
 previous read in memory and publishes one bus event per member whose state,
-revision or number of members ahead changed, per member that left, and per
+revision or number of members ahead changed (counted as the summary counts
+it: a waiter carrying a cancel request is ahead of nobody), per member that left, and per
 queue whose own state or head changed. The first read after a start publishes
 nothing. It waits at least 100 ms and at most 1 s between reads and is woken
 by the domain-event notifier, which every integration Task step already
