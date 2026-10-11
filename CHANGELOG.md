@@ -2371,6 +2371,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A review check that ran longer than a second could stop every database
+  write for 30 seconds.** The check worker looked at the run's consumers
+  (every second) and renewed its lease from the body of a `select!` branch,
+  which stopped polling the owner's operation. The server owner records its
+  receipt in a write transaction inside that operation; when the look came
+  due while that transaction was open, the worker waited for a write lock its
+  own stopped operation held, until SQLite gave up (`database is locked`,
+  code 5) and the run was left to lease recovery. The lease and the consumers
+  are now looked after beside the operation. The same wait in the bounded
+  lookup and cancel exchanges is fixed the same way.
+- **A database refused as busy now says who held it.** Every write
+  transaction records where it began; one held, or waited for, longer than
+  five seconds is logged with its call site, and a `database is locked`
+  refusal is logged with the write transactions open at that moment.
+  `FORGE_DB_BUSY_TIMEOUT_MS` shortens SQLite's busy timeout for diagnosis.
+- **A failed check job is logged.** The check worker dropped a job that
+  returned an error without a line; it now logs it before lease recovery
+  takes the run up again.
+
 - **Garbage collection could take a build directory from a run that had just
   started, and other collector safety gaps (3.4 stage E).** Build eviction is
   now decided per Task under its lifecycle lock after reading its state

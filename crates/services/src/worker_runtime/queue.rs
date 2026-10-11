@@ -428,12 +428,42 @@ impl TaskStepWorker {
                 })
             {
                 if self.db.awaited_check_is_open(task_id).await? {
-                    let mut jobs = JoinSet::new();
-                    checks.sweep(&mut jobs).await?;
-                    while let Some(job) = jobs.join_next().await {
-                        job.map_err(|_| {
-                            ServiceError::invalid_operation("check job stopped during drain")
-                        })??;
+                    // A busy database is not a failed drain here either: the
+                    // sweep wrote nothing, and a run whose job gave up keeps
+                    // its lease and is taken up again when that lapses, as
+                    // the production check worker does it. Both are waited
+                    // out within the drain's own deadline.
+                    let swept = async {
+                        let mut jobs = JoinSet::new();
+                        checks.sweep(&mut jobs).await?;
+                        let mut first = Ok(());
+                        // Every job is joined: one that failed must not
+                        // abort the others in the middle of their effects.
+                        while let Some(job) = jobs.join_next().await {
+                            let job = job
+                                .map_err(|_| {
+                                    ServiceError::invalid_operation(
+                                        "check job stopped during drain",
+                                    )
+                                })
+                                .and_then(|result| result);
+                            if first.is_ok() {
+                                first = job;
+                            }
+                        }
+                        first
+                    }
+                    .await;
+                    match swept {
+                        Ok(()) => {}
+                        Err(error)
+                            if database_busy(&error) && tokio::time::Instant::now() < deadline =>
+                        {
+                            tracing::warn!(task_id, %error, "check sweep in a task step drain found the database busy; trying again");
+                            tokio::time::sleep(BUSY_BACKOFF_START).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                     // The sweep just tried to admit the run. One still queued
                     // behind a full machine is answered only when a run ends
