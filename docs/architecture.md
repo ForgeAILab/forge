@@ -4700,7 +4700,11 @@ imported row or a `shadow:` row) only once its `integration-import:<id>`
 continuation step has settled and no live hooks step of the Task's present
 entry carries an effect of the old merge path (`merge_intent`,
 `merge_outcome`, `rebase_target`). A reserved imported head (an unknown
-result) is held the same way while that step is live. The hand-over is
+result) is held while that hooks step is live and while its own continuation
+step is live (pending, claimed or suspended): the continuation reports a row
+it finds `applied`, so a driver that reconciled the head to `applied` under it
+would be a second writer. A live step is asked for, not a settled one, so a
+head whose settled continuation was pruned is not held. The hand-over is
 admission, in both steps: the `run_merge` hook finishes the rebase the old
 step started and then admits; a merge the old step had finished is admitted
 too, the head finds its commit in the target and the proven `result` step
