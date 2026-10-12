@@ -3046,6 +3046,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A Hold or Cancel that lands right after review entry asked for its
+  check leaves nothing behind.** The hooks step recorded what it waits for
+  only when it suspended. A command that stopped it between the request and
+  the suspension found no request to withdraw: the check ran on, its
+  delivery had no step to wake, and review attempt 1 stayed `running` under
+  the hold until the release. The wait is now recorded with the request, in
+  one transaction; the command withdraws the request, closes the attempt and
+  the check worker stops the run nobody waits for.
+
 - **A merge whose check environment is unavailable says so.** When the
   server's login shell gave no environment while a Task was the queue head,
   the `settle` / `request_check` step failed eight times, the queue asked

@@ -8705,7 +8705,13 @@ attempt and fail the hook. Exhausted infrastructure is no verdict: the Task
 is parked on the typed check condition and the step re-suspends at each
 deadline until the owner's `retry` produces a result.
 
-A step superseded while suspended never reads its result.
+A step superseded while it waits never reads its result. The wait is recorded
+on the step (`awaited_consumer_id`) in the transaction that stores the entry's
+request (`check_run::record_entry_wait_in_tx`), not only when the step
+suspends: a Hold or Cancel that stops the step after it asked and before it
+suspended finds the same request to withdraw. (Before, that step had no
+recorded wait: the consumer stayed live, its delivery found no step to wake
+and the review attempt stayed `running` under the hold until the release.)
 `review_entry::abandon_superseded_waits` cleans the wait up, in the preempting
 Cancel/Hold command's own step (before the command acts) and when a woken step
 finds its Task has left the entry:

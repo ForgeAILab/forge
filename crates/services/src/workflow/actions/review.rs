@@ -750,6 +750,9 @@ pub mod halt {
 
     /// The woken hooks step is claimed and about to read its check result.
     pub const AFTER_WAKE_BEFORE_SETTLE: &str = "after_wake_before_settle";
+    /// The hooks step asked for its entry check (the consumer is stored) and
+    /// has not suspended on it yet.
+    pub const AFTER_REQUEST_BEFORE_SUSPEND: &str = "after_request_before_suspend";
 
     type Armed = (String, &'static str, Arc<Notify>);
     static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
@@ -982,6 +985,7 @@ async fn request_entry_check(
         })
         .await
         .map_err(|error| failed(error.to_string()))?;
+    halt::reach(&task.id, halt::AFTER_REQUEST_BEFORE_SUSPEND).await;
     Ok(EntryCheck::Asked(requested.consumer.id))
 }
 

@@ -738,6 +738,8 @@ impl SqliteDb {
                 if !reusable {
                     return Ok(None);
                 }
+            } else {
+                record_entry_wait_in_tx(&mut tx, &request, &consumer.id).await?;
             }
             tx.commit().await?;
             return Ok(Some(RequestedCheckRun {
@@ -793,10 +795,43 @@ impl SqliteDb {
                 .fetch_one(&mut *tx)
                 .await?,
         )?;
+        if !reuse_only {
+            record_entry_wait_in_tx(&mut tx, &request, &consumer.id).await?;
+        }
         tx.commit().await?;
         Ok(Some(RequestedCheckRun {
             consumer,
             disposition,
         }))
     }
+}
+
+/// A review entry asks from inside its hooks step, which then suspends on the
+/// consumer. The wait is recorded on that step here, in the transaction that
+/// stores the request, not only when the step suspends: an owner command
+/// (Hold, Cancel) that stops the step between the two finds the request to
+/// withdraw (`abandoned_check_waits` reads this column of a superseded
+/// step). Without it the consumer stayed live with no step to wake, its run
+/// went on, and the review attempt stayed `running` under the hold.
+async fn record_entry_wait_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request: &CheckRunRequest,
+    consumer_id: &str,
+) -> Result<()> {
+    if request.origin != CheckConsumerOrigin::Entry {
+        return Ok(());
+    }
+    let Some(step) = crate::task_writer::current_task_step() else {
+        return Ok(());
+    };
+    if step.kind != "hooks" || request.task_id.as_deref() != Some(step.task_id.as_str()) {
+        return Ok(());
+    }
+    sqlx::query("UPDATE task_step SET awaited_consumer_id=? WHERE id=? AND kind='hooks' AND status='claimed' AND claimed_by IS ?")
+        .bind(consumer_id)
+        .bind(&step.id)
+        .bind(&step.claimed_by)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
