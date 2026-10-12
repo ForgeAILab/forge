@@ -2841,48 +2841,82 @@ async fn a_task_whose_entry_check_runs_offers_cancel_and_no_hold() {
     }
 }
 
-/// A hold COMMAND during the running entry check. It is not on offer (see
-/// above) and is accepted all the same, because a hold may stop hooks in
-/// flight: the hooks step is superseded, the check stopped, the attempt
-/// closed. The release runs the review entry again by itself. Before, the
-/// released Task had no check, and its reviewer was given the review.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hold_command_during_the_entry_check_is_resumed_by_its_release() {
+/// Where a hold command finds the entry check of the Task it holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HoldFinds {
+    /// The check runs and the hold is sent at once: whichever of the orders
+    /// below the machine produces.
+    TheRunInFlight,
+    /// The check runs and has a long way to go: the check worker stops it
+    /// before the release.
+    ARunItStops,
+    /// The same, and the release is sent the moment the check worker begins
+    /// to stop the run.
+    ARunBeingStopped,
+    /// The check runs, and the release follows the hold at once: before the
+    /// check worker's next look, unless the machine is very slow.
+    ARunItsReleaseJoins,
+    /// The run has ended and its result is stored, but no Task step has
+    /// read it yet.
+    AFinishedRun,
+    /// The check is asked for and the step that asked has not begun to wait
+    /// for it: the hold stops that step in the middle.
+    AStepThatJustAsked,
+}
+
+/// A hold COMMAND during the entry check. It is not on offer (see above) and
+/// is accepted all the same, because a hold may stop hooks in flight: the
+/// hooks step is superseded, its check request withdrawn, the attempt closed.
+/// The release runs the review entry again by itself. Before, the released
+/// Task had no check, and its reviewer was given the review.
+///
+/// The hold withdraws the request; it does not wait for the run. The check
+/// worker stops a run nobody waits for at its next look (within a second),
+/// so one of two things is true at the release, and both are right:
+/// - the run was stopped: the entry asks again and a second run answers it;
+/// - the run was not stopped (it had ended, or the release asked before the
+///   worker looked): its result answers the entry, and nothing runs twice.
+///
+/// Either way the Task stays in `review` while it is held and no reviewer
+/// runs under the hold; one run of the check passes, one review attempt
+/// passes on it, and every attempt before that one is closed.
+async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, String> {
+    use HoldFinds::*;
+    const REVIEWER_RUNS: &str =
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'";
+    // Results the check worker delivered to a waiting step.
+    const DELIVERED: &str = "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin='entry' AND applied_at IS NOT NULL";
+    const CONSUMERS: &str =
+        "SELECT c.origin || ':' || COALESCE(r.state,'-') || ':' || COALESCE(x.outcome,'-')
+                || CASE WHEN c.cancelled_at IS NOT NULL THEN ':withdrawn' ELSE '' END
+                || CASE WHEN c.applied_at IS NOT NULL THEN ':delivered' ELSE '' END
+         FROM check_consumer c LEFT JOIN check_run r ON r.id = c.run_id
+         LEFT JOIN check_result x ON x.id = c.result_id
+         WHERE c.task_id = ? ORDER BY c.created_at, c.rowid";
+    const ENTRY_RUNS: &str = "SELECT r.state FROM check_run r WHERE r.id IN
+           (SELECT c.run_id FROM check_consumer c WHERE c.task_id = ? AND c.origin = 'entry')
+         ORDER BY r.created_at, r.rowid";
+    const REVIEWS: &str =
+        "SELECT attempt_number || ':' || status FROM review WHERE task_id = ? ORDER BY attempt_number";
+    const STEPS: &str =
+        "SELECT kind || ':' || status FROM task_step WHERE task_id = ? ORDER BY seq";
+    const SET_CHECK: &str = "UPDATE task SET task_state_config=json_set(task_state_config,'$.review.ci_steps',json_array(?)) WHERE id=?";
+    // The check worker alone runs the check in these (no drain beside it):
+    // the check waits for the one slot, which a second Task's run holds,
+    // until that run ends. The model has no step worker, so no Task step
+    // runs meanwhile.
+    let slot_seam = !matches!(finds, TheRunInFlight | ARunItStops);
     let mut world = World::new().await;
     let outcome: Result<(), String> = async {
-        world.apply(&Action::Create).await?;
-        world.quiesce().await?;
-        sqlx::query("UPDATE task SET task_state_config=json_set(task_state_config,'$.review.ci_steps',json_array(?)) WHERE id=?")
-            .bind(format!("sleep 4 && test -f {}", deliverable(0)))
-            .bind(&world.tasks[0])
-            .execute(&world.live().pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        world.apply(&Action::Finish(0, Outcome::Success)).await?;
-        let drain = |world: &World| {
-            let service = world.live().state.task_service.clone();
-            let id = world.tasks[0].clone();
-            tokio::spawn(async move { service.drain(&id).await.map(|_| ()) })
-        };
-        let mut steps = drain(&world);
-        let mut looked = 0;
-        loop {
-            if steps.is_finished() {
-                steps = drain(&world);
-            }
-            let task = world.task(0).await?;
-            let runs = world.check_runs(0).await?;
-            if task["status"] == "review" && runs == ["running"] {
-                break;
-            }
-            looked += 1;
-            if looked > 400 {
-                return Err(format!("no running check: {} {runs:?}", task["status"]));
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        for _ in 0..if slot_seam { 2 } else { 1 } {
+            world.apply(&Action::Create).await?;
+            world.quiesce().await?;
         }
-        let count = |world: &World, sql: &'static str| {
-            let (pool, id) = (world.live().pool.clone(), world.tasks[0].clone());
+        let pool = world.live().pool.clone();
+        let task_id = world.tasks[0].clone();
+        let sql = |error: sqlx::Error| error.to_string();
+        let count = |sql: &'static str| {
+            let (pool, id) = (pool.clone(), task_id.clone());
             async move {
                 sqlx::query_scalar::<_, i64>(sql)
                     .bind(id)
@@ -2891,35 +2925,211 @@ async fn a_hold_command_during_the_entry_check_is_resumed_by_its_release() {
                     .map_err(|error| error.to_string())
             }
         };
-        const REVIEWER_RUNS: &str =
-            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'";
+        let list = |sql: &'static str| {
+            let (pool, id) = (pool.clone(), task_id.clone());
+            async move {
+                sqlx::query_scalar::<_, String>(sql)
+                    .bind(id)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        };
+        // A check that is still running when the hold arrives. The one the
+        // check worker must stop runs long the first time only: its second
+        // run is the one the release waits for.
+        let first = world.dir.path().join("entry-check-ran");
+        let command = match finds {
+            TheRunInFlight | ARunItsReleaseJoins => {
+                Some(format!("sleep 4 && test -f {}", deliverable(0)))
+            }
+            ARunItStops | ARunBeingStopped => Some(format!(
+                "if [ ! -e '{0}' ]; then : > '{0}'; sleep 60; fi; test -f {1}",
+                first.display(),
+                deliverable(0)
+            )),
+            AFinishedRun | AStepThatJustAsked => None,
+        };
+        if let Some(command) = command {
+            sqlx::query(SET_CHECK)
+                .bind(command)
+                .bind(&task_id)
+                .execute(&pool)
+                .await
+                .map_err(sql)?;
+        }
+        let mut steps = None;
+        if slot_seam {
+            let cap = &world.live().state.db.server_run_cap;
+            cap.set(Some(1), 1, &cap.embedded_machine_id());
+            world.apply(&Action::Finish(0, Outcome::Success)).await?;
+            world.quiesce().await?;
+            if world.check_runs(0).await? != ["queued"] {
+                return Err(format!(
+                    "expected one queued check: {:?}",
+                    world.check_runs(0).await?
+                ));
+            }
+            if finds == AStepThatJustAsked {
+                // The consumer and its run are stored; the step holds its
+                // claim and has not suspended (as in the restart case).
+                let changed = sqlx::query(
+                    "UPDATE task_step SET status='claimed', claimed_by='dead-process',
+                            lease_until='2000-01-01T00:00:00+00:00', attempts=attempts+1,
+                            suspended_until=NULL, awaited_consumer_id=NULL
+                     WHERE task_id = ? AND status = 'suspended'",
+                )
+                .bind(&task_id)
+                .execute(&pool)
+                .await
+                .map_err(sql)?
+                .rows_affected();
+                if changed != 1 {
+                    return Err("no suspended hooks step to rewind".to_owned());
+                }
+            } else {
+                // The slot frees and the check worker runs the check.
+                world.apply(&Action::Finish(1, Outcome::Success)).await?;
+                let reached = if finds == AFinishedRun {
+                    "SELECT COUNT(*) FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+                     WHERE c.task_id = ? AND r.state = 'succeeded' AND c.delivery_step_id IS NOT NULL"
+                } else {
+                    "SELECT COUNT(*) FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+                     WHERE c.task_id = ? AND r.state = 'running' AND r.dispatch_json IS NOT NULL"
+                };
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    while count(reached).await? != 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok::<_, String>(())
+                })
+                .await
+                .map_err(|_| format!("the check did not get there: {finds:?}"))??;
+                if count("SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status = 'suspended'")
+                    .await?
+                    != 1
+                    || count(DELIVERED).await? != 0
+                {
+                    return Err("expected a suspended hooks step and an unread result".to_owned());
+                }
+            }
+        } else {
+            world.apply(&Action::Finish(0, Outcome::Success)).await?;
+            // Not `quiesce`: that waits for the check to end.
+            let drain = |world: &World| {
+                let service = world.live().state.task_service.clone();
+                let id = world.tasks[0].clone();
+                tokio::spawn(async move { service.drain(&id).await.map(|_| ()) })
+            };
+            let mut running = drain(&world);
+            let mut looked = 0;
+            loop {
+                if running.is_finished() {
+                    running = drain(&world);
+                }
+                let task = world.task(0).await?;
+                let runs = world.check_runs(0).await?;
+                if task["status"] == "review" && runs == ["running"] {
+                    break;
+                }
+                looked += 1;
+                if looked > 400 {
+                    return Err(format!("no running check: {} {runs:?}", task["status"]));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            steps = Some(running);
+        }
         let (version, _) = world.offers(0).await?;
         let (status, body) = world
             .request(
                 Method::POST,
-                &format!("/api/v1/tasks/{}/actions", world.tasks[0]),
+                &format!("/api/v1/tasks/{task_id}/actions"),
                 Some(json!({ "version": version, "action": { "verb": "hold" } })),
             )
             .await?;
         if !status.is_success() {
             return Err(format!("the hold command was refused: {status} {body}"));
         }
-        let _ = steps.await;
-        world.quiesce().await?;
+        if let Some(steps) = steps {
+            let _ = steps.await;
+        }
+        // What the check worker has to do for the case, the hold standing.
+        let stopping: &[&str] = match finds {
+            ARunItStops => &["cancelled"],
+            ARunBeingStopped => &["cancelling", "cancelled"],
+            _ => &[],
+        };
+        if !stopping.is_empty() {
+            tokio::time::timeout(Duration::from_secs(45), async {
+                loop {
+                    let runs = world.check_runs(0).await?;
+                    if runs.len() == 1 && stopping.contains(&runs[0].as_str()) {
+                        return Ok::<_, String>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .map_err(|_| "the withdrawn check was not stopped".to_owned())??;
+        }
+        if finds == AStepThatJustAsked {
+            // The slot frees under the hold.
+            world.apply(&Action::Finish(1, Outcome::Success)).await?;
+        }
+        if slot_seam {
+            // The hold is what these cases are about, not the one slot.
+            let cap = &world.live().state.db.server_run_cap;
+            cap.set(Some(MODEL_RUN_CAP), MODEL_RUN_CAP, &cap.embedded_machine_id());
+        }
+        // The hold has done all it does when its command is answered; the
+        // two cases that race the check worker do not give it time.
+        if !matches!(finds, ARunBeingStopped | ARunItsReleaseJoins) {
+            world.quiesce().await?;
+        }
         let held = world.task(0).await?;
         let runs = world.check_runs(0).await?;
+        let reviews = list(REVIEWS).await?;
+        let delivered = count(DELIVERED).await?;
         world.trace.push(format!(
-            "held: {} runs {runs:?} {}",
-            held["status"], held["condition"]
+            "{finds:?} held: {} runs {runs:?} consumers {:?} reviews {reviews:?} steps {:?} {}",
+            held["status"],
+            list(CONSUMERS).await?,
+            list(STEPS).await?,
+            held["condition"]
         ));
-        if held["status"] != "review" || runs.iter().any(|state| state == "succeeded") {
+        if held["status"] != "review" || held["condition"]["primary"]["kind"] != "held" {
             return Err(format!(
-                "the hold did not stop the entry check: {} {runs:?}",
-                held["status"]
+                "the held Task is not held in review: {} {}",
+                held["status"], held["condition"]
             ));
         }
-        if count(&world, REVIEWER_RUNS).await? != 0 {
+        if count(REVIEWER_RUNS).await? != 0 {
             return Err("a reviewer ran while the Task was held".to_owned());
+        }
+        // The step that waited for the check is stopped, its request
+        // withdrawn before any result was delivered, and its attempt closed.
+        // A step stopped before it began to wait recorded no request to
+        // withdraw: its check runs on, the delivery finds no step to wake,
+        // and the attempt stays open until the release closes it. (The first
+        // case can meet either on a slow machine.)
+        let closed = reviews == ["1:cancelled"] && delivered == 0;
+        let open = reviews == ["1:running"];
+        if !match finds {
+            TheRunInFlight => closed || open,
+            AStepThatJustAsked => open,
+            _ => closed,
+        } {
+            return Err(format!(
+                "under the hold: review attempts {reviews:?}, {delivered} result(s) delivered"
+            ));
+        }
+        if !match finds {
+            ARunItStops => runs == ["cancelled"],
+            AFinishedRun => runs == ["succeeded"],
+            _ => runs.len() == 1,
+        } {
+            return Err(format!("check runs under the hold: {runs:?}"));
         }
         let (version, offers) = world.offers(0).await?;
         let release = offers
@@ -2928,32 +3138,133 @@ async fn a_hold_command_during_the_entry_check_is_resumed_by_its_release() {
             .ok_or_else(|| format!("the held Task offers no release: {offers:?}"))?;
         world.apply_offer(0, version, release).await?;
         world.quiesce().await?;
-        let runs = world.check_runs(0).await?;
+        let runs = list(ENTRY_RUNS).await?;
         let released = world.task(0).await?;
+        let delivered = count(DELIVERED).await?;
         world.trace.push(format!(
-            "released: {} runs {runs:?} {}",
-            released["status"], released["condition"]
+            "{finds:?} released: {} entry runs {runs:?} consumers {:?} reviews {:?} steps {:?} {}",
+            released["status"],
+            list(CONSUMERS).await?,
+            list(REVIEWS).await?,
+            list(STEPS).await?,
+            released["condition"]
         ));
-        if runs.last().map(String::as_str) != Some("succeeded") || runs.len() != 2 {
+        // One run passed. A second one exists only when the first was
+        // stopped, and never when the first was left to end.
+        let again = runs == ["cancelled", "succeeded"];
+        let kept = runs == ["succeeded"];
+        if !match finds {
+            ARunItStops => again && delivered == 1,
+            // The entry's own step reads a result that exists when it asks:
+            // nothing is delivered.
+            AFinishedRun => kept && delivered == 0,
+            AStepThatJustAsked => kept,
+            TheRunInFlight | ARunBeingStopped | ARunItsReleaseJoins => again || kept,
+        } {
             return Err(format!(
-                "the release did not run the entry check again (once): {runs:?} {} {}",
+                "the entry check after the release: {runs:?}, {delivered} result(s) delivered, {} {}",
                 released["status"], released["condition"]
             ));
         }
-        let applied = count(
-            &world,
-            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin='entry' AND applied_at IS NOT NULL",
+        world.drive_to_settlement().await?;
+        let done = world.task(0).await?;
+        let reviews = list(REVIEWS).await?;
+        world.trace.push(format!(
+            "{finds:?} settled: {} reviews {reviews:?}",
+            done["status"]
+        ));
+        // The attempt the hold stopped is closed, and one attempt passed on
+        // the result. (An entry that joined a run in the middle of being
+        // stopped is answered "cancelled": it closes its attempt too and
+        // asks again.)
+        let (last, before) = reviews.split_last().ok_or("no review attempt")?;
+        if done["status"] != "done"
+            || !last.ends_with(":passed")
+            || before.is_empty()
+            || before.iter().any(|attempt| !attempt.ends_with(":cancelled"))
+        {
+            return Err(format!(
+                "the released Task ended in {} with review attempts {reviews:?}",
+                done["status"]
+            ));
+        }
+        // The owner's rule, for every check this Task asked for: one commit,
+        // target and configuration passes in one run.
+        let repeated = count(
+            "SELECT COUNT(*) - COUNT(DISTINCT r.identity_key) FROM check_run r
+             WHERE r.state = 'succeeded'
+               AND r.id IN (SELECT c.run_id FROM check_consumer c WHERE c.task_id = ?)",
         )
         .await?;
-        if applied != 1 {
-            return Err(format!("{applied} check result(s) were applied, expected one"));
+        if repeated != 0 {
+            return Err(format!("{repeated} check(s) ran to a pass a second time"));
         }
-        world.drive_to_settlement().await
+        Ok(())
     }
     .await;
-    if let Err(violation) = outcome {
-        panic!("{violation}\ntrace:\n{}", world.trace.join("\n"));
+    match outcome {
+        Ok(()) => Ok(world.trace),
+        Err(violation) => Err(format!("{violation}\ntrace:\n{}", world.trace.join("\n"))),
     }
+}
+
+/// The cases that start with two Tasks running side by side pin the cap.
+async fn hold_during_the_entry_check_or_panic(finds: HoldFinds) {
+    let case = hold_during_the_entry_check(finds);
+    if let Err(violation) = PINNED_RUN_CAP.scope(Some(MODEL_RUN_CAP), case).await {
+        panic!("{violation}");
+    }
+}
+
+/// As the owner does it: whichever order the machine produces. (It asserted
+/// exactly two runs, and failed in CI when the release asked before the check
+/// worker had looked at the run.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_command_during_the_entry_check_is_resumed_by_its_release() {
+    if let Err(violation) = hold_during_the_entry_check(HoldFinds::TheRunInFlight).await {
+        panic!("{violation}");
+    }
+}
+
+/// The first order, every run: the check worker stops the run nobody waits
+/// for, and the release runs the check again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_that_stops_the_running_entry_check_runs_it_again_at_its_release() {
+    if let Err(violation) = hold_during_the_entry_check(HoldFinds::ARunItStops).await {
+        panic!("{violation}");
+    }
+}
+
+/// The second order, every run: the run ended before the hold. Its result is
+/// not applied under the hold; the release's entry is answered by it, and
+/// the same commit and configuration do not run a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_after_the_entry_check_ended_keeps_its_result_for_the_release() {
+    hold_during_the_entry_check_or_panic(HoldFinds::AFinishedRun).await;
+}
+
+/// The second order as CI met it: the release follows its hold before the
+/// check worker has looked at the run. The run was never stopped, the entry
+/// joins it, and its result is the one answer. (On a machine too slow for
+/// that, this is the first order.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_right_after_the_hold_joins_the_entry_check_that_still_runs() {
+    hold_during_the_entry_check_or_panic(HoldFinds::ARunItsReleaseJoins).await;
+}
+
+/// Between the two: the release arrives while the run is being stopped. The
+/// entry never takes that run's cancellation for an answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_while_the_entry_check_is_being_stopped_still_gets_one_pass() {
+    hold_during_the_entry_check_or_panic(HoldFinds::ARunBeingStopped).await;
+}
+
+/// The hold stops the hooks step after it asked for the check and before it
+/// began to wait: the run it asked for is the one run, and the release's
+/// entry is answered by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_that_stops_the_step_that_just_asked_keeps_the_entry_check_it_asked_for() {
+    hold_during_the_entry_check_or_panic(HoldFinds::AStepThatJustAsked).await;
 }
 
 /// A held Task in `review` and a system re-entry of its review (recovery, a
