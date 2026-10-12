@@ -6001,9 +6001,13 @@ run); a parked one holds none. The lead's Agent is admitted by the same Agent
 and machine limits as any run.
 
 The step-check role cannot be assigned on a subtask
-(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`); rows that predate the rule (for example
-from Project default role assignments, which still copy every default role
-onto new Tasks) hold nothing and are left out of the action snapshot.
+(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`), and Project default role assignments
+do not copy it onto one (`TaskService::project_default_role_assignments`
+leaves out every role `db::inherited_subtask::step_check_holder` gives to the
+root; the only path that gives a subtask default roles is the dispatcher's
+`Step::ApplyDefaults`). Rows that predate the rule hold nothing and are left
+out of the action snapshot; they are not migrated away (they can be removed
+by hand, and nothing reads them).
 
 The names the database needs of this workflow (its states, the step-check
 state and role) live in `db::inherited_subtask`; the services read them from

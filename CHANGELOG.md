@@ -65,9 +65,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   of a subtask in `todo`, `in_progress`, `lead_check`, `done` or `cancelled`
   is the root's lead and nothing else. Assigning `planner` on such a subtask
   is now refused with `422 STEP_CHECK_ROLE_HELD_BY_ROOT` (it was accepted and
-  never used); rows that already exist, including the ones Project default
-  role assignments copy onto every new Task, hold nothing as before and can
-  still be removed. Removing the root's lead, or archiving the Agent that is
+  never used); Project default role assignments no longer copy a `planner` row onto
+  a subtask; rows that already exist hold nothing as before and can still be
+  removed. Removing the root's lead, or archiving the Agent that is
   the lead, stops a step check that is still running and the subtask passes
   the gate at once. Pausing that Agent does not pass the step: with no check
   running the subtask is parked on the Agent (`agent`, naming it) until the

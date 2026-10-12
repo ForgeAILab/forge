@@ -1537,3 +1537,53 @@ async fn pausing_the_lead_s_agent_lets_its_running_check_finish_and_settle() {
     );
 }
 
+/// Project default role assignments are given to a subtask the dispatcher
+/// releases (`Step::ApplyDefaults`). The step-check role is not among them:
+/// on a subtask it is the root's lead and nothing else, and no row is copied.
+#[tokio::test]
+async fn project_defaults_do_not_copy_the_step_check_role_onto_a_subtask() {
+    let steps = steps(&[], None).await;
+    let settings = serde_json::json!({"default_role_assignments": [
+        {"role_name": "planner", "assignee_type": "agent", "assignee_id": steps.planner},
+        {"role_name": "coder", "assignee_type": "agent", "assignee_id": steps.coder},
+    ]});
+    sqlx::query("UPDATE project SET settings=? WHERE id=?")
+        .bind(settings.to_string())
+        .bind(&steps.project)
+        .execute(steps.db.pool())
+        .await
+        .unwrap();
+    let root = seed_task(&steps.db, &steps.project, "root", "in_progress", 1).await;
+    let child = seed_subtask(&steps.db, &root, "first", "todo", 0).await;
+    steps
+        .dispatcher
+        .task_service
+        .assign_project_default_roles(&child)
+        .await
+        .expect("defaults are applied");
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT role_name FROM task_role_assignment WHERE task_id=? ORDER BY role_name",
+    )
+    .bind(&child.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(roles, vec!["coder".to_owned()]);
+    // A root still gets every default role.
+    let other = seed_task(&steps.db, &steps.project, "single", "todo", 1).await;
+    steps
+        .dispatcher
+        .task_service
+        .assign_project_default_roles(&other)
+        .await
+        .expect("defaults are applied");
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT role_name FROM task_role_assignment WHERE task_id=? ORDER BY role_name",
+    )
+    .bind(&other.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(roles, vec!["coder".to_owned(), "planner".to_owned()]);
+}
+
