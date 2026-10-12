@@ -7,6 +7,10 @@ pub struct CheckEnvironmentAttestation {
     pub shell_revision: String,
 }
 
+/// How long the answer of an earlier generation is kept. A server process
+/// that outlives this and loses its row attests again.
+const ATTESTATION_RETENTION_DAYS: i64 = 30;
+
 impl SqliteDb {
     pub async fn check_environment_attestation(
         &self,
@@ -47,6 +51,16 @@ impl SqliteDb {
         .bind(&answer.inherited_revision)
         .bind(&answer.shell_revision)
         .bind(now_rfc3339())
+        .execute(self.pool())
+        .await?;
+        // One row per server start: the answers of long-ended generations
+        // select nothing any more.
+        sqlx::query(
+            "DELETE FROM check_environment_attestation WHERE owner_id=? AND environment_generation<>? AND created_at<?",
+        )
+        .bind(owner_id)
+        .bind(generation)
+        .bind((chrono::Utc::now() - chrono::Duration::days(ATTESTATION_RETENTION_DAYS)).to_rfc3339())
         .execute(self.pool())
         .await?;
         self.check_environment_attestation(owner_id, generation, salt_revision)

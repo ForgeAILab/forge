@@ -8519,24 +8519,31 @@ profile inputs. Generation ids choose the durable attestation
 row, not the check digest: equal observed inputs still give equal identities
 across restarts. Tool versions and profile-sourced mutable dependencies are not
 probed; an in-place tool upgrade behind unchanged exported values remains
-unseen, as before. Profile changes require a restart to renew the answer.
+unseen, as before. **A profile change is not seen until the server restarts**:
+before this, every identity build read the profile again. Until the restart
+checks keep the identity read at start and an earlier pass is still reused.
 
 The probe is bounded at ten seconds and its process group is stopped when the
 bound passes. It returns a typed reason for a timeout, incomplete output,
 excess output or failure to start. A missing answer returns
-`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`) before an identity or consumer is
-admitted. Review entry leaves its hook checkpoint open and retries through the
-Task-step backoff; integration steps use the same transient retry rule. No
-`NotAttested` identity is substituted, no check executes before initialization,
-and no passing Review can silently lose head evidence through a probe timeout.
-Retry exhaustion follows the existing visible step/hook failure path.
+`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`,
+REST `503 check_environment_unavailable`) before an identity or consumer is
+admitted. No `NotAttested` identity is substituted, no check executes before
+the answer exists, and no passing Review can lose head evidence through a
+probe timeout. What the Task does without an answer:
+
+| Where | Bounded by | Landing |
+|---|---|---|
+| Review entry (`run_ci_steps`, automatic or the owner's re-run) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the hooks step, 1 s doubling back-off; the opened attempt and the hook checkpoint stay | The unstarted Review attempt is discarded (no Review, no review budget) and the Task states `before_work_hook_failed` / `review_ci_infrastructure` with the cause. It re-enters review on the `review_ci_infrastructure` budget's back-off (5 entries); then `review_ci_infrastructure_exhausted` with `retry_hook` and an attention item. |
+| Merge head (`request_check`, `settle` reuse) | the Task-step transient rule: 8 attempts, 1 s doubling to 64 s; then the queue asks the step again `step_reasks` times | The attempt parks as `task_step_failed`; the step's `last_error` and the Task's `cascade_failed` annotation carry the cause. |
 
 The first complete answer is stored in `check_environment_attestation`, keyed
 by owner, environment generation and salt revision. Installation/generation
 single-flight also covers independently composed DB handles: concurrent identity
 builders do one successful probe and re-read its stored answer. The row holds
-only a salted inherited-environment revision and shell version, never names or
-values. Identity construction and owner execution reuse that answer and do no
+only salted digests (the inherited environment and the shell version), never a
+name or a value; rows of generations that ended more than 30 days ago are
+removed when a new one is stored. Identity construction and owner execution reuse that answer and do no
 shell spawn. An unchanged Task's review entry plus merge previously used three
 probes (entry identity, owner execution, head identity); a rebased head used
 four. Both now use one on a cold generation and zero on a warm generation.

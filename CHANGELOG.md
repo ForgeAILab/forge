@@ -53,16 +53,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   after the agent lost authority. A `capture` retry does not: capture stores
   its asset before the command runs, so it is now refused before anything is
   written.
-- **Check identities use a durable owner environment attestation.** Review
-  entry and merge reuse one complete login-shell answer per server environment
-  generation, removing repeated probes and load-dependent identity drift. An
-  absent answer fails typed and retries before admitting a check, instead of
-  building `NotAttested` and silently losing head-check Review evidence. A
-  server restart renews the generation; Project environment changes still
-  invalidate reuse. The environment digest schema changes, so older cached
-  checks miss once. The additive attestation migration preserves existing data
-  and stores only salted revisions and the shell version.
-
 - **A dirty Task checkout returns to its coder through the merge-fix budget.**
   The queue uses the same failure/cascade path as the pre-queue merge hook,
   rather than parking the Task for its owner. A red head check also charges
@@ -1434,6 +1424,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **The server reads its login-shell environment once per start, not once per
+  check.** A canonical check identity names the environment its steps inherit.
+  The server now asks its login shell once per process (one stored answer per
+  installation and server start) and every review-entry and merge-head
+  identity, and the owner right before a run, use that answer; Project
+  environment values are still read each time. A Task's review entry plus
+  merge used three login shells (four with a rebased head) and now uses one
+  after a server start and none afterwards. **Restart the server after
+  changing the login profile it inherits** (`PATH`, toolchain variables):
+  until then checks keep the identity of the environment read at start, and a
+  result that passed before the change is still reused. The environment digest
+  schema changed, so check results stored by an earlier version are not reused
+  (each commit is checked once more). Migration `V202610120637` adds the
+  `check_environment_attestation` table; it holds salted digests only and
+  changes no existing row. `503 check_environment_unavailable` is the REST
+  code of a request that needs the answer before it exists.
 
 - **One registry drives the native and MCP tool surfaces.** Native host
   metadata, permission lists and the MCP dispatch table are generated from the
@@ -3010,6 +3017,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A slow login shell no longer loses a merge's check evidence or runs a
+  check twice.** When the login-shell probe did not answer within its ten
+  seconds (a loaded host), the identity built at the merge head differed from
+  the one review entry had stored: the Task merged without its head-check
+  Review evidence, or the same commit was checked again. An identity is now
+  never built without the answer. Review entry asks again up to four times
+  within a few seconds without showing anything; after that the Task states
+  the `review_ci_infrastructure` interruption with the cause, re-enters review
+  by itself on that budget's back-off and, once it is spent, waits with
+  `retry_hook`. No Review attempt is recorded and no review budget is spent.
+  At the merge head the queue step retries with back-off and then parks the
+  Task as `task_step_failed`.
 
 - **A Project-bound MCP dependency listing no longer names a Task outside the
   Project.** `forge_list_task_dependencies` answers `not found` for the

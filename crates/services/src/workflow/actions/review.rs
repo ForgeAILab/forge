@@ -925,7 +925,7 @@ async fn request_entry_check(
     let commit_sha = state
         .head_sha
         .ok_or_else(|| failed("review workspace has no HEAD".to_owned()))?;
-    let Some(identity) = crate::check_runner::review_entry::review_ci_identity(
+    let identity = match crate::check_runner::review_entry::review_ci_identity(
         &ctx.db,
         crate::check_runner::review_entry::ReviewCiIdentityInput {
             task,
@@ -938,17 +938,31 @@ async fn request_entry_check(
         },
     )
     .await
-    .map_err(|error| {
-        if matches!(
-            error,
-            crate::ServiceError::Review(::review::ReviewError::CheckEnvironmentUnavailable)
-        ) {
-            crate::workflow::engine::durable::note_hook_failure(&ctx.task_id, &error);
+    {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return Ok(EntryCheck::NothingToRun),
+        Err(error) if error.is_check_environment_unavailable() => {
+            // The owner's login shell gave no environment, so no identity
+            // exists and nothing was asked. The first attempts are the hooks
+            // step's own: its checkpoint (the opened attempt) stays and the
+            // step asks again after a short back-off.
+            let again =
+                crate::workflow::engine::durable::current_hook(&ctx.task_id).is_some_and(|hook| {
+                    hook.step.attempts < crate::worker_runtime::queue::ENVIRONMENT_ATTEMPTS
+                });
+            if again {
+                crate::workflow::engine::durable::note_hook_failure(&ctx.task_id, &error);
+                return Err(failed(error.to_string()));
+            }
+            // Still no answer: this is the review-CI infrastructure
+            // interruption, as for an owner that cannot be reached. No
+            // command ran, so this is not a Review attempt; the Task states
+            // the cause, re-enters on the infrastructure budget's back-off
+            // and, once that is spent, waits with `retry_hook`.
+            let _ = ctx.db.discard_unstarted_review(&review.id).await;
+            return Err(interrupt_ci(ctx, task, &error.to_string(), true, false).await);
         }
-        failed(error.to_string())
-    })?
-    else {
-        return Ok(EntryCheck::NothingToRun);
+        Err(error) => return Err(failed(error.to_string())),
     };
     let status_epoch = db::CheckDeliveryRepo::live_task_epoch(&*ctx.db, &task.id)
         .await

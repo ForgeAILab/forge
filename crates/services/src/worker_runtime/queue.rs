@@ -1554,6 +1554,11 @@ fn lease_deadline() -> String {
 }
 /// Attempts (including the first) a step gets for retryable failures.
 const MAX_STEP_ATTEMPTS: i64 = 8;
+/// Attempts (including the first) a review entry asks the owner's login
+/// shell for its environment before the Task shows the interruption: about
+/// seven seconds of back-off on top of each probe's own bound.
+pub(crate) const ENVIRONMENT_ATTEMPTS: i64 = 4;
+const _: () = assert!(ENVIRONMENT_ATTEMPTS < MAX_STEP_ATTEMPTS);
 
 /// Exponential back-off for the next attempt: 1 s doubling to 64 s.
 fn retry_due(attempts: i64) -> String {

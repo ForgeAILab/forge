@@ -72,6 +72,24 @@ fn server_environment_generation() -> &'static str {
 #[cfg(test)]
 static TEST_GENERATIONS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
+/// Installations whose login shell does not answer, for a test of the
+/// unavailable path. Scoped by installation like the generations above.
+#[cfg(test)]
+static TEST_UNANSWERED: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(test)]
+pub(crate) async fn silence_login_shell_for_test(db: &db::SqliteDb, silent: bool) -> Result<()> {
+    let installation = salt(db).await?;
+    let mut unanswered = TEST_UNANSWERED.lock().unwrap_or_else(|p| p.into_inner());
+    if silent {
+        unanswered.insert(installation);
+    } else {
+        unanswered.remove(&installation);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) async fn renew_environment_generation_for_test(db: &db::SqliteDb) -> Result<()> {
     let installation = salt(db).await?;
@@ -90,6 +108,16 @@ fn inherited_revision(
     canonical_digest_with_schema(
         "forge.check-inherited-environment/2",
         &serde_json::json!({ "salt": salt, "inherited": inherited.identity_values() }),
+    )
+    .map_err(|error| ServiceError::invalid_operation(error.to_string()))
+}
+
+/// The shell's version, salted like every other stored revision: the
+/// attestation row holds no name or value the shell reported.
+fn shell_revision(salt: &str, shell: &str) -> Result<String> {
+    canonical_digest_with_schema(
+        "forge.check-shell-revision/1",
+        &serde_json::json!({ "salt": salt, "shell": shell }),
     )
     .map_err(|error| ServiceError::invalid_operation(error.to_string()))
 }
@@ -149,6 +177,21 @@ pub async fn attest(
             .cloned()
             .unwrap_or(generation)
     };
+    #[cfg(test)]
+    let silent = {
+        let installation = salt(db).await?;
+        TEST_UNANSWERED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&installation)
+    };
+    #[cfg(test)]
+    if silent {
+        return attest_for_generation(db, project, &generation, || async {
+            Err(check_executor::ProbeUnanswered::TimedOut)
+        })
+        .await;
+    }
     attest_for_generation(
         db,
         project,
@@ -204,7 +247,7 @@ where
                         &salt_revision,
                         &db::CheckEnvironmentAttestation {
                             inherited_revision: inherited_revision(&salt, &inherited)?,
-                            shell_revision: inherited.shell_revision,
+                            shell_revision: shell_revision(&salt, &inherited.shell_revision)?,
                         },
                     )
                     .await?
