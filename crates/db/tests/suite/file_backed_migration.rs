@@ -6102,7 +6102,11 @@ async fn check_environment_attestation_migration_is_additive_on_a_file_database(
     };
     let before = schema(pool.clone()).await;
 
-    let all = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    // Up to this migration: a later one (`V202610121119`) rebuilds an index
+    // of `check_consumer`, which is its own change.
+    let all = unique_temp_path("attestation-migrations-with");
+    fs::create_dir_all(&all).expect("migration dir creates");
+    copy_migrations_up_to(202610120637, &all);
     run_migrations_from(&pool, &all)
         .await
         .expect("the attestation migration applies to an existing database");
@@ -6157,4 +6161,66 @@ async fn check_environment_attestation_migration_is_additive_on_a_file_database(
     pool.close().await;
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(migration_dir);
+}
+
+/// `V202610121119` rebuilds the undelivered-result index of `check_consumer`
+/// on a populated file database: no row changes, and applying the bundle
+/// again is a no-op.
+#[tokio::test]
+async fn check_consumer_answered_index_migration_changes_the_index_only() {
+    let migration_dir = unique_temp_path("answered-index-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir creates");
+    copy_migrations_up_to(202610120637, &migration_dir);
+    let db_path = unique_temp_path("answered-index-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("migrations before the index rebuild apply");
+    let now = "2026-10-12T00:00:00Z";
+    sqlx::raw_sql(&format!(
+        "INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','{now}','{now}');
+         INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('r','p','repo','main','{now}','{now}');
+         INSERT INTO check_consumer(id,project_id,repo_id,status_epoch,origin,purpose,request_key,identity_key,created_at) VALUES('c','p','r',0,'entry','entry_ci','key','identity','{now}');"
+    ))
+    .execute(&pool)
+    .await
+    .expect("a consumer exists before the migration");
+    let index = |pool: db::SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='check_consumer_undelivered'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("index reads")
+    };
+    let rows = |pool: db::SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT json_object('id',id,'request_key',request_key,'applied_at',applied_at,'delivery_step_id',delivery_step_id,'created_at',created_at) FROM check_consumer",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("rows read")
+    };
+    let before = rows(pool.clone()).await;
+    assert!(!index(pool.clone()).await.contains("applied_at IS NULL"));
+
+    copy_migrations_up_to(202610121119, &migration_dir);
+    for _ in 0..2 {
+        run_migrations_from(&pool, &migration_dir)
+            .await
+            .expect("the index rebuild applies, and again as a no-op");
+    }
+    assert!(index(pool.clone()).await.contains("applied_at IS NULL"));
+    assert_eq!(rows(pool.clone()).await, before);
+    let applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version=202610121119")
+            .fetch_one(&pool)
+            .await
+            .expect("migration row reads");
+    assert_eq!(applied, 1);
+    pool.close().await;
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_dir_all(&migration_dir);
 }

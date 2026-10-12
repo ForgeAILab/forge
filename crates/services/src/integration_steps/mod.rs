@@ -34,14 +34,17 @@ use crate::{
 use api_types::{
     IntegrationAttemptId, IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
 };
+#[cfg(test)]
+use db::IntegrationFailureKind;
 use db::{
-    ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S, IntegrationFailureKind,
-    IntegrationQueueRepo, IntegrationQueueState, IntegrationStepAckOutcome,
-    IntegrationStepAckWrite, IntegrationStepPosition, SqliteDb, TaskRepo, TaskStep, TaskStepRepo,
+    ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S, IntegrationQueueRepo,
+    IntegrationQueueState, IntegrationStepAckOutcome, IntegrationStepAckWrite,
+    IntegrationStepPosition, SqliteDb, TaskRepo, TaskStep, TaskStepRepo,
 };
 use std::sync::Arc;
 
 pub(crate) mod admission;
+pub(crate) mod deferral;
 pub(crate) mod gate;
 pub mod import;
 mod port;
@@ -94,6 +97,9 @@ impl Default for IntegrationStepTimers {
         Self::from(&crate::integration_worker::IntegrationWorkerConfig::default())
     }
 }
+/// Leads the message of a head that could not identify its check because the
+/// owner's environment was not attested.
+pub(crate) const CHECK_ENVIRONMENT_UNAVAILABLE: &str = "check environment unavailable";
 const TEXT_LIMIT: usize = 1000;
 /// Leads the retry reason of a `result` step that found its fast-forward
 /// still in flight.
@@ -214,8 +220,24 @@ impl IntegrationSteps {
             return continued;
         }
         let outcome = match request.action {
-            IntegrationStepAction::RequestCheck => self.request_check(step, &request).await?,
-            IntegrationStepAction::Settle => match self.reuse_review_check(&request).await? {
+            IntegrationStepAction::RequestCheck => match self.request_check(step, &request).await {
+                Err(error) if error.is_check_environment_unavailable() => {
+                    self.environment_unavailable(step, &request, &[S::Checking], error)
+                        .await?
+                }
+                outcome => outcome?,
+            },
+            IntegrationStepAction::Settle => match match self.reuse_review_check(&request).await {
+                Err(error) if error.is_check_environment_unavailable() => {
+                    let outcome = self
+                        .environment_unavailable(step, &request, &[S::AwaitingTaskStep], error)
+                        .await?;
+                    let concluded = self.conclude(step, outcome).await;
+                    self.wake_worker();
+                    return concluded;
+                }
+                reuse => reuse?,
+            } {
                 settle::HeadReuse::Early => StepOutcome::Retry("attempt is not waiting yet".into()),
                 reuse => {
                     let evidence = match reuse {
@@ -249,6 +271,38 @@ impl IntegrationSteps {
         let concluded = self.conclude(step, outcome).await;
         self.wake_worker();
         concluded
+    }
+
+    /// The owner's login shell gave no environment, so the head's check has
+    /// no identity and nothing was asked. The first attempts are the step's
+    /// own (the same bound as review entry, `ENVIRONMENT_ATTEMPTS`: about
+    /// seven seconds of back-off). Then the step answers "no verdict" with
+    /// the cause: the worker parks the attempt as an infrastructure wait
+    /// that names it, retries on its counted timer and, once that is spent,
+    /// waits for the owner's Retry. Letting the error spend every step
+    /// attempt and every re-ask instead parked the attempt as
+    /// `task_step_failed`, which names the step and not the cause.
+    async fn environment_unavailable(
+        &self,
+        step: &TaskStep,
+        request: &IntegrationStepRequest,
+        states: &[S],
+        error: ServiceError,
+    ) -> Result<StepOutcome> {
+        if step.attempts < crate::worker_runtime::queue::ENVIRONMENT_ATTEMPTS {
+            return Err(error);
+        }
+        tracing::warn!(target: "services::integration_steps", task_id = %step.task_id, attempt_id = %request.attempt_id, %error, "the head's check has no identity; the attempt waits for the environment");
+        self.settle(
+            Some(step),
+            request,
+            states,
+            settle::CheckInput::NoVerdict(format!(
+                "{CHECK_ENVIRONMENT_UNAVAILABLE}: the owner's login shell did not report its environment, so the head's check could not be identified"
+            )),
+            None,
+        )
+        .await
     }
 
     /// An answer may have been written on the attempt: its driver re-reads
@@ -373,6 +427,14 @@ impl IntegrationSteps {
         .bind(&attempt.task_ref)
         .fetch_one(self.db.pool())
         .await?;
+        // The machine a pre-queue owner wait named (importer row P15).
+        let waited_owner: Option<String> = sqlx::query_scalar(
+            "SELECT CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.owner_wait.daemon_id') END FROM task WHERE id=?",
+        )
+        .bind(&attempt.task_ref)
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let attempt = db::integration_attempt_in_tx(&mut tx, &request.attempt_id).await?;
         match db::integration_step_position(
@@ -438,30 +500,18 @@ impl IntegrationSteps {
                 (attempt.failure_kind, attempt.failure_message.clone())
             };
             let message = message.unwrap_or_else(|| "integration is waiting".into());
-            let cause = if attempt.state == S::Quarantined {
-                IntegrationDeferralCause::UnresolvedResult
-            } else if message.starts_with("target_dirty") {
-                IntegrationDeferralCause::TargetDirty
-            } else {
-                match kind {
-                    Some(
-                        IntegrationFailureKind::Infrastructure | IntegrationFailureKind::Timeout,
-                    ) => IntegrationDeferralCause::Infrastructure,
-                    Some(IntegrationFailureKind::TargetUnavailable) => {
-                        IntegrationDeferralCause::OwnerOffline
-                    }
-                    Some(IntegrationFailureKind::NeedsFact) => {
-                        IntegrationDeferralCause::UnresolvedResult
-                    }
-                    _ => IntegrationDeferralCause::OwnerRequired,
-                }
-            };
-            // A wait for the machine that holds the Task's checkout names
-            // that machine.
-            let owner_id = message
-                .starts_with("owner_offline")
-                .then(|| attempt.daemon_id.clone())
-                .flatten();
+            // One rule for every writer of this row (`deferral`). The
+            // suspended queue of a `queued` member is the queue's fact: the
+            // importer's classification of the row does not apply to it.
+            let (cause, owner_id) = deferral::deferral(&deferral::DeferralFacts {
+                quarantined: attempt.state == S::Quarantined,
+                kind,
+                message: &message,
+                daemon_id: attempt.daemon_id.as_deref(),
+                import: (attempt.state != S::Queued)
+                    .then(|| deferral::import_facts(&attempt, waited_owner.clone()))
+                    .flatten(),
+            });
             Some(IntegrationReason::Deferred {
                 attempt_id: attempt_ref(&attempt.id),
                 cause,

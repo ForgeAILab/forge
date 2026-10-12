@@ -750,6 +750,9 @@ pub mod halt {
 
     /// The woken hooks step is claimed and about to read its check result.
     pub const AFTER_WAKE_BEFORE_SETTLE: &str = "after_wake_before_settle";
+    /// The hooks step asked for its entry check (the consumer is stored) and
+    /// has not suspended on it yet.
+    pub const AFTER_REQUEST_BEFORE_SUSPEND: &str = "after_request_before_suspend";
 
     type Armed = (String, &'static str, Arc<Notify>);
     static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
@@ -982,6 +985,7 @@ async fn request_entry_check(
         })
         .await
         .map_err(|error| failed(error.to_string()))?;
+    halt::reach(&task.id, halt::AFTER_REQUEST_BEFORE_SUSPEND).await;
     Ok(EntryCheck::Asked(requested.consumer.id))
 }
 
@@ -1483,16 +1487,20 @@ async fn interrupt_ci(
     retry: bool,
     reset: bool,
 ) -> HookResult {
-    if !ctx.triggered_by.is_user() {
-        if let Err(error) = ctx
-            .task_service
-            .annotate_review_ci_interruption(task, ctx, reason, retry, reset)
-            .await
-        {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
+    // Whoever caused the entry: the workflow's own cascade, or the owner's
+    // Retry of the review entry. The hook runs in the Task's hooks step
+    // either way, after the command that asked has returned, so the Task is
+    // the only place the cause can be read. An entry its owner asked for
+    // that was left unannotated showed only "hook failed", with no cause
+    // and no re-entry.
+    if let Err(error) = ctx
+        .task_service
+        .annotate_review_ci_interruption(task, ctx, reason, retry, reset)
+        .await
+    {
+        return HookResult::Failed {
+            reason: error.to_string(),
+        };
     }
     HookResult::Failed {
         reason: reason.to_owned(),

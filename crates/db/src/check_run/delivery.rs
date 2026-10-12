@@ -221,14 +221,17 @@ impl CheckDeliveryRepo for SqliteDb {
         }
         // An idle sweep must not take the write lock: probe the partial
         // index first and open the transaction only when there is work.
-        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL)")
+        // A consumer created already answered (the integration head's reuse:
+        // `applied_at` without a delivery step) is not work: the step that
+        // recorded it applied the result itself.
+        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND c.applied_at IS NULL)")
             .fetch_one(self.pool())
             .await?;
         if !pending {
             return Ok(0);
         }
         let mut tx = begin_immediate(self.pool()).await?;
-        let rows = sqlx::query("SELECT c.*, r.spec_digest, r.commit_sha, t.status AS task_status, t.version AS task_version FROM check_consumer c JOIN check_run r ON r.id=c.run_id JOIN task t ON t.id=c.task_id JOIN check_result result ON result.id=c.result_id WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND (result.outcome<>'infrastructure_failed' OR c.infrastructure_retries>=2) AND r.state IN ('succeeded','failed','cancelled') ORDER BY c.created_at,c.id LIMIT ?")
+        let rows = sqlx::query("SELECT c.*, r.spec_digest, r.commit_sha, t.status AS task_status, t.version AS task_version FROM check_consumer c JOIN check_run r ON r.id=c.run_id JOIN task t ON t.id=c.task_id JOIN check_result result ON result.id=c.result_id WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND c.applied_at IS NULL AND (result.outcome<>'infrastructure_failed' OR c.infrastructure_retries>=2) AND r.state IN ('succeeded','failed','cancelled') ORDER BY c.created_at,c.id LIMIT ?")
             .bind(limit).fetch_all(&mut *tx).await?;
         let count = rows.len() as u64;
         for row in rows {

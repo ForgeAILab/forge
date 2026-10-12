@@ -3818,6 +3818,7 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `integration_queues.heads` | The same shape for members being merged: the head age, from when the attempt took the head. |
 | `integration_queues.parked` | The same shape for members whose merge stopped (`parked`), aged from when it did. |
 | `integration_queues.timings` | Where the merges completed in the last `window_seconds` (86 400) spent their time: `completed` (merges read, newest first, at most `sample_limit` = 500) and five `{ samples, p50_ms, p95_ms, max_ms }` nearest-rank percentiles. `queue_wait` is entering the queue to taking its head; `head_time` is the time at the head over every round; `rebase`, `check` and `fast_forward` are its split. A merge whose target had not moved has no rebase and no check: `samples` says how many merges measured each. Percentiles are `null`, never `0`, when nothing measured them. |
+| `integration_queues.finished_with_receipts` | Finished merge attempts whose owner receipts and observations are still stored. The hourly retention pass empties them once the attempt finished more than `server.check_retention_days` ago (default 30; `0` keeps them). It never touches a current attempt, an unsettled or uncertain effect, an attempt of a Task that is merging again, or the evidence of a quarantined queue, and it deletes no attempt row. A number that keeps growing past the retention period means the pass is not running or a guard holds the rows. |
 | `checks.by_state` | Check runs counted by `queued`, `running`, `cancelling`, `cleaning`, `uncertain`, `succeeded`, `failed`, `cancelled`; all zero states included. History older than `server.check_retention_days` is deleted, so the terminal counts cover that period. |
 | `checks.reusable_results` | Certified passing results with successful cleanup and cacheable attested inputs whose source run succeeded; exact-identity reuse only. Zero on a fresh or upgraded database; no legacy cache is seeded. |
 | `checks.admitted_runs`, `checks.borrowed_runs` | Runs that hold a machine slot (`running`, `cancelling`, `cleaning` or `uncertain` and admitted to one), and how many of those share the slot of their own Task's run or reservation. |
@@ -4756,7 +4757,6 @@ Common HTTP mappings:
 | 412 | Workflow guard rejection (`before_exit` blocked the transition) |
 | 422 | Illegal state transition |
 | 500 | Internal error |
-| 503 | `check_environment_unavailable`: the owner has no complete environment attestation yet; retry before requesting the check. No identity or check run was created. |
 
 `resource_in_use` (HTTP `409`) means a delete or update was refused because
 other records still reference the target, for example a workspace whose remote

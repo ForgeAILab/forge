@@ -738,6 +738,8 @@ impl SqliteDb {
                 if !reusable {
                     return Ok(None);
                 }
+            } else {
+                record_entry_wait_in_tx(&mut tx, &request, &consumer.id).await?;
             }
             tx.commit().await?;
             return Ok(Some(RequestedCheckRun {
@@ -780,19 +782,56 @@ impl SqliteDb {
             (id, None, CheckRequestDisposition::Scheduled)
         };
         let id = new_uuid_v4();
-        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        // A reuse-only request is made by the step that applies the answer
+        // itself (the integration head's `settle`): the consumer is created
+        // answered, so the check worker enqueues no delivery step for it.
+        let answered = reuse_only.then(|| now.clone());
+        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,applied_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.task_id).bind(request.status_epoch)
-            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(now).execute(&mut *tx).await?;
+            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(answered).bind(now).execute(&mut *tx).await?;
         let consumer = map_consumer(
             sqlx::query("SELECT * FROM check_consumer WHERE id=?")
                 .bind(id)
                 .fetch_one(&mut *tx)
                 .await?,
         )?;
+        if !reuse_only {
+            record_entry_wait_in_tx(&mut tx, &request, &consumer.id).await?;
+        }
         tx.commit().await?;
         Ok(Some(RequestedCheckRun {
             consumer,
             disposition,
         }))
     }
+}
+
+/// A review entry asks from inside its hooks step, which then suspends on the
+/// consumer. The wait is recorded on that step here, in the transaction that
+/// stores the request, not only when the step suspends: an owner command
+/// (Hold, Cancel) that stops the step between the two finds the request to
+/// withdraw (`abandoned_check_waits` reads this column of a superseded
+/// step). Without it the consumer stayed live with no step to wake, its run
+/// went on, and the review attempt stayed `running` under the hold.
+async fn record_entry_wait_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request: &CheckRunRequest,
+    consumer_id: &str,
+) -> Result<()> {
+    if request.origin != CheckConsumerOrigin::Entry {
+        return Ok(());
+    }
+    let Some(step) = crate::task_writer::current_task_step() else {
+        return Ok(());
+    };
+    if step.kind != "hooks" || request.task_id.as_deref() != Some(step.task_id.as_str()) {
+        return Ok(());
+    }
+    sqlx::query("UPDATE task_step SET awaited_consumer_id=? WHERE id=? AND kind='hooks' AND status='claimed' AND claimed_by IS ?")
+        .bind(consumer_id)
+        .bind(&step.id)
+        .bind(&step.claimed_by)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }

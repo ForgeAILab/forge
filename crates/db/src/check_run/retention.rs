@@ -135,7 +135,7 @@ impl SqliteDb {
                   AND (c.cancelled_at IS NOT NULL OR c.applied_at IS NOT NULL OR c.task_id IS NULL
                        OR NOT EXISTS(SELECT 1 FROM task t WHERE t.id=c.task_id
                                      AND t.status_epoch=c.status_epoch AND t.deleted_at IS NULL))
-                  AND NOT (c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL)
+                  AND NOT (c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND c.applied_at IS NULL)
                   AND c.id NOT IN (SELECT s.awaited_consumer_id FROM task_step s
                                    WHERE s.status NOT IN {FINISHED_STEP} AND s.awaited_consumer_id IS NOT NULL)
                   AND c.id NOT IN (SELECT json_extract(k.effects_json,'$.ci_consumer')
