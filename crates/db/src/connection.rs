@@ -180,6 +180,11 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
         5
     };
     let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    // A private in-memory database IS its one connection: SQLx replaces a
+    // connection it closed with a new one, and that one opens another, empty
+    // database. Nothing below closes it, and a second connect says so.
+    let memory = database_url.contains(":memory:");
+    let connected = Arc::new(AtomicBool::new(false));
 
     // Connection identities are opaque keys only; no pointer is dereferenced.
     // SQLite's commit hook is BEFORE visibility. It only marks a connection;
@@ -192,10 +197,33 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
         // A release must pass through the notification hook rather than the
         // lifetime-expiry close path. Idle connections can still be recycled.
         .max_lifetime(None)
-        .acquire_timeout(Duration::from_secs(30))
+        // SQLx pings an idle connection before it hands it out, and holds it
+        // outside the pool while it waits for the answer: an `acquire` future
+        // dropped there (an aborted task, a lost `select!` branch, a timeout,
+        // a disconnected request) closes the connection with it. The ping
+        // proves nothing for SQLite, whose connection is a thread of this
+        // process; without it an idle connection is handed out with no await
+        // point, and every release is still tested.
+        .test_before_acquire(false)
+        .acquire_timeout(Duration::from_secs(30));
+    // The idle reaper closes a connection too (SQLx default: ten minutes).
+    let pool = if memory {
+        pool.idle_timeout(None)
+    } else {
+        pool
+    };
+    let pool = pool
         .after_connect(move |connection, _metadata| {
             let hooks = Arc::clone(&on_connect);
+            let connected = Arc::clone(&connected);
             Box::pin(async move {
+                // Loud, because the alternative is `no such table` from an
+                // unrelated statement much later.
+                assert!(
+                    !(memory && connected.load(Ordering::Acquire)),
+                    "the connection of an in-memory SQLite pool was closed and is being replaced: \
+                     the replacement is a new, empty database and everything written so far is gone"
+                );
                 // Only empty databases can enable auto-vacuum without a full
                 // rebuild. Set this before WAL, which dirties even an empty
                 // file. Never change an existing database's mode here.
@@ -255,6 +283,8 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                     }
                     true
                 });
+                drop(handle);
+                connected.store(true, Ordering::Release);
                 Ok(())
             })
         })
@@ -444,6 +474,7 @@ pub async fn convert_sqlite_to_incremental(database_url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::panic::AssertUnwindSafe;
 
     /// Waits until every marked commit has been announced. A release runs on
@@ -518,6 +549,93 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
     }
+    /// One poll of `pool.acquire()`: the connection when the pool had it
+    /// idle, `None` when the future had to wait and was dropped waiting.
+    async fn acquire_or_cancel(pool: &SqlitePool) -> Option<sqlx::pool::PoolConnection<Sqlite>> {
+        let mut acquire = std::pin::pin!(pool.acquire());
+        match std::future::poll_fn(|cx| std::task::Poll::Ready(acquire.as_mut().poll(cx))).await {
+            std::task::Poll::Ready(connection) => Some(connection.unwrap()),
+            std::task::Poll::Pending => None,
+        }
+    }
+    async fn raw_handle(connection: &mut SqliteConnection) -> usize {
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .as_raw_handle()
+            .as_ptr() as usize
+    }
+    async fn idle(pool: &SqlitePool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.num_idle() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection is returned to the pool");
+    }
+
+    /// A caller that stops waiting for a connection (an aborted task, a lost
+    /// `select!` branch, a timeout) must not cost the pool the connection.
+    /// With SQLx's ping before acquire the idle connection was out of the
+    /// pool while the ping was awaited, and dropping the future there closed
+    /// it: a reconnect for a file, a new EMPTY database for `:memory:`.
+    #[tokio::test]
+    async fn a_cancelled_acquire_does_not_close_the_idle_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = format!("sqlite://{}", dir.path().join("cancel.sqlite").display());
+        for url in ["sqlite::memory:", file.as_str()] {
+            let pool = create_sqlite_pool(url).await.unwrap();
+            sqlx::raw_sql("CREATE TABLE kept(v TEXT); INSERT INTO kept VALUES ('row');")
+                .execute(&pool)
+                .await
+                .unwrap();
+            idle(&pool).await;
+            let mut first = pool.acquire().await.unwrap();
+            let original = raw_handle(&mut first).await;
+            drop(first);
+            for round in 0..20 {
+                idle(&pool).await;
+                let acquired = acquire_or_cancel(&pool).await;
+                assert!(
+                    acquired.is_some(),
+                    "{url} round {round}: an idle connection is handed out without a wait"
+                );
+            }
+            idle(&pool).await;
+            assert_eq!(pool.size(), 1, "{url}");
+            let mut again = pool.acquire().await.unwrap();
+            assert_eq!(
+                raw_handle(&mut again).await,
+                original,
+                "{url}: the same connection"
+            );
+            let rows: Vec<String> = sqlx::query_scalar("SELECT v FROM kept")
+                .fetch_all(&mut *again)
+                .await
+                .unwrap();
+            assert_eq!(rows, ["row"], "{url}");
+        }
+    }
+
+    /// An in-memory pool whose connection is closed anyway does not carry on
+    /// over an empty database: the replacement is refused where it is made.
+    #[tokio::test]
+    async fn replacing_the_connection_of_an_in_memory_pool_panics_with_the_cause() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE kept(v TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Out of the pool for good: the next acquire has to connect.
+        let _detached = pool.acquire().await.unwrap().detach();
+        let replaced = tokio::spawn(async move { pool.acquire().await.map(drop) }).await;
+        let panic = replaced.expect_err("the replacement panics").into_panic();
+        let message = panic.downcast_ref::<&str>().copied().unwrap_or_default();
+        assert!(message.contains("new, empty database"), "{message}");
+    }
+
     // Ports W1-W5 without wall-clock performance thresholds. The fast-path
     // counter proves ordinary pool users take no additional worker round trip.
     #[tokio::test]

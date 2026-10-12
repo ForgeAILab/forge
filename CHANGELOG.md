@@ -3117,6 +3117,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A caller that stops waiting for a database connection no longer closes
+  it.** The pool pinged an idle connection before handing it out and held it
+  outside the pool meanwhile: a request that disconnected, a step that was
+  preempted, a timeout or a worker stopped at that moment dropped the
+  connection, and the next caller paid for a new one (open, the PRAGMAs,
+  the hooks, an empty statement cache). The ping is gone (it proves nothing
+  for SQLite, and every release is still tested), so an idle connection is
+  handed out without a wait. For an in-memory database (tests and tools
+  only) the lost connection was the database: the replacement was empty and
+  the next statement failed `no such table`. Such a pool now also keeps its
+  connection past the idle timeout, and replacing it panics with the cause.
+
 - **A merge the queue rebased itself is no longer sent back to review when
   it is asked again.** A head that had rebased and then waited for its
   checkout's machine until the step wait ran out parked `owner_offline`
