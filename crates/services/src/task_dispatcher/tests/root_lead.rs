@@ -994,3 +994,86 @@ async fn a_stopped_planner_parks_the_root_with_a_retry() {
         state_dump(&lead.db).await
     );
 }
+
+/// Every (root state x first-subtask state x lead / no lead) a live database
+/// can hold at upgrade settles into owned work: after the dispatcher's
+/// passes every Task that is not settled has a step, a live execution or a
+/// park (the sweep invariant), no subtask runs under a root that is not
+/// implementing, a root and its subtasks run one execution at most, and a
+/// root without a lead never plans and never rests before implementation
+/// while it has a subtask to run.
+#[tokio::test]
+async fn upgrade_matrix_every_root_and_subtask_state_is_owned() {
+    let mut table = String::new();
+    for root_status in ["backlog", "todo", "planning", "in_progress"] {
+        for first in ["todo", "in_progress", "done", "cancelled"] {
+            for with_lead in [false, true] {
+                let lead = lead_fixture(false).await;
+                let root = seed_task(&lead.db, &lead.project, "root", root_status, 1).await;
+                let one = seed_subtask(&lead.db, &root, "first", first, 0).await;
+                let two = seed_subtask(&lead.db, &root, "later", "todo", 1).await;
+                assign_role(&lead.db, &root.id, "coder", &lead.coder).await;
+                if with_lead {
+                    assign_role(&lead.db, &root.id, "planner", &lead.planner).await;
+                }
+                passes(&lead, 5).await;
+                let case = format!("root={root_status} first={first} lead={with_lead}");
+                let dump = state_dump(&lead.db).await;
+                lead.dispatcher
+                    .sweep_and_assert()
+                    .await
+                    .unwrap_or_else(|error| panic!("{case}: {error}\n{dump}"));
+                let now = reload(&lead.db, &root.id).await;
+                let running = |runs: &[(String, String)]| {
+                    runs.iter()
+                        .filter(|(_, status)| status == "running")
+                        .count()
+                };
+                let root_runs = executions(&lead.db, &root.id).await;
+                let child_running = running(&executions(&lead.db, &one.id).await)
+                    + running(&executions(&lead.db, &two.id).await);
+                table.push_str(&format!(
+                    "{case} -> root={} root_runs={root_runs:?} child_running={child_running}\n",
+                    now.status
+                ));
+                assert!(
+                    running(&root_runs) + child_running <= 1,
+                    "{case}: one execution at most\n{dump}"
+                );
+                assert!(
+                    child_running == 0 || now.status == "in_progress",
+                    "{case}: a subtask runs only under an implementing root\n{dump}"
+                );
+                for task in [&root, &one, &two] {
+                    let task = reload(&lead.db, &task.id).await;
+                    if matches!(task.status.as_str(), "done" | "cancelled") {
+                        continue;
+                    }
+                    assert!(
+                        park(&lead.db, &task.id).await != ""
+                            || running(&executions(&lead.db, &task.id).await) == 1,
+                        "{case}: {} has an owner\n{dump}",
+                        task.title
+                    );
+                }
+                if root_status == "backlog" {
+                    assert_eq!(now.status, "backlog", "{case}\n{dump}");
+                    assert_eq!(child_running, 0, "{case}\n{dump}");
+                    continue;
+                }
+                if with_lead && root_status != "in_progress" {
+                    // Kickoff: the lead plans first.
+                    assert_eq!(now.status, "planning", "{case}\n{dump}");
+                    assert_eq!(running(&root_runs), 1, "{case}\n{dump}");
+                } else {
+                    // No lead (or already implementing): the next subtask
+                    // runs with nobody's help.
+                    assert_eq!(now.status, "in_progress", "{case}\n{dump}");
+                    assert!(root_runs.is_empty(), "{case}\n{dump}");
+                    assert_eq!(child_running, 1, "{case}\n{dump}");
+                }
+            }
+        }
+    }
+    eprintln!("REPORT upgrade matrix:\n{table}");
+}
