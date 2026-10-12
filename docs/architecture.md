@@ -5956,6 +5956,9 @@ role from its own rows, and no row is copied onto it.
 | `lead_check` | the run failed or timed out | the retry, deadline or failure any execution shows | execution retry | `execution` |
 | `lead_check`, nothing running | the root has no lead any more (removed after the entry; a restart between the entry and its skip) | `done`, bridge `gate_skipped` | `Step::SkipGate`, resolved from stored state by `next_step` (fact `gate_skip`); removing or changing the lead marks the subtasks that rest in the gate | — |
 | `lead_check`, nothing running | the root has a lead (a restart between the entry and the run) | the step check | `Step::Role` | — |
+| `lead_check`, a check running | the lead is removed, or the Agent that is the lead is archived | the run is stopped; then `done`, bridge `gate_skipped`, in the next dispatcher pass | `TaskService::wake_step_checks_of` (from role removal and, for an archived Agent, `TaskService::lead_removed_from` after the archive sweep), then `Step::SkipGate` | — |
+| `lead_check`, nothing running | the lead's Agent is paused (or cannot be reached) | stays; `parked` with `agent { agent_id, status }` naming the lead's Agent; the check starts when the Agent is resumed | `next_step` (`Reason::AgentWait`), as for a planning root whose planner is paused | — |
+| `lead_check`, a check running | the lead's Agent is paused | the run goes on and its verdict settles the step (a pause starts nothing and stops nothing) | — | — |
 
 The one loop this adds is `lead_check ↔ in_progress`. Its machine bound is the
 gate's `max_rejections`: two returns, then the third entry parks the subtask
@@ -5979,7 +5982,14 @@ none), so merge-queue returns of the root never spend this budget.
 
 Removing the root's lead stops a step check that is still running
 (`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
-next dispatcher pass. A verdict of a run that no longer owns the role attempt
+next dispatcher pass. Archiving the Agent that is the lead is the same lead
+change: the archive sweep (`on_agent_deleted_in_tx`) clears the row as a
+queued step of the root, and after its commit every caller (the archive
+route, `TaskService::on_agent_deleted`, the removed-machine settlement) runs
+`TaskService::lead_removed_from`, which waits for that clear and then calls
+the same hook. A paused lead is not a missing lead: the step is not passed
+unchecked. With no check running the subtask is parked on the Agent by name
+until it is resumed; a check that is already running finishes and settles. A verdict of a run that no longer owns the role attempt
 (lead removed or replaced, subtask held, cancelled or moved) is dropped
 without a transition (`execution_owns_current_role_attempt`). A replaced
 lead's running check is not stopped: the subtask waits for that run to end

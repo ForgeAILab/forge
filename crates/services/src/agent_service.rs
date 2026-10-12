@@ -644,7 +644,11 @@ impl AgentService {
     }
 
     #[tracing::instrument(skip(self, agent_id), fields(agent_id = tracing::field::Empty))]
-    pub async fn archive(&self, agent_id: impl Into<String>) -> Result<()> {
+    /// Archive the Agent and clear its assignments. Returns the coordination
+    /// roots whose lead it was: the caller hands them to
+    /// [`TaskService::lead_removed_from`], which stops the step checks that
+    /// Agent was running and wakes the subtasks resting in that gate.
+    pub async fn archive(&self, agent_id: impl Into<String>) -> Result<Vec<String>> {
         let agent_id = agent_id.into();
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
@@ -667,6 +671,10 @@ impl AgentService {
             return Err(ServiceError::not_found("agent", agent_id));
         }
         transaction.commit().await?;
+        let lead_roots = TaskService::step_check_roots_of(&role_events)
+            .into_iter()
+            .map(|(root_id, _)| root_id)
+            .collect();
         TaskService::publish_role_sweep_events(&self.event_bus, role_events);
         self.publish(ForgeEvent {
             event_type: "agent.archived".to_owned(),
@@ -674,7 +682,7 @@ impl AgentService {
             timestamp: event_timestamp(),
             context: EventContext::AgentArchived {},
         });
-        Ok(())
+        Ok(lead_roots)
     }
 
     fn publish(&self, event: ForgeEvent) {

@@ -9,7 +9,67 @@ impl TaskService {
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let events = Self::on_agent_deleted_in_tx(&self.db, &mut transaction, agent_id).await?;
         transaction.commit().await?;
+        self.settle_role_sweep(events).await
+    }
+
+    /// After an Agent's assignments were swept and committed
+    /// ([`Self::on_agent_deleted_in_tx`]): publish the changes, and treat a
+    /// cleared lead as any other lead change (stop its running step checks,
+    /// wake the subtasks that rest in the gate).
+    pub(crate) async fn settle_role_sweep(&self, events: Vec<RoleSweepEvent>) -> Result<()> {
+        let leads = Self::step_check_roots_of(&events);
         Self::publish_role_sweep_events(&self.event_bus, events);
+        for (root_id, agent_id) in leads {
+            self.lead_removed_from(&[root_id], &agent_id).await?;
+        }
+        Ok(())
+    }
+
+    /// The roots among `events` whose step-check role (their lead) was
+    /// cleared, each with the Agent that held it.
+    pub(crate) fn step_check_roots_of(events: &[RoleSweepEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter(|event| {
+                event.role_name == crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE
+            })
+            .filter_map(|event| {
+                let agent_id = event.previous_assignment.assignee_id.clone()?;
+                Some((event.task_id.clone(), agent_id))
+            })
+            .collect()
+    }
+
+    /// The lead of each of `root_ids` was `agent_id` and that Agent is gone
+    /// (archived): the same hook as removing the lead by hand.
+    ///
+    /// The sweep clears the assignment as a step of the root Task, which may
+    /// still be queued when the sweep's transaction commits. The clear is
+    /// repeated here as a write this call waits for: steps of one Task run in
+    /// order, so the row is cleared when it returns and the hook reads a
+    /// root without a lead.
+    pub async fn lead_removed_from(&self, root_ids: &[String], agent_id: &str) -> Result<()> {
+        let role = crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE;
+        for root_id in root_ids {
+            let cleared = db::task_writer::TaskQuery::new(
+                &self.db,
+                root_id,
+                "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND role_name=? AND assignee_type='agent' AND assignee_id=?",
+            )
+            .bind(now_rfc3339())
+            .bind(root_id)
+            .bind(role)
+            .bind(agent_id)
+            .identity_fenced()
+            .execute(self.db.pool())
+            .await;
+            if let Err(error) = cleared {
+                // The queued clear still applies; the dispatcher then passes
+                // the gate from stored state once the run has ended.
+                tracing::warn!(task_id = %root_id, %error, "lead clear not confirmed before waking its step checks");
+            }
+            self.wake_step_checks_of(root_id, role).await?;
+        }
         Ok(())
     }
 
