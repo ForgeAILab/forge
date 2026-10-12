@@ -153,7 +153,7 @@ async fn review_conformance_rebuild_preserves_history_and_allows_parent_cascade(
     .expect("writes V132-shaped migration");
     fs::write(
         migration_dir.join("V002__review_conformance_project_delete.sql"),
-        include_str!("../migrations/V134__review_conformance_project_delete.sql"),
+        include_str!("../../migrations/V134__review_conformance_project_delete.sql"),
     )
     .expect("writes V134 migration");
 

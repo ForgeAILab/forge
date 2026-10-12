@@ -5690,7 +5690,7 @@ async fn task_step_suspended_migration_preserves_populated_steps_indexes_and_tri
         "the rebuild follows the workspace disk-usage migration directly"
     );
     assert!(
-        include_str!("../src/migration.rs").contains(&format!(
+        include_str!("../../src/migration.rs").contains(&format!(
             "Embedded migration bundle revision: V{}",
             versions.last().unwrap()
         )),

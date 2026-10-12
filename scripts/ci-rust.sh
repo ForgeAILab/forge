@@ -17,12 +17,13 @@
 #        ci-rust.sh test <shard>  the tests of one shard
 # CI runs `lint` and one `test <shard>` per shard as parallel jobs. The shards
 # are defined in scripts/ci_rust_shards.py, which also checks that together
-# they cover every workspace package.
+# they cover every workspace package and partition the services unit tests.
 set -uo pipefail
 
 mode="${1:-all}"
 shard="${2:-}"
-test_select=(--workspace)
+test_select=(--workspace --all-targets)
+test_filters=()
 case "$mode" in
   all | lint)
     if (($# > 1)); then
@@ -38,8 +39,15 @@ case "$mode" in
     # No `mapfile`: this must run under the macOS system bash (3.2).
     selection="$(python3 "$(dirname "$0")/ci_rust_shards.py" args "$shard")" || exit 2
     test_select=()
+    seen_separator=0
     while IFS= read -r arg; do
-      test_select+=("$arg")
+      if [[ $arg == -- && $seen_separator == 0 ]]; then
+        seen_separator=1
+      elif ((seen_separator)); then
+        test_filters+=("$arg")
+      else
+        test_select+=("$arg")
+      fi
     done <<<"$selection"
     ;;
   *)
@@ -57,8 +65,8 @@ export FORGE_SKIP_WEB_BUILD=1
 # need nothing from the host.
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
-# The workspace has over 150 integration-test binaries. With full debug info
-# they overflow the hosted runner's disk and the linker dies with a bus error.
+# The workspace still has over 100 integration-test binaries. Full debug
+# info overflows the hosted runner's disk and the linker dies with a bus error.
 # Line tables keep file:line in panics and backtraces at a fraction of the size.
 # In GitHub Actions the job-level `env:` of .github/workflows/ci.yml sets these
 # for every cargo invocation of the job (this script and `make types`), so all
@@ -92,12 +100,14 @@ if [[ $mode == all || $mode == test ]]; then
     # One-off measurement: build the test binaries as a stage of their own and
     # write target/cargo-timings/. The test stage below reuses the build.
     stages=$((stages + 1))
-    run_stage 'cargo test build' cargo test "${test_select[@]}" --all-targets --no-run --timings
+    run_stage 'cargo test build' cargo test "${test_select[@]}" --no-run --timings
   fi
   stages=$((stages + 1))
   # --no-fail-fast: keep going across test binaries so one red crate does not
   # mask the others. libtest already reports every failure within a binary.
-  run_stage 'cargo test' cargo test "${test_select[@]}" --all-targets --no-fail-fast
+  # The conditional array expansion also handles empty filters in bash 3.2.
+  run_stage 'cargo test' cargo test "${test_select[@]}" --no-fail-fast -- \
+    --test-threads=4 ${test_filters[@]+"${test_filters[@]}"}
 fi
 
 if ((${#failed[@]} > 0)); then

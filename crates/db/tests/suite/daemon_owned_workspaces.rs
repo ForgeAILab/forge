@@ -9,7 +9,7 @@ use std::{fs, path::Path};
 
 const NOW: &str = "2026-09-29T00:00:00Z";
 const LATER: &str = "2026-09-29T01:00:00Z";
-const MIGRATION: &str = include_str!("../migrations/V202610010400__daemon_owned_workspaces.sql");
+const MIGRATION: &str = include_str!("../../migrations/V202610010400__daemon_owned_workspaces.sql");
 
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");

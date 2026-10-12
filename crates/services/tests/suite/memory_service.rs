@@ -145,10 +145,12 @@ async fn agent_chat_memory_consumer_preserves_upgrade_cursor_ignores_legacy_leas
     )
     .await
     .expect("event appends");
-    sqlx::raw_sql(include_str!("../../db/tests/fixtures/event_delivery.sql"))
-        .execute(db.pool())
-        .await
-        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../db/tests/fixtures/event_delivery.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner,
         leased_until, attempts, updated_at) VALUES (?, ?, 'legacy', '2999-01-01T00:00:00Z', 1, ?)",
@@ -175,7 +177,7 @@ async fn agent_chat_memory_consumer_preserves_upgrade_cursor_ignores_legacy_leas
     .expect("message inserts after source recovery");
 
     sqlx::raw_sql(include_str!(
-        "../../db/migrations/V202610020700__retire_event_delivery_leases.sql"
+        "../../../db/migrations/V202610020700__retire_event_delivery_leases.sql"
     ))
     .execute(db.pool())
     .await

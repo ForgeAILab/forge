@@ -56,7 +56,7 @@ async fn retirement_preserves_all_domain_rows_and_durable_cursors_and_drops_deli
         })
         .await
         .unwrap();
-    sqlx::raw_sql(include_str!("fixtures/event_delivery.sql"))
+    sqlx::raw_sql(include_str!("../fixtures/event_delivery.sql"))
         .execute(db.pool())
         .await
         .unwrap();
@@ -81,7 +81,7 @@ async fn retirement_preserves_all_domain_rows_and_durable_cursors_and_drops_deli
     let before = snapshot(&db).await;
     let cursors: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor WHERE consumer_name <> 'sse-broadcast' ORDER BY consumer_name").fetch_all(db.pool()).await.unwrap();
     sqlx::raw_sql(include_str!(
-        "../migrations/V202610020700__retire_event_delivery_leases.sql"
+        "../../migrations/V202610020700__retire_event_delivery_leases.sql"
     ))
     .execute(db.pool())
     .await

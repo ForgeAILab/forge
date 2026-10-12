@@ -3,7 +3,7 @@
 //!
 //! These tests exercise the service boundary (authorization, denial
 //! translation, label defaulting) on top of the DB-layer contract already
-//! proven directly in `crates/db/tests/main_chat_topics.rs`.
+//! proven directly in `crates/db/tests/suite/main_chat_topics.rs`.
 
 use std::sync::Arc;
 
@@ -169,7 +169,7 @@ async fn fixture() -> Fixture {
 /// This fixture's account is created *after* `run_migrations` (which
 /// includes V103) already ran, so it never goes through the V103 backfill --
 /// that backfill only covers Main Chats that already existed at migration
-/// time (`crates/db/tests/main_chat_topics.rs` covers that path directly).
+/// time (`crates/db/tests/suite/main_chat_topics.rs` covers that path directly).
 /// A brand-new Main Chat legitimately starts with zero topics; a floor of
 /// "no topic yet" behaves exactly like one topic spanning the whole history
 /// (the turn worker's floor defaults to sequence 0), so this is not a gap --

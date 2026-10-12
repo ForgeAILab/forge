@@ -1,7 +1,7 @@
 //! Refactor 3.1 stage 5a write-cost measurement (not a correctness test):
 //! the owner's hold and release, with the condition stated by the writer and
 //! with it mapped back from the legacy fields the same write stores.
-//! `cargo test --release -p db --test task_condition_statement_cost -- --ignored --nocapture`
+//! `cargo test --release -p db --test main task_condition_statement_cost:: -- --ignored --nocapture`
 use db::{
     ConditionStatement, CreateProject, CreateTask, ProjectRepo, SqliteDb, TaskMetadataMutation,
     TaskRepo,

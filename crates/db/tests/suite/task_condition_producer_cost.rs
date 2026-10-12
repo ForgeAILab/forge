@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! COST_WORKFLOW="$(cat workflow.json)" cargo test -p db --release \
-//!   --test task_condition_producer_cost -- --ignored --nocapture
+//!   --test main task_condition_producer_cost:: -- --ignored --nocapture
 //! ```
 //!
 //! `COST_WORKFLOW` is the Project's `workflow_definition`; API-created

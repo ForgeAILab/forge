@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **DB and services integration-test target names are consolidated.** Use
+  `cargo test -p db --test main <old-target>::` or
+  `cargo test -p services --test main <old-target>::` for moved suites.
+  Services retains `project_provisioning_characterization` and
+  `main_project_create_command` as isolated targets. Original test names
+  remain under their target-named module; API test targets are unchanged.
+
 - **Agent doctrine moves to new revisions: Main baseline @5, Product Genesis
   @8, Project @22.** Migration `V202610120418` inserts Genesis @8 and Project
   @22 as new immutable revisions, moves the two current pointers, and moves
@@ -1425,6 +1432,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- Rust CI partitions services unit tests with complementary filters and runs
+  services integration tests in a separate shard. DB and services integration
+  suites share fewer link steps and migration templates; the required `Rust`
+  aggregate still waits for lint and every test shard.
 
 - **One registry drives the native and MCP tool surfaces.** Native host
   metadata, permission lists and the MCP dispatch table are generated from the

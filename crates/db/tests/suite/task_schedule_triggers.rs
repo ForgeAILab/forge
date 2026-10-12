@@ -174,7 +174,7 @@ async fn timed(pool: &db::SqlitePool, reps: u32, sql: &str) -> (Duration, i64) {
 
 /// Write cost of the kicks under fan-out, against the same statements with
 /// every scheduler trigger dropped.
-/// `cargo test -p db --release --test task_schedule_triggers -- --ignored --nocapture`
+/// `cargo test -p db --release --test main task_schedule_triggers:: -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "measurement"]
 async fn trigger_fanout_cost() {

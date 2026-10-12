@@ -32,7 +32,8 @@ A stable `1.0` will land once the workflow engine consolidation, multi-user stor
 ```bash
 cargo build                          # Build entire workspace
 cargo test                           # Full test suite (CI only)
-cargo test -p db <test-filter>       # Run focused tests for the changed behavior
+cargo test -p db --test main <module>::<test-filter> # Focused integration test
+cargo test -p db --lib <test-filter> # Focused unit test
 cargo test -p api --test happy_path <test-name>  # Run one relevant end-to-end case
 cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
@@ -42,6 +43,13 @@ FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Ru
 ```
 
 During local agent work, run only the focused tests directly related to the files and behavior being changed. Do not run a full crate, workspace, or all-target test suite locally; full-suite coverage belongs in CI. Expand to an adjacent focused test only when the change's impact analysis identifies that path as affected.
+
+DB and services integration tests are modules under `tests/suite/`, selected
+with `cargo test -p <crate> --test main <original-file-stem>::<test-name>`.
+Services keeps `project_provisioning_characterization` and
+`main_project_create_command` as separate targets for process isolation.
+See [docs/ci.md](docs/ci.md#services-unit-split-and-integration-inventory) for
+inventory comparison and the services lib filter/skip partition.
 
 The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment. Run only the relevant named case locally; CI runs the complete test target. If you break it, you probably need to revisit the spec, not the test.
 

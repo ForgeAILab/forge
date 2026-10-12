@@ -925,7 +925,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         ),
     ];
     let migrated_inputs: Value = serde_json::from_str(include_str!(
-        "../../operation-registry/tests/project_inputs.json"
+        "../../../operation-registry/tests/project_inputs.json"
     ))
     .unwrap();
     for (operation, mut arguments) in project_proposals {
@@ -2829,13 +2829,13 @@ async fn capture_base_selection(f: &Fixture) -> services::MainGenesisProjectAgen
         .unwrap()
 }
 
-#[path = "common/pre_change_main_runtime.rs"]
+#[path = "../common/pre_change_main_runtime.rs"]
 mod pre_change_main_runtime;
 
 #[tokio::test]
 async fn main_selection_literal_checkpoints_resume_real_provider_and_same_base_receipt() {
     let fixtures: Value = serde_json::from_str(include_str!(
-        "common/main_proposal_checkpoints_pre_change.json"
+        "../common/main_proposal_checkpoints_pre_change.json"
     ))
     .unwrap();
     for form in ["prepared", "approval_pending", "approval_edited"] {
@@ -3294,7 +3294,7 @@ async fn capture_project_proposal_case(operation: &'static str) {
             json!({"arguments":arguments,"first":first,"escalations":count}),
         );
         let fixtures: Value =
-            serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+            serde_json::from_str(include_str!("../fixtures/project_registry_base.json")).unwrap();
         assert_eq!(
             snapshot, fixtures[operation],
             "{operation} hand-path fixture"
@@ -3328,7 +3328,7 @@ async fn capture_project_proposal_case(operation: &'static str) {
             json!({"arguments":arguments,"first":first,"action":{"payload":serde_json::from_str::<Value>(&row.get::<String,_>("payload_json")).unwrap(),"payload_hash":row.get::<String,_>("payload_hash"),"policy_result":row.get::<String,_>("policy_result"),"status":row.get::<String,_>("status")}}),
         );
         let fixtures: Value =
-            serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+            serde_json::from_str(include_str!("../fixtures/project_registry_base.json")).unwrap();
         assert_eq!(
             snapshot, fixtures[operation],
             "{operation} hand-path fixture"
@@ -3368,7 +3368,7 @@ async fn capture_project_proposal_case(operation: &'static str) {
     let snapshot =
         normalized_generated_values(json!({"arguments":arguments,"first":first,"receipt":receipt}));
     let fixtures: Value =
-        serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/project_registry_base.json")).unwrap();
     assert_eq!(
         snapshot, fixtures[operation],
         "{operation} hand-path fixture"

@@ -416,7 +416,7 @@ async fn reviewer_prompt_bytes_for_server_workspace() {
 
     assert_eq!(
         prompt.as_bytes(),
-        include_bytes!("fixtures/server_workspace_reviewer.prompt.snap")
+        include_bytes!("../fixtures/server_workspace_reviewer.prompt.snap")
     );
 }
 

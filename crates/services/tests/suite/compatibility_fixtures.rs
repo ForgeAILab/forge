@@ -2,9 +2,9 @@ use api_types::{StateKind, WorkflowDefinition, WorkflowTrigger};
 use db::{create_sqlite_pool, run_migrations, SqliteDb, TaskRepo};
 use services::workflow::default_workflow::default_workflow;
 
-const DEFAULT_WORKFLOW_FIXTURE: &str = include_str!("fixtures/default_strict_workflow.json");
-const CUSTOM_WORKFLOW_FIXTURE: &str = include_str!("fixtures/legacy_custom_workflow.json");
-const LIFECYCLE_TASKS_FIXTURE: &str = include_str!("fixtures/legacy_lifecycle_tasks.sql");
+const DEFAULT_WORKFLOW_FIXTURE: &str = include_str!("../fixtures/default_strict_workflow.json");
+const CUSTOM_WORKFLOW_FIXTURE: &str = include_str!("../fixtures/legacy_custom_workflow.json");
+const LIFECYCLE_TASKS_FIXTURE: &str = include_str!("../fixtures/legacy_lifecycle_tasks.sql");
 
 fn load_workflow(fixture_name: &str, fixture: &str) -> WorkflowDefinition {
     serde_json::from_str(fixture).unwrap_or_else(|error| {
@@ -145,7 +145,7 @@ async fn lifecycle_database_fixture_covers_current_legacy_state_graph() {
 /// second run must change nothing.
 #[tokio::test]
 async fn v148_inserts_the_carry_hook_before_reviewer_dispatch_idempotently() {
-    const V148: &str = include_str!("../../db/migrations/V148__review_authority_carry.sql");
+    const V148: &str = include_str!("../../../db/migrations/V148__review_authority_carry.sql");
     let update_sql = &V148[V148
         .find("UPDATE project")
         .expect("V148 carries the workflow UPDATE")..];
