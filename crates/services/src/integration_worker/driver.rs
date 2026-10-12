@@ -330,6 +330,9 @@ impl HeadDriver {
             Ok(pass @ (Pass::Released | Pass::Lost)) => {
                 self.holding = None;
                 if pass == Pass::Released {
+                    // The slot is free: an admission of the same Task's next
+                    // entry that waits for it looks now.
+                    self.w.notify_released();
                     // A session that took the head over (a restart, a lost
                     // lease) made no transfer itself, but the head it
                     // releases may have refs from the session before it.

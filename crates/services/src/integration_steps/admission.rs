@@ -238,8 +238,10 @@ pub(crate) async fn admit(
 
 /// How long an admission waits for the worker to release the attempt of an
 /// entry the Task has left. The release is one driver pass after the cancel
-/// flag (a poll, or the wake below); the bound only covers a worker that is
-/// not running. Shorter than a Task step's lease.
+/// flag, and the driver signals it (`IntegrationQueueWorker::notify_released`),
+/// so the admission looks again at the release, not at its poll; the bound
+/// only covers a worker that is not running. Shorter than a Task step's
+/// lease.
 const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -275,6 +277,13 @@ pub(crate) async fn admit_released_or_replaced(
 ) -> Result<IntegrationAttempt> {
     let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
     loop {
+        // Registered before the look: a release between the conflict and
+        // the wait below still wakes it.
+        let released = worker.map(|worker| worker.released());
+        tokio::pin!(released);
+        if let Some(released) = released.as_mut().as_pin_mut() {
+            released.enable();
+        }
         match admit(db, merge_service, task, replace_released).await {
             Err(ServiceError::Db(DbError::VersionConflict))
                 if tokio::time::Instant::now() < deadline =>
@@ -282,10 +291,50 @@ pub(crate) async fn admit_released_or_replaced(
                 if let Some(worker) = worker {
                     worker.notify_answered();
                 }
-                tokio::time::sleep(RELEASE_POLL).await;
+                // The driver's release is the signal; the poll only covers a
+                // worker of another process and a release by another writer.
+                match released.as_mut().as_pin_mut() {
+                    Some(released) => {
+                        #[cfg(test)]
+                        let poll = if test_poll::disabled(&task.id) {
+                            RELEASE_WAIT
+                        } else {
+                            RELEASE_POLL
+                        };
+                        #[cfg(not(test))]
+                        let poll = RELEASE_POLL;
+                        tokio::select! {
+                            _ = released => {}
+                            _ = tokio::time::sleep(poll) => {}
+                        }
+                    }
+                    None => tokio::time::sleep(RELEASE_POLL).await,
+                }
             }
             other => return other,
         }
+    }
+}
+
+/// Test-only: Tasks whose admission does not poll for the release of their
+/// old head. It then succeeds only when the driver's release wakes it.
+#[cfg(test)]
+pub(crate) mod test_poll {
+    use std::{collections::HashSet, sync::Mutex};
+    static DISABLED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    pub(crate) fn disable(task_id: &str) {
+        DISABLED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(task_id.to_owned());
+    }
+    pub(super) fn disabled(task_id: &str) -> bool {
+        DISABLED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|tasks| tasks.contains(task_id))
     }
 }
 
