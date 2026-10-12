@@ -3063,6 +3063,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A merge the queue rebased itself is no longer sent back to review when
+  it is asked again.** A head that had rebased and then waited for its
+  checkout's machine until the step wait ran out parked `owner_offline`
+  with the rebase recorded and not yet applied: its checkout stood on the
+  rebased commit while the attempt still named the commit it was admitted
+  with. The retry validated first, read that as "the candidate commit
+  changed after it was admitted" and moved the Task to review for a commit
+  nobody had changed. Validation now recognises the attempt's own
+  succeeded, conflict-free rebase from exactly that commit and continues:
+  the rebase is not repeated and the rebased commit is checked before it
+  merges. A checkout changed after that rebase still goes to review.
+- **`GET /api/v1/executions/{id}/logs` no longer answers 404 for a remote
+  execution whose first log line is being written.** The log path was
+  recorded on the execution before the file existed, and a read between the
+  two got `execution.logs_unavailable`. The file is created, empty, when the
+  path is recorded (at launch, and when a daemon's first log frame arrives),
+  so a started execution that has not logged yet reads as an empty page.
+
 - **A merge attempt that holds its queue's slot is not handed back to
   admission at every reconciler pass.** An attempt whose placement binding
   changed while it was still the queue head could not be replaced (a head
