@@ -25,7 +25,8 @@ async fn log(lead: &Lead, task: &str) -> Vec<(String, String, Option<String>)> {
 /// a review that failed (on its checks) longer ago than the recovery grace.
 async fn root_with_failed_review(lead: &Lead, with_planner: bool) -> Task {
     let root = seed_task(&lead.db, &lead.project, "root", "review", 1).await;
-    seed_subtask(&lead.db, &root, "child", "done", 0).await;
+    let child = seed_subtask(&lead.db, &root, "child", "done", 0).await;
+    seed_completed_coder_execution(&lead.db, &child.id).await;
     assign_role(&lead.db, &root.id, CODER, &lead.coder).await;
     if with_planner {
         assign_role(&lead.db, &root.id, PLANNER, &lead.planner).await;
@@ -218,6 +219,35 @@ async fn a_rejected_review_with_no_replan_left_parks_the_root_in_review() {
     assert_eq!(blocked.status, "review", "{:?}", log(&lead, &root.id).await);
     assert!(replan_exhausted(&blocked), "{:?}", blocked.condition);
     assert_eq!(spent(&lead, &root.id, "replan").await, 5);
+    // Stable, and with an exit: the owner's retry with a new budget clears
+    // the park and the review runs again in place.
+    passes(&lead, 2).await;
+    assert_eq!(reload(&lead.db, &root.id).await.version, blocked.version);
+    let service = &lead.dispatcher.task_service;
+    let offers = service.test_action_values(&root.id).await.unwrap();
+    let retry = offers
+        .iter()
+        .find(|action| {
+            matches!(
+                action,
+                api_types::TaskAction::Retry {
+                    reset_budget: Some(true),
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("a budget-parked root offers a retry with a new budget: {offers:?}")
+        });
+    service
+        .perform_task_action(&root.id, retry, blocked.version)
+        .await
+        .expect("the retry with a new budget is accepted");
+    let retried = reload(&lead.db, &root.id).await;
+    assert!(!replan_exhausted(&retried), "{:?}", retried.condition);
+    assert_eq!(retried.status, "review");
+    assert_eq!(spent(&lead, &root.id, "replan").await, 0);
 }
 
 async fn spend_replans(lead: &Lead, root: &str, count: usize) {
