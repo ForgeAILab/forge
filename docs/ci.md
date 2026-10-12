@@ -2,10 +2,20 @@
 
 The [CI workflow](../.github/workflows/ci.yml) runs Rust checks and tests,
 security auditing, frontend checks and browser smoke tests, and npm package
-validation. It runs on pull requests and on pushes to `main`; other branch
-pushes do not trigger it, so a PR runs the suite once. A newer run cancels an
-unfinished pull-request run for the same PR. Every `main` commit keeps its own
-run, because a release tag needs a successful run on its exact commit.
+validation. Pushes to `main` and `next/**` run the full suite and populate
+branch-scoped Rust caches. Other branches run through `pull_request`.
+Same-repository PRs whose head is `next/**` reuse the push workflow on their
+exact head SHA: their test, lint, audit, web and npm jobs are skipped, but their
+required `Rust` job waits for that push workflow's **entire conclusion**. A
+failed, cancelled or skipped push fails the PR gate; a missing push fails after
+15 polls (about five minutes), and the job has a 90-minute timeout. Fork PRs,
+even heads named `next/**`, still run the full PR suite and cannot save Rust
+caches. Ordinary PRs continue to test the merge commit; integration lanes test
+the pushed head commit.
+
+A newer run cancels an unfinished run for the same event and ref. Every `main`
+commit keeps its own run, because a release tag needs a successful run on its
+exact commit.
 
 ## Rust jobs
 
@@ -21,10 +31,13 @@ The Rust gates run as eight parallel jobs, then one job that sums them up:
 | `Rust test (api-b)` | Remaining API binaries and all non-integration targets, with four libtest threads |
 | `Rust test (db)` | `cargo test -p db --all-targets --no-fail-fast` |
 | `Rust test (rest)` | `cargo test --workspace --exclude services --exclude api --exclude db --all-targets --no-fail-fast` |
-| `Rust` | no work of its own; succeeds only if the eight jobs above succeeded |
+| `Rust` | requires all eight Rust jobs; on same-repository `next/**` PRs, waits for the exact-head push workflow |
 
-`Rust` is the name to use in branch protection. It also runs when a job it
-needs failed, was cancelled or was skipped, and fails in each of those cases.
+`Rust` is the name to use in branch protection. On normal runs it also runs
+when a job it needs failed, was cancelled or was skipped, and fails in each of
+those cases. On same-repository `next/**` PRs it instead checks the push
+workflow as described above, so the skipped duplicate jobs cannot make a PR
+green while its push is red or pending.
 The matrix sets `fail-fast: false` and every shard keeps `--no-fail-fast`, so
 one red run still lists every failure.
 
@@ -59,10 +72,14 @@ in `services` and `db`). A crate must therefore declare the features of each
 dependency it uses in its own `Cargo.toml`; a missing one fails that crate's
 shard at compile time, as it already does for a local `cargo test -p <crate>`.
 
-While `CI_RUST_TIMINGS` is set in the workflow, each test job first builds its
-test binaries with `--no-run --timings` as a separate stage and uploads
-`target/cargo-timings/` as the `cargo-timings-<shard>` artifact. This is a
-temporary measurement for balancing the shards.
+Each test job first builds its test binaries with `--no-run --timings`
+(`CI_RUST_TIMINGS=1`) as a separate stage and uploads `target/cargo-timings/`
+as the `cargo-timings-<shard>` artifact. Keep these measurements through the
+first cold and warm cache runs: they separate build savings from test time.
+In run 38238432817, the services-unit-a upload took about 0.7 seconds for
+110,240 bytes; the following Cargo invocation reused the build in 0.20 seconds.
+This diagnostic costs seconds rather than minutes and does not change build
+profiles or libtest filters.
 
 `.cargo/config.toml` sets `RUST_MIN_STACK` to 16 MiB for every `cargo`
 invocation, local and CI, so test threads have the same stack as the server's
@@ -107,21 +124,135 @@ the failed jobs.
 
 ## Rust dependency cache
 
-CI uses `Swatinem/rust-cache` with one key per Rust job: `shared-key:
-rust-lint` for the lint job and `rust-test-<shard>` for each test job. The
-jobs build different artifacts (clippy metadata, and a different set of
-dependencies and features per shard); a single key would be saved by whichever
-job finished first and miss for the others. The action automatically includes
-the runner platform, Rust toolchain, build environment (including the
-`CARGO_PROFILE_*` variables above), and Cargo dependency manifests in its
-keys; a dependency change can restore a previous cache and rebuild the
-affected dependencies.
+CI keeps `Swatinem/rust-cache@v2`, with `shared-key: rust-lint` for lint and
+`rust-test-<shard>` for each of the seven test shards. Different feature and
+target selections require separate keys; the two services unit shards also
+keep separate caches. Every job uses the same job-level dev/test debug settings,
+including `make types` in lint. The script falls back to those same settings,
+and the toolchain/cache actions disable incremental compilation.
 
-Only default-branch CI runs save these caches, including runs whose checks
-fail. Pull-request runs restore them without uploading large branch-scoped
-copies. This reduces competition for GitHub Actions cache storage. A new or
-renamed key therefore has no entry until a `main` run has saved it: pull
-requests build their dependencies from scratch until then.
+On Linux x64 the exact key has this shape:
+
+```text
+v0-rust-<shared-key>-Linux-x64-<toolchain-and-environment-hash>-<dependency-hash>
+```
+
+The action hashes the installed Rust toolchain and build environment, including
+`CARGO_PROFILE_*`, into the environment hash. Its dependency hash includes
+`Cargo.lock`, package dependency manifests and `.cargo/config.toml`. The
+restore prefix omits only the dependency hash, selecting the newest compatible
+cache for **the same shard and toolchain/environment** after dependency changes.
+No commit SHA or run ID is added: source-only pushes reuse the exact key;
+lockfile/manifest changes restore the fallback and save the refreshed key.
+Exact hits are immutable and finish with `Cache up-to-date.` rather than
+uploading again. See the [action's key and cleanup implementation](https://github.com/Swatinem/rust-cache/tree/v2/src).
+
+Only `push` events to `refs/heads/main` or `refs/heads/next/**` may save, including
+failed builds (`cache-on-failure: true`). All PRs remain read-only. This is
+why enabling saves requires a `next/**` **push trigger**, rather than only
+changing `save-if` in the old PR-only integration lane.
+[GitHub scopes caches to refs](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache):
+PR saves live under `refs/pull/N/merge` and cannot warm branch push runs;
+branch runs can restore their own scope and the default branch. PRs can use
+base/default-branch caches, but CI does not rely on the integration head's
+push cache being readable from its PR merge ref. The PR gate waits for the
+canonical push workflow instead. No arbitrary PR or fork can write the trusted
+branch caches.
+
+The old lane could never populate its eight new keys. Run
+[38238432817](https://github.com/ForgeAILab/forge/actions/runs/38238432817)
+logged `save-if: false`, restore prefix
+`v0-rust-rust-test-services-unit-a-Linux-x64-babacd59`, exact key ending
+`-7a7c0823`, and `No cache found.`; post-job cleanup uploaded nothing. The
+latest run [38241020570](https://github.com/ForgeAILab/forge/actions/runs/38241020570),
+still in progress during this investigation, confirms the same miss and no save
+in its completed services-integration job (shared-key
+`rust-test-services-integration`, with the same two hash suffixes).
+The cache inventory contained only the old `main` key
+`v0-rust-rust-Linux-x64-c7b3ef7d-d1356e4b` (580.1 MiB) and pnpm (142.5 MiB).
+A different shared-key prefix cannot match that Rust entry, even via fallback.
+
+### Cache storage and remaining builds
+
+`cache-workspace-crates: false` is explicit: the action drops workspace final
+binaries/libraries, fingerprints, build outputs and incremental artifacts before
+saving, retaining third-party dependency artifacts. `cache-bin: false` excludes
+installed Cargo tools, which this workflow does not build. Do not turn on
+workspace caching to preserve the large services test binary.
+
+Read-only measurements of complete existing local macOS fingerprint graphs,
+compressed with zstd level 3, gave the following projections. These artifacts
+pre-date this change; no Rust rebuild was performed at base `17c020c4`. These
+are estimates for Linux CI, not measured GitHub uploads. Lint uses a conservative
+union of compiled dependency graphs, larger than clippy metadata alone. API and
+services integration use their library graphs, and rest uses CLI/client graphs;
+extra test-only dependencies and platform differences are covered by the
+allowance. Each projected total rounds up the measured dependency target plus
+200 MiB for Cargo registry/Git data and graph/platform differences. The locked
+registry archives alone were 72.1 MiB; the retained `-sys` source trees were
+168.3 MiB **uncompressed**, and the pinned Git checkout was 17.5 MiB uncompressed.
+
+| Job | Dependency target, raw / zstd MiB | Projected complete cache MiB |
+| --- | --- | --- |
+| lint | 1323 / 335 | 550 |
+| services-unit-a | 1091 / 270 | 500 |
+| services-unit-b | 1091 / 270 | 500 |
+| services-integration | 1094 / 271 | 500 |
+| api-a | 1133 / 281 | 500 |
+| api-b | 1133 / 281 | 500 |
+| db | 505 / 128 | 350 |
+| rest | 937 / 246 | 450 |
+
+Eight current entries total about **3.76 GiB**. Main plus one active integration
+lane totals about **7.52 GiB**; adding the existing 580.1 MiB Rust and 142.5 MiB
+pnpm entries gives about **8.23 GiB**, below the repository's 10 GB budget.
+GitHub may evict older lockfile/toolchain generations or additional lane caches;
+this policy avoids PR-scoped copies. Verify actual `Cache Size` and inventory
+bytes after the first saves, because Linux artifacts and feature variants can
+differ. The services unit graph excluded about 2.81 GiB of workspace artifacts
+per shard (including its approximately 307 MiB local test binary).
+
+Caching does not skip test execution or compile workspace crates. In the cold
+services-unit-a timing report above, the 766.4-second build included api-types
+(41.3 s), db (47.0 s), the services library (263.8 s) and its unit-test binary
+(331.3 s). Third-party compilation overlaps workspace compilation; its summed
+393.7 seconds is not a wall-time saving. Plan for roughly **1–2 minutes saved**
+per services unit shard, with most of the roughly ten minutes of workspace
+building still present, plus the same 6.5–8 minutes of test execution.
+
+A build job that ships one services-lib test binary to both unit shards would
+compile the same workspace chain once **before** either shard can start. The
+two existing builds already run in parallel, so uploading/downloading the binary
+and starting two more jobs adds critical-path time. It could save runner CPU
+minutes, but is not clearly faster in wall time; CI keeps the simpler parallel
+cached builds, without nextest or binary artifacts.
+
+### Verify the first two push runs
+
+After this workflow lands on `next/v0.14`, inspect **push** runs, not the skipped
+PR copies. A push to `ci/cache-hit` itself does not warm branch caches.
+
+1. On the first completed push, each of the eight cache steps should report
+   its distinct `shared-key`, `save-if: true`, `Restore Key` and `Cache Key`.
+   With today's empty shard inventory it should say `No cache found.`;
+   a newly warmed compatible main entry may instead restore. Each cold/fallback
+   post step must show `... Cleaning ...`, `... Saving cache ...` and
+   `Cache saved successfully`, with the exact key in the preceding cache
+   configuration. Confirm eight matching entries scoped to
+   `refs/heads/next/v0.14` and record their compressed bytes. Complete the run
+   before pushing again so concurrency cancellation cannot interrupt saving.
+2. On a second push with the same toolchain, Cargo configuration and dependencies,
+   each cache step must show `Restored from cache key "<the first run's exact key>"
+   full match: true.` (and `Cache restored successfully`/`Cache Size`). Its post
+   step should say `Cache up-to-date.`. Third-party `Compiling`/`Checking` lines should largely
+   disappear; workspace crates still build and all tests still run. Compare
+   `cargo test build` timing artifacts and `Finished ... profile` durations.
+   A lockfile change intentionally produces a partial restore from the same
+   shard prefix and then saves a new exact key.
+
+The PR's `Rust` gate must log `Integration-lane CI passed on <PR head SHA>` with
+that push run's URL. A failed or cancelled push must fail the gate. Fork and
+ordinary PRs must still run all jobs with `save-if: false`.
 
 Native release builds retain a separate cache key for each target triple.
 GitHub caches are scoped to a branch or tag: a release can restore its own
@@ -256,7 +387,7 @@ and log batching, not instrumented per-test timings. Test counts alone
 (408 / 1808 including ignored tests in that run) would give a misleading split.
 Local validation at base `0adbb146` measured 239.92 / 277.75 seconds with
 four threads (15.8% apart), with both halves passing. The build-timings
-artifacts remain enabled to measure the new jobs in CI.
+artifacts remain enabled to compare cold and warm builds in CI.
 
 For focused integration work, use the original file stem as a module filter:
 
