@@ -5909,7 +5909,29 @@ enters `planning` to stay: nothing changes for it except that it moves to
 `in_progress` when it has a subtask to run instead of resting in `todo`.
 A subtask started by hand (claim, move, manual transition) while its root's
 kickoff is still due starts the root first
-(`TaskService::start_coordination_root_of`).
+(`TaskService::start_coordination_root_of`; every actor but Forge's own
+components). The start is the dispatcher's own next move made early, under the
+system actor: it gives the caller no authority over the root, a root that
+holds its subtasks (blocked, paused Project, planning for its lead, an
+unfinished dependency) still refuses the subtask through the caller's order
+check, and no subtask ever runs under a root that is not implementing.
+
+Edges of the root lifecycle, each a typed wait with an exit:
+
+| Situation | Root | Its subtasks | Exit |
+|---|---|---|---|
+| The root has an unfinished dependency | stays where it is, parked `dispatch_refusal { capability: coordination_root_advance }` | `parent { cause: not_coordinating }` | the dependency's completion wakes the root (`wake_dependents_of_completed_task`), which starts on the next pass; a cancelled dependency blocks it as it blocks any Task |
+| The lead is removed while its planner runs | rests in `planning` (`in_flight`) until the run ends: `RootRolePolicy::planning_run_live` keeps the root advance (fact and walk) off | `parent { cause: planning }` | the run's settlement moves the root to `in_progress`; a stopped run leaves a held root whose release starts nothing and lets the advance move it on |
+| The planner fails, is stopped, or its Agent is paused | `planning`, with the retry deadline, the failure, the hold or the Agent wait any Task shows | `parent { cause: planning }`, or `blocked` / `held` once the root records it | the root's own retry, release or the Agent's resume |
+| The planning gate requires a person's approval and the root has a lead | `planning`, `human_decision { boundary: plan_review }` after the planner succeeded | `parent { cause: planning }` | Approve (or Send back) on the root |
+| The same gate, no lead | never stops there: the walk passes the gate under the system actor | run | — |
+
+`RootRolePolicy::runs_role` is the reader for "does this role run on this root
+now": `allows_execution`, and in the planning state only while a lead is
+assigned. The action offers, the release continuation and the dispatcher
+snapshot use it, so a planning root without a lead offers and launches no
+planner. The plan-candidate exemption applies to exactly the lead's run (the
+planning role, on a root with subtasks, in the planning state).
 
 A subtask can be created only while its parent can still coordinate it: in a
 backlog, initial or working state (`merge_failed` included). A parent that is

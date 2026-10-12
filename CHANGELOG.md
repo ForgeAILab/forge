@@ -17,7 +17,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the first pass after upgrade; a subtask that is running is not interrupted.
   Board columns and automation keyed on a root's status see the change.
   Claiming, moving or transitioning the first subtask by hand starts the root
-  first. No migration.
+  first. Nothing that ran before now waits for a person: a root without a
+  lead passes a planning gate that asks for approval as it always did, and
+  the first subtask is dispatched from the root's own move (measured: two
+  dispatcher passes from the dirty set, no sweep interval). One wait is new:
+  the subtasks of a root that has an unfinished dependency now wait for that
+  dependency with the root (the root shows `dispatch_refusal` for
+  `coordination_root_advance`, its subtasks `parent { cause:
+  not_coordinating }`) and start when it completes; before, they ran while
+  the root sat in `todo`. No migration.
 
 - **Coordination roots accept the planning role: the root's lead.** The
   workflow's planning role (`planner` in the built-in workflow) can be
@@ -30,8 +38,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   other assignments are refused with `422 LEAD_REQUIRES_NATIVE_PROFILE` or
   `422 LEAD_ROLE_NOT_SUPPORTED`. A Project whose default assignments give
   Tasks a native planner therefore gets a lead on every Task that is later
-  split into subtasks. A root without a planner is unchanged apart from the
-  entry above. `TaskResponse.effective_lead` (`{ assignment, source }`) reports
+  split into subtasks; when that Project's planning gate also requires a
+  person's approval, such a root waits for the approval of its lead's kickoff
+  before its subtasks start (Approve on the root), as an ordinary Task there
+  waits for its plan. Remove the planner from the root to run it without a
+  lead. A root without a planner is unchanged apart from the entry above. `TaskResponse.effective_lead` (`{ assignment, source }`) reports
   the lead of a root and of its subtasks.
 
 - **New condition value `parent.cause = planning`.** A subtask whose root is

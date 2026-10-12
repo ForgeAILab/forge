@@ -1630,6 +1630,19 @@ impl World {
     /// where nothing is left for the dispatcher to do: a root restored from
     /// an older release may hold a running subtask in `todo` until its first
     /// pass, and a stopping execution is still `running` until it reports.
+    ///
+    /// What is real and what is vacuous here. (g) is real: with the product
+    /// mutated back to the old rule (a subtask of a `todo` root dispatches
+    /// and the root is not kicked off) `a_coordination_root_merges_through_
+    /// the_queue` fails on it. The no-lead halves of (h) and (k) are real for
+    /// the same roots. (i), (j) and the lead halves of (h) and (k) are
+    /// VACUOUS: the model has no native-runtime stub, so no root in it ever
+    /// has a lead or a planner execution. They need `Action::AssignLead` and
+    /// a scripted native planner (stage 3/4). Until then the lead cases are
+    /// proven at the dispatcher level, in
+    /// `services::task_dispatcher::tests::root_lead` (the upgrade matrix and
+    /// the lead-removed-while-planning case, which checks (g) and (h) with a
+    /// running planner).
     async fn check_roots(&self, quiescent: bool) -> Result<(), String> {
         let pool = &self.live().pool;
         let rows = |sql: &'static str| async move {
