@@ -119,10 +119,10 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
 }
 
 /// `test_app` over the database at `database_url`. An in-memory database is
-/// one connection: a connection the pool discards (a query future dropped
-/// mid-flight by a `select!` or a timeout is enough) is replaced by a new,
-/// EMPTY database, and the next statement fails `no such table`. Tests that
-/// run workers on several threads against the harness use a file.
+/// one connection, so every statement of the harness waits its turn for it;
+/// `db::create_sqlite_pool` never closes that connection and panics if it
+/// would be replaced (by a new, EMPTY database). Tests that run workers on
+/// several threads against the harness use a file.
 pub async fn test_app_on(workspace_root: &Path, prefix: &str, database_url: &str) -> Harness {
     let pool = db::create_sqlite_pool(database_url)
         .await
