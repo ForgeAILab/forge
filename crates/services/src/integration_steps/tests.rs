@@ -4248,9 +4248,33 @@ async fn runtime_crash_boundaries_recover_through_real_ports_without_duplicate_f
         let periodic = crate::worker_runtime::PeriodicWorkers::new(world.db.clone());
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let _checks = composed.worker.start(&periodic, stopped.clone());
+        // Witnesses for a boundary that was passed without its fault (seen
+        // once: `applied/BeforeTransition`). Every state write on the row is
+        // recorded by the database itself, whoever made it, with the queue's
+        // lease holder and the Task steps open at that instant; the hook
+        // records every boundary THIS worker passed.
+        sqlx::raw_sql(
+            "CREATE TABLE crash_witness(seq INTEGER PRIMARY KEY, line TEXT NOT NULL);
+             CREATE TRIGGER crash_witness_state AFTER UPDATE OF state ON integration_attempt
+             WHEN OLD.state<>NEW.state BEGIN
+               INSERT INTO crash_witness(line) SELECT
+                 strftime('%H:%M:%f','now')||' '||OLD.state||' -> '||NEW.state
+                 ||' revision='||NEW.revision
+                 ||' lease_owner='||COALESCE((SELECT q.lease_owner FROM integration_queue q WHERE q.id=NEW.queue_id),'-')
+                 ||' fence='||COALESCE((SELECT q.fence_generation FROM integration_queue q WHERE q.id=NEW.queue_id),-1)
+                 ||' open_steps=['||COALESCE((SELECT group_concat(s.id||' '||s.kind||' '||s.causation_key||' '||s.status||' by '||COALESCE(s.claimed_by,'-'),'; ')
+                    FROM task_step s WHERE s.task_id=NEW.task_ref AND s.status IN ('pending','claimed','suspended')),'')||']';
+             END;",
+        )
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+        let instance = worker.instance.clone();
+        let passed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fired = Arc::new(AtomicBool::new(false));
-        let flag = fired.clone();
+        let (flag, trace) = (fired.clone(), passed.clone());
         worker.set_fault(Some(Arc::new(move |at, here| {
+            trace.lock().unwrap().push(format!("{at}/{here:?}"));
             at == state && here == point && !flag.swap(true, Ordering::SeqCst)
         })));
         let running = tokio::spawn(worker.run(stopped));
@@ -4259,10 +4283,34 @@ async fn runtime_crash_boundaries_recover_through_real_ports_without_duplicate_f
                 && world.attempt(&a.id).await.state == S::Completed
         })
         .await;
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "{state}/{point:?}: boundary reached"
-        );
+        if !fired.load(Ordering::SeqCst) {
+            let writes: Vec<String> =
+                sqlx::query_scalar("SELECT line FROM crash_witness ORDER BY seq")
+                    .fetch_all(world.db.pool())
+                    .await
+                    .unwrap();
+            let steps: Vec<String> = sqlx::query_scalar(
+                "SELECT id||' '||kind||' '||causation_key||' '||status||' by '||COALESCE(claimed_by,'-')||' attempts='||attempts FROM task_step WHERE task_id='crash' ORDER BY seq",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            let after = world.attempt(&a.id).await;
+            panic!(
+                "{state}/{point:?}: boundary reached; the attempt is {} without the fault.\n\
+                 the faulted worker is {instance}\n\
+                 boundaries it passed: {:?}\n\
+                 state writes on the attempt (any writer):\n  {}\n\
+                 Task steps:\n  {}\n\
+                 acknowledgment: {:?}\njournal: {}",
+                after.state,
+                passed.lock().unwrap(),
+                writes.join("\n  "),
+                steps.join("\n  "),
+                after.effect_ack_json,
+                after.operation_receipts_json,
+            );
+        }
         let _ = stop.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
         let after = world.attempt(&a.id).await;
