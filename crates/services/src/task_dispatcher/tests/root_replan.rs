@@ -852,3 +852,37 @@ async fn a_lead_that_adds_no_work_sends_the_root_back_to_its_aggregate_review() 
         log(&lead, &root.id).await
     );
 }
+
+/// A re-plan never starts beside running work. A parked subtask whose run is
+/// still live (a stop that has not landed yet) keeps the root where it is:
+/// the planner shares the root's workspace with that run. The fact stays
+/// true, so the root re-plans once the run has ended.
+#[tokio::test]
+async fn a_parked_subtask_with_a_live_run_is_not_replanned_until_the_run_ends() {
+    let lead = lead_fixture(false).await;
+    let (root, child, _) = root_with_parked_child(&lead, true).await;
+    seed_running_execution(&lead.db, &child.id, &lead.coder, CODER).await;
+    passes(&lead, 3).await;
+
+    assert_eq!(
+        reload(&lead.db, &root.id).await.status,
+        "in_progress",
+        "{:?}",
+        log(&lead, &root.id).await
+    );
+    assert_eq!(spent(&lead, &root.id, "replan").await, 0);
+    assert_eq!(executions(&lead.db, &root.id).await, Vec::new());
+
+    sqlx::query("UPDATE execution SET status='failed', stopped_at=?, updated_at=? WHERE task_id=?")
+        .bind(now_rfc3339())
+        .bind(now_rfc3339())
+        .bind(&child.id)
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    until(&lead, "the root re-plans once the run has ended", async || {
+        reload(&lead.db, &root.id).await.status == "planning"
+    })
+    .await;
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+}

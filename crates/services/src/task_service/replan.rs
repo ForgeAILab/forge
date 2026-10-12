@@ -216,7 +216,15 @@ impl TaskService {
         let children = crate::task_hierarchy::ordered_children(&self.db, root_id).await?;
         let assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, root_id).await?;
         let transitions = TransitionLogRepo::list_by_task(&*self.db, root_id).await?;
-        let due = policy.replan_due(&root, &children, &assignments, &transitions);
+        let due = crate::task_hierarchy::replan_due_now(
+            &self.db,
+            &policy,
+            &root,
+            &children,
+            &assignments,
+            &transitions,
+        )
+        .await?;
         if due
             .as_ref()
             .map(|(child, park)| (child.as_str(), park.as_str()))

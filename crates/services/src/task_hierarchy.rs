@@ -998,6 +998,34 @@ impl RootRolePolicy<'_> {
     }
 }
 
+/// Database form of [`RootRolePolicy::replan_due`], for the two places that
+/// act on it (the dispatcher's fact and the command): the re-plan that is
+/// due and may start now. A re-plan never starts beside running work: while
+/// the parked subtask still has a live run (a stop that has not landed), the
+/// root stays where it is, because its planner would share the root's
+/// workspace with that run. The pure fact stays true, so the park is still
+/// the lead's ([`lead_handles_subtask_park`]) and the root re-plans when
+/// the run has ended.
+pub(crate) async fn replan_due_now(
+    db: &SqliteDb,
+    policy: &RootRolePolicy<'_>,
+    root: &Task,
+    children: &[Task],
+    assignments: &[TaskRoleAssignment],
+    transitions: &[db::TransitionLog],
+) -> Result<Option<(String, String)>> {
+    let Some((child_id, park)) = policy.replan_due(root, children, assignments, transitions) else {
+        return Ok(None);
+    };
+    if !db::ExecutionRepo::list_running_by_task(db, &child_id)
+        .await?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some((child_id, park)))
+}
+
 /// Whether the lead of `task_id`'s coordination root handles that subtask's
 /// park, so the Project Agent is not woken for it: the root is about to
 /// re-plan for this park ([`RootRolePolicy::replan_due`]), or its lead is

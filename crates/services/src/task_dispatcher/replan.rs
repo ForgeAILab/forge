@@ -22,6 +22,17 @@ impl TaskDispatcher {
         ) {
             return Ok(0);
         }
+        // The scheduling fact is computed from rows that do not include a
+        // subtask's runs. A re-plan never starts beside running work
+        // (`task_hierarchy::replan_due_now`, which the command applies under
+        // the root's writer): while the parked subtask's run is still live
+        // this pass issues nothing, and the fact is read again on the next.
+        if !db::ExecutionRepo::list_running_by_task(&*self.db, child_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(0);
+        }
         match self
             .task_service
             .replan_coordination_root(&task.id, child_id, park)
