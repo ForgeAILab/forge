@@ -65,9 +65,17 @@ impl PromptBuilder for CoordinationPlannerPromptBuilder {
                 }
             }
         }
-        user.push_str(
-            "\nThis is the kickoff: no subtask has started. Review the breakdown and report.\n",
-        );
+        // Say only what the states above show: a lead assigned late, or run
+        // again, meets a breakdown that is already under way.
+        let untouched = ctx
+            .sub_tasks
+            .iter()
+            .all(|task| task.status == crate::workflow::default_states::TODO);
+        user.push_str(if untouched {
+            "\nThis is the kickoff: no subtask has started. Review the breakdown and report.\n"
+        } else {
+            "\nSome subtasks have already started or ended (see their states). Review what remains and report.\n"
+        });
 
         AgentPrompt {
             system: format!(

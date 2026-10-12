@@ -1212,6 +1212,14 @@ fn a_planner_on_a_coordination_root_gets_the_lead_prompt() {
     // The doctrine stays within its budget (about 1,200 tokens).
     assert!(lead.system.len() < 4_800, "{}", lead.system.len());
 
+    assert!(lead.user.contains("no subtask has started"));
+    // A breakdown already under way is not described as a kickoff.
+    ctx.sub_tasks[0].status = default_states::DONE.to_owned();
+    let (late, _) = build_effective_prompt(&ctx, None, Some(&state));
+    assert!(!late.user.contains("no subtask has started"));
+    assert!(late.user.contains("1. [done] Add the schema"));
+    assert_eq!(late.system, lead.system, "the stable prefix does not move");
+
     // A subtask's own planner is not a lead.
     ctx.task.parent_task_id = Some("root".to_owned());
     let (_, selection) = build_effective_prompt(&ctx, None, Some(&state));
