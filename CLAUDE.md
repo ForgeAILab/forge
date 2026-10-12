@@ -107,6 +107,8 @@ forge-cli → api → services → db
           → executors → workspace → git
           → config
           → api-types (shared, zero internal deps)
+api / services → pricing → db / api-types
+forge-solo → services (Solo bootstrap and session services live in forge-solo)
 ```
 
 - **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.

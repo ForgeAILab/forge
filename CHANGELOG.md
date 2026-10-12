@@ -1449,6 +1449,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Pricing and the Solo services left the `services` crate (developer-only).**
+  Provider pricing is the new `pricing` crate (`services → pricing → db`), and
+  the Solo bootstrap and session services are `forge_solo::bootstrap` and
+  `forge_solo::session`. No REST, MCP, CLI or stored-data change. Rust callers
+  use `pricing::…` in place of `services::pricing*`; `services` re-exports
+  neither.
+
 - **The server reads its login-shell environment once per start, not once per
   check.** A canonical check identity names the environment its steps inherit.
   The server now asks its login shell once per process (one stored answer per

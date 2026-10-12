@@ -15,7 +15,7 @@ runtime uses the singular binding, chat, and handoff model described below.
 ```
 crates/
 ├── forge-cli/     # Binary entrypoint, server startup, CLI commands
-├── forge-solo/    # Repository-scoped chat-first TUI and local entrypoint
+├── forge-solo/    # Repository-scoped chat-first TUI, its bootstrap and session services, local entrypoint
 ├── forge-client/  # forge-ctl CLI client
 ├── forge-daemon/  # Local daemon detection and reporting
 ├── api/           # Axum REST endpoints, SSE, middleware
@@ -24,6 +24,7 @@ crates/
 ├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
 ├── services/      # Business logic (task state machine, workflow engine)
+├── pricing/       # models.dev catalog, price resolution at admission, cost estimation
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
 ├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
 ├── workspace/     # Git worktree lifecycle, locking, path guardrails
@@ -51,6 +52,8 @@ forge-cli → api → services → db
 forge-solo → services → db / events / agent-host / executors / workspace → git
            → config / api-types / review / cli-adapters
 
+api / services → pricing → db / api-types
+
 services / review / forge-client → check-executor → process-supervisor
                                                   → git → process-supervisor
                                                   → executors / api-types
@@ -62,6 +65,14 @@ process-group implementation that Git, CI steps and daemon helpers share lives
 below all of them. `check-executor` sits between: it needs `git` (managed
 checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 `services`, `review` and `forge-client`; it depends on neither `services` nor `db`.
+
+`pricing` owns the provider pricing catalog, the SQLite pricing repository and
+the admission-time price resolution (`pricing::auto`). It sits below `services`
+and has its own `PricingError`, which `services` maps into `ServiceError`. The
+one thing it needs from above, a provider entry's endpoint, is passed in as a
+function by the caller. The Solo bootstrap and session services
+(`forge_solo::bootstrap`, `forge_solo::session`) live in `forge-solo`, their
+only caller, and use `services` like any other client.
 
 ## Architectural patterns
 
