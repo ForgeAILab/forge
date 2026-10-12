@@ -49,7 +49,7 @@ MCP tools `forge_memory_search` / `forge_memory_get` and the REST/CLI surfaces w
 
 ### B5 — Medium: flaky workspace test caused by a shared on-disk template store
 
-`workflow_template_full_crud_flow` failed in a full-workspace run (404 vs 200 at `crates/api/tests/workflow_templates.rs:132`) and passes in isolation and in a second full run — a parallelism flake. Root cause candidate: every test `AppState` hardcodes the **same** directory:
+`workflow_template_full_crud_flow` failed in a full-workspace run (404 vs 200 at `crates/api/tests/suite/workflow_templates.rs:132`) and passes in isolation and in a second full run — a parallelism flake. Root cause candidate: every test `AppState` hardcodes the **same** directory:
 
 ```rust
 // crates/api/src/state.rs:118

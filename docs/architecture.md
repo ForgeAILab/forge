@@ -6864,7 +6864,7 @@ exposes it via `GET /api/v1/tasks/{id}/transitions`.
 
 ## Happy path
 
-The canonical end-to-end flow is captured by `crates/api/tests/happy_path.rs`.
+The canonical end-to-end flow is captured by `crates/api/tests/suite/happy_path.rs`.
 It boots the in-process Axum router with an embedded daemon and a real temp
 git repo, drives a task through `todo → in_progress → review → merging → done`,
 and asserts:

@@ -21,7 +21,9 @@ class CoverageTests(unittest.TestCase):
         self.workspace = {
             "services": {"targets": [{"name": "services", "kind": ["lib"]},
                                      {"name": "main", "kind": ["test"]}]},
-            "api": {"targets": []},
+            "api": {"targets": [{"name": "api", "kind": ["lib"]}] +
+                                [{"name": name, "kind": ["test"]}
+                                 for names in shards.API_TARGETS.values() for name in names]},
             "db": {"targets": []},
             "new-crate": {"targets": []},
         }
@@ -46,6 +48,39 @@ class CoverageTests(unittest.TestCase):
         broken = copy.deepcopy(shards.SHARDS)
         broken["services-integration"] = ["-p", "services", "--tests"]
         with patch.object(shards, "SHARDS", broken):
+            self.assertTrue(shards.coverage_errors(self.workspace))
+
+    def test_new_api_integration_target_needs_assignment(self):
+        self.workspace["api"]["targets"].append({"name": "new-suite", "kind": ["test"]})
+        self.assertTrue(any("'new-suite' has 0 assignments" in error
+                            for error in shards.coverage_errors(self.workspace)))
+
+    def test_api_target_cannot_be_duplicated_or_disappear(self):
+        broken = copy.deepcopy(shards.API_TARGETS)
+        broken["api-b"].append(broken["api-a"][0])
+        with patch.object(shards, "API_TARGETS", broken):
+            self.assertTrue(any("has 2 assignments" in error
+                                for error in shards.coverage_errors(self.workspace)))
+        self.workspace["api"]["targets"] = [t for t in self.workspace["api"]["targets"]
+                                            if t["name"] != "main"]
+        self.assertTrue(any("exists: False" in error
+                            for error in shards.coverage_errors(self.workspace)))
+
+    def test_api_shard_cannot_select_lib_or_all_targets_twice(self):
+        for selection in ("--all-targets", "--lib", "--tests"):
+            broken = copy.deepcopy(shards.SHARDS)
+            broken["api-a"].append(selection)
+            with self.subTest(selection=selection), patch.object(shards, "SHARDS", broken):
+                self.assertTrue(shards.coverage_errors(self.workspace))
+
+    def test_api_non_integration_targets_have_one_owner(self):
+        for kind in ("bin", "example", "bench"):
+            self.workspace["api"]["targets"].append({"name": kind, "kind": [kind]})
+        self.assertEqual(shards.coverage_errors(self.workspace), [])
+        self.assertNotIn("--lib", shards.cargo_args("api-a"))
+        for flag in ("--lib", "--bins", "--examples", "--benches"):
+            self.assertIn(flag, shards.cargo_args(shards.API_OTHER_TARGETS_SHARD))
+        with patch.object(shards, "API_OTHER_TARGETS_SHARD", "missing"):
             self.assertTrue(shards.coverage_errors(self.workspace))
 
 
@@ -83,6 +118,18 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(commands, [["test", "-p", "services", "--test", "*", "--examples",
                                      "--no-fail-fast", "--", "--test-threads=4"]])
+
+    def test_api_binary_selection_is_preserved_without_all_targets(self):
+        for shard in shards.API_TARGETS:
+            with self.subTest(shard=shard):
+                run, commands = self.commands("test", shard, timings=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                selection = shards.cargo_args(shard)
+                self.assertEqual(commands, [
+                    ["test", *selection, "--no-run", "--timings"],
+                    ["test", *selection, "--no-fail-fast", "--", "--test-threads=4"],
+                ])
+                self.assertNotIn("--all-targets", selection)
 
     def test_all_still_runs_every_stage_after_lint_failure(self):
         run, commands = self.commands(failing="fmt")

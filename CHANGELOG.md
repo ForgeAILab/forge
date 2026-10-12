@@ -8,12 +8,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **API integration-test target names are consolidated.** The 95 targets
+  become eight binaries. For moved suites, use
+  `cargo test -p api --test main <old-target>::<test-name>` (including
+  `happy_path::`). `model_workflow`, `daemon_workspace_roundtrip`,
+  `daemon_plan_transport`, `environment_provisioning`,
+  `environment_surface_lists`, `integration_queue_task_summary` and
+  `task_list_read_path` retain their own binaries for process isolation.
+  CI partitions API binaries across `api-a` and `api-b`; the required
+  aggregate check remains `Rust`.
+
 - **DB and services integration-test target names are consolidated.** Use
   `cargo test -p db --test main <old-target>::` or
   `cargo test -p services --test main <old-target>::` for moved suites.
   Services retains `project_provisioning_characterization` and
   `main_project_create_command` as isolated targets. Original test names
-  remain under their target-named module; API test targets are unchanged.
+  remain under their target-named module.
 
 - **Agent doctrine moves to new revisions: Main baseline @5, Product Genesis
   @8, Project @22.** Migration `V202610120418` inserts Genesis @8 and Project

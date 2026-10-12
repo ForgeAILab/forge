@@ -9,7 +9,7 @@ run, because a release tag needs a successful run on its exact commit.
 
 ## Rust jobs
 
-The Rust gates run as seven parallel jobs, then one job that sums them up:
+The Rust gates run as eight parallel jobs, then one job that sums them up:
 
 | Job | Runs |
 | --- | --- |
@@ -17,10 +17,11 @@ The Rust gates run as seven parallel jobs, then one job that sums them up:
 | `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service::` |
 | `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service::` |
 | `Rust test (services-integration)` | `cargo test -p services --test '*' --examples --no-fail-fast -- --test-threads=4` |
-| `Rust test (api)` | `cargo test -p api --all-targets --no-fail-fast` |
+| `Rust test (api-a)` | API binary selection from `scripts/ci_rust_shards.py`, with four libtest threads |
+| `Rust test (api-b)` | Remaining API binaries and all non-integration targets, with four libtest threads |
 | `Rust test (db)` | `cargo test -p db --all-targets --no-fail-fast` |
 | `Rust test (rest)` | `cargo test --workspace --exclude services --exclude api --exclude db --all-targets --no-fail-fast` |
-| `Rust` | no work of its own; succeeds only if the seven jobs above succeeded |
+| `Rust` | no work of its own; succeeds only if the eight jobs above succeeded |
 
 `Rust` is the name to use in branch protection. It also runs when a job it
 needs failed, was cancelled or was skipped, and fails in each of those cases.
@@ -34,12 +35,14 @@ exclusion, so a new crate is tested there without an edit. The lint job runs
 `python3 scripts/ci_rust_shards.py check`, which reads `cargo metadata` and
 fails unless every workspace package is covered, every package a shard names
 exists (cargo only warns about an unknown `--exclude`), and the workflow matrix
-lists exactly the shards the script defines. Services is the only partitioned
-package: its lib filters must be exact complements and its integration shard
+lists exactly the shards the script defines. Services lib filters must be
+exact complements and its integration shard
 uses `--test '*' --examples`, because `--tests` also runs lib tests. This
 retains the example targets previously built by `--all-targets`; a new services
-bin or benchmark fails the check until it is assigned. Other packages
-remain in exactly one shard with `--all-targets`. It prints
+bin or benchmark fails the check until it is assigned. API integration
+targets must each have exactly one explicit binary assignment; unknown, missing
+or repeated targets fail the check. Its lib, bins, examples and benches belong
+to one API shard. Other packages remain in exactly one shard with `--all-targets`. It prints
 the package-to-shard table and compiles nothing, so it also runs locally.
 
 Run locally, `./scripts/ci-rust.sh` without arguments still runs fmt, clippy
@@ -67,8 +70,7 @@ runtime threads. With the default 2 MiB a deep dispatch future aborts the whole
 test binary on Linux, and the tests after it never run.
 
 CI builds with `CARGO_PROFILE_DEV_DEBUG=line-tables-only` (and the same for
-the test profile). After DB/services consolidation, the workspace still links
-over 100 integration-test binaries;
+the test profile). The workspace still links many integration-test binaries;
 with full debug info they fill the hosted runner's disk and the linker fails
 with `ld terminated with signal 7 [Bus error]`. Panics and backtraces still
 show file and line. The two variables are set in the job-level `env:` of the
@@ -237,7 +239,7 @@ its scaffold tests mutate `FORGE_SCAFFOLD_COMMAND` under their existing lock.
 `main_project_create_command` also stays separate to preserve its shared
 turn-log root and optional capture fixtures. Other fixtures use isolated pools,
 unique temporary paths, immutable statics or atomic filename counters. The
-API integration layout is unchanged. Full workspace test execution remains
+API integration targets are consolidated and isolated as described below. Full workspace test execution remains
 a CI responsibility.
 
 ## Services unit split and integration inventory
@@ -261,6 +263,7 @@ For focused integration work, use the original file stem as a module filter:
 ```bash
 cargo test -p db --test main file_backed_migration::test_name
 cargo test -p services --test main attention_service::test_name
+cargo test -p api --test main happy_path::test_name
 cargo test -p services --test project_provisioning_characterization test_name
 ```
 
@@ -275,13 +278,75 @@ cargo test -p db --tests -- --list > db-before.log 2>&1
 # After moving files:
 cargo test -p db --tests -- --list > db-after.log 2>&1
 python3 scripts/check_integration_test_inventory.py db-before.log db-after.log
-# Repeat with -p services and services-{before,after}.log.
+# Repeat with -p services or -p api and their before/after logs.
 ```
 
 For changes to the consolidated harness, run each integration binary in full
 with `-- --test-threads=4` twice to check for order and process interference.
 Keep environment-mutating targets isolated unless every reader shares the
 same lock, and keep fixture include paths relative to their moved source.
+
+## API binary split and isolation
+
+API has eight integration binaries (down from 95): `main` contains 88 suites
+under `tests/suite/`, named after their original targets. The test bodies stay
+unchanged; moved suites import the root `common` module and adjust relative
+fixture paths. `common/` and `fixtures/` remain in place, and paths based on
+`CARGO_MANIFEST_DIR` retain their original meaning. For example:
+
+```bash
+cargo test -p api --test main happy_path::test_name
+cargo test -p api --test main daemon_connect::test_name
+cargo test -p api --test model_workflow test_name
+```
+
+| Separate binary | Why it stays in its own process |
+| --- | --- |
+| `model_workflow` | Dominant model-sequence workload, task-local run caps and optional global tracing initialization |
+| `daemon_workspace_roundtrip` | Heavy git/daemon ownership, transfer and teardown roundtrips |
+| `daemon_plan_transport` | Installs a global tracing logger and exercises real owner/retry workers |
+| `environment_provisioning` | Clone/probe/retry workers and delayed fixture gates |
+| `environment_surface_lists` | Installs a global SQL tracing subscriber and measures exact query counts |
+| `integration_queue_task_summary` | Installs a global SQL tracing subscriber and measures exact query counts |
+| `task_list_read_path` | Its ignored benchmark installs a global SQL tracing subscriber |
+
+`daemon_connect` is safe in `main`: every server binds `127.0.0.1:0`, its
+pool-close gate is owned by the fixture, and it mutates no process environment,
+working directory or tracing subscriber. The other socket targets also use
+port zero. Neither the API suites nor their shared helpers mutate process env
+or cwd. `'static` lifetime bounds are not global state; the function-local
+`OnceLock` timestamps in `project_charters` and `product_genesis` remain
+independent, immutable and module-scoped. The shared DB migration template is
+immutable after initialization and copies into private per-test databases.
+Fixtures own unique temporary roots; literal remote paths are protocol inputs,
+not shared local directories.
+
+The latest green CI run used for the split was
+[38227423555](https://github.com/ForgeAILab/forge/actions/runs/38227423555),
+whose `Rust test (api)` log reports 304.87 seconds for `model_workflow`,
+44.53 for `daemon_workspace_roundtrip`, 14.43 for provisioning, 7.73 for plan
+transport, and 302.96 for the 88 targets now in `main`. API lib took 3.16
+seconds; all API targets totalled 689.54 seconds. These are measured per-binary
+libtest durations with four threads, not per-test estimates. Target ownership
+and the final measured balance are maintained in `scripts/ci_rust_shards.py`.
+Local validation at base `4d7d91c9` measured 262.28 / 228.86 seconds for
+`api-a` / `api-b` using each binary's mean successful duration (13.6% apart).
+The shared `main` binary passed 398 tests twice, in 44.50 / 74.56 seconds.
+The model and plan binaries each passed once and failed once in the required
+two runs, so their estimates use one successful observation each; these
+numbers do not certify the repeated-run gate. Both targets already have
+separate processes and retain their original source. The full before/after
+inventory is equal: 658 identities, including 99 unit and 559 integration
+cases. The actual two-shard listings also cover that inventory once.
+Keep the heavy model target indivisible: if it exceeds the rest after
+consolidation, that is the lower bound on the two-shard execution time.
+
+Record API inventories with `cargo test -p api --tests -- --list` before and
+after moving files, and compare them with
+`scripts/check_integration_test_inventory.py`. Run each whole API binary
+with `-- --test-threads=4` twice after changing the grouping; isolate any
+interfering suite instead of retrying a flaky shared process. Ignored tests
+remain in the inventory and keep their existing ignore status.
 
 ## Frontend dependency cache
 

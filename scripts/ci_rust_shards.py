@@ -6,7 +6,7 @@ This file defines every shard's package, target and libtest selection:
     ci_rust_shards.py args <shard>   cargo and libtest selection, one argument per
                                      line (read by scripts/ci-rust.sh)
     ci_rust_shards.py check          fail unless every workspace package is
-                                     covered once (services lib is partitioned)
+                                     covered once (services lib and api targets are partitioned)
                                      and the CI matrix runs exactly these shards
 
 `check` only runs `cargo metadata --no-deps`; it compiles nothing.
@@ -30,11 +30,29 @@ SHARDS = {
     # --tests includes the lib again; --test '*' selects integration bins only.
     # Retain the examples that --all-targets previously built (no lib rerun).
     "services-integration": ["-p", "services", "--test", "*", "--examples"],
-    "api": ["-p", "api", "--all-targets"],
+    "api-a": ["-p", "api"],
+    "api-b": ["-p", "api"],
     "db": ["-p", "db", "--all-targets"],
     # Catch-all by exclusion: a new workspace crate needs no edit here.
     "rest": None,
 }
+
+# Green CI 38227423555 measured model_workflow at 304.87s and all other API
+# targets at 384.67s. After consolidation, local successful runs at 4d7d91c9
+# predict 262.28s / 228.86s with four threads (13.6% apart). Each target uses
+# its mean successful duration; model and plan each have only one such run.
+# The model alone exceeds the remaining work, so this is the optimal binary
+# partition. Keep failure evidence separate from the duration calculation.
+# API targets are assigned by binary, never by a libtest substring. Metadata
+# coverage below rejects a new/renamed/missing target until it is assigned.
+API_TARGETS = {
+    "api-a": ["model_workflow"],
+    "api-b": ["main", "daemon_workspace_roundtrip", "daemon_plan_transport",
+              "environment_provisioning", "environment_surface_lists",
+              "integration_queue_task_summary", "task_list_read_path"],
+}
+# Non-integration targets (including future bins/examples/benches) run once.
+API_OTHER_TARGETS_SHARD = "api-b"
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -46,6 +64,13 @@ def named_packages():
 
 def cargo_args(shard):
     args = SHARDS[shard]
+    if shard in API_TARGETS:
+        args = list(args)
+        for target in API_TARGETS[shard]:
+            args += ["--test", target]
+        if shard == API_OTHER_TARGETS_SHARD:
+            args += ["--lib", "--bins", "--examples", "--benches"]
+        return args
     if args is not None:
         return list(args)
     args = ["--workspace", "--all-targets"]
@@ -84,6 +109,27 @@ def coverage_errors(workspace):
             for target in data["targets"]:
                 if target["kind"] not in (["lib"], ["test"], ["example"], ["custom-build"]):
                     errors.append(f"uncovered services target: {target['name']} {target['kind']}")
+        elif pkg == "api":
+            if set(owners) != set(API_TARGETS):
+                errors.append(f"api must be covered by {list(API_TARGETS)}, got {owners}")
+            if API_OTHER_TARGETS_SHARD not in owners:
+                errors.append("api non-integration targets must have one owning shard")
+            targets = {t["name"] for t in data["targets"] if t["kind"] == ["test"]}
+            assigned = [name for names in API_TARGETS.values() for name in names]
+            for name in sorted(targets | set(assigned)):
+                count = assigned.count(name)
+                if name not in targets or count != 1:
+                    errors.append(f"api integration target '{name}' has {count} assignments "
+                                  f"(exists: {name in targets})")
+            # Refuse unexpected cargo selection instead of trusting a package
+            # match that could include every test again or silently drop one.
+            for shard in API_TARGETS:
+                if SHARDS.get(shard) != ["-p", "api"]:
+                    errors.append(f"{shard} must select only the assigned api targets")
+            for target in data["targets"]:
+                if target["kind"] not in (["lib"], ["test"], ["bin"], ["example"],
+                                           ["bench"], ["custom-build"]):
+                    errors.append(f"uncovered api target: {target['name']} {target['kind']}")
         elif len(owners) != 1:
             errors.append(f"package '{pkg}' is covered by {len(owners)} shards: {owners}")
         elif "--all-targets" not in cargo_args(owners[0]):
@@ -151,7 +197,7 @@ def check():
             print(f"::error title=Rust test shards::{error}")
         return 1
     print(f"ok: {len(rows)} workspace packages, covered without overlap across "
-          f"{len(SHARDS)} shards (services lib filter/skip)")
+          f"{len(SHARDS)} shards (services lib filter/skip; api target partition)")
     return 0
 
 

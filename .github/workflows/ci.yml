@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The Rust gates run as seven parallel jobs: lint, and one test job per shard.
+  # The Rust gates run as eight parallel jobs: lint, and one test job per shard.
   # Each job has its own dependency cache; a shared key would be saved by
   # whichever job finishes first and miss for the others.
   rust-lint:
@@ -80,7 +80,7 @@ jobs:
         # Package/target selections and the complementary services filters are
         # defined in scripts/ci_rust_shards.py;
         # its `check` (in the lint job) fails if this list differs from it.
-        shard: [services-unit-a, services-unit-b, services-integration, api, db, rest]
+        shard: [services-unit-a, services-unit-b, services-integration, api-a, api-b, db, rest]
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only

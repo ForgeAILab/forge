@@ -17,7 +17,7 @@
 #        ci-rust.sh test <shard>  the tests of one shard
 # CI runs `lint` and one `test <shard>` per shard as parallel jobs. The shards
 # are defined in scripts/ci_rust_shards.py, which also checks that together
-# they cover every workspace package and partition the services unit tests.
+# they cover every workspace package, services unit tests and API targets.
 set -uo pipefail
 
 mode="${1:-all}"
@@ -65,7 +65,7 @@ export FORGE_SKIP_WEB_BUILD=1
 # need nothing from the host.
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
-# The workspace still has over 100 integration-test binaries. Full debug
+# The workspace has many integration-test binaries. Full debug
 # info overflows the hosted runner's disk and the linker dies with a bus error.
 # Line tables keep file:line in panics and backtraces at a fraction of the size.
 # In GitHub Actions the job-level `env:` of .github/workflows/ci.yml sets these
