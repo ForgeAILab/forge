@@ -369,9 +369,17 @@ impl TaskService {
                     // the root has no checklist of its own to complete (see
                     // `ensure_planning_plan_ready_before_leaving`), so only a
                     // candidate it wrote and Forge rejected holds it back.
-                    let plans_through_subtasks =
-                        crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task)
-                            .await?;
+                    // Exactly the lead's run: the planning role, on a root
+                    // with subtasks, in the root's planning state. Every
+                    // other run keeps its plan contract.
+                    let plans_through_subtasks = task.parent_task_id.is_none() && {
+                        let policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
+                        policy.planning_state() == Some(task.status.as_str())
+                            && policy.planning_role() == Some(execution.role.as_str())
+                    } && crate::task_hierarchy::coordination_root_has_subtasks(
+                        &self.db, &task,
+                    )
+                    .await?;
                     let rejected =
                         plan.rejected_candidate(&execution.id)
                             .await

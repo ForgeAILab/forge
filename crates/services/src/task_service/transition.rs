@@ -13,7 +13,9 @@ impl TaskService {
         let task_id: String = task_id.into();
         let options: TransitionOptions = options.into();
         if !db::task_writer::owns_task(&task_id) {
-            if options.triggered_by.is_user() {
+            // A person or an Agent starting a subtask by hand; Forge's own
+            // components move subtasks only once the root has started.
+            if !options.triggered_by.is_system() {
                 self.start_coordination_root_of(&task_id).await;
             }
             return self
