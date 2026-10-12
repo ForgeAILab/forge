@@ -3117,6 +3117,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Task that re-enters `merging` while the attempt of its previous entry is
+  still the head of the queue is admitted at the release of that head (the
+  driver signals it) instead of at the admission's next 100 ms look.
+
 - A merge taken over at the upgrade that still waits in line and whose
   continuation step was pruned is continued by the merge queue's next sweep
   instead of at the next server start.
@@ -3125,8 +3129,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - A merge taken over at the upgrade as already landed, whose commit the
   target does not contain (or whose target cannot be asked), no longer asks
-  for its proof for ever. After five asks the attempt is parked for the
-  owner: the Task shows `deferred` / `owner_required` with an Attention item,
+  for its proof for ever. After five asks (about 40 minutes) the attempt is
+  parked for the owner: the Task shows `deferred` / `owner_required` with an Attention item,
   and Retry puts it back in line (Cancel ends it).
 
 - A queued check run whose last consumer is withdrawn (a Hold or Cancel

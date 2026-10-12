@@ -4704,8 +4704,8 @@ commit (a merge commit of before the queue) both are asked for.
 |---|---|---|---|
 | The target contains the commit | evidence, comment, `merging` → `done` | answers `done` | `applied` → `completed` |
 | The owner answers "not contained" (the target was rewound after the fast-forward, or the row was wrong) | stays in its merge state, `deferred` / `unresolved_result` with an interruption | answers `not_landed` and ends | the worker drops the recorded result and takes the attempt off the slot (`applied` → `parked`, `target_missing_commit`, kind `needs_fact`); the counted retry timer queues it again and validation merges it against the target as it is (after the counted retries: `owner_required` with the Retry offer) |
-| No answer (the owner is not connected, the checkout cannot be read) | stays, `deferred` / `unresolved_result` | stays pending, asks again at `result_park` (30 s); the worker re-arms it on every sweep | stays `applied` and keeps the slot |
-| An imported landed row (no worker holds a slot for it) is not proven | stays, `deferred` / `unresolved_result` while it asks; after `IMPORT_PROOF_ASKS` (5) asks `deferred` / `owner_required` with an interruption (an Attention item) | the import continuation asks again on the same timer, five times at most, then ends `done` (`park_unproven_import`) | stays `applied` while it asks, then `parked` (`owner_required`, no deadline, `integrated_sha` cleared). The owner's Retry admits the Task again and the queue reads the target as it is; Cancel ends it |
+| No answer (the owner is not connected, the checkout cannot be read) | stays, `deferred` / `unresolved_result` | stays pending, parked for `result_park` (600 s); the worker re-arms it on every sweep (`sweep_interval`, 30 s), so it asks about every 30 s | stays `applied` and keeps the slot |
+| An imported landed row (no worker holds a slot for it) is not proven | stays, `deferred` / `unresolved_result` while it asks; after `IMPORT_PROOF_ASKS` (5) asks `deferred` / `owner_required` with an interruption (an Attention item) | the import continuation asks again at `result_park` (600 s; no worker re-arms it), five times at most (about 40 minutes), then ends `done` (`park_unproven_import`) | stays `applied` while it asks, then `parked` (`owner_required`, no deadline, `integrated_sha` cleared). The owner's Retry admits the Task again and the queue reads the target as it is; Cancel ends it |
 
 **One writer per merge during an upgrade.** Three things could act on a merge
 that was in flight the old way: the old merge's own hooks step, the import
@@ -4727,9 +4727,10 @@ step started and then admits; a merge the old step had finished is admitted
 too, the head finds its commit in the target and the proven `result` step
 reports it (only if the candidate can no longer be named does the hook report
 it itself, after the same proof). The continuation waits for an earlier,
-suspended hooks step of the entry instead of admitting beside it. Residue: a
-`shadow:` row of a deleted Task gets no continuation and is never claimed; it
-holds no slot.
+suspended hooks step of the entry instead of admitting beside it. A `shadow:`
+row of a deleted Task gets no continuation and is never claimed; the start
+pass deletes it (`delete_orphan_shadow_attempts`: not a queue's head, no
+unsettled or unknown effect).
 
 **Unknown results from before the queue.** An imported merge whose old
 operation never reported is recorded `uncertain` against the machine that ran
@@ -4745,7 +4746,11 @@ passive shadow recording left) without a continuation gets one
 identity-fenced `integration/import_continue` step, keyed
 `integration-import:<attempt id>`. The step applies the continuation of the
 imported state under the Task's lease; running the start twice enqueues
-nothing new.
+nothing new. A `queued` pre-queue attempt whose settled continuation step was
+pruned (Task-step retention, 7 days) would not be claimable: the queue
+worker's sweep (`sweep_once`, `continue_queued_imports`) enqueues the
+continuation of every `queued` pre-queue attempt that has none, so it does not
+wait for the next start.
 
 | Imported state | Continuation |
 |---|---|
@@ -4839,9 +4844,18 @@ an attempt that finished before the cutoff. Deny-by-default: the attempt is
 terminal and not current, has no effect intent, no pending / running /
 uncertain operation and no uncertain receipt, its Task has no current attempt,
 and its queue is neither quarantined nor names it as head. **No attempt row is
-deleted**: the row is the queue's history (states, commits, timings, lineage),
-and a Review's `execution.integration_checks` and a settled Task's
-`integration_lineage` witness name it by id; what a Review quotes of a head
+deleted, by decision**: the row is the queue's history (states, commits,
+timings, lineage), and a Review's `execution.integration_checks` and a settled
+Task's `integration_lineage` witness name it by id; no reader of those ids was
+audited for a missing row, and deletion is not built without that audit. The
+table therefore grows by one row per merge attempt: one per entry of a merge
+state, plus one for each re-admission (a re-entry after a repair or a
+re-review, an owner's Retry that replaces the attempt, a rebind). With its
+receipts and observations emptied by the rule above a finished row keeps its
+scalar columns and the small JSON documents (paths, checks, timings), on the
+order of a few kilobytes. The only rows ever deleted are those of a deleted
+queue (`ON DELETE CASCADE` from `integration_queue`) and the `shadow:` rows of
+deleted Tasks. What a Review quotes of a head
 check is stored in the Review itself. `integration_queues.finished_with_receipts`
 in operations status counts finished attempts that still hold receipts.
 Transfer cleanup and owner-journal acknowledgment run as before.
@@ -5561,7 +5575,9 @@ snapshot survives hook-step pruning; cancellation does not erase the only
 possible-landed record.
 
 Current imported/shadow attempts receive an identity-fenced `import_continue`
-step once. Classification is committed before that step can execute. A queued
+step at start; a `queued` one that has lost its settled step to retention
+receives it again from the queue worker's sweep. Classification is committed
+before that step can execute. A queued
 pre-queue member is claimable only after continuation is acknowledged and no
 live legacy merge hook owns it. A suspended older hook completes its recorded
 rebase/read-only outcome and hands over through the same admission function.
@@ -5629,6 +5645,12 @@ pinning a quarantined queue.
 ### The active head pipeline
 
 The supervised sweep runs on admission/answer notifications and every 30 seconds.
+A Task that re-enters its merge state while the attempt of its previous entry
+is still the head is admitted as soon as that head is released: the admission
+flags the old attempt, wakes the worker and waits on the driver's release
+signal (`IntegrationQueueWorker::notify_released`, sent by `HeadDriver::pass`
+on `Pass::Released`), with a 100 ms poll for a worker of another process, for
+at most `RELEASE_WAIT` (20 s) before it returns the conflict to its step.
 At most 16 queues have drivers; claims rotate for fairness. It cancels released
 members, makes due parks runnable, takes expired heads over, refreshes suspended
 targets and revisits quarantine. One slow head/check does not hold another
