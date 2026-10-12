@@ -272,7 +272,10 @@ mod tests {
         let old = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
         let recent = (chrono::Utc::now() - chrono::Duration::days(29)).to_rfc3339();
         sqlx::raw_sql("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('r','p','repo','main','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").execute(db.pool()).await.unwrap();
-        let queue = db.create_or_get_integration_queue("r", "main").await.unwrap();
+        let queue = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
         const RECEIPTS: &str = "effect_receipts_json='[{\"kind\":\"rebase\"}]',operation_receipts_json='[{\"kind\":\"worker_park\"}]',observations_json='[{\"target\":\"a\"}]'";
         for task in ["old", "recent", "current", "unsettled"] {
             sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p',?,'merging','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")

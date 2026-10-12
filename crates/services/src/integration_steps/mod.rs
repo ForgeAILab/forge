@@ -34,13 +34,13 @@ use crate::{
 use api_types::{
     IntegrationAttemptId, IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
 };
-use db::{
-    ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S,
-    IntegrationQueueRepo, IntegrationQueueState, IntegrationStepAckOutcome,
-    IntegrationStepAckWrite, IntegrationStepPosition, SqliteDb, TaskRepo, TaskStep, TaskStepRepo,
-};
 #[cfg(test)]
 use db::IntegrationFailureKind;
+use db::{
+    ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S, IntegrationQueueRepo,
+    IntegrationQueueState, IntegrationStepAckOutcome, IntegrationStepAckWrite,
+    IntegrationStepPosition, SqliteDb, TaskRepo, TaskStep, TaskStepRepo,
+};
 use std::sync::Arc;
 
 pub(crate) mod admission;
@@ -220,15 +220,13 @@ impl IntegrationSteps {
             return continued;
         }
         let outcome = match request.action {
-            IntegrationStepAction::RequestCheck => {
-                match self.request_check(step, &request).await {
-                    Err(error) if error.is_check_environment_unavailable() => {
-                        self.environment_unavailable(step, &request, &[S::Checking], error)
-                            .await?
-                    }
-                    outcome => outcome?,
+            IntegrationStepAction::RequestCheck => match self.request_check(step, &request).await {
+                Err(error) if error.is_check_environment_unavailable() => {
+                    self.environment_unavailable(step, &request, &[S::Checking], error)
+                        .await?
                 }
-            }
+                outcome => outcome?,
+            },
             IntegrationStepAction::Settle => match match self.reuse_review_check(&request).await {
                 Err(error) if error.is_check_environment_unavailable() => {
                     let outcome = self

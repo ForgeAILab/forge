@@ -537,19 +537,18 @@ impl OperatorStatusService {
             count: age.count,
             oldest_age_seconds: age.oldest_seconds,
         };
-        let integration_queues = api_types::IntegrationQueueStatus {
-            queues_by_state: integration_counts.queues_by_state,
-            current_attempts_by_state: integration_counts.current_attempts_by_state,
-            quarantined_imports: integration_counts.quarantined_imports,
-            waiting: integration_backlog(integration_ages.queued),
-            heads: integration_backlog(integration_ages.heads),
-            parked: integration_backlog(integration_ages.parked),
-            timings: integration_timing_status(&integration_samples),
-            finished_with_receipts: db::IntegrationActivationRepo::integration_evidence_retained(
-                &*self.db,
-            )
-            .await?,
-        };
+        let integration_queues =
+            api_types::IntegrationQueueStatus {
+                queues_by_state: integration_counts.queues_by_state,
+                current_attempts_by_state: integration_counts.current_attempts_by_state,
+                quarantined_imports: integration_counts.quarantined_imports,
+                waiting: integration_backlog(integration_ages.queued),
+                heads: integration_backlog(integration_ages.heads),
+                parked: integration_backlog(integration_ages.parked),
+                timings: integration_timing_status(&integration_samples),
+                finished_with_receipts:
+                    db::IntegrationActivationRepo::integration_evidence_retained(&*self.db).await?,
+            };
         let check_counts = self.db.check_run_counts().await?;
         let check_summary = self.db.check_operator_summary().await?;
         let backlog = |(count, oldest_age_seconds): db::CheckBacklogRow| api_types::CheckBacklog {

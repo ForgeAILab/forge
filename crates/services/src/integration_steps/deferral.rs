@@ -44,7 +44,10 @@ pub(crate) fn deferral(facts: &DeferralFacts<'_>) -> (C, Option<String>) {
     if facts.quarantined {
         // An imported row quarantined with no operation to ask about has no
         // result that could still arrive: its owner decides.
-        let unanswerable = facts.import.as_ref().is_some_and(|import| !import.operation);
+        let unanswerable = facts
+            .import
+            .as_ref()
+            .is_some_and(|import| !import.operation);
         return (
             if unanswerable {
                 C::OwnerRequired
@@ -82,7 +85,9 @@ pub(crate) fn deferral(facts: &DeferralFacts<'_>) -> (C, Option<String>) {
     // A wait for the machine that holds the Task's checkout names it.
     (
         cause,
-        offline.then(|| facts.daemon_id.map(str::to_owned)).flatten(),
+        offline
+            .then(|| facts.daemon_id.map(str::to_owned))
+            .flatten(),
     )
 }
 
@@ -144,13 +149,43 @@ mod tests {
     #[test]
     fn worker_parks_read_their_kind_and_reason_code() {
         for (kind, message, cause, owner) in [
-            (Some(K::Infrastructure), "infrastructure: x", C::Infrastructure, None),
+            (
+                Some(K::Infrastructure),
+                "infrastructure: x",
+                C::Infrastructure,
+                None,
+            ),
             (Some(K::Timeout), "timeout: x", C::Infrastructure, None),
-            (Some(K::NeedsFact), "target_missing_commit: x", C::UnresolvedResult, None),
-            (Some(K::OwnerRequired), "target_dirty: a", C::TargetDirty, None),
-            (Some(K::TargetUnavailable), "owner_offline: away", C::OwnerOffline, Some("m")),
-            (Some(K::TargetUnavailable), "target_not_ready: x", C::OwnerOffline, None),
-            (Some(K::OwnerRequired), "retries_exhausted: infrastructure: x", C::OwnerRequired, None),
+            (
+                Some(K::NeedsFact),
+                "target_missing_commit: x",
+                C::UnresolvedResult,
+                None,
+            ),
+            (
+                Some(K::OwnerRequired),
+                "target_dirty: a",
+                C::TargetDirty,
+                None,
+            ),
+            (
+                Some(K::TargetUnavailable),
+                "owner_offline: away",
+                C::OwnerOffline,
+                Some("m"),
+            ),
+            (
+                Some(K::TargetUnavailable),
+                "target_not_ready: x",
+                C::OwnerOffline,
+                None,
+            ),
+            (
+                Some(K::OwnerRequired),
+                "retries_exhausted: infrastructure: x",
+                C::OwnerRequired,
+                None,
+            ),
             (None, "integration is waiting", C::OwnerRequired, None),
         ] {
             assert_eq!(
@@ -177,13 +212,25 @@ mod tests {
             import: Some(import),
             ..facts(quarantined, Some(K::NeedsFact), "evidence")
         };
-        assert_eq!(deferral(&with(true, import(20, false, false))).0, C::OwnerRequired);
-        assert_eq!(deferral(&with(true, import(2, true, false))).0, C::UnresolvedResult);
+        assert_eq!(
+            deferral(&with(true, import(20, false, false))).0,
+            C::OwnerRequired
+        );
+        assert_eq!(
+            deferral(&with(true, import(2, true, false))).0,
+            C::UnresolvedResult
+        );
         assert_eq!(
             deferral(&with(false, import(15, false, true))),
             (C::OwnerOffline, Some("old".to_owned()))
         );
-        assert_eq!(deferral(&with(false, import(14, false, true))).0, C::Infrastructure);
-        assert_eq!(deferral(&with(false, import(13, false, false))).0, C::OwnerRequired);
+        assert_eq!(
+            deferral(&with(false, import(14, false, true))).0,
+            C::Infrastructure
+        );
+        assert_eq!(
+            deferral(&with(false, import(13, false, false))).0,
+            C::OwnerRequired
+        );
     }
 }
