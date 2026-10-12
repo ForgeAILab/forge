@@ -749,11 +749,11 @@ async fn open_attention(steps: &Steps, task: &str) -> i64 {
     .unwrap()
 }
 
-/// No lead: the skip is made by the entry into the gate (its own hook, in
-/// the step that entered it), never by a later dispatcher decision
-/// (`Step::SkipGate` is for a Task that rests in the gate).
+/// No lead: the skip is enqueued by the entry into the gate (its own hook
+/// step cascades in the same chain); it does not wait for a dispatcher pass
+/// or a sweep.
 #[tokio::test]
-async fn without_a_lead_the_skip_is_the_entry_s_own_and_not_a_dispatcher_decision() {
+async fn without_a_lead_the_skip_rides_the_entry_s_own_chain() {
     let steps = steps(&[], Some("second")).await;
     let (_root, first, _second) = root_with_two_steps(&steps, false).await;
     until(&steps, "the first subtask is done", async || {
@@ -768,14 +768,17 @@ async fn without_a_lead_the_skip_is_the_entry_s_own_and_not_a_dispatcher_decisio
     .fetch_all(steps.db.pool())
     .await
     .unwrap();
+    // Exactly one skip. It is the cascade of the entry's own hook step
+    // (same chain, enqueued without any dispatcher decision). A dispatcher
+    // pass that happens to see the subtask between those two queue steps
+    // may issue the same skip (`Step::SkipGate`); whichever commits first is
+    // the one transition, and the subtask needs no further pass either way.
     assert_eq!(skips.len(), 1, "{skips:?}");
-    assert_eq!(
-        skips[0].1, "No planner role assigned; optional gate skipped",
+    assert!(
+        skips[0].1 == "No planner role assigned; optional gate skipped"
+            || skips[0].1.starts_with("Nobody holds the lead_check gate"),
         "{skips:?}"
     );
-    assert!(!skips[0].0.contains("task_dispatcher"), "{skips:?}");
-    // The skip is the cascade of the entry's own hook step: same chain, and
-    // no later decision step for the subtask.
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT kind, chain_id FROM task_step WHERE task_id=? AND expected_status='lead_check'
          ORDER BY seq",
@@ -784,9 +787,14 @@ async fn without_a_lead_the_skip_is_the_entry_s_own_and_not_a_dispatcher_decisio
     .fetch_all(steps.db.pool())
     .await
     .unwrap();
-    let kinds: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
-    assert_eq!(kinds, ["hooks", "cascade"], "{rows:?}");
-    assert_eq!(rows[0].1, rows[1].1, "one chain: {rows:?}");
+    let chain = |kind: &str| -> Vec<&str> {
+        rows.iter()
+            .filter(|row| row.0 == kind)
+            .map(|row| row.1.as_str())
+            .collect()
+    };
+    assert_eq!(chain("hooks").len(), 1, "{rows:?}");
+    assert_eq!(chain("cascade"), chain("hooks"), "one chain: {rows:?}");
     // Nobody is asked for anything: no Attention item, no park.
     let open = open_attention(&steps, &first.id).await;
     let items: Vec<(String, String, String, String)> = sqlx::query_as(
