@@ -111,6 +111,7 @@ const degradedStatus: OperatorStatusResponse = {
       check: { samples: 0, p50_ms: null, p95_ms: null, max_ms: null },
       fast_forward: { samples: 0, p50_ms: null, p95_ms: null, max_ms: null },
     },
+    finished_with_receipts: 0,
   },
   pending_remote_cancels: 0,
   periodic_workers: [],
