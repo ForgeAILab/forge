@@ -216,11 +216,20 @@ impl IntegrationSteps {
         let outcome = match request.action {
             IntegrationStepAction::RequestCheck => self.request_check(step, &request).await?,
             IntegrationStepAction::Settle => {
+                let evidence = self.reuse_review_check(&request).await?;
+                let check = if evidence.is_some() {
+                    settle::CheckInput::Passed(db::IntegrationCheckTiming::Skipped {
+                        reason: db::IntegrationCiSkipReason::TargetUnchanged,
+                    })
+                } else {
+                    settle::CheckInput::NotRequested
+                };
                 self.settle(
                     Some(step),
                     &request,
                     &[S::AwaitingTaskStep],
-                    settle::CheckInput::NotRequested,
+                    check,
+                    evidence.as_ref(),
                 )
                 .await?
             }

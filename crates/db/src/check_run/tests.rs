@@ -2195,3 +2195,22 @@ async fn operator_summary_counts_backlogs_with_ages_and_the_days_reuse() {
     near(summary.waiting_for_disk, (1, 120));
     assert_eq!((summary.runs_24h, summary.reuse_hits_24h), (6, 2));
 }
+
+#[tokio::test]
+async fn reuse_only_miss_creates_neither_run_nor_consumer() {
+    let db = fixture().await;
+    assert!(db
+        .reuse_check_run(request("reuse-only-miss"))
+        .await
+        .unwrap()
+        .is_none());
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let consumers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_consumer")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!((runs, consumers), (0, 0));
+}

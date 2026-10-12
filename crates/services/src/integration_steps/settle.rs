@@ -121,75 +121,40 @@ impl HeadCheckSource for ReviewCiHeadCheck {
         {
             return Ok(None);
         }
-        let owner_is_daemon = attempt.owner_kind == Some(db::IntegrationOwnerKind::Daemon);
         let workspace = match attempt.workspace_id.as_deref() {
             Some(id) => db::WorkspaceRepo::get_by_id(&*self.db, id).await?,
             None => db::WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?,
-        };
-        // The identity review entry asks under (`request_entry_check`): the
-        // same source, the review state's effective configuration, the
-        // canonical policy, and the Task's workspace at its placement
-        // generation. The purpose is a property of who asks (the consumer),
-        // not of the result: a commit that already passed these commands in
-        // this worktree at review entry is a hit and runs nothing, and a
-        // commit the queue rebased is another commit and runs once. A
-        // daemon-owned checkout keeps its owner's frozen policy from the
-        // builder (it always runs), exactly as at review entry. The head is
-        // only asked for a check on a clean worktree (validation parks a
-        // dirty one first), which is the entry's dirty-tree rule.
-        let environment = ::review::contract::project_environment(&self.db, &task.id)
-            .await
-            .map_err(ServiceError::invalid_operation)?;
-        let source = match &workspace {
-            Some(workspace) => serde_json::json!({
-                "task_id": task.id, "project_id": task.project_id, "repo_id": workspace.repo_id,
-            }),
-            None => db::ReviewConformanceRepo::review_source(&*self.db, &task.id, None).await?,
-        };
-        let generation = attempt
-            .placement_generation
-            .and_then(|generation| u64::try_from(generation).ok());
-        let identity_workspace = match (&workspace, generation) {
-            (Some(workspace), Some(generation)) => {
-                Some(::review::check_spec::CheckWorkspaceIdentity {
-                    workspace_id: &workspace.id,
-                    generation,
-                })
-            }
-            _ => None,
-        };
-        let spec = ::review::check_spec::build_check_spec(
-            CheckPurpose::EntryCi,
-            &::review::check_spec::CheckSpecConfiguration {
-                source: &source,
-                entry_state_config: review_config.as_ref(),
-                environment: &environment,
-                hooks: &[],
-                hook_test_index: None,
-                single_environment_check: None,
-                event: api_types::LifecycleEvent::BeforeWork,
-                role: "",
-                owner_is_daemon,
-                canonical_policy: true,
-                workspace: identity_workspace,
-                queue_head_bundle: None,
+        }
+        .ok_or_else(|| ServiceError::invalid_operation("the head has no workspace"))?;
+        let placement = db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &workspace.id)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("the head has no placement"))?;
+        let state_config = review_config.unwrap_or(serde_json::Value::Null);
+        let Some(identity) = crate::check_runner::review_entry::review_ci_identity(
+            &self.db,
+            crate::check_runner::review_entry::ReviewCiIdentityInput {
+                task,
+                workspace: &workspace,
+                placement: &placement,
+                commit_sha,
+                state_config: &state_config,
+                dirty: false,
+                target_branch: Some(&queue.target_branch),
             },
         )
-        .map_err(ServiceError::invalid_operation)?;
-        if spec.commands.is_empty() {
+        .await?
+        else {
             return Ok(None);
+        };
+        if identity.repo_id != queue.repo_id {
+            return Err(ServiceError::invalid_operation(
+                "the head's check names another repository",
+            ));
         }
-        let inputs =
-            crate::check_runner::policy::digest_input(&self.db, spec, &environment.env).await?;
         Ok(Some(HeadCheck {
-            identity: CheckRunIdentity {
-                project_id: task.project_id.clone(),
-                repo_id: queue.repo_id.clone(),
-                commit_sha,
-                inputs,
-            },
-            workspace_id: workspace.map(|workspace| workspace.id),
-            machine_id: attempt.daemon_id.clone(),
+            identity,
+            workspace_id: Some(workspace.id),
+            machine_id: placement.daemon_id,
             wall_timeout_seconds: u64::from(::review::contract::DEFAULT_CHECK_TIMEOUT_SECONDS),
         }))
     }
@@ -230,7 +195,7 @@ fn timing(
     }
 }
 
-fn check_input(application: &CheckApplication) -> CheckInput {
+pub(super) fn check_input(application: &CheckApplication) -> CheckInput {
     match &application.verdict {
         CheckVerdict::InfrastructureExhausted(_) => {
             CheckInput::NoVerdict("the check produced no verdict after its retries".into())
@@ -330,6 +295,7 @@ impl IntegrationSteps {
                     request,
                     &[S::Checking],
                     CheckInput::NotRequested,
+                    None,
                 )
                 .await;
         };
@@ -400,6 +366,7 @@ impl IntegrationSteps {
                             request,
                             &[S::Checking],
                             check_input(&application),
+                            Some(&application),
                         )
                         .await;
                 }
@@ -587,6 +554,7 @@ impl IntegrationSteps {
         request: &IntegrationStepRequest,
         states: &[S],
         check: CheckInput,
+        evidence: Option<&CheckApplication>,
     ) -> Result<StepOutcome> {
         let action = IntegrationStepAction::Settle;
         let Some(attempt) = self.db.integration_attempt(&request.attempt_id).await? else {
@@ -779,6 +747,10 @@ impl IntegrationSteps {
                 (IntegrationStepOutcome::Permit, None, Some(permit))
             }
         };
+        if let Some(application) = evidence {
+            self.record_head_review_in_tx(&mut tx, &attempt, application)
+                .await?;
+        }
         let written = db::acknowledge_integration_step_in_tx(
             &mut tx,
             &IntegrationStepAckWrite {
@@ -866,7 +838,13 @@ impl CheckConsumerFamily for IntegrationCheckFamily {
         for _ in 0..3 {
             match self
                 .steps
-                .settle(None, &request, &[S::Checking], check_input(application))
+                .settle(
+                    None,
+                    &request,
+                    &[S::Checking],
+                    check_input(application),
+                    Some(application),
+                )
                 .await?
             {
                 StepOutcome::Retry(_) | StepOutcome::RetryAt(..) => {
@@ -879,5 +857,218 @@ impl CheckConsumerFamily for IntegrationCheckFamily {
             }
         }
         Err(db::DbError::VersionConflict.into())
+    }
+}
+
+impl IntegrationSteps {
+    /// An unchanged reviewed commit needs no new run. Try the runner's real
+    /// certified cache hit; a frozen/unattested policy retains the passed
+    /// Review's own result as authority rather than launching it again.
+    pub(crate) async fn reuse_review_check(
+        &self,
+        request: &IntegrationStepRequest,
+    ) -> Result<Option<CheckApplication>> {
+        let Some(attempt) = self.db.integration_attempt(&request.attempt_id).await? else {
+            return Ok(None);
+        };
+        if attempt.state != S::AwaitingTaskStep {
+            return Ok(None);
+        }
+        let Some(task) = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await? else {
+            return Ok(None);
+        };
+        let Some(queue) = self.db.integration_queue(&request.queue_id).await? else {
+            return Ok(None);
+        };
+        let Some(check) = self.head_check.head_check(&task, &attempt, &queue).await? else {
+            return Ok(None);
+        };
+        let key = check.identity.key()?;
+        let prior: Option<(String,String,String)> = sqlx::query_as(
+            "SELECT c.id,c.run_id,c.result_id FROM check_consumer c JOIN check_result r ON r.id=c.result_id JOIN review v ON c.request_key='task-step/1|entry|'||v.task_id||'|'||c.status_epoch||'|'||v.id WHERE c.task_id=? AND c.origin='entry' AND c.identity_key=? AND r.outcome='pass' AND v.status='passed' ORDER BY v.attempt_number DESC,c.created_at DESC LIMIT 1")
+            .bind(&task.id).bind(&key).fetch_optional(self.db.pool()).await?;
+        let Some((consumer_id, run_id, result_id)) = prior else {
+            return Ok(None);
+        };
+        let authority = check_authority(&attempt)
+            .ok_or_else(|| ServiceError::invalid_operation("the head has no candidate"))?;
+        let consumers = self
+            .task_service
+            .check_consumers()
+            .ok_or_else(|| ServiceError::invalid_operation("check consumers are not composed"))?;
+        let reused = consumers
+            .try_reuse(TaskCheckRequest {
+                task_id: task.id.clone(),
+                status_epoch: attempt.expected_epoch,
+                authority: authority.clone(),
+                origin: CheckConsumerOrigin::Integration,
+                purpose: CheckPurpose::QueueHeadCi,
+                identity: check.identity,
+                workspace_id: check.workspace_id,
+                machine_id: check.machine_id,
+                wall_timeout_seconds: check.wall_timeout_seconds,
+            })
+            .await?;
+        let (consumer_id, run, result) = match reused {
+            Some(requested) => {
+                let crate::check_runner::CheckRequestOutcome::Hit(result) = requested.outcome
+                else {
+                    return Err(ServiceError::invalid_operation(
+                        "reuse-only request scheduled a run",
+                    ));
+                };
+                let run = self
+                    .db
+                    .check_run(&result.run_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                (requested.consumer.id, run, result)
+            }
+            None => (
+                consumer_id,
+                self.db
+                    .check_run(&run_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?,
+                self.db
+                    .check_result(&result_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?,
+            ),
+        };
+        if result.identity_key != key || run.identity_key != key {
+            return Err(ServiceError::invalid_operation(
+                "the Review's check identity changed",
+            ));
+        }
+        Ok(Some(CheckApplication {
+            task_id: task.id,
+            status_epoch: attempt.expected_epoch,
+            authority,
+            consumer_id,
+            run,
+            verdict: CheckVerdict::Result(result),
+        }))
+    }
+
+    async fn record_head_review_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        attempt: &IntegrationAttempt,
+        application: &CheckApplication,
+    ) -> Result<()> {
+        let CheckVerdict::Result(result) = &application.verdict else {
+            return Ok(());
+        };
+        if !matches!(
+            result.outcome,
+            CheckResultOutcome::Pass | CheckResultOutcome::Fail | CheckResultOutcome::TimedOut
+        ) {
+            return Ok(());
+        }
+        let row: Option<(String,String)> = sqlx::query_as("SELECT id,step_results_json FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1")
+            .bind(&attempt.task_ref).fetch_optional(&mut **tx).await?;
+        let (id, mut details) = match row {
+            Some((id, raw)) => (
+                id,
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            ),
+            None => {
+                let execution: Option<String> = sqlx::query_scalar("SELECT id FROM execution WHERE task_id=? AND role IN ('executor','coder','worker') ORDER BY created_at DESC,id DESC LIMIT 1")
+                    .bind(&attempt.task_ref).fetch_optional(&mut **tx).await?;
+                let execution = attempt.execution_id.clone().or(execution).ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "the head check has no implementation execution for Review evidence",
+                    )
+                })?;
+                let id = db::new_uuid_v4();
+                let now = db::now_rfc3339();
+                sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,finished_at,created_at,updated_at) VALUES(?,?,?,1,?,'{}',?,?,?,?)")
+                    .bind(&id).bind(&attempt.task_ref).bind(execution)
+                    .bind(if result.outcome == CheckResultOutcome::Pass { "passed" } else { "failed" })
+                    .bind(&now).bind(&now).bind(&now).bind(&now).execute(&mut **tx).await?;
+                (id, serde_json::json!({"ci_steps": []}))
+            }
+        };
+        if !details.is_object() {
+            return Err(ServiceError::invalid_operation(
+                "Review evidence is not an object",
+            ));
+        }
+        let execution = details
+            .as_object_mut()
+            .unwrap()
+            .entry("execution")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Review execution evidence is not an object")
+            })?;
+        let records = execution
+            .entry("integration_checks")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("head-check evidence is not an array")
+            })?;
+        if records
+            .iter()
+            .any(|record| record["attempt_id"] == attempt.id && record["result_id"] == result.id)
+        {
+            return Ok(());
+        }
+        let consumer: Option<(String, String)> =
+            sqlx::query_as("SELECT origin,created_at FROM check_consumer WHERE id=?")
+                .bind(&application.consumer_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let reuse = consumer.as_ref().is_some_and(|(_, created)| {
+            let created = chrono::DateTime::parse_from_rfc3339(created).ok();
+            let finished = application
+                .run
+                .finished_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+            matches!((created, finished), (Some(created), Some(finished)) if created >= finished)
+        });
+        let source = if consumer
+            .as_ref()
+            .is_some_and(|(origin, _)| origin == "entry")
+        {
+            "review_authority"
+        } else if reuse {
+            "cache_hit"
+        } else {
+            "executed"
+        };
+        let ci_steps: Vec<serde_json::Value> = result
+            .commands
+            .iter()
+            .map(|command| {
+                let mut value = serde_json::to_value(command).expect("command facts serialize");
+                value["step_id"] = serde_json::json!(db::task_writer::current_step_id());
+                value
+            })
+            .collect();
+        records.push(serde_json::json!({
+            "attempt_id": attempt.id, "commit_sha": application.run.identity.commit_sha,
+            "consumer_id": application.consumer_id, "run_id": application.run.id,
+            "result_id": result.id, "identity_key": result.identity_key,
+            "outcome": result.outcome, "source": source, "ci_steps": ci_steps,
+        }));
+        if records.len() > 64 {
+            records.drain(..records.len() - 64);
+        }
+        sqlx::query("UPDATE review SET step_results_json=?,updated_at=? WHERE id=?")
+            .bind(details.to_string())
+            .bind(db::now_rfc3339())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        self.db
+            .produce_condition_in_tx(tx, &attempt.task_ref, db::ConditionChange::Human)
+            .await?;
+        Ok(())
     }
 }

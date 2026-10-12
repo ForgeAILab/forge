@@ -4916,22 +4916,16 @@ merging": it ends the Task as done, merges nothing and cancels the attempt.
 **Write-transaction rule.** No database write transaction is held across a
 Git subprocess, an owner RPC or a write on another pooled connection anywhere
 under `integration_steps`, `integration_worker`, `integration_ports` or
-`db::integration_queue`. The exception that remains is on code the queue does
-not reach: `lock_review_integration` (`db/src/review_conformance.rs`) wraps
-the Git merge of the old chain below.
+`db::integration_queue`. The obsolete direct merge service and workspace-backend
+merge operations have been deleted, including their three review-authority
+write locks around Git/RPC. The queue fast-forwards through the integration
+owners (`ServerIntegrationOwner::merge` and the daemon's fenced
+`workspace.merge`), after a short Task-step authorization transaction.
 
-Left from the old path, with no production caller: `MergeService::merge`
-and `merge_workspace`, the workspace backends' `merge` operation
-(`WorkspaceBackend::merge`, embedded and daemon) and `MergeSpec`. Only tests
-call them (`merge_service::tests`, `workspace_backend_characterization`,
-`daemon_workspace_roundtrip`, `workflow::engine::tests`). The queue's
-fast-forward goes through the integration owners
-(`ServerIntegrationOwner::merge`, the daemon's `workspace.merge` with a claim
-binding), not through these. Their removal is still to do.
-
-Not built yet: the retention job for receipts and daemon journals; the public
-queue reads, web labels and the `integration.updated` event are built by the
-public-reads change.
+Queue/member reads, web labels and `integration.updated` are live. The storage
+receipt pruner is available, but no production periodic job calls
+`prune_integration_evidence` yet; transfer cleanup and owner-journal
+acknowledgment already run.
 
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same
@@ -5499,1397 +5493,321 @@ version-and-stored-text fence.
 reason. A mapped condition still copies each legacy field into `evidence`
 cut at 4,096 bytes; 24 KiB is its tested ceiling for the same reason.
 
-### Integration-owned conditions (3.2 stage A)
+### Integration ownership and Task conditions
 
-Stage A added the statement seam. Since stage D2b the integration Task steps and the
-`merging` entry hook emit these reasons (see "`merging` is the integration queue").
-There is still no path guard enforcement (stage E).
-`IntegrationAttemptId` is an opaque typed string, never queue rank or worker token.
+Every root Task entering a state with the `run_merge` entry hook joins the
+integration queue. State names are not authority: custom workflows may rename
+or define more than one merge state. Success follows that state's own `accept`
+target; repair and review follow its workflow roles. Subtasks deliver through
+their coordination root rather than creating an independent merge attempt.
 
-`ConditionStatement::Integration { reason }` replaces only integration's reason,
-and is fenced on its attempt: an attempt restates its own reason, and a
-different attempt is refused unless no attempt owns the row (none stated, the
-previous one cleared, or handed off to a role).
-`IntegrationCleared { attempt_id }` clears only the matching attempt.
-`IntegrationHandedOff { attempt_id }` makes a repair/review continuation ready
-for ordinary role admission and recovery while retaining its lineage. All go
-through `SqliteDb::state_integration_condition_in_tx` and `set_condition` under a
-live Task-step lease, with version, legacy-source and status-epoch fences. They
-write only condition JSON, never the legacy pause/deferral/diagnostic/barrier fields.
-No queue worker acquires Task-write authority through this seam. The lease
-check is the generic step fence's: a claimed step with an expired stored lease
-is refused unless this process still holds the step as active.
+The Task-step worker is the only Task writer. The queue worker owns queue and
+attempt state and enqueues short Task steps; integration owners execute fenced
+Git operations. No production database write transaction spans Git, an owner
+RPC, a check run, or another pooled connection's write.
 
-**A statement writes no event (stage D requirement).** A statement changes no
-Task version and appends no `domain_event`, while incidents and agent wakes key
-off `task.interruption_changed`, which only legacy column writes emit today. So
-an intervention-grade `Deferred` (dirty target, exhausted budget, owner
-required) stated on its own raises nothing. The stage D consumer that states
-such a reason must emit `task.interruption_changed` in the same transaction,
-under the Task step lease.
+`ConditionStatement::Integration` states a typed reason under a live Task-step
+lease, Task version, status entry and legacy-source fences. The seven reasons
+are `waiting`, `owned` (phase), `repair`, `review_required`,
+`candidate_check_failed`, `deferred` (cause/owner/message), and `applied`.
+They contain an opaque attempt identity, never queue rank, lease tokens,
+clocks or physical paths. Full path sets and operational timestamps remain on
+the attempt; a condition samples at most 32 paths. A settled Task retains only
+its integration lineage.
 
-The seven typed `IntegrationReason` variants are Waiting (the attempt only),
-Owned (typed phase), Repair (predecessor attempt, and a bounded sample of the
-conflict paths and of the repair-touched paths), ReviewRequired (authority
-reason), CandidateCheckFailed (check and message), Deferred
-(infrastructure/owner/offline/dirty-target/budget/unresolved-result cause, with
-owner and message) and Applied (result awaiting Task-step consumption).
+A new attempt cannot overwrite another attempt's statement. Superseding a
+released predecessor preserves queue sequence; the Task-step writer clears
+that predecessor's statement and states its successor in one transaction.
+`IntegrationHandedOff` retains lineage while making coder/reviewer admission
+ready. A real execution remains `running`; a real user Hold/block stays primary
+with integration behind it. Self-clearing capacity, placement and environment
+waits still reach their normal clearing action.
 
-What a reason deliberately does not carry, so stage B does not have to take it
-back out:
+Ordinary queue and head waits consume no execution capacity and retain an active
+Project slot. Owner-offline waits quietly park the slot. Dirty target, exhausted
+budget and owner-required conditions are intervention blockers. Their material
+identity uses cause, failure kind, owner and message; queue revisions, attempt
+IDs, paths and timer ticks do not create incidents. A Task step emits a changed
+`task.interruption_changed` with an intervention statement, in the same
+transaction. Statements alone change no Task version or event.
 
-- **No queue position in any form.** Waiting names no earlier attempts: every
-  queue advance would otherwise rewrite every waiter's condition.
-- **No clock.** Deferred says that it is deferred and why. Retry times and
-  deadlines live on the attempt row.
-- **Bounded lineage.** A path set is `IntegrationPaths { count, paths,
-  truncated }`: the size of the whole set and at most 32 of its paths. The full
-  set lives on the attempt row. Unknown conflict paths are an explicit `None`.
-- **A settled Task keeps only the attempt id**, as an `IntegrationLineage`
-  witness; the reason, its paths and its cause are dropped at settlement.
+Admission is level-triggered. A Task in a merge state has a live attempt or a
+typed condition with an owner action. The dispatcher admits a missing/released
+attempt without replaying custom entry hooks. Its compact attempt snapshot also
+repairs missing/wrong condition ownership and stale parked/suspended causes
+under the Task lease, preserving real Holds and blocks. A ready placement whose
+binding changed makes a released attempt eligible for ordinary readmission;
+this also recovers a missed reconnect notification. Corrupt/newer condition
+formats retain the existing quarantine fence rather than being overwritten.
 
-There is no guard expiry or lease metadata in a reason. Stage B owns operational
-state and must bind these identities to its attempts; stage D owns effects and
-Task-step acknowledgments.
+### Queues, attempts and the authoritative target
 
-A typed Integration witness survives every producer, even a full recompute or
-status-epoch change. Legacy, Human, Hooks, Budget, Entry, Execution, Operations
-and Children refresh their own fact families and carry integration. Hold/Release
-carry integration independently of their diagnostic cleanup. Invariant repair
-loads the supported stored witness and remaps only legacy and other durable
-facts. Terminal settlement remains Settled, keeping only the attempt id. A live
-execution always reads as Running, handed off or not: the Task is never
-presented as parked on integration while it runs, the reason stays on the
-evidence, and it is the park again when the run ends. An entry hooks step and a
-retry timer are the Task step's own bookkeeping with nothing running, so an
-integration wait parks over them (Entering and Deferred become
-Parked-on-integration); the step keeps its witness and the timer its legacy
-column, and each is the condition again once integration is cleared. Actual
-coder/reviewer execution or hooks after a Repair, ReviewRequired or
-CandidateCheckFailed handoff owns Running/Entering; those handoffs
-retain the witness rather than pretending the integration worker runs an agent.
-The explicit handoff-ready witness also keeps an idle role ready after its hooks
-or execution finish: it does not revert to a queue-owned wait. Changing phase or attempt resets that handoff; updating repair paths keeps it.
-Hold/Release and all producers carry it.
-Other owners' parks remain primary, with integration secondary.
+A queue is unique by `(repo_id, target_branch)`, not by checkout location.
+Branch validation removes one `refs/heads/` prefix and preserves spelling.
+`resolve_integration_target_in_tx` selects the repository's single explicitly
+default `primary_checkout`. `repo.local_path` is a provisioning hint. It does
+not select a second target, and the Task's placement cannot replace the default.
 
-The material mapping revision is **5**. After upgrade the bounded background
-backfill visits every row, settled ones included, once and records revision
-5. Existing legacy rows acquire the current witnesses; existing integration
-statements survive; corrupt rows are restated and rows a newer build wrote
-remain quarantined rather than overwritten.
-No migration is needed because condition JSON already stores typed statements.
-Legacy equivalence is required for legacy-derived reasons, while integration is
-validated from its statement witness, never inferred from legacy merge markers.
-
-`next_step` returns a named IntegrationWorker wait when integration is the
-primary reason, before ordinary recovery/admission. It never chooses
-paused-integration's `Step::Integrate`, fake Running, fake Entering or a
-capacity-unpark demand. The snapshot carries the condition witness without
-stage-B reads. `next_step::integration_decides` is the one predicate for this,
-shared with reconciliation's admission skip:
-
-- integration primary: the IntegrationWorker park;
-- a real owner blocker primary (a hold, a blocked entry, a failure, a human
-  decision) with integration behind it: the blocker's own park and owner, e.g.
-  User/ReleaseHold. Nothing the scheduler does clears those;
-- a self-clearing primary (a capacity wait, a dispatch refusal, an offline
-  owner, an environment wait, a pending placement refresh or owner-wait expiry)
-  with integration behind it: the Task resolves exactly as it would without the
-  integration reason, so the step that clears the primary runs and admission is
-  observed. Integration stays as a retained secondary reason and becomes the
-  primary, and the IntegrationWorker park, once the primary clears. A capacity
-  park in this case is the capacity reason's own; an integration wait raises
-  none.
-
-The reconciliation sweep counts any integration wait as owned. Custom workflow
-states, including an extra state and a merge state under another name, have the
-same named park, preserving totality.
-
-Ordinary queued/head/path/repair/review/result/infrastructure waits have
-`slot_blocker=false`, keep an **active Project slot**, and consume no execution
-capacity. OwnerOffline parks its Project slot quietly. TargetDirty,
-BudgetExhausted and OwnerRequired are actual intervention blockers and count
-parked. Their material inputs are cause, failure kind, owner and message only.
-Attempt IDs, path sets, phase, rank, queue revision, lease deadline, worker token,
-phase timestamps and retry deadlines/ticks never change incident identity.
-Ordinary progress raises no incident or agent wake. Stage A emits no condition
-events; later Task-step consumers must atomically emit a changed material blocker
-when applying a real owner failure. Pushing remains explicit repository sync.
-
-### Passive integration queues, import and observations (3.2 stage B)
-
-Stage B adds `integration_queue` and `integration_attempt`. Their repository
-methods are storage operations. Since stage D2b the queue worker and the
-`merging` entry hook are their production callers (see "`merging` is the
-integration queue"); the shadow observation of the old merge path is removed.
-
-A queue is unique by `(repo_id, target_branch)`. Branch validation strips one
-`refs/heads/` prefix and preserves exact spelling. Location is never a queue
-key. `resolve_integration_target_in_tx` is the single location-selection seam:
-it reads the repo's explicitly default `repo_location` rows of kind
-`primary_checkout`. Exactly one ready location selects the checkout, regardless
-of server/daemon ownership or `repo.local_path`. The latter is a provisioning
-hint, not a second target setting. Task placement and mere daemon presence never
-choose a queue target. The witness stores location/owner/runtime/generation,
-never a path or token.
-
-Today's embedded Task merge uses the selected workspace location's checkout;
-a daemon merge uses the verified primary checkout supplied to that owner. Those
-paths do not veto a checkout because `local_path` disagrees. The table below
-covers a Task using the configured default location. A Task already placed at a
-non-default checkout still follows its existing backend path in this passive
-stage; routing such delivery to the authoritative target remains activation work.
-
-How the resolver decides (queue state, `target_location_id`, typed reason):
-
-| Repo configuration | Result |
+| Default checkout configuration | Queue resolution |
 |---|---|
-| Server only: `repo.local_path` set, one default `primary_checkout` server location at that path, `ready` | `open`, that location |
-| Daemon only: no `local_path`, one default `primary_checkout` daemon location, `ready` | `open`, that location |
-| Both, the server checkout is the default (daemon copies are not default) | `open`, the server location; a non-default copy never selects |
-| Both, the default is a daemon location while `local_path` is set | `open`, the daemon location |
-| `local_path` set, default server location at a different path | `open`, the default server location |
-| No default `primary_checkout` location (including a pre-location legacy repo with no `local_path`) | `suspended`, none, `target_unconfigured` |
-| Two or more default `primary_checkout` locations | `suspended`, none, `target_ambiguous` |
-| The one configured location is not `ready` | `suspended`, that location, `target_unavailable` |
+| Exactly one ready default primary checkout, server or daemon | Open on that location |
+| No default primary checkout | Suspended, `target_unconfigured` |
+| More than one default primary checkout | Suspended, `target_ambiguous` |
+| The configured default is not ready | Suspended, `target_unavailable` |
 
-Creation records a snapshot. Claim refreshes the default location and its
-owner/generation in the same queue-revision CAS transaction. A repaired
-suspended queue can reopen at claim. An unavailable/unconfigured/ambiguous
-resolution is committed as a suspension without advancing the fence, then the
-claim returns a version conflict. A live lease or stale revision cannot refresh
-a queue. An uncertain attempt retains its original intent even if the queue's
-configured target changes; takeover transfers reconciliation ownership and
-cannot repeat that effect.
+Admission pins the implementation execution's repository and workspace, even
+if the Project later selects another primary repository. It records the
+placement, owner kind, daemon, runtime, placement generation and reviewed commit.
+A reconnect/verified placement recovery or the owner's Retry compares that
+binding with the current ready placement. A released attempt with no unsettled
+effect is superseded with its queue sequence and reviewed commit retained.
+Reserved heads and running/uncertain effects cannot be superseded; their frozen
+owner must settle them first.
 
-**Deletion.** In this passive stage the queue tables are evidence, not
-authority, and they restrict no deletion:
+Claims refresh the target in the queue-revision CAS transaction. A live lease
+or stale revision cannot refresh it. One head holds a target slot, including
+while it waits for CI or Task-step authorization. Expired process leases permit
+observation takeover; they never free an uncertain logical head. A takeover
+advances `fence_generation`, stamps the head, drops an old ready permit, and
+reconciles in-flight effects. Each new round receives another generation.
 
-- deleting a Repo, or the Project that owns it, removes that repo's queues and
-  their attempts by `ON DELETE CASCADE` (`repo` → `integration_queue` →
-  `integration_attempt`), the same rule the other repo-owned tables in this
-  schema use. Project deletion also removes import evidence that never resolved
-  a queue (`queue_id IS NULL`), which has no parent to cascade from;
-- deleting a repo location (`RepoLocationRepo::delete`) nulls
-  `target_location_id` and `target_owner_json` and leaves the queue `suspended`
-  with `target_unconfigured` in the same transaction; members and history stay.
-  The foreign key itself is `ON DELETE SET NULL`;
-- deleting a Task nulls `task_id` and keeps `task_ref`/`project_ref`;
-  workspace, placement, execution, location, workflow-reference and
-  predecessor foreign keys are `SET NULL` beside their opaque refs;
-- removing a machine tombstones the daemon and deletes none of these rows.
+The additive queue/attempt and activation migrations retain user data. Their
+SQL is authoritative for fields and indexes in `crates/db/migrations/`;
+repository methods live in `db::integration_queue`. Updates use revisions and
+the transition graph. There is one current attempt per Task and one current
+reservation per queue sequence. Successors retain sequence, while eligible
+position is computed by the read surface. Nullable foreign keys preserve
+opaque Task/project/workspace/execution/location refs after cleanup. Task
+removal keeps history; repository/Project deletion cascades its owned rows.
 
-**Stage D requirement (owner decision needed).** "Deletion is refused while an
-integration effect is uncertain" is NOT implemented here. When the queue starts
-driving Git, stage D must decide explicitly whether a Repo, repo location or
-Project with an unresolved (`reconciling`, `ff_inflight`, quarantined-head or
-running/uncertain-operation) attempt may be deleted, enforce it in the service
-delete paths with a typed refusal the owner can act on, and record the public
-break in the changelog. It must not come back as a silent foreign-key
-`RESTRICT`.
+Attempts store candidate/original/target/integrated SHAs, predecessor lineage,
+full conflict/repair/guard paths, owner binding, effect intent/receipts,
+operation state, permit/acknowledgment, deadlines, failure, import evidence and
+phase timings. Guard paths are retained data: path-guard enforcement is not
+implemented. `path_wait` is reserved storage, not a production path guard.
 
-The migration is additive SQL only: two tables and their indexes, no data DML,
-no logic triggers, no changes to historical migrations. Delivery FKs are
-nullable with separate opaque refs, so workspace/execution cleanup cannot erase
-recorded identity. Columns that nothing in stage B reads or writes were left
-out; a later stage adds each one it needs with `ALTER TABLE ... ADD COLUMN`
-(all are nullable or constant-default, so no table rebuild). `daemon_id`/`runtime_id` and contract/Review/carry identifiers
-are retained opaque witnesses rather than cascading foreign keys.
+### Startup import and legacy continuations
 
-`integration_queue` columns (the SQL is authoritative):
+Startup runs the bounded importer before the Task-step and queue workers.
+`import_integration_pass` examines at most 100 Tasks per transaction, retaining
+at most 64 rows per history source plus a sentinel, and at most 65,536 source
+characters before materialization. Oversized sources keep their original length
+and a marked prefix and require complete evidence. A per-Task savepoint retains
+an unreadable row as quarantine and lets the pass continue.
 
-| Column | SQL type / constraints |
+Each `import:<task>:<epoch>` identity freezes the classification, missing facts
+and source snapshot in `import_source_json`. The pass writes queue/attempt rows
+only: no Task, Review, condition, budget, event or Git mutation. Classification
+uses workflow roles and actual typed bridges, not bridge-looking prose or a
+review-pass timestamp alone.
+
+| Priority | Retained legacy shape and continuation |
 |---|---|
-| `id` | `TEXT PRIMARY KEY` |
-| `repo_id` | `TEXT NOT NULL REFERENCES repo(id) ON DELETE CASCADE` |
-| `target_branch` | `TEXT NOT NULL` |
-| `target_location_id` | `TEXT REFERENCES repo_location(id) ON DELETE SET NULL` |
-| `target_owner_json` | `TEXT CHECK(target_owner_json IS NULL OR json_valid(target_owner_json))` |
-| `next_seq` | `INTEGER NOT NULL DEFAULT 1 CHECK(next_seq >= 1)` |
-| `head_attempt_id` | `TEXT REFERENCES integration_attempt(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED` |
-| `lease_owner` | `TEXT` |
-| `lease_until` | `TEXT` |
-| `fence_generation` | `INTEGER NOT NULL DEFAULT 0 CHECK(fence_generation >= 0)` |
-| `state` | `TEXT NOT NULL CHECK(state IN ('open','suspended','quarantined','closed'))` |
-| `available_at` | `TEXT` |
-| `updated_at` | `TEXT NOT NULL` |
-| `created_at` | `TEXT NOT NULL` |
-| `revision` | `INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)` |
-| `last_error_kind` | `TEXT CHECK(last_error_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
-| `last_error` | `TEXT CHECK(length(CAST(last_error AS BLOB)) <= 4096)` |
+| 1 | Recorded exact Done / merge intent needing ancestry or owner proof |
+| 2 | Original remote operation still unresolved |
+| 3 | Terminal history with no possible legacy effect |
+| 4 | Pending/claimed merge hooks, needing candidate facts |
+| 5 | Rebase started without an outcome |
+| 6 | Clean rebase not yet checked/carried |
+| 7 | Conflict already handed to its coder |
+| 8 | Merge-fix follow-up continuation |
+| 9 | Persisted review carry |
+| 10–12 | Current/resumed/obsolete paused-integration markers |
+| 13 | Hold, failure, human or entry blocker |
+| 14 | Future retry or infrastructure interruption |
+| 15 | Offline owner, upgrade or remote-cancellation exclusion |
+| 16 | Removed/lost workspace owner, needing candidate availability |
+| 17 | Accepted owner command or sticky disposition |
+| 18 | Passed marker and pinned delivery with no runnable hook |
+| 19 | Dirty/conflict repair already in progress |
+| 20 | Unknown, malformed, contradictory or incomplete evidence |
 
-`integration_attempt` columns (the SQL is authoritative):
+Already-reported done Tasks and queue-owned entries are not scanned repeatedly.
+A cancelled Task's terminal shadow attempt suppresses a redundant import only
+when no legacy merge-intent checkpoint remains. A surviving intent is retained
+conservatively even if storage cannot prove whether it landed. Its frozen
+snapshot survives hook-step pruning; cancellation does not erase the only
+possible-landed record.
 
-| Column | SQL type / constraints |
+Current imported/shadow attempts receive an identity-fenced `import_continue`
+step once. Classification is committed before that step can execute. A queued
+pre-queue member is claimable only after continuation is acknowledged and no
+live legacy merge hook owns it. A suspended older hook completes its recorded
+rebase/read-only outcome and hands over through the same admission function.
+There are no shadow observation writers in the active merge path.
+
+The continuation binds a runnable candidate, states a wait/owner action, or
+reports a landed result after the target-owner proof. A held/offline/lost-owner
+row is not readmitted merely because its candidate was unnamed. Offline P15
+resumes on verified reconnect; Retry asks again, and removal of a permanently
+lost machine settles its old operation. An imported unknown operation with no
+fenced intent can be explicitly settled by Retry: Git then decides whether the
+candidate is already contained or must queue again. Completed reporting is
+idempotent across restart; a pruned continuation is enqueued again at startup.
+
+### Fenced owners and object transfer
+
+`services::integration_ports` assembles real owner, facts, location,
+object-transfer and Task-step ports. `TaskService::compose_integration` gives
+the server and Solo runtime their shared supervised worker. The former
+`MergeService::merge`, `merge_workspace`/`merge_inner`, `WorkspaceBackend::merge`
+and `MergeSpec` interfaces are deleted. `drain` and its synchronous queue
+pumping compile only with test support. The remaining review-authority guard is
+a test fixture; production authorizes in a short transaction.
+
+An owner checks queue/attempt/generation/lease fences and the performing owner
+before admitting an effect. The intent is committed before Git, and a durable
+receipt records the result afterwards. A rebase off the target machine records
+that performing owner in `witness.effect_owner`; it cannot impersonate the
+queue's default-checkout owner. A repeated identical request replays its
+receipt. An unknown started request is reconciled, never repeated blindly.
+
+Server effects use keyed checkout/workspace locks and bounded process groups.
+Daemon effects use the authenticated runtime, verified location, announced queue
+fence, workspace generation and owner journal. `workspace.merge` remains the
+queue's reviewed fast-forward message, so deleting the old Rust API removed no
+wire message and requires no daemon revision bump. An owner may reconcile its
+frozen request after observation ownership changes, but this grants no new
+effect authority.
+
+| Placement relative to the default checkout | Delivery |
 |---|---|
-| `id` | `TEXT PRIMARY KEY` |
-| `queue_id` | `TEXT REFERENCES integration_queue(id) ON DELETE CASCADE` |
-| `task_id` | `TEXT REFERENCES task(id) ON DELETE SET NULL` |
-| `task_ref` | `TEXT NOT NULL` |
-| `project_ref` | `TEXT NOT NULL` |
-| `queue_seq` | `INTEGER NOT NULL CHECK(queue_seq >= 1)` |
-| `attempt_number` | `INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number >= 1)` |
-| `predecessor_attempt_id` | `TEXT REFERENCES integration_attempt(id) ON DELETE SET NULL` |
-| `current` | `INTEGER NOT NULL CHECK(current IN (0,1))` |
-| `admission_key` | `TEXT NOT NULL` |
-| `expected_status` | `TEXT NOT NULL` |
-| `expected_epoch` | `INTEGER NOT NULL CHECK(expected_epoch >= 0)` |
-| `observed_task_version` | `INTEGER NOT NULL` |
-| `workflow_ref_id` | `TEXT REFERENCES task_step_workflow(id) ON DELETE SET NULL` |
-| `enqueued_at` | `TEXT NOT NULL` |
-| `execution_id` | `TEXT REFERENCES execution(id) ON DELETE SET NULL` |
-| `execution_ref` | `TEXT` |
-| `workspace_id` | `TEXT REFERENCES workspace(id) ON DELETE SET NULL` |
-| `workspace_ref` | `TEXT` |
-| `placement_id` | `TEXT REFERENCES workspace_placement(id) ON DELETE SET NULL` |
-| `placement_ref` | `TEXT` |
-| `repo_location_id` | `TEXT REFERENCES repo_location(id) ON DELETE SET NULL` |
-| `repo_location_ref` | `TEXT` |
-| `owner_kind` | `TEXT CHECK(owner_kind IN ('server','daemon'))` |
-| `daemon_id` | `TEXT` |
-| `runtime_id` | `TEXT` |
-| `placement_generation` | `INTEGER` |
-| `original_candidate_sha` | `TEXT` |
-| `candidate_sha` | `TEXT` |
-| `target_tip_sha` | `TEXT` |
-| `contract_execution_id` | `TEXT` |
-| `review_id` | `TEXT` |
-| `reviewed_paths_json` | `TEXT CHECK(reviewed_paths_json IS NULL OR json_valid(reviewed_paths_json))` |
-| `changed_paths_json` | `TEXT CHECK(changed_paths_json IS NULL OR json_valid(changed_paths_json))` |
-| `conflict_paths_json` | `TEXT CHECK(conflict_paths_json IS NULL OR json_valid(conflict_paths_json))` |
-| `repair_paths_json` | `TEXT CHECK(repair_paths_json IS NULL OR json_valid(repair_paths_json))` |
-| `guard_paths_json` | `TEXT CHECK(guard_paths_json IS NULL OR json_valid(guard_paths_json))` |
-| `state` | `TEXT NOT NULL CHECK(state IN ('queued','path_wait','validating','rebasing','checking','awaiting_task_step','ready_ff','ff_inflight','reconciling','applied','ejected','needs_review','parked','quarantined','completed','cancelled','superseded'))` |
-| `resume_state` | `TEXT CHECK(resume_state IN ('queued','path_wait','validating','rebasing','checking','awaiting_task_step','ready_ff','ff_inflight','reconciling','applied','ejected','needs_review','parked','quarantined','completed','cancelled','superseded'))` |
-| `failure_kind` | `TEXT CHECK(failure_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
-| `failure_message` | `TEXT CHECK(length(CAST(failure_message AS BLOB)) <= 4096)` |
-| `slot_generation` | `INTEGER NOT NULL DEFAULT 0 CHECK(slot_generation >= 0)` |
-| `permit_json` | `TEXT CHECK(permit_json IS NULL OR json_valid(permit_json))` |
-| `operation_kind` | `TEXT CHECK(operation_kind IN ('merge','rebase','check','fast_forward','reconcile'))` |
-| `operation_id` | `TEXT` |
-| `owner_fence_json` (C2) | nullable owner/queue/attempt fence JSON, capped at 16 KiB |
-| `effect_intent_json` (C2) | nullable frozen request + digest JSON, capped at 64 KiB |
-| `effect_receipts_json` (C2) | non-null JSON array, default `[]`, capped at 1 MiB |
-| `current_operation_state` | `TEXT CHECK(current_operation_state IN ('pending','running','succeeded','failed','uncertain','acknowledged'))` |
-| `operation_receipts_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(operation_receipts_json))` |
-| `checks_json` | `TEXT CHECK(checks_json IS NULL OR json_valid(checks_json))` |
-| `checks_commit_sha` | `TEXT` |
-| `deadline` | `TEXT` |
-| `effect_seq` | `INTEGER NOT NULL DEFAULT 0 CHECK(effect_seq >= 0)` |
-| `effect_ack_json` | `TEXT CHECK(effect_ack_json IS NULL OR json_valid(effect_ack_json))` |
-| `acknowledged_at` | `TEXT` |
-| `integrated_before_sha` | `TEXT` |
-| `integrated_sha` | `TEXT` |
-| `available_at` | `TEXT` |
-| `last_error_kind` | `TEXT CHECK(last_error_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
-| `last_error` | `TEXT CHECK(length(CAST(last_error AS BLOB)) <= 4096)` |
-| `started_at` | `TEXT` |
-| `updated_at` | `TEXT NOT NULL` |
-| `created_at` | `TEXT NOT NULL` |
-| `completed_at` | `TEXT` |
-| `import_source_json` | `TEXT CHECK(import_source_json IS NULL OR json_valid(import_source_json))` |
-| `observations_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(observations_json) AND length(CAST(observations_json AS BLOB)) <= 1048576)` |
-| `observations_dropped` | `INTEGER NOT NULL DEFAULT 0 CHECK(observations_dropped >= 0)` |
-| `revision` | `INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)` |
+| Same checkout/object store | Read/rebase/fast-forward locally on its owner |
+| Another clone on the same owner | Import the target tip into an inbound claim ref; rebase there; export the exact candidate into the default checkout's outbound ref |
+| Different owners | Transfer the same bounded bundles through both owner ports; rebase on the Task owner and fast-forward on the default-checkout owner |
 
-Keys: queue `UNIQUE(repo_id,target_branch)`; attempts
-`UNIQUE(queue_id,queue_seq,attempt_number)` and
-`UNIQUE(queue_id,admission_key)`. The orphan admission key is separately unique.
+Transfers are keyed by attempt/generation/direction, capped at 256 MiB, and
+bind exact requested objects. Missing/wrong objects refuse the effect. The
+Task's non-default target branch is not written. Claim refs and staging files
+are released after the slot; startup/reconnect sweep transfer leftovers.
+The owner journals are acknowledged only after the server has retained their
+receipt. Retention never discards an unsettled intent/receipt or evidence
+pinning a quarantined queue.
 
-Indexes:
+### The active head pipeline
 
-- `CREATE INDEX integration_queue_ready ON integration_queue(state,available_at)`
-- `CREATE INDEX integration_queue_expired_lease ON integration_queue(lease_until) WHERE lease_until IS NOT NULL`
-- `CREATE INDEX integration_queue_location ON integration_queue(target_location_id)`
-- `CREATE UNIQUE INDEX integration_attempt_current_task ON integration_attempt(task_ref) WHERE current=1`
-- `CREATE UNIQUE INDEX integration_attempt_current_seq ON integration_attempt(queue_id,queue_seq) WHERE current=1`
-- `CREATE UNIQUE INDEX integration_attempt_orphan_admission ON integration_attempt(admission_key) WHERE queue_id IS NULL`
-- `CREATE INDEX integration_attempt_members ON integration_attempt(queue_id,state,available_at,queue_seq) WHERE current=1`
-- `CREATE INDEX integration_attempt_history ON integration_attempt(task_ref,created_at DESC)`
-- `CREATE INDEX integration_attempt_reconnect ON integration_attempt(daemon_id,current_operation_state)`
-- `CREATE UNIQUE INDEX integration_attempt_operation ON integration_attempt(operation_id) WHERE operation_id IS NOT NULL`
-- `CREATE INDEX integration_attempt_retention ON integration_attempt(state,completed_at)`
-- `CREATE INDEX integration_attempt_import ON integration_attempt(task_ref,expected_epoch) WHERE import_source_json IS NOT NULL`
-- `CREATE INDEX integration_attempt_import_disposition ON integration_attempt(json_extract(import_source_json,'$.disposition')) WHERE import_source_json IS NOT NULL`
+The supervised sweep runs on admission/answer notifications and every 30 seconds.
+At most 16 queues have drivers; claims rotate for fairness. It cancels released
+members, makes due parks runnable, takes expired heads over, refreshes suspended
+targets and revisits quarantine. One slow head/check does not hold another
+queue's slot or a database writer. Members behind a head keep their reservation.
 
-Nullable JSON path sets distinguish an unknown set (`NULL`) from a known empty
-set (`[]`). They keep exact repo-relative UTF-8 identity, including both rename
-endpoints, case and Unicode spelling. Unsupported encodings and invalid path
-shapes quarantine imports; no lossy normalization grants eligibility. Guards
-have no expiry column. Repair-touched paths have their own full set; conflict
-and guard sets are distinct. Stage E must implement their union, overlap and
-explicit closure rules. Queue sequence is a reservation, not visible eligible
-rank; successors atomically supersede their predecessor and keep its sequence.
-Only one current attempt per Task and one current attempt per queue sequence can
-exist. Terminal attempts are not current. Imported orphan evidence has no queue
-and no current membership.
-
-Claims reserve one head in a `BEGIN IMMEDIATE` transaction. An open queue without a live process lease can be claimed. A quarantined queue
-can only transfer ownership of its existing reconciling/in-flight head, never
-select another member. Takeover retains the reserved head,
-advances `fence_generation`, stamps the head's `slot_generation` and advances its
-revision. A ready permit is invalidated on takeover and returns to Task-step
-authorization; in-flight work returns to reconciliation of its original
-operation. Renewal requires queue revision, owner and fencing generation. Attempt
-updates require revision and the transition graph; ReadyFf/FF-inflight data must bind candidate, target, Task epoch and slot generation in its permit, and configured check evidence must name the same candidate. Stale snapshots return
-`DbError::VersionConflict`. These methods write no Task version. Expired process
-leases never imply that an uncertain logical head is free. No production caller
-claims these leases in Stage B.
-
-The attempt transition table is data (`INTEGRATION_TRANSITIONS`), with an exit
-for every non-terminal state and none for terminals. Self-state updates can
-record facts on non-terminal rows; terminal machine state cannot transition.
-Critical and uncertain states cannot be cancelled merely by a timeout.
-
-| From | Allowed next states |
+| Head state | Action and exit |
 |---|---|
-| `queued` | `path_wait`, `validating`, `parked`, `cancelled`, `superseded` |
-| `path_wait` | `queued`, `validating`, `parked`, `cancelled`, `superseded` |
-| `validating` | `applied`, `needs_review`, `parked`, `rebasing`, `awaiting_task_step`, `cancelled`, `superseded` |
-| `rebasing` | `checking`, `ejected`, `parked`, `reconciling`, `cancelled` |
-| `checking` | `awaiting_task_step`, `ejected`, `parked`, `cancelled` |
-| `awaiting_task_step` | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
-| `ready_ff` | `awaiting_task_step`, `ff_inflight`, `needs_review`, `parked`, `cancelled` |
-| `ff_inflight` | `applied`, `rebasing`, `reconciling` |
-| `reconciling` | `applied`, `rebasing`, `ready_ff`, `queued` (effect settled, nothing landed), `parked`, `quarantined` |
-| `applied` | `completed` |
-| `ejected` | `needs_review`, `parked`, `cancelled`, `superseded` |
-| `needs_review` | `parked`, `cancelled`, `superseded` |
-| `parked` | `queued`, `rebasing`, `checking`, `needs_review`, `ejected`, `cancelled`, `superseded` |
-| `quarantined` | `reconciling`, `parked`, `queued`, `superseded` |
-| `completed` | None (terminal) |
-| `cancelled` | None (terminal) |
-| `superseded` | None (terminal) |
+| `queued` / `validating` | Count/start a bounded round; read gate, candidate and target facts. Already contained → applied after proof; unchanged target → authorization; changed target → rebase; changed candidate → review |
+| `rebasing` | Fenced owner rebase, or adoption of its existing receipt. Clean → checking; conflict → coder handoff; unknown → reconciling |
+| `checking` | Short `request_check` step asks the durable runner. Passed result → authorization/permit; red → merge fix; infrastructure → bounded retry/owner wait |
+| `awaiting_task_step` | `settle` re-reads review authority, carry eligibility, Task gate and owner-command ordering, then writes an exact permit or refusal |
+| `ready_ff` | Reconfirm candidate and outbound objects; permit/cancel CAS; begin fast-forward |
+| `ff_inflight` | Owner fast-forwards the exact candidate by ref CAS. Success → applied; external target movement → new round; unknown → reconciling |
+| `reconciling` / `quarantined` | Ask the frozen effect owner for receipt/facts. Proven applied → result; proven not performed → queue/rebase; unknown → typed unresolved-result wait with timer and owner action |
+| `applied` | Ready the protected result step; wait for its proof/report acknowledgment, then completed and release |
+| `ejected` / `needs_review` | Released; Task step hands to coder/reviewer or an owner action |
+| `parked` | Released; resume at its timer or verified gate/owner recovery, or wait for the offered owner action |
+| `completed` / `cancelled` / `superseded` | Terminal history |
 
-`available_at` and `deadline` are optional application timestamps; there is no
-SQL timeout default. The later head pipeline must read its timeout setting
-(default 1800 seconds). The tables do not charge budgets: a normal stale-base
-rebase must cost nothing, external target movement must be charged once by its
-Task-step consumer, and ordinary waiters keep their active Project slot. Stage A
-already owns the condition projection; queue positions, clocks, leases and full
-path sets stay out of it.
+The first rebase for contention with an earlier queue member is a free
+`queue_member` lost race. Movement while the slot is held is `external`; its
+sixth occurrence parks the attempt. The head is bounded to nine rounds. The
+first-rebase observation cannot distinguish an external push made before claim
+from a previous queue member, so it remains a queue-member race.
 
-**Bounded import.** `SqliteDb::import_integration_pass` imports at most 100 Tasks
-per call in one transaction, with bounded history queries (64 rows per source,
-plus one sentinel), and caps each source text at 65,536 characters before materialization. Oversized sources retain their original byte length and a marked prefix and require `complete_legacy_evidence`. Its unique `import:<Task>:<status_epoch>` admission records
-are the durable progress register. Committed entries are excluded on the next
-pass; a crash rolls back the whole unfinished slice. It orders by current entry
-time, transition identity and Task ID and pins repository provenance from the
-implementation execution's workspace, including a coordination root's relevant
-child execution. It never substitutes the Project's current primary repo for
-attempted work. It visits `merging`/`merge_failed` and relevant `review`, `done`
-and `cancelled` history. This storage pass is callable but is not scheduled or
-activated at startup in Stage B; cutover must drive it before queue consumption.
+Defaults: validation 30 s, owner rebase 120 s, CI wall bound 1800 s plus 300 s
+waiting slack, deciding-step wait 300 s, permit lifetime 120 s, reviewed
+fast-forward owner bound 30 s. Lease is 60 s, renewed after 15 s; waiting drivers
+poll every second. Reconciliation asks every 60 s. Infrastructure retries are
+30 s, 2 min and 10 min, then a typed owner wait. Quiet gate/offline/target-ready
+waits double to a ten-minute maximum, with no counted Task retry. A red check
+and a dirty Task checkout use the pre-queue merge-fix/rejection budget; a dirty
+default checkout is an owner intervention with no Task retry charge.
 
-Each row freezes the priority, disposition, named missing facts and raw source
-JSON in `import_source_json`. Malformed JSON, unknown typed bridges, unsupported
-paths, missing execution/target and contradictory proof sources are retained as
-quarantined rows. The importer writes only the two new tables: no Task, step,
-condition, Review, carry, event, budget or Git effect. It does not redirect any
-legacy hook. Actual Git/daemon facts unavailable to this pass are `needs_fact`,
-never invented approvals, CI results or ancestry. An unresolved operation pins
-a quarantined head and retains its original identity; a second uncertain head
-is separately quarantined. Already current shadow membership is preserved and
-its import records the need to resolve `existing_attempt_identity`.
+Cancel and fast-forward admission are CAS writes on the same attempt. Before
+`ff_inflight`, Cancel can win even after a permit is written. From the permit
+transaction onward a pre-enqueued protected result step prevents a later owner
+command overtaking the result; an expired/revoked permit releases that step.
+An already-admitted fast-forward is reconciled rather than guessed cancelled.
+Shutdown awaits an admitted effect's receipt; takeover retains uncertainty.
 
-| Priority | Storage disposition and evidence |
+Timings accumulate per attempt: queue, validation, transfer, rebase, check
+(slot/run or skip), Task-step wait, fast-forward and total head time. Lost races
+retain their newest 32 entries and fold older counts. Worker park history keeps
+its newest 64 entries. Neither is a Task condition or budget ledger.
+
+### Task steps, CI identity and Review evidence
+
+Integration requests are keyed by `(attempt, effect_seq, action)` and carry the
+Task entry/generation fences. Their acknowledgment and Task effect commit
+atomically. Deciding steps are enqueued before the corresponding attempt
+transition; a step that arrives early retries, and stale generation/sequence
+or Task entry writes nothing.
+
+| Step | Task effect / answer |
 |---|---|
-| 1 | Certified persisted Done → `applied` (`completed` for a done Task), preserving candidate and integrated result separately, including manual merge commits. Intent without success needs `candidate_ancestry`; incomplete owner receipts need `validated_owner_receipt`. Cancelled/deleted/archived success needs original-operation reconciliation. |
-| 2 | Unresolved retained merge intent or running remote operation → `reconciling`, `needs_fact: original_remote_operation_result`; quarantine and pin the queue head. |
-| 3 | Terminal/deleted/archived without possible effect → completed/cancelled/superseded history, not current. Subtasks acquire no independent queue. |
-| 4 | Current pending/claimed hook and its frozen input/effects → `needs_fact: legacy_hook_continuation`; preserve its recorded phase and all blockers, with no redirect. |
-| 5 | Rebase target without outcome → parked with rebasing resume and `needs_fact: git_rebase_in_progress_and_conflict_paths`; do not test ancestry before active-rebase recovery. |
-| 6 | Rebased outcome or clean mechanical bridge → parked with checking resume and `needs_fact: rebased_head_and_bound_checks`; no invented coder or reused CI. |
-| 7 | Typed conflict outcome/handoff in merge_failed → ejected (parked for held/exhausted repair), known conflict/guard paths retained; `needs_fact: current_retry_window_conflict_and_repair_paths`. Retry resets bound the typed bridge union. |
-| 8 | ReviewRefresh or cleared authority without mechanical proof → needs_review; no carry grant. |
-| 9 | Stored carry → parked with validating resume and `needs_fact: carry_head_base_and_check_evidence`; no approval is inferred from the row alone. |
-| 10 | Matching paused-integration marker and paused Project → parked with the exact source/generation retained. |
-| 11 | Matching marker, resumed Project → parked with queued resume and `needs_fact: candidate_head_and_review_authority`. |
-| 12 | Marker names another entry → obsolete evidence with queued resume; current candidate/authority still needs a fact. |
-| 13 | Existing blocked/failed/manual/human/entry blocker → parked; every source reason is preserved. |
-| 14 | Future retry or CI infrastructure interruption → parked with deadline; an incompatible target is obsolete evidence. |
-| 15 | Owner wait/disconnected placement/upgrade/pending remote cancellation → parked owner exclusion. Uncertain operations were handled first. |
-| 16 | Removed owner/machine_removed workspace/lost daemon handle → parked with `needs_fact: candidate_object_availability`. |
-| 17 | Accepted queued recovery or sticky disposition → parked, preserving owner command ordering. |
-| 18 | Root merging with passed marker, pinned delivery, no hook or blocker → parked with queued resume and `needs_fact: candidate_head_and_review_authority`; the timestamp alone grants no authority. |
-| 19 | Ordinary dirty/conflict repair → ejected, workspace/target repair → parked; no manufactured conflict paths or carry provenance. |
-| 20 | Unknown/malformed/contradictory input → quarantined, never dropped. A history source exceeding the bound needs `complete_legacy_evidence`. |
-
-Proof disagreement is checked before a lower-priority blocker can hide it. Owner
-receipts must match the frozen operation, location, owner and generation; a
-reviewed exact object must match its Done result, while an explicitly manual
-merge may integrate a merge commit. A generation-only pause marker grants no
-resume. Bridge-looking prose grants no mechanical lineage.
-
-**Shadow observations.** The existing Task-step owner records typed, idempotent
-observations on current membership. `record_hook_effect` stores admission,
-merge and rebase observations in the same transaction as the legacy checkpoint.
-MergeService buffers the exact target tip where it already reads it (embedded
-under its authority lock, daemon from its existing target precondition); this
-adds no Git command or database transaction during Git work. The buffer is
-scoped to the Task step and is flushed with the existing hook result.
-`update_status_inner` and `update_status_with_review_authority_inner` observe
-actual CI exit codes, and carried authority's candidate/base/changed paths, in
-their existing Review transaction. `finish_step_in_tx` records terminal done or
-cancellation in the existing result transaction. Ordinary observations never
-advance a runnable attempt phase; only resolved terminal Task results detach membership
-into terminal history. A terminal legacy Task does not release an uncertain
-operation or its quarantined head. Unobserved fields remain null; notably Done.before_sha is
-not re-labelled as a target-tip fact.
-
-An attempt created by the shadow stays `queued` and current while its Task
-lives; it is closed straight to `completed`/`cancelled` when the Task settles.
-That close is the one write that does not go through
-`INTEGRATION_TRANSITIONS`: the table governs the future worker
-(`transition_integration_attempt`), not this mirror of the legacy result.
-
-Recording is one SQL statement per observation: a JSON append on the Task's
-current attempt, found through the `integration_attempt_current_task` partial
-unique index, with no read of the row into Rust and no rewrite of its other
-columns. `observations_json` is bounded: an attempt keeps its first observation
-and the 15 most recent, counts the rest in `observations_dropped`, keeps at
-most 256 paths per list (`paths_truncated`) and at most 16 KiB per observation
-(1 MiB per row, by CHECK). Replay of a retained identity is a no-op. Step
-settlement, which every step of every Task passes, pays exactly one indexed
-statement that matches nothing unless the Task is terminal and has a current
-attempt. Only the first merge intent of a merge entry needs several statements
-(create-or-get queue, admit attempt) and they run inside a savepoint.
-
-A recording failure never fails or rolls back the real result. A failed single
-statement undoes only itself (SQLite statement atomicity); a failed admission
-rolls back to its savepoint. Each site has already written in its transaction,
-so it holds the write lock and a recording statement cannot wait on another
-writer. Failures are counted in one process-wide counter: the first and every
-power of two is a warning, the rest are debug lines; no identity set is kept.
-The shadow emits no event, states no condition, schedules no worker, changes
-no ordering/retry timing/budget and drives no Git or CI. The target-read
-buffer is one slot in the Task step's task-local scope: created empty by
-`in_task_step`, keyed by step id and hook index, dropped with the step.
-
-**Stage B shadow rows are disposable.** The importer has no production caller.
-Before stage D's first import, it must discard stage B's unfenced shadow rows or
-version its admission key. Once an owner gate has written an intent or receipt,
-that attempt is retained authority and must survive this discard; a blanket
-`DELETE FROM integration_attempt; DELETE FROM integration_queue;` is only valid
-when no C2 owner effects have been admitted. Import progress
-is the existence of an `import:<Task>:<status_epoch>` row, so a changed
-classification is not re-applied over existing rows; a current shadow attempt
-makes the importer retain its row non-current with
-`existing_attempt_identity`; and mere import/read operations keep the queue target snapshot and any
-quarantine pin. Claim refreshes that snapshot as described above.
-
-Operator status adds only read-only counts by queue/current-attempt state and
-quarantined imports; there are no queue REST/MCP/web/CLI reads yet.
-
-
-### Integration effect primitives and Task-step recorders (3.2 stage C, part 1)
-
-`services::integration_effects` contains the Git/command/socket effect adapters and
-read-only facts used by today's Task-step consumer. It accepts an explicit
-`EffectWorkspace` witness (owner, workspace, placement, generation and handle),
-Git paths/branches and candidate/target objects, command purpose/environment,
-and caller-supplied command/transport deadlines. Its functions receive no
-repository, database, event publisher or Task service. `RpcExchange` receives
-only its selected `DaemonConnection`; connection lookup
-and protocol admission belong to the recorder. Replacement/unregistration marks
-the old connection stale and fails its pending replies. `GitFacts` is
-implemented by `ResolvedWorkspace`, whose daemon path sends the
-owner inspection through the workspace client. The witness is input
-provenance; the current consumers still perform placement and review authority
-checks. The primitives do not verify the witness themselves, so today's
-Task-step path behaves as before; the durable owner gate described below
-verifies placement, HEAD and target before it calls them.
-
-The split is phased to preserve the existing transaction and read order:
-
-- `merge_cleanliness`, `expected_target`, `merge_heads`, `target_tip` and
-  `validate_merge_candidate` collect/classify Git facts. The consumer records
-  the candidate's execution `before_sha` before taking the local review guard,
-  buffers stage B's target observation at the same target read, then calls
-  `apply_merge`. Reviewed integration fast-forwards the exact approved object;
-  manual integration still permits a merge commit. `merge_result` collects the
-  resulting SHA or reads conflict paths and aborts after the guard is released,
-  as before. An exact-object mismatch retains the original guard-drop path.
-  `MergeService::record_merge_execution_evidence` owns execution writes,
-  including their existing Project list-revision and usage-ledger triggers.
-- `rebase` moves the existing dirty/stopped-rebase checks, text-marker
-  materialization and unsupported-conflict abort behavior. `recover_rebase`
-  checks for an interrupted rebase before ancestry;
-  `finish_rebase_recovery` preserves the union and order of previously
-  committed marker paths. Their `GitFacts` port exposes only a Git query. The hook
-  consumer still reads/writes `rebase_target` and `rebase_outcome`, records
-  Forge-established HEAD evidence, and applies comments, typed bridges and
-  Task results. The existing owner HEAD probe produces `RebaseHeadFacts`;
-  `record_rebase_head` consumes it and issues only the original SQLite write.
-  Qualification and probe order are unchanged, with no added HEAD read.
-  Fresh local rebase still uses the branch name, exactly as the
-  legacy path does; local expected-object metadata is absent where today's
-  caller has no such precondition. Daemon rebase retains its existing expected
-  HEAD/generation checks and owner-operation messages.
-- `CheckRunInput` supplies one command list, purpose, environment and placement
-  witness, an explicit optional timeout and output capture bound. `CheckRun`
-  yields one command at a time and returns `CheckRunOutcome` (command index,
-  exit code, bounded redacted stderr/combined output tails and timestamps) or
-  `CheckRunFailure` (infrastructure error and the completed command facts).
-  `run_at` owns only local process execution and capture. The daemon uses the
-  same `RunSpec`/`RunResult` and existing owner wire types. The consumer can
-  retain/acknowledge each owner reply before issuing the next command; the
-  `RunCiSteps` recorder then serializes the facts and performs the same Review
-  settlement, Task authority projection and event publication. Entry CI still
-  passes `None` (wire `timeout_secs=0`), with unbounded collection and the same
-  4096-byte Review tails. A finite `Duration` is rounded upward to the existing wire's whole-second
-  timeout (at least one second), so a sub-second or zero supplied duration
-  cannot become the unbounded `timeout_secs=0` sentinel. No default timeout,
-  CheckRunner cache or conformance consolidation is introduced.
-- `RpcExchange::prepare` installs only the in-memory pending reply; the
-  consumer's `record_exchange_admission` persists remote-operation admission
-  before `execute` sends a frame. `execute` performs the socket exchange with
-  the caller's existing timeout or `None`. The pending reply guard lives
-  through `record_exchange_completion`, and `decode_reply` performs the
-  existing typed/operation-identity validation. `record_merge_reply` retains
-  validated execution evidence and the command receipt before finishing the
-  Task operation and acknowledging the owner journal. The existing client
-  owns persisted intents, retry/reconciliation and acknowledgement receipts.
-  Authority check → persisted intent → authority recheck → RPC outside SQLite
-  → typed validation → evidence commit → journal ACK is unchanged; reconnect
-  still inspects outstanding intents. No daemon method or payload changes.
-
-**Boundary rule.** Production files in `integration_effects/` must not import
-or reference database repositories, SQL, the event bus, Task services or the
-workflow engine. `effects_have_no_persistence_or_task_capability_imports`
-checks every production source in this module for those capabilities: the
-forbidden paths, the identifiers of the repository, service, backend and hook
-types (so one cannot arrive through an allowed module), glob imports, and the
-registry methods `rpc.rs` calls. It reads source text, so it cannot see a
-capability reached through a handle the caller passes in. This is
-an enforced module/source boundary, not a new crate boundary: existing service
-error and transport types are retained. Direct server and real-daemon primitive
-tests compare digests of every SQLite table before/after and assert no event;
-owner journal retention is an effect fact and is deliberately not acknowledged
-by a primitive. The same characterization assertions run before and after the
-extraction, including execution trigger effects and remote receipt ordering.
-
-All stage B shadow observation sites and content remain in their original
-Task-step/Review/result transactions. Carry predicates, manual mode, Task
-single-writer authority and cancellation protection are unchanged. There is
-still no integration worker or activation. The owner gates and attempt sink below
-now bind the existing Task-step merge/rebase recorders, without claiming a queue
-or changing Task projections. The later head CI/rebase wall
-timeout remains an explicit setting decision (default 1800 seconds), not a
-default supplied by these primitives.
-
-
-### Integration owners, fenced wire and reconciliation (3.2 stage C, part 2b)
-
-A queue claim stamps `integration_attempt.owner_fence_json` with queue/attempt
-IDs, monotonic generation, lease owner and the frozen target owner (location,
-server/daemon identity, runtime and location version). `ServerIntegrationOwner`
-and the daemon gate refuse foreign owners, stale fences and changed physical
-placement before Git. Queue effects also verify expected HEAD and target refs
-before Git writes. The persistence-free primitives never validate witnesses;
-the owner gates own those checks.
-
-Both owners use `git::integration` for rebase/conflict handoff and the reviewed
-fast-forward. Server and daemon adapters retain their established outcome
-classification and error rendering. The shared effects receive paths, objects,
-mode and explicit limits; the daemon has no database dependency.
-
-Order: owner checkout lock → receipt lookup → short fenced intent transaction →
-last fence check/start checkpoint → Git outside SQLite → short receipt transaction.
-`IntegrationEffectGuard` holds an in-process owner lock, not a write transaction.
-The durable intent distinguishes `started:false` from a potentially performed
-effect. A refusal after intent commit settles `not_performed`; an abandoned
-unstarted intent is reconciled the same way. A queue claim's started intent never
-authorizes another effect without owner receipt lookup, and a checkout with
-another unresolved started queue intent refuses a new effect. A Task-step intent
-never refuses anything (see "Task-step intents always settle" below). Only
-intents that share an owner lock are compared: a rebase or check locks its
-workspace alone, so one Task's rebase neither waits on nor is refused by another
-Task's in-flight merge into the same checkout. Receipt identity remains
-`(attempt_id, operation_kind, fence)` with the entire request checked against reuse.
-An uncertain receipt is replaced on reconciliation, not appended as a second
-receipt for the same key. An original owner can retain its receipt after lease
-takeover; the frozen intent remains its identity.
-
-**Integration owner wire (3.2 stage D1c, daemon protocol revision 6; `integration.release_objects` with `attempt` since revision 7).** It is
-what the queue worker needs from an owner; the worker is active since stage D2b.
-
-- *Fence announcement.* `integration.announce { daemon_id, runtime_id, fence,
-  live_queue_ids? }` is the first message of a claim generation. The daemon
-  records the fence as the queue's high-water mark, returns the fence it held
-  before, and refuses an older generation (or another claim of the same
-  generation) with `stale_fence`. A queue attempt lookup (`workspace.describe`
-  with `operation: reconcile`) now returns `owner_fence { queue_id, generation,
-  attempt_id, intent }`: the generation the daemon held *before* the lookup and
-  what its journal said. `intent` is `retained` (the journal held the intent;
-  the receipt is evidence), `not_performed` (the daemon already knew this claim
-  generation and holds no intent: the effect never ran, and its key is now
-  fenced off) or `unknown` (the daemon had never been told of this claim
-  generation, so its empty journal proves nothing: lost or replaced owner
-  state). For `unknown` the daemon retains an `uncertain` receipt, so asking
-  again never turns it into `not_performed`, and the server records the effect
-  as uncertain. Forge never guesses a merge result. The rule that keeps a
-  healthy merge from ever reading as `unknown`: the queue transport
-  (`DaemonWorkspaceClient::integration_effect`) sends the announcement itself,
-  before the intent is marked started. So when a started effect is looked up,
-  the daemon was told of its generation: a frame that never arrived reads
-  `not_performed`, and `unknown` can only mean the daemon's registry was lost
-  or replaced. A refused or undelivered announcement leaves no intent. Today's
-  merges are Task-step effects, not queue attempts: their lookups carry no
-  `owner_fence` and behave as before.
-- *Journal retention.* `journal.ack` for a queue attempt entry marks it
-  acknowledged (no longer replayed to the server) and clears the checkout's
-  pending marker. The entry is deleted when the queue's fence passes its
-  generation, when the queue's fence is dropped, or 7 days after the
-  acknowledgement for a queue that never claims again (in the last two cases
-  its key gets a 7-day cancellation tombstone, so a late duplicate is refused
-  and not run). Until it is deleted an acknowledged receipt still counts
-  against the journal's 1024-record bound, so a daemon that holds
-  acknowledged receipts of about a thousand idle queues refuses new effects
-  until the 7 days pass (known limit; stage D1d must lift it). Fences are
-  dropped when the server's `live_queue_ids` no longer lists
-  their queue (the announced queue always stays), and as the least recently
-  recorded past 1024 fences. A fence is never dropped, by either rule, while
-  its queue has a journal entry the server has not acknowledged: dropping it
-  would let an older claim in and turn a lookup into `unknown`. Such fences
-  are bounded by the journal's own entry bound. Pending markers of settled
-  operations are dropped on every acknowledgement and announcement. A
-  revision-5 journal needs no conversion; an in-flight attempt intent and its
-  fence are read unchanged.
-- *Object transfer.* A Task placed on a non-default checkout will be merged
-  into the repository's default checkout (stage D2). Its commits travel as a
-  thin Git bundle: `export_objects` on the source owner, `import_objects` on
-  the target owner, one algorithm (`git::integration`) for the server owner
-  (local) and the daemon (`integration.export_objects`,
-  `integration.import_objects`, `integration.release_objects`, 1 MiB chunks,
-  staging under `.forge/transfer`, removed on release, after 24 hours and at
-  daemon start). The cap is 256 MiB; a larger transfer is refused `too_large`
-  before any byte is stored on the target, and a chunk that runs past the
-  declared size is refused before it is written. Chunks arrive in order; a
-  transfer is never resumed part way: after a lost connection or a daemon
-  restart the sender starts the key again from its first chunk and the owner
-  drops what it had staged. The import checks size and SHA-256, runs `git
-  bundle verify`, unpacks into a quarantine directory inside the Git
-  directory, re-checks the pack with `git index-pack --strict`, requires the
-  expected tip and full connectivity, and only then moves the pack into the
-  object store and creates `refs/forge/integration/<key>` (create-only: of two
-  concurrent imports of a key one binds the ref and the other replays). Ref
-  names inside the bundle are never used, no other ref moves, nothing is
-  checked out, and the index and work tree are not read. `have` and `want`
-  must be full object ids. The ref writes run with hooks disabled
-  (`core.hooksPath=/dev/null`), so no repository hook runs; none of the Git
-  commands used starts a program named in repository configuration. The key
-  is `<attempt>-<generation>-in|out`; an import whose ref already names the
-  expected tip returns its receipt (`replayed`) without reading or
-  transferring anything. A refused, failed or cancelled transfer leaves both
-  repositories unchanged and no temporary file. A killed process can leave
-  an export pin ref (`refs/forge/export/<key>`) or a quarantine directory
-  (`forge-incoming-*` in the Git directory): the daemon removes both from
-  every verified checkout when it starts
-  (`git::integration::sweep_transfer_leftovers`); the server owner does not
-  call that sweep yet (stage D1d). Transfers carry the queue fence (stale
-  claims are refused) but are not journaled effects and write no attempt
-  receipt: the Git ref is the receipt. Imported refs are not deleted by this
-  stage; stage D2 deletes them when the attempt ends.
-
-The existing `V202610082317__integration_fencing.sql` columns retain their bounds:
-16 KiB fence, 64 KiB intent, 128 KiB per receipt, 1 MiB receipt array. This stage
-uses no additional SQL columns or stored enum values and needs no migration.
-The daemon persists high-water fences and unresolved checkout operation identities
-beside its workspace registry in `.forge/journal`; attempt effects use stable
-attempt/kind/generation operation IDs in that journal. The existing journal
-count/byte limits apply before an effect. An acknowledged queue attempt receipt
-stays in the journal and replays without Git, including after restarting the
-owner, until a newer claim generation of its queue is recorded (protocol
-revision 6, below); then it is pruned. Cancelling an attempt
-stops its Git process group before retaining a receipt with observed HEAD and
-rebase progress. Task-step merge cancellation keeps today's protected-completion
-behavior. Ordinary Task-step journal ACKs retain their existing lifecycle.
-
-Daemon protocol revision **5** retains the tagged `integration` binding on
-mutation and reconciliation messages. `attempt` carries the queue fence and
-frozen witness; `task_step_effect` carries the existing Task step's attempt
-binding; `task_step` identifies other existing workspace operations. There is
-one revision-5 format, and revisions below 5 are refused with
-`daemon_upgrade_required` and an “upgrade the daemon” message. Upgrade the server
-then each daemon, preserving `--workspace-root`. Startup forward-migrates retained
-revision-3 journal intents/results in place; old wire decoding is never enabled.
-
-Today's merge/rebase recorders bind to the current shadow attempt and Task-step
-fence without claiming a queue. Their owner witness follows the Task's current
-placement. Existing dirty/review/ancestry/target classification, local review
-authority guard, execution writes, comments, events and hook result ordering
-remain authoritative. The new receipt facts confer no Task or Review authority.
-The local review guard still spans the bounded reviewed merge because it fences
-Review and Project edits; a queue owner guard does not replace that contract.
-
-On server recovery, local intents are reconciled before Task recovery. Before a
-new local effect, the same owner lock waits for any live effect to retain its
-receipt. A restarted server can prove an exact reviewed queue merge from the frozen
-candidate/target refs. A queue claim's unknown effect retains an uncertain receipt
-and its intent. On reconnect, the workspace client reconciles daemon attempt intents
-before ordinary execution receipts and any new effect. The owner returns its
-retained receipt. An absent owner intent is fenced against delayed delivery and
-settles `not_performed`; an interrupted merge needs exact object proof. Receipt
-validation and attempt persistence precede ACK. No Git effect is repeated to
-reconstruct a result.
-
-**Task-step intents always settle.** Today's merge and rebase are bound to the
-Task step's lease (`lease_owner = task-step:<step id>`, `generation` = the step's
-claim count), not to a queue claim, and the Task step already owns recovery of
-its effect: the durable `merge_intent` / `merge_outcome` / `rebase_target` /
-`rebase_outcome` hook effects, the idempotent already-merged check, and
-interrupted-rebase recovery. The attempt receipt is therefore a record of the
-effect and never its result or a precondition of the next one:
-
-- A recorder error, a missing/oversized/contradictory owner receipt and a failed
-  receipt write are logged; the merge or rebase result the Task step computed is
-  returned unchanged. An error result is recorded `failed`, never `uncertain`.
-- A started Task-step intent whose guard is gone (server crash, dropped future,
-  daemon that never answered) is settled `failed` with an `infrastructure`
-  result by whichever comes first: startup reconciliation, the reconnect pass,
-  or the next admission that takes the same owner lock, which holds the lock the
-  dead guard held and so knows the effect is not running here. It never returns
-  `ReconciliationRequired`.
-- Reconciliation before a Task-step effect, at startup and on daemon reconnect
-  is best effort: a failure is logged and neither crash recovery, the reconnect
-  pass for run/merge intents, nor the effect is stopped.
-- When the shadow attempt no longer matches the Task's placement or target
-  branch, the step lease is still verified and the effect proceeds unrecorded.
-- On the daemon, a Task-step effect is not held to the location version (the
-  server changes it without telling the owner; only a queue claim freezes it),
-  and a Task-step journal intent left without an outcome by a daemon restart is
-  settled as interrupted, with a receipt, by the next Task-step request on that
-  checkout instead of refusing it.
-
-| Durable state (Task-step binding) | What moves it | When | Ends as |
-|---|---|---|---|
-| intent written, not started | startup / reconnect reconciliation, or the next admission on the checkout | next server start, daemon reconnect, or next merge/rebase there | receipt `failed` / `not_performed`; Task step retried by its lease |
-| intent started, guard alive | the effect itself; today's deadlines and protected completion | bounded by the step | receipt `succeeded` or `failed` |
-| intent started, guard gone | same three passes as above | next server start, reconnect, or next admission (step lease expiry reclaims the step) | receipt `failed` / `infrastructure`; step recovery re-reads Git |
-| owner receipt missing or invalid | settled at the reply, else by the lookup, else by the next admission | immediately, or as above | receipt `failed` / `infrastructure`; owner result still returned |
-| daemon journal intent without outcome | server lookup, else the next Task-step request on that checkout | reconnect, or next request | journal outcome `interrupted` plus receipt |
-| daemon never reconnects | today's owner-disconnected timeout fails the placement; machine removal settles the attempt | existing timeout / operator removal | receipt `failed` / `infrastructure`, Task handled by placement recovery |
-| machine or location removed mid-effect | the remover's transaction | at removal | receipt `failed`, attempt `parked` (or still `quarantined`), queue `suspended` |
-| queue `suspended` / attempt `quarantined` | the queue worker's sweep: a claim re-opens a suspended queue whose target is ready; the head's reconciliation settles a quarantine | every sweep / the reconcile interval | active since stage D2b |
-
-Queue-claim (`attempt`) intents keep the strict rule (uncertain until the owner's
-receipt). The queue worker creates them.
-
-Machine removal and permitted location deletion settle in-flight attempts with
-an infrastructure receipt/failure in the remover's transaction, suspend their
-queues, clear leases and preserve quarantine. A late owner cannot overwrite
-that settlement. Existing placement-in-use deletion refusals and Repo/Project
-CASCADE behavior remain unchanged.
-
-Every Git command in `git`, including read probes and reviewed fast-forward,
-uses the group runner: closed stdin, a separate process group, SIGTERM, up to
-500 ms grace, then SIGKILL. Review's bounded Git evidence reads use that runner
-as well. Owner merge and rebase accept cancellation; an explicit daemon
-`deadline_nanos` witness binds the owner wall limit, separately from RPC timeout.
-Their deadlines include Git witness probes. Cancellation retains the state interrupted-rebase recovery
-expects, including a stopped rebase without `index.lock`.
-
-Known limits before activation:
-
-- Queue activation, the integration worker and Task state/public shape changes
-  remain stage D work.
-- Placement off the default location still follows today's Task placement;
-  stage D will place integrating Tasks according to the target.
-- Unknown effects are kept uncertain when neither a retained receipt nor exact
-  Git completion proof exists. Lease expiry alone never grants a repeat.
-- Queue attempt receipts are bounded and retained after ACK until the queue's
-  fence moves past their generation (3.2 stage D1c, protocol revision 6): a late
-  duplicate of a pruned key is refused `stale_fence`, so pruning keeps replay
-  fencing.
-- The existing local Review/Project authority guard remains separate from queue
-  owner serialization.
-
-### Integration activation storage (3.2 stage D, part 1a; in use since D2b)
-
-Migration `V202610091612__integration_activation.sql` and
-`db::integration_queue::activation` add the storage the queue worker will use.
-The queue worker is its caller since D2b; rows written before it read both
-new columns as `NULL`.
-
-New `integration_attempt` columns:
-
-| Column | Type / constraint | Meaning |
-|---|---|---|
-| `cancel_requested_at` | `TEXT` | Set once by `request_integration_cancel`. An ordinary attempt transition can neither set nor clear it. |
-| `phase_timings_json` | `TEXT`, JSON object, at most 16384 bytes | The head's timings (`IntegrationPhaseTimings`), written only by `record_integration_head_timings`. |
-
-`IntegrationPhaseTimings` is cumulative over an attempt's rounds: `rounds`,
-`queued_ms`, `validate_ms`, `transfer_ms`, `rebase_ms`, `check` (either
-`ran {slot_wait_ms, run_ms}` or `skipped {reason}` with reason
-`target_unchanged` or `no_checks_configured`), `step_wait_ms`, `ff_ms`,
-`head_total_ms`, `lost_races` (the newest 32 entries of `{kind, round, at}`,
-kind `queue_member` or `external`) and `lost_races_folded` (`{queue_member,
-external}` counts of older entries). A write with more than 32 lost races is
-not refused: the repository folds the oldest into the counts, so a timings
-write can never stop a head and the document stays far below its bound. Only
-an `external` lost race spends the "target moved" allowance;
-`external_target_moves()` counts listed and folded ones. Timings are
-measurements: a stored document this build cannot read reads as absent (the
-attempt stays readable) and the next write replaces it.
-
-New indexes, all partial: `integration_attempt_timed (state, id)` for current
-attempts with an `available_at`; `integration_attempt_cancel_requested (id)`
-for current attempts with a cancel request; `integration_attempt_prunable
-(completed_at, id)` for finished attempts that still hold receipts or
-observations. No trigger is added.
-
-Operations (trait `IntegrationActivationRepo`; all not called until D2). Every
-write compares the row's `revision` and bumps it, so a caller holding an older
-copy gets `VersionConflict` and must re-read:
-
-| Operation | Rule |
-|---|---|
-| `request_integration_cancel` | Legal exactly where the attempt graph can reach `cancelled`: `queued`, `path_wait`, `validating`, `rebasing`, `checking`, `awaiting_task_step`, `ready_ff`, `ejected`, `needs_review`, `parked`. Refused (`InvalidTransition`) in `ff_inflight`, `reconciling`, `applied`, `quarantined` and terminal states. It only sets the flag; the worker performs the transition. Repeating it keeps the first time. A queued member carrying the flag is never selected as head by a claim, so a cancel and a claim racing for the same member have exactly one winner. |
-| `record_integration_head_timings` | Head of its queue only. Replaces the whole document. |
-| `start_integration_round` | The live lease holder, at its current fence generation, takes a new generation and lease for the same head, with the claim's takeover rules. One generation admits one receipt per effect kind, so another rebase or fast-forward of the same head needs a new round. |
-| `claimable_integration_queues` | Unleased queues a worker must act on: open or suspended with a due queued member (not asked to cancel) or a reserved head, and every quarantined queue. Keyset by queue id, `LIMIT` at most 500. |
-| `expired_integration_heads` | Queues whose lease ended at or before the given time. Keyset by queue id. |
-| `due_parked_integration_attempts` | Current `parked` attempts whose `available_at` is due. A parked attempt without `available_at` waits for its owner. Keyset by attempt id. |
-| `cancel_requested_integration_attempts` | Current attempts carrying a cancel request. Keyset by attempt id. |
-| `quarantine_integration_queue` | Lease holder only; needs a head that is `ff_inflight`, `reconciling`, `quarantined` or has an unsettled effect. |
-| `reopen_integration_queue` | The only exit from `quarantined`. Needs a witness that is re-verified against stored rows: `settled_effect` names a succeeded or failed (never uncertain) receipt of this queue, and no current member may still have an intent or a running / uncertain operation. While the queue still has its head, the witness must be that head's own receipt and the head must have left `ff_inflight` / `reconciling` (the worker applies the receipt to the attempt first, then re-opens); once the head has finished and released the slot, its receipt remains a valid witness, and pruning never removes it while the queue is quarantined. The lease and the head are not touched. An owner's reconnect lookup and a machine or location removal settlement both produce such a receipt; a timeout does not. An attempt that never had an effect admitted can have no receipt (an imported uncertain merge that the worker resolved by lookup, or a head that stopped before its intent): the witness for it is `no_effect`, accepted only when that attempt's stored row has no intent, no receipt and no pending / running / uncertain operation, under the same head rules. Whatever the witness, a queue with any current member still in `ff_inflight` / `reconciling`, or with an intent or a running / uncertain operation, does not re-open. With a target that is not ready the queue becomes `suspended` instead of `open`. A `suspended` queue re-opens with `target_ready` naming the repo's one ready default checkout and its version (a claim also still re-opens it). |
-| `prune_integration_evidence` | Empties `effect_receipts_json`, `operation_receipts_json` and `observations_json` of at most `limit` attempts that finished before the cutoff. Never touches a current attempt, an attempt with an intent, a pending / running / uncertain operation or an uncertain receipt, an attempt whose Task has a live successor, or any attempt of a quarantined queue. Rows, SHAs and outcomes stay. A settled intent needs no pruning: its receipt already cleared it. |
-| `integration_queue_ages` | Count and oldest age for queued members, heads, expired heads, parked members, pending cancel requests and unsettled effects. |
-| `integration_timing_samples` | Timings of recently completed attempts, newest first, for percentiles. |
-
-Time comparisons in the sweeps and in pruning use the instant, not the text, so
-a timestamp written with an offset is handled. Where an index range needs a
-text comparison on `completed_at` (pruning, timing samples) the caller's bound
-is first rewritten to the UTC form `completed_at` is stored in; pruning also
-re-checks the instant.
-
-Plans: the due-parked, cancel-requested, claimable and timing-sample reads
-carry no index hint and are held to their index by `EXPLAIN QUERY PLAN` tests.
-The expired-lease sweep and the prune statement keep `INDEXED BY`, because the
-planner otherwise walks the queue primary key or every old terminal attempt. A
-named index is refused when the statement is prepared, from the schema and the
-statement text alone (never from data or statistics), and a test prepares both
-statements on the migrated schema and pins both index definitions, so a later
-migration that changes either index fails that test.
-
-What moves each new durable mark forward (the worker is D1d / D2):
-
-| Mark | Moved by |
-|---|---|
-| `cancel_requested_at` on a queued member | Never claimed as head; the cancel-requested sweep returns it and the worker writes `queued → cancelled`. |
-| `cancel_requested_at` on a head | The head driver sees it (its next attempt write fails the revision check and it re-reads) or the sweep returns it; the worker stops its own effect, waits for the receipt, then writes `cancelled`. If the attempt has meanwhile entered `ff_inflight`, `reconciling`, `applied` or `quarantined`, the mark stays and is acted on only after that result is known; the sweep keeps returning the row until it is terminal. |
-| `cancel_requested_at` on `ejected` / `needs_review` / `parked` | Not a head; only the cancel-requested sweep finds it. |
-| A Task's own Cancel (the cancel transition, a board move into the cancellation state) on a `queued` or `parked` member | Holds no slot and has no admitted effect: the Cancel writes `cancelled` in its own transaction, with no `cancel_requested_at`. A start before the worker's next sweep finds no live attempt behind the terminal Task. The release-step sweep asks for the `clear` no worker asked for (a cancelled attempt whose `clear` step is missing). Any other state is flagged as above. |
-| A `cancelled` Task at the next start | Not imported again when the queue cancelled the attempt of the entry the Task was cancelled out of (`state='cancelled'`, `expected_epoch` one before the Task's): that attempt, a passive-stage `shadow:` row included, is the record of that entry. |
-| Queue `quarantined` | `reopen_integration_queue` with a settled receipt, or with `no_effect` when the pinning attempt never had an effect admitted (every imported uncertain merge). A head that went `reconciling → queued` while its queue is still quarantined is not claimable until the worker re-opens the queue; it then continues with `start_integration_round`. With a `reconciling` / `ff_inflight` head it is still claimable, so the worker can keep asking the owner; every unleased quarantined queue is in the claimable sweep. A machine or location removal settles the receipt. No timer opens it. |
-| Queue `suspended` (also after a re-open with no ready target) | The next claim re-resolves the target and opens it, or `reopen_integration_queue` with `target_ready`. The claimable sweep returns it while it has a due queued member or a head. |
-| Head left in any state by a dead worker | Expired-lease sweep, then a claim (takeover rules). After a machine removal the head can be `parked` or `quarantined` with no lease; the claimable sweep returns every unleased queue that has a head. |
-
-A cancel request is refused in `ff_inflight`, `reconciling`, `applied` and
-`quarantined`: the Git result is in flight, unknown or already landed, and a
-flag cannot undo it. The Task-level cancel is not the storage's decision: from
-the permit on, the Task-step consumer (D1b) keeps the Cancel command waiting
-behind the protected result step, and for a quarantined attempt it must leave
-the attempt and its queue as they are until the result is settled.
-
-Queue states are data too (`INTEGRATION_QUEUE_TRANSITIONS`): `open` →
-`suspended`, `quarantined`, `closed`; `suspended` → `open`, `closed`;
-`quarantined` → `open`, `suspended`, `closed`; `closed` is terminal. The
-attempt graph gains two edges. `validating` → `awaiting_task_step`: with an
-unchanged target there is nothing to rebase or re-check. `reconciling` →
-`queued`: a result proven not landed goes back to validation in place (a head
-keeps its slot and lease); going through `parked` would release the slot, wait
-for `available_at` and spend one of the Task's infrastructure retries. Any
-move to `queued` from `reconciling` or `quarantined` is refused while the
-attempt has an effect intent or a running / uncertain operation, so `queued`
-is never a way around an unknown result.
-
-### Integration queue worker (3.2 stage D, part 1d; started by the runtime since D2b)
-
-`services::integration_worker` is the queue worker. The runtime builds it
-(`TaskService::compose_integration`) and starts it after owner reconciliation
-and the importer. The module writes `integration_queue` and
-`integration_attempt` rows only. It calls no Git and writes no Task, Review,
-budget or event row; a source test (`worker_sources_stay_inside_the_boundary`)
-holds that line.
-
-Parts:
-
-- **Supervised loop** (`IntegrationQueueWorker::start` / `run`): one sweep per
-  wake (an enqueue notification, a head leaving its slot, or every 30 s), then
-  one driver task per claimed queue, at most 16 at a time. Claims rotate after
-  the queue claimed last, so no queue starves when more are claimable than the
-  cap. Shutdown stops each driver at its next await; a started fast-forward is
-  awaited to its receipt. An idle install is read-only.
-- **Sweeps** (each restarts its keyset cursor): cancel requests on attempts
-  that hold no slot; due `parked` attempts back to `queued`; expired heads
-  (takeover) and unleased queues with work. A quarantined queue is claimed
-  when its head is `reconciling` / `ff_inflight`; a `quarantined` head is put
-  back to `reconciling` once per reconcile interval (60 s); a head that
-  resolved before the queue was re-opened is re-opened with its stored
-  witness first. A quarantined queue with no head (an imported quarantine)
-  is re-opened with a `NoEffect` witness as soon as the storage agrees that
-  no member holds an unknown result; the pinned attempt stays `quarantined`
-  for its owner's Retry. A suspended queue is tried again on every sweep
-  (the claim re-resolves the target, one small write per try); its head and
-  each queued member get one `park` step so the Task shows why it waits.
-- **Head driver** (`HeadDriver`): a table-driven state machine (`HEAD_TABLE`:
-  per state the action, success edges, failure edges, timeout, cancel rule and
-  what a restart finds). Every attempt transition goes through one function
-  that re-reads the row first (a receipt, a timings write and a cancel request
-  all bump `revision`) and refuses an edge the table does not have. The lease
-  (60 s) is renewed when 15 s of it are used, re-reading the queue each time
-  because an admission bumps the queue revision.
-
-| Head state | Worker action | Leaves to |
-|---|---|---|
-| `queued` | stamp `started_at`, count the round | `validating`; `parked` past 9 rounds |
-| `validating` | read facts; move commits in when the Task is on another checkout | `applied` (already landed), `awaiting_task_step` (target unchanged: no check), `rebasing`, `needs_review` (candidate changed), `parked`, `cancelled` |
-| `rebasing` | fenced owner rebase with conflict handoff, or adopt a receipt recorded before a crash | `checking`, `ejected` (conflict paths), `parked`, `reconciling`, `cancelled` |
-| `checking` | wait for the verdict the `request_check` step asked for (check timeout + 300 s) | `awaiting_task_step`, `ejected` (red check), `parked`, `cancelled` |
-| `awaiting_task_step` | wait for the `settle` step's permit (300 s) | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
-| `ready_ff` | move commits out if needed; cancel-or-commit compare-and-set (permit lifetime 120 s) | `ff_inflight`, `awaiting_task_step`, `cancelled` |
-| `ff_inflight` | fenced owner fast-forward of the exact candidate | `applied`; `rebasing` in a new round when the target moved; `reconciling` otherwise |
-| `reconciling` | ask the owner to settle the head's own effect, then read the newest receipt and a Git witness | `applied`, `queued` (proven not landed), `rebasing` (a finished rebase to adopt), `quarantined` (unknown) |
-| `applied` | ready the `result` step; wait for its acknowledgment or for the Task to leave `merging` | `completed` |
-
-Rules the driver enforces:
-
-- A check runs only when the commit was rebased by the queue. An unchanged
-  target sends the reviewed commit straight to authorization and records
-  `Skipped { TargetUnchanged }`.
-- A rebase needed when the head gets the slot is recorded as a `queue_member`
-  lost race and is free. A target that moves while the head holds the slot can
-  only have been moved from outside Forge: it is recorded as `external`, starts
-  a new round (`start_integration_round`), and the sixth one parks the attempt
-  with `external_target_moves_exhausted`.
-- An unknown result is never guessed, and only the owner settles an admitted
-  effect. `ServerIntegrationOwner::reconcile_effect` runs under the effect's
-  own checkout lock and, for a started queue-claim effect with no receipt,
-  records: the exact reviewed merge when the target names the candidate;
-  `not_performed` when the target ref (fast-forward) or the Task's HEAD
-  (rebase, none stopped) never moved; `completed` when HEAD already sits on
-  the expected target (a rebase that finished without its receipt, conflict
-  hand-off paths included); `timed_out` after aborting a rebase that is still
-  stopped once its own deadline has passed since the first lookup. Anything
-  else stays uncertain: the queue is quarantined with `needs_fact`, the head
-  becomes `quarantined`, the lookup repeats every 60 s, and the queue
-  re-opens only with a settled receipt (or `NoEffect`) that the storage
-  re-verifies. The lock covers effects of this process; a Git child that
-  outlives a killed server is covered by the lease (takeover is at least one
-  lease later) and by content: a late fast-forward lands the exact candidate,
-  which the next validation reads as already merged.
-- Cancel against the permit: both are compare-and-set writes on the attempt
-  row and a cancel request is refused once `ff_inflight` is stored, so exactly
-  one wins. Before that point a cancel request wins even over a written permit.
-- Deciding steps (`request_check`, `settle`) are always asked under a fresh
-  `effect_seq`, and a step is enqueued before the attempt transition it
-  belongs to, so a crash between the two leaves a step, not a silent attempt.
-- Infrastructure parks retry after 30 s, 2 min and 10 min, then wait for the
-  owner. A wait with no end of its own (paused Project, target not ready) is
-  retried with a doubling gap up to 10 min, and only its first park is a Task
-  step. A permit that does not bind the head is asked for three times, then
-  the attempt parks. The park history is kept in `operation_receipts_json`
-  (entries `{"kind":"worker_park",...}`, newest 64): nothing else writes that
-  column, and the evidence pruner empties it only on terminal attempts that
-  are no longer current, which the worker never reads.
-- A rebase or fast-forward is bounded by the owner (120 s / 30 s), not by a
-  worker timer. A cancel request that arrives while `git rebase` runs stops
-  the process group; the head is released after the cancelled receipt.
-
-Ports (`integration_worker::ports`). Consumed, and to be implemented by D2:
-`IntegrationStepPort` (enqueue an `integration` Task step by causation key
-`integration:<attempt>:<effect_seq>:<action>`; make the protected `result`
-step runnable), `IntegrationFactsPort` (read-only Task gate and Git facts of
-the head, and the repo location of its checkout), `ObjectTransferPort`
-(`transfer`: commits between a non-default checkout and the default checkout,
-256 MiB cap, keyed by attempt, claim generation and direction; `release`: drop
-the attempt's transfer refs on both checkouts when it leaves the slot). The
-real transfer over the owner operations is not written yet. Provided: `IntegrationEnqueuePort`
-(wake the sweep after an admission) and `IntegrationSnapshotPort` (queue,
-members in order with position, state, timings; the read surface is built on
-it). Steps answer by writing `effect_ack_json` / `acknowledged_at` (and
-`permit_json`) on the attempt; the worker only reads them.
-
-Known limit: the first rebase of a head is always counted as a
-`queue_member` lost race (the queue does not store the commit it last
-integrated, so a push from outside before the claim cannot be told apart).
-
-### Integration queue production ports (3.2 stage D, part 2a)
-
-`services::integration_ports` holds the real things behind the worker's seams.
-`build_integration_worker(db, router, daemons, locations, config)` assembles
-them and returns the worker **not started** (`locations` is the
-`RepoLocationService`, behind the worker's `IntegrationLocationPort`): `TaskService::compose_integration` calls it,
-and the runtime starts the worker (stage D2b).
-
-| Worker port | Production | What it does |
-|---|---|---|
-| `IntegrationOwnerPort` (`rebase`, `fast_forward`, `reconcile_effect`, `reconcile_outstanding`) | `RoutingIntegrationOwner` | Dispatches on the fence's `target_owner`. Server: `ServerIntegrationOwner`. Daemon: `DaemonWorkspaceClient::integration_effect` with `workspace.reset` / `rebase_target` and `workspace.merge` (reviewed fast-forward). |
-| `ObjectTransferPort` (`transfer`, `release`, `sweep_at_start`, `sweep_owners`) | `OwnerObjectTransfer` | Moves commits between the Task's checkout and the default checkout when they do not share an object store. |
-| `IntegrationLocationPort` (`verify_location`) | `RepoLocationService::reverify` | Asks for a repo location to be verified again. The service writes `repo_location`; the worker never does. |
-| `IntegrationFactsPort` | `WorkspaceHeadFacts` | Task gate from storage; Git state through the Task's workspace placement. |
-| `IntegrationStepPort` (`enqueue_step`, `ready_result_step`, `step_state`) | `integration_steps::TaskStepIntegrationPort` | The Task-step queue. |
-
-**Daemon-owned targets.** A head whose default checkout is held by a daemon
-is driven through that daemon: it no longer parks. The rebase runs in the
-Task's worktree and the fast-forward in the default checkout, both as attempt
-effects (one intent, one receipt per `(fence, kind)`). The check hand-off is
-unchanged: the `request_check` step asks the check runner, which runs the
-commands on the daemon that holds the workspace. Before the first effect of a
-claim generation on a daemon the worker sends `integration.announce` with
-`live_queue_ids` = every queue that is not closed and targets that daemon,
-plus every queue with an outstanding intent on it (`DaemonFences`).
-
-**Where the Task's checkout may be.** Today's merge path merges every Task
-into the checkout of the Task's *own* repo location (embedded: that
-location's repo source; daemon: `workspace.merge` with the placement's
-`repo_location_id`), wherever the default checkout is. The queue always
-lands in the default checkout:
-
-| Task's checkout | Through the queue |
-|---|---|
-| A worktree of the default checkout (server or daemon) | Rebased and fast-forwarded in place; no transfer. |
-| Another clone, same owner as the default checkout | The target tip is brought to the Task's clone and bound to `refs/forge/integration/<attempt>-<generation>-in`. That ref is the rebase witness on both owner gates (the clone's own target branch is not written and need not match), and the rebase is onto that commit. The exact rebased commit is then sent to the default checkout (`...-out`) and fast-forwarded there from that ref. Proven end to end on a server-owned pair and on two clones on one daemon. |
-| Another owner than the default checkout (Task on a daemon and default checkout on the server, the reverse, or two daemons) | Two fenced owners, each doing only what it holds. The **rebase** and the head check run on the owner of the Task's checkout, onto the inbound transfer ref. The **fast-forward** runs on the owner of the default checkout, from the outbound transfer ref, with the target tip unchanged since the rebase as its witness. The Task's own location is not merged or advanced; the refs are released on both ends when the attempt leaves the slot. |
-
-**Two owners per head.** The claim's fence always names the owner of the
-default checkout (`target_owner`); the claim is verified against it. An effect
-performed by another owner records that owner in its request as
-`witness.effect_owner` (`location_id`, `owner_kind`, `daemon_id`,
-`runtime_id`; the Task's own repo location). `IntegrationEffectRequest::effect_owner`
-is that field, or `target_owner` when it is absent, and it is the one key for
-everything that asks "who performed this": the owner lock, the list of
-outstanding intents of an owner (`outstanding_integration_effects`, read at
-server start and on a daemon's reconnect), the lookup the worker's reconcile
-timer sends (`reconcile_effect`), the connection the held session watches, and
-the settlement when a machine or location is removed. A lost rebase reply is
-therefore asked of, and settled by, the Task's owner; a lost fast-forward
-reply by the target's owner. Both owners are told the claim generation
-(`integration.announce`) before their first effect or transfer of it.
-
-| Effect | Performed by | Candidate witness | Target witness |
-|---|---|---|---|
-| Rebase | owner of the Task's checkout | HEAD of the Task's worktree | same owner as the target: the default checkout's tip, and the Task clone's own branch or the `-in` ref; another owner: the `-in` ref alone |
-| Head check | owner of the Task's checkout (the check runner places by the attempt's `owner_kind` / `daemon_id`) | the rebased commit | n/a |
-| Fast-forward | owner of the default checkout | a worktree of the default checkout: its HEAD; any other checkout: the `-out` ref of this claim generation | the default checkout's tip is still the tip the rebase was onto |
-
-A daemon that holds the default checkout fast-forwards a transferred
-candidate with no worktree, handle or placement of the Task
-(`workspace.merge` with `candidate_transfer_key`); the server does the same
-from the ref in its own checkout. If the target moved between the rebase and
-the fast-forward, the target's owner refuses (`witness_mismatch` /
-`target_moved`) and the head starts a new round: new claim generation, new
-transfers, new rebase, new check.
-
-**What exactly is fast-forwarded.** The outbound transfer sends the commit
-the permit binds (the attempt's `candidate_sha`), never the HEAD the Task's
-checkout happens to have; a head whose checkout no longer holds that commit
-loses its permit and nothing is sent. On the target's owner the ref is bound
-by the import only when the bundle carries exactly the named tip, and a key
-that is already bound to another commit is a conflict, never a move. The
-fast-forward then requires, under the checkout's lock: the key is exactly
-`<attempt>-<generation>-out` of the claim that asks; that ref names the
-request's candidate; the candidate contains the witnessed target tip; the
-work tree is clean; and the branch is still at that tip. The branch is moved
-by a compare-and-swap (`git::integration::fast_forward_exact`: the work tree
-is brought to the candidate with a two-tree `read-tree -m -u`, then
-`update-ref refs/heads/<target> <candidate> <witnessed tip>`), so a writer
-that moved the target after the read makes the swap fail; the work tree is
-then taken back and the outcome is `target_moved`. No `post-merge` hook runs
-for a transferred fast-forward. The fast-forward from a worktree of the
-default checkout is unchanged (`merge --ff-only` after the same witnesses).
-
-**The performing owner is verified, not trusted.** `witness.effect_owner` is
-written by the caller. `begin_integration_effect` admits it only when the
-attempt's own durable owner fields (`owner_kind`, `daemon_id`, `runtime_id`,
-and `repo_location_id` while that location exists; written at admission from
-the Task's placement) say the same, the effect is a rebase, and the named
-owner is not the target's owner. A rebase that names no owner is refused
-when the attempt records another owner than the target's. Both refusals are
-`foreign_owner` and leave no intent. The daemon transport sends an effect
-only to the daemon its request names, and a receipt is recorded only when it
-carries the stored request, so an answer from any other owner is ignored.
-
-**Owner restart during a fast-forward.** A daemon that restarts with a
-started queue fast-forward and no outcome settles it at the lookup, under the
-lock of the checkout the effect writes (a lookup that arrives while the
-effect is still running waits for it): the branch at exactly the candidate,
-clean, is the proof that it landed; a branch that does not contain the
-candidate is the proof that it did not (`not_performed`, settled). Only a
-branch that contains the candidate but is not at it (somebody committed on
-top before the lookup) stays unknown. The delayed frame of the operation is
-answered from that recorded outcome and runs no Git. The worker reads a daemon-owned default
-checkout the Task is not placed in through the owner's read-only
-`integration.target_facts` (tip, "candidate already landed", dirty), so a
-dirty checkout parks `target_dirty` at once from any checkout.
-
-Removal: a removed machine or location settles the intents it was
-**performing** as failed. Only queues whose **target** it owned are suspended;
-a removed Task owner is handled by the existing removed-machine Task
-settlement. An attempt the removal parks gives up its slot in the same
-transaction (head and lease cleared, as any park does): the queue claims its
-next member on the following sweep instead of re-claiming a parked head
-forever. A quarantined head keeps the slot, because its queue re-opens
-through it.
-
-A rebase that cannot even be asked for (the owner could not be told the
-claim, or storage refused the effect before any intent) ran nothing: the head
-parks as a counted infrastructure retry and leaves the slot, instead of
-staying in `rebasing` to be re-claimed at every lease expiry. A request that
-failed after its intent stays an unknown result for its owner, as before.
-
-Transfer refs are released on both ends whenever the head leaves the slot.
-The session that releases it may not be the one that made the transfer (a
-takeover, a restart): it then takes the two ends from the attempt's durable
-owner fields and the queue's target. Exits that no session drives (a cancel
-applied by the sweep, a machine removal) are covered by the start-time sweep
-of the transfer owner.
-
-After a reconnect the Task's placement stays `disconnected` until the owner
-reconciliation of the server runtime has looked at it. A head whose rebase
-receipt has arrived waits in `rebasing` (bounded by the Task-step wait, then
-an infrastructure park) until the placement is `ready` before it asks for the
-head check: the check owner refuses a placement that is not ready.
-
-A check that ends "no result after its retries" is not a verdict on the
-commit. The round that waited for it is told so and parks (a counted
-infrastructure retry). When a later round of the same commit asks again,
-`request_check` does not answer it from that stored row: the consumer is
-re-armed (fresh infrastructure budget, a new run, the same rule as the
-owner's `retry`) and the head waits for the new result. Only an exhausted
-answer whose cleanup is unproven is not run again from there; it stands, and
-the counted retries end at the owner.
-
-**Location version.** A claim freezes `repo_location.version` as the
-target's `generation`, and a daemon owner refuses a claim whose generation is
-not the one it holds `foreign_owner`. The owner holds the version its last
-verification was *stored as*: `repo_location.verify` carries
-`expected_version` = the present version plus one, because the server writes
-the row right after the owner answers. (It used to carry the present
-version, which left the owner one behind after every stored verification,
-so every claim after a reconnect was refused.) The server also bumps the
-version for reasons the owner is not told (a default toggle). On a
-`foreign_owner` refusal the worker therefore asks for the location to be
-verified again (`IntegrationLocationPort`) and goes on in a new round, at
-most twice per claim session; after that, or when the verification cannot
-be requested, the head parks `target_not_ready` and retries with backoff.
-
-**Lost reply.** A transport failure during an effect is never read as "it did
-not run". The intent stays on the attempt, the head goes `reconciling`, and
-the worker asks the owner for the receipt (`reconcile_effect`; for a daemon
-this is the journal lookup, which runs no Git). The same lookup runs when the
-daemon reconnects. The receipt decides: an applied fast-forward goes to
-`applied`; a completed rebase is adopted as the new candidate; "not
-performed" re-queues the head. The effect is never sent a second time. While
-the result is unknown the queue is `quarantined` and the Task shows
-`deferred / unresolved_result`. The head keeps its slot and its lease while
-the result is unknown: the claim session stays, renews the lease, and asks
-the owner again every `reconcile_interval` (60 s). It also re-reads the
-attempt every `poll` (1 s) and goes on at once when the receipt has arrived
-(the reconnect lookup recorded it) or the owner is on a new connection. The
-lease expiry is only the retry clock of a worker that died.
-
-A queue-claim lookup also carries what the owner's own records said
-(`owner_fence.intent`). `unknown` (the owner had never been told of the claim
-generation, so its empty journal proves nothing) is never a settlement,
-whatever the receipt says. `not_performed` settles the intent even when the
-receipt is unusable.
-
-**Object transfer.** One transfer runs `imported_objects` on the receiver (a
-repeat of the key finds its import and moves nothing), `export_objects` on the
-source into a server staging file, `import_objects` on the receiver, then
-`release_objects` for the source's staging. `have` names commits the receiver holds so the bundle
-carries only what is new: inbound, the Task's HEAD, its clone's own target
-branch tip, and the target tip an earlier round of the attempt brought;
-outbound, the target tip. A transfer over the worker's cap
-(256 MiB) moves nothing and parks the head `transfer_too_large`. When the
-attempt leaves the slot the worker calls `release`, which deletes
-`refs/forge/integration/<attempt>-*` on both ends (local Git for a
-server-owned checkout; `integration.release_objects` with `attempt` for a
-daemon-owned one, protocol revision 7). At start the worker calls
-`sweep_at_start`: for every ready server-owned location it removes the export
-pins and import quarantines of a crashed transfer
-(`git::integration::sweep_transfer_leftovers`) and the imported refs of every
-attempt that is not the head of a queue. Daemon-owned checkouts are swept by
-the daemon at its own start (staging and crash leftovers). Their imported
-refs cannot be listed from the server, so at start the worker releases, by
-the same `integration.release_objects` call, every attempt of the last 30
-days that once held a slot, holds none now, and whose Task was placed in
-another checkout than its queue's target (at most 4096). A daemon that is
-not connected then is asked on a later sweep (`sweep_owners`), three tries
-per attempt.
-
-**Facts.** The gate is `left` when the Task is no longer in the status entry
-the attempt was admitted in (nothing else is read for a Task that left: its
-checkout may be gone), or when that entry is not a merge state at all (an
-attempt the start-time import made for a Task that was with its coder or back
-in review at the upgrade: once its old merge is known not to have landed the
-attempt is cancelled and the Task's own flow continues), `gated(cause)` when it is still there and its owner
-or its Project stopped it, and `live` otherwise. The causes are one
-rule (`integration_steps::gate`), read from the Task's own columns: `task_held`
-(the owner's Hold), `task_blocked`, `task_failed`, `task_entry_blocked`,
-`task_awaiting_human`, `project_paused`. A paused Agent is not a cause: a
-merge needs no Agent turn (rebase, check and fast-forward are machine work),
-so a Task whose Agent is paused still merges; a head that needs an Agent (a
-conflict for its coder, a fresh review) is sent back and waits for the paused
-Agent at dispatch, like any other Task. The head reads the gate from storage alone before a round is
-counted, before the rebase, while it waits for a check and before it asks for
-a permit; `settle` reads it before it writes one. A gated head leaves the
-slot at once: the attempt is `parked` with the cause's code leading
-`failure_message`, no Git effect runs, no counted retry and no round is spent,
-and the next member is claimed. The Task keeps its own reason and the action
-that lifts it (the Hold and its Release, the failure and its Retry): the
-`park` step of a gated attempt states `waiting`, never `deferred`, because a
-`deferred` would replace that reason and offer a Retry of the merge, which
-cannot lift a stop on the Task. Under a paused Project it states `waiting`
-too. The worker's sweep looks again every sweep
-interval; the owner action that lifts the gate (Release, an unblock, a retry,
-a Project resume) makes the attempt due at once
-(`expedite_parked_integration_attempt`). A check that was running when the
-gate landed finds the attempt parked and is applied to nothing; after the
-gate the rebase is not repeated (a candidate already on the target tip goes
-straight to its check). HEAD, target tip, ancestry, dirtiness and a stopped rebase are read
-through the workspace placement, so a daemon-placed Task is read on its
-daemon. A daemon-owned default checkout's dirtiness is read on the daemon
-(`workspace.read` Git query `target_status_porcelain`: `git status
---porcelain` of the checkout the Task's repo location names) when the Task is
-placed in that checkout, and a dirty one parks the head `target_dirty` before
-any effect. From another clone on the same daemon it is not read; the owner
-then refuses the fast-forward itself.
-
-**Waits that end by themselves.** These close gaps found in the D1 reviews:
-
-| Wait | Before | Now |
-|---|---|---|
-| A parked attempt is re-queued after a counted retry (infrastructure, timeout) | The Task kept showing `deferred` | One `park` step under a new `effect_seq` restates `waiting` |
-| A suspended queue re-opens | Members kept showing `deferred` | Each waiting member that was told gets one `park` step. The mark is stored on the attempt, so a restart neither repeats nor forgets it |
-| A deciding step (`request_check`, `settle`) settled `failed` or was superseded | The head waited its full timeout | Asked again under a new `effect_seq`, twice per claim, then parked `task_step_failed` (counted retry) |
-| The check verdict's delivery to the Task failed | The head waited the check timeout (35 min) | `request_check` is asked again every 60 s (`check_reask`); the ask applies the stored verdict, or joins a check still running |
-| A `result` step hit an error | Parked itself for 10 min | Re-armed on every sweep interval while the attempt is `applied` |
-| A deciding step is asked again after a permit was issued | Waited up to 150 s behind that permit's sleeping protected `result` step | The stale protected step is woken; it sees the newer `effect_seq` and finishes without a write |
-| The owner refuses a claim `foreign_owner` | The head held its lease and claimed again at once | The location is verified again and the head goes on in a new round; parked `target_not_ready` with backoff after two requests |
-| A released attempt's `send_back`, `park` or `clear` step settled `failed` or was superseded | The Task was never told | The sweep asks again under a new `effect_seq`, three times, then writes the queue's `last_error` (`task_step_failed: ...`). A Task that already left its status entry is not asked |
-| A head with an unknown result | Taken up again when its lease ran out (60 s) | Keeps its slot; asked every `reconcile_interval` and at once when the owner is back |
-
-A wait with no end of its own (a paused Project, a target that is not ready)
-still tells the Task once and restates nothing on each retry.
-
-The Task-step timers (`result_wake` 150 s, `result_poll` 15 s, `result_park`
-600 s) are fields of `IntegrationWorkerConfig`;
-`IntegrationSteps::with_timers(IntegrationStepTimers::from(&config))` gives
-the step side the same values.
-
-**Daemon journal.** Acknowledged queue-attempt receipts no longer count
-against the journal's record bound (1024): that bound now means "entries the
-server has not acknowledged", so a journal full of history cannot refuse a new
-intent, and nothing unacknowledged is ever removed to make room. Acknowledged
-receipts still count against the byte bound and are pruned by the owner: when
-the queue's fence moves past their generation, when the queue's fence is
-gone, seven days after the acknowledgement, or as the oldest past 1024 (the
-last three leave a tombstone that refuses a late duplicate).
-
-Known limits of this part: a head whose Task checkout and default checkout
-are different clones is rebased only if the Task's clone already has the
-target branch at the target tip (the owner's rebase gate compares the Task
-checkout's own `refs/heads/<target>`); after a daemon reconnect the owner
-refuses the next claim's fast-forward `foreign_owner` (see the D2b
-checklist); a failed `send_back`, `park` or `clear` step is not asked again.
-
-### Integration Task steps (3.2 stage D, part 1b; produced since D2b)
-
-`services::integration_steps` is the Task-step side of the integration queue.
-The queue worker enqueues its steps since D2b, the `merging` entry hook
-admits through `integration_steps::admission`, and the start-time importer
-enqueues `import_continue` (`integration_steps::import`).
-
-The worker never writes Task state. Each request is one Task step of kind
-`integration` with the payload `{task_id, queue_id, attempt_id,
-expected_epoch, generation, effect_seq, action}` and the causation key
-`integration:<attempt>:<effect_seq>:<action>`; `(task_id, causation_key)`
-makes the enqueue idempotent. The step answers by writing the attempt's
-`effect_ack_json` / `acknowledged_at` (and `permit_json` for a permit) in the
-same transaction as its Task write (`acknowledge_integration_step_in_tx`: a
-compare-and-set on the attempt's revision, `effect_seq` and, except for
-`result`, its slot generation).
-
-A step is enqueued before the attempt transition it belongs to. So every
-action first places itself: attempt not yet in the state it answers → retry
-with back-off (no write); attempt past its `effect_seq` or generation, or no
-longer current → finish without a write; same `(effect_seq, action)` already
-answered → finish without a write.
-
-| Action | Attempt state | Task effect | Answer |
-|---|---|---|---|
-| `request_check` | `checking` | Asks the check runner (origin `integration`, purpose queue-head CI: the review state's effective `ci_steps`) for the rebased commit; states `integration/owned/checking`. With nothing configured to run it settles at once. | None. The check's own delivery step (`apply_check_result`) writes the `settle` answer: verdict, check timing and, on a pass, the permit. |
-| `settle` | `awaiting_task_step` | Reads review authority; when the queue rebased the commit, carries the review by attempt lineage; pre-enqueues the protected `result` step; states `integration/owned/fast_forwarding`. | `settle`: `permit` + `permit_json`, or `needs_review`, `candidate_check_failed`, `infrastructure`, `task_left`. |
-| `result` | `applied` | Execution evidence, the "Changes merged to …" comment, `integration/applied`, the `paused_integration` marker cleared, and the `merging → done` cascade enqueued at priority 2: the writes today's merge success performs. | `result`: `done` (or `task_left`). |
-| `send_back` | `ejected`, `needs_review` | Conflict: today's conflict handoff to the Worker (annotation, comment, `merge.failed`, `conflict_handoff` bridge and budget). Red check: a merge failure under the merge-fix budget. Lost review: `review_refresh` through `merge_failed`. States the typed reason and the handoff. | `send_back`: `done`. |
-| `park` | `parked`, `quarantined`, `queued` | Level-triggered: states `integration/deferred` with the cause read from the attempt (or the suspended queue); `integration/waiting` again once the member is queued behind an open queue; nothing for a paused Project. An intervention cause appends `task.interruption_changed` in the same transaction. | `park`: `done`. |
-| `clear` | `cancelled` | Clears this attempt's integration statement. | None (the attempt is terminal). |
-
-The permit binds `candidate_sha`, `target_tip_sha`, `task_ref`,
-`expected_epoch` and `slot_generation`; storage refuses any other.
-
-**Protection and Cancel.** In the transaction that writes a permit, `settle`
-enqueues the `result` step identity-fenced and marked as started integration
-(`enqueue_protected_integration_step_in_tx`), due at its own deadline. From
-that commit a later Cancel, Hold or move can neither be claimed ahead of it
-nor supersede it. The other way round, `settle` writes no permit while an
-owner command is already queued for the Task: it yields, the command runs,
-and the Task leaves `merging`. Exactly one of the two wins. Kind
-`integration` is in the supersede list, so a pending unprotected step is
-dropped the moment a Cancel is enqueued; the protected `result` step never
-is. The Task's cancel transition calls
-`request_task_integration_cancel_in_tx` in its own transaction: a
-cancellable attempt gets `cancel_requested_at` with the Task write; in
-`ff_inflight`, `reconciling`, `applied` or `quarantined` the Cancel is
-refused as busy while the protected step is alive (it then runs after the
-result) and is not held back by an attempt nothing drives. A board move into
-the cancellation state does the same through the same function
-(`CompareAndMoveTask.integration_cancel`, inside the move's transaction), so
-the flag has one writer. The call never fails a Cancel for a reason of its
-own: an attempt row or request time storage refuses counts as an attempt
-nothing drives. Storage refuses a permit for an attempt that carries the
-flag, and `settle` answers `task_left` instead of asking for one.
-
-**Redelivery.** Every action is safe to deliver twice. `settle`, `result`,
-`park` and `clear` write only in their final transaction. `send_back` writes
-its comment, annotation, block and `merge.failed` event before that
-transaction, as today's merge hook does; the comments are keyed by the step
-(`with_comment_key`), the annotation, block and cleared approval are the same
-values again, and the budget is charged by the cascade enqueued in the
-transaction, so a step that stops before its commit and runs again leaves one
-comment, one charge and one transition. The `merge.failed` and `task.blocked`
-bus events are not durable and can repeat. `request_check` asked again for a
-commit whose verdict already exists (applied for an earlier `effect_seq`, or a
-delivery whose application failed part-way and is not run again) applies the
-stored verdict itself.
-
-**`result` cannot dead-letter.** It never settles `failed` or `parked`. If it
-cannot apply, the Task states `integration/deferred/unresolved_result`, the
-step stays pending far in the future, and the worker's `ready_result_step`
-re-arms it. Woken by its own deadline with the permit unused, it takes the
-permit back (`revoke_integration_permit_in_tx`, a compare-and-set against
-the worker's commit to `ff_inflight`) and finishes, which lets a waiting
-owner command run.
-
-**Carry by attempt lineage.** One rule decides whether a passed review may
-cover a mechanically changed commit, for a Task entering `review` on a
-mechanical bridge and for an attempt the queue rebased in `merging`:
-`gate_refuses_carry`, `task_carry_checks`, `carry_budget_refusal` and
-`carry_path_refusal` in `workflow::actions::carry`. The queue's carry is
-recorded by `settle_attempt_review_carry_in_tx` (a `review_authority_carry`
-row and one `review_carry` charge, with the permit); no Review row is opened
-because the Task never left `merging`.
-
-Storage: migration `V202610100137__integration_task_step.sql` adds the step
-kind (a data-preserving `task_step` rebuild; SQLite cannot alter a CHECK).
-
-Not here yet: the head's check result is not copied onto a Review row; after
-a queue reopens nothing asks for the `park` step that restores `waiting`.
+| `request_check` | Ask the durable runner for the exact head; state checking. Its result-delivery step supplies the settle verdict |
+| `settle` | Check review authority/carry and Task gates; pre-enqueue protected result; state fast-forwarding; write candidate/target/entry/generation permit or typed refusal |
+| `result` | Obtain target-owner ancestry proof, write execution evidence and one merge comment, state applied, enqueue the workflow's success cascade, acknowledge |
+| `send_back` | Record failure, typed repair/review reason and handoff; enqueue one workflow cascade/budget charge |
+| `park` | State current deferred/waiting cause and emit an intervention when required |
+| `clear` | Clear only this cancelled attempt's statement |
+| `import_continue` | Apply the committed legacy classification or hand over through admission |
+
+Review entry and queue head call the same `review_ci_identity` builder. Its
+identity includes repository, exact candidate, normalized target branch,
+commands, effective Review configuration, workspace generation and
+owner/environment policy. Consumer purpose/authority do not change the result
+identity. An unchanged reviewed commit tries transactional reuse-only admission:
+a certified hit creates a consumer and no run. A matching passed Review under
+a frozen/unattested policy retains its own result as review authority without
+launching it again. A rebased commit is another identity and runs its check.
+A missing matching entry result preserves the existing unchanged-target skip;
+manual/agent review authority is still checked by settle.
+
+The consuming Task step appends the newest 64 command-shaped results to
+`Review.details.execution.integration_checks`, with attempt, commit, consumer,
+run, result and identity references and source (`executed`, `cache_hit`, or
+`review_authority`). Original entry CI and immutable reviewer conformance are
+preserved; head evidence grants no new reviewer authority. The write is in the
+acknowledgment/permit transaction and is idempotent per attempt/result. The
+existing execution envelope is accepted by strict REST/MCP readers; generated
+TypeScript exposes the new evidence. Raw Review workspace commands without
+explicit limits now use 1800 s / 1 MiB; verdict/tail handling belongs to the
+shared check executor and durable runner.
+
+A result is never reported merged merely from `integrated_sha`. The target's
+current owner proves it contains the exact candidate before `done`, including
+imported landed rows and sibling target advances. Wrong-owner/generation receipts,
+a forged SHA, an unavailable owner or a rewound target produce a typed
+`unresolved_result`; a proven missing commit queues again. Git/RPC proof is
+outside the write transaction; the transaction rechecks attempt and Task entry.
+
+### Deletion, recovery and operational limits
+
+Repository/location/Project deletion and default-location change return
+`409 integration_unresolved` while an effect is outstanding or its result is
+unknown. The guard names Task and machine and is checked in the mutation's
+transaction. `force` cannot bypass it. Location deletion does not settle an
+in-flight effect as failed. Removal of a permanently lost machine is the
+explicit permanent-loss operation; it settles that owner's intents/imported
+operations and lets the queue recover without silently dropping uncertainty.
+
+Owner Retry readmits released/unbound/stale-bound attempts or makes a valid
+park due. It cannot repeat a fenced unknown effect; reconnect/removal supplies
+its receipt. Imported operations with no fenced intent can be explicitly closed
+by Retry. Approve on a held Task in its merge state is labelled **Mark done
+without merging**: it ends the Task and cancels its attempt without changing Git.
+
+Public queue/member reads, Task integration summaries, operations status and
+`integration.updated` are live; see [api.md](api.md) and [cli.md](cli.md).
+`pending_steps` counts short queued Task steps, not a head waiting for CI or its
+slot. Queue position, phases, timing and actions come from the dedicated reads.
+
+Path guards, speculative/batched merging and an automatic decision that an
+unknown effect failed are not implemented. Transfer cleanup and bounded
+receipt/journal storage are separate from evidence retention: current attempts,
+unsettled effects and quarantine pins are never pruned just for age. Before a
+running-install cutover, test a copy of its database/workspace root and inspect
+the import report and operations status. Synthetic importer fixtures do not
+replace validation of that install's retained owner evidence.
 
 
 ### Task condition actions
@@ -8770,7 +7688,7 @@ cite them.
 | What runs | `review::check_spec::build_check_spec` builds a `CheckSpec` from the entry's effective configuration. Review entry asks for `canonical-ci/1` in a server-owned Task worktree; a daemon placement and a bundle with no worktree get the frozen `legacy-daemon/1` / `legacy-server/1` policies, which always run and are never reused | "Check contract", "Reusable results" |
 | Who runs it | `check-executor`, a persistence-free owner primitive, on the machine that owns the checkout (server or daemon) | "Owner check execution" |
 | When it runs | The `check-runs` worker: single-flight per identity, machine run-cap admission in the shared writer transaction, slot fairness with aging, recovery by operation id | "Durable check runner" |
-| Who asks | A Task step, through `TaskCheckConsumers`. Two families: review entry (`run_ci_steps`, in production) and the merge path (integration, passive until the queue is activated) | "Task-step consumer contract" |
+| Who asks | A Task step, through `TaskCheckConsumers`. Two families: review entry (`run_ci_steps`, in production) and the integration queue head (production) | "Task-step consumer contract" |
 | How the Task waits | Its hooks step suspends on the consumer (or on the disk wait) and the Task states a typed condition (`check`, or `capacity` with scope `disk`); every wait has a deadline or a typed park | "Review-entry CI on the check runner", "Typed check conditions" |
 | What a re-run is | The same review entry again (`rerun_review`); there is no second review pipeline | "Manual review re-run through the review entry" |
 | What changes under a wait | Configuration: the entry asks again by itself (at most 3 times). A withdrawn check (refused forced delete): the same. Workflow: typed park | "Review-entry CI on the check runner" |
@@ -9601,11 +8519,10 @@ Rules:
 **Two families are registered, composed by one constructor
 (`TaskService::compose_checks`, used by the production runtime and by every
 test): review entry (`entry`, requested in production, see "Review-entry CI on
-the check runner") and the merge path (`integration`, passive until the
-integration queue is activated).** A manual review re-run is a review entry
+the check runner") and the live integration queue head (`integration`).** A manual review re-run is a review entry
 and asks through the `entry` family. Conformance, before-work and other checks
-retain their current inline orchestration, limits and verdicts. The 3.2 integration queue stays inactive. Still pending:
-the merge-queue cutover and managed-checkout activation. The
+retain their current orchestration, limits and verdicts. The integration queue
+is active; its head requests the same CI bundle through this constructor. The
 owners execute the frozen legacy policies and the canonical CI policy below;
 only the canonical one attests its inputs and may be reused. A reusable result
 has no expiry of its own: reuse ends when the commit, spec digest, owner

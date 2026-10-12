@@ -25,7 +25,6 @@ pub(crate) fn embedded_workspace_router_for_test(
 ) -> std::sync::Arc<crate::workspace_backend::WorkspaceBackendRouter> {
     let merge_service = std::sync::Arc::new(crate::MergeService::new(
         std::sync::Arc::clone(&db),
-        std::sync::Arc::new(events::EventBus::default()),
         root.clone(),
     ));
     let mut embedded =

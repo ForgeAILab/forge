@@ -52,45 +52,6 @@ pub async fn merge_cleanliness(
     Ok(None)
 }
 
-pub async fn expected_target(
-    repo_path: &Path,
-    target_branch: &str,
-    expected_target_sha: &str,
-) -> Result<Option<MergeOutcome>> {
-    if !expected_target_sha.is_empty() {
-        let target_sha = ::review::contract::git_read(
-            repo_path,
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("refs/heads/{target_branch}"),
-            ],
-        )
-        .await
-        .map_err(ServiceError::invalid_operation)?;
-        if target_sha.trim() != expected_target_sha {
-            return Ok(Some(MergeOutcome::TargetMoved {
-                reason: format!(
-                    "{target_branch} advanced to {} since this Task was reviewed against {}",
-                    short_sha(target_sha.trim()),
-                    short_sha(expected_target_sha)
-                ),
-                target_branch: target_branch.to_owned(),
-            }));
-        }
-    }
-    Ok(None)
-}
-
-/// These reads remain separate because today's candidate evidence is recorded
-/// before acquiring the review guard; the target probe runs under that guard.
-pub async fn merge_heads(repo_path: &Path, worktree_path: &Path) -> Result<(String, String)> {
-    Ok((
-        git::get_current_sha(repo_path).await?,
-        git::get_current_sha(worktree_path).await?,
-    ))
-}
-
 pub async fn target_tip(repo_path: &Path, target_branch: &str) -> Result<String> {
     ::review::contract::git_read(
         repo_path,

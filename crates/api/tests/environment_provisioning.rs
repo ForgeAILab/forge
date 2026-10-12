@@ -174,7 +174,6 @@ async fn state_for_db(db: Arc<db::SqliteDb>, root: &std::path::Path) -> Arc<api:
     let events = Arc::new(events::EventBus::new(64));
     let merge = Arc::new(services::MergeService::new_for_test(
         db.clone(),
-        events.clone(),
         root.to_owned(),
     ));
     let cleanup = Arc::new(services::WorkspaceCleanupScheduler::new(

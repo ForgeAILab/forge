@@ -1441,6 +1441,7 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
     let value = serde_json::from_str::<Value>(value)?;
     if value.is_array() {
         return Ok(ReviewDetails {
+            execution: None,
             conformance: Default::default(),
             ci_steps: serde_json::from_value(value)?,
             auditor: None,

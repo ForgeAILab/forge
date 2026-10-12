@@ -8849,7 +8849,6 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let merge = Arc::new(crate::MergeService::new(
             db.clone(),
-            bus.clone(),
             root.path().to_path_buf(),
         ));
         let router = Arc::new(
@@ -8970,7 +8969,6 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let merge = Arc::new(crate::MergeService::new(
             db.clone(),
-            bus.clone(),
             root.path().to_path_buf(),
         ));
         let router = Arc::new(

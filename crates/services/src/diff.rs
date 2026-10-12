@@ -90,11 +90,7 @@ impl DiffService {
 pub(crate) fn embedded_read_router_for_test(db: Arc<SqliteDb>) -> Arc<WorkspaceBackendRouter> {
     // Read-only fixture: nothing is created under this root.
     let root = crate::workspace_root::fixture_root();
-    let merge_service = Arc::new(MergeService::new(
-        Arc::clone(&db),
-        Arc::new(events::EventBus::default()),
-        root.clone(),
-    ));
+    let merge_service = Arc::new(MergeService::new(Arc::clone(&db), root.clone()));
     Arc::new(WorkspaceBackendRouter::new(Arc::new(
         EmbeddedWorkspaceBackend::new(db, merge_service, root),
     )))

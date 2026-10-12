@@ -2554,7 +2554,6 @@ async fn queue_conflict_handoff(
     let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
     ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
-        Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
     )));
     let result = RunMerge.execute(&ctx).await;
@@ -2784,7 +2783,6 @@ async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
     let (dir, _worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
     ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
-        Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
     )));
     let limit = db::budget::Kind::ConflictHandoff.default_limit() as i64;
@@ -2859,7 +2857,6 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
     let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
     ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
-        Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
     )));
 
@@ -3977,7 +3974,6 @@ async fn build_carry_scenario(
     let mut harness = harness;
     harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&harness.ctx.db),
-        Arc::clone(&harness.ctx.event_bus),
         harness._workspace_root.path().to_path_buf(),
     )));
     seed_passed_carry_review(

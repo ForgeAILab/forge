@@ -116,7 +116,6 @@ async fn test_app(workspace_root: &Path) -> Harness {
     let event_bus = Arc::new(events::EventBus::new(64));
     let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
-        Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
     let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(

@@ -8,6 +8,7 @@ use sqlx::{Row, SqliteConnection};
 #[async_trait]
 pub trait ReviewConformanceRepo: Send + Sync {
     async fn review_source(&self, task_id: &str, execution_id: Option<&str>) -> Result<Value>;
+    #[cfg(any(test, feature = "test-template"))]
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard>;
     async fn create_review_contract(&self, contract: &ReviewContract) -> Result<()>;
     async fn review_contract(&self, execution_id: &str) -> Result<Option<ReviewContract>>;
@@ -79,8 +80,9 @@ pub struct ReviewCarryBase {
     pub carries_since_review: i64,
 }
 
-/// Holds the authority write lock only across the local, bounded integration step.
-/// No provider or test command may run while this guard is held.
+/// Test fixture for the review-authority snapshot; production reads that
+/// snapshot in its short authorization transaction and never holds it over Git.
+#[cfg(any(test, feature = "test-template"))]
 pub struct ReviewIntegrationGuard {
     pub contract: Option<ReviewContract>,
     /// The commit and target tip integration must match. Equal to the
@@ -89,6 +91,7 @@ pub struct ReviewIntegrationGuard {
     pub candidate: Option<ReviewCandidate>,
     transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
 }
+#[cfg(any(test, feature = "test-template"))]
 impl ReviewIntegrationGuard {
     pub async fn release(self) -> Result<()> {
         self.transaction.commit().await?;
@@ -484,6 +487,7 @@ pub async fn review_integration_authority_in_tx(
 
 #[async_trait]
 impl ReviewConformanceRepo for SqliteDb {
+    #[cfg(any(test, feature = "test-template"))]
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard> {
         let mut tx = crate::begin_immediate(self.pool()).await?;
         let paused_project_id: Option<String> = sqlx::query_scalar(

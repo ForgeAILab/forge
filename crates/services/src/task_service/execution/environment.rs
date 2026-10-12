@@ -870,11 +870,7 @@ mod tests {
             .await
             .unwrap();
         let events = Arc::new(EventBus::new(64));
-        let merge = Arc::new(crate::MergeService::new(
-            db.clone(),
-            events.clone(),
-            root.path().to_owned(),
-        ));
+        let merge = Arc::new(crate::MergeService::new(db.clone(), root.path().to_owned()));
         let router = crate::workspace_backend::WorkspaceBackendRouter::new(Arc::new(
             crate::workspace_backend::EmbeddedWorkspaceBackend::new(
                 db.clone(),

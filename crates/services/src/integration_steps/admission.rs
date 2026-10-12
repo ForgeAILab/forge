@@ -33,6 +33,29 @@ pub(crate) fn unbound(attempt: &IntegrationAttempt) -> bool {
     !bound(attempt)
 }
 
+/// A ready placement is recovery's verified binding. A released attempt
+/// can be replaced only after its effects are settled (the DB supersede
+/// fence checks that); it must not keep an obsolete runtime or generation.
+pub(crate) async fn binding_current(db: &SqliteDb, attempt: &IntegrationAttempt) -> Result<bool> {
+    let Some(id) = attempt.placement_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(placement) = db::WorkspacePlacementRepo::get_by_id(db, id).await? else {
+        return Ok(false);
+    };
+    Ok(placement.state == db::PlacementState::Ready
+        && attempt.workspace_id.as_deref() == Some(placement.workspace_id.as_str())
+        && attempt.repo_location_id.as_deref() == Some(placement.repo_location_id.as_str())
+        && attempt.owner_kind
+            == Some(match placement.owner_kind {
+                db::PlacementOwnerKind::Server => IntegrationOwnerKind::Server,
+                db::PlacementOwnerKind::Daemon => IntegrationOwnerKind::Daemon,
+            })
+        && attempt.daemon_id == placement.daemon_id
+        && attempt.runtime_id == placement.runtime_id
+        && attempt.placement_generation == Some(placement.generation))
+}
+
 /// Admit `task` (in `merging`) to its target's queue and return its current
 /// attempt. Idempotent: a hook that runs again for the same status entry,
 /// placement and candidate gets the same row.
@@ -123,6 +146,15 @@ pub(crate) async fn admit(
             && current.queue_id.as_deref() == Some(queue.id.as_str())
             && current.placement_id.as_deref() == Some(placement.id.as_str())
             && current.placement_generation == Some(placement.generation)
+            && current.daemon_id == placement.daemon_id
+            && current.runtime_id == placement.runtime_id
+            && current.repo_location_id.as_deref() == Some(placement.repo_location_id.as_str())
+            && current.workspace_id.as_deref() == Some(facts.workspace.id.as_str())
+            && current.owner_kind
+                == Some(match placement.owner_kind {
+                    db::PlacementOwnerKind::Server => IntegrationOwnerKind::Server,
+                    db::PlacementOwnerKind::Daemon => IntegrationOwnerKind::Daemon,
+                })
             && (current.original_candidate_sha.as_deref() == Some(facts.candidate_sha.as_str())
                 || (current.import_source_json.is_none()
                     && current.candidate_sha.as_deref() == Some(facts.candidate_sha.as_str())
@@ -325,6 +357,27 @@ pub(crate) async fn state_waiting(db: &Arc<SqliteDb>, attempt: &IntegrationAttem
         return Ok(());
     }
     let mut tx = db::begin_immediate(db.pool()).await?;
+    // A successor may replace a released parked attempt whose statement
+    // still owns the condition. Clear only that predecessor, under this
+    // Task's lease, before stating the successor in the same transaction.
+    if let Some(predecessor) = attempt.predecessor_attempt_id.as_deref() {
+        if let Some(task) = db.get_task_in_tx(&mut tx, &attempt.task_ref).await? {
+            if task
+                .condition
+                .integration_reason()
+                .is_some_and(|reason| reason.attempt_id().as_str() == predecessor)
+            {
+                db.state_integration_condition_in_tx(
+                    &mut tx,
+                    &attempt.task_ref,
+                    &ConditionStatement::IntegrationCleared {
+                        attempt_id: super::attempt_ref(predecessor),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
     match db
         .state_integration_condition_in_tx(
             &mut tx,

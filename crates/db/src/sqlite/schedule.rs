@@ -29,6 +29,8 @@ pub struct ScheduleRead {
     /// Task's owner, with no deadline) and has no continuation step left to
     /// run.
     pub integration_owned: bool,
+    /// Compact operational facts for level-triggered condition repair.
+    pub integration_statement: Option<serde_json::Value>,
     pub park_json: Option<String>,
     pub has_wait: bool,
     pub capability_class: Option<String>,
@@ -38,9 +40,28 @@ pub struct ScheduleRead {
 }
 /// Whether Task `t`'s current integration attempt belongs to its present
 /// status entry and something owns it (see `ScheduleRead::integration_owned`).
-const INTEGRATION_OWNED: &str = "EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND a.current=1 AND a.expected_epoch=t.status_epoch AND a.expected_status=t.status AND a.state NOT IN ('completed','cancelled','superseded','ejected','needs_review') AND NOT (a.state IN ('queued','parked') AND (a.workspace_id IS NULL OR a.placement_id IS NULL OR a.original_candidate_sha IS NULL OR (a.import_source_json IS NOT NULL AND a.state='parked' AND a.available_at IS NULL)) AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref AND s.causation_key='integration-import:'||a.id AND s.status IN ('pending','claimed','suspended'))))";
+const INTEGRATION_OWNED: &str = "EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND a.current=1 AND a.expected_epoch=t.status_epoch AND a.expected_status=t.status AND a.state NOT IN ('completed','cancelled','superseded','ejected','needs_review') AND NOT (a.state IN ('queued','parked') AND EXISTS(SELECT 1 FROM workspace_placement wp WHERE wp.id=a.placement_id AND wp.state='ready' AND (wp.workspace_id IS NOT a.workspace_id OR wp.repo_location_id IS NOT a.repo_location_id OR wp.owner_kind IS NOT a.owner_kind OR wp.daemon_id IS NOT a.daemon_id OR wp.runtime_id IS NOT a.runtime_id OR wp.generation IS NOT a.placement_generation))) AND NOT (a.state IN ('queued','parked') AND (a.workspace_id IS NULL OR a.placement_id IS NULL OR a.original_candidate_sha IS NULL OR (a.import_source_json IS NOT NULL AND a.state='parked' AND a.available_at IS NULL)) AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref AND s.causation_key='integration-import:'||a.id AND s.status IN ('pending','claimed','suspended'))))";
 /// [`INTEGRATION_OWNED`] for one Task id.
-pub const INTEGRATION_OWNED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM task t WHERE t.id=? AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND a.current=1 AND a.expected_epoch=t.status_epoch AND a.expected_status=t.status AND a.state NOT IN ('completed','cancelled','superseded','ejected','needs_review') AND NOT (a.state IN ('queued','parked') AND (a.workspace_id IS NULL OR a.placement_id IS NULL OR a.original_candidate_sha IS NULL OR (a.import_source_json IS NOT NULL AND a.state='parked' AND a.available_at IS NULL)) AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref AND s.causation_key='integration-import:'||a.id AND s.status IN ('pending','claimed','suspended')))))";
+pub const INTEGRATION_OWNED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM task t WHERE t.id=? AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.task_ref=t.id AND a.current=1 AND a.expected_epoch=t.status_epoch AND a.expected_status=t.status AND a.state NOT IN ('completed','cancelled','superseded','ejected','needs_review') AND NOT (a.state IN ('queued','parked') AND EXISTS(SELECT 1 FROM workspace_placement wp WHERE wp.id=a.placement_id AND wp.state='ready' AND (wp.workspace_id IS NOT a.workspace_id OR wp.repo_location_id IS NOT a.repo_location_id OR wp.owner_kind IS NOT a.owner_kind OR wp.daemon_id IS NOT a.daemon_id OR wp.runtime_id IS NOT a.runtime_id OR wp.generation IS NOT a.placement_generation))) AND NOT (a.state IN ('queued','parked') AND (a.workspace_id IS NULL OR a.placement_id IS NULL OR a.original_candidate_sha IS NULL OR (a.import_source_json IS NOT NULL AND a.state='parked' AND a.available_at IS NULL)) AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref AND s.causation_key='integration-import:'||a.id AND s.status IN ('pending','claimed','suspended')))))";
+const INTEGRATION_STATEMENT: &str = "(SELECT json_object('attempt_id',a.id,'state',a.state,'failure_kind',a.failure_kind,'failure_message',a.failure_message,'daemon_id',a.daemon_id,'queue_state',q.state,'queue_failure_kind',q.last_error_kind,'queue_failure_message',q.last_error) FROM integration_attempt a LEFT JOIN integration_queue q ON q.id=a.queue_id WHERE a.task_ref=t.id AND a.current=1 AND a.expected_epoch=t.status_epoch AND a.expected_status=t.status AND a.state NOT IN ('completed','cancelled','superseded','ejected','needs_review') LIMIT 1)";
+
+/// The same compact snapshot as the scheduler, re-read under the writer's
+/// transaction before a restatement. No receipt blobs or physical paths.
+pub async fn integration_statement_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let raw: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT {INTEGRATION_STATEMENT} FROM task t WHERE t.id=?"
+    ))
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    raw.map(|raw| serde_json::from_str(&raw).map_err(|error| DbError::Check(error.to_string())))
+        .transpose()
+}
+
 impl SqliteDb {
     pub fn schedule_commit_pending(&self) -> bool {
         self.domain_event_hooks.pending_commit()
@@ -90,7 +111,7 @@ impl SqliteDb {
         let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
         let mut reader = self.pool().begin().await?;
         let mut reads = Vec::new();
-        for row in sqlx::query(&"SELECT t.*,COALESCE(d.generation,0) AS dirty_generation,COALESCE(d.dirty,0) AS dirty,COALESCE(d.external,0) AS dirty_external,EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=t.id AND s.kind!='mutation' AND s.status IN ('pending','claimed','suspended') AND (s.entry_fenced=0 OR (s.expected_epoch=t.status_epoch AND s.expected_status=t.status))) AS queue_owned,EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=t.id AND s.kind='hooks' AND s.expected_epoch=t.status_epoch AND s.expected_status=t.status) AS hooks_seen,@OWNED@ AS integration_owned,(SELECT state FROM workspace_placement WHERE task_id=COALESCE(t.parent_task_id,t.id)) AS placement_state,(SELECT COALESCE(execution_daemon_id,daemon_id) FROM workspace_placement WHERE task_id=COALESCE(t.parent_task_id,t.id)) AS placement_daemon_id,(SELECT checks_digest FROM project_machine_readiness WHERE project_id=t.project_id AND status='ready' AND owner_kind=json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.owner_kind') AND daemon_id=COALESCE(json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.daemon_id'),'') AND runtime_id=COALESCE(json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.runtime_id'),'')) AS ready_environment_digest,(SELECT capability_class FROM project_task_governance WHERE task_id=t.id) AS capability_class,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS park_json,EXISTS(SELECT 1 FROM task_schedule_wait WHERE task_id=t.id) AS has_wait FROM task t LEFT JOIN task_schedule_dirty d ON d.task_id=t.id WHERE t.id IN (SELECT value FROM json_each(?))".replace("@OWNED@", INTEGRATION_OWNED))
+        for row in sqlx::query(&"SELECT t.*,COALESCE(d.generation,0) AS dirty_generation,COALESCE(d.dirty,0) AS dirty,COALESCE(d.external,0) AS dirty_external,EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=t.id AND s.kind!='mutation' AND s.status IN ('pending','claimed','suspended') AND (s.entry_fenced=0 OR (s.expected_epoch=t.status_epoch AND s.expected_status=t.status))) AS queue_owned,EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=t.id AND s.kind='hooks' AND s.expected_epoch=t.status_epoch AND s.expected_status=t.status) AS hooks_seen,@OWNED@ AS integration_owned,@STATEMENT@ AS integration_statement,(SELECT state FROM workspace_placement WHERE task_id=COALESCE(t.parent_task_id,t.id)) AS placement_state,(SELECT COALESCE(execution_daemon_id,daemon_id) FROM workspace_placement WHERE task_id=COALESCE(t.parent_task_id,t.id)) AS placement_daemon_id,(SELECT checks_digest FROM project_machine_readiness WHERE project_id=t.project_id AND status='ready' AND owner_kind=json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.owner_kind') AND daemon_id=COALESCE(json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.daemon_id'),'') AND runtime_id=COALESCE(json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.runtime_id'),'')) AS ready_environment_digest,(SELECT capability_class FROM project_task_governance WHERE task_id=t.id) AS capability_class,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS park_json,EXISTS(SELECT 1 FROM task_schedule_wait WHERE task_id=t.id) AS has_wait FROM task t LEFT JOIN task_schedule_dirty d ON d.task_id=t.id WHERE t.id IN (SELECT value FROM json_each(?))".replace("@OWNED@", INTEGRATION_OWNED).replace("@STATEMENT@", INTEGRATION_STATEMENT))
             .bind(&ids).fetch_all(&mut *reader).await? {
             let id: String = row.try_get("id")?;
             let condition = row
@@ -110,7 +131,7 @@ impl SqliteDb {
                 epoch: row.try_get("status_epoch")?,
                 condition,
                 generation: row.try_get("dirty_generation")?, dirty:row.try_get("dirty")?, external: row.try_get::<i64,_>("dirty_external")? != 0,
-                queue_owned: row.try_get("queue_owned")?, entry_hooks_seen: row.try_get("hooks_seen")?, integration_owned: row.try_get("integration_owned")?, placement_state: row.try_get("placement_state")?, placement_daemon_id:row.try_get("placement_daemon_id")?, ready_environment_digest:row.try_get("ready_environment_digest")?, capability_class:row.try_get("capability_class")?, park_json:row.try_get("park_json")?, has_wait: row.try_get("has_wait")?,
+                queue_owned: row.try_get("queue_owned")?, entry_hooks_seen: row.try_get("hooks_seen")?, integration_owned: row.try_get("integration_owned")?, integration_statement: row.try_get::<Option<String>, _>("integration_statement")?.map(|raw| serde_json::from_str(&raw).map_err(|error| DbError::Check(error.to_string()))).transpose()?, placement_state: row.try_get("placement_state")?, placement_daemon_id:row.try_get("placement_daemon_id")?, ready_environment_digest:row.try_get("ready_environment_digest")?, capability_class:row.try_get("capability_class")?, park_json:row.try_get("park_json")?, has_wait: row.try_get("has_wait")?,
                 task: map_schedule_task(row)?, assignments: Vec::new(), executions: Vec::new(), reviews: Vec::new(), transitions: Vec::new(), children: Vec::new(), parent: None, siblings: Vec::new(),
             });
         }

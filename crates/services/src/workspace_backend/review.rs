@@ -473,8 +473,11 @@ impl ReviewWorkspace for ResolvedWorkspace {
                     purpose: WorkspaceRunPurpose::CiStep,
                     command: command.to_owned(),
                     env: env.clone(),
-                    timeout_secs: limits.map_or(0, |limits| limits.timeout_secs),
-                    max_output_bytes: limits.map_or(usize::MAX, |limits| limits.max_output_bytes),
+                    timeout_secs: limits.map_or(
+                        u64::from(::review::contract::DEFAULT_CHECK_TIMEOUT_SECONDS),
+                        |limits| limits.timeout_secs,
+                    ),
+                    max_output_bytes: limits.map_or(1024 * 1024, |limits| limits.max_output_bytes),
                 },
             )
             .await

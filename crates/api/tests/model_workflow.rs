@@ -779,7 +779,6 @@ impl World {
             )))
             .with_merge_service(Arc::new(services::MergeService::new_for_test(
                 Arc::clone(&db),
-                Arc::clone(&event_bus),
                 workspaces,
             )))
             .with_workflows_dir(api::state::test_workflows_dir())

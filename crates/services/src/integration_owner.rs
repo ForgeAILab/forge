@@ -396,52 +396,6 @@ impl ServerIntegrationOwner {
         })))
     }
 
-    /// Today's recorder keeps its phased read/authority ordering. Bind its
-    /// existing facts to the current Task-step fence, not a queue claim.
-    pub(crate) async fn admit_task_step(
-        &self,
-        workspace: &EffectWorkspace,
-        kind: IntegrationOperationKind,
-        witness: serde_json::Value,
-    ) -> Result<Option<IntegrationEffectAdmission>> {
-        let Some(request) = self
-            .db
-            .task_step_integration_request(&workspace.workspace_id, kind, witness)
-            .await?
-        else {
-            return Ok(None);
-        };
-        // Reconciliation is bookkeeping for a recorder: admission below settles
-        // any Task-step intent it could not, so a failure here never blocks.
-        if let Err(error) = self.reconcile_checkout(Some(&request)).await {
-            tracing::warn!(target: "services::integration_owner", %error, "integration reconciliation before a Task-step effect failed");
-        }
-        Ok(Some(
-            match self.db.begin_integration_effect(request).await? {
-                IntegrationEffectAdmission::Started(mut guard) => {
-                    if let Some(refusal) = guard.start().await? {
-                        return Ok(Some(IntegrationEffectAdmission::Refused(refusal)));
-                    }
-                    if guard.server_workspace_paths().await?.is_none() {
-                        // The shadow attempt no longer describes this Task's
-                        // placement or target (it is passive until activation).
-                        // The step lease was verified above, so the Task-step
-                        // effect proceeds unrecorded instead of being refused.
-                        guard
-                            .record(
-                                json!({"kind":"refused","reason":"witness_mismatch"}),
-                                IntegrationOperationState::Failed,
-                            )
-                            .await?;
-                        return Ok(None);
-                    }
-                    IntegrationEffectAdmission::Started(guard)
-                }
-                admission => admission,
-            },
-        ))
-    }
-
     pub async fn rebase(&self, input: ServerRebaseRequest<'_>) -> Result<OwnerRebaseReceipt> {
         // Owner mismatch is refused before any Git (including fact queries).
         // The rebase belongs to the owner of the Task's checkout. The default

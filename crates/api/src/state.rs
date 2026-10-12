@@ -116,7 +116,6 @@ impl AppState {
         let workflows_dir = test_workflows_dir();
         let merge_service = Arc::new(MergeService::new_for_test(
             Arc::clone(&db),
-            Arc::clone(&event_bus),
             workspace_root.clone(),
         ));
         let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new(

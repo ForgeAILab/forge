@@ -3816,13 +3816,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
             unreachable!()
         }
-        async fn merge(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::MergeSpec,
-        ) -> ws::Result<ws::MergeOutcome> {
-            unreachable!()
-        }
+
         async fn reset(
             &self,
             _: &db::WorkspacePlacement,
@@ -4000,13 +3994,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
             unreachable!()
         }
-        async fn merge(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::MergeSpec,
-        ) -> ws::Result<ws::MergeOutcome> {
-            unreachable!()
-        }
+
         async fn reset(
             &self,
             _: &db::WorkspacePlacement,
@@ -5077,13 +5065,7 @@ async fn review_ci_infrastructure_second_entry_gets_full_allowance() {
         async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
             Ok(Vec::new())
         }
-        async fn merge(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::MergeSpec,
-        ) -> ws::Result<ws::MergeOutcome> {
-            unreachable!()
-        }
+
         async fn reset(
             &self,
             _: &db::WorkspacePlacement,

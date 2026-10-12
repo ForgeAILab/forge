@@ -45,61 +45,12 @@ pub async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
             .map_err(|_| ServiceError::invalid_operation("review command timed out"))?
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
         }
-        api_types::WorkspaceRunPurpose::CiStep if spec.max_output_bytes == usize::MAX => {
-            let receipt =
-                crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
-                    operation_id: "legacy-server-ci",
-                    spec: &check_executor::legacy_ci_spec(
-                        &spec.command,
-                        &spec.env,
-                        spec.timeout_secs,
-                        false,
-                    ),
-                    target: check_executor::CheckoutTarget::Workspace(path),
-                    owner: api_types::CheckOwnerIdentity {
-                        owner_kind: "server".into(),
-                        machine_id: None,
-                        runtime_id: "server".into(),
-                    },
-                    input_revisions: None,
-                    environment: &spec.env,
-                    deadline: None,
-                    cancel: &tokio_util::sync::CancellationToken::new(),
-                    permit: &check_executor::CheckPermit::already_admitted(),
-                    cleanup: check_executor::CleanupPlan {
-                        commands: &[],
-                        timeout: check_executor::CLEANUP_TIMEOUT,
-                    },
-                    output_limit: 1024 * 1024,
-                })
-                .await?;
-            if let Some(message) = receipt.infrastructure_message {
-                return Err(std::io::Error::other(message).into());
-            }
-            let Some(output) = receipt.commands.into_iter().next() else {
-                return Ok(RunResult {
-                    exit_code: 0,
-                    stdout_tail: String::new(),
-                    stderr_tail: String::new(),
-                    duration_ms: 0,
-                });
-            };
-            if output.outcome == api_types::CheckExecutionOutcome::TimedOut {
-                return Err(ServiceError::invalid_operation("review command timed out").into());
-            }
-            return Ok(RunResult {
-                exit_code: output.exit_code.unwrap_or(-1),
-                stdout_tail: output.stdout_tail,
-                stderr_tail: output.stderr_tail,
-                duration_ms: output.duration_ms,
-            });
-        }
         api_types::WorkspaceRunPurpose::CiStep => review::run_workspace_command(
             path,
             &spec.command,
             &spec.env,
             spec.timeout_secs,
-            spec.max_output_bytes,
+            spec.max_output_bytes.min(1024 * 1024),
         )
         .await
         .map_err(ServiceError::invalid_operation)?,
@@ -184,24 +135,6 @@ pub fn tail_bytes(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod environment_tests {
     use super::*;
-    #[tokio::test]
-    async fn legacy_ci_spawn_failure_keeps_its_git_io_error_boundary() {
-        let directory = tempfile::tempdir().unwrap();
-        let result = run_at(
-            &directory.path().join("missing"),
-            &RunSpec {
-                purpose: api_types::WorkspaceRunPurpose::CiStep,
-                command: "true".into(),
-                env: Default::default(),
-                timeout_secs: 0,
-                max_output_bytes: usize::MAX,
-            },
-        )
-        .await;
-        assert!(
-            matches!(result,Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(*error,ServiceError::Git(git::GitError::Io(_))))
-        );
-    }
 
     #[tokio::test]
     async fn environment_output_is_bounded_while_draining_both_streams() {

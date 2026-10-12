@@ -268,19 +268,14 @@ async fn record_in_tx(
 /// Quarantine is retained; settlement cannot grant a fresh effect or Task action.
 pub(crate) async fn settle_removed_integration_owner(
     tx: &mut Transaction<'_, Sqlite>,
-    location: Option<&str>,
-    daemon: Option<&str>,
+    daemon: &str,
 ) -> Result<()> {
     // Matched by the owner that performs the effect: a rebase in flight on a
     // removed machine is settled even when the default checkout is elsewhere.
     // Only the queues that target the removed owner are suspended below.
-    let rows: Vec<String> = sqlx::query_scalar(&format!("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND ((? IS NOT NULL AND {}=?) OR (? IS NOT NULL AND {}=?))", effect_owner_sql("location_id"), effect_owner_sql("daemon_id")))
-        .bind(location).bind(location).bind(daemon).bind(daemon).fetch_all(&mut **tx).await?;
-    let message = if daemon.is_some() {
-        "integration owner machine removed"
-    } else {
-        "integration owner location removed"
-    };
+    let rows: Vec<String> = sqlx::query_scalar(&format!("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND {}=?", effect_owner_sql("daemon_id")))
+        .bind(daemon).fetch_all(&mut **tx).await?;
+    let message = "integration owner machine removed";
     for raw in rows {
         let intent = parse_json(raw)?;
         let request: IntegrationEffectRequest = serde_json::from_value(intent["request"].clone())
@@ -307,15 +302,9 @@ pub(crate) async fn settle_removed_integration_owner(
     // gone nothing ever answers for it: it would refuse every deletion of
     // its repository (`integration_unresolved`) and its owner's Retry for
     // good. The removal settles it as failed, as it settles an intent.
-    if let Some(daemon) = daemon {
-        settle_imported_operations(tx, "daemon_id=?1", daemon, message).await?;
-    }
-    // Location deletion's existing queue update owns its single revision
-    // increment and target-unconfigured projection in this transaction.
-    if daemon.is_some() {
-        sqlx::query("UPDATE integration_queue SET state=CASE WHEN state='quarantined' THEN state ELSE 'suspended' END,lease_owner=NULL,lease_until=NULL,last_error_kind='infrastructure',last_error=?,revision=revision+1,updated_at=? WHERE state<>'closed' AND ((? IS NOT NULL AND target_location_id=?) OR (? IS NOT NULL AND json_extract(target_owner_json,'$.daemon_id')=?))")
-        .bind(message).bind(now_rfc3339()).bind(location).bind(location).bind(daemon).bind(daemon).execute(&mut **tx).await?;
-    }
+    settle_imported_operations(tx, "daemon_id=?1", daemon, message).await?;
+    sqlx::query("UPDATE integration_queue SET state=CASE WHEN state='quarantined' THEN state ELSE 'suspended' END,lease_owner=NULL,lease_until=NULL,last_error_kind='infrastructure',last_error=?,revision=revision+1,updated_at=? WHERE state<>'closed' AND json_extract(target_owner_json,'$.daemon_id')=?")
+        .bind(message).bind(now_rfc3339()).bind(daemon).execute(&mut **tx).await?;
     Ok(())
 }
 

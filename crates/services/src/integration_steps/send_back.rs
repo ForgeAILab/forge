@@ -177,6 +177,25 @@ impl IntegrationSteps {
                     bridge: TransitionBridge::new(TransitionBridgeKind::ReviewRefresh),
                 },
             )
+        } else if attempt.failure_kind == Some(IntegrationFailureKind::OwnerRequired)
+            && detail.starts_with("worktree_dirty:")
+        {
+            task =
+                record_integration_failure(&ctx, &task, FailureKind::DirtyWorktree, &detail, None)
+                    .await?;
+            task = clear_review(task).await?;
+            (
+                IntegrationReason::Repair {
+                    attempt_id: attempt_ref(&attempt.id),
+                    predecessor_attempt_id: attempt
+                        .predecessor_attempt_id
+                        .as_deref()
+                        .map(attempt_ref),
+                    conflict_paths: None,
+                    repair_paths: IntegrationPaths::bounded(std::iter::empty::<String>()),
+                },
+                merge_failure_result(&ctx, &task, detail.clone(), FailureKind::DirtyWorktree).await,
+            )
         } else if attempt.failure_kind == Some(IntegrationFailureKind::CandidateCheckFailed) {
             // The rebased commit is red: a merge failure the coder fixes
             // under the merge-fix budget, as any failed integration is.

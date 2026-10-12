@@ -18,15 +18,13 @@ use db::{
     UpdateWorkspacePlacement, WorkspacePlacementRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_client::{
-    daemon_persistence::{JournalEntry, JournalOperation, MAX_CI_LOG_BYTES},
+    daemon_persistence::{JournalEntry, JournalOperation},
     daemon_runtime::{ActiveExecutionTracker, DaemonRuntime},
 };
 use futures_util::{SinkExt, StreamExt};
 use review::{CommandLimits, ReviewWorkspace};
 use serde_json::{json, Value};
-use services::workspace_backend::{
-    MergeOutcome, MergeSpec, PrepareSpec, ResolvedWorkspace, RunSpec, WorkspaceBackendError,
-};
+use services::workspace_backend::{PrepareSpec, ResolvedWorkspace, RunSpec, WorkspaceBackendError};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_tungstenite::{
     connect_async,
@@ -1458,15 +1456,15 @@ async fn remote_plan_checklist_gate_matches_server_placement() {
 }
 
 #[tokio::test]
-async fn remote_review_uses_owner_evidence_checkouts_and_unbounded_ci_output() {
+async fn remote_review_uses_owner_evidence_checkouts_and_bounded_ci_output() {
     let fixture = Fixture::new("forge-workspace-review").await;
     let candidate = fixture.candidate().await;
     let env = BTreeMap::from([("FORGE_TEST_SECRET".into(), "secret-value".into())]);
     let output = ReviewWorkspace::run(&fixture.resolved,
-        "head -c 1100000 /dev/zero | tr '\\000' x; printf '%s' \"$FORGE_TEST_SECRET\"; printf 'stderr' >&2", &env, None)
-        .await.expect("CI collects the full stream");
+        "head -c 700000 /dev/zero | tr '\\000' x; printf '%s' \"$FORGE_TEST_SECRET\"; printf 'stderr' >&2", &env, None)
+        .await.expect("bounded workspace command collects its stream");
     assert_eq!(output.exit_code, Some(0));
-    assert_eq!(output.stdout.len(), MAX_CI_LOG_BYTES);
+    assert_eq!(output.stdout.len(), 700000 + "[REDACTED]".len());
     assert!(!output.stdout.contains("secret-value"));
     assert_eq!(output.stderr, "stderr");
     let run = fixture
@@ -1476,8 +1474,8 @@ async fn remote_review_uses_owner_evidence_checkouts_and_unbounded_ci_output() {
         .requests(METHOD_WORKSPACE_RUN)
         .pop()
         .unwrap();
-    assert_eq!(run["timeout_secs"], 0);
-    assert_eq!(run["max_output_bytes"], json!(u64::MAX));
+    assert_eq!(run["timeout_secs"], 1800);
+    assert_eq!(run["max_output_bytes"], json!(1024 * 1024));
     let receipt = fixture.receipt(METHOD_WORKSPACE_RUN).await;
     assert!(!receipt["owner_result"]["stdout"]
         .as_str()
@@ -1601,187 +1599,6 @@ async fn remote_review_uses_owner_evidence_checkouts_and_unbounded_ci_output() {
     }
     fixture.assert_server_cannot_resolve_workspace();
     fixture.wait_until_journal_empty().await;
-}
-
-#[tokio::test]
-async fn remote_merge_binds_approved_evidence_and_replays_durable_success() {
-    let fixture = Fixture::new("forge-workspace-merge").await;
-    let candidate = fixture.candidate().await;
-    let contract = fixture.approve_candidate().await;
-    assert_eq!(contract.commit_sha, candidate);
-    let spec = MergeSpec {
-        target_branch: "main".into(),
-        expected_target_sha: fixture.base_sha.clone(),
-        handed_off_paths: vec![],
-    };
-    let outcome = fixture
-        .resolved
-        .backend
-        .merge(&fixture.resolved.placement, &spec)
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome,
-        MergeOutcome::Done {
-            before_sha: fixture.base_sha.clone(),
-            after_sha: candidate.clone(),
-            branch: "main".into()
-        }
-    );
-    let receipt = fixture.receipt(METHOD_WORKSPACE_MERGE).await;
-    assert_eq!(receipt["owner_result"]["diffstat"]["files_changed"], 1);
-    assert_eq!(receipt["owner_result"]["outcome"]["after_sha"], candidate);
-    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.before_sha.as_deref(), Some(candidate.as_str()));
-    assert_eq!(execution.after_sha.as_deref(), Some(candidate.as_str()));
-    let requests = fixture
-        .link
-        .as_ref()
-        .unwrap()
-        .requests(METHOD_WORKSPACE_MERGE);
-    assert_eq!(requests[0]["expected"]["sha"], candidate);
-    assert_eq!(requests[0]["expected_target_sha"], contract.base_sha);
-    assert_eq!(requests[0]["reviewed_commit_sha"], candidate);
-    let replay = fixture
-        .resolved
-        .backend
-        .merge(&fixture.resolved.placement, &spec)
-        .await
-        .unwrap();
-    assert_eq!(replay, outcome);
-    assert_eq!(
-        fixture
-            .link
-            .as_ref()
-            .unwrap()
-            .requests(METHOD_WORKSPACE_MERGE)
-            .len(),
-        1
-    );
-    fixture.wait_until_journal_empty().await;
-    fixture.assert_server_cannot_resolve_workspace();
-}
-
-#[tokio::test]
-async fn remote_merge_refuses_changed_candidate_and_target() {
-    let fixture = Fixture::new("forge-workspace-merge-fences").await;
-    fixture.candidate().await;
-    fixture.approve_candidate().await;
-    let spec = MergeSpec {
-        target_branch: "main".into(),
-        expected_target_sha: fixture.base_sha.clone(),
-        handed_off_paths: vec![],
-    };
-    assert_eq!(
-        fixture
-            .run(&format!(
-                "git -C {} commit --allow-empty -m target-moved",
-                quote(&fixture.checkout.to_string_lossy())
-            ))
-            .await
-            .exit_code,
-        0
-    );
-    assert!(matches!(
-        fixture
-            .resolved
-            .backend
-            .merge(&fixture.resolved.placement, &spec)
-            .await
-            .unwrap(),
-        MergeOutcome::TargetMoved { .. }
-    ));
-    let candidate_changed = fixture
-        .run("git commit --allow-empty -m changed-candidate")
-        .await;
-    assert_eq!(candidate_changed.exit_code, 0);
-    let before = fixture
-        .link
-        .as_ref()
-        .unwrap()
-        .requests(METHOD_WORKSPACE_MERGE)
-        .len();
-    assert!(matches!(
-        fixture
-            .resolved
-            .backend
-            .merge(&fixture.resolved.placement, &spec)
-            .await
-            .unwrap(),
-        MergeOutcome::ReviewRequired { .. }
-    ));
-    assert_eq!(
-        fixture
-            .link
-            .as_ref()
-            .unwrap()
-            .requests(METHOD_WORKSPACE_MERGE)
-            .len(),
-        before
-    );
-    fixture.assert_server_cannot_resolve_workspace();
-}
-
-#[tokio::test]
-async fn remote_merge_without_a_reviewer_preserves_merge_commit_and_conflict_evidence() {
-    let fixture = Fixture::new("forge-workspace-unreviewed-merge").await;
-    let candidate = fixture.candidate().await;
-    assert_eq!(
-        fixture
-            .run(&format!(
-                "git -C {} commit --allow-empty -m target",
-                quote(&fixture.checkout.to_string_lossy())
-            ))
-            .await
-            .exit_code,
-        0
-    );
-    let outcome = fixture
-        .harness
-        .state
-        .merge_service
-        .merge(&fixture.resolved.placement.task_id)
-        .await
-        .unwrap();
-    let MergeOutcome::Done { after_sha, .. } = outcome else {
-        panic!("divergent histories merge")
-    };
-    assert_ne!(after_sha, candidate);
-    let requests = fixture
-        .link
-        .as_ref()
-        .unwrap()
-        .requests(METHOD_WORKSPACE_MERGE);
-    assert!(requests[0]["reviewed_commit_sha"].is_null());
-    let receipt = fixture.receipt(METHOD_WORKSPACE_MERGE).await;
-    assert_eq!(receipt["owner_result"]["outcome"]["after_sha"], after_sha);
-    assert_eq!(receipt["owner_result"]["diffstat"]["files_changed"], 1);
-    fixture.assert_server_cannot_resolve_workspace();
-
-    let fixture = Fixture::new("forge-workspace-conflict").await;
-    fixture.candidate().await;
-    let target = quote(&fixture.checkout.to_string_lossy());
-    assert_eq!(fixture.run(&format!("printf 'target\\n' > {target}/feature.txt; git -C {target} add feature.txt; git -C {target} commit -m target")).await.exit_code, 0);
-    let outcome = fixture
-        .harness
-        .state
-        .merge_service
-        .merge(&fixture.resolved.placement.task_id)
-        .await
-        .unwrap();
-    let MergeOutcome::Conflict { conflict_paths, .. } = outcome else {
-        panic!("conflicting additions fail the merge")
-    };
-    assert_eq!(conflict_paths, vec![PathBuf::from("feature.txt")]);
-    assert_eq!(
-        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["conflict_paths"],
-        json!(["feature.txt"])
-    );
-    fixture.wait_until_journal_empty().await;
-    fixture.assert_server_cannot_resolve_workspace();
 }
 
 // Snapshot every table, including rows the effect must leave alone. SQLite's
@@ -2015,210 +1832,6 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
 }
 
 #[tokio::test]
-async fn remote_exact_object_mismatch_retains_refusal_without_execution_success() {
-    let fixture = Fixture::new("forge-workspace-exact-object-mismatch").await;
-    let candidate = fixture.candidate().await;
-    let contract = fixture.approve_candidate().await;
-    let hooks = fixture.checkout.join(".git").join("effect-hooks");
-    let hook = hooks.join("post-merge");
-    let script = "#!/bin/sh\ngit -c core.hooksPath=/dev/null commit --allow-empty -m hook-moved\n";
-    assert_eq!(
-        fixture
-            .run(&format!(
-                "mkdir -p {}; printf %s {} > {}; chmod +x {}; git -C {} config core.hooksPath {}",
-                quote(&hooks.to_string_lossy()),
-                quote(script),
-                quote(&hook.to_string_lossy()),
-                quote(&hook.to_string_lossy()),
-                quote(&fixture.checkout.to_string_lossy()),
-                quote(&hooks.to_string_lossy())
-            ))
-            .await
-            .exit_code,
-        0
-    );
-    let before = task_projection(&fixture).await;
-    let outcome = fixture
-        .resolved
-        .backend
-        .merge(
-            &fixture.resolved.placement,
-            &MergeSpec {
-                target_branch: "main".into(),
-                expected_target_sha: contract.base_sha,
-                handed_off_paths: vec![],
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome,
-        MergeOutcome::TargetMoved {
-            reason: "integration target changed during merge; reviewed content was not integrated"
-                .into(),
-            target_branch: "main".into(),
-        }
-    );
-    assert_eq!(before, task_projection(&fixture).await);
-    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.after_sha, None);
-    assert_ne!(
-        fixture
-            .resolved
-            .git_query(
-                WorkspaceGitQuery::TargetHead {
-                    branch: "main".into()
-                },
-                false
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .trim(),
-        candidate
-    );
-    assert_eq!(
-        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["kind"],
-        "target_moved"
-    );
-    fixture.wait_until_journal_empty().await;
-}
-
-#[tokio::test]
-async fn remote_target_moves_after_rebase_and_review_before_fast_forward() {
-    let fixture = Fixture::new("forge-workspace-target-moves-after-rebase").await;
-    fixture.candidate().await;
-    let target = quote(&fixture.checkout.to_string_lossy());
-    assert_eq!(
-        fixture
-            .run(&format!(
-                "git -C {target} commit --allow-empty -m first-target-move"
-            ))
-            .await
-            .exit_code,
-        0
-    );
-    assert!(matches!(
-        fixture.resolved.rebase_target("main", true).await.unwrap(),
-        WorkspaceOwnerOperationOutcome::Rebased
-    ));
-    let contract = fixture.approve_candidate().await;
-    assert_eq!(
-        fixture
-            .run(&format!(
-                "git -C {target} commit --allow-empty -m second-target-move"
-            ))
-            .await
-            .exit_code,
-        0
-    );
-    let before = task_projection(&fixture).await;
-    let outcome = fixture
-        .resolved
-        .backend
-        .merge(
-            &fixture.resolved.placement,
-            &MergeSpec {
-                target_branch: "main".into(),
-                expected_target_sha: contract.base_sha,
-                handed_off_paths: vec![],
-            },
-        )
-        .await
-        .unwrap();
-    assert!(matches!(outcome, MergeOutcome::TargetMoved { .. }));
-    assert_eq!(before, task_projection(&fixture).await);
-    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.after_sha, None);
-    assert_eq!(
-        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["kind"],
-        "target_moved"
-    );
-    fixture.wait_until_journal_empty().await;
-}
-
-#[tokio::test]
-async fn remote_dirty_task_and_target_retain_receipts_without_task_projection() {
-    for target_dirty in [false, true] {
-        let fixture = Fixture::new("forge-workspace-dirty-characterization").await;
-        let candidate = fixture.candidate().await;
-        let command = if target_dirty {
-            format!(
-                "printf dirty > {}/README.md",
-                quote(&fixture.checkout.to_string_lossy())
-            )
-        } else {
-            "printf dirty > feature.txt".into()
-        };
-        assert_eq!(fixture.run(&command).await.exit_code, 0);
-        let before = task_projection(&fixture).await;
-        let outcome = fixture
-            .resolved
-            .backend
-            .merge(
-                &fixture.resolved.placement,
-                &MergeSpec {
-                    target_branch: "main".into(),
-                    expected_target_sha: fixture.base_sha.clone(),
-                    handed_off_paths: vec![],
-                },
-            )
-            .await
-            .unwrap();
-        if target_dirty {
-            assert!(matches!(outcome, MergeOutcome::TargetDirty { .. }));
-        } else {
-            assert_eq!(
-                outcome,
-                MergeOutcome::Dirty {
-                    files: vec!["feature.txt".into()]
-                }
-            );
-        }
-        let receipt = fixture.receipt(METHOD_WORKSPACE_MERGE).await;
-        assert_eq!(receipt["metadata"]["status"], "result");
-        assert_eq!(before, task_projection(&fixture).await);
-        let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(execution.after_sha, None);
-        assert_eq!(
-            fixture
-                .resolved
-                .git_query(WorkspaceGitQuery::Head, false)
-                .await
-                .unwrap()
-                .unwrap()
-                .trim(),
-            candidate
-        );
-        assert_eq!(
-            fixture
-                .resolved
-                .git_query(
-                    WorkspaceGitQuery::TargetHead {
-                        branch: "main".into()
-                    },
-                    false
-                )
-                .await
-                .unwrap()
-                .unwrap()
-                .trim(),
-            fixture.base_sha
-        );
-        fixture.wait_until_journal_empty().await;
-    }
-}
-
-#[tokio::test]
 async fn remote_rebase_clean_conflict_and_interrupted_recovery_preserve_projection() {
     for case in ["clean", "conflict", "restart", "abort"] {
         let mut fixture = Fixture::new("forge-workspace-rebase-characterization").await;
@@ -2286,93 +1899,37 @@ async fn remote_rebase_clean_conflict_and_interrupted_recovery_preserve_projecti
         );
         fixture.wait_until_journal_empty().await;
         if case == "clean" {
-            assert!(matches!(
-                fixture
-                    .harness
-                    .state
-                    .merge_service
-                    .merge(&fixture.resolved.placement.task_id)
-                    .await
-                    .unwrap(),
-                MergeOutcome::Done { .. }
-            ));
+            let head = fixture
+                .resolved
+                .git_query(WorkspaceGitQuery::Head, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let target = fixture
+                .resolved
+                .git_query(
+                    WorkspaceGitQuery::TargetHead {
+                        branch: "main".into(),
+                    },
+                    false,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fixture
+                .resolved
+                .git_query(
+                    WorkspaceGitQuery::IsAncestor {
+                        base: target.trim().to_owned(),
+                        head: head.trim().to_owned()
+                    },
+                    true
+                )
+                .await
+                .unwrap()
+                .is_some());
         }
     }
-}
-
-#[tokio::test]
-async fn remote_lost_merge_reply_reconnect_commits_evidence_before_ack_without_rerun() {
-    let mut fixture = Fixture::new("forge-workspace-lost-merge-reply").await;
-    let candidate = fixture.candidate().await;
-    fixture.approve_candidate().await;
-    let before = task_projection(&fixture).await;
-    fixture
-        .link
-        .as_ref()
-        .unwrap()
-        .drop_replies
-        .lock()
-        .unwrap()
-        .insert(METHOD_WORKSPACE_MERGE.into());
-    let resolved = fixture.resolved.clone();
-    let target = fixture.base_sha.clone();
-    let running = tokio::spawn(async move {
-        resolved
-            .backend
-            .merge(
-                &resolved.placement,
-                &MergeSpec {
-                    target_branch: "main".into(),
-                    expected_target_sha: target,
-                    handed_off_paths: vec![],
-                },
-            )
-            .await
-    });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if fixture.runtime.journal().pending().unwrap().iter().any(|entry| matches!(entry,
-            JournalEntry::Operation { operation } if operation.method == METHOD_WORKSPACE_MERGE && operation.outcome.is_some())) { break }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "merge reaches the owner journal"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    fixture.link.take();
-    common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
-    assert!(matches!(
-        running.await.unwrap(),
-        Err(WorkspaceBackendError::OwnerUnreachable { .. })
-    ));
-    fixture.reconnect().await;
-    let client = fixture.resolved.backend.daemon_client().unwrap();
-    client
-        .reconcile_pending_operations(&fixture.daemon_id)
-        .await
-        .unwrap();
-    client
-        .retry_acknowledgements(&fixture.daemon_id)
-        .await
-        .unwrap();
-    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.before_sha.as_deref(), Some(candidate.as_str()));
-    assert_eq!(execution.after_sha.as_deref(), Some(candidate.as_str()));
-    assert_eq!(
-        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["after_sha"],
-        candidate
-    );
-    assert_eq!(before, task_projection(&fixture).await);
-    fixture.wait_until_journal_empty().await;
-    assert!(fixture
-        .link
-        .as_ref()
-        .unwrap()
-        .requests(METHOD_WORKSPACE_MERGE)
-        .is_empty());
 }
 
 #[tokio::test]
@@ -2687,68 +2244,6 @@ async fn remote_review_disconnect_does_not_freeze_a_failed_assessment() {
         .await
         .unwrap()
         .is_none());
-    fixture.assert_server_cannot_resolve_workspace();
-}
-
-#[tokio::test]
-async fn remote_interrupted_merge_recovers_only_the_exact_candidate() {
-    let fixture = Fixture::new("forge-workspace-interrupted-merge").await;
-    let candidate = fixture.candidate().await;
-    let contract = fixture.approve_candidate().await;
-    assert_eq!(
-        fixture
-            .run(&format!(
-                "git -C {} merge --ff-only {}",
-                quote(&fixture.checkout.to_string_lossy()),
-                quote(&candidate)
-            ))
-            .await
-            .exit_code,
-        0
-    );
-    fixture
-        .link
-        .as_ref()
-        .unwrap()
-        .interrupt
-        .lock()
-        .unwrap()
-        .insert(METHOD_WORKSPACE_MERGE.into());
-    let outcome = fixture
-        .resolved
-        .backend
-        .merge(
-            &fixture.resolved.placement,
-            &MergeSpec {
-                target_branch: "main".into(),
-                expected_target_sha: contract.base_sha.clone(),
-                handed_off_paths: vec![],
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome,
-        MergeOutcome::Done {
-            before_sha: contract.base_sha,
-            after_sha: candidate.clone(),
-            branch: "main".into()
-        }
-    );
-    assert_eq!(
-        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["diffstat"]["files_changed"],
-        1
-    );
-    fixture.wait_until_journal_empty().await;
-    assert_eq!(
-        fixture
-            .link
-            .as_ref()
-            .unwrap()
-            .requests(METHOD_WORKSPACE_MERGE)
-            .len(),
-        1
-    );
     fixture.assert_server_cannot_resolve_workspace();
 }
 
@@ -6297,6 +5792,20 @@ async fn second_task(fixture: &Fixture, worktree_path: &str) -> (db::Task, db::W
     )
     .await
     .expect("second workspace creates");
+    // Queue admission in production always comes from an implementation
+    // execution; cross-checkout fixtures need that evidence parent too.
+    ExecutionRepo::create(
+        &*database,
+        execution_input(
+            &db::new_uuid_v4(),
+            &task.id,
+            &workspace.id,
+            "executor",
+            ExecutionStatus::Completed,
+        ),
+    )
+    .await
+    .unwrap();
     (task, workspace)
 }
 
@@ -8241,4 +7750,91 @@ async fn a_pre_queue_merge_waiting_for_its_disconnected_daemon_merges_on_reconne
         "the reviewed commit landed as it was"
     );
     let _ = service;
+}
+
+/// A parked attempt still names the runtime/generation that admitted it,
+/// while reconnect recovery has verified its placement on the current owner.
+/// Recovery must replace that binding before the next rebase is requested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_parked_daemon_attempt_rebinds_after_runtime_or_placement_recovery() {
+    use db::IntegrationQueueRepo;
+    for changed in ["runtime", "generation"] {
+        let fixture = Fixture::file_backed("forge-queue-rebind").await;
+        let head = admit_queue_head(&fixture, &[]).await;
+        let database = fixture.harness.state.db.clone();
+        // Keep the ready, verified fake daemon placement, but give the
+        // parked attempt the obsolete binding it had before recovery.
+        let sql = if changed == "runtime" {
+            "UPDATE integration_attempt SET state='parked',runtime_id='gone-runtime',failure_kind='infrastructure',failure_message='owner_offline: owner absent',available_at=NULL WHERE id=?"
+        } else {
+            "UPDATE integration_attempt SET state='parked',placement_generation=0,failure_kind='infrastructure',failure_message='owner_offline: owner absent',available_at=NULL WHERE id=?"
+        };
+        sqlx::query(sql)
+            .bind(&head.attempt_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        // Force a rebase, the effect that used to reject the old owner.
+        std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+        git::commit_all(&fixture.checkout, "target advanced")
+            .await
+            .unwrap();
+        fixture
+            .harness
+            .state
+            .task_service
+            .integration_owner_ready(&head.task_id)
+            .await
+            .unwrap();
+        fixture
+            .harness
+            .state
+            .task_service
+            .task_step_worker()
+            .drain(&head.task_id)
+            .await
+            .unwrap();
+        let successor: Option<String> =
+            sqlx::query_scalar("SELECT id FROM integration_attempt WHERE predecessor_attempt_id=?")
+                .bind(&head.attempt_id)
+                .fetch_optional(database.pool())
+                .await
+                .unwrap();
+        let rebound = database
+            .integration_attempt(&successor.expect("recovery admitted a successor"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            rebound.id, head.attempt_id,
+            "{changed}: the obsolete binding must be released"
+        );
+        assert_eq!(rebound.runtime_id, fixture.resolved.placement.runtime_id);
+        assert_eq!(
+            rebound.placement_generation,
+            Some(fixture.resolved.placement.generation)
+        );
+        assert_eq!(
+            rebound.queue_seq,
+            queue_attempt(&fixture, &head).await.queue_seq
+        );
+        assert_eq!(
+            queue_attempt(&fixture, &head).await.state,
+            db::IntegrationAttemptState::Superseded
+        );
+        assert_ne!(
+            rebound.candidate_sha.as_deref(),
+            Some(head.candidate.as_str())
+        );
+        assert!(
+            rebound.integrated_sha.is_some(),
+            "the replacement actually rebased and merged"
+        );
+        let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+        queue_eventually!(&fixture, &head, "the rebound Task to merge", {
+            task_status(&fixture, &head.task_id).await == "done"
+        });
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    }
 }

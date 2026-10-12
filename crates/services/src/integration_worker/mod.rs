@@ -1,5 +1,5 @@
-//! Integration queue worker (3.2 stage D, part 1d). NOT started by the
-//! runtime until D2: nothing constructs it outside its tests.
+//! The production integration queue worker, shared by the server and Solo
+//! runtimes through TaskService::compose_integration.
 //!
 //! One supervised loop sweeps the queues; one driver per claimed queue walks
 //! its head through the table in `table.rs`. The worker writes queue and

@@ -2259,7 +2259,6 @@ async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {
     let event_bus = Arc::new(EventBus::new(32));
     let merge_service = Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&db),
-        Arc::clone(&event_bus),
         workspace_dir.path().to_owned(),
     ));
     let task_service = Arc::new(
@@ -9703,14 +9702,12 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
         )
         .await
         .unwrap();
-    assert!(matches!(
-        fixture
-            .merge_service
-            .merge(fixture.task.id.clone())
-            .await
-            .unwrap(),
-        crate::merge_service::MergeOutcome::Done { .. }
-    ));
+    // Seed the pre-queue Git effect itself. No current service may bypass
+    // the queue to reproduce a merge from an older installed build.
+    run_git(
+        fixture._repo_dir.path(),
+        &["merge", "--ff-only", &intent.candidate_sha],
+    );
     std::fs::write(
         fixture._repo_dir.path().join("later-user-edit.txt"),
         "preserved after landed merge",
