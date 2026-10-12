@@ -1243,3 +1243,69 @@ async fn a_step_in_the_gate_holds_one_project_slot_and_a_parked_one_none() {
     let parked = slots().await;
     assert_eq!(parked.parked, 1, "{parked:?}");
 }
+
+/// A lead assigned while a step rests in the gate (nothing skipped it yet:
+/// the Project is paused) checks that step: the assignment marks the subtask
+/// and the dispatcher starts the check instead of the skip.
+#[tokio::test]
+async fn a_lead_assigned_while_a_step_rests_in_the_gate_checks_it() {
+    let steps = steps(&[PASS], None).await;
+    let (root, child) = in_progress_root_with_a_step_in_the_gate(&steps, false).await;
+    let pause = async |paused_at: Option<String>| {
+        let project = ProjectRepo::get_by_id(&*steps.db, &steps.project)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectRepo::update_at_version(
+            &*steps.db,
+            UpdateProject {
+                id: project.id.clone(),
+                name: None,
+                settings: None,
+                primary_repo_id: None,
+                paused_at: Some(paused_at),
+                updated_at: now_rfc3339(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .unwrap();
+    };
+    pause(Some(now_rfc3339())).await;
+    passes(&steps, 2).await;
+    assert_eq!(reload(&steps.db, &child.id).await.status, "lead_check");
+    let now = now_rfc3339();
+    steps
+        .dispatcher
+        .task_service
+        .reassign_role(
+            db::CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: root.id.clone(),
+                role_name: crate::workflow::default_roles::PLANNER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(steps.planner.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("the lead is assigned on the root");
+    pause(None).await;
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &child.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(
+        executions(&steps.db, &child.id).await,
+        vec![("planner".to_owned(), "completed".to_owned())],
+        "the new lead checked it"
+    );
+    assert_eq!(
+        log(&steps.db, &child.id).await,
+        vec![hop("lead_check", "done", None, false)]
+    );
+}
