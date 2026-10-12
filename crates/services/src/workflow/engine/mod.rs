@@ -1459,7 +1459,9 @@ impl WorkflowExecution<'_> {
                 && to_state.gate_config.as_ref().is_some_and(|g|g.optional_when_unassigned() && !g.requires_user_approval())
                 && to_state.hooks.after_enter.iter().any(|h|h.action=="auto_cascade_on_unassigned_role" && hook_audience_matches(h.applies_to,&actor))
             {
-                if let Some(target)=workflow.outgoing_trigger_targets(&target_state).filter(|(trigger,_)|!trigger.system_only()).find_map(|(_,to)|WorkflowEngine::find_state(workflow,&to).filter(|s|s.kind==StateKind::Active)) {
+                // The state the skip really goes to; a gate skipped to a terminal
+                // state (a step check) starts no role and reserves nothing.
+                if let Some(target)=crate::workflow::optional_gate_skip_target(workflow,&target_state).filter(|s|s.kind==StateKind::Active) {
                     if let Some(role)=crate::workflow::effective_role(target) {
                         admission_agent_id=crate::task_hierarchy::effective_role_assignment(&self.db,&producing,role).await?.map(|r|r.assignment).filter(|a|a.assignee_type==Some(db::AssigneeKind::Agent)).and_then(|a|a.assignee_id);
                         if admission_agent_id.is_some() { dispatch_index=None; }
