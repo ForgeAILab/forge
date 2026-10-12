@@ -4000,6 +4000,20 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             assert_eq!(evidence["identity_key"], entry.1);
             assert_eq!(evidence["result_id"], entry.0);
             assert_eq!(evidence["source"], "cache_hit", "{details}");
+            // The reuse was applied by the `settle` step that recorded it:
+            // its consumer is answered and no delivery step is spent on it,
+            // now or at a later look of the check worker.
+            let _ = db::CheckDeliveryRepo::enqueue_check_result_steps(&*world.db, 100)
+                .await
+                .unwrap();
+            let head: (Option<String>, Option<String>, i64) = sqlx::query_as(
+                "SELECT c.applied_at,c.delivery_step_id,(SELECT COUNT(*) FROM task_step s WHERE s.task_id=c.task_id AND s.causation_key LIKE 'check-result:'||c.id||':%') FROM check_consumer c WHERE c.task_id='evidence' AND c.origin='integration'",
+            )
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap();
+            assert!(head.0.is_some(), "the head's reuse is created answered");
+            assert_eq!((head.1, head.2), (None, 0), "no delivery step for a reuse");
         }
         let runs: i64 = world.scalar("SELECT COUNT(*) FROM check_run WHERE id IN(SELECT run_id FROM check_consumer WHERE task_id=?)", "evidence").await;
         // Both consumers of a hit reference the one entry run. A rebased

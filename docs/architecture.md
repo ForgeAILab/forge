@@ -5660,9 +5660,10 @@ A missing matching entry result preserves the existing unchanged-target skip;
 manual/agent review authority is still checked by settle. Only the `settle`
 step that is due for its `effect_seq` records a reuse; a stale or answered
 step writes no consumer. The reuse states no check wait on the Task (the
-answer exists and the step applies it itself), and the head consumer is never
-the applied delivery of a result: its delivery step finds no checking attempt
-and ends stale. The Review's entry consumer is found by the request key
+answer exists and the step applies it itself), and the head consumer is
+created answered (`applied_at` set, no delivery step): the check worker's
+delivery sweep leaves it out, so a merge of an unchanged commit spends no
+Task step on a delivery. The Review's entry consumer is found by the request key
 review entry asks with (`TaskCheckRequest::request_key`).
 
 The consuming Task step appends the newest 64 command-shaped results to

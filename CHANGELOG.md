@@ -3039,6 +3039,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Merging an unchanged commit no longer spends a Task step on a check
+  delivery nobody reads.** The queue head's reuse of the review entry's
+  check result is applied by the `settle` step that records it; its consumer
+  is now created answered and the check worker enqueues no
+  `apply_check_result` step for it (that step found no checking attempt and
+  ended `stale`). Migration `V202610121119` rebuilds the undelivered-result
+  index so an answered consumer is not in it; no row changes.
+
 - **A slow login shell no longer loses a merge's check evidence or runs a
   check twice.** When the login-shell probe did not answer within its ten
   seconds (a loaded host), the identity built at the merge head differed from

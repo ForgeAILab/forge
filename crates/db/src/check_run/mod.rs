@@ -780,9 +780,13 @@ impl SqliteDb {
             (id, None, CheckRequestDisposition::Scheduled)
         };
         let id = new_uuid_v4();
-        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        // A reuse-only request is made by the step that applies the answer
+        // itself (the integration head's `settle`): the consumer is created
+        // answered, so the check worker enqueues no delivery step for it.
+        let answered = reuse_only.then(|| now.clone());
+        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,applied_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.task_id).bind(request.status_epoch)
-            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(now).execute(&mut *tx).await?;
+            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(answered).bind(now).execute(&mut *tx).await?;
         let consumer = map_consumer(
             sqlx::query("SELECT * FROM check_consumer WHERE id=?")
                 .bind(id)
