@@ -453,6 +453,22 @@ impl RepoLocationService {
         self.visible_location(repo_id, location_id, user_id).await?;
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let now = now_rfc3339();
+        // Moving a repository's default checkout takes the target away from
+        // its merge queues: refused (`409 integration_unresolved`) while a
+        // merge into the repository has an unknown result or an owner effect
+        // outstanding. In the transaction of the write it guards.
+        let changes: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM repo_location WHERE id = ? AND repo_id = ? AND is_default <> ?)",
+        )
+        .bind(location_id)
+        .bind(repo_id)
+        .bind(request.is_default)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if changes {
+            db::refuse_default_change_while_integration_unresolved(&mut transaction, location_id)
+                .await?;
+        }
         let result = sqlx::query("UPDATE repo_location SET is_default = ?, version = version + 1, updated_at = ? WHERE id = ? AND repo_id = ? AND version = ?")
             .bind(request.is_default).bind(&now).bind(location_id).bind(repo_id).bind(request.version)
             .execute(&mut *transaction).await?;

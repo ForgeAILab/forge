@@ -8,6 +8,39 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Deleting a repository, a repo location or a Project, and changing a
+  repository's default location, is refused while a merge into it is
+  unresolved (`409 integration_unresolved`).** "Unresolved" is a merge whose
+  result is unknown or whose effect on an owner machine has not been answered
+  for. The error's `details` name the Task (`task_id`) and the machine
+  (`machine`); `?force=true` does not override it. Reconnect that machine, or
+  remove the machine (which settles the effect as failed), then retry.
+  Deleting a repo location used to settle an in-flight merge effect as a
+  permanent loss; it is now refused instead, so a merge that landed is never
+  recorded as failed by a deletion.
+- **A merge that waits for an offline machine says so and resumes by itself.**
+  A Task in the merge queue whose checkout's machine is unreachable (or whose
+  placement is not `ready` again after a reconnect) now reports
+  `integration` / `deferred` with cause `owner_offline` and the machine in
+  `owner_id`, instead of `infrastructure`. It no longer spends the three
+  counted infrastructure retries and then asks its owner to Retry: it waits,
+  is asked again on a back-off of at most ten minutes, and goes on at once
+  when the machine reconnects.
+- **Admission to the merge queue under the disk floor is a disk wait.** When a
+  Task's worktree is gone and the disk is under its floor, entering `merging`
+  no longer recreates the worktree anyway (and no longer fails the merge as a
+  `workspace_error`): the Task reports its disk capacity wait
+  (`machine_capacity` / `disk`), is not blocked and is asked again at the
+  30 second recheck. Nothing is charged to a retry budget.
+- **The merge-queue check and the review-entry check are one result.** The
+  check a queue head runs on a rebased commit is asked for under the same
+  identity as review entry's check (same commands, policy, workspace and
+  placement generation; the purpose is not part of it). `check_run` rows of a
+  queue head therefore carry the review-entry specification
+  (`purpose` `entry_ci` in the stored spec) rather than a separate
+  `queue_head_ci` specification, and a result of either is eligible for
+  reuse by the other for the same commit in the same worktree (a rebased
+  commit is another commit and still runs once).
 - **`merging` now means "in the merge queue" (3.2 stage D2b).** A Task
   entering `merging` is queued for its repository's target branch and stays
   in `merging` while Forge rebases it (only if the target moved), checks the
@@ -1276,6 +1309,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   credential and from 16,060 to 13,060 for a Project owner.
   `forge_transition_task` is unchanged: it still runs as the MCP system
   component, on defined workflow edges only and without the user override.
+- The owner's override on a Task in its merge state is labelled **Mark done
+  without merging** (it was "Advance Task"): it ends the Task as done, merges
+  nothing and cancels its place in the merge queue.
 
 - **Operator status shows where merges spend their time (3.2 stage D3a).**
   `GET /api/v1/operations/status` `integration_queues` adds `waiting`,
@@ -2809,6 +2845,77 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   A contract correction names the field and the accepted type and never
   quotes the value that was sent.
 
+- **Changing a repository's default location is refused over the API while a
+  merge is unresolved.** The `409 integration_unresolved` guard for the
+  default change sat on a storage method the `PATCH` route does not use, so
+  the route moved the default (and with it every merge queue's target) while
+  a merge had an unknown result. The guard is now in the transaction of the
+  write the route makes.
+- **A forced Project delete that is refused for an unresolved merge no longer
+  cancels the Project's work first.** `DELETE /api/v1/projects/{id}?force=true`
+  checks `integration_unresolved` before it stops any execution, lease or
+  check.
+- **A merge with an unknown result from before the merge queue can be
+  settled.** Such a merge is recorded against the machine that ran it, with no
+  queue-era effect to settle. Removing that machine now settles it (it used to
+  stay unknown, refusing every deletion of its repository and its owner's
+  Retry for good), and the owner's **Retry Merge** on such a Task settles it
+  explicitly: the old operation is closed as failed and Git decides (the
+  commit is in the target: reported once the target's owner has proven it;
+  it is not: the Task is queued again). Nothing is merged twice.
+- **A workflow with two merge states** reports a landed merge to the `accept`
+  target of the merge state the Task was in (it went to the state named
+  `done` whenever the workflow still had one), and sends a repair to that
+  state's own repair state. **A workflow in which no state merges** is no
+  longer scanned by the upgrade import for Tasks in a state that happens to
+  be called `merging`.
+
+- **One writer per merge while an install is upgraded to the merge queue.**
+  The queue worker no longer takes an attempt that was recorded before the
+  queue was active (an imported row, or a `shadow:` row of the passive stage)
+  until that Task's import continuation step has settled, and never while the
+  old merge's own hooks step is still live (a pending, claimed or suspended
+  hooks step that recorded a `merge_intent`, `merge_outcome` or
+  `rebase_target`): it could start a rebase in a checkout that step was still
+  rebasing. The same rule holds a reserved imported head (an unknown result).
+  The old step now hands over through admission only: a merge it had finished
+  is no longer reported by that step beside the queue. The Task is admitted,
+  the head finds its commit in the target, and the `result` step reports it
+  after the target's owner has proven it (if the candidate can no longer be
+  named, the step reports it itself, after the same proof). The import
+  continuation waits for an earlier, suspended hooks step of the entry instead
+  of admitting beside it.
+
+- **A Task is reported merged only when the target's owner confirms it.**
+  Before the merge queue moves a Task to `done` (and before a merge that had
+  landed before an upgrade is reported), the owner of the repository's default
+  checkout is asked whether the target branch contains the merged commit: one
+  `git merge-base --is-ancestor` on the server, or the read-only
+  `integration.target_facts` of the daemon that holds the checkout. A recorded
+  merge receipt never replaces that read; a receipt of another attempt, of a
+  later claim, of another owner or naming another commit refuses the report
+  without reading Git. If the target does not contain the commit (it was
+  rewound after the fast-forward, or the row was wrong) the Task stays in its
+  merge state with the typed reason `integration` / `deferred` /
+  `unresolved_result`, its attempt leaves the queue slot
+  (`target_missing_commit`) and is validated again on the retry timer, so it
+  merges again against the target as it is. If the owner cannot be asked, the
+  Task says so and the question is repeated every 30 seconds; nothing is
+  reported meanwhile. The attempt graph gains `applied → parked`.
+
+- A Task that was merging on a daemon when the daemon dropped off, on an
+  install upgraded to the merge queue, merges when the daemon reconnects with
+  no owner action. Its stored retry time no longer puts a row the queue
+  cannot drive back in line.
+- A start no longer writes a history row for a cancelled Task whose merge
+  entry lies more than one status entry back (a Task cancelled out of
+  `merge_failed`).
+- Projects whose workflow renames the done, cancellation or review state: the
+  start-time import reads Tasks in those states by their role, and a merge the
+  old path had finished, a merge failure and the conflict-marker guard go to
+  the workflow's own states instead of `done` / `merge_failed` / `review`.
+- Draining a Task's steps no longer waits without limit for a stopped merge
+  head driver (30 seconds, then it is aborted).
 - **Cancel and Hold no longer strand a merge-queue step at transaction startup.**
   Preemption could drop SQLx's `BEGIN IMMEDIATE` after SQLite acknowledged it
   but before a rollback guard existed, returning a connection that held the

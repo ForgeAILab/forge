@@ -5,6 +5,11 @@ use ts_rs::TS;
 
 pub type TaskStatus = String;
 pub const TASK_BUSY: &str = "task_busy";
+/// `409`: a repository, repo location or Project cannot be deleted, and a
+/// repository's default location cannot be changed, while a merge into it
+/// has an unknown result or an owner effect still outstanding. `details`
+/// names the Task (`task_id`) and the machine (`machine`).
+pub const INTEGRATION_UNRESOLVED: &str = "integration_unresolved";
 /// HTTP 409: the Task's stored condition was written by a newer Forge build.
 /// A hold, a release or an integration statement on it is refused whole.
 pub const TASK_CONDITION_QUARANTINED: &str = "task_condition_quarantined";

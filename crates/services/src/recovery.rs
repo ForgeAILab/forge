@@ -3312,6 +3312,21 @@ async fn complete_workspace_reconciliation(
         .bind(format!("task-owner-wait:{}", ready.task_id)).execute(&mut *transaction).await?;
     transaction.commit().await?;
     if let Some(task_service) = task_service {
+        // A merge that waited for this machine goes on now, not at the
+        // worker's next retry. Best effort: the worker's sweep and the
+        // reconciler find the same Task without this call.
+        // It may queue a Task command and wait for it, so it does not run
+        // inside this reconciliation.
+        let (service, task_id, placement_id) = (
+            task_service.clone(),
+            ready.task_id.clone(),
+            ready.id.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(error) = service.integration_owner_ready(&task_id).await {
+                tracing::warn!(%placement_id, %task_id, %error, "integration was not woken for the reconnected owner; the sweep retries");
+            }
+        });
         // Cascades and terminal ACK retries run outside the owner permit.
         // A ready-placement sweep can redrive a crash here.
         if let Err(error) =

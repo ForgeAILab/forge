@@ -33,7 +33,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
-| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution, a Workspace lease or a check run is live; `?force=true` refuses without cancelling anything when a check run is on an unreachable machine, and otherwise requests cancellation before retrying the guard |
+| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution, a Workspace lease or a check run is live, and `409 integration_unresolved` (never forced) while a merge into one of its repositories has an unknown result or an owner effect outstanding; `?force=true` refuses without cancelling anything when a check run is on an unreachable machine, and otherwise requests cancellation before retrying the guard |
 | GET    | `/api/v1/projects/{id}/analytics` | Read authorized Project analytics for a half-open window (CI steps, review summary, typed usage/cost breakdown, and released-milestone outcome economics) |
 | POST   | `/api/v1/projects/{id}/cost-estimation-previews` | Preview exact retrospective estimates for eligible legacy Project usage against one immutable catalog snapshot |
 | POST   | `/api/v1/projects/{id}/cost-estimation-runs` | Commit one preview's retrospective estimates idempotently |
@@ -107,7 +107,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
 | GET    | `/api/v1/repos/{id}` | Get repo |
 | PATCH  | `/api/v1/repos/{id}` | Update repo |
-| DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it |
+| DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it, and `409 integration_unresolved` while a merge into it has an unknown result or an owner effect outstanding |
 | GET    | `/api/v1/repos/{id}/integration-queues` | The repository's merge queues, one per target branch, with their members in queue order (see [Merge queue reads](#merge-queue-reads)) |
 | GET    | `/api/v1/repos/{id}/locations` | Owner/admin lists visible repository locations with opaque cursor pagination |
 | POST   | `/api/v1/repos/{id}/locations` | Owner/admin registers and verifies a machine-local checkout |
@@ -2679,6 +2679,28 @@ Deleting a Repo clears the Project's primary pointer while retaining historical
 Workspace provenance. The delete is atomic and returns HTTP `409` with
 `code: "repo_in_use"` if a running Execution or active Workspace lease is still
 bound to that Repo; it never tears repository authority out from under a run.
+
+**`409 integration_unresolved`.** Deleting a Repo, a repo location or a
+Project, and changing a Repo's default location, is refused while a merge into
+that Repo has an unknown result or an owner effect still outstanding: the
+merge's attempt has an effect the owner machine has not answered for, or is
+being reconciled. `details` is `{"task_id", "machine"}`: the Task whose merge
+it is and the machine whose answer is missing (`the server` for the server's
+own checkout). `?force=true` does not override it. Reconnect that machine (its
+receipt settles the merge) or remove the machine (the effect is settled as
+failed and the Task goes back to review); then retry the request. A merge that
+was in flight before the merge queue existed and never reported is settled the
+same way by removing its machine, or by the Task owner's `retry` action on
+that Task (it closes the old operation and lets Git decide). A forced Project
+delete is refused before anything is cancelled.
+
+**Reporting a merge.** A Task is moved to `done` by the merge queue only after
+the owner of the repository's default checkout has confirmed that the target
+branch contains the merged commit. If it does not (the target was rewound),
+the Task stays in its merge state with condition reason `integration`, kind
+`deferred`, cause `unresolved_result`, and is queued again on the retry timer.
+In a merge state the owner's `approve` override is offered with the label
+"Mark done without merging".
 
 The response also includes `availability` for each dimension. `current` means
 the authoritative rows were read; `unavailable` (with a `refresh_and_retry`

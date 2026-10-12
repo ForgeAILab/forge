@@ -1453,11 +1453,16 @@ pub(crate) async fn ensure_valid(
 /// worktree that cannot be made again under the disk floor into the Task's
 /// disk capacity wait: a claim (`Execute`), a before-work hook and the
 /// review entry's check request (`Check`, whose hooks step suspends on the
-/// wait) do. An integration step would fail instead, so its recreate is
-/// admitted under the floor as it was before the typed outcome existed,
-/// until its owner maps it.
+/// wait) do. So does admission to the integration queue (`Integrate`): the
+/// `run_merge` hook suspends on the wait like any other hook, and the
+/// reconciler, the importer's continuation and the owner's Retry state the
+/// Task's disk capacity wait and ask again at its recheck. No worktree is
+/// recreated under the floor.
 fn waits_for_disk(purpose: Purpose) -> bool {
-    matches!(purpose, Purpose::Execute | Purpose::Hook | Purpose::Check)
+    matches!(
+        purpose,
+        Purpose::Execute | Purpose::Hook | Purpose::Check | Purpose::Integrate
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

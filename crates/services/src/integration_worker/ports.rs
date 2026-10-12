@@ -147,6 +147,9 @@ pub enum IntegrationStepOutcome {
     Infrastructure,
     /// `result`: the Task was advanced.
     Done,
+    /// `result`: the owner of the target says the target does not contain
+    /// the commit the attempt records as merged. Nothing was reported.
+    NotLanded,
 }
 
 /// What a Task step writes to `effect_ack_json` (with `acknowledged_at`) in

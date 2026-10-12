@@ -4766,7 +4766,9 @@ this and no other code merges.
 | Result: execution evidence, "Changes merged" comment | protected `integration/result` step | `merging` → `done` | `applied`, then settled |
 | Rebase conflict (committed with markers), or a red head check | `integration/send_back` step | `merging` → `merge_failed` (coder), typed `conflict_handoff` bridge for a conflict | `repair` / `candidate_check_failed`, handed off |
 | The rebased commit is not covered by the passed review | `integration/send_back` step | `merging` → `merge_failed` → `review` (`review_refresh` bridge) | `review_required`, handed off |
-| Infrastructure, an offline owner, a dirty default checkout, a paused Project, a suspended queue | `integration/park` step | `merging` | `deferred` with its cause (retried by the worker's sweep, or the owner's) |
+| Infrastructure, a dirty default checkout, a paused Project, a suspended queue | `integration/park` step | `merging` | `deferred` with its cause (retried by the worker's sweep, or the owner's) |
+| The machine that holds the Task's checkout is unreachable, or its placement is not `ready` again | `integration/park` step | `merging` | `deferred` / `owner_offline`, `owner_id` the machine; no retry is counted, the sweep asks again (back-off to `soon_retry_max`), and the reconnect makes the attempt due at once |
+| The Task's worktree would have to be recreated under the disk floor at admission | the entry's hooks step (suspended on the disk wait), or the reconciler | `merging` | the Task's disk capacity wait (`machine_capacity` / `disk`), 30 s recheck; no attempt exists yet |
 | The Task leaves `merging` by an owner command (Cancel, Hold, a board move) | that command; then `integration/clear` | the command's target | cleared |
 
 `merge_failed` therefore only means "a coder is repairing a conflict, a red
@@ -4799,6 +4801,55 @@ one set of timers. A Task step that writes an answer on an attempt wakes that
 head's driver (`IntegrationQueueWorker::notify_answered`); a driver that
 misses the wake reads the answer at its poll.
 
+**Settle-time proof: `done` means the target contains the commit.** The
+attempt's `integrated_sha` is a claim the worker wrote (from a fast-forward
+receipt, or from a landed witness it read earlier). The `integration/result`
+step does not report on it. Before it writes the evidence, the comment or the
+`done` cascade it asks the owner of the queue's default checkout whether the
+target branch contains the commit (`integration_steps::proof`): one
+`git merge-base --is-ancestor` in a server-owned checkout, the read-only
+`integration.target_facts` of the daemon that owns a daemon-owned one. The
+read runs outside of any database transaction. A receipt never replaces it;
+a fast-forward receipt on the attempt that is another attempt's, of a later
+claim generation, of another owner, or that names another commit refuses the
+report before Git is read. When the integrated commit is not the Task's own
+commit (a merge commit of before the queue) both are asked for.
+
+| Proof | Task | `result` step | Attempt |
+|---|---|---|---|
+| The target contains the commit | evidence, comment, `merging` → `done` | answers `done` | `applied` → `completed` |
+| The owner answers "not contained" (the target was rewound after the fast-forward, or the row was wrong) | stays in its merge state, `deferred` / `unresolved_result` with an interruption | answers `not_landed` and ends | the worker drops the recorded result and takes the attempt off the slot (`applied` → `parked`, `target_missing_commit`, kind `needs_fact`); the counted retry timer queues it again and validation merges it against the target as it is (after the counted retries: `owner_required` with the Retry offer) |
+| No answer (the owner is not connected, the checkout cannot be read) | stays, `deferred` / `unresolved_result` | stays pending, asks again at `result_park` (30 s); the worker re-arms it on every sweep | stays `applied` and keeps the slot |
+| An imported landed row (no worker holds a slot for it) is not proven | stays, `deferred` / `unresolved_result` | the import continuation asks again on the same timer | stays `applied` |
+
+**One writer per merge during an upgrade.** Three things could act on a merge
+that was in flight the old way: the old merge's own hooks step, the import
+continuation step, and the queue worker. The two Task steps exclude each
+other (one step per Task). The worker is kept out by the claim predicate
+(`integration_queue`, the head pick and the claimable-queues listing): an
+attempt admission made is claimable; an attempt from before the queue (an
+imported row or a `shadow:` row) only once its `integration-import:<id>`
+continuation step has settled and no live hooks step of the Task's present
+entry carries an effect of the old merge path (`merge_intent`,
+`merge_outcome`, `rebase_target`). A reserved imported head (an unknown
+result) is held the same way while that step is live. The hand-over is
+admission, in both steps: the `run_merge` hook finishes the rebase the old
+step started and then admits; a merge the old step had finished is admitted
+too, the head finds its commit in the target and the proven `result` step
+reports it (only if the candidate can no longer be named does the hook report
+it itself, after the same proof). The continuation waits for an earlier,
+suspended hooks step of the entry instead of admitting beside it. Residue: a
+`shadow:` row of a deleted Task gets no continuation and is never claimed; it
+holds no slot.
+
+**Unknown results from before the queue.** An imported merge whose old
+operation never reported is recorded `uncertain` against the machine that ran
+it, without a fenced intent, so no owner receipt settles it. It is settled by
+removing that machine (`settle_removed_integration_owner`) or, explicitly, by
+its owner's Retry (`settle_imported_integration_operation`): the operation
+becomes `failed`, a `reconciling` attempt becomes `quarantined`, and Git
+decides from there. Until then it refuses the deletions below.
+
 **Importer continuation.** At every start the storage importer runs until
 nothing is left, then each *current* imported attempt (and each attempt the
 passive shadow recording left) without a continuation gets one
@@ -4827,18 +4878,78 @@ recorded `rebase_target` without an outcome is finished by the
 interrupted-rebase rule it was started under (a conflict is handed to the
 Worker); anything else is admitted.
 
+**Head check identity.** The check of a rebased head is asked for under the
+identity review entry asks under (`workflow/actions/review.rs`
+`request_entry_check`): the spec built by `build_check_spec` with the canonical
+policy, the review state's effective configuration, the Task's workspace id
+and placement generation, digested by `check_runner::policy::digest_input`.
+The purpose (`queue_head_ci`) is a property of the consumer, not of the
+result. A commit that passed these commands in this worktree at review entry
+is a hit and runs nothing; a commit the queue rebased is another commit and
+runs once; a daemon-owned checkout keeps its owner's frozen policy and always
+runs, as at entry. A head is only checked on a clean worktree (validation
+parks a dirty one), which is the entry's dirty-tree rule. Measured by
+`head_check_runs_are_zero_on_an_unchanged_target_and_one_per_rebased_task`:
+Tasks that reach the head with the target where their review left it run no
+head check; Tasks that had to be rebased run exactly one each.
+
+**Owner reconnect.** When a reconnected daemon's placement turns `ready`
+(`recovery::reconcile_workspace_placement`) the Task's merge is woken
+(`TaskService::integration_owner_ready`): a parked attempt with a retry time
+is made due and the worker notified; a Task whose merge was waiting for that
+machine before the queue existed (importer row P15, an attempt that names no
+candidate) is admitted there. The worker's sweep never re-queues an imported
+row that names no candidate: only admission (its continuation step, the
+reconciler, the reconnect, the owner's Retry) continues it, by superseding it.
+
+**Roles, not names.** The importer selects and classifies by the role a state
+plays in the Project's workflow (`integration_queue::importer::merge_roles`:
+merge, repair, done = the merge state's `accept` target, cancellation = any
+other terminal state, review = the `run_ci_steps` entry), and the Task-side
+targets of a merge outcome are resolved by `integration_steps::reconcile::
+role_target`, including the legacy effects the admitting `run_merge` reports.
+
+A workflow with two merge states gives each its own outcome targets: a landed
+merge goes to the `accept` target of the merge state the Task was in, a
+repair to that state's own `reject` target when it carries the repair role's
+exit guard. A workflow in which no state has the `run_merge` entry hook has
+no merge role and nothing of it is imported.
+
+**Deletion guards.** `integration_queue::refuse_unresolved_integration` runs
+inside the transaction that deletes a repository, a repo location or a
+Project, and before a location's `is_default` changes. It refuses with
+`DbError::IntegrationUnresolved` (HTTP `409 integration_unresolved`, naming
+the Task and the machine) while an attempt of a queue in that scope has an
+effect intent, a running or uncertain owner operation, or is `reconciling` /
+`ff_inflight`. Removing the machine is the operation that settles an effect
+nobody can answer for (`settle_removed_integration_owner`).
+
+The default-location change is guarded in `RepoLocationService::update`, in
+the transaction of the write the `PATCH` route makes
+(`refuse_default_change_while_integration_unresolved`). A forced Project
+delete checks the guard before it cancels anything. The owner's override
+(`approve`) on a Task in its merge state is offered as "Mark done without
+merging": it ends the Task as done, merges nothing and cancels the attempt.
+
+**Write-transaction rule.** No database write transaction is held across a
+Git subprocess, an owner RPC or a write on another pooled connection anywhere
+under `integration_steps`, `integration_worker`, `integration_ports` or
+`db::integration_queue`. The exception that remains is on code the queue does
+not reach: `lock_review_integration` (`db/src/review_conformance.rs`) wraps
+the Git merge of the old chain below.
+
 Left from the old path, with no production caller: `MergeService::merge`
 and `merge_workspace`, the workspace backends' `merge` operation
 (`WorkspaceBackend::merge`, embedded and daemon) and `MergeSpec`. Only tests
 call them (`merge_service::tests`, `workspace_backend_characterization`,
-`daemon_workspace_roundtrip`). The queue's fast-forward goes through the
-integration owners (`ServerIntegrationOwner::merge`, the daemon's
-`workspace.merge` with a claim binding), not through these.
+`daemon_workspace_roundtrip`, `workflow::engine::tests`). The queue's
+fast-forward goes through the integration owners
+(`ServerIntegrationOwner::merge`, the daemon's `workspace.merge` with a claim
+binding), not through these. Their removal is still to do.
 
-Not built in this stage (stage D3): public queue reads (REST, MCP,
-`forge-ctl`), web labels, the `integration.updated` event, operator timing
-percentiles, the retention job, and the `409 integration_unresolved` deletion
-guards.
+Not built yet: the retention job for receipts and daemon journals; the public
+queue reads, web labels and the `integration.updated` event are built by the
+public-reads change.
 
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same

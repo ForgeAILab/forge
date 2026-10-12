@@ -627,6 +627,157 @@ async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
     assert_eq!(db.import_integration_pass(100).await.unwrap().examined, 0);
 }
 
+/// The `integration_unresolved` guard. While a merge into a repository has an
+/// unknown result or an owner effect outstanding, deleting the repository,
+/// the target location or the Project, and changing the repository's default
+/// location, are refused with a typed error naming the Task and the machine.
+/// Once the effect is settled each of them works again.
+#[tokio::test]
+async fn deletion_and_default_change_are_refused_while_a_merge_is_unresolved() {
+    use crate::{ProjectRepo, RepoLocationRepo, RepoRepo};
+    for unresolved in [
+        "effect_intent_json='{\"kind\":\"fast_forward\"}'",
+        "current_operation_state='uncertain'",
+        "state='reconciling'",
+    ] {
+        let db = fixture().await;
+        seed_delivery(&db, "a").await;
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let attempt = db
+            .admit_integration_attempt(admission(&q, "a", "admit:a:0"))
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE integration_attempt SET {unresolved} WHERE id=?"
+        ))
+        .bind(&attempt.id)
+        .execute(db.pool())
+        .await
+        .unwrap_or_else(|error| panic!("{unresolved}: {error}"));
+        let refused = |result: Result<()>| match result {
+            Err(DbError::IntegrationUnresolved { task_id, machine }) => {
+                assert_eq!(task_id, "a", "{unresolved}");
+                assert_eq!(machine, "the server", "{unresolved}");
+            }
+            other => panic!("{unresolved}: not refused: {other:?}"),
+        };
+        refused(RepoRepo::delete(&db, "r").await);
+        refused(RepoLocationRepo::delete(&db, "l").await);
+        refused(ProjectRepo::delete(&db, "p").await);
+        let location = RepoLocationRepo::get_by_id(&db, "l")
+            .await
+            .unwrap()
+            .unwrap();
+        refused(
+            RepoLocationRepo::update(
+                &db,
+                crate::UpdateRepoLocation {
+                    id: "l".into(),
+                    expected_version: location.version,
+                    path: None,
+                    kind: None,
+                    is_default: Some(false),
+                    status: None,
+                    last_verified_at: None,
+                    last_error: None,
+                    updated_at: FIXED_TIME.into(),
+                },
+            )
+            .await
+            .map(|_| ()),
+        );
+        // Settled: nothing is refused any more.
+        sqlx::query("UPDATE integration_attempt SET effect_intent_json=NULL,current_operation_state=NULL,state='parked' WHERE id=?")
+            .bind(&attempt.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        ProjectRepo::delete(&db, "p").await.unwrap();
+    }
+}
+
+/// A cancelled Task whose merge entry is behind it, at any distance, is not
+/// imported again: its newest attempt is the record of that entry once it is
+/// terminal, whatever epoch it was admitted in (an attempt that never joined
+/// a queue can only be an imported row, which already stands for its Task).
+/// A start after the Cancel writes no history row for it. While the
+/// newest attempt still has an effect outstanding the Task is imported, so
+/// an unproved merge is never dropped.
+#[tokio::test]
+async fn a_cancelled_task_is_not_imported_again_at_any_epoch_distance() {
+    for (name, epochs_since, state, intent, in_queue, imported) in [
+        // Cancelled out of `merging`: one epoch back (the old rule).
+        ("from merging", 1, "cancelled", false, true, 0),
+        // Cancelled out of `merge_failed`: the attempt is of the `merging`
+        // entry before it, two epochs back.
+        ("from merge_failed", 2, "cancelled", false, true, 0),
+        // Repaired and re-reviewed several times before the Cancel.
+        ("many entries later", 7, "superseded", false, true, 0),
+        // Still in a queue and not terminal: the worker has not ended it.
+        ("not ended yet", 2, "ejected", false, true, 1),
+        // An outstanding effect is never dropped.
+        ("effect outstanding", 2, "cancelled", true, true, 1),
+    ] {
+        let db = fixture().await;
+        sqlx::raw_sql("DELETE FROM integration_attempt; DELETE FROM integration_queue;")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM task WHERE id<>'a'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        seed_delivery(&db, "a").await;
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let admitted = db
+            .admit_integration_attempt(admission(&q, "a", "admit:a:0"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('left','a','merging','merge_failed','workflow','conflict',?)").bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET status='cancelled',status_epoch=status_epoch+? WHERE id='a'")
+            .bind(epochs_since)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // The admission identity is left out of the question: only the rule
+        // for a cancelled Task decides.
+        sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE integration_attempt SET admission_key='entry:a',state=?,current=0,\
+               effect_intent_json=CASE WHEN ? THEN '{\"kind\":\"merge\"}' ELSE NULL END,\
+               queue_id=CASE WHEN ? THEN queue_id ELSE NULL END WHERE id=?",
+        )
+        .bind(state)
+        .bind(intent)
+        .bind(in_queue)
+        .bind(&admitted.id)
+        .execute(db.pool())
+        .await
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let pass = db.import_integration_pass(100).await.unwrap();
+        assert_eq!(pass.imported, imported, "{name}: {pass:?}");
+        // A second start changes nothing either way.
+        assert_eq!(
+            db.import_integration_pass(100).await.unwrap().imported,
+            0,
+            "{name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn claim_refreshes_default_location_and_recovers_a_suspended_queue_under_cas() {
     let db = fixture().await;
@@ -996,4 +1147,64 @@ async fn start_time_import_of_a_large_history_is_bounded() {
     assert!(first < std::time::Duration::from_secs(2), "{first:?}");
     assert!(second < std::time::Duration::from_secs(2), "{second:?}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A merge the importer took over with an unknown result records the old
+/// path's operation as `uncertain` on the machine that ran it, without a
+/// fenced intent. Removing that machine settles it (it used to stay unknown
+/// for good, refusing every deletion of its repository), and the owner can
+/// settle it explicitly.
+#[tokio::test]
+async fn an_imported_unknown_operation_is_settled_by_machine_removal_or_explicitly() {
+    use crate::RepoRepo;
+    for by_owner in [false, true] {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('d','remote-machine','host','linux','aarch64','offline',?,?)").bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let attempt = db
+            .admit_integration_attempt(admission(&q, "a", "import:a:0"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE integration_attempt SET import_source_json='{\"version\":1,\"priority\":2}',state='reconciling',current_operation_state='uncertain',operation_id='old-merge',daemon_id='d' WHERE id=?")
+            .bind(&attempt.id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE integration_queue SET state='quarantined',head_attempt_id=?,revision=revision+1 WHERE id=?")
+            .bind(&attempt.id).bind(&q.id).execute(db.pool()).await.unwrap();
+        match RepoRepo::delete(&db, "r").await {
+            Err(DbError::IntegrationUnresolved { task_id, machine }) => {
+                assert_eq!((task_id.as_str(), machine.as_str()), ("a", "host"));
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        if by_owner {
+            assert!(db
+                .settle_imported_integration_operation(&attempt.id)
+                .await
+                .unwrap());
+            // Once: a settled operation is not settled again.
+            assert!(!db
+                .settle_imported_integration_operation(&attempt.id)
+                .await
+                .unwrap());
+        } else {
+            db.remove_daemon("d", "admin", true, "local-host", false)
+                .await
+                .unwrap();
+        }
+        let settled = db.integration_attempt(&attempt.id).await.unwrap().unwrap();
+        assert_eq!(
+            settled.current_operation_state,
+            Some(IntegrationOperationState::Failed)
+        );
+        assert_eq!(settled.state, IntegrationAttemptState::Quarantined);
+        assert_eq!(
+            settled.operation_receipts_json[0]["kind"],
+            "imported_operation_settled"
+        );
+        // The queue's head is still this attempt: the worker's next look
+        // reads Git and decides. Nothing refuses the deletion any more.
+        RepoRepo::delete(&db, "r").await.unwrap();
+    }
 }

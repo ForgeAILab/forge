@@ -1485,7 +1485,9 @@ async fn a_paused_project_parks_with_backoff_and_one_task_step() {
 /// meanwhile is refused for good. A head whose rebase is done waits in
 /// `rebasing` until the placement is ready: the receipt is kept and adopted,
 /// the rebase is not repeated, and no check is asked for. The wait is
-/// bounded by the Task-step wait; then the head parks as infrastructure.
+/// bounded by the Task-step wait; then the head leaves the slot waiting for
+/// its owner machine (`owner_offline`): no retry is counted, however long
+/// the machine is away, and the attempt always has a time it is asked again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check() {
     let rebases = |attempt: &IntegrationAttempt| {
@@ -1537,19 +1539,27 @@ async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check
             assert_eq!(parked.state, S::Parked);
             assert_eq!(
                 parked.failure_kind,
-                Some(IntegrationFailureKind::Infrastructure)
+                Some(IntegrationFailureKind::TargetUnavailable)
             );
             assert!(
-                parked
-                    .failure_message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("not ready on its machine")),
+                parked.failure_message.as_deref().is_some_and(|message| {
+                    message.starts_with("owner_offline")
+                        && message.contains("not ready on its machine")
+                }),
                 "{:?}",
                 parked.failure_message
             );
             assert!(parked.available_at.is_some(), "retried by the sweep");
             // Parked means out of the slot: the queue goes on without it.
             assert!(world.queue_of(&a).await.head_attempt_id.is_none());
+            let journal = parked.operation_receipts_json.as_array().unwrap();
+            assert!(
+                journal
+                    .iter()
+                    .filter(|entry| entry["kind"] == "worker_park")
+                    .all(|entry| entry["counted"] == false),
+                "an owner wait counts no retry: {journal:?}"
+            );
         }
     }
 }
@@ -3054,4 +3064,76 @@ async fn an_imported_unknown_merge_with_unreadable_checkouts_is_quarantined_not_
         .await
         .unwrap();
     assert_eq!(log.lines().filter(|line| *line == head).count(), 1);
+}
+
+/// The `result` step's proof failed: the owner of the target says the target
+/// does not contain the commit the attempt recorded as merged (it was rewound
+/// after the fast-forward). The head is not completed: it leaves the slot
+/// with a typed cause and its recorded result dropped, the retry timer
+/// queues it again, and validation reads the target as it is: the Task
+/// merges again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_the_target_does_not_confirm_leaves_the_slot_typed_and_merges_again() {
+    let world = World::new().await;
+    let mut pump = Pump::new(world.worker());
+    let held = hold_in(&world, &mut pump, S::Applied).await;
+    let merged = held.integrated_sha.clone().expect("recorded as merged");
+    assert_eq!(world.tip("r").await, merged);
+    // The force-push: the target goes back to where it was.
+    let before = held.integrated_before_sha.clone().expect("before");
+    git_out(&world.repo("r"), &["reset", "--hard", &before])
+        .await
+        .unwrap();
+    // What the `result` step answers when its proof fails.
+    let mut answered = held.clone();
+    answered.effect_ack_json = Some(json!(IntegrationStepAck {
+        effect_seq: held.effect_seq,
+        generation: held.slot_generation,
+        action: IntegrationStepAction::Result,
+        outcome: IntegrationStepOutcome::NotLanded,
+        check: None,
+        message: Some("`main` does not contain the commit".into()),
+    }));
+    answered.acknowledged_at = Some(db::now_rfc3339());
+    world
+        .db
+        .transition_integration_attempt(answered)
+        .await
+        .unwrap();
+    world.settle(&mut pump).await;
+
+    let parked = world.attempt(&held.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert_eq!(parked.failure_kind, Some(IntegrationFailureKind::NeedsFact));
+    assert!(
+        parked
+            .failure_message
+            .as_deref()
+            .unwrap()
+            .starts_with("target_missing_commit"),
+        "{:?}",
+        parked.failure_message
+    );
+    assert!(parked.integrated_sha.is_none(), "no merge is recorded");
+    assert!(parked.available_at.is_some(), "asked again on the timer");
+    assert!(world.queue_of(&held).await.head_attempt_id.is_none());
+    assert!(world
+        .steps
+        .actions("a")
+        .contains(&IntegrationStepAction::Park));
+    let status: String = sqlx::query_scalar("SELECT status FROM task WHERE id='a'")
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "merging", "never done without the proof");
+
+    // The timer: the attempt is queued again and merges for real.
+    world.steps.unhold("a", IntegrationStepAction::Result);
+    world.clock.advance(3600);
+    world.settle(&mut pump).await;
+    let done = world.attempt(&held.id).await;
+    assert_eq!(done.state, S::Completed);
+    assert_eq!(done.integrated_sha.as_deref(), Some(merged.as_str()));
+    assert_eq!(world.tip("r").await, merged);
+    assert_eq!(ff_successes(&world, &held.id).await, 2);
 }

@@ -1930,3 +1930,166 @@ async fn a_pruned_attempt_key_is_refused_and_never_performed_again() {
     assert!(pruned.effect_intent_json.is_none());
     assert_eq!(pruned.effect_receipts_json, serde_json::json!([]));
 }
+
+async fn step(db: &SqliteDb, task: &str, id: &str, kind: &str, key: &str, status: &str) {
+    use crate::TaskStepRepo;
+    db.enqueue_step(&crate::EnqueueTaskStep {
+        id: id.into(),
+        task_id: task.into(),
+        kind: kind.into(),
+        payload_json: "{}".into(),
+        causation_step_id: None,
+        causation_key: key.into(),
+        chain_id: id.into(),
+        chain_position: 1,
+        expected_status: "merging".into(),
+        expected_version: 1,
+        expected_epoch: Some(0),
+        lane: "fast".into(),
+        available_at: NOW.into(),
+    })
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task_step SET status=? WHERE id=?")
+        .bind(status)
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+async fn listed(db: &SqliteDb) -> Vec<String> {
+    db.claimable_integration_queues(NOW, None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|queue| queue.id)
+        .collect()
+}
+
+/// One writer per merge across an upgrade: the worker takes an attempt only
+/// once it was handed over. An attempt admission made is; one from before
+/// the queue (a `shadow:` row, an imported row) is once its import
+/// continuation step settled and the old merge's own hooks step is gone.
+#[tokio::test]
+async fn a_pre_queue_attempt_is_not_claimable_until_the_import_has_continued_it() {
+    for imported in [false, true] {
+        let db = fixture().await;
+        let q = main_queue(&db).await;
+        let mut row = admission(&q, "a", if imported { "import:a:0" } else { "shadow:a:0" });
+        if imported {
+            row.import_source_json = Some(serde_json::json!({"version":1,"priority":4}));
+        }
+        let pre = db.admit_integration_attempt(row).await.unwrap();
+        let key = format!("integration-import:{}", pre.id);
+
+        // No continuation yet, then one that is still to run or running.
+        assert!(listed(&db).await.is_empty(), "imported={imported}");
+        assert!(matches!(
+            claim(&db, &q.id, NOW, LATER).await,
+            Err(DbError::NotFound)
+        ));
+        step(&db, "a", "cont", "integration", &key, "pending").await;
+        for live in ["pending", "claimed"] {
+            exec(
+                &db,
+                &format!("UPDATE task_step SET status='{live}' WHERE id='cont'"),
+            )
+            .await;
+            assert!(listed(&db).await.is_empty(), "{live}");
+            assert!(matches!(
+                claim(&db, &q.id, NOW, LATER).await,
+                Err(DbError::NotFound)
+            ));
+        }
+        // Continued, but the old merge's own hooks step (it recorded a
+        // rebase target) is still live: never claimable.
+        exec(&db, "UPDATE task_step SET status='done' WHERE id='cont'").await;
+        step(&db, "a", "legacy", "hooks", "legacy", "pending").await;
+        exec(&db, "INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES('legacy',0,'2026-10-08T00:00:00Z','{\"rebase_target\":\"\\\"abc\\\"\"}')").await;
+        for live in ["pending", "claimed", "suspended"] {
+            exec(
+                &db,
+                &format!("UPDATE task_step SET status='{live}' WHERE id='legacy'"),
+            )
+            .await;
+            assert!(listed(&db).await.is_empty(), "legacy {live}");
+            assert!(matches!(
+                claim(&db, &q.id, NOW, LATER).await,
+                Err(DbError::NotFound)
+            ));
+        }
+        // A hooks step with no effect of the old merge path only admits: it
+        // holds nothing.
+        exec(
+            &db,
+            "UPDATE task_hook_checkpoint SET effects_json='{}' WHERE step_id='legacy'",
+        )
+        .await;
+        assert_eq!(listed(&db).await, vec![q.id.clone()]);
+        exec(&db, "UPDATE task_hook_checkpoint SET effects_json='{\"merge_intent\":\"{}\"}' WHERE step_id='legacy'").await;
+        assert!(listed(&db).await.is_empty());
+        // The old step settled: handed over.
+        exec(&db, "UPDATE task_step SET status='done' WHERE id='legacy'").await;
+        assert_eq!(listed(&db).await, vec![q.id.clone()]);
+        let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
+        assert_eq!(claimed.head_attempt_id.as_deref(), Some(pre.id.as_str()));
+    }
+}
+
+/// An attempt admission made is claimable at once, also while its entry's
+/// hooks step (the admission itself) is still running, and it is taken ahead
+/// of an older pre-queue row that was not handed over.
+#[tokio::test]
+async fn an_admitted_attempt_is_claimed_past_a_pre_queue_row_that_was_not_handed_over() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let shadow = db
+        .admit_integration_attempt(admission(&q, "a", "shadow:a:0"))
+        .await
+        .unwrap();
+    let admitted = db
+        .admit_integration_attempt(admission(&q, "b", "admit:b:0"))
+        .await
+        .unwrap();
+    step(&db, "b", "entry", "hooks", "entry", "claimed").await;
+    assert!(shadow.queue_seq < admitted.queue_seq);
+    assert_eq!(listed(&db).await, vec![q.id.clone()]);
+    let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
+    assert_eq!(
+        claimed.head_attempt_id.as_deref(),
+        Some(admitted.id.as_str())
+    );
+}
+
+/// An imported unknown result is a reserved head. The worker does not drive
+/// it while the old merge's own hooks step is live, and does once it is not.
+#[tokio::test]
+async fn a_reserved_imported_head_is_held_while_the_old_merge_step_is_live() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let mut row = admission(&q, "a", "import:a:0");
+    row.import_source_json = Some(serde_json::json!({"version":1,"priority":2}));
+    let head = db.admit_integration_attempt(row).await.unwrap();
+    sqlx::query("UPDATE integration_attempt SET state='reconciling' WHERE id=?")
+        .bind(&head.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_queue SET state='quarantined',head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&head.id)
+        .bind(&q.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    step(&db, "a", "legacy", "hooks", "legacy", "claimed").await;
+    exec(&db, "INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES('legacy',0,'2026-10-08T00:00:00Z','{\"merge_intent\":\"{}\"}')").await;
+    assert!(listed(&db).await.is_empty());
+    assert!(matches!(
+        claim(&db, &q.id, NOW, LATER).await,
+        Err(DbError::VersionConflict)
+    ));
+    exec(&db, "UPDATE task_step SET status='done' WHERE id='legacy'").await;
+    assert_eq!(listed(&db).await, vec![q.id.clone()]);
+    let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
+    assert_eq!(claimed.head_attempt_id.as_deref(), Some(head.id.as_str()));
+}

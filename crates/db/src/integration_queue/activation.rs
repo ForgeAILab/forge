@@ -233,7 +233,13 @@ pub struct IntegrationQueueAges {
 // statement is prepared against the migrated schema in
 // `hinted_statements_prepare_and_their_indexes_are_pinned`. The other sweeps
 // carry no hint; their plans are asserted by `EXPLAIN QUERY PLAN` tests.
-pub(super) const CLAIMABLE_QUEUES_SQL: &str = "SELECT q.* FROM integration_queue q WHERE q.id>? AND q.lease_until IS NULL AND ((q.head_attempt_id IS NOT NULL AND q.state<>'closed') OR q.state='quarantined' OR (q.state IN ('open','suspended') AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.queue_id=q.id AND a.current=1 AND a.state='queued' AND a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday(?))))) ORDER BY q.id LIMIT ?";
+pub(super) const CLAIMABLE_QUEUES_SQL: &str = concat!(
+    "SELECT q.* FROM integration_queue q WHERE q.id>? AND q.lease_until IS NULL AND ((q.head_attempt_id IS NOT NULL AND q.state<>'closed' AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=q.head_attempt_id AND ",
+    head_held_by_legacy_step!(),
+    ")) OR (q.state='quarantined' AND q.head_attempt_id IS NULL) OR (q.state IN ('open','suspended') AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.queue_id=q.id AND a.current=1 AND a.state='queued' AND a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday(?)) AND ",
+    claimable_member!(),
+    "))) ORDER BY q.id LIMIT ?"
+);
 pub(super) const EXPIRED_HEADS_SQL: &str = "SELECT * FROM integration_queue INDEXED BY integration_queue_expired_lease WHERE lease_until IS NOT NULL AND julianday(lease_until)<=julianday(?) AND id>? ORDER BY id LIMIT ?";
 pub(super) const DUE_PARKED_SQL: &str = "SELECT * FROM integration_attempt WHERE current=1 AND available_at IS NOT NULL AND state='parked' AND id>? AND julianday(available_at)<=julianday(?) ORDER BY id LIMIT ?";
 pub(super) const CANCEL_REQUESTED_SQL: &str = "SELECT * FROM integration_attempt WHERE current=1 AND cancel_requested_at IS NOT NULL AND id>? ORDER BY id LIMIT ?";

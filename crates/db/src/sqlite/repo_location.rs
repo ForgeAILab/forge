@@ -78,6 +78,27 @@ impl RepoLocationRepo for SqliteDb {
     }
 
     async fn update(&self, input: UpdateRepoLocation) -> Result<RepoLocation> {
+        // Moving a repository's default checkout takes the target away from
+        // its queues: refused while a merge into the repository has an
+        // unknown result or an outstanding owner effect.
+        if input.is_default.is_some() {
+            let mut guard = crate::begin_immediate(&self.pool).await?;
+            let changes: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM repo_location WHERE id=? AND is_default<>?)",
+            )
+            .bind(&input.id)
+            .bind(input.is_default)
+            .fetch_one(&mut *guard)
+            .await?;
+            if changes {
+                crate::integration_queue::refuse_unresolved_integration(
+                    &mut guard,
+                    crate::integration_queue::IntegrationGuardScope::RepoOfLocation(&input.id),
+                )
+                .await?;
+            }
+            guard.commit().await?;
+        }
         let mut query = sqlx::QueryBuilder::<Sqlite>::new(
             "UPDATE repo_location SET version = version + 1, updated_at = ",
         );
@@ -129,8 +150,15 @@ impl RepoLocationRepo for SqliteDb {
         if in_use {
             return Err(DbError::VersionConflict);
         }
-        // Passive integration queues never block this deletion; the queue
-        // that targeted the location is left without one, suspended.
+        // A merge whose result is unknown, or whose owner effect is still
+        // outstanding, into or from this location refuses the deletion.
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut transaction,
+            crate::integration_queue::IntegrationGuardScope::Location(id),
+        )
+        .await?;
+        // A queue with nothing unresolved never blocks this deletion; the
+        // one that targeted the location is left without one, suspended.
         crate::integration_queue::suspend_queues_for_deleted_location(&mut transaction, id).await?;
         let result = sqlx::query("DELETE FROM repo_location WHERE id = ?")
             .bind(id)

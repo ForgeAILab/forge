@@ -6,6 +6,7 @@
 //! attempt rows only. Git runs behind the fenced owner; Task state is written
 //! by Task steps it asks for through [`IntegrationStepPort`].
 mod driver;
+pub mod holders;
 mod ports;
 mod table;
 #[cfg(test)]
@@ -672,6 +673,20 @@ impl IntegrationQueueWorker {
             let full = page.len() as u32 >= self.config.page;
             for attempt in page {
                 if attempt.cancel_requested_at.is_some() {
+                    continue;
+                }
+                // A row the importer wrote names no candidate and no
+                // placement, so no head can drive it: a stored deadline on
+                // it (the old build's retry time) re-queues nothing. Its
+                // Task is admitted again by its continuation step, by the
+                // reconciler or by its owner machine's reconnect
+                // (`TaskService::integration_owner_ready`), which supersedes
+                // the row.
+                if attempt.import_source_json.is_some()
+                    && (attempt.workspace_id.is_none()
+                        || attempt.placement_id.is_none()
+                        || attempt.original_candidate_sha.is_none())
+                {
                     continue;
                 }
                 // A counted retry (infrastructure, timeout) is over: one

@@ -33,6 +33,47 @@ stored_enum!(IntegrationOperationKind { Merge => "merge", Rebase => "rebase", Ch
 stored_enum!(IntegrationOperationState { Pending => "pending", Running => "running", Succeeded => "succeeded", Failed => "failed", Uncertain => "uncertain", Acknowledged => "acknowledged" });
 stored_enum!(IntegrationImportDisposition { Classified => "classified", NeedsFact => "needs_fact", Quarantined => "quarantined", Obsolete => "obsolete", History => "history" });
 
+/// One writer per merge across an upgrade. Attempt `a` came from before the
+/// queue was active: the importer wrote it, or the passive stage recorded it
+/// (`shadow:`). Admission (`admit:` keys) is the only other source.
+macro_rules! pre_queue_attempt {
+    () => {
+        "(a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%')"
+    };
+}
+/// The old merge's own hooks step is still to run or running: a live hooks
+/// step of the Task's present status entry that recorded an effect of the
+/// pre-queue merge path (`merge_intent`, `merge_outcome`, `rebase_target`).
+/// It finishes the rebase or reads the merge it recorded, then hands over
+/// through admission: the worker does not touch the attempt meanwhile. A
+/// hooks step without such an effect only admits, and is not waited for.
+macro_rules! entry_hooks_live {
+    () => {
+        "EXISTS(SELECT 1 FROM task_step h JOIN task t ON t.id=h.task_id WHERE h.task_id=a.task_ref AND h.kind='hooks' AND h.status IN ('pending','claimed','suspended') AND h.expected_status=t.status AND h.expected_epoch=t.status_epoch AND EXISTS(SELECT 1 FROM task_hook_checkpoint c WHERE c.step_id=h.id AND (json_extract(c.effects_json,'$.merge_intent') IS NOT NULL OR json_extract(c.effects_json,'$.merge_outcome') IS NOT NULL OR json_extract(c.effects_json,'$.rebase_target') IS NOT NULL)))"
+    };
+}
+/// A `queued` attempt the worker may take as a head: one admission made, or a
+/// pre-queue attempt whose import continuation step (`integration-import:<id>`)
+/// has settled and whose old merge's hooks step is gone.
+macro_rules! claimable_member {
+    () => {
+        concat!(
+            "(NOT ",
+            pre_queue_attempt!(),
+            " OR (EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref AND s.causation_key='integration-import:'||a.id AND s.status IN ('done','superseded')) AND NOT ",
+            entry_hooks_live!(),
+            "))"
+        )
+    };
+}
+/// A reserved head (an imported unknown result) the worker may not drive
+/// yet: the old merge's own hooks step is still live.
+macro_rules! head_held_by_legacy_step {
+    () => {
+        concat!(pre_queue_attempt!(), " AND ", entry_hooks_live!())
+    };
+}
+
 mod activation;
 #[cfg(test)]
 mod activation_tests;
@@ -646,7 +687,13 @@ pub const INTEGRATION_TRANSITIONS: &[(IntegrationAttemptState, &[IntegrationAtte
     ),
     (
         IntegrationAttemptState::Applied,
-        &[IntegrationAttemptState::Completed],
+        &[
+            IntegrationAttemptState::Completed,
+            // The settle-time proof failed: the owner of the target says the
+            // target does not contain the commit. The attempt leaves the
+            // slot and is validated again from the target as it is.
+            IntegrationAttemptState::Parked,
+        ],
     ),
     (
         IntegrationAttemptState::Ejected,
@@ -873,6 +920,71 @@ async fn resolve_integration_target_in_tx(
 /// A queue whose target location is being deleted keeps its members and
 /// history but names no location: `suspended` with `target_unconfigured`.
 /// The foreign key alone would only null the column (`ON DELETE SET NULL`).
+/// What a deletion or a default-location change would take away from a merge.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IntegrationGuardScope<'a> {
+    Repo(&'a str),
+    /// A repo location: the target of a queue, or where a candidate lives.
+    Location(&'a str),
+    /// The repository a location belongs to (its default is changing).
+    RepoOfLocation(&'a str),
+    Project(&'a str),
+}
+
+/// Refuse (`DbError::IntegrationUnresolved`, HTTP 409
+/// `integration_unresolved`) while a merge in `scope` has an unknown result
+/// or an owner effect still outstanding: an attempt with a recorded effect
+/// intent, a running or uncertain owner operation, or one in `reconciling` /
+/// `ff_inflight`. Deleting the repository, the location or the Project, or
+/// moving the repository's default location, would drop the only record
+/// that can still say whether the commit landed. The error names the Task
+/// and the machine whose answer is missing; the way out is that machine's
+/// reconnect, or removing the machine (which settles the effect as failed).
+/// Called inside the transaction of the write it guards.
+pub(crate) async fn refuse_unresolved_integration(
+    tx: &mut Transaction<'_, Sqlite>,
+    scope: IntegrationGuardScope<'_>,
+) -> Result<()> {
+    let (filter, id) = match scope {
+        IntegrationGuardScope::Repo(id) => ("q.repo_id=?1", id),
+        IntegrationGuardScope::Location(id) => {
+            ("(q.target_location_id=?1 OR a.repo_location_id=?1)", id)
+        }
+        IntegrationGuardScope::RepoOfLocation(id) => (
+            "q.repo_id=(SELECT repo_id FROM repo_location WHERE id=?1)",
+            id,
+        ),
+        IntegrationGuardScope::Project(id) => {
+            ("q.repo_id IN (SELECT id FROM repo WHERE project_id=?1)", id)
+        }
+    };
+    let unresolved: Option<(String, String)> = sqlx::query_as(&format!(
+        "SELECT a.task_ref,COALESCE((SELECT d.hostname FROM daemon d WHERE d.id=COALESCE(json_extract(q.target_owner_json,'$.daemon_id'),a.daemon_id)),'the server') \
+         FROM integration_attempt a JOIN integration_queue q ON q.id=a.queue_id \
+         WHERE a.state NOT IN ('completed','cancelled','superseded') \
+           AND (a.effect_intent_json IS NOT NULL OR COALESCE(a.current_operation_state,'') IN ('running','uncertain') OR a.state IN ('reconciling','ff_inflight')) \
+           AND {filter} ORDER BY a.id LIMIT 1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match unresolved {
+        Some((task_id, machine)) => Err(DbError::IntegrationUnresolved { task_id, machine }),
+        None => Ok(()),
+    }
+}
+
+/// The guard of [`refuse_unresolved_integration`] for a writer outside this
+/// crate that moves a repository's default location inside its own
+/// transaction (`services::repo_location`): the repository of `location_id`
+/// has no merge with an unknown result or an outstanding owner effect.
+pub async fn refuse_default_change_while_integration_unresolved(
+    tx: &mut Transaction<'_, Sqlite>,
+    location_id: &str,
+) -> Result<()> {
+    refuse_unresolved_integration(tx, IntegrationGuardScope::RepoOfLocation(location_id)).await
+}
+
 pub(crate) async fn suspend_queues_for_deleted_location(
     tx: &mut Transaction<'_, Sqlite>,
     location_id: &str,
@@ -1118,8 +1230,19 @@ pub(super) async fn claim_queue_in_tx(
         if a.queue_id.as_deref() != Some(queue_id) || !a.current || a.state.terminal() {
             return Err(DbError::Check("invalid reserved integration head".into()));
         }
+        let held: bool = sqlx::query_scalar(concat!(
+            "SELECT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=? AND ",
+            head_held_by_legacy_step!(),
+            ")"
+        ))
+        .bind(head)
+        .fetch_one(&mut **tx)
+        .await?;
+        if held {
+            return Err(DbError::VersionConflict);
+        }
     } else {
-        q.head_attempt_id = sqlx::query_scalar("SELECT id FROM integration_attempt WHERE queue_id=? AND current=1 AND state='queued' AND cancel_requested_at IS NULL AND (available_at IS NULL OR julianday(available_at)<=julianday(?)) ORDER BY queue_seq,id LIMIT 1").bind(queue_id).bind(now).fetch_optional(&mut **tx).await?;
+        q.head_attempt_id = sqlx::query_scalar(concat!("SELECT a.id FROM integration_attempt a WHERE a.queue_id=? AND a.current=1 AND a.state='queued' AND a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday(?)) AND ", claimable_member!(), " ORDER BY a.queue_seq,a.id LIMIT 1")).bind(queue_id).bind(now).fetch_optional(&mut **tx).await?;
         if q.head_attempt_id.is_none() {
             return Err(DbError::NotFound);
         }
