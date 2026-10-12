@@ -137,8 +137,9 @@ impl TaskService {
     }
 
     /// The bridge of an automatic review rejection of `task` into `target`:
-    /// the `replan` bridge when `task` is a coordination root with a lead
-    /// and `target` is where its rejection re-plans, and none otherwise.
+    /// the `replan` bridge when `target` is where only a coordination root
+    /// with a lead is sent (`review_failure_target` decided that), and none
+    /// otherwise.
     pub(crate) async fn review_rejection_bridge(
         &self,
         task: &Task,
@@ -156,12 +157,16 @@ impl TaskService {
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
+        // The lead was read once, by `review_failure_target`, when it chose
+        // `target` and charged the re-plan. A target that only a lead root
+        // gets is that decision; reading the assignment again here could
+        // disagree with it (the lead removed in between) and leave a charged
+        // re-plan with an entry the engine refuses. A root that lost its lead
+        // still enters planning and leaves it at once through the gate's own
+        // unassigned-role cascade.
         if crate::task_hierarchy::effective_reject_target(&workflow, &task.status, false) == target
             || crate::task_hierarchy::effective_reject_target(&workflow, &task.status, true)
                 != target
-            || crate::task_hierarchy::coordination_root_lead(&self.db, task, &workflow)
-                .await?
-                .is_none()
         {
             return Ok(Default::default());
         }

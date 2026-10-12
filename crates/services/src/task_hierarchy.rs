@@ -870,10 +870,36 @@ fn decision_condition(child: &Task) -> db::TaskCondition {
     }
 }
 
+/// Whether a subtask's failure of this kind is the lead's to decide. The
+/// lead decides about the work: retry it, hand it to another Agent, split or
+/// drop it. So the list is the kinds that say "the work did not get done":
+/// its attempts ran out, its run failed or ran out of turns, its checks or
+/// its own gate rejected it, a dependency was cancelled. Every other kind is
+/// the host's, the repository's, the workspace's or the platform's (a hook, a
+/// dirty or conflicting tree, a missing executor, a failed dispatch, an
+/// internal error), or the owner's own stop: no plan fixes those, so they
+/// spend no re-plan and stay the Project Agent's and the owner's. A kind this
+/// build does not know is not the lead's either.
+fn lead_decides_failure(kind: api_types::FailureKind) -> bool {
+    use api_types::FailureKind as Kind;
+    matches!(
+        kind,
+        Kind::RetryExhausted
+            | Kind::ExecutorFailed
+            | Kind::MaxTurnsExceeded
+            | Kind::CiFailed
+            | Kind::ReviewGateFailed
+            | Kind::ReviewBudgetExhausted
+            | Kind::WorkflowGuardRejected
+            | Kind::DependencyCancelled
+    )
+}
+
 /// A subtask parked needing a decision, and the identity of that park:
 /// it failed or was interrupted, and nothing clears that by itself. Never a
-/// hold or a host environment that is not ready (the owner's), a queued
-/// owner action, or any wait that ends on its
+/// hold or a failure the lead cannot fix ([`lead_decides_failure`]: a host
+/// environment that is not ready, the workspace, the repository, a missing
+/// executor), a queued owner action, or any wait that ends on its
 /// own (capacity, an Agent, a machine, the environment, an unfinished
 /// dependency, a human decision, checks, its parent, a retry deadline, a run
 /// in flight). A cancelled dependency does need a decision.
@@ -907,10 +933,9 @@ pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
     };
     let read = condition.read();
     if !(read.hard_failure || read.interruption_present)
-        || matches!(
-            read.failure_kind,
-            Some(api_types::FailureKind::ManualStop | api_types::FailureKind::EnvironmentNotReady)
-        )
+        || read
+            .failure_kind
+            .is_some_and(|kind| !lead_decides_failure(kind))
         || read.queued_command
     {
         return None;
@@ -991,6 +1016,24 @@ pub(crate) async fn lead_handles_subtask_park(db: &SqliteDb, task_id: &str) -> R
     Ok(policy
         .replan_due(&root, &children, &assignments, &transitions)
         .is_some_and(|(child_id, _)| child_id == task.id))
+}
+
+/// THE rule for who answers a subtask's park, for every caller that would
+/// wake the Project Agent for it: true while the lead of its root handles it
+/// ([`lead_handles_subtask_park`]). It never fails. A subtask or root that
+/// is gone has no lead to handle anything, so the park is the Project
+/// Agent's. Any other read error says nothing about the lead: the caller
+/// holds this one round and asks again on its next sweep, because waking the
+/// Project Agent on a guess would set it and the lead on the same park.
+pub(crate) async fn subtask_park_is_the_leads(db: &SqliteDb, task_id: &str) -> bool {
+    match lead_handles_subtask_park(db, task_id).await {
+        Ok(handled) => handled,
+        Err(ServiceError::NotFound { .. } | ServiceError::Db(db::DbError::NotFound)) => false,
+        Err(error) => {
+            tracing::warn!(%task_id, %error, "lead filter could not read a subtask's root; holding its wake for one sweep");
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1199,6 +1242,48 @@ mod replan_tests {
             subtask_decision_park(&parked("child", "2026-10-12T02:00:00Z", "retry_exhausted")),
             subtask_decision_park(&restated)
         );
+    }
+
+    /// The lead decides about work: what to retry, reassign, split or drop.
+    /// A park whose cause is the host, the repository, the workspace or the
+    /// platform is not its to fix, and must not spend a re-plan.
+    #[test]
+    fn a_park_the_lead_cannot_fix_is_not_replanned() {
+        let at = "2026-10-12T01:00:00Z";
+        for kind in ["retry_exhausted", "executor_failed", "max_turns_exceeded"] {
+            assert_eq!(
+                subtask_decision_park(&parked("child", at, kind)).as_deref(),
+                Some(at),
+                "{kind}"
+            );
+        }
+        for kind in [
+            "workspace_failed",
+            "workspace_reset_required",
+            "workspace_error",
+            "executor_unavailable",
+            "before_work_hook_failed",
+            "before_work_hook_timeout",
+            "dispatch_failed",
+            "merge_conflict",
+            "target_repo_dirty",
+            "dirty_worktree",
+            "internal_command_failed",
+            "recovery_required",
+            "review_needs_owner",
+            "review_blocked",
+            "cascade_failed",
+            "workflow_loop",
+            "environment_not_ready",
+            "manual_stop",
+            "some_kind_a_later_release_adds",
+        ] {
+            assert_eq!(
+                subtask_decision_park(&parked("child", at, kind)),
+                None,
+                "{kind}"
+            );
+        }
     }
 
     #[test]

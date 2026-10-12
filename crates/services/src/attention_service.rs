@@ -452,15 +452,7 @@ impl AttentionService {
         let Some(task_id) = details.get("entity_id").and_then(Value::as_str) else {
             return false;
         };
-        // Fail open: a blocker this filter cannot judge (its Task or root is
-        // gone) is the Project Agent's, and never stops the Project's sweep.
-        match crate::task_hierarchy::lead_handles_subtask_park(&self.db, task_id).await {
-            Ok(handled) => handled,
-            Err(error) => {
-                tracing::debug!(%task_id, %error, "lead filter could not judge a blocker; not suppressed");
-                false
-            }
-        }
+        crate::task_hierarchy::subtask_park_is_the_leads(&self.db, task_id).await
     }
 
     /// One wake per Project window for every eligible blocker, with one directive.

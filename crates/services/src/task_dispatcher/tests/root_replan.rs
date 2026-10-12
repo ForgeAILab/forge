@@ -615,3 +615,198 @@ async fn a_parked_subtask_without_a_lead_leaves_the_root_alone() {
             .unwrap()
     );
 }
+
+/// A root that lost its lead while it sat in planning for a re-plan, with no
+/// run left, does not stay there: it returns to implementation, waits on its
+/// subtasks, and the park is the Project Agent's. Nothing more is charged.
+#[tokio::test]
+async fn a_replanning_root_that_lost_its_lead_returns_to_implementation() {
+    let lead = lead_fixture(false).await;
+    let (root, child, _) = root_with_parked_child(&lead, false).await;
+    let receipt = child_receipt(&lead, &child).await;
+    sqlx::query("UPDATE task SET status='planning', version=version+1 WHERE id=?")
+        .bind(&root.id)
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    TransitionLogRepo::insert(
+        &*lead.db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: root.id.clone(),
+            from_state: "in_progress".to_owned(),
+            to_state: "planning".to_owned(),
+            trigger_name: None,
+            triggered_by: Actor::system(SystemComponent::TaskDispatcher).display(),
+            bridge: crate::task_hierarchy::replan_bridge(
+                "subtask_parked",
+                &child.id,
+                &receipt,
+                "parked",
+            ),
+            trigger_reason: "parked".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    passes(&lead, 4).await;
+
+    assert_eq!(
+        reload(&lead.db, &root.id).await.status,
+        "in_progress",
+        "{:?}",
+        log(&lead, &root.id).await
+    );
+    assert!(
+        park(&lead.db, &root.id).await.contains("Children"),
+        "{}",
+        park(&lead.db, &root.id).await
+    );
+    assert_eq!(executions(&lead.db, &root.id).await, Vec::new());
+    assert_eq!(spent(&lead, &root.id, "replan").await, 0);
+    assert!(
+        !crate::task_hierarchy::lead_handles_subtask_park(&lead.db, &child.id)
+            .await
+            .unwrap()
+    );
+    // Stable: the root does not bounce between planning and implementation.
+    let settled = log(&lead, &root.id).await.len();
+    passes(&lead, 4).await;
+    assert_eq!(log(&lead, &root.id).await.len(), settled);
+}
+
+/// The re-plan command re-derives its fact from current rows: a park that is
+/// gone, and a root the owner stopped in between, are left alone and charge
+/// nothing.
+#[tokio::test]
+async fn a_replan_command_that_lost_its_fact_writes_nothing() {
+    let lead = lead_fixture(false).await;
+    let (root, child, _) = root_with_parked_child(&lead, true).await;
+    let service = &lead.dispatcher.task_service;
+    let park_id = crate::task_hierarchy::subtask_decision_park(&reload(&lead.db, &child.id).await)
+        .expect("parked");
+    assert!(!service
+        .replan_coordination_root(&root.id, &child.id, "2020-01-01T00:00:00Z")
+        .await
+        .unwrap());
+    // The owner stops the root between the step and the command.
+    let current = reload(&lead.db, &root.id).await;
+    let at = now_rfc3339();
+    TaskRepo::update(
+        &*lead.db,
+        db::UpdateTask {
+            id: current.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::json!({
+                    "type": api_types::FailureKind::ManualStop,
+                    "blocking_reason": "held by the owner",
+                    "message": "held by the owner",
+                    "blocked_at": at,
+                })
+                .to_string(),
+            )),
+            blocked_json: Some(Some(
+                serde_json::json!({
+                    "reason": "held by the owner",
+                    "created_at": at,
+                    "kind": api_types::FailureKind::ManualStop,
+                    "source": null,
+                    "execution_id": null,
+                })
+                .to_string(),
+            )),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: at.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!service
+        .replan_coordination_root(&root.id, &child.id, &park_id)
+        .await
+        .unwrap());
+    passes(&lead, 3).await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    assert_eq!(spent(&lead, &root.id, "replan").await, 0);
+    assert_eq!(log(&lead, &root.id).await, Vec::new());
+    assert_eq!(executions(&lead.db, &root.id).await, Vec::new());
+    // A held root's subtask is not the lead's: the Project Agent hears of it.
+    assert!(
+        !crate::task_hierarchy::lead_handles_subtask_park(&lead.db, &child.id)
+            .await
+            .unwrap()
+    );
+}
+
+/// The lead is read once per rejection. A rejection already decided (and
+/// charged) as a re-plan keeps its bridge when the lead is removed before
+/// the entry: the engine admits the entry instead of refusing a move that
+/// has no trigger.
+#[tokio::test]
+async fn a_rejection_decided_as_a_replan_keeps_its_bridge_when_the_lead_is_removed() {
+    let lead = lead_fixture(false).await;
+    let root = root_with_failed_review(&lead, true).await;
+    let service = &lead.dispatcher.task_service;
+    let (task, target, reason) = service.review_failure_target(&root, None).await.unwrap();
+    assert_eq!(target.as_deref(), Some("planning"));
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    sqlx::query("DELETE FROM task_role_assignment WHERE task_id=? AND role_name=?")
+        .bind(&root.id)
+        .bind(PLANNER)
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    let bridge = service
+        .review_rejection_bridge(&task, "planning", &reason)
+        .await
+        .unwrap();
+    assert_eq!(
+        bridge.bridge_kind,
+        Some(api_types::TransitionBridgeKind::Replan)
+    );
+    // A rejection into the configured target never carries it.
+    let plain = service
+        .review_rejection_bridge(&task, "in_progress", &reason)
+        .await
+        .unwrap();
+    assert_eq!(plain.bridge_kind, None);
+}
+
+/// The one wake rule never fails and never guesses: a subtask whose root is
+/// gone is the Project Agent's; a read that failed for any other reason
+/// holds the wake for a sweep instead of waking the Project Agent beside a
+/// lead that may be handling the park.
+#[tokio::test]
+async fn the_wake_rule_holds_on_an_unreadable_root_and_releases_a_missing_one() {
+    let lead = lead_fixture(false).await;
+    let (root, child, _) = root_with_parked_child(&lead, true).await;
+    assert!(crate::task_hierarchy::subtask_park_is_the_leads(&lead.db, &child.id).await);
+    assert!(!crate::task_hierarchy::subtask_park_is_the_leads(&lead.db, &root.id).await);
+    assert!(!crate::task_hierarchy::subtask_park_is_the_leads(&lead.db, "no-such-task").await);
+    sqlx::query("UPDATE task SET deleted_at=? WHERE id=?")
+        .bind(now_rfc3339())
+        .bind(&root.id)
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    assert!(
+        !crate::task_hierarchy::subtask_park_is_the_leads(&lead.db, &child.id).await,
+        "a subtask whose root is gone is the Project Agent's"
+    );
+    lead.db.pool().close().await;
+    assert!(
+        crate::task_hierarchy::subtask_park_is_the_leads(&lead.db, &child.id).await,
+        "an unreadable root holds the wake; it does not wake the Project Agent on a guess"
+    );
+}
