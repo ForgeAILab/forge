@@ -267,6 +267,15 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
 // F adds the generated shared-read contracts on Main (+340 bytes), inquiry
 // (+210), and setup (+265): these replace untyped argument prose and expose
 // field/type errors before dispatch. Task and ready Project ceilings shrink.
+// Slice I sets every ceiling to the measured size after the optional-read
+// argument lines were removed (they only restated `{limit?}` / `{query?}`).
+// Main keeps one generated read line, 60 bytes over its pre-F 8,552: Main must
+// name `project_id` on `project.summary`, and a call without it costs a turn.
+// The ready Project surfaces carry the Charter adoption field list without the
+// nested Charter shape (about 3,000 bytes a turn): `project.charter` returns
+// the content an amendment starts from, and Project setup still declares the
+// whole nested schema. Adoption names its `maturity` and `project_mode`
+// values and evidence its kinds, as the hand contracts did.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // Main was 8,558 and Inquiry 4,089 at 33e2a974. The orchestration read
     // tool states its purpose once (-118 on both). The Main propose tool
@@ -277,8 +286,8 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // `content_digest`, `render_digest`). That line keeps the whole nested
     // Charter shape (about 3,000 bytes): the description is the only place
     // a Main model is shown it, so it is not a saving to take.
-    ("main", 8_650),
-    ("inquiry", 3_980),
+    ("main", 8_612),
+    ("inquiry", 3_946),
     // 24,252 and 25,501 at 435ff088, less 382: the pending proposals' eleven
     // root aliases are no longer declared (-156; arguments are normalized
     // before schema validation, and the flat fields are still lifted by
@@ -295,19 +304,19 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // cannot: the three Task types, the capability profiles, what
     // `plan_item_id` refers to and which way `priority` sorts. Without them
     // the first proposal with a guessed value costs a turn.
-    ("project", 17_302),
-    ("project_verify_solo", 18_551),
+    ("project", 14_050),
+    ("project_verify_solo", 15_299),
     // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
     // and the same two descriptions (-226). The hand Charter adoption
     // schema dominates (12,418 bytes).
-    ("project_setup", 15_500),
+    ("project_setup", 12_626),
     // 6,062 / 4,829 / 5,437 before the Task operations were registered.
     // Each includes 40 bytes for the evidence kinds a run can name
     // (screenshot, walkthrough_video, log, report, other): the hand prose
     // listed them, and a guessed kind is stored as `other`.
-    ("worker", 4_655),
-    ("reviewer", 3_955),
-    ("planner", 4_030),
+    ("worker", 4_507),
+    ("reviewer", 3_807),
+    ("planner", 3_882),
 ];
 
 /// Schema keywords that provider function-declaration dialects do not

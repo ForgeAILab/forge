@@ -441,6 +441,6 @@
     },
     "required": [],
     "additionalProperties": false,
-    "description": "Main names an owned project_id; Project scope uses its binding."
+    "description": "Main must name an owned project_id."
   }
 }

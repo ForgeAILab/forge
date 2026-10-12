@@ -921,6 +921,65 @@ fn lifecycle_scripts_require_project_admin_on_both_mcp_paths_and_shared_rest_val
             .unwrap()
             .unwrap();
         assert_eq!(after, before, "nothing persisted on denial");
+        // An account grant (no bound Project) held by a plain member names
+        // the Project in its arguments: membership is still not command
+        // authority, on either tool.
+        let member_id = new_uuid_v4();
+        ProjectMemberRepo::add_member(
+            &*state.db,
+            CreateProjectMember {
+                id: member_id.clone(),
+                project_id: project_id.clone(),
+                user_id: "mcp-test-user".into(),
+                role: "member".into(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let account = McpContext {
+            user_id: Some("mcp-test-user".into()),
+            project_id: None,
+        };
+        for grant in [&account, &context] {
+            for name in [
+                "forge_update_project",
+                "forge_update_project_lifecycle_hooks",
+            ] {
+                let mut arguments = json!({"project_id":project_id,"version":before.version});
+                if name == "forge_update_project" {
+                    arguments["settings"] = settings.clone();
+                } else {
+                    arguments["lifecycle_hooks"] = hooks.clone();
+                }
+                assert!(
+                    dispatch_with_context(
+                        &state,
+                        grant,
+                        "tools/call",
+                        json!({"name":name,"arguments":arguments})
+                    )
+                    .await
+                    .is_err(),
+                    "{name}: a plain member holds no command authority (bound Project {:?})",
+                    grant.project_id
+                );
+            }
+        }
+        assert_eq!(
+            ProjectRepo::get_by_id(&*state.db, &project_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before,
+            "nothing persisted on a member's denial"
+        );
+        sqlx::query("DELETE FROM project_member WHERE id = ?")
+            .bind(&member_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
         ProjectMemberRepo::add_member(
             &*state.db,
             CreateProjectMember {

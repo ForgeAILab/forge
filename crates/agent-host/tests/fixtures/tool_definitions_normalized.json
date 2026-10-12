@@ -92,8 +92,8 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "type": "object",
-            "description": "- project.summary: {project_id?}; Main names an owned project_id; Project scope uses its binding."
+            "description": "- project.summary: {project_id?}; Main must name an owned project_id.",
+            "type": "object"
           },
           "operation": {
             "enum": [
@@ -967,7 +967,7 @@
             "type": "string"
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: {action: one of draft_revision, base_revision_id?, charter_id?, content, expected_charter_version, expected_digest?, maturity, project_mode, provenance, render_version?, rendered_view?}; Draft an adoption or amendment Charter; only the user can approve it. Payload <=65536 serialized UTF-8 bytes.\n- project.decision: {action: one of record_candidate|record_effective, affected_artifact_refs?, affected_milestone_ids?, affected_task_ids?, decision_class: one of project_implementation, decision_id?, expected_project_version, options?, question, rationale?, selected_outcome?}; Record implementation decisions within the approved Charter. Payload <=65536 serialized UTF-8 bytes.\n- project.document: action=draft_revision {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=propose_approval {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=approve {content_digest, document_id, envelope_digest?, expected_document_version, kind?, render_digest, revision_id, title?}; Draft, propose or policy-authorize a bound Project Document. Payload <=65536 serialized UTF-8 bytes.\n- project.escalate: {need, task_ids?}; Ask the owner for the need blocking named Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.evidence: {acceptance_check_ids, action: one of attach|capture, asset_id?, caption, checksum?, content?, expected_milestone_version, filename?, kind, milestone_id, path?, source_run_id?, source_validation_id?, task_id?}; Attach milestone proof, or capture the artifact your verification produced. Payload <=65536 serialized UTF-8 bytes.\n- project.milestone: action=define {content, display_label?, expected_milestone_version?, lifecycle?, milestone_id?, primary_milestone_id?, provenance?}; action=revise {base_revision_id?, content, display_label?, expected_milestone_version, lifecycle?, milestone_id, primary_milestone_id?, provenance?}; action=set_primary {content?, display_label?, expected_milestone_version, milestone_id?, primary_milestone_id?}; Define, revise or select a bound Project milestone. Payload <=65536 serialized UTF-8 bytes.\n- project.readiness: {action: one of evaluate, milestone_id, milestone_version}; Evaluate milestone readiness against its exact version. Payload <=65536 serialized UTF-8 bytes.\n- project.release.request: {action: one of propose_candidate, milestone_id, milestone_version, readiness_digest, readiness_snapshot_id}; Queue an exact release candidate proposal; final release is user-only. Payload <=65536 serialized UTF-8 bytes.\n- project.review_config: {action: one of set_ci_steps, ci_steps, expected_project_version, setup_steps?}; Set independent review commands for subsequent Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.validation: {action: one of record, check_id, definition_revision_id, evidence_asset_id?, expected_milestone_version?, governing_revision_ids?, input_digest, milestone_id, milestone_version?, observed_command_ids?, observed_task_id?, result, status: one of pass|fail|blocked|stale|unavailable}; Record disposable-checkout observations; pass/fail require observed commands, manual attestation is user-only. Payload <=65536 serialized UTF-8 bytes.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: {action: one of draft_revision, base_revision_id?, charter_id?, content, expected_charter_version, expected_digest?, maturity: one of prototype|mvp|production|critical, project_mode: one of compact|standard, provenance, render_version?, rendered_view?}; Draft an adoption or amendment Charter; only the user can approve it. Payload <=65536 serialized UTF-8 bytes.\n- project.decision: {action: one of record_candidate|record_effective, affected_artifact_refs?, affected_milestone_ids?, affected_task_ids?, decision_class: one of project_implementation, decision_id?, expected_project_version, options?, question, rationale?, selected_outcome?}; Record implementation decisions within the approved Charter. Payload <=65536 serialized UTF-8 bytes.\n- project.document: action=draft_revision {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=propose_approval {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=approve {content_digest, document_id, envelope_digest?, expected_document_version, kind?, render_digest, revision_id, title?}; Draft, propose or policy-authorize a bound Project Document. Payload <=65536 serialized UTF-8 bytes.\n- project.escalate: {need, task_ids?}; Ask the owner for the need blocking named Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.evidence: {acceptance_check_ids, action: one of attach|capture, asset_id?, caption, checksum?, content?, expected_milestone_version, filename?, kind, milestone_id, path?, source_run_id?, source_validation_id?, task_id?}; Attach milestone proof or capture your verification artifact; kind: screenshot|walkthrough_video|log|report|other. Payload <=65536 serialized UTF-8 bytes.\n- project.milestone: action=define {content, display_label?, expected_milestone_version?, lifecycle?, milestone_id?, primary_milestone_id?, provenance?}; action=revise {base_revision_id?, content, display_label?, expected_milestone_version, lifecycle?, milestone_id, primary_milestone_id?, provenance?}; action=set_primary {content?, display_label?, expected_milestone_version, milestone_id?, primary_milestone_id?}; Define, revise or select a bound Project milestone. Payload <=65536 serialized UTF-8 bytes.\n- project.readiness: {action: one of evaluate, milestone_id, milestone_version}; Evaluate milestone readiness against its exact version. Payload <=65536 serialized UTF-8 bytes.\n- project.release.request: {action: one of propose_candidate, milestone_id, milestone_version, readiness_digest, readiness_snapshot_id}; Queue an exact release candidate proposal; final release is user-only. Payload <=65536 serialized UTF-8 bytes.\n- project.review_config: {action: one of set_ci_steps, ci_steps, expected_project_version, setup_steps?}; Set independent review commands for subsequent Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.validation: {action: one of record, check_id, definition_revision_id, evidence_asset_id?, expected_milestone_version?, governing_revision_ids?, input_digest, milestone_id, milestone_version?, observed_command_ids?, observed_task_id?, result, status: one of pass|fail|blocked|stale|unavailable}; Record disposable-checkout observations; pass/fail require observed commands, manual attestation is user-only. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
           }
         },
@@ -1574,7 +1574,7 @@
             "type": "string"
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: {action: one of draft_revision, base_revision_id?, charter_id?, content, expected_charter_version, expected_digest?, maturity, project_mode, provenance, render_version?, rendered_view?}; Draft an adoption or amendment Charter; only the user can approve it. Payload <=65536 serialized UTF-8 bytes.\n- project.decision: {action: one of record_candidate|record_effective, affected_artifact_refs?, affected_milestone_ids?, affected_task_ids?, decision_class: one of project_implementation, decision_id?, expected_project_version, options?, question, rationale?, selected_outcome?}; Record implementation decisions within the approved Charter. Payload <=65536 serialized UTF-8 bytes.\n- project.document: action=draft_revision {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=propose_approval {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=approve {content_digest, document_id, envelope_digest?, expected_document_version, kind?, render_digest, revision_id, title?}; Draft, propose or policy-authorize a bound Project Document. Payload <=65536 serialized UTF-8 bytes.\n- project.escalate: {need, task_ids?}; Ask the owner for the need blocking named Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.evidence: {acceptance_check_ids, action: one of attach|capture, asset_id?, caption, checksum?, content?, expected_milestone_version, filename?, kind, milestone_id, path?, source_run_id?, source_validation_id?, task_id?}; Attach milestone proof, or capture the artifact your verification produced. Payload <=65536 serialized UTF-8 bytes.\n- project.milestone: action=define {content, display_label?, expected_milestone_version?, lifecycle?, milestone_id?, primary_milestone_id?, provenance?}; action=revise {base_revision_id?, content, display_label?, expected_milestone_version, lifecycle?, milestone_id, primary_milestone_id?, provenance?}; action=set_primary {content?, display_label?, expected_milestone_version, milestone_id?, primary_milestone_id?}; Define, revise or select a bound Project milestone. Payload <=65536 serialized UTF-8 bytes.\n- project.readiness: {action: one of evaluate, milestone_id, milestone_version}; Evaluate milestone readiness against its exact version. Payload <=65536 serialized UTF-8 bytes.\n- project.release.request: {action: one of propose_candidate, milestone_id, milestone_version, readiness_digest, readiness_snapshot_id}; Queue an exact release candidate proposal; final release is user-only. Payload <=65536 serialized UTF-8 bytes.\n- project.review_config: {action: one of set_ci_steps, ci_steps, expected_project_version, setup_steps?}; Set independent review commands for subsequent Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.validation: {action: one of record, check_id, definition_revision_id, evidence_asset_id?, expected_milestone_version?, governing_revision_ids?, input_digest, milestone_id, milestone_version?, observed_command_ids?, observed_task_id?, result, status: one of pass|fail|blocked|stale|unavailable}; Record disposable-checkout observations; pass/fail require observed commands, manual attestation is user-only. Payload <=65536 serialized UTF-8 bytes.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: {action: one of draft_revision, base_revision_id?, charter_id?, content, expected_charter_version, expected_digest?, maturity: one of prototype|mvp|production|critical, project_mode: one of compact|standard, provenance, render_version?, rendered_view?}; Draft an adoption or amendment Charter; only the user can approve it. Payload <=65536 serialized UTF-8 bytes.\n- project.decision: {action: one of record_candidate|record_effective, affected_artifact_refs?, affected_milestone_ids?, affected_task_ids?, decision_class: one of project_implementation, decision_id?, expected_project_version, options?, question, rationale?, selected_outcome?}; Record implementation decisions within the approved Charter. Payload <=65536 serialized UTF-8 bytes.\n- project.document: action=draft_revision {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=propose_approval {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=approve {content_digest, document_id, envelope_digest?, expected_document_version, kind?, render_digest, revision_id, title?}; Draft, propose or policy-authorize a bound Project Document. Payload <=65536 serialized UTF-8 bytes.\n- project.escalate: {need, task_ids?}; Ask the owner for the need blocking named Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.evidence: {acceptance_check_ids, action: one of attach|capture, asset_id?, caption, checksum?, content?, expected_milestone_version, filename?, kind, milestone_id, path?, source_run_id?, source_validation_id?, task_id?}; Attach milestone proof or capture your verification artifact; kind: screenshot|walkthrough_video|log|report|other. Payload <=65536 serialized UTF-8 bytes.\n- project.milestone: action=define {content, display_label?, expected_milestone_version?, lifecycle?, milestone_id?, primary_milestone_id?, provenance?}; action=revise {base_revision_id?, content, display_label?, expected_milestone_version, lifecycle?, milestone_id, primary_milestone_id?, provenance?}; action=set_primary {content?, display_label?, expected_milestone_version, milestone_id?, primary_milestone_id?}; Define, revise or select a bound Project milestone. Payload <=65536 serialized UTF-8 bytes.\n- project.readiness: {action: one of evaluate, milestone_id, milestone_version}; Evaluate milestone readiness against its exact version. Payload <=65536 serialized UTF-8 bytes.\n- project.release.request: {action: one of propose_candidate, milestone_id, milestone_version, readiness_digest, readiness_snapshot_id}; Queue an exact release candidate proposal; final release is user-only. Payload <=65536 serialized UTF-8 bytes.\n- project.review_config: {action: one of set_ci_steps, ci_steps, expected_project_version, setup_steps?}; Set independent review commands for subsequent Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.validation: {action: one of record, check_id, definition_revision_id, evidence_asset_id?, expected_milestone_version?, governing_revision_ids?, input_digest, milestone_id, milestone_version?, observed_command_ids?, observed_task_id?, result, status: one of pass|fail|blocked|stale|unavailable}; Record disposable-checkout observations; pass/fail require observed commands, manual attestation is user-only. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
           }
         },
@@ -1783,7 +1783,7 @@
           },
           "payload": {
             "additionalProperties": false,
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: {action: one of draft_revision, base_revision_id?, charter_id?, content, expected_charter_version, expected_digest?, maturity, project_mode, provenance, render_version?, rendered_view?}; Draft an adoption or amendment Charter; only the user can approve it. Payload <=65536 serialized UTF-8 bytes.\n\nThe bound Project may have no current Charter. Omit charter_id to start; expected_charter_version is 0. For a revision, copy the returned Charter id/version. The server renders the canonical view.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: {action: one of draft_revision, base_revision_id?, charter_id?, content, expected_charter_version, expected_digest?, maturity: one of prototype|mvp|production|critical, project_mode: one of compact|standard, provenance, render_version?, rendered_view?}; Draft an adoption or amendment Charter; only the user can approve it. Payload <=65536 serialized UTF-8 bytes.\n\nThe bound Project may have no current Charter. Omit charter_id to start; expected_charter_version is 0. For a revision, copy the returned Charter id/version. The server renders the canonical view.",
             "properties": {
               "action": {
                 "const": "draft_revision",
@@ -2450,9 +2450,19 @@
                 ]
               },
               "maturity": {
+                "enum": [
+                  "prototype",
+                  "mvp",
+                  "production",
+                  "critical"
+                ],
                 "type": "string"
               },
               "project_mode": {
+                "enum": [
+                  "compact",
+                  "standard"
+                ],
                 "type": "string"
               },
               "provenance": {
@@ -2745,8 +2755,8 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "type": "object",
-            "description": "- task.summary: no arguments; Task-run offers are informational: this tool grants no workflow mutation."
+            "description": "- task.summary: no arguments; Task-run offers are informational: this tool grants no workflow mutation.",
+            "type": "object"
           },
           "operation": {
             "enum": [
@@ -2959,8 +2969,8 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "type": "object",
-            "description": "- task.summary: no arguments; Task-run offers are informational: this tool grants no workflow mutation."
+            "description": "- task.summary: no arguments; Task-run offers are informational: this tool grants no workflow mutation.",
+            "type": "object"
           },
           "operation": {
             "enum": [
@@ -3163,8 +3173,8 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "type": "object",
-            "description": "- task.summary: no arguments; Task-run offers are informational: this tool grants no workflow mutation."
+            "description": "- task.summary: no arguments; Task-run offers are informational: this tool grants no workflow mutation.",
+            "type": "object"
           },
           "operation": {
             "enum": [

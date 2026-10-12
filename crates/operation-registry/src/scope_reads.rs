@@ -40,7 +40,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
                 projection: FieldProjection::ReadArguments,
             }],
             "Read a bounded Project summary.",
-            "Main names an owned project_id; Project scope uses its binding.",
+            "Main must name an owned project_id.",
             &[StructuralConstraint::ClosedObject],
             |c, i| Box::pin(c.project_summary(i)),
         ),

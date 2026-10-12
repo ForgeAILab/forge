@@ -1,6 +1,8 @@
 //! Receipt-bearing Project commands. Exact receipts are retrieved before fresh
 //! admission; their typed contracts govern only a new effect.
-use crate::hand_proposals::charter::{ProjectCharterContent, RevisionProvenance};
+use crate::hand_proposals::charter::{
+    ProductMaturity, ProjectCharterContent, ProjectMode, RevisionProvenance,
+};
 use crate::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -18,8 +20,8 @@ pub struct CharterAdoption {
     pub expected_digest: Option<String>,
     #[schemars(range(min = 0))]
     pub expected_charter_version: i64,
-    pub project_mode: String,
-    pub maturity: String,
+    pub project_mode: ProjectMode,
+    pub maturity: ProductMaturity,
     pub content: ProjectCharterContent,
     pub rendered_view: Option<String>,
     pub render_version: Option<String>,
@@ -100,7 +102,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             CONSTRAINTS, |c, i| Box::pin(c.charter_adoption(i))).with_receipt_replay(),
         OperationSpec::typed("project.evidence", AUTHORITY, EffectClass::DirectCommand,
             AvailabilityRule::ReadyOnly, SURFACES,
-            "Attach milestone proof, or capture the artifact your verification produced.",
+            "Attach milestone proof or capture your verification artifact; kind: screenshot|walkthrough_video|log|report|other.",
             "attach requires asset_id and checksum. capture requires exactly one of content or path in the Project workspace, without asset_id/checksum. source_validation_id is the recorded validation RESULT id, never the check id.",
             CONSTRAINTS, |c, i| Box::pin(c.project_evidence(i))).with_receipt_replay(),
         OperationSpec::typed("project.readiness", AUTHORITY, EffectClass::DirectCommand,

@@ -8,6 +8,50 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Agent doctrine moves to new revisions: Main baseline @5, Product Genesis
+  @8, Project @22.** Migration `V202610120418` inserts Genesis @8 and Project
+  @22 as new immutable revisions, moves the two current pointers, and moves
+  Project Agent bindings that were on @21 to @22 (the baseline is compiled, not
+  stored). No earlier revision is edited. A chat turn admitted on an earlier
+  revision keeps the exact prompt it was admitted on, body and override
+  section; turns admitted after the upgrade get the new text. The server-owned
+  override section is now part of each revision body. The Project text no
+  longer lists the eight Task action verbs and their parameters: a Project
+  Agent copies the call from the `action_schema` that `work.read` returns
+  beside the current offers. It also no longer says a Project Agent can
+  reassign a role on an existing Task (no operation ever did that); it says
+  to replace the Task or escalate. It states that `action` is optional on
+  `task.worklog` and `task.evidence`, and that each worklog entry takes a new
+  `correlation_id`.
+- **Project lifecycle hooks and script hooks need the Project owner or an
+  admin member, on REST and MCP.** MCP `forge_update_project_lifecycle_hooks`
+  is no longer listed or callable for a caller who can only see the Project or
+  is a plain member, whether the grant is bound to the Project or to the
+  account. A settings document that contains a `script` lifecycle hook is
+  refused with `insufficient_role` (MCP `forge_update_project`) or `403`
+  (REST `PATCH /api/v1/projects/{id}`) for anyone else, including when the
+  hook is already stored and unchanged, and including an ownerless Project
+  with no admin member. Before, MCP let any caller who could see an ownerless
+  Project write a hook command, and REST did not check.
+- **MCP agent ids must be usable by the caller.** `forge_assign_agent.agent_id`,
+  `forge_create_sub_tasks.subtasks[].assignee_id` and
+  `forge_follow_up_execution.agent_id` are refused unless the agent is usable in
+  the Task's Project by the calling user (the rule REST applies). Another
+  account's agent answers `not found`, the same as an id that does not exist.
+- **Four native Project operations have closed contracts.** `project.summary`,
+  `project.charter.adoption`, `project.evidence` and `project.readiness` refuse
+  an undeclared field with a correctable `validation_error` that names the
+  expected fields. `project.evidence` requires `acceptance_check_ids` at the
+  contract (its command always required it). `project.summary` from the Main
+  chat now needs the stored `read_agent_chat` permission, as
+  `agent_chat.summary` does.
+- **A paused or restricted Project Agent's evidence `capture` retry is
+  refused.** An exact retry of a committed `project.charter.adoption`,
+  `project.readiness` or `project.evidence` `attach` still returns its receipt
+  after the agent lost authority. A `capture` retry does not: capture stores
+  its asset before the command runs, so it is now refused before anything is
+  written.
+
 - **A dirty Task checkout returns to its coder through the merge-fix budget.**
   The queue uses the same failure/cascade path as the pre-queue merge hook,
   rather than parking the Task for its owner. A red head check also charges
@@ -1379,6 +1423,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **One registry drives the native and MCP tool surfaces.** Native host
+  metadata, permission lists and the MCP dispatch table are generated from the
+  operation registry; the hand-written proposal fallback and its unadvertised
+  aliases (`message.propose`, `commitment.propose`, `review.propose`) are gone.
+  No prompt, doctrine revision or tool schema ever named those aliases.
+- **Smaller tool prefixes.** The generic read tools no longer restate optional
+  `{limit?}` / `{query?}` arguments; a wrong argument is still answered with
+  the expected fields. The ready Project surface lists the Charter adoption
+  fields without the nested Charter shape (about 3,000 bytes a turn); Project
+  setup still declares the whole nested schema. Compact UTF-8 bytes, before →
+  after: worker 4,655 → 4,507; reviewer 3,955 → 3,807; planner 4,030 → 3,882;
+  Project 17,302 → 14,050; Project with verification 18,551 → 15,299; Main
+  8,891 → 8,612; inquiry 4,181 → 3,946; Project setup 15,782 → 12,626.
 
 - **Native Task operations come from the operation registry.** The Task
   reads, `task.plan` / `task.worklog` / `task.evidence`, and the Project
@@ -2941,6 +2999,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A Project-bound MCP dependency listing no longer names a Task outside the
+  Project.** `forge_list_task_dependencies` answers `not found` for the
+  requested Task instead of naming the foreign dependency id.
+- **`forge_transition_task` returns the caller's own offers.** The response's
+  `available_actions` are computed for the delegated user, as `forge_get_task`
+  does, instead of for the owner. The transition itself still runs under the
+  MCP system policy.
+- **Charter adoption and evidence name their accepted values again.** The
+  registry contracts for `project.charter.adoption` and `project.evidence`
+  had dropped the `maturity` and `project_mode` values and the evidence
+  kinds, so a first call had to guess them.
 
 - **`task.propose` no longer advertises `action: "create"`.** The native
   schema declared the field as required and the command refused it. The
