@@ -175,18 +175,17 @@ impl TaskDispatcher {
                 if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await? {
                     return Ok(());
                 }
-                if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
+                let children = crate::task_hierarchy::children_if_root(&self.db, &task).await?;
+                if !children.is_empty() {
                     // The Project Agent coordinates this root through its child
                     // records. Only children receive implementation dispatches.
-                    let sequence_complete = crate::task_hierarchy::coordination_root_sequence_complete(
-                        &self.db, &task, workflow,
-                    )
-                    .await?;
-                    let needs_recovery_advance = sequence_complete
-                        && workflow.canonical_phase_for_state(&task.status)
-                            != api_types::CanonicalPhase::Review
-                        && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
-                    if crate::task_service::coordination_review_pending(&task) || needs_recovery_advance
+                    if crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
+                        .root_advance_due(
+                            &task,
+                            &children,
+                            &db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?,
+                            crate::task_service::coordination_review_pending(&task),
+                        )
                     {
                         dispatched += self.advance_coordination_root_once(&task).await?;
                     }

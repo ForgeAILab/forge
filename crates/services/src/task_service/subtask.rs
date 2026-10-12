@@ -110,11 +110,18 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("project", parent.project_id.clone()))?;
         let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
         let subtasks = crate::task_hierarchy::ordered_children(&self.db, parent_task_id).await?;
-        if !crate::task_hierarchy::child_sequence_complete(&subtasks, &workflow) {
+        if subtasks.is_empty() {
             return Err(ServiceError::invalid_operation(format!(
-                "coordination root {parent_task_id} cannot enter aggregate review before every subtask is terminal"
+                "coordination root {parent_task_id} has no subtasks to coordinate"
             )));
         }
+        // Two modes of one walk. Kickoff: a subtask is left to run, so the
+        // root moves forward to the state it coordinates from. Completion:
+        // every subtask is terminal, so the root goes on to aggregate review.
+        // Both stop where the root's lead holds the state (the planning gate
+        // with the planning role assigned): the lead's execution moves the
+        // root on from there, never this walk.
+        let complete = crate::task_hierarchy::child_sequence_complete(&subtasks, &workflow);
 
         if workflow.state_kind(&parent.status) == Some(api_types::StateKind::Terminal) {
             self.set_coordination_review_pending(parent_task_id, false)
@@ -123,12 +130,21 @@ impl TaskService {
         }
 
         crate::task_hierarchy::ensure_coordination_root_unblocked(&parent)?;
+        let policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
+        let lead_assigned = crate::task_hierarchy::root_lead(&self.db, &parent, &workflow)
+            .await?
+            .is_some();
+        let lead_holds = |status: &str| lead_assigned && policy.planning_state() == Some(status);
+        let reason = if complete {
+            "ordered subtasks completed"
+        } else {
+            "ordered subtasks ready to start"
+        };
 
         // Traverse ready/non-review gate hops until the workflow reaches its
-        // active aggregation state. Root non-review dispatch hooks are
-        // deliberately skipped, so this advances coordination state without
-        // launching a root planner/coder. The bound also makes malformed
-        // cyclic workflow definitions fail deterministically.
+        // active aggregation state or the lead's planning state. The root's
+        // implementation role is never dispatched on it. The bound also makes
+        // malformed cyclic workflow definitions fail deterministically.
         for _ in 0..workflow.states.len() {
             crate::task_hierarchy::ensure_coordination_root_unblocked(&parent)?;
             let Some(parent_state) = workflow
@@ -140,31 +156,12 @@ impl TaskService {
             };
             if parent_state.kind == api_types::StateKind::Active
                 || parent_state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                || lead_holds(&parent.status)
             {
                 break;
             }
-            let next_target = workflow
-                .outgoing_trigger_targets(&parent.status)
-                .filter_map(|(_, target)| {
-                    workflow
-                        .states
-                        .iter()
-                        .find(|state| state.name == target)
-                        .filter(|state| {
-                            !matches!(
-                                state.kind,
-                                api_types::StateKind::Backlog | api_types::StateKind::Terminal
-                            ) && state.canonical_phase != Some(api_types::CanonicalPhase::Review)
-                        })
-                        .map(|state| {
-                            (
-                                state.kind == api_types::StateKind::Active,
-                                state.name.clone(),
-                            )
-                        })
-                })
-                .max_by_key(|(is_active, _)| *is_active)
-                .map(|(_, target)| target)
+            let next_target = policy
+                .advance_target(&parent.status, lead_assigned)
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
                         "coordination root {} has no route from {} to an active aggregation state",
@@ -178,7 +175,7 @@ impl TaskService {
                 TransitionOptions {
                     bridge: Default::default(),
                     version: parent.version,
-                    reason: Some("ordered subtasks completed".to_owned()),
+                    reason: Some(reason.to_owned()),
                     triggered_by: api_types::Actor::system(
                         api_types::SystemComponent::TaskDispatcher,
                     ),
@@ -197,6 +194,19 @@ impl TaskService {
         }
 
         crate::task_hierarchy::ensure_coordination_root_unblocked(&parent)?;
+        if lead_holds(&parent.status) {
+            // The lead decides from here. Nothing is pending for this walk:
+            // a flag left set would starve the planner on every pass.
+            self.set_coordination_review_pending(parent_task_id, false)
+                .await?;
+            crate::wake_task_dispatch(
+                &self.db,
+                parent_task_id,
+                "coordination root waits for its lead",
+            )
+            .await?;
+            return Ok(());
+        }
         let parent_kind = workflow.state_kind(&parent.status);
         let parent_phase = workflow.canonical_phase_for_state(&parent.status);
         if parent_kind != Some(api_types::StateKind::Active)
@@ -206,6 +216,17 @@ impl TaskService {
                 "coordination root {} could not reach an active aggregation or review state from {}",
                 parent.id, parent.status
             )));
+        }
+
+        if !complete {
+            // Kickoff ends in the implementation state: the first subtask
+            // may start now. A completion flag left from before a subtask
+            // was added no longer describes this root.
+            self.set_coordination_review_pending(parent_task_id, false)
+                .await?;
+            self.wake_next_ordered_subtask(parent_task_id, "coordination root started")
+                .await?;
+            return Ok(());
         }
 
         if parent_kind == Some(api_types::StateKind::Active) {

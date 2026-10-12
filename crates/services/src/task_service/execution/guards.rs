@@ -24,9 +24,10 @@ impl TaskService {
 
     /// Admit an execution attempt against the coordination hierarchy before a
     /// caller transitions a Task or prepares a workspace.  A root with
-    /// children is a container: only its aggregate reviewer may run after
-    /// every child is terminal.  A child must be the first incomplete sibling,
-    /// and its root must still be live and unblocked.
+    /// children is a container: its lead may run in the planning state, and
+    /// its aggregate reviewer after every child is terminal.  A child must be
+    /// the first incomplete sibling, and its root must be unblocked and in
+    /// its implementation state.
     pub(super) async fn ensure_ordered_execution_admission(
         &self,
         task: &Task,
@@ -52,19 +53,20 @@ impl TaskService {
                 &project.workflow_definition,
                 &api_types::Actor::system(api_types::SystemComponent::Executor),
             );
-            if workflow.canonical_phase_for_state(&task.status) != api_types::CanonicalPhase::Review
-            {
-                return Err(ServiceError::invalid_operation(format!(
-                    "coordination root {} is not in its aggregate review state",
-                    task.id
-                )));
-            }
+            // The policy names the one role that may run on a root in each
+            // state: its lead in the planning state, its aggregate reviewer
+            // in the review phase.
             if !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
                 .allows_execution(&task.status, role)
             {
                 return Err(ServiceError::invalid_operation(
-                    "root tasks with subtasks are coordination containers; only their aggregate review role may execute",
+                    "root tasks with subtasks are coordination containers; only their lead may execute in the planning state and their aggregate review role in review",
                 ));
+            }
+            if workflow.canonical_phase_for_state(&task.status) != api_types::CanonicalPhase::Review
+            {
+                // The lead plans while subtasks are still to run.
+                return Ok(());
             }
 
             let subtasks = crate::task_hierarchy::ordered_children(&self.db, &task.id).await?;

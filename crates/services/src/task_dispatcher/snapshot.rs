@@ -346,17 +346,16 @@ impl TaskDispatcher {
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .is_some_and(|a| a["blocking_reason"] == "review_ci_infrastructure");
         f.root = t.parent_task_id.is_none() && !r.children.is_empty();
-        let complete = f.root && crate::task_hierarchy::child_sequence_complete(&r.children, &pw);
+        // One policy decides kickoff, completion and the lead's hold, here
+        // and in the walk that `Step::AdvanceRoot` runs.
+        let root_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&pw);
         f.root_advance = f.root
-            && matches!(
-                w.state_kind(&t.status),
-                Some(StateKind::Initial | StateKind::Active | StateKind::Gate)
-            )
-            && (crate::task_service::coordination_review_pending(t)
-                || (complete
-                    && pw.canonical_phase_for_state(&t.status)
-                        != api_types::CanonicalPhase::Review
-                    && pw.state_kind(&t.status) != Some(StateKind::Terminal)));
+            && root_policy.root_advance_due(
+                t,
+                &r.children,
+                &r.assignments,
+                crate::task_service::coordination_review_pending(t),
+            );
         if let Some(parent) = &r.parent {
             let allowed =
                 crate::task_hierarchy::coordination_root_allows_child_dispatch(parent, &pw);
@@ -376,6 +375,10 @@ impl TaskDispatcher {
                     "held"
                 } else if crate::task_hierarchy::root_blocked(parent) {
                     "blocked"
+                } else if root_policy.planning_state() == Some(parent.status.as_str()) {
+                    // The root plans (its lead runs, waits or is about to be
+                    // moved on): its subtasks start when it implements.
+                    "planning"
                 } else {
                     "not_coordinating"
                 };
@@ -383,9 +386,7 @@ impl TaskDispatcher {
             }
         }
         if let Some(role) = role {
-            f.root_role_allowed = !f.root
-                || crate::task_hierarchy::RootRolePolicy::for_workflow(&w)
-                    .allows_execution(&t.status, role);
+            f.root_role_allowed = !f.root || root_policy.allows_execution(&t.status, role);
             f.in_flight = r.executions.iter().any(|e| {
                 e.status == ExecutionStatus::Running
                     && helpers::execution_guard_roles(role).contains(&e.role.as_str())

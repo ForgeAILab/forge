@@ -365,13 +365,19 @@ impl TaskService {
                         .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
                 }
                 Ok(false) => {
-                    let candidate_required =
-                        plan.rejected_candidate(&execution.id)
-                            .await
-                            .map_err(|error| {
-                                error.into_service_error("execution plan candidate is unreadable")
-                            })?
-                            || execution.role == crate::workflow::default_roles::PLANNER
+                    // A coordination root's lead plans through its subtasks:
+                    // the root has no checklist of its own to complete (see
+                    // `ensure_planning_plan_ready_before_leaving`), so only a
+                    // candidate it wrote and Forge rejected holds it back.
+                    let plans_through_subtasks =
+                        crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task)
+                            .await?;
+                    let rejected = plan.rejected_candidate(&execution.id).await.map_err(
+                        |error| error.into_service_error("execution plan candidate is unreadable"),
+                    )?;
+                    let candidate_required = rejected
+                        || (!plans_through_subtasks
+                            && (execution.role == crate::workflow::default_roles::PLANNER
                             || task.plan.as_deref().is_some_and(|plan| {
                                 !crate::plan_artifact::parse_plan_markdown(plan)
                                     .items
@@ -386,7 +392,7 @@ impl TaskService {
                                     "canonical plan artifact is unreadable: {error}"
                                 ))
                             })?
-                            .is_some();
+                            .is_some()));
                     if candidate_required {
                         self.discard_brokered_execution_plan_stage(&execution)
                             .await?;

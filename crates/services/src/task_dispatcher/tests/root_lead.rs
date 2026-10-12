@@ -137,6 +137,19 @@ async fn seed_native_agent(db: &db::SqliteDb) -> String {
     .await
     .expect("native agent creates");
     assert_eq!(agent.backend_kind, "native");
+    db::AgentConnectionHealthRepo::upsert_connection_health(
+        db,
+        db::UpsertAgentConnectionHealth {
+            profile_id: agent.profile_id.clone(),
+            status: "healthy".to_owned(),
+            capability_status_json: "{}".to_owned(),
+            checked_at: Some(now_rfc3339()),
+            error_code: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("connection health records");
     id
 }
 
@@ -177,7 +190,24 @@ async fn until(lead: &Lead, what: &str, done: impl AsyncFn() -> bool) {
         tokio::time::sleep(Duration::from_millis(25)).await;
         lead.dispatcher.check_once_and_drain().await.unwrap();
     }
-    panic!("timed out waiting until {what}");
+    let tasks: Vec<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT title, status, metadata_json, error_annotation, condition_json FROM task ORDER BY created_at",
+    )
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    let runs: Vec<(String, String, String, Option<String>)> =
+        sqlx::query_as("SELECT task_id, role, status, error FROM execution ORDER BY created_at")
+            .fetch_all(lead.db.pool())
+            .await
+            .unwrap();
+    let steps: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT kind, status, substr(payload_json, 1, 200), last_error FROM task_step ORDER BY rowid",
+    )
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    panic!("timed out waiting until {what}\ntasks: {tasks:#?}\nexecutions: {runs:#?}\nsteps: {steps:#?}");
 }
 
 async fn root_with_child(lead: &Lead, with_planner: bool) -> (Task, Task) {
@@ -258,8 +288,14 @@ async fn a_planner_that_succeeds_releases_the_subtasks() {
     );
     assert_eq!(reload(&lead.db, &child.id).await.status, "in_progress");
     // The planner ran in the root workspace and the subtask reuses it.
-    let planner_ctx = lead.rx.try_recv().expect("planner context");
-    let coder_ctx = lead.rx.try_recv().expect("coder context");
+    let planner_ctx = tokio::time::timeout(Duration::from_secs(5), lead.rx.recv())
+        .await
+        .expect("planner context arrives")
+        .expect("planner context");
+    let coder_ctx = tokio::time::timeout(Duration::from_secs(5), lead.rx.recv())
+        .await
+        .expect("coder context arrives")
+        .expect("coder context");
     assert_eq!(planner_ctx.task_id, root.id);
     assert_eq!(coder_ctx.task_id, child.id);
     assert_eq!(planner_ctx.worktree_path, coder_ctx.worktree_path);
