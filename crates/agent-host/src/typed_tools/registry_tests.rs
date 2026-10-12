@@ -756,12 +756,7 @@ fn registry_field_canonicalization_does_not_depend_on_root_aliases() {
 #[test]
 fn task_role_advertisement_matches_evaluator_and_never_grants_workflow_commands() {
     use operation_registry::authority::{AuthorityFacts, EffectiveAuthority, Principal, TaskRole};
-    for role in [
-        TaskRole::Worker,
-        TaskRole::Reviewer,
-        TaskRole::Planner,
-        TaskRole::Lead,
-    ] {
+    for role in [TaskRole::Worker, TaskRole::Reviewer, TaskRole::Planner] {
         for active in [false, true] {
             for granted in [false, true] {
                 let permissions = if granted {

@@ -98,7 +98,6 @@ pub enum TaskRole {
     Worker,
     Reviewer,
     Planner,
-    Lead,
 }
 impl TaskRole {
     pub fn parse(role: &str) -> Option<Self> {
@@ -108,7 +107,6 @@ impl TaskRole {
             // under the reviewer session; rows of it still exist.
             "reviewer" | "auditor" => Some(Self::Reviewer),
             "planner" => Some(Self::Planner),
-            "lead" => Some(Self::Lead),
             _ => None,
         }
     }
@@ -449,12 +447,12 @@ mod tests {
             ("reviewer", Some(TaskRole::Reviewer)),
             ("auditor", Some(TaskRole::Reviewer)),
             ("planner", Some(TaskRole::Planner)),
+            ("lead", None),
             ("interactive", None),
         ] {
             assert_eq!(TaskRole::parse(role), expected, "{role}");
         }
         assert!(!TaskRole::Reviewer.can_write_plan());
-        assert!(!TaskRole::Lead.can_write_plan());
     }
     fn authority(permissions: &[&str]) -> EffectiveAuthority {
         EffectiveAuthority::resolve(AuthorityFacts {

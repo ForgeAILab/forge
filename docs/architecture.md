@@ -10163,9 +10163,7 @@ comment with missing execution/role provenance, and a `correlation_id` reused
 for a different entry is refused instead of answered with the first entry.
 File evidence is read from that execution's workspace (the Task's when the
 execution recorded none). Planner and implementation roles can stage a plan;
-reviewers can record observations and cannot author a plan. The evaluator knows
-a `lead` role (observations, no plan); no native Task session is composed for
-it.
+reviewers can record observations and cannot author a plan.
 
 `task_proposals` owns the Project Agent's eight-verb `task.action`,
 `task.dependency`, `task.adaptive` and `task.propose` contracts. It reuses the
