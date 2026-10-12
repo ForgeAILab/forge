@@ -1620,6 +1620,96 @@ impl World {
             }
         }
         self.check_roots(false).await?;
+        self.check_replans(false).await?;
+        Ok(())
+    }
+
+    /// The re-plan invariants of plan 3.10 stage 2.
+    ///
+    /// (l) in every committed state: only a coordination root with a lead
+    /// ever spends `replan` or enters planning over the `replan` bridge;
+    /// what is spent is within the limit, each charge has one receipt, no
+    /// two planning entries share a receipt, and at most one charge is ahead
+    /// of its entry (the crash window between the charge and the entry).
+    /// (o) at quiescence: a root in aggregate review, merging or a terminal
+    /// state has no subtask left to run, so a re-plan can add work only
+    /// before the root returns to implementation.
+    ///
+    /// What is real and what is vacuous here. The "nobody without a lead"
+    /// half of (l) is real: every root in the model is such a root, and a
+    /// charge or a `replan` entry on any of them fails it. (o) is real for
+    /// the same roots. The accounting half of (l) (limit, receipts, charge
+    /// against entry) is VACUOUS until the harness has a lead
+    /// (`Action::AssignLead` and a scripted native planner): it is proven at
+    /// the dispatcher level in `services::task_dispatcher::tests::
+    /// root_replan` (one charge per trigger, the crash window, the sixth
+    /// re-plan, the Review budget untouched).
+    async fn check_replans(&self, quiescent: bool) -> Result<(), String> {
+        let pool = &self.live().pool;
+        let rows = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(pool)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        const LEAD_ROOT: &str = "t.parent_task_id IS NULL AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = t.id AND c.deleted_at IS NULL) AND EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = t.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
+        let strangers: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT t.id FROM task t WHERE NOT ({LEAD_ROOT})
+               AND (EXISTS (SELECT 1 FROM task_budget b WHERE b.task_id = t.id AND b.kind = 'replan' AND b.spent > 0)
+                    OR EXISTS (SELECT 1 FROM transition_log l WHERE l.task_id = t.id AND l.bridge_kind = 'replan'
+                               AND NOT EXISTS (SELECT 1 FROM task_budget_charge c WHERE c.task_id = t.id AND c.kind = 'replan')))"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !strangers.is_empty() {
+            return Err(format!(
+                "(l) Tasks that are not lead-managed roots re-planned: {strangers:?}"
+            ));
+        }
+        let overspent = rows(
+            "SELECT b.task_id || ' spent ' || b.spent FROM task_budget b WHERE b.kind = 'replan'
+               AND (b.spent > 5
+                    OR b.spent != (SELECT COUNT(*) FROM task_budget_charge c
+                                   WHERE c.task_id = b.task_id AND c.kind = 'replan' AND c.window_id = b.window_id)
+                    OR (SELECT COUNT(*) FROM task_budget_charge c
+                        WHERE c.task_id = b.task_id AND c.kind = 'replan' AND c.window_id = b.window_id
+                          AND NOT EXISTS (SELECT 1 FROM transition_log l WHERE l.task_id = b.task_id AND l.bridge_kind = 'replan'
+                                          AND json_extract(l.bridge_payload, '$.receipt') = c.step_id)) > 1)",
+        )
+        .await?;
+        if !overspent.is_empty() {
+            return Err(format!(
+                "(l) re-plan charges disagree with their receipts or entries: {overspent:?}"
+            ));
+        }
+        let repeated = rows(
+            "SELECT l.task_id || ' ' || json_extract(l.bridge_payload, '$.receipt') FROM transition_log l
+             WHERE l.bridge_kind = 'replan' GROUP BY l.task_id, json_extract(l.bridge_payload, '$.receipt')
+             HAVING COUNT(*) > 1",
+        )
+        .await?;
+        if !repeated.is_empty() {
+            return Err(format!(
+                "(l) one re-plan trigger entered planning twice: {repeated:?}"
+            ));
+        }
+        if !quiescent {
+            return Ok(());
+        }
+        let open = rows(
+            "SELECT r.id || ' in ' || r.status || ' with ' || c.id || ' in ' || c.status
+             FROM task r JOIN task c ON c.parent_task_id = r.id
+             WHERE r.parent_task_id IS NULL AND r.deleted_at IS NULL AND c.deleted_at IS NULL
+               AND r.status IN ('review', 'merging', 'done', 'cancelled')
+               AND c.status NOT IN ('done', 'cancelled')",
+        )
+        .await?;
+        if !open.is_empty() {
+            return Err(format!(
+                "(o) roots past implementation with a subtask left to run: {open:?}"
+            ));
+        }
         Ok(())
     }
 
@@ -1725,7 +1815,7 @@ impl World {
                AND c.status IN ('todo', 'in_progress')
                AND NOT (COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') = 'parent'
                         AND json_extract(c.condition_json, '$.primary.cause') IN ('planning', 'held', 'blocked'))
-               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure')",
+               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure', 'budget_exhausted', 'agent_timeout')",
         )
         .await?;
         if !unheld.is_empty() {
@@ -1740,6 +1830,7 @@ impl World {
     async fn check_quiescent(&mut self) -> Result<String, String> {
         self.check_committed().await?;
         self.check_roots(true).await?;
+        self.check_replans(true).await?;
         // (a) the dispatcher's own "owned or parked" assertion.
         bounded(
             &self.probe,
