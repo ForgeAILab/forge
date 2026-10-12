@@ -843,7 +843,7 @@ async fn a_planner_that_fails_parks_the_root_and_its_subtask_with_a_way_out() {
     // The root waits for its retry deadline or shows its failure; either way
     // it has an owner, and so has its subtask.
     assert!(
-        park(&lead.db, &root.id).await != ""
+        !park(&lead.db, &root.id).await.is_empty()
             || executions(&lead.db, &root.id)
                 .await
                 .iter()
@@ -1050,7 +1050,7 @@ async fn upgrade_matrix_every_root_and_subtask_state_is_owned() {
                         continue;
                     }
                     assert!(
-                        park(&lead.db, &task.id).await != ""
+                        !park(&lead.db, &task.id).await.is_empty()
                             || running(&executions(&lead.db, &task.id).await) == 1,
                         "{case}: {} has an owner\n{dump}",
                         task.title
