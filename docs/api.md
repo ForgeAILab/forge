@@ -4756,7 +4756,6 @@ Common HTTP mappings:
 | 412 | Workflow guard rejection (`before_exit` blocked the transition) |
 | 422 | Illegal state transition |
 | 500 | Internal error |
-| 503 | `check_environment_unavailable`: the owner has no complete environment attestation yet; retry before requesting the check. No identity or check run was created. |
 
 `resource_in_use` (HTTP `409`) means a delete or update was refused because
 other records still reference the target, for example a workspace whose remote
