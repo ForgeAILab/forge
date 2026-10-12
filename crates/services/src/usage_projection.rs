@@ -1896,3 +1896,6 @@ mod source_read_tests {
         assert_eq!(acquisitions.load(Ordering::Relaxed), 1);
     }
 }
+
+#[cfg(test)]
+mod retrospective_pricing_tests;

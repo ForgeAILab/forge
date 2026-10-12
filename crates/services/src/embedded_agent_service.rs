@@ -2372,6 +2372,12 @@ pub fn default_api_key_base_url(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// [`entry_base_url`] as the pricing crate asks for it: the endpoint, or `None`
+/// when the entry has no usable one.
+pub fn provider_entry_endpoint(entry: &CredentialHandle) -> Option<String> {
+    entry_base_url(entry).ok()
+}
+
 /// Whether a base URL points at the ChatGPT Codex backend, which speaks the
 /// Responses API only and has no OpenAI-compatible `GET /models` route.
 fn is_codex_backend(base_url: &str) -> bool {

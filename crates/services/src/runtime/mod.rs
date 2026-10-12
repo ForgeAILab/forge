@@ -242,8 +242,8 @@ impl ForgeRuntime {
 #[derive(Clone)]
 pub struct ForgeRuntime {
     pub db: Arc<SqliteDb>,
-    pub pricing_repository: Arc<crate::pricing_db::SqlitePricingRepository>,
-    pub models_dev_client: Arc<crate::pricing::ModelsDevClient>,
+    pub pricing_repository: Arc<pricing::sqlite::SqlitePricingRepository>,
+    pub models_dev_client: Arc<pricing::ModelsDevClient>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
@@ -599,13 +599,13 @@ impl ForgeRuntimeBuilder {
             config::resolved_run_cap(effective_config.server.max_concurrent_runs),
             &config::embedded_machine_id(),
         );
-        let pricing_repository = Arc::new(crate::pricing_db::SqlitePricingRepository::new(
+        let pricing_repository = Arc::new(pricing::sqlite::SqlitePricingRepository::new(
             Arc::clone(&self.db),
         ));
-        let catalog_repository: Arc<dyn crate::pricing::PricingCatalogRepository> =
+        let catalog_repository: Arc<dyn pricing::PricingCatalogRepository> =
             pricing_repository.clone();
         let models_dev_client = Arc::new(
-            crate::pricing::ModelsDevClient::new(catalog_repository)
+            pricing::ModelsDevClient::new(catalog_repository)
                 .expect("models.dev pricing client must initialize"),
         );
         let embedded_agent_service = Arc::new(EmbeddedAgentService::new(

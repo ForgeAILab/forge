@@ -255,6 +255,7 @@ dependencies = [
  "hex",
  "jsonwebtoken",
  "mcp-server",
+ "pricing",
  "rand 0.8.6",
  "review",
  "schemars",
@@ -2695,6 +2696,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pricing"
+version = "0.13.12"
+dependencies = [
+ "api-types",
+ "async-trait",
+ "chrono",
+ "db",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3374,6 +3395,7 @@ dependencies = [
  "jsonwebtoken",
  "operation-registry",
  "portable-pty",
+ "pricing",
  "rand 0.8.6",
  "reqwest",
  "review",

@@ -1757,7 +1757,7 @@ struct LedgerChat {
 /// input tokens and $2 per million output tokens.
 #[cfg(feature = "test-support")]
 async fn ledger_chat(steps: Vec<ScriptedStream>) -> LedgerChat {
-    use services::pricing::PricingCatalogRepository;
+    use pricing::PricingCatalogRepository;
     use std::time::{Duration, SystemTime};
 
     let fixture = chat_fixture().await;
@@ -1796,7 +1796,7 @@ async fn ledger_chat(steps: Vec<ScriptedStream>) -> LedgerChat {
     .await
     .unwrap();
     let when = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-    let snapshot = services::pricing::parse_models_dev_catalog(
+    let snapshot = pricing::parse_models_dev_catalog(
         br#"{"openai": {"id":"openai","name":"OpenAI","models":{
               "fake":{"id":"fake","last_updated":"2026-09-01",
                 "cost":{"input":1,"output":2}}}}}"#,
@@ -1804,7 +1804,7 @@ async fn ledger_chat(steps: Vec<ScriptedStream>) -> LedgerChat {
     .expect("catalog parses")
     .into_snapshot("usage-ledger-snapshot", None, when, when)
     .expect("snapshot materializes");
-    services::pricing_db::SqlitePricingRepository::new(fixture.db.clone())
+    pricing::sqlite::SqlitePricingRepository::new(fixture.db.clone())
         .activate_catalog_snapshot(snapshot, "usage-ledger-refresh")
         .await
         .expect("catalog activates");

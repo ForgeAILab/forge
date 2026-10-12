@@ -2009,7 +2009,7 @@ refreshes the fixed models.dev catalog endpoint only through an explicit
 authorized operation, activates a candidate snapshot atomically after bounded
 validation, and keeps the last known good snapshot on failure.
 
-Rates are resolved at admission by `services::pricing_auto`, inside the
+Rates are resolved at admission by `pricing::auto`, inside the
 admission transaction. It provisions the pricing subject (provider entry or
 CLI runtime) and its non-secret revision, picks the effective
 `pricing_adjustment` (the agent's own, else the subject's, else list price),

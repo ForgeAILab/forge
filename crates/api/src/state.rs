@@ -26,10 +26,10 @@ pub struct AppState {
     pub db: Arc<SqliteDb>,
     /// Shared pricing persistence boundary for catalog, subject bindings,
     /// and retrospective estimate routes.
-    pub pricing_repository: Arc<services::pricing_db::SqlitePricingRepository>,
+    pub pricing_repository: Arc<pricing::sqlite::SqlitePricingRepository>,
     /// One process-wide models.dev client per AppState. Clones share the
     /// client's single-flight refresh gate and its fixed endpoint transport.
-    pub models_dev_client: Arc<services::pricing::ModelsDevClient>,
+    pub models_dev_client: Arc<pricing::ModelsDevClient>,
     /// Shared incremental usage index for Operations and Agent reads.
     pub usage_ledger_index: Arc<services::usage_projection::UsageLedgerIndex>,
     /// Display-only Project slot counts. Never shared with admission services.

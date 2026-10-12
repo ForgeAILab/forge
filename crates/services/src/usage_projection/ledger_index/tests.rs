@@ -8,7 +8,7 @@ async fn fixture() -> Arc<db::SqliteDb> {
     let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let db = Arc::new(db::SqliteDb::new(pool));
-    crate::pricing_db::tests::subject_fixture(&db).await;
+    pricing::sqlite::test_support::subject_fixture(&db).await;
     for id in AGENTS {
         sqlx::query("INSERT INTO agent_identity (id,name,max_concurrent_tasks,created_at,updated_at) VALUES (?,?,10000,?,?)")
             .bind(id)
@@ -561,29 +561,29 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 async fn reprice(db: &Arc<db::SqliteDb>, e: &UsageEvent, step: usize) {
-    use crate::pricing::{PricingCatalogRepository, RetrospectiveEstimateRepository};
+    use pricing::{PricingCatalogRepository, RetrospectiveEstimateRepository};
     let body = format!(
         r#"{{"openai":{{"id":"openai","name":"OpenAI","models":{{"gpt-test":{{"id":"gpt-test","last_updated":"2026-09-01","cost":{{"input":{},"output":2,"cache_read":0}}}}}}}}}}"#,
         1 + step
     );
     let at = |n| SystemTime::UNIX_EPOCH + Duration::from_secs(n);
-    let snapshot = crate::pricing::parse_models_dev_catalog(body.as_bytes())
+    let snapshot = pricing::parse_models_dev_catalog(body.as_bytes())
         .unwrap()
         .into_snapshot(format!("catalog-{step}"), None, at(10), at(10))
         .unwrap();
-    let repository = crate::pricing_db::SqlitePricingRepository::new(db.clone());
+    let repository = pricing::sqlite::SqlitePricingRepository::new(db.clone());
     repository
         .activate_catalog_snapshot(snapshot.clone(), &format!("activate-{step}"))
         .await
         .unwrap();
-    let preview = crate::pricing::preview_retrospective_estimates(
+    let preview = pricing::preview_retrospective_estimates(
         e.project_id.clone().unwrap(),
         &snapshot,
-        &[crate::pricing::RetrospectiveUsageEvent {
+        &[pricing::RetrospectiveUsageEvent {
             event_id: e.id.clone(),
             provider_id: e.provider_id.clone(),
             model_id: e.model_id.clone(),
-            counters: Some(crate::pricing::EventTokenCounts::new(
+            counters: Some(pricing::EventTokenCounts::new(
                 e.input_tokens.unwrap() as u64,
                 e.output_tokens.unwrap() as u64,
                 0,
@@ -599,7 +599,7 @@ async fn reprice(db: &Arc<db::SqliteDb>, e: &UsageEvent, step: usize) {
         Duration::from_secs(1_000_000),
     )
     .unwrap();
-    let request = crate::pricing::RetrospectiveCommitRequest {
+    let request = pricing::RetrospectiveCommitRequest {
         preview_id: preview.id.clone(),
         usage_set_digest: preview.usage_set_digest.clone(),
         idempotency_key: format!("commit-{step}"),
@@ -1579,7 +1579,7 @@ async fn file_db(path: &std::path::Path) -> Arc<db::SqliteDb> {
         .unwrap();
     db::run_migrations(&pool).await.unwrap();
     let db = Arc::new(db::SqliteDb::new(pool));
-    crate::pricing_db::tests::subject_fixture(&db).await;
+    pricing::sqlite::test_support::subject_fixture(&db).await;
     for id in AGENTS {
         sqlx::query("INSERT INTO agent_identity (id,name,max_concurrent_tasks,created_at,updated_at) VALUES (?,?,100000,?,?)")
             .bind(id).bind(id).bind(AT).bind(AT).execute(db.pool()).await.unwrap();
@@ -1685,9 +1685,9 @@ mod concurrent_tests;
 mod fold_tests;
 
 async fn admission_binding(db: &Arc<db::SqliteDb>) {
-    use crate::pricing::PricingCatalogRepository;
-    let snapshot=crate::pricing::parse_models_dev_catalog(br#"{"openai":{"id":"openai","name":"OpenAI","models":{"gpt-test":{"id":"gpt-test","last_updated":"2026-09-01","cost":{"input":1,"output":2,"cache_read":0}}}}}"#).unwrap().into_snapshot("admission-catalog",None,SystemTime::UNIX_EPOCH+Duration::from_secs(10),SystemTime::UNIX_EPOCH+Duration::from_secs(10)).unwrap();
-    crate::pricing_db::SqlitePricingRepository::new(db.clone())
+    use pricing::PricingCatalogRepository;
+    let snapshot=pricing::parse_models_dev_catalog(br#"{"openai":{"id":"openai","name":"OpenAI","models":{"gpt-test":{"id":"gpt-test","last_updated":"2026-09-01","cost":{"input":1,"output":2,"cache_read":0}}}}}"#).unwrap().into_snapshot("admission-catalog",None,SystemTime::UNIX_EPOCH+Duration::from_secs(10),SystemTime::UNIX_EPOCH+Duration::from_secs(10)).unwrap();
+    pricing::sqlite::SqlitePricingRepository::new(db.clone())
         .activate_catalog_snapshot(snapshot.clone(), "admission-activate")
         .await
         .unwrap();

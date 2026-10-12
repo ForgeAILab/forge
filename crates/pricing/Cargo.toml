@@ -1,0 +1,35 @@
+[package]
+name = "pricing"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Forge's provider pricing catalog, price resolution, and cost estimation"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Exposes the SQLite fixtures in `sqlite::test_support` to dependent crates' tests.
+test-support = []
+
+[dependencies]
+api-types = { path = "../api-types" }
+db = { path = "../db" }
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.11"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

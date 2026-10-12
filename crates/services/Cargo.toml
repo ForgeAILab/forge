@@ -13,6 +13,7 @@ test-support = ["cli-adapters/test-support"]
 [dependencies]
 check-executor = { path = "../check-executor" }
 operation-registry = { path = "../operation-registry" }
+pricing = { path = "../pricing" }
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
 db = { path = "../db" }
@@ -51,6 +52,7 @@ tracing-subscriber.workspace = true
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = ".", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }
+pricing = { path = "../pricing", features = ["test-support"] }
 agent-runtime.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

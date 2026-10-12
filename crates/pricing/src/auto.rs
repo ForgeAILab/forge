@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
-use crate::{pricing, Result, ServiceError};
+use crate::{self as pricing, PricingError, PricingResult as Result};
 
 const SUBJECT_SCHEMA_REVISION: &str = "pricing-subject-v1";
 const CLI_FINGERPRINT_DOMAIN: &str = "forge-pricing-cli-runtime-fingerprint-v1";
@@ -64,10 +64,17 @@ pub fn agent_scope_key(agent_id: &str) -> String {
 // Non-secret subject identity
 // ---------------------------------------------------------------------------
 
+/// Answers which API endpoint a provider entry talks to, or `None` when it
+/// has no usable one. The endpoint rules belong to the provider-entry code in
+/// `services`; pricing takes the answer so it does not depend on that crate.
+pub type ProviderEndpointResolver = fn(&CredentialHandle) -> Option<String>;
+
 /// Identity of a provider entry. Labels and credentials never participate.
-pub fn provider_identity(handle: &CredentialHandle) -> pricing::PricingSubjectIdentity {
-    let endpoint_class = crate::embedded_agent_service::entry_base_url(handle)
-        .ok()
+pub fn provider_identity(
+    handle: &CredentialHandle,
+    endpoint: ProviderEndpointResolver,
+) -> pricing::PricingSubjectIdentity {
+    let endpoint_class = endpoint(handle)
         .and_then(|base_url| canonical_endpoint_class(&base_url))
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| handle.provider.clone());
@@ -298,7 +305,7 @@ async fn rate_revision(
         id: row.try_get("id")?,
         source_kind: source_kind
             .parse()
-            .map_err(|error: String| ServiceError::invalid_operation(error))?,
+            .map_err(|error: String| PricingError::invalid_operation(error))?,
         owner_user_id: row.try_get("owner_user_id")?,
         catalog_snapshot_id: row.try_get("catalog_snapshot_id")?,
         catalog_provider_id: row.try_get("catalog_provider_id")?,
@@ -466,7 +473,7 @@ async fn adjustment_on(
         scope: scope.clone(),
         mode: mode
             .parse()
-            .map_err(|error: String| ServiceError::invalid_operation(error))?,
+            .map_err(|error: String| PricingError::invalid_operation(error))?,
         discount_bps: row.try_get("discount_bps")?,
         fixed_rates: RateBuckets::new(
             row.try_get("input_nano_usd_per_million")?,
@@ -733,6 +740,7 @@ async fn subject_identity(
     conn: &mut SqliteConnection,
     owner_user_id: &str,
     subject: &SubjectRef,
+    endpoint: ProviderEndpointResolver,
 ) -> Result<Option<(PricingSubjectKind, pricing::PricingSubjectIdentity)>> {
     if let Some(entry_id) = &subject.provider_entry_id {
         let row = sqlx::query(
@@ -765,7 +773,7 @@ async fn subject_identity(
         }
         return Ok(Some((
             PricingSubjectKind::ProviderEntry,
-            provider_identity(&handle),
+            provider_identity(&handle, endpoint),
         )));
     }
     let (Some(daemon_id), Some(executor_type)) = (&subject.daemon_id, &subject.executor_type)
@@ -793,9 +801,11 @@ async fn ensure_subject(
     tx: &mut Transaction<'_, Sqlite>,
     owner_user_id: &str,
     subject: &SubjectRef,
+    endpoint: ProviderEndpointResolver,
     now: &str,
 ) -> Result<Option<SubjectState>> {
-    let Some((kind, identity)) = subject_identity(tx, owner_user_id, subject).await? else {
+    let Some((kind, identity)) = subject_identity(tx, owner_user_id, subject, endpoint).await?
+    else {
         return Ok(None);
     };
     let expected_digest = pricing::pricing_subject_revision_digest(&identity);
@@ -954,7 +964,7 @@ async fn manual_rate_revision(
         ..
     } = desired
     else {
-        return Err(ServiceError::invalid_operation(
+        return Err(PricingError::invalid_operation(
             "manual rate requested for a catalog price",
         ));
     };
@@ -1020,16 +1030,18 @@ async fn manual_rate_revision(
 /// Makes the one binding admission should resolve for this subject, agent,
 /// and runtime model active, retiring whatever the scope held before.
 /// Returns the binding scope key to resolve with.
-pub(crate) async fn prepare_price_in_tx(
+pub async fn prepare_price_in_tx(
     db: &SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
     owner_user_id: &str,
     subject_ref: &SubjectRef,
     agent_id: Option<&str>,
     runtime_model: &str,
+    endpoint: ProviderEndpointResolver,
     now: &str,
 ) -> Result<String> {
-    let Some(subject) = ensure_subject(db, tx, owner_user_id, subject_ref, now).await? else {
+    let Some(subject) = ensure_subject(db, tx, owner_user_id, subject_ref, endpoint, now).await?
+    else {
         return Ok(String::new());
     };
     let resolution = resolve_price(
@@ -1140,8 +1152,9 @@ pub async fn subject_provider_kind(
     conn: &mut SqliteConnection,
     owner_user_id: &str,
     subject: &SubjectRef,
+    endpoint: ProviderEndpointResolver,
 ) -> Result<Option<String>> {
-    Ok(subject_identity(conn, owner_user_id, subject)
+    Ok(subject_identity(conn, owner_user_id, subject, endpoint)
         .await?
         .map(|(_, identity)| identity.provider_kind))
 }
@@ -1170,6 +1183,7 @@ pub async fn preview_agent_price(
     db: &SqliteDb,
     owner_user_id: &str,
     agent: &db::Agent,
+    endpoint: ProviderEndpointResolver,
 ) -> Result<AgentPricePreview> {
     let mut conn = db.pool().acquire().await?;
     let subject = agent_subject(agent);
@@ -1186,7 +1200,8 @@ pub async fn preview_agent_price(
     let runtime_model = agent.model.clone().filter(|model| !model.trim().is_empty());
     let resolution = match runtime_model.as_deref() {
         Some(runtime_model) => {
-            let provider_kind = subject_provider_kind(&mut conn, owner_user_id, &subject).await?;
+            let provider_kind =
+                subject_provider_kind(&mut conn, owner_user_id, &subject, endpoint).await?;
             Some(
                 resolve_price(
                     &mut conn,

@@ -15,13 +15,14 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use sqlx::{Row, Sqlite, Transaction};
 
-use crate::pricing::{
-    self, CatalogFreshness, CatalogModelRate, CatalogRefreshErrorCode, CatalogRefreshOutcome,
-    CatalogRepositoryError, CatalogSnapshot, CatalogState, CatalogStatus, ContextTierState,
-    EventBucketRates, EventTokenCounts, NanoUsd, NanoUsdPerMillion, PriceSelectionReasonCode,
-    PricingCatalogRepository, RetrospectiveCommitRequest, RetrospectiveEstimateCandidate,
-    RetrospectiveEstimateRepository, RetrospectivePreview, RetrospectiveRepositoryError,
-    RetrospectiveRun, RetrospectiveUnmatchedEvent, RetrospectiveUsageEvent,
+use crate::{
+    self as pricing, CatalogFreshness, CatalogModelRate, CatalogRefreshErrorCode,
+    CatalogRefreshOutcome, CatalogRepositoryError, CatalogSnapshot, CatalogState, CatalogStatus,
+    ContextTierState, EventBucketRates, EventTokenCounts, NanoUsd, NanoUsdPerMillion,
+    PriceSelectionReasonCode, PricingCatalogRepository, RetrospectiveCommitRequest,
+    RetrospectiveEstimateCandidate, RetrospectiveEstimateRepository, RetrospectivePreview,
+    RetrospectiveRepositoryError, RetrospectiveRun, RetrospectiveUnmatchedEvent,
+    RetrospectiveUsageEvent,
 };
 
 /// Concrete V135 persistence boundary used by services and tests.
@@ -704,7 +705,7 @@ async fn update_catalog_check_in_tx(
         .ok_or_else(|| catalog_conversion("catalog state disappeared during its operation"))
 }
 
-pub(crate) async fn catalog_freshness_for_snapshot_in_tx(
+pub async fn catalog_freshness_for_snapshot_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     snapshot_id: &str,
     now: SystemTime,
@@ -2513,35 +2514,29 @@ async fn create_unmatched_revision(
     .await
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Fixtures shared by this crate's tests and by `services` tests that
+/// exercise pricing rows through the usage projection.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::*;
-    use crate::pricing::{
-        parse_models_dev_catalog, preview_retrospective_estimates, CatalogRefreshOutcome,
-        CatalogRefreshRequest, EventTokenCounts, ModelsDevClient, ModelsDevHttpResponse,
-        ModelsDevTransport, ModelsDevTransportError, NanoUsdPerMillion, RetrospectiveUsageEvent,
-    };
+    use crate::{parse_models_dev_catalog, EventTokenCounts};
     use db::{
         create_sqlite_pool, run_migrations, CreatePricingSubject, CreatePricingSubjectRevision,
-        PricingCatalogRepo, PricingSubjectKind, PricingSubjectRepo, PricingSubjectState,
-        ProjectRepo, User, UserRepo,
+        PricingSubjectKind, PricingSubjectRepo, PricingSubjectState, ProjectRepo, User, UserRepo,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
     use std::time::Duration;
-    use tokio::sync::Notify;
 
-    async fn database() -> Arc<db::SqliteDb> {
+    pub async fn database() -> Arc<db::SqliteDb> {
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         Arc::new(db::SqliteDb::new(pool))
     }
 
-    fn at(seconds: u64) -> SystemTime {
+    pub fn at(seconds: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
     }
 
-    fn catalog_body() -> Vec<u8> {
+    pub fn catalog_body() -> Vec<u8> {
         br#"{
           "openai": {
             "id": "openai",
@@ -2562,169 +2557,14 @@ pub(crate) mod tests {
         .to_vec()
     }
 
-    fn snapshot(id: &str, when: SystemTime) -> CatalogSnapshot {
+    pub fn snapshot(id: &str, when: SystemTime) -> CatalogSnapshot {
         parse_models_dev_catalog(&catalog_body())
             .expect("fixture parses")
             .into_snapshot(id, Some("etag-1".to_owned()), when, when)
             .expect("snapshot materializes")
     }
 
-    fn snapshot_variant(id: &str, when: SystemTime, model_id: &str) -> CatalogSnapshot {
-        let body = String::from_utf8(catalog_body())
-            .expect("fixture UTF-8")
-            .replace("gpt-test", model_id)
-            .into_bytes();
-        parse_models_dev_catalog(&body)
-            .expect("variant parses")
-            .into_snapshot(id, Some(format!("etag-{model_id}")), when, when)
-            .expect("variant materializes")
-    }
-
-    struct CountingTransport {
-        responses: Mutex<Vec<Result<ModelsDevHttpResponse, ModelsDevTransportError>>>,
-        fetch_count: AtomicUsize,
-    }
-
-    impl CountingTransport {
-        fn new(responses: Vec<Result<ModelsDevHttpResponse, ModelsDevTransportError>>) -> Self {
-            Self {
-                responses: Mutex::new(responses),
-                fetch_count: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ModelsDevTransport for CountingTransport {
-        async fn fetch(
-            &self,
-            _if_none_match: Option<&str>,
-        ) -> Result<ModelsDevHttpResponse, ModelsDevTransportError> {
-            self.fetch_count.fetch_add(1, Ordering::Relaxed);
-            let mut responses = self.responses.lock().expect("transport response lock");
-            if responses.is_empty() {
-                Err(ModelsDevTransportError::Request(
-                    "unexpected third transport fetch".to_owned(),
-                ))
-            } else {
-                responses.remove(0)
-            }
-        }
-    }
-
-    struct BlockingFirstTransport {
-        response: Mutex<Option<Result<ModelsDevHttpResponse, ModelsDevTransportError>>>,
-        first_started: Notify,
-        release_first: Notify,
-        fetch_count: AtomicUsize,
-    }
-
-    impl BlockingFirstTransport {
-        fn new(response: Result<ModelsDevHttpResponse, ModelsDevTransportError>) -> Self {
-            Self {
-                response: Mutex::new(Some(response)),
-                first_started: Notify::new(),
-                release_first: Notify::new(),
-                fetch_count: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ModelsDevTransport for BlockingFirstTransport {
-        async fn fetch(
-            &self,
-            _if_none_match: Option<&str>,
-        ) -> Result<ModelsDevHttpResponse, ModelsDevTransportError> {
-            let fetch_number = self.fetch_count.fetch_add(1, Ordering::Relaxed);
-            if fetch_number == 0 {
-                self.first_started.notify_one();
-                self.release_first.notified().await;
-            }
-            self.response
-                .lock()
-                .expect("blocking transport response lock")
-                .take()
-                .unwrap_or_else(|| {
-                    Err(ModelsDevTransportError::Request(
-                        "unexpected second transport fetch".to_owned(),
-                    ))
-                })
-        }
-    }
-
-    struct SignallingCatalogRepository {
-        inner: Arc<SqlitePricingRepository>,
-        status_calls: AtomicUsize,
-        second_initial_status: Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl PricingCatalogRepository for SignallingCatalogRepository {
-        async fn catalog_status(&self) -> Result<CatalogStatus, CatalogRepositoryError> {
-            if self.status_calls.fetch_add(1, Ordering::Relaxed) >= 2 {
-                self.second_initial_status.notify_one();
-            }
-            self.inner.catalog_status().await
-        }
-
-        async fn replay_catalog_refresh(
-            &self,
-            idempotency_key: &str,
-        ) -> Result<Option<CatalogRefreshOutcome>, CatalogRepositoryError> {
-            self.inner.replay_catalog_refresh(idempotency_key).await
-        }
-
-        async fn record_catalog_refresh_already_refreshed(
-            &self,
-            checked_at: SystemTime,
-            idempotency_key: &str,
-        ) -> Result<CatalogStatus, CatalogRepositoryError> {
-            self.inner
-                .record_catalog_refresh_already_refreshed(checked_at, idempotency_key)
-                .await
-        }
-
-        async fn active_catalog_snapshot(
-            &self,
-        ) -> Result<Option<CatalogSnapshot>, CatalogRepositoryError> {
-            self.inner.active_catalog_snapshot().await
-        }
-
-        async fn activate_catalog_snapshot(
-            &self,
-            snapshot: CatalogSnapshot,
-            idempotency_key: &str,
-        ) -> Result<CatalogStatus, CatalogRepositoryError> {
-            self.inner
-                .activate_catalog_snapshot(snapshot, idempotency_key)
-                .await
-        }
-
-        async fn record_catalog_not_modified(
-            &self,
-            checked_at: SystemTime,
-            etag: Option<String>,
-            idempotency_key: &str,
-        ) -> Result<CatalogStatus, CatalogRepositoryError> {
-            self.inner
-                .record_catalog_not_modified(checked_at, etag, idempotency_key)
-                .await
-        }
-
-        async fn record_catalog_refresh_failure(
-            &self,
-            checked_at: SystemTime,
-            code: CatalogRefreshErrorCode,
-            idempotency_key: &str,
-        ) -> Result<CatalogStatus, CatalogRepositoryError> {
-            self.inner
-                .record_catalog_refresh_failure(checked_at, code, idempotency_key)
-                .await
-        }
-    }
-
-    pub(crate) async fn subject_fixture(db: &db::SqliteDb) -> (String, String, String) {
+    pub async fn subject_fixture(db: &db::SqliteDb) -> (String, String, String) {
         let now = db_time(at(100));
         UserRepo::create_user(
             db,
@@ -2810,7 +2650,7 @@ pub(crate) mod tests {
         (subject_id, revision_id, revision_digest)
     }
 
-    async fn project_fixture(db: &db::SqliteDb) -> String {
+    pub async fn project_fixture(db: &db::SqliteDb) -> String {
         let now = db_time(at(100));
         let project_id = "pricing-project".to_owned();
         ProjectRepo::create(
@@ -2831,9 +2671,9 @@ pub(crate) mod tests {
         project_id
     }
 
-    const FIXTURE_AGENT_ID: &str = "pricing-agent";
+    pub const FIXTURE_AGENT_ID: &str = "pricing-agent";
 
-    async fn usage_event_fixture(
+    pub async fn usage_event_fixture(
         db: &db::SqliteDb,
         project_id: &str,
         suffix: &str,
@@ -3024,6 +2864,175 @@ pub(crate) mod tests {
         .await
         .expect("invocation settles");
         event_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::{
+        parse_models_dev_catalog, CatalogRefreshOutcome, CatalogRefreshRequest, ModelsDevClient,
+        ModelsDevHttpResponse, ModelsDevTransport, ModelsDevTransportError, NanoUsdPerMillion,
+    };
+    use db::PricingCatalogRepo;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    fn snapshot_variant(id: &str, when: SystemTime, model_id: &str) -> CatalogSnapshot {
+        let body = String::from_utf8(catalog_body())
+            .expect("fixture UTF-8")
+            .replace("gpt-test", model_id)
+            .into_bytes();
+        parse_models_dev_catalog(&body)
+            .expect("variant parses")
+            .into_snapshot(id, Some(format!("etag-{model_id}")), when, when)
+            .expect("variant materializes")
+    }
+
+    struct CountingTransport {
+        responses: Mutex<Vec<Result<ModelsDevHttpResponse, ModelsDevTransportError>>>,
+        fetch_count: AtomicUsize,
+    }
+
+    impl CountingTransport {
+        fn new(responses: Vec<Result<ModelsDevHttpResponse, ModelsDevTransportError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                fetch_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelsDevTransport for CountingTransport {
+        async fn fetch(
+            &self,
+            _if_none_match: Option<&str>,
+        ) -> Result<ModelsDevHttpResponse, ModelsDevTransportError> {
+            self.fetch_count.fetch_add(1, Ordering::Relaxed);
+            let mut responses = self.responses.lock().expect("transport response lock");
+            if responses.is_empty() {
+                Err(ModelsDevTransportError::Request(
+                    "unexpected third transport fetch".to_owned(),
+                ))
+            } else {
+                responses.remove(0)
+            }
+        }
+    }
+
+    struct BlockingFirstTransport {
+        response: Mutex<Option<Result<ModelsDevHttpResponse, ModelsDevTransportError>>>,
+        first_started: Notify,
+        release_first: Notify,
+        fetch_count: AtomicUsize,
+    }
+
+    impl BlockingFirstTransport {
+        fn new(response: Result<ModelsDevHttpResponse, ModelsDevTransportError>) -> Self {
+            Self {
+                response: Mutex::new(Some(response)),
+                first_started: Notify::new(),
+                release_first: Notify::new(),
+                fetch_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelsDevTransport for BlockingFirstTransport {
+        async fn fetch(
+            &self,
+            _if_none_match: Option<&str>,
+        ) -> Result<ModelsDevHttpResponse, ModelsDevTransportError> {
+            let fetch_number = self.fetch_count.fetch_add(1, Ordering::Relaxed);
+            if fetch_number == 0 {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            self.response
+                .lock()
+                .expect("blocking transport response lock")
+                .take()
+                .unwrap_or_else(|| {
+                    Err(ModelsDevTransportError::Request(
+                        "unexpected second transport fetch".to_owned(),
+                    ))
+                })
+        }
+    }
+
+    struct SignallingCatalogRepository {
+        inner: Arc<SqlitePricingRepository>,
+        status_calls: AtomicUsize,
+        second_initial_status: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl PricingCatalogRepository for SignallingCatalogRepository {
+        async fn catalog_status(&self) -> Result<CatalogStatus, CatalogRepositoryError> {
+            if self.status_calls.fetch_add(1, Ordering::Relaxed) >= 2 {
+                self.second_initial_status.notify_one();
+            }
+            self.inner.catalog_status().await
+        }
+
+        async fn replay_catalog_refresh(
+            &self,
+            idempotency_key: &str,
+        ) -> Result<Option<CatalogRefreshOutcome>, CatalogRepositoryError> {
+            self.inner.replay_catalog_refresh(idempotency_key).await
+        }
+
+        async fn record_catalog_refresh_already_refreshed(
+            &self,
+            checked_at: SystemTime,
+            idempotency_key: &str,
+        ) -> Result<CatalogStatus, CatalogRepositoryError> {
+            self.inner
+                .record_catalog_refresh_already_refreshed(checked_at, idempotency_key)
+                .await
+        }
+
+        async fn active_catalog_snapshot(
+            &self,
+        ) -> Result<Option<CatalogSnapshot>, CatalogRepositoryError> {
+            self.inner.active_catalog_snapshot().await
+        }
+
+        async fn activate_catalog_snapshot(
+            &self,
+            snapshot: CatalogSnapshot,
+            idempotency_key: &str,
+        ) -> Result<CatalogStatus, CatalogRepositoryError> {
+            self.inner
+                .activate_catalog_snapshot(snapshot, idempotency_key)
+                .await
+        }
+
+        async fn record_catalog_not_modified(
+            &self,
+            checked_at: SystemTime,
+            etag: Option<String>,
+            idempotency_key: &str,
+        ) -> Result<CatalogStatus, CatalogRepositoryError> {
+            self.inner
+                .record_catalog_not_modified(checked_at, etag, idempotency_key)
+                .await
+        }
+
+        async fn record_catalog_refresh_failure(
+            &self,
+            checked_at: SystemTime,
+            code: CatalogRefreshErrorCode,
+            idempotency_key: &str,
+        ) -> Result<CatalogStatus, CatalogRepositoryError> {
+            self.inner
+                .record_catalog_refresh_failure(checked_at, code, idempotency_key)
+                .await
+        }
     }
 
     #[tokio::test]
@@ -3316,215 +3325,5 @@ pub(crate) mod tests {
             .await
             .expect("rate count");
         assert_eq!(rate_count, 0);
-    }
-
-    #[tokio::test]
-    async fn retrospective_commit_reconstructs_snapshot_rates_and_replays_without_touching_reported_cost(
-    ) {
-        let db = database().await;
-        let _ = subject_fixture(&db).await;
-        let project_id = project_fixture(&db).await;
-        let repository = SqlitePricingRepository::new(db.clone());
-        let snapshot = snapshot("catalog-retrospective", at(10));
-        repository
-            .activate_catalog_snapshot(snapshot.clone(), "catalog-retrospective-refresh")
-            .await
-            .expect("catalog activates");
-        let stored_rate =
-            PricingCatalogRepo::get_catalog_rate_revision(&*db, &snapshot.id, "openai", "gpt-test")
-                .await
-                .expect("catalog rate lookup")
-                .expect("catalog rate exists");
-        assert_eq!(stored_rate.id, snapshot.models[0].rate_digest(&snapshot.id));
-
-        let estimated_event = usage_event_fixture(
-            &db,
-            &project_id,
-            "retrospective-estimated",
-            Some(EventTokenCounts::new(1, 0, 0, 0)),
-            None,
-        )
-        .await;
-        let reported_event =
-            usage_event_fixture(&db, &project_id, "retrospective-reported", None, Some(42)).await;
-        let preview = preview_retrospective_estimates(
-            project_id.clone(),
-            &snapshot,
-            &[
-                RetrospectiveUsageEvent {
-                    event_id: estimated_event.clone(),
-                    provider_id: Some("openai".to_owned()),
-                    model_id: Some("gpt-test".to_owned()),
-                    counters: Some(EventTokenCounts::new(1, 0, 0, 0)),
-                    provider_reported_amount: None,
-                    context_tokens: None,
-                    occurred_at: at(100),
-                },
-                RetrospectiveUsageEvent {
-                    event_id: reported_event.clone(),
-                    provider_id: Some("openai".to_owned()),
-                    model_id: Some("gpt-test".to_owned()),
-                    counters: None,
-                    provider_reported_amount: Some(NanoUsd::from_nano_usd(42).unwrap()),
-                    context_tokens: None,
-                    occurred_at: at(100),
-                },
-            ],
-            at(110),
-            Duration::from_secs(1_000),
-        )
-        .expect("preview builds");
-        assert_eq!(preview.eligible_event_count, 1);
-        assert_eq!(preview.unmatched_event_count, 0);
-        assert_eq!(preview.already_reported_event_count, 1);
-        assert_eq!(
-            preview.projected_cost,
-            Some(NanoUsd::from_nano_usd(1_000).unwrap())
-        );
-
-        let request = RetrospectiveCommitRequest {
-            preview_id: preview.id.clone(),
-            usage_set_digest: preview.usage_set_digest.clone(),
-            idempotency_key: "retrospective-commit-1".to_owned(),
-        };
-        let mut tampered_preview = preview.clone();
-        tampered_preview.eligible_events[0].amount = NanoUsd::ZERO;
-        assert!(matches!(
-            repository
-                .commit_retrospective_preview(tampered_preview, request.clone(), at(111),)
-                .await,
-            Err(RetrospectiveRepositoryError::UsageSetConflict)
-        ));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cost_estimation_run")
-                .fetch_one(db.pool())
-                .await
-                .expect("run count after rejected preview"),
-            0
-        );
-        let index = crate::usage_projection::UsageLedgerIndex::new(db.clone());
-        let before_agent = index.agent(FIXTURE_AGENT_ID).await.unwrap();
-        let _ = index.operations().await.unwrap();
-        assert!(before_agent.cost.estimated.is_none());
-        let committed = repository
-            .commit_retrospective_preview(preview.clone(), request.clone(), at(111))
-            .await
-            .expect("retrospective commit");
-        assert_eq!(committed.project_id, project_id);
-        assert_eq!(committed.applied_event_count, 1);
-        assert_eq!(committed.unmatched_event_count, 0);
-        assert_eq!(committed.cost, preview.projected_cost);
-        let stored_preview =
-            db::RetrospectiveEstimateRepo::get_cost_estimation_preview(&*db, &preview.id)
-                .await
-                .expect("preview lookup")
-                .expect("preview exists");
-        assert_eq!(
-            stored_preview.catalog_freshness,
-            db::PricingCatalogFreshness::Fresh
-        );
-
-        let revisions = db::RetrospectiveEstimateRepo::list_cost_estimate_revisions_for_run(
-            &*db,
-            &committed.id,
-        )
-        .await
-        .expect("estimate revisions list");
-        assert_eq!(revisions.len(), 1);
-        assert_eq!(revisions[0].usage_event_id, estimated_event);
-        assert_eq!(revisions[0].state, db::CostEstimateRevisionState::Applied);
-        assert_eq!(revisions[0].rate_revision_id, Some(stored_rate.id));
-        assert_eq!(revisions[0].catalog_snapshot_id, Some(snapshot.id.clone()));
-        assert_eq!(revisions[0].estimated_nano_usd, Some(1_000));
-        assert_eq!(
-            revisions[0].formula_revision.as_deref(),
-            Some(pricing::COST_FORMULA_REVISION)
-        );
-
-        // The public projection overlays the applied revision onto the
-        // immutable event, including the preview's frozen provenance.
-        let breakdowns = crate::usage_projection::usage_breakdowns_for_source(
-            &db,
-            "execution-retrospective-estimated",
-        )
-        .await
-        .expect("breakdowns project");
-        assert_eq!(breakdowns.len(), 1);
-        let cost = &breakdowns[0].cost;
-        assert_eq!(cost.kind, api_types::CostKind::Estimated);
-        assert_eq!(cost.sources.len(), 1);
-        assert!(cost.sources[0].retrospective);
-        assert_eq!(
-            cost.sources[0].rate_revision_id,
-            revisions[0].rate_revision_id
-        );
-        assert_eq!(
-            cost.sources[0].catalog_snapshot_id.as_deref(),
-            Some(snapshot.id.as_str())
-        );
-        assert_eq!(
-            cost.sources[0].freshness,
-            api_types::CostSourceFreshness::Fresh
-        );
-
-        // Operations reads the same ledger in id batches. With an applied
-        // revision next to a provider-reported event it must equal the
-        // per-invocation walk, estimate and provenance included.
-        let operations = crate::usage_projection::usage_aggregate_for_operations(&db)
-            .await
-            .expect("operations aggregate");
-        assert_eq!(
-            serde_json::to_value(index.operations().await.unwrap()).unwrap(),
-            serde_json::to_value(&operations).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(index.agent(FIXTURE_AGENT_ID).await.unwrap()).unwrap(),
-            serde_json::to_value(
-                crate::usage_projection::usage_aggregate_for_agent(&db, FIXTURE_AGENT_ID)
-                    .await
-                    .unwrap()
-            )
-            .unwrap()
-        );
-        assert!(operations.cost.estimated.is_some());
-        assert!(operations.cost.provider_reported.is_some());
-        assert!(operations
-            .cost
-            .sources
-            .iter()
-            .any(|source| source.retrospective));
-        assert_eq!(
-            serde_json::to_value(
-                crate::usage_projection::per_invocation_usage_aggregate_for_operations(&db)
-                    .await
-                    .expect("per-invocation operations aggregate")
-            )
-            .unwrap(),
-            serde_json::to_value(operations).unwrap()
-        );
-
-        let reported = db::UsageLedgerRepo::get_usage_event(&*db, &reported_event)
-            .await
-            .expect("reported event lookup")
-            .expect("reported event exists");
-        assert_eq!(reported.provider_reported_nano_usd, Some(42));
-        assert_eq!(reported.estimated_nano_usd, None);
-        assert_eq!(reported.cost_kind, db::UsageCostKind::ProviderReported);
-
-        let replay = repository
-            .commit_retrospective_preview(preview, request, at(999))
-            .await
-            .expect("idempotent replay");
-        assert_eq!(replay, committed);
-        assert_eq!(
-            db::RetrospectiveEstimateRepo::list_cost_estimate_revisions_for_run(
-                &*db,
-                &committed.id,
-            )
-            .await
-            .expect("revisions remain immutable")
-            .len(),
-            1
-        );
     }
 }

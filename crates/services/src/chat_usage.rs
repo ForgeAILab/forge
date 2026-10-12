@@ -410,17 +410,18 @@ async fn create_chat_invocation(
         }
     }
     let resolved = if let Some(runtime_model) = runtime_model.as_deref() {
-        let scope_key = crate::pricing_auto::prepare_price_in_tx(
+        let scope_key = pricing::auto::prepare_price_in_tx(
             db,
             &mut transaction,
             &scope.owner_user_id,
-            &crate::pricing_auto::SubjectRef {
+            &pricing::auto::SubjectRef {
                 provider_entry_id: provider_entry.clone(),
                 daemon_id: daemon_id.clone(),
                 executor_type: Some(profile.executor_type.clone()),
             },
             Some(agent.id.as_str()),
             runtime_model,
+            crate::embedded_agent_service::provider_entry_endpoint,
             &admitted_at,
         )
         .await?;
@@ -472,7 +473,7 @@ async fn create_chat_invocation(
             let catalog_freshness = match source_kind {
                 PricingRateSourceKind::ManualOverride => Some("not_applicable".to_owned()),
                 PricingRateSourceKind::ModelsDevCatalog => Some(
-                    crate::pricing_db::catalog_freshness_for_snapshot_in_tx(
+                    pricing::sqlite::catalog_freshness_for_snapshot_in_tx(
                         &mut transaction,
                         rate.catalog_snapshot_id.as_deref().ok_or_else(|| {
                             ServiceError::invalid_operation(
