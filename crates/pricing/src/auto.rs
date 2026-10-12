@@ -1030,6 +1030,7 @@ async fn manual_rate_revision(
 /// Makes the one binding admission should resolve for this subject, agent,
 /// and runtime model active, retiring whatever the scope held before.
 /// Returns the binding scope key to resolve with.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_price_in_tx(
     db: &SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
