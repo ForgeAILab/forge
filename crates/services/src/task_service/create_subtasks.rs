@@ -85,7 +85,25 @@ impl TaskService {
         let root_role_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
         let mut current_parent = result.source_task.clone();
         for assignment in TaskRoleAssignmentRepo::list_by_task(&*self.db, &parent.id).await? {
-            if !root_role_policy.allows_assignment(&assignment.role_name) {
+            let backend_kind = match (&assignment.assignee_type, assignment.assignee_id.as_deref())
+            {
+                (Some(db::AssigneeKind::Agent), Some(agent_id)) => {
+                    db::AgentRepo::get_by_id(&*self.db, agent_id)
+                        .await?
+                        .map(|agent| agent.backend_kind)
+                }
+                _ => None,
+            };
+            if !crate::task_hierarchy::root_keeps_assignment(
+                &root_role_policy,
+                &parent.id,
+                &assignment.role_name,
+                assignment
+                    .assignee_id
+                    .as_ref()
+                    .and(assignment.assignee_type.as_ref()),
+                backend_kind.as_deref(),
+            ) {
                 current_parent = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
                     &*self.db,
                     &assignment,

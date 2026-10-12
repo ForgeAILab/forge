@@ -294,3 +294,67 @@ async fn root_cancel_enqueues_child_cancels_without_waiting_on_a_busy_child() {
         assert_eq!(service.drain(&child.id).await.unwrap().status, "cancelled");
     }
 }
+
+/// Converting a Task into a coordination root keeps a planner that may lead
+/// it (a native Agent) and strips one that may not (a CLI Agent), like every
+/// other role the root does not accept.
+#[tokio::test]
+async fn conversion_keeps_a_native_planner_as_the_lead_and_strips_a_cli_planner() {
+    for native in [true, false] {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let service = TaskService::new(Arc::clone(&db), event_bus);
+        let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+        let planner = if native {
+            crate::test_support::seed_native_agent(&db).await
+        } else {
+            seed_agent(&db).await
+        };
+        let root = service
+            .create_task(
+                project_id.clone(),
+                "Root",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("root task creates");
+        service
+            .reassign_role(
+                role_assignment_input(&root.id, "planner", Some(planner.clone()), None),
+                false,
+                false,
+            )
+            .await
+            .expect("any Agent plans an ordinary Task");
+        service
+            .create_task(
+                project_id.clone(),
+                "Child",
+                None,
+                Some(root.id.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("subtask creates");
+        service.drain(&root.id).await.expect("root steps settle");
+
+        let kept = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &root.id, "planner")
+            .await
+            .expect("planner row loads");
+        assert_eq!(
+            kept.and_then(|row| row.assignee_id),
+            native.then_some(planner),
+            "native={native}"
+        );
+    }
+}

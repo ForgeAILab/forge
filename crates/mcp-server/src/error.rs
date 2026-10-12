@@ -485,6 +485,28 @@ impl From<ServiceError> for McpToolError {
                     "code": "NESTED_SUBTASK_UNSUPPORTED"
                 }))
             }
+            ServiceError::LeadRequiresNativeProfile { task_id, role } => Self::new(
+                -32602,
+                format!(
+                    "the lead of coordination root {task_id} must be a native Agent; assign a native Agent to its `{role}` role"
+                ),
+            )
+            .with_data(json!({
+                "code": "LEAD_REQUIRES_NATIVE_PROFILE",
+                "task_id": task_id,
+                "role": role
+            })),
+            ServiceError::LeadRoleNotSupported { task_id, role } => Self::new(
+                -32602,
+                format!(
+                    "the planning role `{role}` of this workflow cannot lead coordination root {task_id}; only the built-in `planner` role is supported"
+                ),
+            )
+            .with_data(json!({
+                "code": "LEAD_ROLE_NOT_SUPPORTED",
+                "task_id": task_id,
+                "role": role
+            })),
             ServiceError::SubtaskParentClosed {
                 parent_task_id,
                 state,

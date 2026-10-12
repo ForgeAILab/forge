@@ -291,3 +291,66 @@ pub(crate) async fn with_task_lease<T>(
     lease.release().await;
     output
 }
+
+/// A native Agent with a healthy provider connection: the only kind of
+/// Agent that may lead a coordination root.
+pub(crate) async fn seed_native_agent(db: &SqliteDb) -> String {
+    use db::{AgentConnectionHealthRepo, AgentRepo};
+    let now = now_rfc3339();
+    let id = db::new_uuid_v4();
+    let agent = AgentRepo::create_identity_with_profile(
+        db,
+        db::CreateAgentIdentity {
+            id: id.clone(),
+            name: "lead".to_owned(),
+            description: None,
+            max_concurrent_tasks: 2,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        db::CreateAgentProfile {
+            id: db::new_uuid_v4(),
+            identity_id: id.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("fixture".to_owned()),
+            model: Some("fixture-model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("native agent creates");
+    assert_eq!(agent.backend_kind, "native");
+    AgentConnectionHealthRepo::upsert_connection_health(
+        db,
+        db::UpsertAgentConnectionHealth {
+            profile_id: agent.profile_id.clone(),
+            status: "healthy".to_owned(),
+            capability_status_json: "{}".to_owned(),
+            checked_at: Some(now.clone()),
+            error_code: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("connection health records");
+    id
+}

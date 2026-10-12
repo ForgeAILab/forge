@@ -181,8 +181,9 @@ impl<'a> RootRolePolicy<'a> {
     /// Whether the level-triggered root advance has work for this root:
     /// kickoff (a root that has not reached implementation and has a subtask
     /// left to run), or completion (every subtask is terminal and the root
-    /// has not reached aggregate review). Never while the lead holds the
-    /// root's state, whatever flag an earlier advance left behind.
+    /// has not reached aggregate review, or an advance is flagged pending).
+    /// Never while the lead holds the root's state, whatever flag an earlier
+    /// advance left behind.
     pub(crate) fn root_advance_due(
         &self,
         root: &Task,
@@ -206,13 +207,12 @@ impl<'a> RootRolePolicy<'a> {
             StateKind::Initial | StateKind::Gate | StateKind::Active => {}
             _ => return false,
         }
-        if review_pending {
-            return true;
-        }
         if child_sequence_complete(children, self.workflow) {
-            return !review_phase;
+            return review_pending || !review_phase;
         }
-        // Kickoff: only from a state before implementation.
+        // Kickoff: only from a state before implementation. A completion
+        // flag left on a root that has since been given another subtask
+        // describes nothing: that subtask runs first.
         state.kind != StateKind::Active && !review_phase
     }
 
@@ -265,6 +265,48 @@ pub async fn root_lead(
     };
     let row = TaskRoleAssignmentRepo::get_by_task_and_role(db, &root.id, role).await?;
     Ok(row.filter(|row| policy.lead(&root.id, std::slice::from_ref(row)).is_some()))
+}
+
+/// Admit an assignee for the lead (the planning role) of coordination root
+/// `task_id`. `backend_kind` is the assigned Agent's, and `None` for a
+/// person. An empty assignment is always admitted: it removes the lead.
+pub(crate) fn ensure_lead_assignable(
+    task_id: &str,
+    role: &str,
+    assignee_type: Option<&db::AssigneeKind>,
+    backend_kind: Option<&str>,
+) -> Result<()> {
+    if assignee_type.is_none() {
+        return Ok(());
+    }
+    if !lead_role_supported(role) {
+        return Err(ServiceError::LeadRoleNotSupported {
+            task_id: task_id.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    if assignee_type != Some(&db::AssigneeKind::Agent) || backend_kind != Some("native") {
+        return Err(ServiceError::LeadRequiresNativeProfile {
+            task_id: task_id.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether an existing assignment row stays on a Task that becomes a
+/// coordination root: the roles the policy admits, and the planning role only
+/// with an assignee that may lead (conversion never fails; it strips).
+pub(crate) fn root_keeps_assignment(
+    policy: &RootRolePolicy<'_>,
+    task_id: &str,
+    role: &str,
+    assignee_type: Option<&db::AssigneeKind>,
+    backend_kind: Option<&str>,
+) -> bool {
+    policy.allows_assignment(role)
+        && (policy.planning_role() != Some(role)
+            || ensure_lead_assignable(task_id, role, assignee_type, backend_kind).is_ok())
 }
 
 /// Error returned when a role may not be assigned to a coordination root.
@@ -921,6 +963,9 @@ mod tests {
         assert!(!due("planning", &closed, &lead, false));
         assert!(!due("planning", &closed, &lead, true));
         assert!(due("planning", &closed, &[], true));
+        assert!(due("review", &closed, &[], true));
+        // A stale completion flag on a root with a subtask left is not work.
+        assert!(!due("in_progress", &open, &[], true));
 
         assert_eq!(policy.advance_target("todo", true).as_deref(), Some("planning"));
         assert_eq!(policy.advance_target("todo", false).as_deref(), Some("in_progress"));

@@ -57,7 +57,7 @@ async fn lead_fixture(planner_completes: bool) -> Lead {
     let (repo, workspace) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (project, _) = seed_project_repo(&db, repo.path()).await;
     let coder = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
-    let planner = seed_native_agent(&db).await;
+    let planner = crate::test_support::seed_native_agent(&db).await;
     let event_bus = Arc::new(EventBus::new(64));
     let (tx, rx) = mpsc::unbounded_channel();
     let task_executor: Arc<dyn TaskExecutor> = if planner_completes {
@@ -90,67 +90,6 @@ async fn lead_fixture(planner_completes: bool) -> Lead {
         rx,
         _dirs: (repo, workspace),
     }
-}
-
-/// A native Agent: the only kind that may lead a coordination root.
-async fn seed_native_agent(db: &db::SqliteDb) -> String {
-    let now = now_rfc3339();
-    let id = new_uuid_v4();
-    let agent = AgentRepo::create_identity_with_profile(
-        db,
-        db::CreateAgentIdentity {
-            id: id.clone(),
-            name: "lead".to_owned(),
-            description: None,
-            max_concurrent_tasks: 2,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: AgentStatus::Idle,
-            last_heartbeat_at: Some(now.clone()),
-            is_default: false,
-            paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
-            account_permission_ceiling: "{}".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-        db::CreateAgentProfile {
-            id: new_uuid_v4(),
-            identity_id: id.clone(),
-            backend_kind: "native".to_owned(),
-            executor_type: "embedded".to_owned(),
-            provider: Some("fixture".to_owned()),
-            model: Some("fixture-model".to_owned()),
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: "{}".to_owned(),
-            tool_policy_json: "{}".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("native agent creates");
-    assert_eq!(agent.backend_kind, "native");
-    db::AgentConnectionHealthRepo::upsert_connection_health(
-        db,
-        db::UpsertAgentConnectionHealth {
-            profile_id: agent.profile_id.clone(),
-            status: "healthy".to_owned(),
-            capability_status_json: "{}".to_owned(),
-            checked_at: Some(now_rfc3339()),
-            error_code: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("connection health records");
-    id
 }
 
 async fn reload(db: &db::SqliteDb, id: &str) -> Task {

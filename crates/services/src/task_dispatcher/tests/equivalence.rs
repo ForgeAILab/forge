@@ -1150,7 +1150,23 @@ const ALLOWED: &[&str] = &[
     // (or the `project_capacity` wait it was converted to). A Task that
     // holds the slot waits for none.
     "OwnSlotIsNoWait",
+    // (plan 3.10 stage 1) One rule for every coordination root: it moves to
+    // its implementation state when it has a subtask left to run, and its
+    // subtasks run only while it is there. The base left such a root in
+    // `todo`. A completion flag on a root that still has a subtask left is
+    // no longer attempted (and refused) as an aggregate-review advance.
+    "RootKickoff",
 ];
+
+/// `RootKickoff` may only change a coordination root's own row, or the
+/// counts of a pass that moved one.
+fn root_kickoff_exception_is_sound(key: &str) -> bool {
+    key.ends_with(')')
+        || key
+            .rsplit(' ')
+            .next()
+            .is_some_and(|title| title.starts_with('R') && !title.contains('C'))
+}
 
 /// `OwnSlotIsNoWait` may only remove a capacity wait from a Task whose own
 /// execution is running, and change nothing else.
@@ -1211,6 +1227,12 @@ fn settle(section: &str, lines: Vec<String>) {
                     expected, recorded,
                     "exception {name} changes nothing: {line}"
                 );
+                if name == &"RootKickoff" {
+                    assert!(
+                        root_kickoff_exception_is_sound(key(line)),
+                        "{name} may only change a coordination root: {line}"
+                    );
+                }
                 if name == &"OwnSlotIsNoWait" {
                     assert!(
                         own_slot_exception_is_sound(recorded, expected),
