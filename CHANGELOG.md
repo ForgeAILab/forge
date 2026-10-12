@@ -32,6 +32,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `main_project_create_command` as isolated targets. Original test names
   remain under their target-named module.
 
+- **The `services` and `db` integration tests need their test feature on the
+  command line.** Neither crate dev-depends on itself any more (that compiled
+  the lib twice in series for every unit-test build: `cargo test -p services
+  --lib --no-run` 6 m 12 s → 4 m 50 s, `-p db` 1 m 10 s → 29 s). Use
+  `cargo test -p services --features test-support --test main <module>::` and
+  `cargo test -p db --features test-template --test main <module>::`. A named
+  target without the feature is a Cargo error; a plain `cargo test -p services`
+  or `cargo test -p db` runs the unit tests only and skips the integration
+  targets without a message. A whole-workspace `cargo test`, `make test` and
+  `./scripts/ci-rust.sh` still run them. The CI unit shards for `services` now
+  split on `task_service::`, `task_dispatcher::` and `workspace_root::`.
+
 - **Agent doctrine moves to new revisions: Main baseline @5, Product Genesis
   @8, Project @22.** Migration `V202610120418` inserts Genesis @8 and Project
   @22 as new immutable revisions, moves the two current pointers, and moves

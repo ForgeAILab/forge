@@ -8,8 +8,9 @@
 # a full CI round-trip each to discover. Now a stage failing only records the
 # failure, and the run ends with the complete list.
 #
-# `cargo check` is deliberately absent: `clippy --workspace --all-targets`
-# already type-checks every target, and the test build compiles them again.
+# `cargo check` is deliberately absent: `clippy --workspace --all-targets` with
+# the workspace features already type-checks every target, and the test build
+# compiles them again.
 # With no stage skipped any more, that third pass was pure wall clock.
 #
 # Usage: ci-rust.sh               every stage, whole workspace (local default)
@@ -22,7 +23,12 @@ set -uo pipefail
 
 mode="${1:-all}"
 shard="${2:-}"
-test_select=(--workspace --all-targets)
+# Targets with `required-features` (the services and db integration tests) are
+# skipped without a word when the feature is absent, so every whole-workspace
+# command names them. `ci_rust_shards.py check` fails unless this line lists
+# exactly the features `cargo metadata` reports as required.
+workspace_features=(--features db/test-template,services/test-support)
+test_select=(--workspace --all-targets "${workspace_features[@]}")
 test_filters=()
 case "$mode" in
   all | lint)
@@ -93,7 +99,8 @@ stages=0
 if [[ $mode == all || $mode == lint ]]; then
   stages=$((stages + 2))
   run_stage 'cargo fmt' cargo fmt --all -- --check
-  run_stage 'cargo clippy' cargo clippy --workspace --all-targets -- -D warnings
+  run_stage 'cargo clippy' cargo clippy --workspace --all-targets "${workspace_features[@]}" \
+    -- -D warnings
 fi
 if [[ $mode == all || $mode == test ]]; then
   if [[ -n ${CI_RUST_TIMINGS:-} ]]; then
