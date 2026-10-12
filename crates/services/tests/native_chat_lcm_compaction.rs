@@ -933,6 +933,21 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
     )
     .await
     .expect("workspace persists");
+    // A Task session is only admitted while a running execution of its
+    // identity serves its role; the turn's binding now re-checks that.
+    sqlx::query(
+        "INSERT INTO execution (
+             id, task_id, agent_id, role, status, created_at, updated_at
+         ) VALUES (?, ?, ?, 'coder', 'running', ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&identity_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("running execution inserts");
     AgentContextScopeRepo::create_context_scope(
         &*db,
         CreateAgentContextScope {

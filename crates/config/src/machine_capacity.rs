@@ -42,6 +42,11 @@ mod tests {
     use super::*;
     #[test]
     fn machine_capacity_file_and_cli_precedence() {
+        // Loading reads `FORGE_*` variables other tests set under this lock.
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tests::clear_forge_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("forge.yaml");
         std::fs::write(&path, "server:\n  max_concurrent_runs: 3\n").unwrap();

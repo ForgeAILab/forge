@@ -28,6 +28,17 @@ impl SqliteDb {
         )
         .await
     }
+    /// Whether the identity is paused or archived: the cause a refused
+    /// caller is told when its authority is no longer active for that reason.
+    pub async fn agent_identity_paused(&self, identity_id: &str) -> Result<bool> {
+        let paused: Option<i64> = sqlx::query_scalar(
+            "SELECT paused OR archived_at IS NOT NULL FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(paused.is_some_and(|paused| paused != 0))
+    }
     /// The one running execution this native Task session writes records
     /// under: `None` when the session is not this identity's Task session,
     /// nothing is running for its role, or more than one execution is.

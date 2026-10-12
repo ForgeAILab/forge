@@ -90,6 +90,32 @@ impl CoordinationToolProvider {
         self.registered_authority(actor, scope, operation).await?;
         Ok(())
     }
+    /// The Project Agent's Task commands always named a paused or archived
+    /// caller as `identity_paused`; `authority_revoked` is the lost binding or
+    /// ceiling. The shared evaluator reports both as revoked.
+    async fn paused_task_proposal_denial(
+        &self,
+        actor: &str,
+        operation: &str,
+        denial: AgentHostError,
+    ) -> AgentHostError {
+        match denial {
+            AgentHostError::StructuredOutcome(mut outcome)
+                if outcome.denied_by == Some(DeniedBy::AuthorityRevoked)
+                    && operation_registry::task_proposals::IDS.contains(&operation)
+                    && self.db.agent_identity_paused(actor).await.unwrap_or(false) =>
+            {
+                *outcome = OrchestrationOutcome::terminal_denial(
+                    outcome.operation.clone(),
+                    outcome.scope.clone(),
+                    outcome.correlation_id.clone(),
+                    DeniedBy::IdentityPaused,
+                );
+                AgentHostError::StructuredOutcome(outcome)
+            }
+            denial => denial,
+        }
+    }
     /// A native Main proposal still needs the caller's active Main binding.
     /// The shared evaluator admits an owned unbound identity for the
     /// AgentAction policy; the native boundary never did.
@@ -249,29 +275,45 @@ impl CoordinationToolProvider {
             };
         if let Some(admitted) = admitted_authority {
             self.main_proposal_binding(actor, scope, operation).await?;
-            self.evaluate_registered_authority(
+            if let Err(denial) = self.evaluate_registered_authority(
                 admitted,
                 scope,
                 CATALOG.lookup(operation).expect("registered proposal"),
-            )?;
+            ) {
+                return Err(self
+                    .paused_task_proposal_denial(actor, operation, denial)
+                    .await);
+            }
         } else if let Err(denial) = self.proposal_admission(actor, scope, operation).await {
             if !prepared {
                 self.record_denied_queued_proposal(actor, scope, operation, &arguments, &denial)
                     .await;
             }
-            return Err(denial);
+            return Err(self
+                .paused_task_proposal_denial(actor, operation, denial)
+                .await);
         }
+        let spec = CATALOG.lookup(operation).expect("registered proposal");
+        let task_operation = operation_registry::task_records::IDS
+            .iter()
+            .chain(operation_registry::task_proposals::IDS)
+            .any(|id| *id == operation);
         if contains_authority_override(&arguments) {
+            // A Task command or record that names a server-derived field was
+            // always a payload the caller can correct, not a policy refusal
+            // that withdraws the operation for the session.
+            if task_operation {
+                return Err(invalid_arguments(format!(
+                    "{operation}: scope and authority are server-derived and are not payload fields; expected {}",
+                    spec.contract_line()
+                )));
+            }
             return Err(AgentHostError::Authority(
                 "Forge orchestration scope and authority are server-derived".into(),
             ));
         }
-        let spec = CATALOG.lookup(operation).expect("registered proposal");
         if !prepared
-            && operation_registry::task_records::IDS
-                .iter()
-                .chain(operation_registry::task_proposals::IDS)
-                .any(|id| *id == operation)
+            && task_operation
             && arguments.get("causation_depth").is_some_and(Value::is_null)
         {
             arguments.as_object_mut().unwrap().remove("causation_depth");
