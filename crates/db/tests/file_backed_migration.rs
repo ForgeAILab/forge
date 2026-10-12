@@ -5937,3 +5937,135 @@ async fn slot_wait_age_migration_preserves_waits_and_checks_and_ages_existing_wa
     let _ = fs::remove_file(&db_path);
     let _ = fs::remove_dir_all(migration_dir);
 }
+
+/// The registry doctrine cutover (Genesis @8, Project @22) on a file-backed
+/// database that was already running on @7 / @21: every historical revision
+/// keeps its exact bytes, the two new revisions are inserted with the digest of
+/// their own body, only the current pointers move, and a second run of the
+/// migration runner changes nothing.
+#[tokio::test]
+async fn registry_doctrine_cutover_adds_revisions_and_keeps_history_on_a_file_database() {
+    use sha2::{Digest, Sha256};
+
+    async fn revisions(pool: &sqlx::SqlitePool) -> Vec<(String, String, String, String, String)> {
+        sqlx::query(
+            "SELECT id, canonical_body, content_digest, policy_json, policy_digest
+             FROM operating_skill_revision ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("revisions read")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("id"),
+                row.get("canonical_body"),
+                row.get("content_digest"),
+                row.get("policy_json"),
+                row.get("policy_digest"),
+            )
+        })
+        .collect()
+    }
+    async fn pointers(pool: &sqlx::SqlitePool) -> Vec<(String, String, i64)> {
+        sqlx::query("SELECT id, current_revision_id, version FROM operating_skill ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("pointers read")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get("id"),
+                    row.get("current_revision_id"),
+                    row.get("version"),
+                )
+            })
+            .collect()
+    }
+
+    let migration_dir = unique_temp_path("registry-doctrine-migrations");
+    fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
+    copy_migrations_up_to(202610111630, &migration_dir);
+    let db_path = unique_temp_path("registry-doctrine-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("pre-cutover migrations apply");
+
+    let history = revisions(&pool).await;
+    let before = pointers(&pool).await;
+    let pointer = |rows: &[(String, String, i64)], skill: &str| {
+        rows.iter()
+            .find(|row| row.0 == skill)
+            .map(|row| (row.1.clone(), row.2))
+            .expect("seeded operating skill")
+    };
+    const MAIN: &str = "forge.main.project-discovery/v2";
+    const PROJECT: &str = "forge.project.orchestration/v1";
+    let (main_before, main_version) = pointer(&before, MAIN);
+    let (project_before, project_version) = pointer(&before, PROJECT);
+    assert_eq!(main_before, format!("{MAIN}@7"));
+    assert_eq!(project_before, format!("{PROJECT}@21"));
+
+    run_migrations(&pool).await.expect("cutover applies");
+    let after = revisions(&pool).await;
+    for row in &history {
+        assert!(
+            after.contains(row),
+            "historical revision {} keeps its exact bytes",
+            row.0
+        );
+    }
+    let added = after
+        .iter()
+        .filter(|row| !history.contains(row))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        added.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        [format!("{MAIN}@8"), format!("{PROJECT}@22")]
+    );
+    for (row, predecessor) in added.iter().zip([main_before, project_before]) {
+        assert_eq!(
+            row.2,
+            hex::encode(Sha256::digest(row.1.as_bytes())),
+            "{} carries the digest of its own body",
+            row.0
+        );
+        let predecessor = history
+            .iter()
+            .find(|old| old.0 == predecessor)
+            .expect("predecessor revision");
+        assert_eq!(
+            (&row.3, &row.4),
+            (&predecessor.3, &predecessor.4),
+            "{} keeps the policy of the revision it follows",
+            row.0
+        );
+        assert_ne!(row.1, predecessor.1);
+    }
+    let moved = pointers(&pool).await;
+    assert_eq!(
+        pointer(&moved, MAIN),
+        (format!("{MAIN}@8"), main_version + 1)
+    );
+    assert_eq!(
+        pointer(&moved, PROJECT),
+        (format!("{PROJECT}@22"), project_version + 1)
+    );
+    assert_eq!(
+        moved.len(),
+        before.len(),
+        "no operating skill is added or removed"
+    );
+
+    run_migrations(&pool).await.expect("second run is a no-op");
+    assert_eq!(revisions(&pool).await, after);
+    assert_eq!(pointers(&pool).await, moved);
+    pool.close().await;
+    let reopened = create_sqlite_pool(&url).await.expect("file reopens");
+    assert_eq!(pointers(&reopened).await, moved);
+    reopened.close().await;
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_dir_all(&migration_dir);
+}

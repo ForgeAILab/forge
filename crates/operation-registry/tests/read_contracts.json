@@ -428,5 +428,19 @@
     },
     "required": [],
     "type": "object"
+  },
+  "project.summary": {
+    "type": "object",
+    "properties": {
+      "project_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "description": "Main must name an owned project_id."
   }
 }

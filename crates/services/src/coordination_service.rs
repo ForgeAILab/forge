@@ -1279,11 +1279,11 @@ async fn evaluate_action_policy(
             && scope_permissions.contains(requested_permission);
         if !authorized {
             return Ok((
-            AgentActionPolicyResult::Denied,
-            Some(format!(
-                "permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"
-            )),
-        ));
+                AgentActionPolicyResult::Denied,
+                Some(format!(
+                    "permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"
+                )),
+            ));
         }
     } else {
         use operation_registry::authority::{
@@ -1310,28 +1310,33 @@ async fn evaluate_action_policy(
                 return Ok((
                     AgentActionPolicyResult::Denied,
                     Some("direct Project command has no selected active profile".into()),
-                ))
+                ));
             }
             Err(error) => return Err(error.into()),
         };
         if let Err(denial) = authority.evaluate(ActionPermission(requested_permission)) {
             let reason = match denial {
-                AuthorityDenial::PermissionMissing(_) => format!("permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"),
+                AuthorityDenial::PermissionMissing(_) => format!(
+                    "permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"
+                ),
                 AuthorityDenial::Revoked => {
-                    let paused: i64=sqlx::query_scalar("SELECT paused OR archived_at IS NOT NULL FROM agent_identity WHERE id=?").bind(actor_identity_id).fetch_one(db.pool()).await?;
-                    if paused != 0 { "actor identity is paused or archived".into() } else { "actor identity has no active binding in the requested scope or is paused or archived".into() }
-                },
+                    let paused: i64 = sqlx::query_scalar(
+                        "SELECT paused OR archived_at IS NOT NULL FROM agent_identity WHERE id=?",
+                    )
+                    .bind(actor_identity_id)
+                    .fetch_one(db.pool())
+                    .await?;
+                    if paused != 0 {
+                        "actor identity is paused or archived".into()
+                    } else {
+                        "actor identity has no active binding in the requested scope or is paused or archived".into()
+                    }
+                }
                 _ => "operation is denied by the canonical native operation catalog".into(),
             };
             return Ok((AgentActionPolicyResult::Denied, Some(reason)));
         }
-        let canonical_operation = match operation {
-            "message.propose" => "message.send",
-            "commitment.propose" => "commitment.update",
-            "review.propose" => "review.request",
-            other => other,
-        };
-        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(canonical_operation) {
+        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
             // A caller naming another permission is judged by the checks
             // below, exactly as before the registry: they name the real cause
             // (read boundary, independent approval) instead of "unavailable".
@@ -1339,8 +1344,12 @@ async fn evaluate_action_policy(
             if spec.authority.permission(scope_type) != Some(requested_permission) {
             } else if let Err(denial) = authority.evaluate(spec) {
                 let reason = match denial {
-                    AuthorityDenial::StateChanged => "Project orchestration remains blocked until a user-approved Charter adoption is committed",
-                    AuthorityDenial::SetupCompleted => "Project Charter adoption is not valid for the current Project state",
+                    AuthorityDenial::StateChanged => {
+                        "Project orchestration remains blocked until a user-approved Charter adoption is committed"
+                    }
+                    AuthorityDenial::SetupCompleted => {
+                        "Project Charter adoption is not valid for the current Project state"
+                    }
                     _ => "operation is denied by the canonical native operation catalog",
                 };
                 return Ok((AgentActionPolicyResult::Denied, Some(reason.into())));
@@ -1454,6 +1463,9 @@ fn is_allowed_main_orchestration_operation(requested_permission: &str, operation
 }
 
 fn is_allowed_project_draft_operation(operation: &str, payload_json: &str) -> bool {
+    if !is_catalog_project_orchestration_operation(operation) {
+        return false;
+    }
     let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
         return false;
     };
@@ -1522,7 +1534,7 @@ mod tests {
 
     #[test]
     fn generic_executor_rejects_every_typed_orchestration_operation() {
-        for contract in MIGRATED_OPERATION_CONTRACTS {
+        for contract in MIGRATED_OPERATION_CONTRACTS.iter() {
             let operation = contract.operation;
             assert!(
                 is_typed_orchestration_operation(operation),
@@ -2004,7 +2016,7 @@ mod tests {
                 actor_identity_id: "agent-a".to_owned(),
                 scope_type: "agent".to_owned(),
                 scope_id: "agent-a".to_owned(),
-                operation: "message.propose".to_owned(),
+                operation: "message.send".to_owned(),
                 payload_json: "{}".to_owned(),
                 dedupe_key: "allowed-1".to_owned(),
                 correlation_id: "corr-allowed".to_owned(),
@@ -2208,7 +2220,7 @@ mod tests {
                 actor_identity_id: "agent-a".to_owned(),
                 scope_type: "project".to_owned(),
                 scope_id: "project-3".to_owned(),
-                operation: "message.propose".to_owned(),
+                operation: "message.send".to_owned(),
                 payload_json: r#"{"message":"needs approval"}"#.to_owned(),
                 dedupe_key: "cross-project-approval-1".to_owned(),
                 correlation_id: "corr-cross-project-approval".to_owned(),
@@ -2245,7 +2257,7 @@ mod tests {
         use forge_agent_host::{OperationExposure, OperationSurface, MIGRATED_OPERATION_CONTRACTS};
 
         let mut checked = 0;
-        for contract in MIGRATED_OPERATION_CONTRACTS {
+        for contract in MIGRATED_OPERATION_CONTRACTS.iter() {
             // Only `GenericProposal` operations reach this gate: they are
             // composed into `forge_scope_propose` and executed through the
             // shared direct-command path. A `TypedProposal` (task.worklog,
@@ -2474,7 +2486,10 @@ mod tests {
                             AgentActionPolicyResult::ApprovalRequired => 1,
                             AgentActionPolicyResult::Allowed => 2,
                         };
-                        assert!(rank <= base_rank, "widened {state}/{actor}/{scope}/{id}/{operation}/{action}: base={base_rank} new={rank}");
+                        assert!(
+                            rank <= base_rank,
+                            "widened {state}/{actor}/{scope}/{id}/{operation}/{action}: base={base_rank} new={rank}"
+                        );
                         if rank < base_rank {
                             narrowed.push(format!("{state}/{actor}/{scope}/{id}/{operation}/{action}: base={base_rank} new={rank}"));
                         }

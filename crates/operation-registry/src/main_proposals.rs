@@ -33,16 +33,10 @@ pub trait MainProposalContext<E>: Send + Sync {
     async fn propose_project_create(&self, input: ProjectCreate) -> Result<Value, E>;
 }
 pub type Catalog<E> = OperationCatalog<E>;
-const SURFACES: &[SurfaceBinding] = &[
-    SurfaceBinding {
-        native_aggregate: "forge_main_orchestration_propose",
-        projection: FieldProjection::ProposalPayload,
-    },
-    SurfaceBinding {
-        native_aggregate: "forge_scope_propose",
-        projection: FieldProjection::ProposalPayload,
-    },
-];
+const SURFACES: &[SurfaceBinding] = &[SurfaceBinding {
+    native_aggregate: "forge_main_orchestration_propose",
+    projection: FieldProjection::ProposalPayload,
+}];
 pub const IDS: &[&str] = &["genesis.project_agent.select", "project.create"];
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
     vec![

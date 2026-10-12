@@ -5391,6 +5391,24 @@ Project/Chat/handoff/Task references remain restricted to that same bound
 Project. The credential acts as the authenticated delegated user, not the
 bound Project Agent.
 
+`forge_update_project_lifecycle_hooks` requires a Project owner/admin role.
+It is omitted and refused for a constrained public/ordinary-member grant. Account
+grants authorize that role against the supplied Project. Script lifecycle hooks
+inside `forge_update_project.settings` require the same authority; the shared
+REST/MCP settings validator repeats the check before writing. Visibility of an
+ownerless Project alone cannot authorize a script command.
+
+`forge_assign_agent.agent_id`, `forge_create_sub_tasks.subtasks[].assignee_id`,
+and `forge_follow_up_execution.agent_id` must be usable by the authenticated user
+in the Task's Project, using the same query as REST assignment. A private foreign
+identity returns the same not-found response as a missing identity. A constrained
+`forge_list_task_dependencies` denial names only the requested Task, never a
+foreign dependency ID loaded from storage.
+
+`forge_transition_task` executes as the MCP system component, preserving its
+workflow-edge and override policy. The response's `available_actions` uses the
+delegated caller, matching `forge_get_task` and delegated retry-budget rules.
+
 All 43 MCP tools use typed contracts in `operation-registry::mcp`. Each description is one generated summary line
 with the admitted fields. Names and result shapes are unchanged. Unknown fields
 on any tool map to one `-32602` contract error. The in-band result has
@@ -6268,8 +6286,7 @@ with the permission that advertises them (`read_agent_chat`), like
 setup completes name `charter_adoption_not_applicable`.
 
 These changes affect native tool contracts and agent-action admission; REST
-resource shapes and MCP projections are unchanged. Charter adoption, evidence
-and readiness retain their hand paths in this slice.
+resource shapes and MCP projections are unchanged. Charter adoption, evidence and readiness now use typed registry contracts, with exact committed receipt replay before fresh authority and contract checks.
 
 
 ### Native Main command contracts (3.8 E2)
@@ -6410,3 +6427,25 @@ terminal command returns `action_unavailable` instead of reporting a successful
 no-op. Commands admitted before integration completed retain their existing
 queued no-op settlement behavior. Project read-only or setup sessions also mark
 workflow offers informational and omit an executable action schema.
+
+### Operation registry consolidation and doctrine (3.8 I)
+
+All native aggregate operations and the 43 MCP tools have one registry spec,
+with coverage across native roles and MCP grant/role combinations. Fresh native
+`project.summary` arguments and adoption, evidence and readiness payloads are
+closed. `expected_digest` (adoption) and `source_run_id` (evidence) remain accepted;
+evidence requires `acceptance_check_ids`, which its materializer already needed.
+Committed Project-command receipts are retrieved by exact principal, scope,
+operation, key and input digest before fresh admission, including through the
+native wrapper after revocation. Different inputs require current authority.
+
+Generic optional-read argument lists are removed from tool prefixes; defaults
+and typed correction errors remain. The Project-summary selector and Task-run
+informational-offer warning are retained. Full named read contracts and the
+nested Main Charter draft remain available in the generated tool description.
+
+The current immutable operating revisions are Main baseline @5, Genesis @8 and
+Project @22. Historical revisions and frozen rendering remain unchanged. New
+revisions include their override text in their content digest. Project Agents
+copy Task calls from `action_schema`, and Task worklog/evidence `action` is
+optional. Use a new `correlation_id` for each distinct worklog entry.

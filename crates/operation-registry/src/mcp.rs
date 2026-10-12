@@ -192,12 +192,62 @@ pub enum ResourceRule {
     Execution,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum AgentReference {
+    Task {
+        task: &'static str,
+        agent: &'static str,
+    },
+    SubTasks {
+        parent: &'static str,
+        items: &'static str,
+        agent: &'static str,
+    },
+    Execution {
+        execution: &'static str,
+        agent: &'static str,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldCondition {
+    NonNull,
+    ScriptHooks,
+}
+pub fn contains_script_hooks(settings: &Value) -> bool {
+    settings
+        .get("lifecycle_hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|events| {
+            events
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .any(|hook| {
+                    hook.get("type").is_some_and(|kind| kind == "script")
+                        || hook.get("command").is_some()
+                })
+        })
+}
+
 /// A conditional field is advertised and admitted by the same evaluator.
 pub struct FieldAuthority {
+    pub condition: FieldCondition,
     pub field: &'static str,
     pub permission: &'static str,
     pub denial_code: &'static str,
     pub denial_message: &'static str,
+}
+impl FieldAuthority {
+    pub fn applies(&self, arguments: &Value) -> bool {
+        match self.condition {
+            FieldCondition::NonNull => arguments
+                .get(self.field)
+                .is_some_and(|value| !value.is_null()),
+            FieldCondition::ScriptHooks => {
+                arguments.get(self.field).is_some_and(contains_script_hooks)
+            }
+        }
+    }
 }
 impl AuthorityRequirement for &FieldAuthority {
     fn principal_rule(&self) -> PrincipalRule {
@@ -211,6 +261,12 @@ impl AuthorityRequirement for &FieldAuthority {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum VersionTarget {
+    Project(&'static str),
+    Task(&'static str),
+}
+
 pub struct McpOperation {
     pub name: &'static str,
     pub summary: &'static str,
@@ -219,9 +275,15 @@ pub struct McpOperation {
     pub resource: ResourceRule,
     pub input: TypedInputContract,
     pub field_authority: Option<FieldAuthority>,
+    pub version_target: Option<VersionTarget>,
+    pub agent_reference: Option<AgentReference>,
     decode: Box<dyn Fn(Value) -> Result<McpInput, String> + Send + Sync>,
 }
 impl McpOperation {
+    fn with_agent_reference(mut self, reference: AgentReference) -> Self {
+        self.agent_reference = Some(reference);
+        self
+    }
     pub fn descriptor(&self, constrained: bool, account_admin: bool) -> Value {
         let mut schema = self.input.schema.clone();
         portable_projection(&mut schema);
@@ -232,7 +294,9 @@ impl McpOperation {
                 .retain(|field| field != "project_id");
         }
         if let Some(rule) = &self.field_authority {
-            if !account_admin {
+            if rule.condition == FieldCondition::ScriptHooks {
+                schema["properties"][rule.field]["description"] = json!(rule.denial_message);
+            } else if !account_admin {
                 // Explicit null is a base-accepted no-op. Advertise exactly
                 // that input to users who cannot exercise the field's power.
                 schema["properties"][rule.field] = json!({"type":"null"});
@@ -449,14 +513,33 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
         schema["properties"]["wake_budget"]["minimum"] = json!(0);
     }
     McpOperation {
+        version_target: match name {
+            "forge_update_project" | "forge_update_project_lifecycle_hooks" => {
+                Some(VersionTarget::Project("project_id"))
+            }
+            "forge_update_task" | "forge_transition_task" => Some(VersionTarget::Task("task_id")),
+            _ => None,
+        },
+        agent_reference: None,
         name,
         summary,
-        field_authority: (name == "forge_register_agent").then_some(FieldAuthority {
-            field: "daemon_id",
-            permission: "mcp_account_admin",
-            denial_code: "admin_required",
-            denial_message: "Admin access required to pin an agent to a daemon",
-        }),
+        field_authority: match name {
+            "forge_register_agent" => Some(FieldAuthority {
+                condition: FieldCondition::NonNull,
+                field: "daemon_id",
+                permission: "mcp_account_admin",
+                denial_code: "admin_required",
+                denial_message: "Admin access required to pin an agent to a daemon",
+            }),
+            "forge_update_project" => Some(FieldAuthority {
+                condition: FieldCondition::ScriptHooks,
+                field: "settings",
+                permission: "mcp_project_admin",
+                denial_code: "insufficient_role",
+                denial_message: "Script lifecycle hooks require the Project owner or admin role.",
+            }),
+            _ => None,
+        },
         role,
         resource,
         scope: if role == RequiredRole::Account {
@@ -483,51 +566,67 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
     }
 }
 
-#[derive(Debug)]
-pub enum McpInput {
-    ProjectEscalate(ProjectEscalateParams),
-    UpdateProjectLifecycleHooks(UpdateProjectLifecycleHooksParams),
-    UpdateProject(UpdateProjectParams),
-    GetProject(GetProjectParams),
-    FollowUpExecution(FollowUpExecutionParams),
-    ReorderSubTasks(ReorderSubTasksParams),
-    CreateSubTasks(CreateSubTasksParams),
-    RemoveTaskDependency(RemoveTaskDependencyParams),
-    AddTaskDependency(AddTaskDependencyParams),
-    TransitionTask(TransitionTaskParams),
-    UpdateTask(UpdateTaskParams),
-    TaskAction(TaskActionParams),
-    AssignAgent(AssignAgentParams),
-    CreateTask(CreateTaskParams),
-    ListSubTasks(ListSubTasksParams),
-    ListTaskDependents(ListTaskDependenciesParams),
-    ListTaskDependencies(ListTaskDependenciesParams),
-    ListExecutions(ListExecutionsParams),
-    GetTaskDiff(GetTaskParams),
-    MemoryGet(MemoryGetParams),
-    MemorySearch(MemorySearchParams),
-    PreviewPrompt(PreviewPromptParams),
-    GetTask(GetTaskParams),
-    ListTasks(ListTasksParams),
-    RegisterAgent(RegisterAgentParams),
-    ListAgents(ListAgentsParams),
-    ListProjects(ListProjectsParams),
-    CreateProject(CreateProjectParams),
-    ListAgentProfiles(ListAgentProfilesParams),
-    ListAgentSessions(ListAgentSessionsParams),
-    GetAgentSession(GetAgentSessionParams),
-    GetMainAgent(GetMainAgentParams),
-    BindMainAgent(BindMainAgentParams),
-    GetProjectAgent(GetProjectAgentParams),
-    BindProjectAgent(BindProjectAgentParams),
-    GetIntegrationQueue(GetIntegrationQueueParams),
-    ListAgentChats(ListAgentChatsParams),
-    GetAgentChat(GetAgentChatParams),
-    ListAgentChatMessages(ListAgentChatMessagesParams),
-    SendAgentChatMessage(SendAgentChatMessageParams),
-    ListAgentHandoffs(ListAgentHandoffsParams),
-    GetAgentHandoff(GetAgentHandoffParams),
-    CreateAgentHandoff(CreateAgentHandoffParams),
+// One declaration generates typed inputs and their handler interface/dispatch.
+// The domain specs select these typed variants; consumers bind concrete effects.
+macro_rules! mcp_inputs {
+    ($($variant:ident($input:ty) => $method:ident),* $(,)?) => {
+        #[derive(Debug)]
+        pub enum McpInput { $($variant($input)),* }
+        #[async_trait::async_trait]
+        pub trait McpHandlerContext<E>: Send + Sync {
+            $(async fn $method(&self, input: $input) -> Result<Value, E>;)*
+        }
+        impl McpInput {
+            pub async fn dispatch<E>(self, context: &dyn McpHandlerContext<E>) -> Result<Value, E> {
+                match self { $(Self::$variant(input) => context.$method(input).await),* }
+            }
+        }
+    };
+}
+mcp_inputs! {
+    ProjectEscalate(ProjectEscalateParams) => project_escalate,
+    UpdateProjectLifecycleHooks(UpdateProjectLifecycleHooksParams) => update_project_lifecycle_hooks,
+    UpdateProject(UpdateProjectParams) => update_project,
+    GetProject(GetProjectParams) => get_project,
+    FollowUpExecution(FollowUpExecutionParams) => follow_up_execution,
+    ReorderSubTasks(ReorderSubTasksParams) => reorder_sub_tasks,
+    CreateSubTasks(CreateSubTasksParams) => create_sub_tasks,
+    RemoveTaskDependency(RemoveTaskDependencyParams) => remove_task_dependency,
+    AddTaskDependency(AddTaskDependencyParams) => add_task_dependency,
+    TransitionTask(TransitionTaskParams) => transition_task,
+    UpdateTask(UpdateTaskParams) => update_task,
+    TaskAction(TaskActionParams) => task_action,
+    AssignAgent(AssignAgentParams) => assign_agent,
+    CreateTask(CreateTaskParams) => create_task,
+    ListSubTasks(ListSubTasksParams) => list_sub_tasks,
+    ListTaskDependents(ListTaskDependenciesParams) => list_task_dependents,
+    ListTaskDependencies(ListTaskDependenciesParams) => list_task_dependencies,
+    ListExecutions(ListExecutionsParams) => list_executions,
+    GetTaskDiff(GetTaskParams) => get_task_diff,
+    MemoryGet(MemoryGetParams) => memory_get,
+    MemorySearch(MemorySearchParams) => memory_search,
+    PreviewPrompt(PreviewPromptParams) => preview_prompt,
+    GetTask(GetTaskParams) => get_task,
+    ListTasks(ListTasksParams) => list_tasks,
+    RegisterAgent(RegisterAgentParams) => register_agent,
+    ListAgents(ListAgentsParams) => list_agents,
+    ListProjects(ListProjectsParams) => list_projects,
+    CreateProject(CreateProjectParams) => create_project,
+    ListAgentProfiles(ListAgentProfilesParams) => list_agent_profiles,
+    ListAgentSessions(ListAgentSessionsParams) => list_agent_sessions,
+    GetAgentSession(GetAgentSessionParams) => get_agent_session,
+    GetMainAgent(GetMainAgentParams) => get_main_agent,
+    BindMainAgent(BindMainAgentParams) => bind_main_agent,
+    GetProjectAgent(GetProjectAgentParams) => get_project_agent,
+    BindProjectAgent(BindProjectAgentParams) => bind_project_agent,
+    GetIntegrationQueue(GetIntegrationQueueParams) => get_integration_queue,
+    ListAgentChats(ListAgentChatsParams) => list_agent_chats,
+    GetAgentChat(GetAgentChatParams) => get_agent_chat,
+    ListAgentChatMessages(ListAgentChatMessagesParams) => list_agent_chat_messages,
+    SendAgentChatMessage(SendAgentChatMessageParams) => send_agent_chat_message,
+    ListAgentHandoffs(ListAgentHandoffsParams) => list_agent_handoffs,
+    GetAgentHandoff(GetAgentHandoffParams) => get_agent_handoff,
+    CreateAgentHandoff(CreateAgentHandoffParams) => create_agent_handoff,
 }
 
 pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
@@ -587,7 +686,11 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
             RequiredRole::Project,
             ResourceRule::Task,
             McpInput::AssignAgent,
-        ),
+        )
+        .with_agent_reference(AgentReference::Task {
+            task: "task_id",
+            agent: "agent_id",
+        }),
         typed::<TaskActionParams>(
             "forge_task_action",
             "Apply a current available_actions command at an exact version.",
@@ -668,8 +771,8 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<UpdateProjectLifecycleHooksParams>(
             "forge_update_project_lifecycle_hooks",
             "Replace lifecycle hooks at an exact Project version.",
-            RequiredRole::Project,
-            ResourceRule::None,
+            RequiredRole::Admin,
+            ResourceRule::Project,
             McpInput::UpdateProjectLifecycleHooks,
         ),
         typed::<FollowUpExecutionParams>(
@@ -678,7 +781,11 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
             RequiredRole::Project,
             ResourceRule::Execution,
             McpInput::FollowUpExecution,
-        ),
+        )
+        .with_agent_reference(AgentReference::Execution {
+            execution: "execution_id",
+            agent: "agent_id",
+        }),
         typed::<AddTaskDependencyParams>(
             "forge_add_task_dependency",
             "Add a prerequisite gate without sharing a workspace.",
@@ -713,7 +820,12 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
             RequiredRole::Project,
             ResourceRule::ParentTask,
             McpInput::CreateSubTasks,
-        ),
+        )
+        .with_agent_reference(AgentReference::SubTasks {
+            parent: "parent_task_id",
+            items: "subtasks",
+            agent: "assignee_id",
+        }),
         typed::<ListSubTasksParams>(
             "forge_list_sub_tasks",
             "List ordered children sharing the root workspace.",

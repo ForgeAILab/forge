@@ -26,6 +26,24 @@ impl operation_registry::scope_reads::ScopeReadContext<AgentHostError> for Conte
             .summary(self.actor_identity_id, self.scope)
             .await
     }
+    async fn project_summary(
+        &self,
+        input: operation_registry::scope_reads::ProjectSummary,
+    ) -> Result<Value, AgentHostError> {
+        if self.scope.scope_type == forge_agent_host::CanonicalScopeType::AgentChat {
+            self.provider
+                .project_summary_read(
+                    self.actor_identity_id,
+                    self.scope,
+                    serde_json::json!({"project_id":input.project_id}),
+                )
+                .await
+        } else {
+            self.provider
+                .summary(self.actor_identity_id, self.scope)
+                .await
+        }
+    }
     async fn chat_summary(&self, _input: NoArguments) -> Result<Value, AgentHostError> {
         self.provider
             .summary(self.actor_identity_id, self.scope)

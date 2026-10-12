@@ -13,6 +13,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn serialized_mcp_tool_definitions() {
@@ -32,9 +33,14 @@ mod tests {
             for (before, after) in before.iter().zip(after) {
                 let name = after["name"].as_str().unwrap();
                 assert_eq!(before["name"], after["name"], "base names/order");
+                let mut expected = schemas[surface][name].clone();
+                if name == "forge_update_project" {
+                    expected["properties"]["settings"]["description"] =
+                        json!("Script lifecycle hooks require the Project owner or admin role.");
+                }
                 assert_eq!(
-                    schemas[surface][name], after["inputSchema"],
-                    "only explicit H schema corrections: {surface}/{name}"
+                    expected, after["inputSchema"],
+                    "explicit H/I schema corrections: {surface}/{name}"
                 );
                 assert!(after["description"].as_str().unwrap().len() <= 200);
             }
@@ -70,7 +76,11 @@ mod tests {
             let before_bytes = serde_json::to_vec(&before).unwrap().len();
             let after_bytes = serde_json::to_vec(&after).unwrap().len();
             assert!(after_bytes < before_bytes, "smaller {surface} prefix");
-            println!("MCP_PREFIX {surface} before_bytes={before_bytes} after_bytes={after_bytes} before_token_estimate={} after_token_estimate={} (ceil bytes/4)",before_bytes.div_ceil(4),after_bytes.div_ceil(4));
+            println!(
+                "MCP_PREFIX {surface} before_bytes={before_bytes} after_bytes={after_bytes} before_token_estimate={} after_token_estimate={} (ceil bytes/4)",
+                before_bytes.div_ceil(4),
+                after_bytes.div_ceil(4)
+            );
             println!(
                 "TOOL_DEFINITIONS {surface} {}",
                 serde_json::to_string(&definitions).unwrap()

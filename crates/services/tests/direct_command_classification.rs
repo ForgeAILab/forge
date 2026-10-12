@@ -1780,7 +1780,13 @@ async fn terminal_denial_permission_grant_invalidates_reminder_and_next_turn_cal
 
 #[tokio::test]
 async fn terminal_denial_bad_project_summary_id_does_not_withdraw_operation() {
-    let fixture = fixture().await;
+    // `project.summary` is a registry read now, so the stored ceiling must
+    // carry the Agent Chat read permission the composed tool already names
+    // (as `agent_chat.summary` always required).
+    let fixture = fixture_with_permissions(
+        r#"{"permissions":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#,
+    )
+    .await;
     sqlx::query("INSERT INTO account_main_agent_binding (id, account_id, identity_id, profile_id, created_at, updated_at) VALUES ('summary-main', ?, ?, ?, ?, ?)")
         .bind(USER_ID).bind(AGENT_ID).bind(PROFILE_ID).bind(NOW).bind(NOW).execute(fixture.db.pool()).await.unwrap();
     let chat_id: String = sqlx::query_scalar(

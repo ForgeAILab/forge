@@ -2426,6 +2426,11 @@ fn forge_update_project_lifecycle_hooks_replaces_hooks_only() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        sqlx::query("UPDATE project SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
         call_tool(
             &state,
             "forge_update_project",
@@ -2487,6 +2492,11 @@ fn forge_update_project_lifecycle_hooks_validates_blocking_event() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        sqlx::query("UPDATE project SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
         let error = dispatch(
             &state,
             "tools/call",
@@ -3089,7 +3099,9 @@ fn project_constrained_catalog_matches_call_authority_and_projects_only_the_boun
             names,
             CATALOG
                 .iter()
-                .filter(|spec| registry_contract::base_admitted("account", spec.name))
+                .filter(|spec| registry_contract::admitted_after_consolidation(
+                    "account", spec.name
+                ))
                 .map(|spec| spec.name)
                 .collect(),
             "every MCP tool needs an explicit scope classification"
@@ -3109,7 +3121,7 @@ fn project_constrained_catalog_matches_call_authority_and_projects_only_the_boun
             assert_eq!(
                 scoped_names.contains(name),
                 rule == McpScopeRule::BoundProject
-                    && registry_contract::base_admitted("project_public", name),
+                    && registry_contract::admitted_after_consolidation("project_public", name),
                 "{name}"
             );
             if rule == McpScopeRule::AccountInspection {

@@ -65,198 +65,69 @@ checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 
 ## Architectural patterns
 
-### Native operation registry
+### Operation registry and immutable doctrine
 
-`operation-registry` is below the host and services: Serde, schemars, async-trait
-and shared `api-types` value inputs, all already in the workspace. `agent-host`, `services`, `db` and
-`mcp-server` depend on it; it imports none of those consumers, so typed service handler registration does not
-create a dependency cycle. Specifications live in domain modules of that crate
-(`scope_reads`, `project_reads`, `main_reads`, `main_proposals`, `hand_proposals`), below `agent-host`, because `agent-host`
-builds the advertised schema and cannot depend on `services`. Each module owns
-its specs, its id list and the small context trait its handlers need;
-`services` implements the traits. `lib.rs` only concatenates the modules,
-checks that specs and ids agree with no collision, and iterates by id.
+`operation-registry` is below the native host, services and MCP adapters. Domain
+modules own input types, canonical schemas, structural constraints, authority,
+effect class, availability, surface bindings and typed handler bindings. Native
+aggregates and MCP descriptors are projections of those specs. Host metadata,
+operation names, permissions and classification are generated; MCP input variants
+and their handler interface/dispatch come from one declaration. Service adapters
+bind concrete effects without a second operation dispatch table or parameter type.
+Runtime workspace tools, fetch and configured public search retain their single
+capability-bound Tool implementations rather than masquerading as Forge domain
+operations. Catalog tests cover every composed aggregate operation and MCP tool,
+require one spec each, and prove every spec is reachable.
 
-An `OperationSpec` owns its Serde input type and the JSON schema derived from
-it, declared structural constraints, authority facts, effect class,
-availability, native aggregate and field projection, short summary, bounded
-guidance, and typed handler binding. A handler takes exactly the spec's input
-type, so a mismatch does not compile.
+Fresh calls authorize before decoding the selected closed contract. Native
+integer-valued strings/floats normalize to integers; MCP retains strict JSON
+integer spelling. Provider schemas use portable base keywords, while complete
+canonical schemas govern decoding. Optional generic read arguments use defaults
+without a repeated argument list in every tool prefix. The Project-summary
+selector and the Task-run informational-offer warning remain because omitting
+those constraints leads to an invalid query or an unauthorized workflow attempt.
+Named orchestration reads retain their generated field contracts. The Main Charter
+draft retains nested shapes needed to produce a valid first call.
 
-**Contracts and authority.** The schema projection and full input contract
-have different jobs; operation authority uses the same evaluator:
+`project.summary`, adoption/amendment drafting, milestone evidence and readiness
+now have registry specs. Every fresh payload/envelope rejects undeclared fields;
+Charter adoption also declares the previously accepted `expected_digest`, and
+Project evidence declares `source_run_id`. Evidence requires the acceptance-check
+list its materializer reads. The receipt-bearing Project specs retrieve an exact
+principal/scope/operation/key/input-digest receipt before current authority or
+contract checks. That read is forwarded through the native authority wrapper and
+preparation boundary. A changed input/key receives fresh authorization. Prepared
+calls retain their arguments, and committed replay never executes an effect again.
+Domain semantic validation, transaction authority, CAS, receipts and workspace
+preparation remain in their command services. The six legacy pending-intent
+operations still have no materializer and never report a completed domain effect.
 
-- *Advertised.* The aggregate tool schema sent to a provider keeps the flat
-  shape `{operation: enum, arguments: object}` and uses only the JSON-Schema
-  keywords the native schemas already used. It never expresses a per-operation
-  contract with `allOf`, `anyOf`, `not`, `if`/`then`/`else`, `$ref`, `$defs`,
-  `dependentSchemas` or `patternProperties`. The model learns a registered
-  operation's contract from one generated line in the `arguments` description
-  (`project.charter: no arguments`; `skill.section: {section: one of
-  research|documents|...}`; `?` marks an optional field). The line is generated
-  from the spec's schema, so it cannot drift from what is enforced.
-- *Enforced.* After argument normalization, the registry validates and decodes
-  the arguments against the spec: in tool preparation, which native execution
-  and the CLI chat callback both run, and again at dispatch in `services`. A
-  violation is an ordinary in-turn tool error naming the operation, the
-  offending field and the expected contract. The check lives in one place,
-  `input_check.rs`, and is driven by the canonical schema: closed object,
-  required fields, scalar types, string lengths, numeric bounds, then the
-  Serde decode. Before the type check an integer field sent as an
-  integer-valued string (`"10"`) or float (`10.0`) is rewritten to the
-  integer, because several providers emit numbers that way; the handler
-  receives the integer. Nothing else is coerced (`"ten"`, `1.5`, `true` and a
-  negative value for an unsigned field are refused), and neither the
-  advertised line nor the canonical schema is widened. Denial comes before
-  contract detail: the read tool rejects an operation outside the session's
-  grant, then (on the named orchestration read tools; `forge_scope_read` has
-  no such guard, its closed contracts refuse the field) a forged scope or
-  authority field, and only then reports a contract violation; at dispatch, a caller the Main handler would deny gets
-  that denial even when the arguments are malformed.
-- *Canonical.* The full per-operation JSON Schema stays in the registry for
-  validation, documentation and the read/proposal canonical fixtures. It is not
-  what providers are sent.
+The same EffectiveAuthority evaluator governs native and MCP advertisement and
+admission. MCP remains delegated-user authority. Project grants omit account-wide
+tools and load current Project visibility and member/admin/owner facts. Lifecycle
+hook replacement requires owner/admin authority; script hooks inside opaque
+Project settings require that same role, with a shared REST/MCP effect-time
+recheck. Agent references in assignment, subtask creation and execution follow-up
+use REST's Project usability query, and private identities answer as missing.
+Stored foreign dependency IDs are not disclosed by constrained dependency reads.
+Transition execution remains `SystemComponent::Mcp`; its returned action offers
+use the delegated caller, just as Task reads do.
 
-Why: function-declaration schema dialects (OpenAI Chat Completions and
-Responses, OpenAI-compatible routers, xAI, Gemini) do not reliably accept
-conditional keywords, and Gemini rejects unknown ones; and a conditional per
-operation would add thousands of tokens to every turn's tool prefix once all
-operations move. Two tests in `agent-host` hold the rule: one walks every
-advertised native definition for the forbidden keywords, one pins a byte
-ceiling per surface (`SURFACE_BYTE_CEILINGS`, the unit
-`scripts/measure-tool-definitions.py` prints). Raise a ceiling only on purpose.
+Current doctrine is Main baseline `forge.main.baseline/v1@5`, Genesis
+`forge.main.project-discovery/v2@8`, and Project
+`forge.project.orchestration/v1@22`. New immutable revisions retain historical
+rows, admissions and receipts. Their overrides are inside the canonical body and
+content digest. Historical renderers restore the exact legacy override suffix;
+new frozen bodies carry their own overrides through future cutovers. Admitted
+Project verification uses only its disposable checkout, with observed command
+provenance and user-only manual attestation/release. Project Agents build Task
+calls from `work.read.action_schema`; Task worklog/evidence `action` is optional,
+and each distinct worklog entry uses a new `correlation_id`.
 
-Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
-`skill.section`, `project.current_state`, `project.observations`, `repo.integration_queue`, `genesis.project_agents.read`, `charter.read`,
-`charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
-`portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
-input types directly; their former dispatcher and handwritten decoders are
-removed. Discovery/portfolio defaults and clamping remain in the handlers. Inquiry remains a query: its run log and
-bounded findings do not grant proposal authority. Its `MainChatOnly`
-availability records the existing exclusion from account inquiry sessions.
-The scope-read aggregate adds no contract prose where the base had none.
-Main proposal projection registers `genesis.project_agent.select` (direct
-command) and `project.create` (approval-required). The named Main propose
-aggregate and the generic scope-propose aggregate generate their payload
-contract lines from those specs, retaining the portable envelope
-`{operation, payload, dedupe_key, correlation_id, causation_id?, causation_depth?}`.
-The envelope owns provenance; the spec owns only the payload. Selection's line
-is `{expected_session_version, genesis_session_id?, project_agent_identity_id}`;
-Project-create's is `{approval_id}`. The old `action` fields were discarded or
-ignored by their handlers, so they are omitted from advertisement. Selection
-declaratively strips its ignored discriminator before checking/decoding and
-keeps its closed request; Project-create keeps an open payload because its
-executor ignores extra fields, preserving their exact bytes for action dedupe.
-`approval_id` names the user's Charter approval; the user executor reads it
-from the stored action payload, so the agent is its only source. A new call
-must carry it as a non-empty string: the base enqueuer queued a call without
-it, and the owner then approved an action that could never execute. Supplying
-an id grants nothing: execution still needs the owner's independent approval
-of the action, the user executor, and a Charter approval that belongs to the
-account and is not consumed. Selection uses the same integer
-coercion as reads and the same receipt-backed command service.
-
-Fresh proposals check the registry's current principal/scope/permission rule first, then forged authority
-fields, then their payload contract, then the typed handler. The provider's
-preparation denial check also runs before payload diagnostics. Dispatch of the two registered
-proposals checks the entire envelope for authority/scope replacements; direct
-provider calls previously ignored such root fields, while named preparation
-already rejected them. Hand-path operations do not run this envelope check.
-The guards share one name list (`operation_catalog::SERVER_DERIVED_FIELDS`):
-dispatch adds `project_id`, preparation adds its prompt-injection names, and
-preparation of a registered proposal runs both. Exact prepared
-invocations use `propose_prepared` and `dispatch_prepared`: they reauthorize and
-run existing domain checks, but never revalidate stored arguments against the
-current contract. Runtime prepared, approval-pending and recorded edited calls
-retain their serialized arguments and fingerprints. `project.create` only
-queues its existing approval-required AgentAction; the unchanged user executor
-parses the stored action payload, consumes the exact Charter approval and
-atomically records the Project/handoff/receipt. It cannot execute by proposing
-or by an agent executor. Dedupe keys, correlation/causation, immutable receipts,
-protected checkpoint encryption and approval storage are unchanged.
-
-`genesis.start` and `charter.draft` use typed specs in `hand_proposals` and
-registered dispatch. Their existing command adapters and domain authorizers are
-unchanged: Genesis still derives its creation intent from the leased user
-message, and neither command grants a fresh effect to an owned unbound identity.
-An owned former Main identity may retrieve its exact committed receipt as at
-base. The native `main_account_id` gate remains on `project.create` and
-`genesis.project_agent.select`; extending it to these direct commands would
-narrow that receipt retrieval. Stored preparations retain their exact arguments;
-the transport-only `action` is omitted from the advertised contracts and ignored
-before decoding, as the domain adapters already did. `genesis.start` likewise
-accepts and discards an unadvertised `initial_idea`: the hand path decoded it
-and then replaced it with the leased user message. Both contracts accept every
-field their hand path read. The Charter draft is the one registered operation
-whose advertised line carries nested shapes (every Charter section and the
-provenance object, generated from the registry schema): the tool description is
-the only place a Main model is shown them, and a draft sent without them costs
-one correction turn per missing field. All other operations keep
-their hand paths; an operation never has both. Existing permission/binding checks enforce
-authority; spec/check parity is tested pending EffectiveAuthority. Domain
-semantic validation, transactions, workspace preparation, MCP projections and
-doctrine remain hand-written.
-
-To add an operation, declare a closed Serde/JsonSchema input and its
-constraints in its domain module, add its id to that module's `IDS`, and bind
-a typed context handler. Delete its former schema fragment, validator branch
-and dispatch branch, implement the context method in `services`, and test
-schema, contract line, dispatch, constraints and authority parity. Adding an
-operation to an existing domain module needs no edit to `lib.rs`. A new domain module joins the composed `OperationContext` and contributes its
-specs and id list to the appropriate effect catalog. Reads and Main proposals
-use the same `OperationSpec` and typed decoding/dispatch machinery; registered
-operation inventory includes both catalogs.
-
-Project proposal specs now own `project.review_config`, `project.document`,
-`project.decision`, `project.milestone`, `project.validation`,
-`project.release.request` and `project.escalate`. Document and milestone actions
-have separate closed field contracts, each of which keeps every field that was
-advertised for the operation before the move; their provider projection is still one
-generated line per operation, with no conditional schema keywords. Fresh calls
-check authority before contract details. Commands receive the original admitted
-payload, preserving receipt digests; exact preparations bypass the current field
-contract while still running typed decoding and existing domain checks. Payload
-ceilings use serialized UTF-8 bytes (65,536), review command lengths use characters,
-and read limits use rows. Ready Project Agents also advertise the existing
-Charter amendment draft capability; no approval authority is added.
-
-`message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
-`review.request` and `session.action` are pending-intent specs with an open,
-size-capped payload that is stored as sent. Their
-results remain pending proposals, never success for a message, memory, commitment,
-review or session effect. No materializer was added. The operation schema produces the contract line and the canonical field names
-used by normalization. Registered pending fields are no longer duplicated as
-root-level aliases in `forge_scope_propose`. Flat calls still canonicalize from
-the registry's field names, so handlers and prepared calls keep their inputs.
-Hand Task operations retain their existing root and payload field declarations.
-Named orchestration descriptions state the action once; the canonical scope and
-authority rules are enforced by the same server checks. A `null` payload on a registered proposal is read as
-`{}`.
-
-`project.charter.adoption`, `project.evidence` and `project.readiness` retain their
-hand paths. Literal fixtures from the real approved Charter/create and milestone
-command setup show that adoption and evidence return committed receipts after
-an identity pause or ceiling reduction. Registry admission would narrow those
-replays, so no partial move is retained. Readiness's base capture reached its
-bounded fixture-attempt limit; its dispatch and schema are unchanged. Moving
-adoption and evidence needs a registry receipt-retrieval step that runs before
-current authority is evaluated: an exact replay (same principal, scope,
-operation, dedupe key and input digest) returns the stored receipt unchanged
-whatever the caller's present pause state or ceiling, while any other call,
-including the same key with different input, is evaluated as a fresh command.
-The registered Main commands differ and must stay as they are: their replay is
-refused while the identity is paused or restricted, and allowed after the Main
-binding is replaced.
-
-A queued proposal (the six pending ones and `project.release.request`) refused
-for a missing permission still writes its `agent_action` row with status
-`denied`, as the queueing step did before these operations were registered. A
-call that could never have been queued (malformed payload, no Project target,
-Charter not adopted) writes none. Project verification remains a disposable checkout with observed commands:
-`project.validation` still requires the command observations for pass/fail and
-refuses manual attestation through the Project-Agent path. Setup-only availability
-now reports `charter_adoption_not_applicable` after setup completes, rather than
-`charter_not_adopted`.
+To add an operation, declare its typed spec and handler in its domain module,
+bind the service context, and extend the coverage/input fixtures. Do not add a
+parallel host permission/schema/name list. Receipts and exact prepared calls must
+remain valid under their admitted history, while fresh effects use current facts.
 
 ### Repository trait pattern
 
@@ -719,10 +590,10 @@ that are discovered or registered without editing a shared list. If a shared
 edit is unavoidable, one Task owns it and other Tasks depend on that Task.
 Work splits follow module boundaries, with owned modules/files named in each
 Task. Main applies this to Charter architecture constraints during Genesis
-(`forge.main.project-discovery/v2@7`). Its account baseline remains at @4,
-with no additional resident layout rule. Project
+(since `forge.main.project-discovery/v2@7`). Its account baseline carries no
+additional resident layout rule. Project
 standing invariants apply it to `task.propose`
-(`forge.project.orchestration/v1@20`); the on-demand document and Task sections
+(since `forge.project.orchestration/v1@20`); the on-demand document and Task sections
 apply it to architecture/execution plans and adaptive splitting. Planner runs
 receive it once in their system prompt for both native and outbox delivery;
 plan-artifact delivery instructions still require owned repository-relative
@@ -1859,8 +1730,7 @@ grants omit the eight account-wide tools, load current visibility/member/admin
 facts, and allow escalation only for the exact `project.owner_id`. Memory reads
 and escalation require a bound Project and are omitted/refused for account
 grants. Other Task/Project APIs retain their existing Project-visibility rule,
-including ownerless visible Projects; this migration adds no member-only write
-policy. Account grants resolve ownership and roles against supplied references.
+including ownerless visible Projects. Lifecycle-hook replacement and script-command settings require Project owner/admin authority; other visibility-based operations keep their existing policy. Account grants resolve ownership and roles against supplied references.
 Conditional daemon pinning uses the same evaluator for field advertisement and
 admission.
 
@@ -1886,9 +1756,7 @@ retain state, CAS, graph, content, and transaction-time authority invariants.
 `Actor::is_user` selects the interactive override policy throughout the engine
 (undefined edges, dependency and conflict-marker gates, displaced runs), so a
 delegated MCP credential is not given it. `forge_task_action` keeps its
-delegated-user actor, which spends retry budgets. Both Project settings paths
-pass the authenticated user into shared validation, including assigned-agent
-usability checks. Under a Project-constrained grant a Task or Execution
+delegated-user actor, which spends retry budgets. Both Project settings paths pass the authenticated user into shared validation, including script-hook authority and assigned-agent usability checks. Assignment, subtask assignees and follow-up agent overrides use the same usability query. Under a Project-constrained grant a Task or Execution
 outside the bound Project is reported exactly like a missing one. Task reads continue consuming the
 existing typed integration summary and `available_actions`; merge states,
 queue-owned eligibility, integration commands, and Task-step writing are

@@ -2280,6 +2280,7 @@ name = "mcp-server"
 version = "0.13.12"
 dependencies = [
  "api-types",
+ "async-trait",
  "axum",
  "db",
  "events",

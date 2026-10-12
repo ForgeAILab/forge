@@ -339,9 +339,19 @@ async fn evidence_attach_and_authority_match_hand_base() {
             temp.path().join("media"),
         )
         .await;
+        // The one difference from the hand base: a capture stores its asset
+        // before its command runs, so an exact retry is not answered from the
+        // receipt ahead of admission. A paused or restricted Project Agent is
+        // refused before it writes an asset; the base wrote it and replayed.
+        let mut expected = checkpoint["project.evidence"]["authority"].clone();
+        for cell in ["granted/paused", "restricted/ready", "restricted/paused"] {
+            let cell = format!("{PROJECT_IDENTITY_ID}/{cell}/project");
+            assert_eq!(expected[&cell], true, "base replayed {cell}");
+            expected[&cell] = json!(false);
+        }
         assert_eq!(
-            actual, checkpoint["project.evidence"]["authority"],
-            "no widening or narrowing on principal/profile/state/scope"
+            actual, expected,
+            "no widening, and no narrowing but the capture retry of a paused or restricted agent"
         );
         replay_case("project.evidence.attach").await;
     }

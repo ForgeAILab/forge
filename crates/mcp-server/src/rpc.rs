@@ -128,11 +128,13 @@ async fn enrich_authorized_conflict(
     let Some(arguments) = arguments.as_object() else {
         return error;
     };
-    if matches!(
-        tool_name,
-        "forge_update_project" | "forge_update_project_lifecycle_hooks"
-    ) {
-        let Some(project_id) = arguments.get("project_id").and_then(Value::as_str) else {
+    let Some(target) =
+        operation_registry::mcp::lookup(tool_name).and_then(|spec| spec.version_target)
+    else {
+        return error;
+    };
+    if let operation_registry::mcp::VersionTarget::Project(field) = target {
+        let Some(project_id) = arguments.get(field).and_then(Value::as_str) else {
             return error;
         };
         if context
@@ -154,7 +156,14 @@ async fn enrich_authorized_conflict(
             project.version,
         );
     }
-    let Some(task_id) = task_version_target(tool_name, arguments) else {
+    let operation_registry::mcp::VersionTarget::Task(field) = target else {
+        return error;
+    };
+    let Some(task_id) = arguments
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+    else {
         return error;
     };
     let Ok(Some(task)) = TaskRepo::get_by_id(&*state.db, task_id, false).await else {
@@ -174,20 +183,6 @@ async fn enrich_authorized_conflict(
         return error;
     }
     error.with_authorized_current_target("task", task.id, "version", task.version)
-}
-
-fn task_version_target<'a>(
-    tool_name: &str,
-    arguments: &'a serde_json::Map<String, Value>,
-) -> Option<&'a str> {
-    let field = match tool_name {
-        "forge_update_task" | "forge_transition_task" => "task_id",
-        _ => return None,
-    };
-    arguments
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
 }
 
 async fn apply_project_scope(
@@ -321,7 +316,14 @@ async fn apply_project_scope(
                     &depends_on_id,
                     user_id,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    if error.code == -32004 {
+                        McpToolError::not_found("task", task_id.to_owned())
+                    } else {
+                        error
+                    }
+                })?;
             }
         }
         if resource == ResourceRule::Dependents {

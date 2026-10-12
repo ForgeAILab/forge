@@ -2537,6 +2537,15 @@ async fn conflict_handoff_preserves_later_merge_fix_follow_up() {
     assert!(matches!(budget_result, HookResult::Ok), "{budget_result:?}");
 }
 
+/// The `merging` entry hook as the worker runs it: inside the claimed hooks
+/// step of that entry (the step worker scopes every step it executes with
+/// `db::task_writer::in_task_step`). Admission states
+/// the Task's integration condition, which only the holder of the Task's
+/// step lease may write.
+async fn run_merge_entry_hook(ctx: &HookContext) -> HookResult {
+    crate::test_support::with_task_lease(&ctx.db, &ctx.task_id, RunMerge.execute(ctx)).await
+}
+
 /// The queue path of a sibling conflict, up to the handoff: the entry hook
 /// admits the Task, the queue's rebase meets the sibling's change and commits
 /// the conflict with its markers, and its `send_back` step hands the files to
@@ -2556,7 +2565,7 @@ async fn queue_conflict_handoff(
         Arc::clone(&ctx.db),
         dir.path().to_path_buf(),
     )));
-    let result = RunMerge.execute(&ctx).await;
+    let result = run_merge_entry_hook(&ctx).await;
     assert!(matches!(result, HookResult::Ok), "{result:?}");
     ctx.task_service
         .drain(&ctx.task_id)
@@ -2671,7 +2680,7 @@ async fn run_merge_blocks_unresolved_handed_off_markers() {
     assert_eq!(ejected.state, db::IntegrationAttemptState::Ejected);
     reenter_merging(&ctx).await;
 
-    let result = RunMerge.execute(&ctx).await;
+    let result = run_merge_entry_hook(&ctx).await;
     assert!(matches!(result, HookResult::Ok), "{result:?}");
     let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
         .await
@@ -2741,7 +2750,7 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     run_git(&worktree_path, &["commit", "-m", "resolve handoff"]);
     reenter_merging(&ctx).await;
 
-    let result = RunMerge.execute(&ctx).await;
+    let result = run_merge_entry_hook(&ctx).await;
     assert!(matches!(result, HookResult::Ok), "{result:?}");
     let admitted = current_attempt(&ctx).await;
     assert_eq!(

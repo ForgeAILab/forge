@@ -1133,25 +1133,92 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
         current_job.operating_skill_revision_id.as_deref(),
         Some("forge.project.orchestration/v1@21")
     );
-    let current_preview = runner.preview_prompt(&current_job).await.unwrap();
-    assert!(current_preview
-        .system_prompt
-        .as_deref()
-        .unwrap()
-        .contains(services::operating_skills::canonical_project_operating_skill_body()));
-    assert!(current_preview
-        .system_prompt
-        .as_deref()
-        .unwrap()
-        .contains("`retry: none` is final for the turn"));
-    runner
-        .validate_admission_authority(&retained)
+    let v21_body: String = sqlx::query_scalar(
+        "SELECT canonical_body FROM operating_skill_revision WHERE id = 'forge.project.orchestration/v1@21'",
+    )
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    let v21_preview = runner.preview_prompt(&current_job).await.unwrap();
+    let v21_prompt = v21_preview.system_prompt.clone().unwrap();
+    assert!(v21_prompt.contains(&v21_body));
+    assert!(v21_prompt.contains("Eight verbs:"));
+    assert!(v21_prompt.contains("Never access a repository Workspace"));
+    assert!(v21_prompt.contains("`retry: none` is final for the turn"));
+
+    // The registry doctrine cutover (@22). A turn admitted on @21 is still in
+    // flight when the server upgrades: it keeps the exact contract it was
+    // admitted on, body and override section, and is neither refused nor
+    // switched to the new text.
+    let registry_migration =
+        include_str!("../../db/migrations/V202610120418__operation_registry_doctrine.sql").replace(
+            "INSERT INTO operating_skill_revision",
+            "INSERT OR IGNORE INTO operating_skill_revision",
+        );
+    sqlx::raw_sql(&registry_migration)
+        .execute(harness.state.db.pool())
         .await
         .unwrap();
-    runner
-        .validate_admission_authority(&current_job)
+    let binding_revision: String = sqlx::query_scalar(
+        "SELECT operating_skill_revision_id FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(required_string(
+        &genesis.create_response,
+        &["project_agent_binding_id"],
+    ))
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(binding_revision, "forge.project.orchestration/v1@22");
+    let in_flight =
+        AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &current_turn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(in_flight, current_job, "the admitted turn is untouched");
+    assert_eq!(
+        runner
+            .preview_prompt(&in_flight)
+            .await
+            .unwrap()
+            .system_prompt
+            .as_deref(),
+        Some(v21_prompt.as_str()),
+        "an in-flight @21 turn renders byte-identically after the cutover"
+    );
+    let retained_after = runner.preview_prompt(&retained).await.unwrap();
+    assert_eq!(previous_preview.system_prompt, retained_after.system_prompt);
+
+    let next_turn = admit_preview_turn(
+        &harness,
+        &genesis.project_chat_id,
+        "Check after the registry doctrine upgrade",
+    )
+    .await;
+    let next_job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &next_turn)
         .await
+        .unwrap()
         .unwrap();
+    assert_eq!(
+        next_job.operating_skill_revision_id.as_deref(),
+        Some("forge.project.orchestration/v1@22")
+    );
+    let next_prompt = runner
+        .preview_prompt(&next_job)
+        .await
+        .unwrap()
+        .system_prompt
+        .unwrap();
+    assert!(
+        next_prompt.contains(services::operating_skills::canonical_project_operating_skill_body())
+    );
+    assert!(next_prompt.contains("copy the action call from `action_schema`"));
+    assert!(next_prompt.contains("`retry: none` is final for the turn"));
+    assert!(!next_prompt.contains("Never access a repository Workspace"));
+    assert_eq!(next_prompt.matches("## SERVER-OWNED OVERRIDES").count(), 1);
+    for job in [&retained, &in_flight, &next_job] {
+        runner.validate_admission_authority(job).await.unwrap();
+    }
 }
 
 #[tokio::test]

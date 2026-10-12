@@ -333,6 +333,31 @@ impl ProjectOrchestrationActionService {
         Ok(())
     }
 
+    pub(crate) async fn replay_direct_input(
+        &self,
+        input: &ExecuteDirectProjectCommandInput,
+    ) -> Result<Option<DirectProjectCommandResult>> {
+        if validate_direct_input(input).is_err() {
+            return Ok(None);
+        }
+        let operation = direct_receipt_operation(&input.operation, &input.payload)?;
+        let context = direct_command_context(input, &operation, &input.payload, "allowed")?;
+        let receipt = CommandReceiptRepo::get_command_receipt_by_identity(
+            &*self.db,
+            context.principal().principal_type(),
+            context.principal().principal_id(),
+            context.canonical_scope().scope_type().as_str(),
+            context.canonical_scope().scope_id(),
+            context.operation(),
+            context.idempotency_key(),
+        )
+        .await?;
+        receipt
+            .filter(|receipt| receipt.input_digest == context.input_digest())
+            .map(|receipt| direct_result_from_receipt(receipt, &input.project_id, true))
+            .transpose()
+    }
+
     /// Execute one closed, automatically-allowed Project coordination
     /// subaction directly.  The receipt lookup intentionally precedes the
     /// current binding/policy check: a response-loss retry returns its frozen

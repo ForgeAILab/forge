@@ -6,6 +6,7 @@ use serde::Deserialize;
 #[async_trait::async_trait]
 pub trait ScopeReadContext<E>: Send + Sync {
     async fn account_summary(&self, input: NoArguments) -> Result<Value, E>;
+    async fn project_summary(&self, input: ProjectSummary) -> Result<Value, E>;
     async fn chat_summary(&self, input: NoArguments) -> Result<Value, E>;
 }
 
@@ -13,10 +14,36 @@ pub trait ScopeReadContext<E>: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct NoArguments {}
 
-pub const IDS: &[&str] = &["account.summary", "agent_chat.summary"];
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSummary {
+    pub project_id: Option<String>,
+}
+pub const IDS: &[&str] = &["account.summary", "agent_chat.summary", "project.summary"];
 
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
     vec![
+        OperationSpec::typed(
+            "project.summary",
+            AuthorityRule {
+                principal: authority::PrincipalRule::MainOrProjectScope,
+                permissions: &[
+                    ("project", "read_project"),
+                    ("agent_chat", "read_agent_chat"),
+                ],
+                binding: "admitted scope",
+            },
+            EffectClass::Query,
+            AvailabilityRule::Always,
+            &[SurfaceBinding {
+                native_aggregate: "forge_scope_read",
+                projection: FieldProjection::ReadArguments,
+            }],
+            "Read a bounded Project summary.",
+            "Main must name an owned project_id.",
+            &[StructuralConstraint::ClosedObject],
+            |c, i| Box::pin(c.project_summary(i)),
+        ),
         OperationSpec::typed(
             "account.summary",
             AuthorityRule {

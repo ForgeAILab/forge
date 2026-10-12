@@ -9,10 +9,7 @@ use std::collections::BTreeSet;
 use agent_runtime::core::prelude::RuntimeError;
 use serde_json::{Value, json};
 
-use crate::operation_catalog::{
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_READINESS_OPERATION, TASK_ADAPTIVE_OPERATION,
-};
+use crate::operation_catalog::{PROJECT_CHARTER_ADOPTION_OPERATION, TASK_ADAPTIVE_OPERATION};
 #[cfg(test)]
 use crate::{
     MAIN_GENESIS_START_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_MILESTONE_OPERATION,
@@ -29,180 +26,10 @@ pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
         "additionalProperties": false,
     })
 }
-pub(crate) fn described_object_schema(
-    properties: Value,
-    required: &[&str],
-    description: &str,
-) -> Value {
-    let mut schema = object_schema(properties, required);
-    schema["description"] = Value::String(description.to_owned());
-    schema
-}
-
-pub(crate) fn string_array_schema() -> Value {
-    json!({"type":"array","items":{"type":"string"}})
-}
-
 pub(crate) fn string_or_null_schema() -> Value {
     json!({"type":["string","null"]})
 }
 
-pub(crate) fn principal_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "kind": {"type":"string","enum":["user","agent","worker","reviewer","service","system"]},
-            "id": {"type":"string","minLength":1},
-            "display_name": string_or_null_schema(),
-        }),
-        &["kind", "id"],
-    )
-}
-
-pub(crate) fn provenance_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "source_kind": {"type":"string","enum":["user","main_chat","project_chat","research","task","validation","document","decision","milestone","release","system"]},
-            "source_id": {"type":"string","minLength":1},
-            "revision_id": string_or_null_schema(),
-            "digest": string_or_null_schema(),
-            "label": string_or_null_schema(),
-            "observed_at": string_or_null_schema(),
-        }),
-        &["source_kind", "source_id"],
-    )
-}
-
-pub(crate) fn revision_provenance_schema() -> Value {
-    object_schema(
-        json!({
-            "author": principal_ref_schema(),
-            "profile_revision": string_or_null_schema(),
-            "operating_skill_revision": string_or_null_schema(),
-            "source_refs": {"type":"array","items":provenance_ref_schema()},
-            "change_summary": {"type":"string","minLength":1},
-            "material_diff": string_or_null_schema(),
-        }),
-        &["author", "change_summary"],
-    )
-}
-
-pub(crate) fn charter_risk_schema() -> Value {
-    object_schema(
-        json!({
-            "id": {"type":"string","minLength":1},
-            "description": {"type":"string","minLength":1},
-            "impact": string_or_null_schema(),
-            "treatment": string_or_null_schema(),
-            "revisit_trigger": string_or_null_schema(),
-            "owner": {"oneOf":[principal_ref_schema(), {"type":"null"}]},
-        }),
-        &["id", "description"],
-    )
-}
-
-pub(crate) fn charter_knowledge_item_schema() -> Value {
-    object_schema(
-        json!({
-            "id": {"type":"string","minLength":1},
-            "statement": {"type":"string","minLength":1},
-            "kind": {"type":"string","enum":["observed_fact","user_decision","research_finding","assumption","hypothesis","open_decision","research_queue"]},
-            "normative": {"type":"boolean"},
-            "transfer_approved": {"type":"boolean"},
-            "provenance": {"type":"array","items":provenance_ref_schema()},
-            "confidence": {"type":["string","null"],"enum":["low","medium","high","not_applicable",null]},
-            "observed_at": string_or_null_schema(),
-            "freshness_expires_at": string_or_null_schema(),
-            "impact": string_or_null_schema(),
-            "owner": {"oneOf":[principal_ref_schema(), {"type":"null"}]},
-            "default_value": string_or_null_schema(),
-            "revisit_trigger": string_or_null_schema(),
-            "falsification_evidence": string_or_null_schema(),
-            "blocking": {"type":"boolean"},
-        }),
-        &["id", "statement", "kind", "normative", "transfer_approved"],
-    )
-}
-
-pub(crate) fn charter_content_schema() -> Value {
-    object_schema(
-        json!({
-            "identity": object_schema(json!({
-                "working_name": {"type":"string","minLength":1},
-                "slug_proposal": string_or_null_schema(),
-                "one_line_vision": {"type":"string","minLength":1},
-                "maturity": {"type":"string","enum":["prototype","mvp","production","critical"]},
-                "lifecycle_intent": string_or_null_schema(),
-                "project_type": string_or_null_schema(),
-                "value_proposition": string_or_null_schema(),
-            }), &["working_name", "one_line_vision", "maturity"]),
-            "problem_and_people": object_schema(json!({
-                "problem_or_opportunity": {"type":"string","minLength":1},
-                "target_users": string_array_schema(),
-                "beneficiaries": string_array_schema(),
-                "jobs_pains_opportunity": string_array_schema(),
-                "current_alternatives": string_array_schema(),
-                "stakeholders": string_array_schema(),
-                "excluded_audiences": string_array_schema(),
-            }), &["problem_or_opportunity"]),
-            "core_experience": object_schema(json!({
-                "primary_outcome": {"type":"string","minLength":1},
-                "core_loop": string_or_null_schema(),
-                "principal_journeys": string_array_schema(),
-            }), &["primary_outcome"]),
-            "scope": object_schema(json!({
-                "must_have_outcomes": string_array_schema(),
-                "required_deliverables": string_array_schema(),
-                "later_possibilities": string_array_schema(),
-                "explicit_non_goals": string_array_schema(),
-            }), &[]),
-            "success": object_schema(json!({
-                "qualitative_outcome": string_or_null_schema(),
-                "success_signals": string_array_schema(),
-                "acceptance_statements": string_array_schema(),
-                "required_evidence": string_array_schema(),
-                "non_claims": string_array_schema(),
-            }), &[]),
-            "constraints_and_risks": object_schema(json!({
-                "product": string_array_schema(),
-                "time_and_budget": string_array_schema(),
-                "technology": string_array_schema(),
-                "data": string_array_schema(),
-                "integrations": string_array_schema(),
-                "security_privacy_compliance": string_array_schema(),
-                "accessibility": string_array_schema(),
-                "operations": string_array_schema(),
-                "migration": string_array_schema(),
-                "launch": string_array_schema(),
-                "agent_authority": string_array_schema(),
-                "risks": {"type":"array","items":charter_risk_schema()},
-            }), &[]),
-            "knowledge_ledger": object_schema(json!({
-                "items": {"type":"array","items":charter_knowledge_item_schema()},
-            }), &[]),
-            "scaffold": {"oneOf":[object_schema(json!({
-                "template":{"type":"string","minLength":1,"description":"spark template id: nextjs or vite-react"},
-                "packs":string_array_schema(),
-            }), &["template"]), {"type":"null"}], "description":"Repository scaffold for a web product: a spark template plus feature packs. Omit for a non-web product or a repository the user brings."},
-            "handoff_note": {"oneOf":[object_schema(json!({
-                "recommended_first_action": string_or_null_schema(),
-                "bounded_summary": string_or_null_schema(),
-                "unresolved_item_ids": string_array_schema(),
-            }), &[]), {"type":"null"}]},
-        }),
-        &[
-            "identity",
-            "problem_and_people",
-            "core_experience",
-            "scope",
-            "success",
-            "constraints_and_risks",
-            "knowledge_ledger",
-        ],
-    )
-}
-
-/// Whether a property is an object with declared fields, directly, as a
-/// nullable alternative, or as the item of an array.
 fn declares_structure(schema: &Value) -> bool {
     schema.get("properties").is_some()
         || schema.get("items").is_some_and(declares_structure)
@@ -261,51 +88,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
     if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
         return spec.canonical_schema();
     }
-    match operation {
-        PROJECT_CHARTER_ADOPTION_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"draft_revision"},
-                "charter_id":{"type":"string","minLength":1,"description":"Omit to start the Project's adoption Charter. The server mints the id and returns it; supply it only to revise the Charter it already returned."},
-                "base_revision_id":string_or_null_schema(),
-                "expected_charter_version":{"type":"integer","minimum":0,"description":"0 to start the Project's adoption Charter. To revise an existing draft, send the charter_version returned by your previous action result; a conflict names the value to send."},
-                "project_mode":{"type":"string","enum":["compact","standard"]},
-                "maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},
-                "content":charter_content_schema(),
-                "rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},
-                "render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},
-                "provenance":revision_provenance_schema()
-            }),
-            // `rendered_view`/`render_version` stay optional for the same
-            // reason as the Main Charter draft: the render is derived from
-            // `content`, and a model cannot reproduce the server renderer
-            // byte-for-byte.
-            &[
-                "action",
-                "expected_charter_version",
-                "project_mode",
-                "maturity",
-                "content",
-                "provenance",
-            ],
-            "Project Agent adoption or amendment Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
-        ),
-        PROJECT_EVIDENCE_OPERATION => described_object_schema(
-            json!({"action":{"enum":["attach","capture"],"description":"attach binds an existing Project media asset (asset_id + checksum required). capture stores an artifact your own verification run produced and attaches it in the same call: supply exactly one of content or path, never asset_id/checksum."},"milestone_id":{"type":"string","minLength":1},"expected_milestone_version":{"type":"integer","minimum":1},"asset_id":{"type":["string","null"],"minLength":1,"description":"attach only: the existing Project media asset to bind."},"task_id":string_or_null_schema(),"source_validation_id":{"type":["string","null"],"minLength":1,"description":"The id of the recorded validation RESULT this artifact backs — the `validation_id`/result id returned by `project.validation` (`record`), never the acceptance-check id. Record the check result first, then capture its proof citing that returned id."},"acceptance_check_ids":string_array_schema(),"caption":{"type":"string","minLength":1},"kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},"checksum":{"type":["string","null"],"minLength":1,"description":"attach only: SHA-256 of the named asset's bytes."},"content":{"type":["string","null"],"minLength":1,"description":"capture only: inline text artifact (for example a verification report)."},"path":{"type":["string","null"],"minLength":1,"description":"capture only: a file path under your Project workspace root (forge/ or checkout/)."},"filename":{"type":["string","null"],"minLength":1,"description":"capture only: display filename override, no path separators."}}),
-            &[
-                "action",
-                "milestone_id",
-                "expected_milestone_version",
-                "caption",
-                "kind",
-            ],
-            "Evidence for a milestone acceptance check. attach an existing asset, or capture the proof your own verification run produced — the server creates the Project media asset and attaches it atomically. Never create a Task just to produce evidence.",
-        ),
-        PROJECT_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1}}),
-            &["action", "milestone_id", "milestone_version"],
-        ),
-        _ => object_schema(json!({}), &[]),
-    }
+    object_schema(json!({}), &[])
 }
 
 /// Adds `type`/`enum` beside every string `const` in a JSON schema (and a
@@ -681,6 +464,7 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
     })
 }
 
+#[cfg(test)]
 pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
     if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
         return spec.canonical_schema();
@@ -689,32 +473,35 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
 }
 
 pub(crate) fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
-    let mut guidance = vec!["Arguments by operation:".to_owned()];
+    let compact = operations.iter().all(|id| {
+        operation_registry::READ_CATALOG
+            .lookup(id)
+            .is_some_and(|spec| {
+                spec.surfaces
+                    .iter()
+                    .any(|surface| surface.native_aggregate == "forge_scope_read")
+            })
+    });
+    let mut guidance = Vec::new();
     for operation in operations {
-        // A registered operation states its own contract, generated from its
-        // spec. The contract is enforced at preparation, not by this schema.
         if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
-            guidance.push(format!("- {}", spec.contract_line()));
-            continue;
+            if !compact {
+                guidance.push(format!("- {}", spec.contract_line()));
+            } else if !spec.guidance.is_empty() {
+                guidance.push(format!("- {}; {}", spec.contract_line(), spec.guidance));
+            }
         }
-        let arguments = orchestration_read_arguments_schema(operation);
-        let keys = arguments
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|map| map.keys().cloned().collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-        guidance.push(if keys.is_empty() {
-            format!("- {operation}: no arguments")
-        } else {
-            format!("- {operation}: optional {{{keys}}}")
-        });
+    }
+    let mut arguments = json!({"type":"object"});
+    if !guidance.is_empty() {
+        arguments["description"] = json!(guidance.join("\n"));
     }
     json!({
         "type":"object",
         "required":["operation"],
         "properties":{
             "operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},
-            "arguments":{"type":"object","description":guidance.join("\n")},
+            "arguments":arguments,
         },
         "additionalProperties":false,
     })
@@ -761,53 +548,36 @@ pub(crate) fn validate_orchestration_proposal_arguments(
             .get("payload")
             .and_then(Value::as_object)
             .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
-        if operation == PROJECT_ESCALATE_OPERATION {
-            let request: api_types::ProjectEscalateRequest =
-                serde_json::from_value(Value::Object(payload.clone()))
-                    .map_err(|error| RuntimeError::tool(error.to_string()))?;
-            if request.need.trim().is_empty()
-                || request.need.chars().count() > 4096
-                || request.task_ids.len() > 100
-                || request.task_ids.iter().any(|id| id.is_empty())
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::tool("Forge orchestration payload action is required"))?;
+        let schema = orchestration_payload_schema(operation);
+        let action_schema = schema
+            .get("properties")
+            .and_then(|properties| properties.get("action"))
+            .ok_or_else(|| {
+                RuntimeError::tool("Forge orchestration action schema is unavailable")
+            })?;
+        if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
+            if action != expected {
+                return Err(RuntimeError::tool(format!(
+                    "Forge orchestration action must be {expected}"
+                )));
+            }
+        } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
+            if !actions
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(action))
             {
                 return Err(RuntimeError::tool(
-                    "escalation need and Task IDs must be bounded and nonblank",
+                    "Forge orchestration action is outside this typed contract",
                 ));
             }
         } else {
-            let action = payload
-                .get("action")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    RuntimeError::tool("Forge orchestration payload action is required")
-                })?;
-            let schema = orchestration_payload_schema(operation);
-            let action_schema = schema
-                .get("properties")
-                .and_then(|properties| properties.get("action"))
-                .ok_or_else(|| {
-                    RuntimeError::tool("Forge orchestration action schema is unavailable")
-                })?;
-            if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
-                if action != expected {
-                    return Err(RuntimeError::tool(format!(
-                        "Forge orchestration action must be {expected}"
-                    )));
-                }
-            } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
-                if !actions
-                    .iter()
-                    .any(|candidate| candidate.as_str() == Some(action))
-                {
-                    return Err(RuntimeError::tool(
-                        "Forge orchestration action is outside this typed contract",
-                    ));
-                }
-            } else {
-                return Err(RuntimeError::tool(
-                    "Forge orchestration action schema is not closed",
-                ));
-            }
+            return Err(RuntimeError::tool(
+                "Forge orchestration action schema is not closed",
+            ));
         }
     }
     if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
@@ -868,13 +638,12 @@ mod tests {
 
     #[test]
     fn every_migrated_contract_resolves_to_its_input_and_shared_output() {
-        for contract in MIGRATED_OPERATION_CONTRACTS {
+        for contract in MIGRATED_OPERATION_CONTRACTS.iter() {
             let schema = match contract.input {
                 OperationInputContract::ReadArguments => {
                     orchestration_read_arguments_schema(contract.operation)
                 }
-                OperationInputContract::ProposalEnvelope
-                | OperationInputContract::CoordinationEnvelope => {
+                OperationInputContract::ProposalEnvelope => {
                     orchestration_payload_schema(contract.operation)
                 }
             };
@@ -985,8 +754,14 @@ mod tests {
         };
         let draft = line("charter.draft");
         for (field, hand) in [
-            ("content", charter_content_schema()),
-            ("provenance", revision_provenance_schema()),
+            (
+                "content",
+                orchestration_payload_schema("charter.draft")["properties"]["content"].clone(),
+            ),
+            (
+                "provenance",
+                orchestration_payload_schema("charter.draft")["properties"]["provenance"].clone(),
+            ),
         ] {
             assert!(
                 draft.contains(&format!("{field}: {}", schema_signature(&hand, 0))),
