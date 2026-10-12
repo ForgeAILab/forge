@@ -745,6 +745,17 @@ pub fn operation_permission(
     scope_type: CanonicalScopeType,
     operation: &str,
 ) -> Option<&'static str> {
+    if let Some(spec) = operation_registry::READ_CATALOG
+        .lookup(operation)
+        .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+    {
+        return spec.authority.permission(match scope_type {
+            CanonicalScopeType::Account => "account",
+            CanonicalScopeType::Project => "project",
+            CanonicalScopeType::AgentChat => "agent_chat",
+            CanonicalScopeType::Task => "task",
+        });
+    }
     if let Some(permission) = operation_contract_permission(scope_type, operation) {
         return Some(permission);
     }

@@ -24,6 +24,8 @@ pub fn authority_bound_provider(
     let workspace = match binding.scope.workspace_access {
         crate::WorkspaceAccess::AccountScratch => "account_scratch",
         crate::WorkspaceAccess::ProjectVerify => "project_verify",
+        crate::WorkspaceAccess::TaskRead => "task_read",
+        crate::WorkspaceAccess::TaskWrite => "task_write",
         _ => "deny",
     };
     Arc::new(AuthorityBoundProvider {
@@ -77,16 +79,31 @@ impl AuthorityBoundProvider {
             ));
         }
         let current = if fresh_effect {
-            let current = self
-                .db
-                .resolve_effective_authority(
-                    actor,
-                    Some(&self.admitted.admitted_profile_id),
-                    &self.admitted.scope_type,
-                    &self.admitted.scope_id,
-                    self.workspace,
-                )
-                .await;
+            let current = if let operation_registry::authority::Principal::TaskAgent {
+                runtime_session_id: Some(runtime),
+                ..
+            } = &self.admitted.principal
+            {
+                self.db
+                    .resolve_task_effective_authority(
+                        actor,
+                        Some(&self.admitted.admitted_profile_id),
+                        &self.admitted.scope_id,
+                        self.workspace,
+                        runtime,
+                    )
+                    .await
+            } else {
+                self.db
+                    .resolve_effective_authority(
+                        actor,
+                        Some(&self.admitted.admitted_profile_id),
+                        &self.admitted.scope_type,
+                        &self.admitted.scope_id,
+                        self.workspace,
+                    )
+                    .await
+            };
             match current {
                 Ok(current) => current,
                 Err(db::DbError::NotFound) => {
@@ -199,6 +216,11 @@ impl ForgeToolProvider for AuthorityBoundProvider {
             .is_some()
         {
             self.check(actor, scope, operation, true).await?;
+            if operation_registry::task_records::IDS.contains(&operation)
+                || operation_registry::task_proposals::IDS.contains(&operation)
+            {
+                return Ok(());
+            }
             // The provider keeps its own admission (the Main binding gate).
             self.inner.proposal_denial(actor, scope, operation).await
         } else {

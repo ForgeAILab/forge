@@ -85,14 +85,41 @@ pub enum Principal {
     TaskAgent {
         identity_id: String,
         execution_id: String,
+        role: TaskRole,
+        runtime_session_id: Option<String>,
     },
     SystemComponent {
         name: String,
     },
 }
+/// Task roles come from the running execution, never the tool payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRole {
+    Worker,
+    Reviewer,
+    Planner,
+    Lead,
+}
+impl TaskRole {
+    pub fn parse(role: &str) -> Option<Self> {
+        match role {
+            "worker" | "coder" | "executor" => Some(Self::Worker),
+            "reviewer" => Some(Self::Reviewer),
+            "planner" => Some(Self::Planner),
+            "lead" => Some(Self::Lead),
+            _ => None,
+        }
+    }
+    pub fn can_write_plan(self) -> bool {
+        matches!(self, Self::Worker | Self::Planner)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalRule {
     BoundIdentity,
+    TaskRecord,
+    ProjectOrTask,
+    TaskPlan,
     OwnedMain,
     AgentAction,
     ProjectOrOwnedIdentity,
@@ -197,6 +224,20 @@ impl EffectiveAuthority {
                 Principal::TaskAgent { .. } => self.scope_type == "task",
                 _ => false,
             },
+            PrincipalRule::ProjectOrTask => match &self.principal {
+                Principal::ProjectAgent { .. } => {
+                    matches!(self.scope_type.as_str(), "project" | "agent_chat")
+                }
+                Principal::TaskAgent { .. } => self.scope_type == "task",
+                _ => false,
+            },
+            PrincipalRule::TaskRecord | PrincipalRule::TaskPlan => {
+                self.scope_type == "task"
+                    && matches!(&self.principal,
+                    Principal::TaskAgent { execution_id, role, .. }
+                    if !execution_id.is_empty() &&
+                       (requirement.principal_rule() == PrincipalRule::TaskRecord || role.can_write_plan()))
+            }
             PrincipalRule::OwnedMain => {
                 matches!(self.principal, Principal::MainAgent { .. })
                     && matches!(self.scope_type.as_str(), "account" | "agent_chat")
@@ -499,6 +540,8 @@ mod tests {
         reviewer.principal = Principal::TaskAgent {
             identity_id: "reviewer".into(),
             execution_id: "review-exec".into(),
+            role: TaskRole::Reviewer,
+            runtime_session_id: None,
         };
         reviewer.scope_type = "task".into();
         for spec in crate::main_proposals::CATALOG.iter() {

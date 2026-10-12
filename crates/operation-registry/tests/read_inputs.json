@@ -53,5 +53,13 @@
   "repo.integration_queue": {
     "target_branch": "main",
     "limit": 20
-  }
+  },
+  "task.summary": {},
+  "work.read": {},
+  "events.read": {},
+  "inbox.read": {},
+  "commitments.read": {},
+  "delivery.read": {},
+  "memory.read": {},
+  "decisions.read": {}
 }

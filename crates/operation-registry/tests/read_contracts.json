@@ -145,7 +145,73 @@
     ],
     "type": "object"
   },
+  "commitments.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "decisions.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "query": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "delivery.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
   "discovery.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "events.read": {
     "additionalProperties": false,
     "properties": {
       "limit": {
@@ -167,6 +233,21 @@
       "genesis_session_id": {
         "type": [
           "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "inbox.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
           "null"
         ]
       }
@@ -202,6 +283,27 @@
     ],
     "type": "object"
   },
+  "memory.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "query": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
   "portfolio.read": {
     "additionalProperties": false,
     "properties": {
@@ -221,6 +323,66 @@
     "additionalProperties": false,
     "description": "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",
     "properties": {},
+    "required": [],
+    "type": "object"
+  },
+  "project.current_state": {
+    "additionalProperties": false,
+    "description": "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "maximum": 64.0,
+        "minimum": 1.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "project.observations": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "task_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "repo.integration_queue": {
+    "additionalProperties": false,
+    "description": "Returns the merge queue of each target branch of the bound Project's repository: the queue's state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position (members ahead), typed wait reason, action hint and timings. A Task in its merge state is in this queue; read it before retrying, holding or cancelling a Task that waits to merge. Read-only and scope-bound: it never accepts a Project or repository selector.",
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "target_branch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
     "required": [],
     "type": "object"
   },
@@ -245,64 +407,26 @@
     ],
     "type": "object"
   },
-  "project.current_state": {
-    "type": "object",
-    "properties": {
-      "limit": {
-        "type": [
-          "integer",
-          "null"
-        ],
-        "format": "uint64",
-        "minimum": 1.0,
-        "maximum": 64.0
-      }
-    },
-    "required": [],
+  "task.summary": {
     "additionalProperties": false,
-    "description": "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector."
+    "description": "Task-run offers are informational: this tool grants no workflow mutation.",
+    "properties": {},
+    "required": [],
+    "type": "object"
   },
-  "project.observations": {
-    "type": "object",
+  "work.read": {
+    "additionalProperties": false,
     "properties": {
       "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
         "type": [
           "integer",
-          "null"
-        ],
-        "format": "uint64",
-        "minimum": 0.0
-      },
-      "task_id": {
-        "type": [
-          "string",
           "null"
         ]
       }
     },
     "required": [],
-    "additionalProperties": false
-  },
-  "repo.integration_queue": {
-    "type": "object",
-    "properties": {
-      "limit": {
-        "type": [
-          "integer",
-          "null"
-        ],
-        "format": "uint64",
-        "minimum": 0.0
-      },
-      "target_branch": {
-        "type": [
-          "string",
-          "null"
-        ]
-      }
-    },
-    "required": [],
-    "additionalProperties": false,
-    "description": "Returns the merge queue of each target branch of the bound Project's repository: the queue's state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position (members ahead), typed wait reason, action hint and timings. A Task in its merge state is in this queue; read it before retrying, holding or cancelling a Task that waits to merge. Read-only and scope-bound: it never accepts a Project or repository selector."
+    "type": "object"
   }
 }

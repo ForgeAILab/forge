@@ -3,7 +3,7 @@
 use crate::{Result, SqliteDb};
 use operation_registry::authority::{
     parse_permissions, scope_permissions, AuthorityFacts, EffectiveAuthority, PermissionSet,
-    Principal,
+    Principal, TaskRole,
 };
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
@@ -24,6 +24,28 @@ impl SqliteDb {
             scope_type,
             scope_id,
             workspace,
+            None,
+        )
+        .await
+    }
+    /// Bind Task records to the one running execution of this native session.
+    pub async fn resolve_task_effective_authority(
+        &self,
+        identity_id: &str,
+        admitted_profile_id: Option<&str>,
+        task_id: &str,
+        workspace: &str,
+        runtime_session_id: &str,
+    ) -> Result<EffectiveAuthority> {
+        let mut connection = self.pool().acquire().await?;
+        load(
+            &mut connection,
+            identity_id,
+            admitted_profile_id,
+            "task",
+            task_id,
+            workspace,
+            Some(runtime_session_id),
         )
         .await
     }
@@ -43,6 +65,7 @@ impl SqliteDb {
             scope_type,
             scope_id,
             workspace,
+            None,
         )
         .await
     }
@@ -54,6 +77,7 @@ async fn load(
     scope_type: &str,
     scope_id: &str,
     workspace: &str,
+    runtime_session_id: Option<&str>,
 ) -> Result<EffectiveAuthority> {
     let row = sqlx::query(
             "SELECT i.owner_id, i.paused, i.archived_at, i.account_permission_ceiling,
@@ -101,7 +125,7 @@ async fn load(
                     .flatten()
                     == owner
         }),
-        "project" | "agent_chat" => true,
+        "project" | "agent_chat" | "task" => true,
         _ => false,
     };
     let mut binding_id = None;
@@ -137,7 +161,85 @@ async fn load(
     } else {
         active = false;
     }
-    let principal = if let Some(project_id) = project_id {
+    let principal = if scope_type == "task" {
+        // Every Task read or record has one execution principal. A direct read
+        // without a session is allowed only when that principal is unambiguous.
+        let executions = sqlx::query(
+            "SELECT e.id, e.role, e.agent_session_id FROM execution e
+             WHERE e.task_id = ? AND e.agent_id = ? AND e.status = 'running'
+               AND (? IS NULL OR e.agent_session_id IS NULL OR e.agent_session_id = ?)
+               AND (? IS NULL OR EXISTS (
+                 SELECT 1 FROM agent_session s JOIN agent_context_scope c ON c.id=s.context_scope_id
+                 WHERE s.runtime_session_id=? AND s.identity_id=e.agent_id
+                   AND c.scope_type='task' AND c.scope_id=e.task_id AND c.task_id=e.task_id
+                   AND ((c.task_role IN ('worker','coder','executor') AND e.role IN ('worker','coder','executor')) OR c.task_role=e.role)))
+             ORDER BY e.created_at DESC, e.id DESC LIMIT 2",
+        )
+        .bind(scope_id)
+        .bind(identity_id)
+        .bind(runtime_session_id)
+        .bind(runtime_session_id)
+        .bind(runtime_session_id)
+        .bind(runtime_session_id)
+        .fetch_all(&mut *connection)
+        .await?;
+        let execution = if executions.len() == 1 {
+            executions.first()
+        } else {
+            None
+        };
+        let role = execution
+            .and_then(|e| e.try_get::<String, _>("role").ok())
+            .and_then(|role| TaskRole::parse(&role));
+        active &= execution.is_some() && role.is_some();
+        let session = if let Some(runtime) = runtime_session_id {
+            sqlx::query(
+                "SELECT s.profile_id, c.task_role, c.workspace_access
+                FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id
+                WHERE s.runtime_session_id = ? AND s.identity_id = ?
+                  AND c.scope_type = 'task' AND c.scope_id = ? AND c.task_id = ?",
+            )
+            .bind(runtime)
+            .bind(identity_id)
+            .bind(scope_id)
+            .bind(scope_id)
+            .fetch_optional(&mut *connection)
+            .await?
+        } else {
+            None
+        };
+        if runtime_session_id.is_some() {
+            active &= session.as_ref().is_some_and(|session| {
+                let scope_role = session
+                    .try_get::<String, _>("task_role")
+                    .ok()
+                    .and_then(|role| TaskRole::parse(&role));
+                scope_role == role
+                    && session
+                        .try_get::<String, _>("workspace_access")
+                        .ok()
+                        .as_deref()
+                        == Some(workspace)
+                    && session.try_get::<String, _>("profile_id").ok()
+                        == row.try_get::<String, _>("profile_id").ok()
+            });
+        }
+        // Preserve the optional Project-binding ceiling a Task session held
+        // before Task authority joined this resolver.
+        if let Some(binding) = sqlx::query("SELECT b.id, b.permission_ceiling_json FROM project_agent_binding b JOIN task t ON t.project_id = b.project_id WHERE t.id = ? AND b.identity_id = ? AND b.state = 'active'")
+            .bind(scope_id).bind(identity_id).fetch_optional(&mut *connection).await? {
+            binding_id = Some(binding.try_get("id")?);
+            layers.push(layer("project_binding_permission_ceiling", &binding.try_get::<String, _>("permission_ceiling_json")?));
+        }
+        Principal::TaskAgent {
+            identity_id: identity_id.to_owned(),
+            execution_id: execution
+                .and_then(|e| e.try_get("id").ok())
+                .unwrap_or_default(),
+            role: role.unwrap_or(TaskRole::Reviewer),
+            runtime_session_id: runtime_session_id.map(str::to_owned),
+        }
+    } else if let Some(project_id) = project_id {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE id = ?")
             .bind(&project_id)
             .fetch_one(&mut *connection)

@@ -58,25 +58,30 @@ fn normalize_schema(schema: &Value, value: &Value, field: &str) -> Result<Value,
         format!("argument `{field}`")
     };
     if let Some(variants) = schema["oneOf"].as_array() {
-        if variants
-            .iter()
-            .all(|variant| variant["properties"]["action"]["enum"].is_array())
-        {
+        if let Some(tag) = ["action", "verb"].into_iter().find(|tag| {
+            variants
+                .iter()
+                .all(|variant| variant["properties"][*tag]["enum"].is_array())
+        }) {
             let action = value
-                .get("action")
+                .get(tag)
                 .and_then(Value::as_str)
-                .ok_or("argument `action` is required")?;
+                .ok_or_else(|| format!("argument `{tag}` is required"))?;
             let variant = variants
                 .iter()
                 .find(|variant| {
-                    variant["properties"]["action"]["enum"]
+                    variant["properties"][tag]["enum"]
                         .as_array()
                         .unwrap()
                         .contains(&Value::from(action))
                 })
-                .ok_or("argument `action` is outside this typed contract")?;
+                .ok_or_else(|| format!("argument `{tag}` is outside this typed contract"))?;
             return normalize_schema(variant, value, field);
         }
+        return variants
+            .iter()
+            .find_map(|variant| normalize_schema(variant, value, field).ok())
+            .ok_or_else(|| format!("{label} has no admitted variant"));
     }
     if let Some(variants) = schema["anyOf"].as_array() {
         let mut last = None;
@@ -255,6 +260,31 @@ impl TypedInputContract {
                     if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > *bound =>
                 {
                     return Err(format!("payload exceeds {bound} serialized UTF-8 bytes"))
+                }
+                StructuralConstraint::MaxUtf8Bytes { field, bound }
+                    if value
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.len() > *bound) =>
+                {
+                    return Err(format!("argument `{field}` exceeds {bound} UTF-8 bytes"));
+                }
+                StructuralConstraint::ExactlyOne(fields)
+                    if fields
+                        .iter()
+                        .filter(|field| {
+                            value
+                                .get(**field)
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.trim().is_empty())
+                        })
+                        .count()
+                        != 1 =>
+                {
+                    return Err(format!(
+                        "exactly one argument `{}` is required",
+                        fields.join("` or `")
+                    ));
                 }
                 StructuralConstraint::AtLeastOne(fields)
                     if !fields

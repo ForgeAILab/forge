@@ -67,9 +67,9 @@ checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 
 ### Native operation registry
 
-`operation-registry` is a leaf crate: Serde, schemars and async-trait, all of
-which the workspace already resolved. `agent-host`, `services`, `db` and
-`mcp-server` depend on it; it imports neither, so typed service handler registration does not
+`operation-registry` is below the host and services: Serde, schemars, async-trait
+and shared `api-types` value inputs, all already in the workspace. `agent-host`, `services`, `db` and
+`mcp-server` depend on it; it imports none of those consumers, so typed service handler registration does not
 create a dependency cycle. Specifications live in domain modules of that crate
 (`scope_reads`, `project_reads`, `main_reads`, `main_proposals`, `hand_proposals`), below `agent-host`, because `agent-host`
 builds the advertised schema and cannot depend on `services`. Each module owns
@@ -10009,3 +10009,53 @@ exception for a `reviewer` execution without an Agent are deleted. A queued
 mutation step of that kind left by an upgrade is closed as `superseded` by
 `V202610110112`. The `review_runner` actor type on historical review events is
 kept for reading.
+
+### Native Task registry contracts (3.8 F)
+
+Task scope reads (`task.summary`, `work.read`, `decisions.read`, `events.read`,
+`memory.read`, `inbox.read`, `commitments.read`, `delivery.read`) use typed
+`task_reads` specifications. Shared coordination reads use those same specs in
+Main and Project scopes; defaults, null optional arguments, truncation and row
+limit clamping stay in their handlers. Unknown argument fields are refused.
+
+`task_records` owns `task.plan`, `task.worklog` and `task.evidence`.
+The shared authority resolver derives a Task principal from the native session's
+identity, Task, profile, workspace access and role and its sole running execution.
+The execution's runtime correlation may be null before settlement; when present
+it must match the session. The admitted execution ID and role cannot change
+within a turn. Selected-profile changes can revoke authority, and cannot widen
+an admitted turn. Plan/worklog/evidence also recheck that execution at the write
+boundary. Worklog never chooses the latest of several executions or writes a
+comment with missing execution/role provenance. File evidence must come from
+that execution's workspace. Planner and implementation roles can stage a plan;
+reviewers and leads can record observations and cannot author a plan. Leads
+have read and observation tools, without repository writes or a validation tool.
+
+`task_proposals` owns the Project Agent's eight-verb `task.action`,
+`task.dependency`, `task.adaptive` and `task.propose` contracts. It reuses the
+public typed Task action, assignment and governance inputs from `api-types`;
+that crate still has no internal dependencies. `operation-registry` depends on
+those shared value types, and never on services, persistence or a transport.
+Typed bindings convert the Task creation/adaptive inputs directly to existing
+commands. Command receipts, their canonical input bytes, reviewed objects,
+retry budgets, queue eligibility, Task-step writes and settlement are unchanged.
+Transaction-time current-policy/governance checks stay in the command boundary.
+
+`available_actions` remains the only source of verb/state eligibility. The
+parameter predicate used by Task action execution lives in the registry beside
+its per-offer schema projection. Native Project `work.read` returns that schema
+as `action_schema` beside each Task's current offers and version. It projects
+those offers, including boolean choices and presets, rather than reconstructing
+workflow or queue state. Task-run reads mark offers
+`available_actions_informational: true` and return a null `action_schema`:
+workers, reviewers, planners and leads acquire no workflow mutation capability.
+
+Native Task schemas and flat aliases are derived from only the admitted specs.
+Aliases preserve nested fields for providers that strip undeclared properties;
+the payload contract is described once and enforced from the canonical schema.
+Native dispatch performs one typed Serde decode. Plan size is UTF-8 bytes,
+worklog summary size is characters, and evidence requires one nonblank source.
+Existing custom evidence kinds remain accepted and retain their label as
+`other`. Names, Task action parameter names and provider wrapper normalization
+are unchanged. Historical prepared calls keep their stored arguments and
+fingerprints and still run current authority and domain checks on invocation.

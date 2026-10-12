@@ -78,6 +78,14 @@ fn serialized_tool_definitions() {
             false,
         ),
         (
+            "lead",
+            CanonicalScopeType::Task,
+            WorkspaceAccess::TaskRead,
+            Some("lead"),
+            false,
+            false,
+        ),
+        (
             "planner",
             CanonicalScopeType::Task,
             WorkspaceAccess::TaskRead,
@@ -143,6 +151,9 @@ fn serialized_tool_definitions() {
 /// unit `scripts/measure-tool-definitions.py` prints; tokens = ceil(bytes / 4)).
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
 /// change that explains why the prefix has to grow.
+// F adds the generated shared-read contracts on Main (+340 bytes), inquiry
+// (+210), and setup (+265): these replace untyped argument prose and expose
+// field/type errors before dispatch. Task and ready Project ceilings shrink.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // Main was 8,558 and Inquiry 4,089 at 33e2a974. The orchestration read
     // tool states its purpose once (-118 on both). The Main propose tool
@@ -153,8 +164,8 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // `content_digest`, `render_digest`). That line keeps the whole nested
     // Charter shape (about 3,000 bytes): the description is the only place
     // a Main model is shown it, so it is not a saving to take.
-    ("main", 8_551),
-    ("inquiry", 3_971),
+    ("main", 8_891),
+    ("inquiry", 4_181),
     // 24,252 and 25,501 at 435ff088, less 382: the pending proposals' eleven
     // root aliases are no longer declared (-156; arguments are normalized
     // before schema validation, and the flat fields are still lifted by
@@ -165,15 +176,18 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // name in the read tool's operation list and its generated contract
     // line. It is how a Project Agent sees where a Task is in the merge
     // queue and why it waits.
-    ("project", 23_947),
-    ("project_verify_solo", 25_196),
+    ("project", 17_080),
+    ("project_verify_solo", 18_329),
     // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
     // and the same two descriptions (-226). The hand Charter adoption
     // schema dominates (12,418 bytes).
-    ("project_setup", 15_517),
-    ("worker", 6_062),
-    ("reviewer", 4_829),
-    ("planner", 5_437),
+    ("project_setup", 15_782),
+    ("worker", 4_620),
+    ("reviewer", 3_920),
+    ("planner", 3_995),
+    // A lead execution now has the bounded read/record surface; no plan,
+    // command or validation tool. Its ceiling starts below the reviewer.
+    ("lead", 3_737),
 ];
 
 /// Schema keywords that provider function-declaration dialects do not
@@ -1205,6 +1219,7 @@ async fn nullable_generic_causation_fields_survive_both_paths() {
         .await
         .is_error
     );
+    arguments.as_object_mut().unwrap().remove("causation_depth");
     let cli = composition
         .invoke_denied_chat_tool(
             "session",

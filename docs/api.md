@@ -6265,3 +6265,58 @@ The supervised worker appears as `check-runs` in `periodic_workers`. There is no
 new REST check execution or result-application route, and daemon protocol 5 is
 unchanged. Review-entry CI, and with it the review `retry` re-run, runs on this
 runner; the `checks` section of the status (above) is its operator summary.
+
+### Native Task registry contracts (3.8 F)
+
+The existing `forge_scope_read` and `forge_scope_propose` tool names remain.
+Task reads have closed per-operation arguments: `task.summary` accepts `{}`;
+`work.read`, `events.read`, `inbox.read`, `commitments.read`, `delivery.read`
+accept optional `limit`; `memory.read` and `decisions.read` accept optional
+`query` and `limit`. Null optional values retain their default meaning. Work
+limits clamp to 1–50 rows; memory limits clamp to 1–20 rows and queries truncate
+to 512 characters. A foreign field or a non-object argument is refused.
+
+Task record payloads require their advertised action: `task.plan` uses
+`write`, `task.worklog` uses `append`, and `task.evidence` uses `capture`.
+Unknown payload fields are refused. All three bind the exact running execution
+and role through the native session; worklog requires that provenance even when
+no execution can be found. Plan content is limited to 1,048,576 UTF-8 bytes,
+with a Markdown checklist; summary is limited to 4,000 characters. Evidence
+accepts custom nonempty kind strings, stores them as `other` with the label
+retained, and requires exactly one nonblank `path` or `content`. Path evidence
+must belong to the execution's workspace. Evidence results also identify the
+execution and role. These observations are not validation attestations.
+
+Planner and implementation Task sessions can write a plan. Reviewer and lead
+sessions can record worklogs/evidence and cannot write a plan or apply workflow
+actions. The lead toolset is read-only and has no validation command. `executor`
+uses the same implementation toolset as `worker` and `coder`.
+
+Ready Project Agents use typed `task.propose`, `task.adaptive`,
+`task.dependency`, and `task.action`. `task.propose` has no `action: create`
+field: that field was advertised but its decoder rejected it. The contract
+includes the decoder's existing parentage, configuration, assignment, governance
+and traceability fields. Requirement ownership remains explicit through
+`review_requirement_ids`. These commands still use the existing domain
+transactions and receipt replay.
+
+Native Project `work.read` returns `action_schema` beside each Task's
+`available_actions` and version. The schema comes from those offers, including
+allowed boolean values and presets; copy an offered verb and parameters and
+supply that version to `task.action`. The eight names remain `start`, `hold`,
+`release`, `retry`, `send_back`, `approve`, `restart`, `cancel`. Agents cannot
+set `approve.override=true`. Task-run work reads mark offers informational and
+return a null action schema; displaying an offer grants no command capability.
+
+The canonical proposal envelope requires nonblank string `dedupe_key` and
+`correlation_id`. Optional `causation_id` can be null. For Task operations,
+explicit null `causation_depth` is normalized as omission (depth zero), matching
+the former handler. Flat Task fields and provider `parameters` wrapping still
+normalize to the canonical envelope. Stored preparations retain their original
+arguments on replay. REST and MCP shapes are unchanged by this native migration.
+
+Fresh native Hold/Cancel calls require a current offer and version. An unoffered
+terminal command returns `action_unavailable` instead of reporting a successful
+no-op. Commands admitted before integration completed retain their existing
+queued no-op settlement behavior. Project read-only or setup sessions also mark
+workflow offers informational and omit an executable action schema.
