@@ -11,6 +11,14 @@ path = "src/lib.rs"
 # Test processes share a migrated image; normal builds retain migration replay.
 test-template = ["dep:rusqlite", "dep:tempfile"]
 
+# The integration target reads the shared template. It names the feature here
+# instead of through a `db = { path = "." }` self dev-dependency, which made
+# `cargo test -p db --lib` compile the plain lib and then the test lib, in
+# series. Build it with `--features test-template`; see docs/ci.md.
+[[test]]
+name = "main"
+required-features = ["test-template"]
+
 [dependencies]
 operation-registry = { path = "../operation-registry" }
 api-types = { path = "../api-types" }
@@ -33,7 +41,10 @@ tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time"] }
 
 [dev-dependencies]
-db = { path = ".", features = ["test-template"] }
+# Unit tests get the template code through `cfg(test)`, so its two optional
+# dependencies are also dev-dependencies (same versions as above).
+rusqlite = { version = "0.32.1", default-features = false, features = ["backup"] }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 workspace = { path = "../workspace" }
 sha2 = "0.11"

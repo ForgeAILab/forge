@@ -32,8 +32,11 @@ make frontend
 cargo test
 
 # Specific crate
-cargo test -p db
 cargo test -p api --test main happy_path::
+# db and services: without the feature, only the unit tests run and the
+# integration targets are skipped without a message (see docs/ci.md)
+cargo test -p db --features test-template
+cargo test -p services --features test-support
 
 # Frontend
 cd web
@@ -65,7 +68,7 @@ a reminder to run `make types`.
 ## Code Standards
 
 - **No unsafe code** — `#![forbid(unsafe_code)]` is enforced workspace-wide
-- **Clippy clean** — `cargo clippy -- -D warnings` must pass
+- **Clippy clean** — `cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings` must pass (`./scripts/ci-rust.sh lint` runs it)
 - **Formatted** — run `cargo fmt` before committing
 - **Frontend** — `pnpm lint` with zero warnings
 

@@ -74,6 +74,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `main_project_create_command` as isolated targets. Original test names
   remain under their target-named module.
 
+- **The `services` and `db` integration tests need their test feature on the
+  command line.** Neither crate dev-depends on itself any more (that compiled
+  the lib twice in series for every unit-test build: `cargo test -p services
+  --lib --no-run` 6 m 12 s → 4 m 50 s, `-p db` 1 m 10 s → 29 s). Use
+  `cargo test -p services --features test-support --test main <module>::` and
+  `cargo test -p db --features test-template --test main <module>::`. A named
+  target without the feature is a Cargo error; a plain `cargo test -p services`
+  or `cargo test -p db` runs the unit tests only and skips the integration
+  targets without a message. A whole-workspace `cargo test`, `make test` and
+  `./scripts/ci-rust.sh` still run them. The CI unit shards for `services` now
+  split on `task_service::`, `task_dispatcher::` and `workspace_root::`.
+
 - **Agent doctrine moves to new revisions: Main baseline @5, Product Genesis
   @8, Project @22.** Migration `V202610120418` inserts Genesis @8 and Project
   @22 as new immutable revisions, moves the two current pointers, and moves
@@ -3104,6 +3116,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A merge the queue rebased itself is no longer sent back to review when
+  it is asked again.** A head that had rebased and then waited for its
+  checkout's machine until the step wait ran out parked `owner_offline`
+  with the rebase recorded and not yet applied: its checkout stood on the
+  rebased commit while the attempt still named the commit it was admitted
+  with. The retry validated first, read that as "the candidate commit
+  changed after it was admitted" and moved the Task to review for a commit
+  nobody had changed. Validation now recognises the attempt's own
+  succeeded, conflict-free rebase from exactly that commit and continues:
+  the rebase is not repeated and the rebased commit is checked before it
+  merges. A checkout changed after that rebase still goes to review.
+- **`GET /api/v1/executions/{id}/logs` no longer answers 404 for a remote
+  execution whose first log line is being written.** The log path was
+  recorded on the execution before the file existed, and a read between the
+  two got `execution.logs_unavailable`. The file is created, empty, when the
+  path is recorded (at launch, and when a daemon's first log frame arrives),
+  so a started execution that has not logged yet reads as an empty page.
 
 - **A merge attempt that holds its queue's slot is not handed back to
   admission at every reconciler pass.** An attempt whose placement binding

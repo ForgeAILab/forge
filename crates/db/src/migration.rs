@@ -38,11 +38,11 @@ struct Migration {
     path: PathBuf,
 }
 
-#[cfg(feature = "test-template")]
+#[cfg(any(test, feature = "test-template"))]
 mod template;
 
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
-    #[cfg(feature = "test-template")]
+    #[cfg(any(test, feature = "test-template"))]
     if template::try_restore(pool).await? {
         return Ok(());
     }
