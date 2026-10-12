@@ -326,6 +326,32 @@ impl crate::TaskService {
         {
             return Ok(false);
         }
+        // A released attempt (queued or parked) that is still its queue's
+        // head is its driver's: the supersede transaction refuses a head, so
+        // admission would only hand the same row back and `waiting` would be
+        // restated at every pass with no rebind. Nothing is written here:
+        // the head's round either merges from the checkout the attempt names
+        // or ends off the slot (an owner that refuses the fence parks it),
+        // and a released attempt off the slot is replaced through admission
+        // at the next pass.
+        if let Some(attempt) = self
+            .db
+            .current_integration_attempt(&task.id)
+            .await?
+            .filter(|attempt| matches!(attempt.state, S::Queued | S::Parked))
+        {
+            let head = match attempt.queue_id.as_deref() {
+                Some(queue_id) => self
+                    .db
+                    .integration_queue(queue_id)
+                    .await?
+                    .and_then(|queue| queue.head_attempt_id),
+                None => None,
+            };
+            if head.as_deref() == Some(attempt.id.as_str()) {
+                return Ok(false);
+            }
+        }
         if owned {
             let current = self.db.current_integration_attempt(&task.id).await?;
             // Recovery may have verified a different placement binding.

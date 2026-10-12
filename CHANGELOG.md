@@ -3056,6 +3056,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A merge attempt that holds its queue's slot is not handed back to
+  admission at every reconciler pass.** An attempt whose placement binding
+  changed while it was still the queue head could not be replaced (a head
+  is never superseded), so the reconciler got the same row back and restated
+  `waiting` each pass. It now writes nothing while the attempt is the head
+  and rebinds it once it is off the slot.
+
 - **A Hold or Cancel that lands right after review entry asked for its
   check leaves nothing behind.** The hooks step recorded what it waits for
   only when it suspended. A command that stopped it between the request and

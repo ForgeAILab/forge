@@ -2263,3 +2263,81 @@ async fn a_head_without_an_environment_answer_parks_naming_the_cause_and_retry_m
         let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     }
 }
+
+/// A stale-bound attempt that is still its queue's head (claimed, not yet
+/// started; or reconciled back to `queued` on the slot). Supersede refuses a
+/// head, so the reconciler used to get the same row back from admission and
+/// restate `waiting` at every pass. It now writes nothing while the attempt
+/// holds the slot, and rebinds it through admission once it is off the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_bound_head_is_left_to_its_driver_and_rebound_once_it_is_off_the_slot() {
+    let world = World::new().await;
+    world.legacy_task("head", "head.txt", "merging").await;
+    world.seed_execution("head", "executor", None).await;
+    let first = world
+        .service
+        .admit_to_integration_queue("head")
+        .await
+        .unwrap();
+    let queue = first.queue_id.clone().unwrap();
+    // The placement is `ready` under another generation than the attempt's.
+    world
+        .set(&first.id, "placement_generation=placement_generation+7")
+        .await;
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&first.id)
+        .bind(&queue)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let before = world.task("head").await;
+    let rows = || async {
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                "head",
+            )
+            .await
+    };
+    for _ in 0..3 {
+        assert!(
+            !world
+                .service
+                .reconcile_integration_admission(&before)
+                .await
+                .unwrap(),
+            "a head was handed to admission"
+        );
+    }
+    let after = world.task("head").await;
+    assert_eq!(
+        (after.version, json!(after.condition)),
+        (before.version, json!(before.condition)),
+        "the reconciler wrote on a Task whose attempt holds the slot"
+    );
+    assert_eq!(rows().await, 1);
+    assert_eq!(world.attempt(&first.id).await.state, S::Queued);
+    // Off the slot: the binding is replaced, the place in line kept.
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,revision=revision+1 WHERE id=?")
+        .bind(&queue)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    assert!(world
+        .service
+        .reconcile_integration_admission(&after)
+        .await
+        .unwrap());
+    let rebound = world
+        .db
+        .current_integration_attempt("head")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebound.predecessor_attempt_id.as_deref(),
+        Some(first.id.as_str())
+    );
+    assert_eq!(rebound.queue_seq, first.queue_seq);
+    assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
+}
