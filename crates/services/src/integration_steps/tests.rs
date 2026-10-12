@@ -1887,7 +1887,16 @@ fn production_ports_config(
 
 impl Production {
     fn new(world: &World) -> Self {
-        let (worker, daemons, config) = production_ports(world);
+        Self::with_ports(world, production_ports(world))
+    }
+    fn with_ports(
+        world: &World,
+        (worker, daemons, config): (
+            Arc<IntegrationQueueWorker>,
+            Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+            crate::integration_worker::IntegrationWorkerConfig,
+        ),
+    ) -> Self {
         // The check runner, its consumer families and its worker, as the
         // one constructor builds them. The merge-path family is registered
         // again only to give it this worker's (fast) timers.
@@ -3624,6 +3633,21 @@ async fn a_cancelled_legacy_merge_that_landed_keeps_durable_evidence_after_hook_
 /// attempt is discarded, and no check, consumer or failed Review exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_review_entry_without_an_environment_answer_retries_then_states_the_interruption() {
+    // The workflow's own entry, and the entry the owner's Retry of the
+    // review asks for: both land the same way.
+    for owner_asked in [false, true] {
+        review_entry_without_an_environment_answer(owner_asked).await;
+    }
+}
+
+async fn review_entry_without_an_environment_answer(owner_asked: bool) {
+    let triggered_by = if owner_asked {
+        crate::TaskService::task_action_actor(api_types::Actor::user(
+            api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+        ))
+    } else {
+        crate::worker_runtime::queue::cascade_actor()
+    };
     use crate::workflow::HookAction as _;
     let mut world = World::new().await;
     let _ = world.stop.send(true);
@@ -3673,7 +3697,7 @@ async fn a_review_entry_without_an_environment_answer_retries_then_states_the_in
         workflow: Arc::new(workflow),
         project_version: Some(project.version),
         project_workflow_definition: Some(project.workflow_definition),
-        triggered_by: crate::worker_runtime::queue::cascade_actor(),
+        triggered_by,
         merge_service: world.service.merge_service.clone(),
         cleanup_scheduler: None,
         task_service: world.service.clone(),

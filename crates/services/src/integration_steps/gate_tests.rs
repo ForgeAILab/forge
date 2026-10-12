@@ -2144,3 +2144,122 @@ async fn the_reconciler_and_the_import_continuation_state_one_cause_for_one_row(
         );
     }
 }
+
+/// The server's login shell gives no environment when a Task is the head:
+/// its check cannot be identified. On an unchanged target that is the
+/// `settle` step's reuse, on a rebased commit the `request_check` step. The
+/// step asks a few times on its own, then answers "no verdict" with the
+/// cause. The attempt parks naming `check environment unavailable` (never
+/// `task_step_failed`, which names the step), the Task states it, no check,
+/// consumer or Review is created, and once the environment answers the
+/// owner's Retry merges the Task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_head_without_an_environment_answer_parks_naming_the_cause_and_retry_merges() {
+    for moved in [false, true] {
+        let world = World::new().await;
+        sqlx::query("UPDATE project SET primary_repo_id='r' WHERE id='p'")
+            .execute(world.db.pool())
+            .await
+            .unwrap();
+        let a = world.reconciled("env", "env.txt").await;
+        review_ci(&world, "env", &["true"]).await;
+        if moved {
+            world.move_target("outside").await;
+        }
+        crate::check_runner::policy::silence_login_shell_for_test(&world.db, true)
+            .await
+            .unwrap();
+        let reviews = world
+            .scalar::<i64>("SELECT COUNT(*) FROM review WHERE task_id=?", "env")
+            .await;
+        // No counted retry: the first park is the owner's.
+        let production = Production::with_ports(
+            &world,
+            production_ports_config(
+                &world,
+                crate::integration_worker::IntegrationWorkerConfig {
+                    poll: Duration::from_millis(20),
+                    sweep_interval: Duration::from_millis(100),
+                    conflict_backoff: Duration::from_millis(5),
+                    infra_retry: Vec::new(),
+                    ..Default::default()
+                },
+            ),
+        );
+        let running = production.run();
+        world
+            .until("env", "the head parks for its environment", || async {
+                world.attempt(&a.id).await.state == S::Parked
+                    && integration(&world.task("env").await)["kind"] == "deferred"
+            })
+            .await;
+        let parked = world.attempt(&a.id).await;
+        let message = parked.failure_message.clone().unwrap_or_default();
+        assert!(
+            message.contains(super::super::CHECK_ENVIRONMENT_UNAVAILABLE)
+                && !message.contains("task_step_failed"),
+            "moved={moved}: {message}"
+        );
+        let stated = integration(&world.task("env").await);
+        assert!(
+            stated["message"]
+                .as_str()
+                .unwrap()
+                .contains(super::super::CHECK_ENVIRONMENT_UNAVAILABLE),
+            "moved={moved}: {stated}"
+        );
+        let failed_steps = world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM task_step WHERE task_id=? AND status='failed'",
+                "env",
+            )
+            .await;
+        assert_eq!(failed_steps, 0, "moved={moved}: no step failed for it");
+        let checks: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM check_run)+(SELECT COUNT(*) FROM check_consumer)",
+        )
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(checks, 0, "moved={moved}: nothing was asked");
+        assert_eq!(
+            world
+                .scalar::<i64>("SELECT COUNT(*) FROM review WHERE task_id=?", "env")
+                .await,
+            reviews,
+            "moved={moved}: no Review recorded"
+        );
+        assert_eq!(world.merges("env").await, 0);
+        assert_eq!(world.task("env").await.status, "merging");
+        let offers = world.offers("env").await;
+        assert!(
+            offers.iter().any(|(verb, _)| verb == "retry"),
+            "moved={moved}: the Task offers Retry: {offers:?}"
+        );
+        // The environment answers; the owner's Retry puts the Task back in
+        // line and it merges.
+        crate::check_runner::policy::silence_login_shell_for_test(&world.db, false)
+            .await
+            .unwrap();
+        world
+            .act(
+                "env",
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+            )
+            .await;
+        world
+            .until("env", "the retried merge lands", || async {
+                world.task("env").await.status == "done"
+            })
+            .await;
+        assert_eq!(world.merges("env").await, 1, "moved={moved}");
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    }
+}

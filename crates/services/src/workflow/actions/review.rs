@@ -1483,16 +1483,20 @@ async fn interrupt_ci(
     retry: bool,
     reset: bool,
 ) -> HookResult {
-    if !ctx.triggered_by.is_user() {
-        if let Err(error) = ctx
-            .task_service
-            .annotate_review_ci_interruption(task, ctx, reason, retry, reset)
-            .await
-        {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
+    // Whoever caused the entry: the workflow's own cascade, or the owner's
+    // Retry of the review entry. The hook runs in the Task's hooks step
+    // either way, after the command that asked has returned, so the Task is
+    // the only place the cause can be read. An entry its owner asked for
+    // that was left unannotated showed only "hook failed", with no cause
+    // and no re-entry.
+    if let Err(error) = ctx
+        .task_service
+        .annotate_review_ci_interruption(task, ctx, reason, retry, reset)
+        .await
+    {
+        return HookResult::Failed {
+            reason: error.to_string(),
+        };
     }
     HookResult::Failed {
         reason: reason.to_owned(),

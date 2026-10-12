@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **REST no longer documents or maps `503 check_environment_unavailable`.**
+  No REST handler could return it: the check environment is read only inside
+  Task steps and the check worker, and the Task states the cause (review
+  entry: `review_ci_infrastructure`; merge head: `deferred` naming `check
+  environment unavailable`). The error-mapper arm and the `docs/api.md` row
+  are removed. A client that matched on the code never received it.
+
 - **API integration-test target names are consolidated.** The 95 targets
   become eight binaries. For moved suites, use
   `cargo test -p api --test main <old-target>::<test-name>` (including
@@ -3038,6 +3045,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A merge whose check environment is unavailable says so.** When the
+  server's login shell gave no environment while a Task was the queue head,
+  the `settle` / `request_check` step failed eight times, the queue asked
+  again, and the attempt parked as `task_step_failed: the settle Task step
+  failed`, naming the step and not the cause. The step now asks four times,
+  then answers "no verdict": the attempt parks as `infrastructure: check
+  environment unavailable`, the Task states it, the counted retries run and
+  the owner's Retry merges the Task once the environment answers.
+- **The owner's Retry of a review entry lands like the automatic entry when
+  review CI cannot start.** An entry a user caused (Retry of the entry
+  hooks) skipped the `review_ci_infrastructure` annotation: the Task showed
+  a failed hook with no cause and no re-entry. It now states the cause,
+  records no Review and re-enters on the same back-off.
 
 - **A merge that waits states one cause, whoever writes it.** The `park`
   step, the import continuation and the reconciler's restatement each

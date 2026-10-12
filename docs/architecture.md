@@ -8543,16 +8543,16 @@ checks keep the identity read at start and an earlier pass is still reused.
 The probe is bounded at ten seconds and its process group is stopped when the
 bound passes. It returns a typed reason for a timeout, incomplete output,
 excess output or failure to start. A missing answer returns
-`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`,
-REST `503 check_environment_unavailable`) before an identity or consumer is
-admitted. No `NotAttested` identity is substituted, no check executes before
+`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`)
+before an identity or consumer is admitted. Every caller is a Task step or the
+check worker, so no REST request returns it: the Task states the cause. No `NotAttested` identity is substituted, no check executes before
 the answer exists, and no passing Review can lose head evidence through a
 probe timeout. What the Task does without an answer:
 
 | Where | Bounded by | Landing |
 |---|---|---|
-| Review entry (`run_ci_steps`, automatic or the owner's re-run) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the hooks step, 1 s doubling back-off; the opened attempt and the hook checkpoint stay | The unstarted Review attempt is discarded (no Review, no review budget) and the Task states `before_work_hook_failed` / `review_ci_infrastructure` with the cause. It re-enters review on the `review_ci_infrastructure` budget's back-off (5 entries); then `review_ci_infrastructure_exhausted` with `retry_hook` and an attention item. |
-| Merge head (`request_check`, `settle` reuse) | the Task-step transient rule: 8 attempts, 1 s doubling to 64 s; then the queue asks the step again `step_reasks` times | The attempt parks as `task_step_failed`; the step's `last_error` and the Task's `cascade_failed` annotation carry the cause. |
+| Review entry (`run_ci_steps`: the workflow's own entry, the owner's re-run, the owner's Retry of the entry) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the hooks step, 1 s doubling back-off; the opened attempt and the hook checkpoint stay | The unstarted Review attempt is discarded (no Review, no review budget) and the Task states `before_work_hook_failed` / `review_ci_infrastructure` with the cause, whoever caused the entry (`interrupt_ci` annotates a user-triggered entry too). It re-enters review on the `review_ci_infrastructure` budget's back-off (5 entries); then `review_ci_infrastructure_exhausted` with `retry_hook` and an attention item. |
+| Merge head (`request_check`, `settle` reuse) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the Task step, 1 s doubling back-off | The step answers "no verdict" with the cause; nothing is asked of the check runner. The worker parks the attempt `infrastructure: check environment unavailable: ...` and the Task states `deferred` with that message. Counted retries (30 s, 2 min, 10 min), then `retries_exhausted: ...`, `owner_required` and the Retry offer; the owner's Retry starts the counted retries again. It never parks as `task_step_failed`. |
 
 The first complete answer is stored in `check_environment_attestation`, keyed
 by owner, environment generation and salt revision. Installation/generation
