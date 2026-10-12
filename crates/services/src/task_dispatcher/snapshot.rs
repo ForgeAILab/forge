@@ -23,8 +23,18 @@ pub(super) struct Prepared {
     /// The stored condition did not match the legacy fields it shadows.
     pub condition_stale: bool,
 }
-fn assignment<'a>(r: &'a ScheduleRead, role: &str) -> Option<&'a TaskRoleAssignment> {
+/// Snapshot form of `task_hierarchy::effective_role_assignment`, over the rows
+/// the schedule read loaded (the Task's own, and its root's `coder` and
+/// `planner`). `pw` is the Project workflow.
+fn assignment<'a>(
+    r: &'a ScheduleRead,
+    pw: &WorkflowDefinition,
+    role: &str,
+) -> Option<&'a TaskRoleAssignment> {
     let role = if role == "executor" { "coder" } else { role };
+    if let Some(root_id) = crate::task_hierarchy::step_check_root(&r.task, role) {
+        return crate::task_hierarchy::step_check_lead(pw, root_id, &r.assignments);
+    }
     r.assignments
         .iter()
         .find(|a| a.task_id == r.task.id && a.role_name == role)
@@ -34,7 +44,26 @@ fn assignment<'a>(r: &'a ScheduleRead, role: &str) -> Option<&'a TaskRoleAssignm
                 .find(|a| role == "coder" && a.role_name == role)
         })
 }
-fn initial_target(w: &WorkflowDefinition, r: &ScheduleRead) -> Option<(String, String, String)> {
+/// The state an optional gate nobody holds is skipped to, when that state is
+/// terminal (a step check in front of `done`). The entry's own hook makes
+/// this skip; the dispatcher repeats it for a Task that rests in the gate
+/// (its lead was removed after it entered).
+fn gate_skip(w: &WorkflowDefinition, pw: &WorkflowDefinition, r: &ScheduleRead) -> Option<String> {
+    let state = w.states.iter().find(|s| s.name == r.task.status)?;
+    let role = effective_role(state)?;
+    (state.kind == StateKind::Gate
+        && helpers::auto_cascades_on_unassigned_role(state)
+        && helpers::role_assignment_unassigned(assignment(r, pw, role)))
+    .then(|| crate::workflow::optional_gate_skip_target(w, &state.name))
+    .flatten()
+    .filter(|target| target.kind == StateKind::Terminal)
+    .map(|target| target.name.clone())
+}
+fn initial_target(
+    w: &WorkflowDefinition,
+    pw: &WorkflowDefinition,
+    r: &ScheduleRead,
+) -> Option<(String, String, String)> {
     let mut cursor = r.task.status.as_str();
     let mut seen = std::collections::HashSet::new();
     let mut kinds = vec![StateKind::Active, StateKind::Gate];
@@ -46,7 +75,7 @@ fn initial_target(w: &WorkflowDefinition, r: &ScheduleRead) -> Option<(String, S
         let state = helpers::first_transition_to_kind(w, cursor, &kinds)?;
         let first = first.get_or_insert_with(|| state.name.clone());
         let role = effective_role(state)?;
-        match assignment(r, role) {
+        match assignment(r, pw, role) {
             Some(a) if a.assignee_type == Some(AssigneeKind::Agent) && a.assignee_id.is_some() => {
                 return Some((first.clone(), role.into(), a.assignee_id.clone()?))
             }
@@ -252,7 +281,7 @@ impl TaskDispatcher {
                 s.kind == StateKind::Gate
                     && helpers::auto_cascades_on_unassigned_role(s)
                     && helpers::role_assignment_unassigned(
-                        role.and_then(|role| assignment(&r, role)),
+                        role.and_then(|role| assignment(&r, &pw, role)),
                     )
             });
         let mut f = Facts {
@@ -405,7 +434,7 @@ impl TaskDispatcher {
                 e.status == ExecutionStatus::Running
                     && helpers::execution_guard_roles(role).contains(&e.role.as_str())
             });
-            let a = assignment(&r, role);
+            let a = assignment(&r, &pw, role);
             f.role_target = a
                 .filter(|a| a.assignee_type == Some(AssigneeKind::Agent))
                 .and_then(|a| a.assignee_id.as_ref())
@@ -559,9 +588,14 @@ impl TaskDispatcher {
             f.human_wait = true;
         }
         if admits {
-            f.initial_target = initial_target(&w, &r);
+            // A gate in front of a terminal state is skipped to it; it never
+            // continues into the state its Reject returns to.
+            f.gate_skip = gate_skip(&w, &pw, &r);
+            if f.gate_skip.is_none() {
+                f.initial_target = initial_target(&w, &pw, &r);
+            }
         }
-        if let Some(held) = role.and_then(|role| assignment(&r, role)) {
+        if let Some(held) = role.and_then(|role| assignment(&r, &pw, role)) {
             f.role_user = held.assignee_type == Some(AssigneeKind::User);
         }
         f.role_open = role.is_some() && f.role_target.is_none() && !f.role_user;
@@ -569,7 +603,7 @@ impl TaskDispatcher {
             .is_ok_and(|s| !s.default_role_assignments.is_empty())
             && is_initial
             && !r.assignments.iter().any(|a| a.task_id == t.id)
-            && assignment(&r, "coder").is_none();
+            && assignment(&r, &pw, "coder").is_none();
         let capability = if f.root_advance {
             super::initial_scheduling::COORDINATION_ROOT_CAPABILITY
         } else if f.root_replan.is_some() {

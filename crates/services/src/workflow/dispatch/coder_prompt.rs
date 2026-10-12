@@ -147,6 +147,14 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         user.push('\n');
     }
 
+    if let Some(findings) = returned_step_findings(ctx) {
+        user.push_str(
+            "\nThe lead checked this step and returned it. Your earlier work is in the worktree; change exactly what the findings ask and finish the step again:\n",
+        );
+        user.push_str(&findings);
+        user.push('\n');
+    }
+
     if !ctx.comments.is_empty() {
         user.push_str("\nRecent comments:\n");
         for comment in &ctx.comments {
@@ -291,6 +299,21 @@ fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKi
         .read()
         .diagnostic
         .map(|a| a.annotation_type)
+}
+
+/// The lead's findings when this entry into the implementation state is a
+/// step returned by the step check (`lead_check`).
+fn returned_step_findings(ctx: &AgentDispatchContext) -> Option<String> {
+    ctx.transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == ctx.state_name)
+        .filter(|entry| {
+            entry.rejection
+                && entry.from_state == default_states::LEAD_CHECK
+                && entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::GateRejected)
+        })
+        .map(|entry| entry.trigger_reason.clone())
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {

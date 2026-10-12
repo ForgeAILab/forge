@@ -507,6 +507,22 @@ impl From<ServiceError> for McpToolError {
                 "task_id": task_id,
                 "role": role
             })),
+            ServiceError::StepCheckRoleHeldByRoot {
+                task_id,
+                root_task_id,
+                role,
+            } => Self::new(
+                -32602,
+                format!(
+                    "the `{role}` role of subtask {task_id} is held by the lead of its root {root_task_id}; assign `{role}` on the root"
+                ),
+            )
+            .with_data(json!({
+                "code": "STEP_CHECK_ROLE_HELD_BY_ROOT",
+                "task_id": task_id,
+                "root_task_id": root_task_id,
+                "role": role
+            })),
             ServiceError::SubtaskParentClosed {
                 parent_task_id,
                 state,

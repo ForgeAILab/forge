@@ -1440,6 +1440,11 @@ pub async fn load_snapshot(
         .find(|state| state.name == task.status)
         .and_then(crate::workflow::effective_role)
     {
+        // A subtask's step-check role is its root's lead and never an own
+        // row: the snapshot shows what the resolver says, nothing else.
+        if crate::task_hierarchy::step_check_root(&task, role).is_some() {
+            assignments.retain(|assignment| assignment.role_name != role);
+        }
         if let Some(resolved) =
             crate::task_hierarchy::effective_role_assignment(db, &task, role).await?
         {

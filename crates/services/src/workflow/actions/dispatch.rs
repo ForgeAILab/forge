@@ -153,16 +153,20 @@ impl HookAction for DispatchRoleAgent {
                 reason: "task is blocked".to_string(),
             };
         }
-        match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, &current_task).await {
-            Ok(true)
-                if !crate::task_hierarchy::RootRolePolicy::for_workflow(&ctx.workflow)
-                    .allows_execution(&state.name, role_name) =>
-            {
+        match crate::task_hierarchy::root_runs_role(
+            &ctx.db,
+            &current_task,
+            &ctx.workflow,
+            role_name,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
                 return HookResult::Skipped {
                     reason: "root task is a subtask coordination container".to_string(),
                 };
             }
-            Ok(_) => {}
             Err(error) => {
                 return HookResult::Failed {
                     reason: error.to_string(),

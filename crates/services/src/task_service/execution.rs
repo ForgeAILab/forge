@@ -17,6 +17,7 @@ mod launch;
 pub(crate) mod ledger;
 mod recovery;
 mod runner;
+mod step_check;
 
 const PLAN_PUBLICATION_CLAIM_KEY: &str = "plan_publication_claim";
 const PLAN_PUBLICATION_CLEANUP_KEY: &str = "plan_publication_cleanup";

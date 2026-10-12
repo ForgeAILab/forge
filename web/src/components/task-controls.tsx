@@ -47,6 +47,11 @@ export const taskStatusColors: Record<string, { dot: string; bg: string; text: s
     bg: 'bg-orange-500/12',
     text: 'text-orange-700 dark:text-orange-300',
   },
+  lead_check: {
+    dot: 'bg-orange-400',
+    bg: 'bg-orange-400/12',
+    text: 'text-orange-700 dark:text-orange-300',
+  },
   review: {
     dot: 'bg-violet-400',
     bg: 'bg-violet-400/12',

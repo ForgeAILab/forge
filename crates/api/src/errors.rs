@@ -399,6 +399,20 @@ impl From<ServiceError> for ApiError {
                 ),
                 details: Some(json!({ "task_id": task_id, "role": role })),
             },
+            ServiceError::StepCheckRoleHeldByRoot {
+                task_id,
+                root_task_id,
+                role,
+            } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "STEP_CHECK_ROLE_HELD_BY_ROOT",
+                message: format!(
+                    "the `{role}` role of subtask {task_id} is held by the lead of its root {root_task_id}; assign `{role}` on the root"
+                ),
+                details: Some(
+                    json!({ "task_id": task_id, "root_task_id": root_task_id, "role": role }),
+                ),
+            },
             ServiceError::SubtaskParentClosed {
                 parent_task_id,
                 state,

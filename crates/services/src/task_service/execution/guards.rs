@@ -56,9 +56,13 @@ impl TaskService {
             // The policy names the one role that may run on a root in each
             // state: its lead in the planning state, its aggregate reviewer
             // in the review phase.
-            if !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
-                .allows_execution(&task.status, role)
-            {
+            let assignments = db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?;
+            if !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow).runs_role(
+                &task.id,
+                &task.status,
+                role,
+                &assignments,
+            ) {
                 return Err(ServiceError::invalid_operation(
                     "root tasks with subtasks are coordination containers; only their lead may execute in the planning state and their aggregate review role in review",
                 ));

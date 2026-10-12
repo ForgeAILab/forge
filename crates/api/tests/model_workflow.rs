@@ -1621,6 +1621,102 @@ impl World {
         }
         self.check_roots(false).await?;
         self.check_replans(false).await?;
+        self.check_step_checks(false).await?;
+        Ok(())
+    }
+
+    /// The step-check invariants of plan 3.10 stage 3 (`lead_check`).
+    ///
+    /// Real here: the no-lead rule. Every subtask the model finishes now
+    /// passes through `lead_check`, and under a root without a lead it must
+    /// never rest there (the gate is skipped in the entry's own step, and the
+    /// dispatcher passes a subtask it finds there). With the skip target
+    /// mutated back to "the first implementation state" this fails on the
+    /// first finished subtask.
+    ///
+    /// VACUOUS here: (m) and (n). The model still has no native-runtime stub
+    /// (`Action::AssignLead` and a scripted native planner were not built in
+    /// stage 3), so no root has a lead, no step check ever runs and
+    /// `gate:lead_check` is never charged. Both are stated so that they bind
+    /// the day a lead exists in the model; until then the lead cases are
+    /// proven at the dispatcher level, in
+    /// `services::task_dispatcher::tests::lead_check`.
+    async fn check_step_checks(&self, quiescent: bool) -> Result<(), String> {
+        let pool = &self.live().pool;
+        let rows = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(pool)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        // (n) the returns of a step are bounded by the gate's limit.
+        let overspent = rows(
+            "SELECT task_id || ' spent ' || spent FROM task_budget
+             WHERE kind = 'gate:lead_check' AND spent > 2",
+        )
+        .await?;
+        if !overspent.is_empty() {
+            return Err(format!(
+                "(n) step checks returned past their limit: {overspent:?}"
+            ));
+        }
+        // A step check is a planner run and nothing else: no other role ever
+        // runs on a subtask in the gate.
+        let foreign = rows(
+            "SELECT c.id || ' runs ' || e.role FROM task c JOIN execution e ON e.task_id = c.id
+             WHERE c.parent_task_id IS NOT NULL AND c.deleted_at IS NULL
+               AND c.status = 'lead_check' AND e.status = 'running' AND e.role != 'planner'",
+        )
+        .await?;
+        if !foreign.is_empty() {
+            return Err(format!(
+                "a subtask in the step check runs another role: {foreign:?}"
+            ));
+        }
+        if !quiescent {
+            return Ok(());
+        }
+        const LEAD: &str = "EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = r.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
+        // No lead: a subtask never rests in the gate. A hold, a failure or a
+        // wait on its root is a rest with an owner; anything else is not: a
+        // clear condition, and equally a park that asks somebody to assign
+        // the role (the form a broken skip takes: mutation-tested by removing
+        // the gate's skip hook and the dispatcher's `gate_skip` fact).
+        let resting: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT c.id || ' ' || COALESCE(c.condition_json, '') FROM task c JOIN task r ON r.id = c.parent_task_id
+             WHERE c.deleted_at IS NULL AND r.deleted_at IS NULL AND c.status = 'lead_check'
+               AND NOT {LEAD}
+               AND r.status IN ('in_progress', 'merge_failed')
+               AND COALESCE(json_extract(c.condition_json, '$.kind'), 'clear') != 'failed'
+               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure')
+               AND json_extract(r.condition_json, '$.kind') = 'clear'
+               AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = c.project_id AND p.paused_at IS NOT NULL)"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !resting.is_empty() {
+            return Err(format!(
+                "subtasks of a root without a lead rest in the step check: {resting:?}"
+            ));
+        }
+        // (m) under a lead, a subtask in the gate has its check running or a
+        // typed park.
+        let unowned: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT c.id FROM task c JOIN task r ON r.id = c.parent_task_id
+             WHERE c.deleted_at IS NULL AND r.deleted_at IS NULL AND c.status = 'lead_check'
+               AND {LEAD}
+               AND json_extract(c.condition_json, '$.kind') = 'clear'
+               AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = c.id AND e.role = 'planner' AND e.status = 'running')"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !unowned.is_empty() {
+            return Err(format!(
+                "(m) subtasks in the step check under a lead with no check and no park: {unowned:?}"
+            ));
+        }
         Ok(())
     }
 
@@ -1831,6 +1927,7 @@ impl World {
         self.check_committed().await?;
         self.check_roots(true).await?;
         self.check_replans(true).await?;
+        self.check_step_checks(true).await?;
         // (a) the dispatcher's own "owned or parked" assertion.
         bounded(
             &self.probe,

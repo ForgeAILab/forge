@@ -486,6 +486,15 @@ pub enum ServiceError {
     #[error("the planning role `{role}` of this workflow cannot lead coordination root {task_id}; only the built-in `planner` role is supported")]
     LeadRoleNotSupported { task_id: String, role: String },
 
+    /// The step-check role of a subtask is held by its root's lead; a row
+    /// on the subtask would hold nothing.
+    #[error("the `{role}` role of subtask {task_id} is held by the lead of its root {root_task_id}; assign `{role}` on the root")]
+    StepCheckRoleHeldByRoot {
+        task_id: String,
+        root_task_id: String,
+        role: String,
+    },
+
     #[error("workspace reset required for task {task_id}: {reason}")]
     WorkspaceResetRequired { task_id: String, reason: String },
 

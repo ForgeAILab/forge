@@ -6045,11 +6045,93 @@ Edges of the root lifecycle, each a typed wait with an exit:
 | The same gate, no lead | never stops there: the walk passes the gate under the system actor | run | — |
 
 `RootRolePolicy::runs_role` is the reader for "does this role run on this root
-now": `allows_execution`, and in the planning state only while a lead is
-assigned. The action offers, the release continuation and the dispatcher
-snapshot use it, so a planning root without a lead offers and launches no
-planner. The plan-candidate exemption applies to exactly the lead's run (the
+now": the workflow's rule (the planning role in the planning state, the
+aggregate review role in review), and in the planning state only while a lead
+is assigned. Every site uses it (`task_hierarchy::root_runs_role` is its
+database form): the action offers, the release continuation, the dispatcher
+snapshot, the dispatch hook, execution admission and the active recovery, so a
+planning root without a lead offers, launches and admits no planner. The plan-candidate exemption applies to exactly the lead's run (the
 planning role, on a root with subtasks, in the planning state).
+
+**Step check (`lead_check`).** The inherited subtask workflow is
+`todo → in_progress → lead_check → done` (`cancelled` from any of them).
+`lead_check` is an optional gate in the working phase, never a review: no
+`Review` row, no check run, no Review budget and no integration evidence exist
+for it, and it changes nothing about subtask creation, the aggregate review
+role or merge admission. Its role (`planner`) is held by the root's lead and
+by nothing else: a subtask in an inherited workflow state never reads that
+role from its own rows, and no row is copied onto it.
+
+| Subtask state | Condition | Result | Mechanism | Budget |
+|---|---|---|---|---|
+| `in_progress` | the implementation run succeeded | `lead_check` | the state's Accept | — |
+| `lead_check` | the root has no lead | `done`, bridge `gate_skipped` | `auto_cascade_on_unassigned_role` on the entry, in the entry's own step: no execution, no person, no dispatcher decision | — |
+| `lead_check` | the root has a lead | a `planner` execution on the subtask, under the lead's Agent, in the shared root workspace (prompt `planner.step_check.v1`) | `dispatch_role_agent` on the entry | — |
+| `lead_check` | the lead's result block says `pass` | `done` | the gate's Accept (`TaskService::settle_step_check`) | — |
+| `lead_check` | the result block says `fail` | `in_progress`, bridge `gate_rejected`, rejection; the same worker thread is resumed (`ResumeLatestTargetRoleThread`) with the lead's findings | the gate's Reject | charges `gate:lead_check` (limit: the gate's `max_rejections`, 2) |
+| `lead_check` | entry with `gate:lead_check` spent | stays; `parked` with failure `retry_exhausted` and an Attention item; no check is started | `check_retry_budget`, before the dispatch on the same entry | — |
+| `lead_check` | the run ended without a usable verdict (no result block, or `blocked`) | the same session is asked again for the block; when that budget is spent or there is no session, `parked` with failure `workflow_guard_rejected` (guard `step_check_result`) | the completion-guard path every completed run shares | `workflow_guard` (limit: the execution limit, 3) |
+| `lead_check` | the run failed or timed out | the retry, deadline or failure any execution shows | execution retry | `execution` |
+| `lead_check`, nothing running | the root has no lead any more (removed after the entry; a restart between the entry and its skip) | `done`, bridge `gate_skipped` | `Step::SkipGate`, resolved from stored state by `next_step` (fact `gate_skip`); removing or changing the lead marks the subtasks that rest in the gate | — |
+| `lead_check`, nothing running | the root has a lead (a restart between the entry and the run) | the step check | `Step::Role` | — |
+
+The one loop this adds is `lead_check ↔ in_progress`. Its machine bound is the
+gate's `max_rejections`: two returns, then the third entry parks the subtask
+(the owner's `retry` opens a new budget window; the parked subtask also stops
+the ordered sequence, as any blocked subtask does). The next sibling starts
+only when the subtask is `done`, so no subtask ever builds on a step the lead
+has not accepted. A verdict is the run's result block, read by the reviewer's
+result-block parser (`review::contract::parse_assessment`: the last JSON
+object that names a result wins; `fixable_by` and `repeat` mean nothing here).
+The verdict is recorded once per run as a comment on the subtask and as the
+reason of the transition; the worker's next prompt carries the findings from
+that rejection.
+
+Retry on the spent-budget park opens a new budget window and re-enters the
+gate, so the lead checks the rework that is already in the workspace; the
+worker is not run again before anybody looked (validate first). The budget is
+checked once per entry (`check_retry_budget` on entry, before the dispatch; the
+auto-attached after-enter check is not added to a gate that already checks on
+entry). A subtask never enters a merge state (the inherited workflow has
+none), so merge-queue returns of the root never spend this budget.
+
+Removing the root's lead stops a step check that is still running
+(`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
+next dispatcher pass. A verdict of a run that no longer owns the role attempt
+(lead removed or replaced, subtask held, cancelled or moved) is dropped
+without a transition (`execution_owns_current_role_attempt`). A replaced
+lead's running check is not stopped: the subtask waits for that run to end
+(bounded by the execution timeout), then the new lead checks it. Hold on a
+subtask in the gate stops the check; Release has the lead check it again.
+Cancelling the subtask or its root ends the check. A subtask in the gate holds
+the one Project slot it held during implementation (the check is that Task's
+run); a parked one holds none. The lead's Agent is admitted by the same Agent
+and machine limits as any run.
+
+The step-check role cannot be assigned on a subtask
+(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`); rows that predate the rule (for example
+from Project default role assignments, which still copy every default role
+onto new Tasks) hold nothing and are left out of the action snapshot.
+
+The names the database needs of this workflow (its states, the step-check
+state and role) live in `db::inherited_subtask`; the services read them from
+there and `the_database_names_are_this_workflow` fails when the workflow
+definition and those names diverge.
+
+One resolver answers "who holds this role on this Task"
+(`task_hierarchy::effective_role_assignment`): `coder` falls back from the
+subtask's row to its root's, a subtask's step-check role is its root's lead
+(`RootRolePolicy::lead` under the Project workflow, which requires an Agent),
+and every other role is the Task's own row. The dispatcher snapshot
+(`snapshot::assignment`, over the rows `db::schedule_reads` loads: the Task's
+own and its root's `coder` and `planner`), the workflow hooks, the action
+snapshot and the completion ownership check call it; the database repeats the
+same rule where it re-checks an admission in the writer's transaction
+(`effective_execution_assignment_in_tx`, `assignment_holder_in_tx`). An
+optional gate nobody holds is skipped to its Accept target when that is an
+implementation state or a terminal state other than cancellation
+(`workflow::optional_gate_skip_target`); a gate whose Reject returns to
+implementation is passed, never bounced.
 
 A subtask can be created only while its parent can still coordinate it: in a
 backlog, initial or working state (`merge_failed` included). A parent that is
@@ -6287,6 +6369,7 @@ membership, not on who started the original user move.
 | Root | any | any | Project |
 | Subtask | Not in inherited subtask workflow (e.g. `review`, `merging`) | any | Project |
 | Subtask | In shared subtask-workflow state (e.g. `in_progress`) | User (`user:*`) | Project |
+| Subtask | In an inherited state the Project workflow does not have (`lead_check` for the built-in workflow; also `todo`/`in_progress` under a workflow that names its states differently, such as the autonomous one) | any | Inherited subtask workflow |
 | Subtask | In shared subtask-workflow state | Agent or system | Inherited subtask workflow |
 
 This aligns validation with the frontend, which presents target states from the
@@ -6764,7 +6847,9 @@ account/Project scope, coordinator exclusion, and the exact Task-scoped lease.
 On a coordination root, `coder` is a default rather than an executable root
 role: a child without its own `coder` inherits that root row, while an own row
 overrides it. Task responses expose the resolved row and whether its source is
-`own` or `inherited_from_root`.
+`own` or `inherited_from_root`. The role of a subtask's step check (`planner`
+in `lead_check`) is the root's lead and never a row of the subtask; see "Step
+check" under Root Tasks.
 Changing or confirming a Task role clears any stale deferred-dispatch
 disposition so a previously blocked Task is reconsidered. When the role choice
 is newer than a stopped attempt for that role, it is also the explicit retry
