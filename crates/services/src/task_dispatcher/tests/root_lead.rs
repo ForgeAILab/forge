@@ -129,8 +129,8 @@ async fn until(lead: &Lead, what: &str, done: impl AsyncFn() -> bool) {
         tokio::time::sleep(Duration::from_millis(25)).await;
         lead.dispatcher.check_once_and_drain().await.unwrap();
     }
-    let tasks: Vec<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT title, status, metadata_json, error_annotation, condition_json FROM task ORDER BY created_at",
+    let tasks: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT title, status, COALESCE(condition_json, '') FROM task ORDER BY created_at",
     )
     .fetch_all(lead.db.pool())
     .await
