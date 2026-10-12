@@ -2520,7 +2520,13 @@ async fn a_pre_queue_queued_row_without_its_continuation_step_is_continued_by_th
         .await;
     assert_eq!(continuations().await, 1, "one continuation, enqueued once");
     assert_eq!(world.merges("pruned").await, 1);
-    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    // The same attempt merged; its driver completes it after the Task is
+    // reported `done`.
+    world
+        .until("pruned", "the attempt is completed", || async {
+            world.attempt(&a.id).await.state == S::Completed
+        })
+        .await;
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
