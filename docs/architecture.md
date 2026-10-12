@@ -5947,7 +5947,7 @@ role from its own rows, and no row is copied onto it.
 | Subtask state | Condition | Result | Mechanism | Budget |
 |---|---|---|---|---|
 | `in_progress` | the implementation run succeeded | `lead_check` | the state's Accept | — |
-| `lead_check` | the root has no lead | `done`, bridge `gate_skipped` | `auto_cascade_on_unassigned_role` on the entry, in the entry's own step: no execution, no person, no dispatcher decision | — |
+| `lead_check` | the root has no lead | `done`, bridge `gate_skipped`; no execution, no person, no park, no Attention item | `auto_cascade_on_unassigned_role`, an on-enter hook of the gate: the entry's hook step enqueues the skip as a `cascade` step of the same chain, so it runs as soon as the entry's hooks end and waits for no dispatcher pass and no sweep interval | — |
 | `lead_check` | the root has a lead | a `planner` execution on the subtask, under the lead's Agent, in the shared root workspace (prompt `planner.step_check.v1`) | `dispatch_role_agent` on the entry | — |
 | `lead_check` | the lead's result block says `pass` | `done` | the gate's Accept (`TaskService::settle_step_check`) | — |
 | `lead_check` | the result block says `fail` | `in_progress`, bridge `gate_rejected`, rejection; the same worker thread is resumed (`ResumeLatestTargetRoleThread`) with the lead's findings | the gate's Reject | charges `gate:lead_check` (limit: the gate's `max_rejections`, 2) |
@@ -5959,6 +5959,21 @@ role from its own rows, and no row is copied onto it.
 | `lead_check`, a check running | the lead is removed, or the Agent that is the lead is archived | the run is stopped; then `done`, bridge `gate_skipped`, in the next dispatcher pass | `TaskService::wake_step_checks_of` (from role removal and, for an archived Agent, `TaskService::lead_removed_from` after the archive sweep), then `Step::SkipGate` | — |
 | `lead_check`, nothing running | the lead's Agent is paused (or cannot be reached) | stays; `parked` with `agent { agent_id, status }` naming the lead's Agent; the check starts when the Agent is resumed | `next_step` (`Reason::AgentWait`), as for a planning root whose planner is paused | — |
 | `lead_check`, a check running | the lead's Agent is paused | the run goes on and its verdict settles the step (a pause starts nothing and stops nothing) | — | — |
+
+"No dispatcher decision" in the no-lead row means the skip does not depend on
+one, not that the dispatcher never looks: the subtask is in `lead_check` for
+the time between two queue steps (the entry and its cascade), and a dispatcher
+pass that reads it in that window resolves the same skip from stored state
+(`Step::SkipGate`, the `gate_skip` fact, which is also the recovery when the
+process dies in that window). Both carry the Task version they read, so
+exactly one of them makes the transition (`gate_skipped`, once in the
+transition log) and the other is dropped as a version conflict; the subtask
+needs no further pass either way. What a client sees per finished subtask is
+two transitions and their events (`in_progress -> lead_check`,
+`lead_check -> done`), never a rest in `lead_check`.
+`without_a_lead_the_skip_rides_the_entry_s_own_chain` pins the hook path (the
+`cascade` step shares the chain of the entry's `hooks` step): removing the
+hook and keeping only the dispatcher's `SkipGate` fails it.
 
 The one loop this adds is `lead_check ↔ in_progress`. Its machine bound is the
 gate's `max_rejections`: two returns, then the third entry parks the subtask
