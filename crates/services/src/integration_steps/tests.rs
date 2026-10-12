@@ -1887,7 +1887,16 @@ fn production_ports_config(
 
 impl Production {
     fn new(world: &World) -> Self {
-        let (worker, daemons, config) = production_ports(world);
+        Self::with_ports(world, production_ports(world))
+    }
+    fn with_ports(
+        world: &World,
+        (worker, daemons, config): (
+            Arc<IntegrationQueueWorker>,
+            Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+            crate::integration_worker::IntegrationWorkerConfig,
+        ),
+    ) -> Self {
         // The check runner, its consumer families and its worker, as the
         // one constructor builds them. The merge-path family is registered
         // again only to give it this worker's (fast) timers.
@@ -3624,6 +3633,21 @@ async fn a_cancelled_legacy_merge_that_landed_keeps_durable_evidence_after_hook_
 /// attempt is discarded, and no check, consumer or failed Review exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_review_entry_without_an_environment_answer_retries_then_states_the_interruption() {
+    // The workflow's own entry, and the entry the owner's Retry of the
+    // review asks for: both land the same way.
+    for owner_asked in [false, true] {
+        review_entry_without_an_environment_answer(owner_asked).await;
+    }
+}
+
+async fn review_entry_without_an_environment_answer(owner_asked: bool) {
+    let triggered_by = if owner_asked {
+        crate::TaskService::task_action_actor(api_types::Actor::user(
+            api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+        ))
+    } else {
+        crate::worker_runtime::queue::cascade_actor()
+    };
     use crate::workflow::HookAction as _;
     let mut world = World::new().await;
     let _ = world.stop.send(true);
@@ -3673,7 +3697,7 @@ async fn a_review_entry_without_an_environment_answer_retries_then_states_the_in
         workflow: Arc::new(workflow),
         project_version: Some(project.version),
         project_workflow_definition: Some(project.workflow_definition),
-        triggered_by: crate::worker_runtime::queue::cascade_actor(),
+        triggered_by,
         merge_service: world.service.merge_service.clone(),
         cleanup_scheduler: None,
         task_service: world.service.clone(),
@@ -4000,6 +4024,20 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             assert_eq!(evidence["identity_key"], entry.1);
             assert_eq!(evidence["result_id"], entry.0);
             assert_eq!(evidence["source"], "cache_hit", "{details}");
+            // The reuse was applied by the `settle` step that recorded it:
+            // its consumer is answered and no delivery step is spent on it,
+            // now or at a later look of the check worker.
+            let _ = db::CheckDeliveryRepo::enqueue_check_result_steps(&*world.db, 100)
+                .await
+                .unwrap();
+            let head: (Option<String>, Option<String>, i64) = sqlx::query_as(
+                "SELECT c.applied_at,c.delivery_step_id,(SELECT COUNT(*) FROM task_step s WHERE s.task_id=c.task_id AND s.causation_key LIKE 'check-result:'||c.id||':%') FROM check_consumer c WHERE c.task_id='evidence' AND c.origin='integration'",
+            )
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap();
+            assert!(head.0.is_some(), "the head's reuse is created answered");
+            assert_eq!((head.1, head.2), (None, 0), "no delivery step for a reuse");
         }
         let runs: i64 = world.scalar("SELECT COUNT(*) FROM check_run WHERE id IN(SELECT run_id FROM check_consumer WHERE task_id=?)", "evidence").await;
         // Both consumers of a hit reference the one entry run. A rebased

@@ -982,6 +982,11 @@ async fn upgrade_preserves_old_rows_and_never_seeds_cache() {
                 .file_name()
                 .to_string_lossy()
                 .ends_with("__slot_wait_age.sql")
+            // Rebuilds an index of `check_consumer`.
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("__check_consumer_answered_index.sql")
         {
             continue;
         }
@@ -2213,4 +2218,69 @@ async fn reuse_only_miss_creates_neither_run_nor_consumer() {
         .await
         .unwrap();
     assert_eq!((runs, consumers), (0, 0));
+}
+
+/// The integration head's reuse is applied by the step that records it: its
+/// consumer is created answered and the check worker enqueues no delivery
+/// step for it. An ordinary request answered by the same stored result is
+/// still delivered.
+#[tokio::test]
+async fn a_reuse_only_hit_is_created_answered_and_gets_no_delivery_step() {
+    let db = fixture().await;
+    complete(
+        &db,
+        request("entry"),
+        CheckResultOutcome::Pass,
+        CheckCleanup::Success,
+    )
+    .await;
+    assert_eq!(db.enqueue_check_result_steps(10).await.unwrap(), 1);
+
+    let mut head = request("head");
+    head.origin = CheckConsumerOrigin::Integration;
+    head.purpose = CheckPurpose::QueueHeadCi;
+    let reused = db.reuse_check_run(head.clone()).await.unwrap().unwrap();
+    assert!(matches!(
+        reused.disposition,
+        CheckRequestDisposition::Reused
+    ));
+    let state = db
+        .check_consumer_delivery(&reused.consumer.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.applied_at.is_some(), "created answered");
+    assert_eq!(state.delivery_step_id, None);
+    assert_eq!(
+        db.enqueue_check_result_steps(10).await.unwrap(),
+        0,
+        "no delivery step for the reuse"
+    );
+    let undelivered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM check_consumer INDEXED BY check_consumer_undelivered WHERE result_id IS NOT NULL AND delivery_step_id IS NULL AND cancelled_at IS NULL AND applied_at IS NULL",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(undelivered, 0, "the idle probe's index is empty");
+    // Asking again is the same consumer, still without a delivery.
+    let again = db.reuse_check_run(head).await.unwrap().unwrap();
+    assert_eq!(again.consumer.id, reused.consumer.id);
+    assert_eq!(db.enqueue_check_result_steps(10).await.unwrap(), 0);
+
+    let plain = db.request_check_run(request("plain")).await.unwrap();
+    assert!(matches!(plain.disposition, CheckRequestDisposition::Reused));
+    assert_eq!(db.enqueue_check_result_steps(10).await.unwrap(), 1);
+    // Retention: an answered reuse is finished history, not an undelivered
+    // result that must be kept.
+    sqlx::query("UPDATE check_consumer SET created_at='2000-01-01T00:00:00Z' WHERE id=?")
+        .bind(&reused.consumer.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let pruned = db
+        .prune_check_history("2001-01-01T00:00:00Z", 10)
+        .await
+        .unwrap();
+    assert_eq!(pruned.consumers, 1);
 }

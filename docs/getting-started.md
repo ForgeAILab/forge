@@ -1860,3 +1860,12 @@ request used within the retention period. The verdict and command output
 recorded on a Review are part of the Review and are not deleted. Deleting the
 history of a green result only means the next review of that same commit runs
 its checks again.
+
+The same setting bounds the merge queue's receipts. On the same hourly pass
+Forge empties the owner receipts and observations of merge attempts that
+finished more than `check_retention_days` ago. The attempt row itself stays
+(its states, commits and timings are the queue's history), and nothing of a
+Task that is merging now, of an effect whose result is still unknown, or of a
+quarantined queue is touched. `GET /api/v1/operations/status` reports
+`integration_queues.finished_with_receipts`: finished attempts whose receipts
+are still stored.

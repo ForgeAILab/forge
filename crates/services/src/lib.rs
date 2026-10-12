@@ -61,9 +61,6 @@ pub mod operator_status_emitter;
 pub mod orchestration_authorization;
 pub mod placement;
 pub mod plan_artifact;
-pub mod pricing;
-pub mod pricing_auto;
-pub mod pricing_db;
 pub mod product_genesis;
 pub mod project_agent_actions;
 pub mod project_agent_selection;
@@ -92,8 +89,6 @@ pub mod repo_location;
 pub mod runtime;
 pub mod shared_media_cleanup;
 pub mod shutdown;
-pub mod solo_bootstrap;
-pub mod solo_session;
 pub mod task_actions;
 pub mod task_diagnostics;
 pub use task_actions::{available_actions, ActionCaller, TaskSnapshot};
@@ -547,6 +542,17 @@ impl From<db::DbError> for ServiceError {
     }
 }
 
+impl From<pricing::PricingError> for ServiceError {
+    fn from(error: pricing::PricingError) -> Self {
+        match error {
+            pricing::PricingError::Db(error) => error.into(),
+            pricing::PricingError::InvalidOperation { message } => {
+                Self::InvalidOperation { message }
+            }
+        }
+    }
+}
+
 impl From<sqlx::Error> for ServiceError {
     fn from(error: sqlx::Error) -> Self {
         Self::Db(error.into())
@@ -604,14 +610,14 @@ impl ServiceError {
         )
     }
 
-    pub(crate) fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
+    pub fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         Self::NotFound {
             entity,
             id: id.into(),
         }
     }
 
-    pub(crate) fn invalid_operation(message: impl Into<String>) -> Self {
+    pub fn invalid_operation(message: impl Into<String>) -> Self {
         Self::InvalidOperation {
             message: message.into(),
         }
@@ -643,7 +649,7 @@ impl ServiceError {
         }
     }
 
-    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+    pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
     }
 
@@ -692,10 +698,6 @@ mod execution_admission_error_tests {
         ));
     }
 }
-
-#[cfg(test)]
-#[path = "pricing_auto_tests.rs"]
-mod pricing_auto_tests;
 
 pub mod project_escalation;
 

@@ -164,7 +164,7 @@ async fn shutdown_after_startup_failure(backend: &Arc<RuntimeBackend>) {
     .await;
 }
 
-fn to_ui_candidate(candidate: &services::solo_bootstrap::SoloAgentCandidate) -> AgentCandidate {
+fn to_ui_candidate(candidate: &forge_solo::bootstrap::SoloAgentCandidate) -> AgentCandidate {
     AgentCandidate {
         id: candidate.identity_id.clone(),
         label: candidate.display_name.clone(),
@@ -172,7 +172,7 @@ fn to_ui_candidate(candidate: &services::solo_bootstrap::SoloAgentCandidate) -> 
         available: candidate.eligible,
         authenticated: matches!(
             candidate.availability,
-            services::solo_bootstrap::SoloAgentAvailability::Authenticated
+            forge_solo::bootstrap::SoloAgentAvailability::Authenticated
         ),
         detail: candidate
             .reason

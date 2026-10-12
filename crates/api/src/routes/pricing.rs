@@ -4,7 +4,7 @@
 //! The handlers in this module deliberately contain no SQL.  They resolve
 //! visibility through the existing repositories, translate wire contracts to
 //! the fixed-point pricing domain, and leave atomic mutation/idempotency work
-//! to `services::pricing` and `services::pricing_db`.
+//! to the `pricing` crate (`pricing` and `pricing::sqlite`).
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -39,17 +39,14 @@ use db::{
     Project, ProjectRepo, RetrospectiveEstimateRepo, SortBy, SortOrder, UsageEvent,
     UsageLedgerRepo,
 };
-use serde_json::{json, Value};
-use services::{
-    pricing::{
-        self, CatalogClientError, CatalogFreshness, CatalogSnapshot, CatalogStatus,
-        EventBucketRates, EventTokenCounts, NanoUsd, NanoUsdPerMillion, PriceSelectionReasonCode,
-        RetrospectiveCommitRequest, RetrospectivePreview, RetrospectiveRepositoryError,
-        RetrospectiveUsageEvent,
-    },
-    pricing_auto,
-    pricing_db::SqlitePricingRepository,
+use pricing::{
+    auto, sqlite::SqlitePricingRepository, CatalogClientError, CatalogFreshness, CatalogSnapshot,
+    CatalogStatus, EventBucketRates, EventTokenCounts, NanoUsd, NanoUsdPerMillion,
+    PriceSelectionReasonCode, RetrospectiveCommitRequest, RetrospectivePreview,
+    RetrospectiveRepositoryError, RetrospectiveUsageEvent,
 };
+use serde_json::{json, Value};
+use services::embedded_agent_service::provider_entry_endpoint;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -432,7 +429,7 @@ async fn cli_runtime_scope(
         .ok_or_else(|| {
             ApiError::not_found("cli_runtime", format!("{daemon_id}/{executor_type}"))
         })?;
-    if pricing_auto::detected_cli(&daemon.detected_clis_json, executor_type).is_none() {
+    if auto::detected_cli(&daemon.detected_clis_json, executor_type).is_none() {
         return Err(ApiError::not_found(
             "cli_runtime",
             format!("{daemon_id}/{executor_type}"),
@@ -470,7 +467,7 @@ async fn agent_pricing_response(
     user_id: &str,
     agent: &db::Agent,
 ) -> ApiResult<AgentPricing> {
-    let preview = pricing_auto::preview_agent_price(&state.db, user_id, agent)
+    let preview = auto::preview_agent_price(&state.db, user_id, agent, provider_entry_endpoint)
         .await
         .map_err(|_| ApiError::internal("agent pricing could not be resolved"))?;
     let (status, catalog_row, candidates, desired, source) = match &preview.resolution {
@@ -489,16 +486,16 @@ async fn agent_pricing_response(
         ),
         Some(resolution) => {
             let (status, row, candidates) = match &resolution.catalog {
-                pricing_auto::CatalogMatch::Found(row) => {
+                auto::CatalogMatch::Found(row) => {
                     (PricingResolutionStatus::Priced, Some(row), Vec::new())
                 }
-                pricing_auto::CatalogMatch::Ambiguous(providers) => {
+                auto::CatalogMatch::Ambiguous(providers) => {
                     (PricingResolutionStatus::Ambiguous, None, providers.clone())
                 }
-                pricing_auto::CatalogMatch::NotFound => {
+                auto::CatalogMatch::NotFound => {
                     (PricingResolutionStatus::NotInCatalog, None, Vec::new())
                 }
-                pricing_auto::CatalogMatch::CatalogAbsent => {
+                auto::CatalogMatch::CatalogAbsent => {
                     (PricingResolutionStatus::CatalogAbsent, None, Vec::new())
                 }
             };
@@ -514,9 +511,9 @@ async fn agent_pricing_response(
                 candidates,
                 resolution.desired.as_ref(),
                 match resolution.adjustment.source {
-                    pricing_auto::AdjustmentSource::Agent => PricingAdjustmentSource::Agent,
-                    pricing_auto::AdjustmentSource::Provider => PricingAdjustmentSource::Provider,
-                    pricing_auto::AdjustmentSource::Default => PricingAdjustmentSource::Default,
+                    auto::AdjustmentSource::Agent => PricingAdjustmentSource::Agent,
+                    auto::AdjustmentSource::Provider => PricingAdjustmentSource::Provider,
+                    auto::AdjustmentSource::Default => PricingAdjustmentSource::Default,
                 },
             )
         }
@@ -661,10 +658,9 @@ async fn upsert_adjustment(
         ));
     }
     if let Some(provider_id) = catalog_provider_id.as_deref() {
-        let listed =
-            pricing_auto::catalog_lists(&state.db, provider_id, catalog_model_id.as_deref())
-                .await
-                .map_err(|_| ApiError::internal("pricing catalog is temporarily unavailable"))?;
+        let listed = auto::catalog_lists(&state.db, provider_id, catalog_model_id.as_deref())
+            .await
+            .map_err(|_| ApiError::internal("pricing catalog is temporarily unavailable"))?;
         if !listed {
             return Err(ApiError::validation(
                 "the pinned models.dev provider/model is not in the current catalog",
@@ -1779,13 +1775,13 @@ fn map_catalog_client_error(error: CatalogClientError) -> ApiError {
     }
 }
 
-fn map_catalog_repository_error(error: services::pricing::CatalogRepositoryError) -> ApiError {
+fn map_catalog_repository_error(error: pricing::CatalogRepositoryError) -> ApiError {
     match error {
-        services::pricing::CatalogRepositoryError::Conflict(_) => ApiError::conflict_with_code(
+        pricing::CatalogRepositoryError::Conflict(_) => ApiError::conflict_with_code(
             "pricing_catalog.conflict",
             "pricing catalog changed before the operation completed",
         ),
-        services::pricing::CatalogRepositoryError::Unavailable(_) => {
+        pricing::CatalogRepositoryError::Unavailable(_) => {
             ApiError::internal("pricing catalog is temporarily unavailable")
         }
     }
@@ -1844,7 +1840,7 @@ mod tests {
 
     #[test]
     fn endpoint_identity_keeps_scheme_port_and_custom_path_distinct() {
-        use pricing_auto::canonical_endpoint_class;
+        use auto::canonical_endpoint_class;
         assert_eq!(
             canonical_endpoint_class("HTTPS://API.OpenAI.com/v1/").as_deref(),
             Some("https://api.openai.com/v1")
@@ -1892,7 +1888,7 @@ mod tests {
             ),
             path: Some("https://user:sentinel-secret@example.test/bin?token=sentinel".to_owned()),
         };
-        let identity = pricing_auto::cli_identity("shell", Some(&detected));
+        let identity = auto::cli_identity("shell", Some(&detected));
         let persisted = format!("{identity:?}");
         assert!(!persisted.contains("sentinel"));
         assert!(!persisted.contains("example.test"));

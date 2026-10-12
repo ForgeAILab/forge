@@ -264,12 +264,6 @@ impl From<ServiceError> for ApiError {
                 message: "git error".to_owned(),
                 details: Some(json!({ "details": error.to_string() })),
             },
-            unavailable @ ServiceError::Review(_) if unavailable.is_check_environment_unavailable() => Self {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "check_environment_unavailable",
-                message: "Check environment attestation unavailable; retry before requesting the check".into(),
-                details: None,
-            },
             ServiceError::Review(error) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "review_error",

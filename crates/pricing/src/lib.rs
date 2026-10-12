@@ -22,6 +22,16 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+pub mod auto;
+mod error;
+pub mod sqlite;
+
+#[cfg(test)]
+#[path = "auto_tests.rs"]
+mod auto_tests;
+
+pub use error::{PricingError, PricingResult};
+
 /// The only remote catalog endpoint used by Forge.
 pub const MODELS_DEV_ENDPOINT: &str = "https://models.dev/api.json";
 

@@ -2053,3 +2053,291 @@ async fn a_parked_attempt_is_rebound_only_when_its_ready_placement_names_another
     assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
     assert_eq!(rebound.queue_seq, first.queue_seq);
 }
+
+/// Two writers on one row state one cause. The reconciler's restatement
+/// (from the scheduler's snapshot) writes first on an imported row nothing
+/// has stated yet; the import continuation writes the same row afterwards;
+/// the reconciler looks again. All three decide with `deferral::deferral`:
+/// a quarantined imported row that names no operation is its owner's
+/// (`owner_required`, not a result that could still arrive), and a row that
+/// waited for a machine before the queue (P15) names that machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reconciler_and_the_import_continuation_state_one_cause_for_one_row() {
+    for (case, assignments, cause, owner) in [
+        (
+            "quarantined",
+            "state='quarantined',import_source_json='{\"priority\":20}',failure_kind='infrastructure',failure_message='contradictory evidence',available_at=NULL",
+            "owner_required",
+            Value::Null,
+        ),
+        (
+            "offline",
+            "state='parked',import_source_json='{\"priority\":15}',failure_kind='infrastructure',failure_message='waiting for the checkout owner',available_at='2099-01-01T00:00:00Z'",
+            "owner_offline",
+            json!("gone-machine"),
+        ),
+    ] {
+        let world = World::new().await;
+        world.legacy_task("two", "two.txt", "merging").await;
+        world.seed_execution("two", "executor", None).await;
+        if case == "offline" {
+            sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.owner_wait',json_object('daemon_id','gone-machine')) WHERE id='two'")
+                .execute(world.db.pool())
+                .await
+                .unwrap();
+        }
+        let current = world
+            .service
+            .admit_to_integration_queue("two")
+            .await
+            .unwrap();
+        world.set(&current.id, assignments).await;
+        let stated = || async {
+            let reason = integration(&world.task("two").await);
+            (reason["cause"].clone(), reason["owner_id"].clone())
+        };
+        let dispatcher = dispatcher(&world).await;
+        // Writer one: the reconciler, on a row whose deferral nobody stated.
+        world
+            .until("two", "the reconciler states the deferral", || async {
+                dispatcher.reconcile_all().await.unwrap();
+                integration(&world.task("two").await)["kind"] == "deferred"
+            })
+            .await;
+        assert_eq!(stated().await, (json!(cause), owner.clone()), "{case}: reconciler");
+        // Writer two: the import continuation of the same row.
+        let report = super::super::import::import_at_start(&world.db)
+            .await
+            .unwrap();
+        assert_eq!(report.continuations, 1, "{case}");
+        world
+            .until("two", "the import continuation settles", || async {
+                world
+                    .scalar::<i64>(
+                        "SELECT COUNT(*) FROM task_step WHERE task_id=? AND causation_key LIKE 'integration-import:%' AND status='done'",
+                        "two",
+                    )
+                    .await
+                    == 1
+            })
+            .await;
+        assert_eq!(
+            stated().await,
+            (json!(cause), owner.clone()),
+            "{case}: import continuation"
+        );
+        // And the reconciler finds nothing to restate.
+        let before = world.task("two").await.version;
+        dispatcher.reconcile_all().await.unwrap();
+        assert_eq!(stated().await, (json!(cause), owner), "{case}: second look");
+        assert_eq!(world.task("two").await.version, before, "{case}");
+        assert_eq!(
+            world.attempt(&current.id).await.revision,
+            world
+                .db
+                .current_integration_attempt("two")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            "{case}: the row was not replaced"
+        );
+    }
+}
+
+/// The server's login shell gives no environment when a Task is the head:
+/// its check cannot be identified. On an unchanged target that is the
+/// `settle` step's reuse, on a rebased commit the `request_check` step. The
+/// step asks a few times on its own, then answers "no verdict" with the
+/// cause. The attempt parks naming `check environment unavailable` (never
+/// `task_step_failed`, which names the step), the Task states it, no check,
+/// consumer or Review is created, and once the environment answers the
+/// owner's Retry merges the Task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_head_without_an_environment_answer_parks_naming_the_cause_and_retry_merges() {
+    for moved in [false, true] {
+        let world = World::new().await;
+        sqlx::query("UPDATE project SET primary_repo_id='r' WHERE id='p'")
+            .execute(world.db.pool())
+            .await
+            .unwrap();
+        let a = world.reconciled("env", "env.txt").await;
+        review_ci(&world, "env", &["true"]).await;
+        if moved {
+            world.move_target("outside").await;
+        }
+        crate::check_runner::policy::silence_login_shell_for_test(&world.db, true)
+            .await
+            .unwrap();
+        let reviews = world
+            .scalar::<i64>("SELECT COUNT(*) FROM review WHERE task_id=?", "env")
+            .await;
+        // No counted retry: the first park is the owner's.
+        let production = Production::with_ports(
+            &world,
+            production_ports_config(
+                &world,
+                crate::integration_worker::IntegrationWorkerConfig {
+                    poll: Duration::from_millis(20),
+                    sweep_interval: Duration::from_millis(100),
+                    conflict_backoff: Duration::from_millis(5),
+                    infra_retry: Vec::new(),
+                    ..Default::default()
+                },
+            ),
+        );
+        let running = production.run();
+        world
+            .until("env", "the head parks for its environment", || async {
+                world.attempt(&a.id).await.state == S::Parked
+                    && integration(&world.task("env").await)["kind"] == "deferred"
+            })
+            .await;
+        let parked = world.attempt(&a.id).await;
+        let message = parked.failure_message.clone().unwrap_or_default();
+        assert!(
+            message.contains(super::super::CHECK_ENVIRONMENT_UNAVAILABLE)
+                && !message.contains("task_step_failed"),
+            "moved={moved}: {message}"
+        );
+        let stated = integration(&world.task("env").await);
+        assert!(
+            stated["message"]
+                .as_str()
+                .unwrap()
+                .contains(super::super::CHECK_ENVIRONMENT_UNAVAILABLE),
+            "moved={moved}: {stated}"
+        );
+        let failed_steps = world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM task_step WHERE task_id=? AND status='failed'",
+                "env",
+            )
+            .await;
+        assert_eq!(failed_steps, 0, "moved={moved}: no step failed for it");
+        let checks: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM check_run)+(SELECT COUNT(*) FROM check_consumer)",
+        )
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(checks, 0, "moved={moved}: nothing was asked");
+        assert_eq!(
+            world
+                .scalar::<i64>("SELECT COUNT(*) FROM review WHERE task_id=?", "env")
+                .await,
+            reviews,
+            "moved={moved}: no Review recorded"
+        );
+        assert_eq!(world.merges("env").await, 0);
+        assert_eq!(world.task("env").await.status, "merging");
+        let offers = world.offers("env").await;
+        assert!(
+            offers.iter().any(|(verb, _)| verb == "retry"),
+            "moved={moved}: the Task offers Retry: {offers:?}"
+        );
+        // The environment answers; the owner's Retry puts the Task back in
+        // line and it merges.
+        crate::check_runner::policy::silence_login_shell_for_test(&world.db, false)
+            .await
+            .unwrap();
+        world
+            .act(
+                "env",
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+            )
+            .await;
+        world
+            .until("env", "the retried merge lands", || async {
+                world.task("env").await.status == "done"
+            })
+            .await;
+        assert_eq!(world.merges("env").await, 1, "moved={moved}");
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    }
+}
+
+/// A stale-bound attempt that is still its queue's head (claimed, not yet
+/// started; or reconciled back to `queued` on the slot). Supersede refuses a
+/// head, so the reconciler used to get the same row back from admission and
+/// restate `waiting` at every pass. It now writes nothing while the attempt
+/// holds the slot, and rebinds it through admission once it is off the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_bound_head_is_left_to_its_driver_and_rebound_once_it_is_off_the_slot() {
+    let world = World::new().await;
+    world.legacy_task("head", "head.txt", "merging").await;
+    world.seed_execution("head", "executor", None).await;
+    let first = world
+        .service
+        .admit_to_integration_queue("head")
+        .await
+        .unwrap();
+    let queue = first.queue_id.clone().unwrap();
+    // The placement is `ready` under another generation than the attempt's.
+    world
+        .set(&first.id, "placement_generation=placement_generation+7")
+        .await;
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&first.id)
+        .bind(&queue)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let before = world.task("head").await;
+    let rows = || async {
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                "head",
+            )
+            .await
+    };
+    for _ in 0..3 {
+        assert!(
+            !world
+                .service
+                .reconcile_integration_admission(&before)
+                .await
+                .unwrap(),
+            "a head was handed to admission"
+        );
+    }
+    let after = world.task("head").await;
+    assert_eq!(
+        (after.version, json!(after.condition)),
+        (before.version, json!(before.condition)),
+        "the reconciler wrote on a Task whose attempt holds the slot"
+    );
+    assert_eq!(rows().await, 1);
+    assert_eq!(world.attempt(&first.id).await.state, S::Queued);
+    // Off the slot: the binding is replaced, the place in line kept.
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,revision=revision+1 WHERE id=?")
+        .bind(&queue)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    assert!(world
+        .service
+        .reconcile_integration_admission(&after)
+        .await
+        .unwrap());
+    let rebound = world
+        .db
+        .current_integration_attempt("head")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebound.predecessor_attempt_id.as_deref(),
+        Some(first.id.as_str())
+    );
+    assert_eq!(rebound.queue_seq, first.queue_seq);
+    assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
+}

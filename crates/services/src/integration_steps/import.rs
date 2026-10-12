@@ -345,27 +345,22 @@ impl IntegrationSteps {
                     .failure_message
                     .clone()
                     .unwrap_or_else(|| "integration is waiting".into());
-                let cause = if attempt.state == S::Quarantined {
-                    if attempt.current_operation_state.is_some() || attempt.operation_id.is_some() {
-                        IntegrationDeferralCause::UnresolvedResult
-                    } else {
-                        IntegrationDeferralCause::OwnerRequired
-                    }
-                } else if priority == Some(15) {
-                    // Ends when the machine is back, whatever retry time
-                    // the old build had stored for its own polling.
-                    IntegrationDeferralCause::OwnerOffline
-                } else if attempt.available_at.is_some() {
-                    // A stored deadline: the Task is admitted again at it.
-                    IntegrationDeferralCause::Infrastructure
-                } else {
-                    IntegrationDeferralCause::OwnerRequired
-                };
+                // One rule for every writer of this row (`deferral`): the
+                // reconciler's restatement and a later `park` step read the
+                // same facts and state the same cause.
+                let (cause, owner_id) =
+                    super::deferral::deferral(&super::deferral::DeferralFacts {
+                        quarantined: attempt.state == S::Quarantined,
+                        kind: attempt.failure_kind,
+                        message: &message,
+                        daemon_id: attempt.daemon_id.as_deref(),
+                        import: super::deferral::import_facts(&attempt, waited_owner.clone()),
+                    });
                 // A paused Project is the Task's reason; integration adds none.
                 let reason = (!paused).then(|| IntegrationReason::Deferred {
                     attempt_id: attempt_ref(&attempt.id),
                     cause,
-                    owner_id: waited_owner.clone(),
+                    owner_id,
                     message: bounded(&message),
                 });
                 self.import_state(step, &attempt, reason).await

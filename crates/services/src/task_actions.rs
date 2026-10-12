@@ -1902,19 +1902,13 @@ pub(crate) fn action_test_evidence_dir() -> std::path::PathBuf {
     dir
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    fn projected_actions(snapshot: &super::TaskSnapshot) -> Vec<api_types::Offer> {
-        let mut projected = snapshot.clone();
-        projected.task.condition =
-            db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
-        super::available_actions(&projected)
-    }
-
+/// Task fixtures shared with the crates that test against a [`TaskSnapshot`].
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::*;
     use serde_json::json;
 
-    pub(crate) fn snapshot(state: &str, kind: Option<FailureKind>) -> TaskSnapshot {
+    pub fn snapshot(state: &str, kind: Option<FailureKind>) -> TaskSnapshot {
         let mut task: Task = serde_json::from_value(json!({
             "id":"task", "project_id":"project", "parent_task_id":null, "assignee_type":"agent", "assignee_id":"agent", "title":"Fixture", "description":null, "task_type":"task", "status":state, "is_automation":false, "priority":0, "board_position":0.0, "subtask_order":null, "task_state_config":null, "merge_config":null, "metadata_json":null, "plan":null, "error_annotation":null, "blocked_json":null, "failed_json":null, "entry_barrier_json":null, "review_passed_at":null, "archived_at":null, "deleted_at":null, "version":1, "created_at":"2026-10-02T00:00:00Z", "updated_at":"2026-10-02T00:00:00Z"
         })).expect("Task fixture");
@@ -1942,6 +1936,21 @@ pub(crate) mod tests {
             entry_hooks_running: false,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    fn projected_actions(snapshot: &super::TaskSnapshot) -> Vec<api_types::Offer> {
+        let mut projected = snapshot.clone();
+        projected.task.condition =
+            db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
+        super::available_actions(&projected)
+    }
+
+    use super::*;
+    use serde_json::json;
+
+    pub(crate) use super::test_support::snapshot;
 
     pub(crate) fn integration_conditions() -> Vec<db::TaskCondition> {
         use api_types::{

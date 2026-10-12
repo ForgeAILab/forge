@@ -2643,7 +2643,9 @@ impl World {
             heads += 1;
             let reused = matches!((run, result), (Some(run), Some(result))
                 if passed.iter().any(|(r, s)| r == run && s == result));
-            if origin != "integration" || !reused || applied.is_some() {
+            // A reuse is created answered: the `settle` step that records it
+            // applies it, and no delivery step is spent on it.
+            if origin != "integration" || !reused || applied.is_none() {
                 return Err(format!(
                     "a consumer beside the review entry is not a reuse of its passed run: {rows:?}"
                 ));
@@ -2974,6 +2976,8 @@ enum HoldFinds {
     /// The check is asked for and the step that asked has not begun to wait
     /// for it: the hold stops that step in the middle.
     AStepThatJustAsked,
+    /// The same window, and the owner command is a Cancel.
+    AStepThatJustAskedCancelled,
 }
 
 /// A hold COMMAND during the entry check. It is not on offer (see above) and
@@ -3018,6 +3022,7 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
     // until that run ends. The model has no step worker, so no Task step
     // runs meanwhile.
     let slot_seam = !matches!(finds, TheRunInFlight | ARunItStops);
+    let just_asked = matches!(finds, AStepThatJustAsked | AStepThatJustAskedCancelled);
     let mut world = World::new().await;
     let outcome: Result<(), String> = async {
         for _ in 0..if slot_seam { 2 } else { 1 } {
@@ -3060,7 +3065,7 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
                 first.display(),
                 deliverable(0)
             )),
-            AFinishedRun | AStepThatJustAsked => None,
+            AFinishedRun | AStepThatJustAsked | AStepThatJustAskedCancelled => None,
         };
         if let Some(command) = command {
             sqlx::query(SET_CHECK)
@@ -3074,32 +3079,64 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
         if slot_seam {
             let cap = &world.live().state.db.server_run_cap;
             cap.set(Some(1), 1, &cap.embedded_machine_id());
-            world.apply(&Action::Finish(0, Outcome::Success)).await?;
-            world.quiesce().await?;
-            if world.check_runs(0).await? != ["queued"] {
-                return Err(format!(
-                    "expected one queued check: {:?}",
-                    world.check_runs(0).await?
-                ));
-            }
-            if finds == AStepThatJustAsked {
-                // The consumer and its run are stored; the step holds its
-                // claim and has not suspended (as in the restart case).
-                let changed = sqlx::query(
-                    "UPDATE task_step SET status='claimed', claimed_by='dead-process',
-                            lease_until='2000-01-01T00:00:00+00:00', attempts=attempts+1,
-                            suspended_until=NULL, awaited_consumer_id=NULL
-                     WHERE task_id = ? AND status = 'suspended'",
-                )
-                .bind(&task_id)
-                .execute(&pool)
-                .await
-                .map_err(sql)?
-                .rows_affected();
-                if changed != 1 {
-                    return Err("no suspended hooks step to rewind".to_owned());
+            if just_asked {
+                // The real hooks step asks for the check (the run waits for
+                // the one slot) and is stopped right there, before it
+                // suspends: it holds its claim, and the drain that carries
+                // it stays alive for the owner command to preempt.
+                use services::workflow::actions::review_entry_halt as halt;
+                let reached = halt::arm(&task_id, halt::AFTER_REQUEST_BEFORE_SUSPEND);
+                world.apply(&Action::Finish(0, Outcome::Success)).await?;
+                let drain = |world: &World| {
+                    let service = world.live().state.task_service.clone();
+                    let id = world.tasks[0].clone();
+                    tokio::spawn(async move { service.drain(&id).await.map(|_| ()) })
+                };
+                let mut running = drain(&world);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let asked = reached.notified();
+                tokio::pin!(asked);
+                loop {
+                    tokio::select! {
+                        _ = &mut asked => break,
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                    if running.is_finished() {
+                        running = drain(&world);
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        halt::disarm(&task_id);
+                        running.abort();
+                        let task = world.task(0).await?;
+                        return Err(format!(
+                            "the entry never asked for its check: {} steps {:?}",
+                            task["status"],
+                            list(STEPS).await?
+                        ));
+                    }
                 }
+                let claimed = list(
+                    "SELECT kind || ':' || status FROM task_step WHERE task_id = ? AND status IN ('claimed','suspended')",
+                )
+                .await?;
+                if world.check_runs(0).await? != ["queued"] || claimed != ["hooks:claimed"] {
+                    halt::disarm(&task_id);
+                    running.abort();
+                    return Err(format!(
+                        "expected a queued check and a claimed hooks step: {:?} {claimed:?}",
+                        world.check_runs(0).await?
+                    ));
+                }
+                steps = Some(running);
             } else {
+                world.apply(&Action::Finish(0, Outcome::Success)).await?;
+                world.quiesce().await?;
+                if world.check_runs(0).await? != ["queued"] {
+                    return Err(format!(
+                        "expected one queued check: {:?}",
+                        world.check_runs(0).await?
+                    ));
+                }
                 // The slot frees and the check worker runs the check.
                 world.apply(&Action::Finish(1, Outcome::Success)).await?;
                 let reached = if finds == AFinishedRun {
@@ -3152,16 +3189,27 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
             }
             steps = Some(running);
         }
-        let (version, _) = world.offers(0).await?;
-        let (status, body) = world
-            .request(
-                Method::POST,
-                &format!("/api/v1/tasks/{task_id}/actions"),
-                Some(json!({ "version": version, "action": { "verb": "hold" } })),
-            )
-            .await?;
-        if !status.is_success() {
-            return Err(format!("the hold command was refused: {status} {body}"));
+        let (version, offers) = world.offers(0).await?;
+        if finds == AStepThatJustAskedCancelled {
+            let cancel = offers
+                .iter()
+                .find(|offer| offer["action"]["verb"] == "cancel")
+                .ok_or_else(|| format!("no cancel is offered: {offers:?}"))?;
+            world.apply_offer(0, version, cancel).await?;
+        } else {
+            let (status, body) = world
+                .request(
+                    Method::POST,
+                    &format!("/api/v1/tasks/{task_id}/actions"),
+                    Some(json!({ "version": version, "action": { "verb": "hold" } })),
+                )
+                .await?;
+            if !status.is_success() {
+                return Err(format!("the hold command was refused: {status} {body}"));
+            }
+        }
+        if just_asked {
+            services::workflow::actions::review_entry_halt::disarm(&task_id);
         }
         if let Some(steps) = steps {
             let _ = steps.await;
@@ -3173,7 +3221,7 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
             _ => &[],
         };
         if !stopping.is_empty() {
-            tokio::time::timeout(Duration::from_secs(45), async {
+            let stopped = tokio::time::timeout(Duration::from_secs(45), async {
                 loop {
                     let runs = world.check_runs(0).await?;
                     if runs.len() == 1 && stopping.contains(&runs[0].as_str()) {
@@ -3182,12 +3230,50 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             })
-            .await
-            .map_err(|_| "the withdrawn check was not stopped".to_owned())??;
+            .await;
+            match stopped {
+                Ok(done) => done?,
+                Err(_) => {
+                    return Err(format!(
+                        "the withdrawn check was not stopped: runs {:?} consumers {:?} reviews {:?} steps {:?}",
+                        world.check_runs(0).await?,
+                        list(CONSUMERS).await?,
+                        list(REVIEWS).await?,
+                        list("SELECT kind || ':' || status || ':' || COALESCE(awaited_consumer_id,'-') || ':' || COALESCE(last_error,'-') FROM task_step WHERE task_id = ? ORDER BY seq").await?
+                    ))
+                }
+            }
         }
-        if finds == AStepThatJustAsked {
-            // The slot frees under the hold.
+        if just_asked {
+            // The request was withdrawn with the step that made it, and its
+            // attempt closed, before the slot frees.
+            let (consumers, reviews) = (list(CONSUMERS).await?, list(REVIEWS).await?);
+            if consumers != ["entry:queued:-:withdrawn"] || reviews != ["1:cancelled"] {
+                return Err(format!(
+                    "the request of the stopped step was not withdrawn: consumers {consumers:?} reviews {reviews:?}"
+                ));
+            }
+            // The slot frees under the hold: the check worker looks at the
+            // queued run nobody waits for and cancels it instead of running
+            // it.
             world.apply(&Action::Finish(1, Outcome::Success)).await?;
+            let stopped = tokio::time::timeout(Duration::from_secs(45), async {
+                while world.check_runs(0).await? != ["cancelled"] {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, String>(())
+            })
+            .await;
+            match stopped {
+                Ok(done) => done?,
+                Err(_) => {
+                    return Err(format!(
+                        "the run nobody waits for was not cancelled: runs {:?} consumers {:?}",
+                        world.check_runs(0).await?,
+                        list(CONSUMERS).await?
+                    ))
+                }
+            }
         }
         if slot_seam {
             // The hold is what these cases are about, not the one slot.
@@ -3198,6 +3284,41 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
         // two cases that race the check worker do not give it time.
         if !matches!(finds, ARunBeingStopped | ARunItsReleaseJoins) {
             world.quiesce().await?;
+        }
+        if finds == AStepThatJustAskedCancelled {
+            // Nothing is left of the entry: the Task is cancelled, the
+            // request withdrawn, its run stopped, the attempt closed, and no
+            // step waits or was delivered to.
+            world.quiesce().await?;
+            let task = world.task(0).await?;
+            let (runs, reviews, consumers, steps) = (
+                world.check_runs(0).await?,
+                list(REVIEWS).await?,
+                list(CONSUMERS).await?,
+                list(STEPS).await?,
+            );
+            world.trace.push(format!(
+                "{finds:?}: {} runs {runs:?} consumers {consumers:?} reviews {reviews:?} steps {steps:?}",
+                task["status"]
+            ));
+            let live = count(
+                "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status IN ('pending','claimed','suspended')",
+            )
+            .await?;
+            if task["status"] != "cancelled"
+                || runs != ["cancelled"]
+                || reviews != ["1:cancelled"]
+                || consumers != ["entry:cancelled:cancelled:withdrawn"]
+                || count(DELIVERED).await? != 0
+                || count(REVIEWER_RUNS).await? != 0
+                || live != 0
+            {
+                return Err(format!(
+                    "after the cancel: {} runs {runs:?} reviews {reviews:?} consumers {consumers:?}, {live} live step(s)",
+                    task["status"]
+                ));
+            }
+            return Ok(());
         }
         let held = world.task(0).await?;
         let runs = world.check_runs(0).await?;
@@ -3221,23 +3342,16 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
         }
         // The step that waited for the check is stopped, its request
         // withdrawn before any result was delivered, and its attempt closed.
-        // A step stopped before it began to wait recorded no request to
-        // withdraw: its check runs on, the delivery finds no step to wake,
-        // and the attempt stays open until the release closes it. (The first
-        // case can meet either on a slow machine.)
+        // A step stopped after it asked and before it began to wait is no
+        // different: the request is recorded on the step when it is made.
         let closed = reviews == ["1:cancelled"] && delivered == 0;
-        let open = reviews == ["1:running"];
-        if !match finds {
-            TheRunInFlight => closed || open,
-            AStepThatJustAsked => open,
-            _ => closed,
-        } {
+        if !closed {
             return Err(format!(
                 "under the hold: review attempts {reviews:?}, {delivered} result(s) delivered"
             ));
         }
         if !match finds {
-            ARunItStops => runs == ["cancelled"],
+            ARunItStops | AStepThatJustAsked => runs == ["cancelled"],
             AFinishedRun => runs == ["succeeded"],
             _ => runs.len() == 1,
         } {
@@ -3270,7 +3384,8 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
             // The entry's own step reads a result that exists when it asks:
             // nothing is delivered.
             AFinishedRun => kept && delivered == 0,
-            AStepThatJustAsked => kept,
+            AStepThatJustAsked => again && delivered == 1,
+            AStepThatJustAskedCancelled => false,
             TheRunInFlight | ARunBeingStopped | ARunItsReleaseJoins => again || kept,
         } {
             return Err(format!(
@@ -3372,11 +3487,20 @@ async fn a_release_while_the_entry_check_is_being_stopped_still_gets_one_pass() 
 }
 
 /// The hold stops the hooks step after it asked for the check and before it
-/// began to wait: the run it asked for is the one run, and the release's
-/// entry is answered by it.
+/// began to wait. The request is recorded on the step with the request
+/// itself, so the hold withdraws it as it does for a step that waits: the
+/// run nobody waits for is stopped, no result is delivered to a step that is
+/// gone, the attempt is closed under the hold, and the release asks again.
+/// (The step is stopped at that exact point, in the real hook.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hold_that_stops_the_step_that_just_asked_keeps_the_entry_check_it_asked_for() {
+async fn a_hold_that_stops_the_step_that_just_asked_withdraws_the_entry_check_it_asked_for() {
     hold_during_the_entry_check_or_panic(HoldFinds::AStepThatJustAsked).await;
+}
+
+/// The same window under a Cancel: nothing is left of the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_that_stops_the_step_that_just_asked_leaves_nothing_of_the_entry_check() {
+    hold_during_the_entry_check_or_panic(HoldFinds::AStepThatJustAskedCancelled).await;
 }
 
 /// A held Task in `review` and a system re-entry of its review (recovery, a
@@ -3561,7 +3685,7 @@ async fn restart_with_two_slots_then_one(point: RestartPoint) {
             let changed = sqlx::query(
                 "UPDATE task_step SET status='claimed', claimed_by='dead-process',
                         lease_until='2000-01-01T00:00:00+00:00', attempts=attempts+1,
-                        suspended_until=NULL, awaited_consumer_id=NULL
+                        suspended_until=NULL
                  WHERE task_id = ? AND status = 'suspended'",
             )
             .bind(&task_id)

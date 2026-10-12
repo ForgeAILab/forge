@@ -39,6 +39,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   finishes. Clients that enumerate `cause` (`held`, `blocked`,
   `not_coordinating`) must render it as a wait that needs no action.
 
+- **REST no longer documents or maps `503 check_environment_unavailable`.**
+  No REST handler could return it: the check environment is read only inside
+  Task steps and the check worker, and the Task states the cause (review
+  entry: `review_ci_infrastructure`; merge head: `deferred` naming `check
+  environment unavailable`). The error-mapper arm and the `docs/api.md` row
+  are removed. A client that matched on the code never received it.
+
 - **API integration-test target names are consolidated.** The 95 targets
   become eight binaries. For moved suites, use
   `cargo test -p api --test main <old-target>::<test-name>` (including
@@ -1473,6 +1480,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Pricing and the Solo services left the `services` crate (developer-only).**
+  Provider pricing is the new `pricing` crate (`services → pricing → db`), and
+  the Solo bootstrap and session services are `forge_solo::bootstrap` and
+  `forge_solo::session`. No REST, MCP, CLI or stored-data change. Rust callers
+  use `pricing::…` in place of `services::pricing*`; `services` re-exports
+  neither.
+
 - **The server reads its login-shell environment once per start, not once per
   check.** A canonical check identity names the environment its steps inherit.
   The server now asks its login shell once per process (one stored answer per
@@ -2760,6 +2774,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Merge-queue receipts have a retention period.** The hourly storage pass
+  now empties the owner receipts and observations of merge attempts that
+  finished more than `server.check_retention_days` ago (default 30; `0`
+  keeps them). The attempt row stays, and a current attempt, an unsettled or
+  unknown effect, a Task that is merging again and a quarantined queue's
+  evidence are never touched. `GET /api/v1/operations/status` adds
+  `integration_queues.finished_with_receipts` (finished attempts whose
+  receipts are still stored); `IntegrationQueueStatus` in the generated
+  TypeScript types gains the field.
+
 - **Merge queue reads (3.2 stage D3a).** `GET
   /api/v1/repos/{id}/integration-queues` lists a repository's merge queues,
   one per target branch (`items`, opaque `cursor`, `has_more`): the queue's
@@ -3070,6 +3094,62 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A merge attempt that holds its queue's slot is not handed back to
+  admission at every reconciler pass.** An attempt whose placement binding
+  changed while it was still the queue head could not be replaced (a head
+  is never superseded), so the reconciler got the same row back and restated
+  `waiting` each pass. It now writes nothing while the attempt is the head
+  and rebinds it once it is off the slot.
+
+- **A Hold or Cancel that lands right after review entry asked for its
+  check leaves nothing behind.** The hooks step recorded what it waits for
+  only when it suspended. A command that stopped it between the request and
+  the suspension found no request to withdraw: the check ran on, its
+  delivery had no step to wake, and review attempt 1 stayed `running` under
+  the hold until the release. The wait is now recorded with the request, in
+  one transaction; the command withdraws the request, closes the attempt and
+  the check worker stops the run nobody waits for.
+
+- **A merge whose check environment is unavailable says so.** When the
+  server's login shell gave no environment while a Task was the queue head,
+  the `settle` / `request_check` step failed eight times, the queue asked
+  again, and the attempt parked as `task_step_failed: the settle Task step
+  failed`, naming the step and not the cause. The step now asks four times,
+  then answers "no verdict": the attempt parks as `infrastructure: check
+  environment unavailable`, the Task states it, the counted retries run and
+  the owner's Retry merges the Task once the environment answers.
+- **The owner's Retry of a review entry lands like the automatic entry when
+  review CI cannot start.** An entry a user caused (Retry of the entry
+  hooks) skipped the `review_ci_infrastructure` annotation: the Task showed
+  a failed hook with no cause and no re-entry. It now states the cause,
+  records no Review and re-enters on the same back-off.
+
+- **A merge that waits states one cause, whoever writes it.** The `park`
+  step, the import continuation and the reconciler's restatement each
+  mapped a parked or quarantined attempt to a deferral cause with their own
+  rule, so a quarantined imported row with no operation read
+  `unresolved_result` from the reconciler and `owner_required` from its
+  continuation, and a pre-queue owner wait lost the machine it names. One
+  function (`integration_steps::deferral`) now decides cause and machine
+  for all three from the attempt row; a stated deferral is restated only
+  when those differ.
+
+- **One writer per merge during an upgrade: an imported unknown result is
+  not driven while its import continuation is still to run.** The queue
+  worker could take a reserved imported head (a merge whose old operation
+  never reported) as soon as the old merge's hooks step was gone, while the
+  row's `import_continue` step was still pending. The driver then proved the
+  merge landed and the continuation reported the same row. Both writes were
+  idempotent and the Task ended `done` once, but two writers held the merge.
+  The claim now also waits for a live continuation step of the head.
+
+- **Merging an unchanged commit no longer spends a Task step on a check
+  delivery nobody reads.** The queue head's reuse of the review entry's
+  check result is applied by the `settle` step that records it; its consumer
+  is now created answered and the check worker enqueues no
+  `apply_check_result` step for it (that step found no checking attempt and
+  ended `stale`). Migration `V202610121119` rebuilds the undelivered-result
+  index so an answered consumer is not in it; no row changes.
 - **Creating a Project from an approved Charter answers with the Project as
   provisioning left it, and two overlapping submissions of the same command
   get the same answer.** The response carried the Project row as it was

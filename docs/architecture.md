@@ -15,7 +15,7 @@ runtime uses the singular binding, chat, and handoff model described below.
 ```
 crates/
 ├── forge-cli/     # Binary entrypoint, server startup, CLI commands
-├── forge-solo/    # Repository-scoped chat-first TUI and local entrypoint
+├── forge-solo/    # Repository-scoped chat-first TUI, its bootstrap and session services, local entrypoint
 ├── forge-client/  # forge-ctl CLI client
 ├── forge-daemon/  # Local daemon detection and reporting
 ├── api/           # Axum REST endpoints, SSE, middleware
@@ -24,6 +24,7 @@ crates/
 ├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
 ├── services/      # Business logic (task state machine, workflow engine)
+├── pricing/       # models.dev catalog, price resolution at admission, cost estimation
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
 ├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
 ├── workspace/     # Git worktree lifecycle, locking, path guardrails
@@ -49,7 +50,9 @@ forge-cli → api → services → db
           → api-types (shared request/response types, zero internal deps)
 
 forge-solo → services → db / events / agent-host / executors / workspace → git
-           → config / api-types / review / cli-adapters
+           → config / api-types / review / cli-adapters / operation-registry
+
+api / services → pricing → db / api-types
 
 services / review / forge-client → check-executor → process-supervisor
                                                   → git → process-supervisor
@@ -62,6 +65,14 @@ process-group implementation that Git, CI steps and daemon helpers share lives
 below all of them. `check-executor` sits between: it needs `git` (managed
 checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 `services`, `review` and `forge-client`; it depends on neither `services` nor `db`.
+
+`pricing` owns the provider pricing catalog, the SQLite pricing repository and
+the admission-time price resolution (`pricing::auto`). It sits below `services`
+and has its own `PricingError`, which `services` maps into `ServiceError`. The
+one thing it needs from above, a provider entry's endpoint, is passed in as a
+function by the caller. The Solo bootstrap and session services
+(`forge_solo::bootstrap`, `forge_solo::session`) live in `forge-solo`, their
+only caller, and use `services` like any other client.
 
 ## Architectural patterns
 
@@ -2009,7 +2020,7 @@ refreshes the fixed models.dev catalog endpoint only through an explicit
 authorized operation, activates a candidate snapshot atomically after bounded
 validation, and keeps the last known good snapshot on failure.
 
-Rates are resolved at admission by `services::pricing_auto`, inside the
+Rates are resolved at admission by `pricing::auto`, inside the
 admission transaction. It provisions the pricing subject (provider entry or
 CLI runtime) and its non-secret revision, picks the effective
 `pricing_adjustment` (the agent's own, else the subject's, else list price),
@@ -4706,7 +4717,11 @@ imported row or a `shadow:` row) only once its `integration-import:<id>`
 continuation step has settled and no live hooks step of the Task's present
 entry carries an effect of the old merge path (`merge_intent`,
 `merge_outcome`, `rebase_target`). A reserved imported head (an unknown
-result) is held the same way while that step is live. The hand-over is
+result) is held while that hooks step is live and while its own continuation
+step is live (pending, claimed or suspended): the continuation reports a row
+it finds `applied`, so a driver that reconciled the head to `applied` under it
+would be a second writer. A live step is asked for, not a settled one, so a
+head whose settled continuation was pruned is not held. The hand-over is
 admission, in both steps: the `run_merge` hook finishes the rebase the old
 step started and then admits; a merge the old step had finished is admitted
 too, the head finds its commit in the target and the proven `result` step
@@ -4814,10 +4829,22 @@ write locks around Git/RPC. The queue fast-forwards through the integration
 owners (`ServerIntegrationOwner::merge` and the daemon's fenced
 `workspace.merge`), after a short Task-step authorization transaction.
 
-Queue/member reads, web labels and `integration.updated` are live. The storage
-receipt pruner is available, but no production periodic job calls
-`prune_integration_evidence` yet; transfer cleanup and owner-journal
-acknowledgment already run.
+Queue/member reads, web labels and `integration.updated` are live. Retention
+(3.2 D3c): `StorageMaintenanceWorker::prune_integration_evidence` runs in the
+hourly slot of check retention, under the same `server.check_retention_days`
+(30; `0` disables), at most 20 batches of 100 attempts. It calls
+`IntegrationActivationRepo::prune_integration_evidence`, which empties
+`effect_receipts_json`, `operation_receipts_json` and `observations_json` of
+an attempt that finished before the cutoff. Deny-by-default: the attempt is
+terminal and not current, has no effect intent, no pending / running /
+uncertain operation and no uncertain receipt, its Task has no current attempt,
+and its queue is neither quarantined nor names it as head. **No attempt row is
+deleted**: the row is the queue's history (states, commits, timings, lineage),
+and a Review's `execution.integration_checks` and a settled Task's
+`integration_lineage` witness name it by id; what a Review quotes of a head
+check is stored in the Review itself. `integration_queues.finished_with_receipts`
+in operations status counts finished attempts that still hold receipts.
+Transfer cleanup and owner-journal acknowledgment run as before.
 
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same
@@ -5432,6 +5459,18 @@ binding changed makes a released attempt eligible for ordinary readmission;
 this also recovers a missed reconnect notification. Corrupt/newer condition
 formats retain the existing quarantine fence rather than being overwritten.
 
+Three writers can state `deferred` for one attempt row: the `park` step, the
+import continuation and the reconciler's restatement (from the scheduler's
+compact snapshot). `integration_steps::deferral::deferral` is the one rule for
+the cause and the machine waited for, from facts of the row: a quarantined
+attempt is `unresolved_result` unless the importer made it and it names no
+operation (`owner_required`: no result can still arrive); an imported row the
+worker has not parked itself reads the importer's classification (P15
+`owner_offline` with the machine the old wait named, a stored deadline
+`infrastructure`, otherwise `owner_required`); any other row reads its park
+reason code and failure kind. The reconciler restates a stated deferral only
+when cause or machine differ, never for its wording.
+
 ### Queues, attempts and the authoritative target
 
 A queue is unique by `(repo_id, target_branch)`, not by checkout location.
@@ -5666,9 +5705,10 @@ A missing matching entry result preserves the existing unchanged-target skip;
 manual/agent review authority is still checked by settle. Only the `settle`
 step that is due for its `effect_seq` records a reuse; a stale or answered
 step writes no consumer. The reuse states no check wait on the Task (the
-answer exists and the step applies it itself), and the head consumer is never
-the applied delivery of a result: its delivery step finds no checking attempt
-and ends stale. The Review's entry consumer is found by the request key
+answer exists and the step applies it itself), and the head consumer is
+created answered (`applied_at` set, no delivery step): the check worker's
+delivery sweep leaves it out, so a merge of an unchanged commit spends no
+Task step on a delivery. The Review's entry consumer is found by the request key
 review entry asks with (`TaskCheckRequest::request_key`).
 
 The consuming Task step appends the newest 64 command-shaped results to
@@ -8579,16 +8619,16 @@ checks keep the identity read at start and an earlier pass is still reused.
 The probe is bounded at ten seconds and its process group is stopped when the
 bound passes. It returns a typed reason for a timeout, incomplete output,
 excess output or failure to start. A missing answer returns
-`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`,
-REST `503 check_environment_unavailable`) before an identity or consumer is
-admitted. No `NotAttested` identity is substituted, no check executes before
+`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`)
+before an identity or consumer is admitted. Every caller is a Task step or the
+check worker, so no REST request returns it: the Task states the cause. No `NotAttested` identity is substituted, no check executes before
 the answer exists, and no passing Review can lose head evidence through a
 probe timeout. What the Task does without an answer:
 
 | Where | Bounded by | Landing |
 |---|---|---|
-| Review entry (`run_ci_steps`, automatic or the owner's re-run) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the hooks step, 1 s doubling back-off; the opened attempt and the hook checkpoint stay | The unstarted Review attempt is discarded (no Review, no review budget) and the Task states `before_work_hook_failed` / `review_ci_infrastructure` with the cause. It re-enters review on the `review_ci_infrastructure` budget's back-off (5 entries); then `review_ci_infrastructure_exhausted` with `retry_hook` and an attention item. |
-| Merge head (`request_check`, `settle` reuse) | the Task-step transient rule: 8 attempts, 1 s doubling to 64 s; then the queue asks the step again `step_reasks` times | The attempt parks as `task_step_failed`; the step's `last_error` and the Task's `cascade_failed` annotation carry the cause. |
+| Review entry (`run_ci_steps`: the workflow's own entry, the owner's re-run, the owner's Retry of the entry) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the hooks step, 1 s doubling back-off; the opened attempt and the hook checkpoint stay | The unstarted Review attempt is discarded (no Review, no review budget) and the Task states `before_work_hook_failed` / `review_ci_infrastructure` with the cause, whoever caused the entry (`interrupt_ci` annotates a user-triggered entry too). It re-enters review on the `review_ci_infrastructure` budget's back-off (5 entries); then `review_ci_infrastructure_exhausted` with `retry_hook` and an attention item. |
+| Merge head (`request_check`, `settle` reuse) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the Task step, 1 s doubling back-off | The step answers "no verdict" with the cause; nothing is asked of the check runner. The worker parks the attempt `infrastructure: check environment unavailable: ...` and the Task states `deferred` with that message. Counted retries (30 s, 2 min, 10 min), then `retries_exhausted: ...`, `owner_required` and the Retry offer; the owner's Retry starts the counted retries again. It never parks as `task_step_failed`. |
 
 The first complete answer is stored in `check_environment_attestation`, keyed
 by owner, environment generation and salt revision. Installation/generation
@@ -8741,7 +8781,13 @@ attempt and fail the hook. Exhausted infrastructure is no verdict: the Task
 is parked on the typed check condition and the step re-suspends at each
 deadline until the owner's `retry` produces a result.
 
-A step superseded while suspended never reads its result.
+A step superseded while it waits never reads its result. The wait is recorded
+on the step (`awaited_consumer_id`) in the transaction that stores the entry's
+request (`check_run::record_entry_wait_in_tx`), not only when the step
+suspends: a Hold or Cancel that stops the step after it asked and before it
+suspended finds the same request to withdraw. (Before, that step had no
+recorded wait: the consumer stayed live, its delivery found no step to wake
+and the review attempt stayed `running` under the hold until the release.)
 `review_entry::abandon_superseded_waits` cleans the wait up, in the preempting
 Cancel/Hold command's own step (before the command acts) and when a woken step
 finds its Task has left the entry:

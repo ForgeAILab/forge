@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod bootstrap;
 pub mod cli;
 pub mod controller;
 pub mod data_dir;
@@ -14,6 +15,7 @@ pub mod keymap;
 pub mod repository;
 pub mod runtime_backend;
 pub mod runtime_lock;
+pub mod session;
 pub mod startup;
 pub mod terminal;
 pub mod tracing;

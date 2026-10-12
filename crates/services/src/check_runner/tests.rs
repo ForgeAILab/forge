@@ -2007,7 +2007,7 @@ async fn an_idle_sweep_writes_nothing_and_a_poison_run_does_not_stop_the_sweep()
     assert_eq!(after, before);
     // The sweep reads through indexes that stay empty while idle.
     for sql in [
-        "SELECT 1 FROM check_consumer c WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL",
+        "SELECT 1 FROM check_consumer c WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND c.applied_at IS NULL",
         "SELECT 1 FROM check_run WHERE dispatch_json IS NOT NULL AND acknowledged_at IS NULL AND finished_at IS NOT NULL ORDER BY updated_at",
         "SELECT 1 FROM check_run WHERE state IN ('queued','running','cancelling','cleaning','uncertain') AND lease_until IS NULL",
     ] {

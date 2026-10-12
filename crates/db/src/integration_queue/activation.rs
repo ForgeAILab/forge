@@ -235,7 +235,7 @@ pub struct IntegrationQueueAges {
 // carry no hint; their plans are asserted by `EXPLAIN QUERY PLAN` tests.
 pub(super) const CLAIMABLE_QUEUES_SQL: &str = concat!(
     "SELECT q.* FROM integration_queue q WHERE q.id>? AND q.lease_until IS NULL AND ((q.head_attempt_id IS NOT NULL AND q.state<>'closed' AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=q.head_attempt_id AND ",
-    head_held_by_legacy_step!(),
+    head_held_before_handover!(),
     ")) OR (q.state='quarantined' AND q.head_attempt_id IS NULL) OR (q.state IN ('open','suspended') AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.queue_id=q.id AND a.current=1 AND a.state='queued' AND a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday(?)) AND ",
     claimable_member!(),
     "))) ORDER BY q.id LIMIT ?"
@@ -244,6 +244,10 @@ pub(super) const EXPIRED_HEADS_SQL: &str = "SELECT * FROM integration_queue INDE
 pub(super) const DUE_PARKED_SQL: &str = "SELECT * FROM integration_attempt WHERE current=1 AND available_at IS NOT NULL AND state='parked' AND id>? AND julianday(available_at)<=julianday(?) ORDER BY id LIMIT ?";
 pub(super) const CANCEL_REQUESTED_SQL: &str = "SELECT * FROM integration_attempt WHERE current=1 AND cancel_requested_at IS NOT NULL AND id>? ORDER BY id LIMIT ?";
 pub(super) const PRUNE_SQL: &str = "UPDATE integration_attempt SET effect_receipts_json='[]',operation_receipts_json='[]',observations_json='[]',revision=revision+1,updated_at=? WHERE id IN (SELECT a.id FROM integration_attempt a INDEXED BY integration_attempt_prunable WHERE a.completed_at IS NOT NULL AND (a.effect_receipts_json<>'[]' OR a.operation_receipts_json<>'[]' OR a.observations_json<>'[]') AND a.completed_at<? AND julianday(a.completed_at)<julianday(?) AND a.current=0 AND a.state IN ('completed','cancelled','superseded') AND a.effect_intent_json IS NULL AND COALESCE(a.current_operation_state,'') NOT IN ('pending','running','uncertain') AND NOT EXISTS(SELECT 1 FROM json_each(a.effect_receipts_json) r WHERE json_extract(r.value,'$.operation_state')='uncertain') AND NOT EXISTS(SELECT 1 FROM integration_attempt live WHERE live.task_ref=a.task_ref AND live.current=1) AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=a.queue_id AND (q.state='quarantined' OR q.head_attempt_id=a.id)) ORDER BY a.completed_at,a.id LIMIT ?)";
+/// Finished attempts whose receipts or observations are still stored: what
+/// [`PRUNE_SQL`] has not emptied (yet, or because a guard keeps them). Counted
+/// from the partial index the pruner walks.
+pub(super) const RETAINED_EVIDENCE_SQL: &str = "SELECT COUNT(*) FROM integration_attempt INDEXED BY integration_attempt_prunable WHERE completed_at IS NOT NULL AND (effect_receipts_json<>'[]' OR operation_receipts_json<>'[]' OR observations_json<>'[]')";
 pub(super) const TIMING_SAMPLES_SQL: &str = "SELECT phase_timings_json FROM integration_attempt WHERE state='completed' AND completed_at>=? AND phase_timings_json IS NOT NULL ORDER BY completed_at DESC LIMIT ?";
 
 fn page(limit: u32) -> u32 {
@@ -483,6 +487,9 @@ pub trait IntegrationActivationRepo: Send + Sync {
     /// receipt, a live successor of the same Task, or a quarantined queue.
     /// Returns the number pruned; call again while it equals `limit`.
     async fn prune_integration_evidence(&self, completed_before: &str, limit: u32) -> Result<u64>;
+    /// Finished attempts that still hold receipts or observations: recent
+    /// ones, and ones a guard of [`Self::prune_integration_evidence`] keeps.
+    async fn integration_evidence_retained(&self) -> Result<i64>;
     async fn integration_queue_ages(&self, now: &str) -> Result<IntegrationQueueAges>;
     /// Timings of attempts completed at or after `completed_since`, newest first.
     async fn integration_timing_samples(
@@ -900,6 +907,11 @@ impl IntegrationActivationRepo for SqliteDb {
             .rows_affected();
         tx.commit().await?;
         Ok(pruned)
+    }
+    async fn integration_evidence_retained(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar(RETAINED_EVIDENCE_SQL)
+            .fetch_one(self.pool())
+            .await?)
     }
     async fn integration_queue_ages(&self, now: &str) -> Result<IntegrationQueueAges> {
         integration_time(now)?;

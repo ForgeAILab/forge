@@ -10,9 +10,11 @@ use db::{
 };
 
 use crate::{
-    pricing::{self, parse_models_dev_catalog, PricingCatalogRepository},
-    pricing_auto::{prepare_price_in_tx, SubjectRef},
-    pricing_db::SqlitePricingRepository,
+    self as pricing,
+    auto::{prepare_price_in_tx, SubjectRef},
+    parse_models_dev_catalog,
+    sqlite::SqlitePricingRepository,
+    PricingCatalogRepository,
 };
 
 const OWNER: &str = "pricing-auto-owner";
@@ -132,6 +134,16 @@ async fn seed_with_catalog(db: &Arc<db::SqliteDb>, body: &[u8]) {
         .expect("catalog activates");
 }
 
+/// The fixture entry stores its endpoint; `services` supplies the full
+/// provider-default rules in production.
+fn stored_base_url(handle: &db::CredentialHandle) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&handle.metadata_json)
+        .ok()?
+        .get("base_url")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 async fn prepare_and_resolve(
     db: &db::SqliteDb,
     agent_id: Option<&str>,
@@ -148,6 +160,7 @@ async fn prepare_and_resolve(
         },
         agent_id,
         MODEL,
+        stored_base_url,
         &db::now_rfc3339(),
     )
     .await

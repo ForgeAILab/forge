@@ -160,6 +160,16 @@ pub struct IntegrationQueueStatus {
     pub parked: IntegrationBacklog,
     #[serde(default)]
     pub timings: IntegrationTimingStatus,
+    /// Finished merge attempts whose owner receipts and observations are
+    /// still stored. The hourly retention pass empties them once the attempt
+    /// finished more than `server.check_retention_days` ago (`0` keeps them);
+    /// it never touches a current attempt, an unsettled effect or the
+    /// evidence of a quarantined queue, and it deletes no attempt row. A
+    /// number that keeps growing past the retention period means the pass is
+    /// not running or a guard holds the rows.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub finished_with_receipts: i64,
 }
 
 /// Cascade queue health, separate from durable consumer dead letters.
