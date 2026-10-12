@@ -67,10 +67,20 @@ macro_rules! claimable_member {
     };
 }
 /// A reserved head (an imported unknown result) the worker may not drive
-/// yet: the old merge's own hooks step is still live.
-macro_rules! head_held_by_legacy_step {
+/// yet: the old merge's own hooks step is still live, or the row's import
+/// continuation step is (pending, claimed or suspended). The continuation
+/// reports a row it finds `applied`; a driver that reconciled the head to
+/// `applied` under it would be a second writer of that merge. A live step is
+/// asked for, not a settled one: a reserved head whose settled continuation
+/// was pruned must not be held for good.
+macro_rules! head_held_before_handover {
     () => {
-        concat!(pre_queue_attempt!(), " AND ", entry_hooks_live!())
+        concat!(
+            pre_queue_attempt!(),
+            " AND (",
+            entry_hooks_live!(),
+            " OR EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref AND s.causation_key='integration-import:'||a.id AND s.status IN ('pending','claimed','suspended')))"
+        )
     };
 }
 
@@ -1232,7 +1242,7 @@ pub(super) async fn claim_queue_in_tx(
         }
         let held: bool = sqlx::query_scalar(concat!(
             "SELECT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=? AND ",
-            head_held_by_legacy_step!(),
+            head_held_before_handover!(),
             ")"
         ))
         .bind(head)

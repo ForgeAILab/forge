@@ -2062,7 +2062,8 @@ async fn an_admitted_attempt_is_claimed_past_a_pre_queue_row_that_was_not_handed
 }
 
 /// An imported unknown result is a reserved head. The worker does not drive
-/// it while the old merge's own hooks step is live, and does once it is not.
+/// it while the old merge's own hooks step or the row's import continuation
+/// step is live, and does once neither is.
 #[tokio::test]
 async fn a_reserved_imported_head_is_held_while_the_old_merge_step_is_live() {
     let db = fixture().await;
@@ -2089,6 +2090,54 @@ async fn a_reserved_imported_head_is_held_while_the_old_merge_step_is_live() {
         Err(DbError::VersionConflict)
     ));
     exec(&db, "UPDATE task_step SET status='done' WHERE id='legacy'").await;
+    // The old step is gone and the row's import continuation is still to
+    // run, running or waiting (it retries behind a suspended hooks step). It
+    // reports a row it finds `applied`: a driver that took the head now and
+    // reconciled it to `applied` would hold the merge beside it (seen in CI
+    // as `[ImportContinuation, WorkerDriver]` on a P1 row).
+    let key = format!("integration-import:{}", head.id);
+    step(&db, "a", "cont", "integration", &key, "pending").await;
+    for live in ["pending", "claimed", "suspended"] {
+        exec(
+            &db,
+            &format!("UPDATE task_step SET status='{live}' WHERE id='cont'"),
+        )
+        .await;
+        assert!(listed(&db).await.is_empty(), "continuation {live}");
+        assert!(
+            matches!(
+                claim(&db, &q.id, NOW, LATER).await,
+                Err(DbError::VersionConflict)
+            ),
+            "continuation {live}"
+        );
+    }
+    exec(&db, "UPDATE task_step SET status='done' WHERE id='cont'").await;
+    assert_eq!(listed(&db).await, vec![q.id.clone()]);
+    let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
+    assert_eq!(claimed.head_attempt_id.as_deref(), Some(head.id.as_str()));
+}
+
+/// A reserved imported head whose settled continuation step was pruned (or
+/// that never had one) is not held: only a live step holds it.
+#[tokio::test]
+async fn a_reserved_imported_head_without_a_live_continuation_is_claimable() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let mut row = admission(&q, "a", "import:a:0");
+    row.import_source_json = Some(serde_json::json!({"version":1,"priority":1}));
+    let head = db.admit_integration_attempt(row).await.unwrap();
+    sqlx::query("UPDATE integration_attempt SET state='reconciling' WHERE id=?")
+        .bind(&head.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_queue SET state='quarantined',head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&head.id)
+        .bind(&q.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     assert_eq!(listed(&db).await, vec![q.id.clone()]);
     let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
     assert_eq!(claimed.head_attempt_id.as_deref(), Some(head.id.as_str()));

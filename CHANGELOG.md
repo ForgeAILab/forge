@@ -3039,6 +3039,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **One writer per merge during an upgrade: an imported unknown result is
+  not driven while its import continuation is still to run.** The queue
+  worker could take a reserved imported head (a merge whose old operation
+  never reported) as soon as the old merge's hooks step was gone, while the
+  row's `import_continue` step was still pending. The driver then proved the
+  merge landed and the continuation reported the same row. Both writes were
+  idempotent and the Task ended `done` once, but two writers held the merge.
+  The claim now also waits for a live continuation step of the head.
+
 - **Merging an unchanged commit no longer spends a Task step on a check
   delivery nobody reads.** The queue head's reuse of the review entry's
   check result is applied by the `settle` step that records it; its consumer

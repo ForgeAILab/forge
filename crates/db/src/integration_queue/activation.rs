@@ -235,7 +235,7 @@ pub struct IntegrationQueueAges {
 // carry no hint; their plans are asserted by `EXPLAIN QUERY PLAN` tests.
 pub(super) const CLAIMABLE_QUEUES_SQL: &str = concat!(
     "SELECT q.* FROM integration_queue q WHERE q.id>? AND q.lease_until IS NULL AND ((q.head_attempt_id IS NOT NULL AND q.state<>'closed' AND NOT EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=q.head_attempt_id AND ",
-    head_held_by_legacy_step!(),
+    head_held_before_handover!(),
     ")) OR (q.state='quarantined' AND q.head_attempt_id IS NULL) OR (q.state IN ('open','suspended') AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.queue_id=q.id AND a.current=1 AND a.state='queued' AND a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday(?)) AND ",
     claimable_member!(),
     "))) ORDER BY q.id LIMIT ?"
