@@ -160,9 +160,31 @@ pub struct IntegrationSteps {
     pub(crate) timers: IntegrationStepTimers,
 }
 
-/// How often the continuation of an imported, landed merge asks the target's
-/// owner for the proof before it parks the attempt for the Task's owner.
+/// How often in a row the continuation of an imported, landed merge gets no
+/// answer about its commit, from an owner that will not come back by itself
+/// (a removed machine, a checkout that is gone, a connected machine that
+/// keeps failing the read), before it parks the attempt for the Task's
+/// owner. An owner machine that is merely not connected is waited for and
+/// not counted (`proof::target_owner_away`).
 pub(crate) const IMPORT_PROOF_ASKS: i64 = 5;
+/// The same bound when the owner answered that the target does not contain
+/// the commit: the second answer confirms the first.
+pub(crate) const IMPORT_ABSENT_ASKS: i64 = 2;
+/// The asks so far are carried on the continuation step itself, as the end
+/// of its retry reason (`task_step.last_error`): `... [asked N, answered]`
+/// or `... [asked N, no answer]`. A step whose last retry was for anything
+/// else (it waited for the entry's hooks, an error, a build before this
+/// counter) starts at one, so a row is never parked on runs that asked
+/// nothing.
+fn import_asks(step: &TaskStep, answered: bool) -> i64 {
+    let kind = if answered { "answered" } else { "no answer" };
+    step.last_error
+        .as_deref()
+        .and_then(|last| last.strip_suffix(&format!(", {kind}]")))
+        .and_then(|last| last.rsplit_once(" [asked "))
+        .and_then(|(_, asked)| asked.parse::<i64>().ok())
+        .map_or(1, |asked| asked.saturating_add(1))
+}
 
 impl IntegrationSteps {
     pub fn new(task_service: crate::TaskService) -> Self {
@@ -808,7 +830,7 @@ impl IntegrationSteps {
             Ok(sha) => sha,
             Err(unproven) => {
                 return self
-                    .result_unproven(step, request, &attempt, unproven, imported)
+                    .result_unproven(step, request, &attempt, queue.as_ref(), unproven, imported)
                     .await
             }
         };
@@ -974,14 +996,17 @@ impl IntegrationSteps {
     ///   again; validation then reads the target as it is.
     /// - No answer, or an imported row: the step stays and asks again at
     ///   `result_park`; the worker re-arms it on every sweep. An imported
-    ///   row has no worker: its continuation asks [`IMPORT_PROOF_ASKS`]
-    ///   times and then parks the attempt for the owner
-    ///   (`park_unproven_import`).
+    ///   row has no worker: its continuation parks the attempt for the owner
+    ///   (`park_unproven_import`) at the second "not contained"
+    ///   ([`IMPORT_ABSENT_ASKS`]) or after [`IMPORT_PROOF_ASKS`] asks nobody
+    ///   answered, and waits without a bound for a target owner machine that
+    ///   is only not connected.
     async fn result_unproven(
         &self,
         step: &TaskStep,
         request: &IntegrationStepRequest,
         attempt: &IntegrationAttempt,
+        queue: Option<&db::IntegrationQueue>,
         unproven: TargetProof,
         imported: bool,
     ) -> Result<StepOutcome> {
@@ -990,8 +1015,36 @@ impl IntegrationSteps {
             TargetProof::Unknown(why) => (false, why),
             TargetProof::Contains => unreachable!("a proven merge is reported"),
         };
-        if imported && step.attempts >= IMPORT_PROOF_ASKS {
-            return self.park_unproven_import(step, attempt, &why).await;
+        // An imported row has no worker to take it off a slot. Its asks end
+        // with a park for the owner, but only on asks that could have been
+        // answered: a target owner that is merely not connected is waited
+        // for, however long (a park needs the owner to decide something, and
+        // "the machine is offline" is not a decision).
+        let mut asks = None;
+        if imported {
+            let away = match queue {
+                Some(queue) if !answered => {
+                    proof::target_owner_away(
+                        &self.db,
+                        self.task_service.daemon_connections.as_ref(),
+                        queue,
+                    )
+                    .await?
+                }
+                _ => None,
+            };
+            if away.is_none() {
+                let asked = import_asks(step, answered);
+                let bound = if answered {
+                    IMPORT_ABSENT_ASKS
+                } else {
+                    IMPORT_PROOF_ASKS
+                };
+                if asked >= bound {
+                    return self.park_unproven_import(step, attempt, &why, asked).await;
+                }
+                asks = Some(asked);
+            }
         }
         let message = bounded(&format!(
             "the merge of this Task is not confirmed on its target: {why}"
@@ -1030,8 +1083,15 @@ impl IntegrationSteps {
         }
         if !answered || imported {
             tx.commit().await?;
+            let reason = match asks {
+                Some(asked) => format!(
+                    "{message} [asked {asked}, {}]",
+                    if answered { "answered" } else { "no answer" }
+                ),
+                None => message,
+            };
             return Ok(StepOutcome::RetryAt(
-                message,
+                reason,
                 chrono::Utc::now() + self.timers.result_park,
             ));
         }
@@ -1069,8 +1129,8 @@ impl IntegrationSteps {
         Ok(StepOutcome::Settled)
     }
 
-    /// An imported, landed merge is still not proven after
-    /// [`IMPORT_PROOF_ASKS`] asks. No worker holds a slot for such a row and
+    /// An imported, landed merge is still not proven after its bound of asks
+    /// (`result_unproven`). No worker holds a slot for such a row and
     /// nothing else would end the asking, so the continuation ends it: the
     /// attempt is parked for the Task's owner (`applied -> parked`,
     /// `owner_required`, no deadline, its unproven commit claim dropped as
@@ -1083,9 +1143,10 @@ impl IntegrationSteps {
         step: &TaskStep,
         attempt: &IntegrationAttempt,
         why: &str,
+        asked: i64,
     ) -> Result<StepOutcome> {
         let message = bounded(&format!(
-            "the merge of this Task from before the upgrade is not confirmed on its target ({why}); asked {IMPORT_PROOF_ASKS} times. Retry puts the Task back in line; Cancel ends it."
+            "the merge of this Task from before the upgrade is not confirmed on its target ({why}); asked {asked} times. Retry puts the Task back in line; Cancel ends it."
         ));
         tracing::warn!(target: "services::integration_steps", task_id = %attempt.task_ref, attempt_id = %attempt.id, %message, "imported merge parked for its owner");
         let mut parked = attempt.clone();
