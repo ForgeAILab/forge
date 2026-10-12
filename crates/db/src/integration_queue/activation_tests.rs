@@ -1,6 +1,6 @@
 use super::activation::{
     CANCEL_REQUESTED_SQL, CLAIMABLE_QUEUES_SQL, DUE_PARKED_SQL, EXPIRED_HEADS_SQL, PRUNE_SQL,
-    TIMING_SAMPLES_SQL,
+    RETAINED_EVIDENCE_SQL, TIMING_SAMPLES_SQL,
 };
 use super::tests::{admission, fixture, legacy_digest, seed, FIXED_TIME};
 use super::*;
@@ -1726,6 +1726,11 @@ async fn hinted_statements_prepare_and_their_indexes_are_pinned() {
         ),
         (
             PRUNE_SQL,
+            "integration_attempt_prunable",
+            "CREATE INDEX integration_attempt_prunable ON integration_attempt(completed_at,id) WHERE completed_at IS NOT NULL AND (effect_receipts_json<>'[]' OR operation_receipts_json<>'[]' OR observations_json<>'[]')",
+        ),
+        (
+            RETAINED_EVIDENCE_SQL,
             "integration_attempt_prunable",
             "CREATE INDEX integration_attempt_prunable ON integration_attempt(completed_at,id) WHERE completed_at IS NOT NULL AND (effect_receipts_json<>'[]' OR operation_receipts_json<>'[]' OR observations_json<>'[]')",
         ),
