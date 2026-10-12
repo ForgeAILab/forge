@@ -278,3 +278,257 @@ async fn a_root_without_a_planner_moves_to_implementation_and_starts_its_subtask
         "{log:?}"
     );
 }
+
+/// The lead cancels (here: the owner cancels) the last incomplete subtask
+/// while the root plans. The terminal subtask runs the root advance directly;
+/// it must leave the root in planning with its planner, and must not hop on
+/// to aggregate review.
+#[tokio::test]
+async fn cancelling_the_last_subtask_while_the_root_plans_keeps_the_planner() {
+    let lead = lead_fixture(false).await;
+    let (root, child) = root_with_child(&lead, true).await;
+    passes(&lead, 3).await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
+
+    let held = reload(&lead.db, &child.id).await;
+    lead.dispatcher
+        .task_service
+        .perform_task_action(
+            &child.id,
+            api_types::TaskAction::Cancel { reason: None },
+            held.version,
+        )
+        .await
+        .expect("a held subtask is cancelled");
+    passes(&lead, 4).await;
+
+    assert_eq!(reload(&lead.db, &child.id).await.status, "cancelled");
+    let planning = reload(&lead.db, &root.id).await;
+    assert_eq!(planning.status, "planning", "no hop to aggregate review");
+    assert!(
+        !crate::task_service::coordination_review_pending(&planning),
+        "a flag left set would starve the planner: {:?}",
+        planning.metadata_json
+    );
+    assert_eq!(
+        executions(&lead.db, &root.id).await,
+        vec![("planner".to_owned(), "running".to_owned())]
+    );
+    let log: Vec<(String, String)> = sqlx::query_as(
+        "SELECT from_state, to_state FROM transition_log WHERE task_id=? ORDER BY created_at, rowid",
+    )
+    .bind(&root.id)
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(log, vec![("todo".to_owned(), "planning".to_owned())]);
+}
+
+/// With every subtask already terminal, a root that has a lead still goes
+/// through its planner before aggregate review.
+#[tokio::test]
+async fn a_planner_that_succeeds_with_nothing_left_sends_the_root_to_review() {
+    let lead = lead_fixture(true).await;
+    let root = seed_task(&lead.db, &lead.project, "root", "todo", 1).await;
+    seed_subtask(&lead.db, &root, "child", "cancelled", 0).await;
+    assign_role(
+        &lead.db,
+        &root.id,
+        crate::workflow::default_roles::PLANNER,
+        &lead.planner,
+    )
+    .await;
+    let entries = async || -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT from_state, to_state FROM transition_log WHERE task_id=? ORDER BY created_at, rowid",
+        )
+        .bind(&root.id)
+        .fetch_all(lead.db.pool())
+        .await
+        .unwrap()
+    };
+    until(&lead, "the root reaches aggregate review", async || {
+        entries().await.iter().any(|(_, to)| to == "review")
+    })
+    .await;
+    // With no reviewer assigned the review gate passes on by itself; the
+    // path up to it is what this stage decides.
+    let log = entries().await;
+    assert_eq!(
+        log[..3],
+        [
+            ("todo".to_owned(), "planning".to_owned()),
+            ("planning".to_owned(), "in_progress".to_owned()),
+            ("in_progress".to_owned(), "review".to_owned()),
+        ]
+    );
+    assert_eq!(
+        executions(&lead.db, &root.id).await[0],
+        ("planner".to_owned(), "completed".to_owned())
+    );
+}
+
+/// Holding a root that plans stops its planner and names the hold on its
+/// subtask; the release runs the planner again.
+#[tokio::test]
+async fn a_hold_and_release_in_planning_stops_and_reruns_the_planner() {
+    let lead = lead_fixture(false).await;
+    let (root, child) = root_with_child(&lead, true).await;
+    passes(&lead, 3).await;
+    let planning = reload(&lead.db, &root.id).await;
+    assert_eq!(planning.status, "planning");
+    let service = &lead.dispatcher.task_service;
+
+    service
+        .perform_task_action(
+            &root.id,
+            api_types::TaskAction::Hold { reason: None },
+            planning.version,
+        )
+        .await
+        .expect("a planning root is held");
+    passes(&lead, 3).await;
+    let held = reload(&lead.db, &root.id).await;
+    assert_eq!(held.status, "planning");
+    assert!(
+        !executions(&lead.db, &root.id)
+            .await
+            .iter()
+            .any(|(_, status)| status == "running"),
+        "the hold stops the planner"
+    );
+    let reason = park(&lead.db, &child.id).await;
+    assert!(
+        reason.contains("ParentWait") && reason.contains("\"held\""),
+        "held takes precedence over planning: {reason}"
+    );
+    assert_eq!(executions(&lead.db, &child.id).await, Vec::new());
+
+    let offers = service.test_action_values(&root.id).await.unwrap();
+    assert!(
+        offers.contains(&api_types::TaskAction::Release { reason: None }),
+        "a held planning root offers its release: {offers:?}"
+    );
+    service
+        .perform_task_action(
+            &root.id,
+            api_types::TaskAction::Release { reason: None },
+            held.version,
+        )
+        .await
+        .expect("the root is released");
+    passes(&lead, 4).await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
+    let runs = executions(&lead.db, &root.id).await;
+    assert_eq!(
+        runs.iter().filter(|(_, status)| status == "running").count(),
+        1,
+        "the release runs the planner again: {runs:?}"
+    );
+    assert_eq!(executions(&lead.db, &child.id).await, Vec::new());
+    assert!(park(&lead.db, &child.id).await.contains("\"planning\""));
+}
+
+/// Kickoff does not take a Project slot: a root that moved to its
+/// implementation state counts for nothing by itself, and a root whose lead
+/// runs holds one slot, as any running Task does.
+#[tokio::test]
+async fn kickoff_leaves_the_project_slot_count_to_running_work() {
+    let lead = lead_fixture(false).await;
+    let project = set_project_active_task_limit(&lead.db, &lead.project, 5).await;
+    let slots = async || {
+        let project = ProjectRepo::get_by_id(&*lead.db, &project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let slots = crate::task_dispatcher::slots::load_project_slots(&lead.db, &project)
+            .await
+            .unwrap();
+        (slots.active, slots.queued)
+    };
+    // No lead: the root is in_progress, its one running subtask is the slot.
+    let (plain, plain_child) = root_with_child(&lead, false).await;
+    assert_eq!(slots().await, (0, 2));
+    passes(&lead, 3).await;
+    assert_eq!(reload(&lead.db, &plain.id).await.status, "in_progress");
+    assert_eq!(executions(&lead.db, &plain_child.id).await.len(), 1);
+    assert_eq!(slots().await, (1, 0), "the root holds no slot of its own");
+
+    // With a lead: the planning root's running planner is one slot, and its
+    // held subtask is still queued.
+    let (led, _) = root_with_child(&lead, true).await;
+    passes(&lead, 3).await;
+    assert_eq!(reload(&lead.db, &led.id).await.status, "planning");
+    assert_eq!(slots().await, (2, 1));
+}
+
+/// Upgrade: a root left in `todo` by the previous release while its subtask
+/// was already running. The first pass moves the root; the running subtask
+/// is not interrupted and nothing is started twice.
+#[tokio::test]
+async fn a_root_left_in_todo_with_a_running_subtask_is_moved_without_interrupting_it() {
+    let lead = lead_fixture(false).await;
+    let root = seed_task(&lead.db, &lead.project, "root", "todo", 1).await;
+    let child = seed_subtask(&lead.db, &root, "child", "in_progress", 0).await;
+    let later = seed_subtask(&lead.db, &root, "later", "todo", 1).await;
+    assign_role(
+        &lead.db,
+        &root.id,
+        crate::workflow::default_roles::CODER,
+        &lead.coder,
+    )
+    .await;
+    let now = now_rfc3339();
+    let running = ExecutionRepo::create(
+        &*lead.db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: child.id.clone(),
+            agent_id: Some(lead.coder.clone()),
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some(now.clone()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "task_state": "in_progress",
+                })
+                .to_string(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("the running execution of the previous release");
+
+    passes(&lead, 4).await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    assert_eq!(executions(&lead.db, &root.id).await, Vec::new());
+    assert_eq!(
+        executions(&lead.db, &child.id).await,
+        vec![("coder".to_owned(), "running".to_owned())],
+        "the running subtask is neither stopped nor started again"
+    );
+    let still = ExecutionRepo::get_by_id(&*lead.db, &running.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.status, ExecutionStatus::Running);
+    assert_eq!(reload(&lead.db, &child.id).await.status, "in_progress");
+    assert_eq!(executions(&lead.db, &later.id).await, Vec::new());
+}

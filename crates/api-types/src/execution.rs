@@ -186,6 +186,16 @@ pub enum EffectiveCoderSource {
     InheritedFromRoot,
 }
 
+/// The lead of a coordination root, as a Task sees it: the Agent assigned to
+/// the root's planning role. A root reports its `own` row; its subtasks
+/// report the same row as `inherited_from_root`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct EffectiveLeadResponse {
+    pub assignment: TaskRoleAssignmentResponse,
+    pub source: EffectiveCoderSource,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskResponse {
@@ -210,6 +220,11 @@ pub struct TaskResponse {
     pub role_assignments: Vec<TaskRoleAssignmentResponse>,
     pub effective_coder: Option<TaskRoleAssignmentResponse>,
     pub effective_coder_source: Option<EffectiveCoderSource>,
+    /// The lead of the coordination root this Task is, or belongs to; `null`
+    /// for a root without a lead, its subtasks, and a Task without subtasks.
+    #[serde(default)]
+    #[ts(optional)]
+    pub effective_lead: Option<EffectiveLeadResponse>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
     /// Gate state keys plus non-gate budget kinds; all values are authoritative remaining allowances.

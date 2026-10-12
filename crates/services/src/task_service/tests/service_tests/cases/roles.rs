@@ -1128,6 +1128,36 @@ async fn a_native_planner_is_assignable_as_the_lead_of_a_coordination_root() {
         .expect("the root has a lead");
     assert_eq!(resolved.assignee_id.as_deref(), Some(native.as_str()));
 
+    // What a Task response reports: the root's own row, and the same row
+    // for its subtask as inherited from the root.
+    let root_rows = TaskRoleAssignmentRepo::list_by_task(&*db, &root.id)
+        .await
+        .unwrap();
+    let own = crate::task_hierarchy::effective_lead(&db, &root, &root_rows, &workflow)
+        .await
+        .unwrap()
+        .expect("the root reports its lead");
+    assert_eq!(own.source, api_types::EffectiveCoderSource::Own);
+    assert_eq!(own.assignment.assignee_id.as_deref(), Some(native.as_str()));
+    let child = TaskRepo::list_subtasks_ordered(&*db, &root.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let inherited = crate::task_hierarchy::effective_lead(
+        &db,
+        &child,
+        &[],
+        &WorkflowEngine::resolve_subtask_workflow(),
+    )
+    .await
+    .unwrap()
+    .expect("the subtask reports its root's lead");
+    assert_eq!(
+        inherited.source,
+        api_types::EffectiveCoderSource::InheritedFromRoot
+    );
+    assert_eq!(inherited.assignment.task_id, root.id);
+
     // A planner on a Task that coordinates nothing is not a lead: any Agent
     // may hold it, as before.
     let plain = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
@@ -1139,10 +1169,16 @@ async fn a_native_planner_is_assignable_as_the_lead_of_a_coordination_root() {
         )
         .await
         .expect("a CLI planner on an ordinary Task is unchanged");
-    assert!(crate::task_hierarchy::root_lead(&db, &plain, &workflow)
+    let plain_rows = TaskRoleAssignmentRepo::list_by_task(&*db, &plain.id)
         .await
-        .expect("resolves")
-        .is_some());
+        .unwrap();
+    assert!(
+        crate::task_hierarchy::effective_lead(&db, &plain, &plain_rows, &workflow)
+            .await
+            .unwrap()
+            .is_none(),
+        "a Task without subtasks reports no lead"
+    );
 }
 
 /// v1 runs a lead only under the built-in `planner` role name.

@@ -169,6 +169,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     TaskAction::export().expect("export TaskAction");
     TaskActionsResponse::export().expect("export TaskActionsResponse");
     EffectiveCoderSource::export().expect("export EffectiveCoderSource");
+    EffectiveLeadResponse::export().expect("export EffectiveLeadResponse");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
     ExecutionBehaviorKind::export().expect("export ExecutionBehaviorKind");

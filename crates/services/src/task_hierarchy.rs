@@ -267,6 +267,44 @@ pub async fn root_lead(
     Ok(row.filter(|row| policy.lead(&root.id, std::slice::from_ref(row)).is_some()))
 }
 
+/// The lead a Task response reports: a coordination root's own lead, and for
+/// a subtask its root's. `own_rows` and `task_workflow` are what the caller
+/// already loaded for `task`; nothing more is read unless a lead may exist.
+pub async fn effective_lead(
+    db: &SqliteDb,
+    task: &Task,
+    own_rows: &[TaskRoleAssignment],
+    task_workflow: &WorkflowDefinition,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+        // A root resolves under the Project workflow, which is its own.
+        let policy = RootRolePolicy::for_workflow(task_workflow);
+        let Some(lead) = policy.lead(&task.id, own_rows) else {
+            return Ok(None);
+        };
+        if !coordination_root_has_subtasks(db, task).await? {
+            return Ok(None);
+        }
+        return Ok(Some(EffectiveCoderAssignment {
+            assignment: lead.clone(),
+            source: EffectiveCoderSource::Own,
+        }));
+    };
+    let root_rows = TaskRoleAssignmentRepo::list_by_task(db, parent_task_id).await?;
+    if !root_rows.iter().any(|row| {
+        row.role_name != crate::workflow::default_roles::CODER && row.assignee_id.is_some()
+    }) {
+        return Ok(None);
+    }
+    let (_, workflow) = coordination_root_context(db, parent_task_id).await?;
+    Ok(RootRolePolicy::for_workflow(&workflow)
+        .lead(parent_task_id, &root_rows)
+        .map(|lead| EffectiveCoderAssignment {
+            assignment: lead.clone(),
+            source: EffectiveCoderSource::InheritedFromRoot,
+        }))
+}
+
 /// Admit an assignee for the lead (the planning role) of coordination root
 /// `task_id`. `backend_kind` is the assigned Agent's, and `None` for a
 /// person. An empty assignment is always admitted: it removes the lead.
@@ -599,17 +637,6 @@ pub(crate) fn coordination_root_allows_child_dispatch(
     workflow: &WorkflowDefinition,
 ) -> bool {
     !root_blocked(parent) && workflow.state_kind(&parent.status) == Some(StateKind::Active)
-}
-
-/// Return whether a coordination root's non-empty child sequence is complete.
-#[cfg(test)]
-pub(crate) async fn coordination_root_sequence_complete(
-    db: &SqliteDb,
-    task: &Task,
-    workflow: &WorkflowDefinition,
-) -> Result<bool> {
-    let children = children_if_root(db, task).await?;
-    Ok(child_sequence_complete(&children, workflow))
 }
 
 /// Require every child to finish before aggregate review or terminal entry.
