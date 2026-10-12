@@ -1283,7 +1283,16 @@ async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_mer
     let world = World::new().await;
     world.legacy_task("t", "t.txt", "merging").await;
     world.seed_execution("t", "executor", None).await;
-    let (imported, _) = world.imported("t").await;
+    // Startup classifies every row before any continuation may run.
+    // Enqueuing first and then rewriting the row allowed the live step
+    // worker to finish a different disposition before this fixture's write.
+    world.db.import_integration_pass(100).await.unwrap();
+    let imported = world
+        .db
+        .current_integration_attempt("t")
+        .await
+        .unwrap()
+        .unwrap();
     // As the importer and the worker leave a merge whose old operation never
     // reported and whose checkouts could not be read then.
     sqlx::query("UPDATE integration_attempt SET state='quarantined',current_operation_state='uncertain',operation_id='old-merge',failure_kind='needs_fact',failure_message='integration result unknown',available_at=NULL,revision=revision+1 WHERE id=?")
@@ -1291,6 +1300,14 @@ async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_mer
         .execute(world.db.pool())
         .await
         .unwrap();
+    super::super::import::import_at_start(&world.db)
+        .await
+        .unwrap();
+    world
+        .until("t", "the owner is told the result is unknown", || async {
+            integration(&world.task("t").await)["cause"] == "unresolved_result"
+        })
+        .await;
     let refused = db::RepoRepo::delete(&*world.db, "r").await;
     assert!(
         matches!(&refused, Err(db::DbError::IntegrationUnresolved { task_id, .. }) if task_id == "t"),
@@ -1298,14 +1315,23 @@ async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_mer
     );
     let production = Production::new(&world);
     let running = production.run();
-    // The owner's Retry (`perform_task_action` reaches this through the
-    // `integration_retry` offer of the `deferred` statement; whether the
-    // import continuation has stated it yet is not what is under test).
-    world
-        .service
-        .retry_integration(&world.task("t").await)
+    // The public offer must exist and its action must end the wait.
+    assert!(world
+        .offers("t")
         .await
-        .expect("the Retry settles the old operation instead of refusing");
+        .contains(&("retry".into(), "integration_retry".into())));
+    world
+        .act(
+            "t",
+            TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+        )
+        .await;
     world
         .until(
             "t",
@@ -1812,4 +1838,218 @@ async fn approving_a_held_merging_task_settles_its_attempt() {
     }
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
+/// A durable attempt, a lost/wrong condition, then a parked cause behind a
+/// real Hold. Reconciliation restores ownership without a new admission,
+/// hook replay, or loss of the Hold's primary action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_dispatcher_restates_stale_integration_from_the_current_attempt() {
+    let world = World::new().await;
+    world.legacy_task("stale", "stale.txt", "merging").await;
+    world.seed_execution("stale", "executor", None).await;
+    let current = world
+        .service
+        .admit_to_integration_queue("stale")
+        .await
+        .unwrap();
+    let dispatcher = dispatcher(&world).await;
+    world
+        .until("stale", "missing ownership is restated", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            integration(&world.task("stale").await)["attempt_id"] == current.id
+        })
+        .await;
+    let raw: String = world
+        .scalar(
+            "SELECT CAST(condition_json AS TEXT) FROM task WHERE id=?",
+            "stale",
+        )
+        .await;
+    sqlx::query("UPDATE task SET condition_json=? WHERE id='stale'")
+        .bind(raw.replace(&current.id, "stale-attempt"))
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world
+        .until("stale", "old ownership is replaced", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            integration(&world.task("stale").await)["attempt_id"] == current.id
+        })
+        .await;
+    world.act("stale", TaskAction::Hold { reason: None }).await;
+    world.set(&current.id, "state='parked',failure_kind='owner_required',failure_message='target_dirty: local edit',available_at=NULL").await;
+    world
+        .until(
+            "stale",
+            "the current parked cause is restated behind the hold",
+            || async {
+                dispatcher.reconcile_all().await.unwrap();
+                integration(&world.task("stale").await)["cause"] == "target_dirty"
+            },
+        )
+        .await;
+    assert!(matches!(
+        world.task("stale").await.condition,
+        db::TaskCondition::Parked {
+            primary: db::ParkReason::Held { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        world
+            .db
+            .current_integration_attempt("stale")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        current.id
+    );
+    assert_eq!(
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                "stale"
+            )
+            .await,
+        1
+    );
+    assert_eq!(
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM task_step WHERE task_id=? AND kind='hooks'",
+                "stale"
+            )
+            .await,
+        0
+    );
+}
+
+/// The pre-queue rejection rule charges one merge fix and one rejection at
+/// the merging gate for a red candidate / dirty Task. Dirty target is an
+/// owner stop, with no charge. The queue must preserve those outcomes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn red_head_dirty_task_and_dirty_target_preserve_pre_queue_budget_outcomes() {
+    for case in ["red", "dirty-task", "dirty-target"] {
+        let world = World::new().await;
+        let a = world.reconciled("budget", "budget.txt").await;
+        match case {
+            "red" => {
+                review_ci(&world, "budget", &["exit 7"]).await;
+                world.move_target("outside").await;
+            }
+            "dirty-task" => {
+                std::fs::write(world.tree("budget").join("local"), "dirty\n").unwrap();
+            }
+            _ => {
+                std::fs::write(world.repo().join("local"), "dirty\n").unwrap();
+            }
+        }
+        let production = Production::new(&world);
+        let running = production.run();
+        world
+            .until("budget", "the budget outcome is settled", || async {
+                if case == "dirty-target" {
+                    integration(&world.task("budget").await)["cause"] == "target_dirty"
+                } else {
+                    world.task("budget").await.status == "merge_failed"
+                }
+            })
+            .await;
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        let charged: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind,spent FROM task_budget WHERE task_id='budget' AND spent>0 ORDER BY kind",
+        )
+        .fetch_all(world.db.pool())
+        .await
+        .unwrap();
+        let expected = if case == "dirty-target" {
+            vec![]
+        } else {
+            vec![("gate:merging".to_owned(), 1), ("merge_fix".to_owned(), 1)]
+        };
+        assert_eq!(charged, expected, "{case}");
+        assert_eq!(world.merges("budget").await, 0, "{case}");
+        if case == "dirty-target" {
+            assert_eq!(world.attempt(&a.id).await.state, S::Parked);
+            assert_eq!(world.task("budget").await.status, "merging");
+        } else {
+            assert_eq!(world.attempt(&a.id).await.state, S::Ejected);
+        }
+    }
+}
+
+/// 1a, the other half: a binding is replaced only when it is provably gone.
+/// A placement that is not `ready` (its machine is away) proves nothing: the
+/// parked attempt keeps its binding, and the owner's Retry puts that same
+/// attempt back in line. Once recovery has verified the placement `ready`
+/// under another generation, the attempt is superseded by one bound to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_attempt_is_rebound_only_when_its_ready_placement_names_another_binding() {
+    let world = World::new().await;
+    world.legacy_task("bind", "bind.txt", "merging").await;
+    world.seed_execution("bind", "executor", None).await;
+    let first = world
+        .service
+        .admit_to_integration_queue("bind")
+        .await
+        .unwrap();
+    let placement = first.placement_id.clone().unwrap();
+    world.set(&first.id, "state='parked',placement_generation=placement_generation+7,failure_kind='infrastructure',failure_message='owner_offline: owner absent',available_at=NULL").await;
+    sqlx::query("UPDATE workspace_placement SET state='disconnected' WHERE id=?")
+        .bind(&placement)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let attempts = || async {
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                "bind",
+            )
+            .await
+    };
+    world.service.integration_owner_ready("bind").await.unwrap();
+    assert_eq!(attempts().await, 1, "an away machine's binding was stolen");
+    let task = world.task("bind").await;
+    world.service.retry_integration(&task).await.unwrap();
+    let current = world
+        .db
+        .current_integration_attempt("bind")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (attempts().await, current.id.as_str()),
+        (1, first.id.as_str()),
+        "Retry replaced the attempt of a machine that is only away"
+    );
+    assert!(
+        current.available_at.is_some(),
+        "Retry did not put the parked attempt back in line"
+    );
+    world
+        .set(&first.id, "state='parked',available_at=NULL")
+        .await;
+    sqlx::query("UPDATE workspace_placement SET state='ready' WHERE id=?")
+        .bind(&placement)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.service.integration_owner_ready("bind").await.unwrap();
+    let rebound = world
+        .db
+        .current_integration_attempt("bind")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebound.predecessor_attempt_id.as_deref(),
+        Some(first.id.as_str())
+    );
+    assert_eq!(rebound.placement_generation, first.placement_generation);
+    assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
+    assert_eq!(rebound.queue_seq, first.queue_seq);
 }

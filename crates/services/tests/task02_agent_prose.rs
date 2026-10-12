@@ -410,6 +410,69 @@ async fn project_agent_prose_stays_pending_and_reads_are_sanitized() {
     // The typed Task boundary rejects status/delivery/review/validation/git/
     // evidence fields rather than treating them as a Task result.  The
     // structured error is sanitized and does not echo the model's prose.
+    // Authority is decided before the payload is looked at, and a Project
+    // in setup holds no `propose_task`: the claim-shaped payload is refused
+    // there without being read back.
+    let unadmitted = fixture
+        .provider
+        .propose(
+            AGENT_ID,
+            &fixture.scope,
+            RUNTIME_SESSION_ID,
+            "task.propose",
+            proposal_arguments(
+                json!({"title": "Claimed completed Task", "description": CLAIM, "status": "done"}),
+                "task02-setup-claim",
+            ),
+        )
+        .await;
+    let unadmitted = match unadmitted {
+        Err(AgentHostError::StructuredOutcome(outcome)) => *outcome,
+        other => panic!("a Project in setup holds no Task proposal authority: {other:?}"),
+    };
+    assert_eq!(
+        unadmitted.denied_by,
+        Some(api_types::DeniedBy::PermissionMissing(
+            "propose_task".to_owned()
+        ))
+    );
+    assert!(!serde_json::to_string(&unadmitted)
+        .expect("structured denial serializes")
+        .contains(CLAIM));
+    // With the Project out of setup the same boundary reaches the payload.
+    for statement in [
+        "INSERT INTO project_charter (
+             id, account_id, project_id, project_mode, maturity, lifecycle,
+             version, created_at, updated_at
+         ) VALUES ('task02-charter', ?2, ?1, 'compact', 'prototype', 'attached', 1, ?3, ?3)",
+        "INSERT INTO project_charter_revision (
+             id, charter_id, revision, base_revision, lifecycle, schema_version,
+             render_version, content_json, rendered_view, change_summary,
+             author_type, author_id, source_refs_json, content_digest,
+             rendered_digest, created_at
+         ) VALUES ('task02-charter-revision', 'task02-charter', 1, 0, 'approved',
+                   'forge.project-charter/v1', 'forge.project-charter-render/v1',
+                   '{}', '# Project', 'test fixture approval', 'user', ?2, '[]',
+                   'charter-content-digest', 'charter-render-digest', ?3)",
+        "UPDATE project_charter
+         SET current_approved_revision_id = 'task02-charter-revision',
+             current_draft_revision_id = 'task02-charter-revision', version = 2
+         WHERE project_id = ?1 AND account_id = ?2 AND ?3 = ?3",
+        "UPDATE project
+         SET current_charter_id = 'task02-charter',
+             current_charter_revision_id = 'task02-charter-revision',
+             current_charter_version = 1, charter_status = 'charter_backed',
+             charter_setup_required = 0, version = version + 1, updated_at = ?3
+         WHERE id = ?1 AND owner_id = ?2",
+    ] {
+        sqlx::query(statement)
+            .bind(PROJECT_ID)
+            .bind(USER_ID)
+            .bind(NOW)
+            .execute(fixture.db.pool())
+            .await
+            .expect("approved Charter attaches to the Project");
+    }
     let malformed_task = fixture
         .provider
         .propose(

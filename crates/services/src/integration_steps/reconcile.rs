@@ -162,7 +162,10 @@ impl crate::TaskService {
         if current.state.terminal() {
             return Ok(());
         }
-        if matches!(current.state, S::Parked | S::Queued) && admission::unbound(&current) {
+        if matches!(current.state, S::Parked | S::Queued)
+            && (admission::unbound(&current)
+                || admission::binding_stale(&self.db, &current).await?)
+        {
             if let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? {
                 self.reconcile_integration_admission(&task).await?;
             }
@@ -234,7 +237,11 @@ impl crate::TaskService {
                     "the result of this Task's merge is unknown: reconnect the machine that ran it, or remove that machine",
                 ));
             }
-            Some(attempt) if attempt.state == S::Parked && !admission::unbound(&attempt) => {
+            Some(attempt)
+                if attempt.state == S::Parked
+                    && !admission::unbound(&attempt)
+                    && !admission::binding_stale(&self.db, &attempt).await? =>
+            {
                 self.db
                     .expedite_parked_integration_attempt(&task.id, &db::now_rfc3339(), true)
                     .await?;
@@ -301,6 +308,16 @@ impl crate::TaskService {
         if !merge_state(&workflow, &task.status) {
             return Ok(false);
         }
+        let owned: bool = sqlx::query_scalar(db::INTEGRATION_OWNED_SQL)
+            .bind(&task.id)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db::DbError::from)?;
+        // Rebind stale released owners through admission first. Healthy
+        // attempts can repair their condition behind a real hold/block.
+        if owned && self.restate_integration_condition(&task).await? {
+            return Ok(true);
+        }
         // The same guards as the transition into the state: a Task its owner
         // stopped is not admitted, and an entry whose hooks are still to run
         // admits itself.
@@ -309,13 +326,20 @@ impl crate::TaskService {
         {
             return Ok(false);
         }
-        let owned: bool = sqlx::query_scalar(db::INTEGRATION_OWNED_SQL)
-            .bind(&task.id)
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
         if owned {
-            return Ok(false);
+            let current = self.db.current_integration_attempt(&task.id).await?;
+            // Recovery may have verified a different placement binding.
+            // Do not replace a head or an unsettled effect: supersede's
+            // transaction is the final authority for whether it is free.
+            let rebind = match current {
+                Some(ref attempt) if matches!(attempt.state, S::Queued | S::Parked) => {
+                    admission::binding_stale(&self.db, attempt).await?
+                }
+                _ => false,
+            };
+            if !rebind {
+                return Ok(false);
+            }
         }
         let attempt = match admission::admit_released_or_replaced(
             &self.db,
@@ -384,6 +408,165 @@ impl crate::TaskService {
         if let Some(worker) = self.integration_worker() {
             worker.notify_enqueued(attempt.queue_id.as_deref().unwrap_or_default());
         }
+        Ok(true)
+    }
+}
+
+/// The durable attempt is the operational source; conditions retain no
+/// queue clock/rank/lease. A phase label may lag a healthy driver, but a
+/// missing/wrong attempt or a parked cause must be repaired by a Task step.
+pub(crate) fn statement_reason(
+    snapshot: &serde_json::Value,
+) -> Option<api_types::IntegrationReason> {
+    use api_types::{IntegrationDeferralCause as C, IntegrationPhase as P, IntegrationReason as R};
+    let id = snapshot["attempt_id"].as_str()?;
+    let attempt_id = super::attempt_ref(id);
+    let state = snapshot["state"].as_str()?;
+    if state == "queued" && snapshot["queue_state"] == "open" {
+        return Some(R::Waiting { attempt_id });
+    }
+    let phase = match state {
+        "validating" => Some(P::Validating),
+        "rebasing" => Some(P::Rebasing),
+        "checking" => Some(P::Checking),
+        "awaiting_task_step" => Some(P::AwaitingAuthorization),
+        "ready_ff" | "ff_inflight" => Some(P::FastForwarding),
+        "reconciling" => Some(P::Reconciling),
+        _ => None,
+    };
+    if let Some(phase) = phase {
+        return Some(R::Owned { attempt_id, phase });
+    }
+    if state == "applied" {
+        return Some(R::Applied { attempt_id });
+    }
+    if !matches!(state, "queued" | "parked" | "quarantined") {
+        return None;
+    }
+    let (kind, message) = if state == "queued" {
+        (
+            snapshot["queue_failure_kind"].as_str(),
+            snapshot["queue_failure_message"].as_str(),
+        )
+    } else {
+        (
+            snapshot["failure_kind"].as_str(),
+            snapshot["failure_message"].as_str(),
+        )
+    };
+    let message = message.unwrap_or("integration is waiting");
+    if state == "parked" && crate::integration_worker::GateCause::parked_under(message) {
+        return Some(R::Waiting { attempt_id });
+    }
+    let cause = if state == "quarantined" {
+        C::UnresolvedResult
+    } else if message.starts_with("target_dirty") {
+        C::TargetDirty
+    } else if message.starts_with("owner_offline") {
+        C::OwnerOffline
+    } else {
+        match kind {
+            Some("infrastructure" | "timeout") => C::Infrastructure,
+            Some("target_unavailable") => C::OwnerOffline,
+            Some("needs_fact") => C::UnresolvedResult,
+            _ => C::OwnerRequired,
+        }
+    };
+    Some(R::Deferred {
+        attempt_id,
+        cause,
+        owner_id: message
+            .starts_with("owner_offline")
+            .then(|| snapshot["daemon_id"].as_str().map(str::to_owned))
+            .flatten(),
+        message: super::bounded(message),
+    })
+}
+
+pub(crate) fn statement_stale(
+    snapshot: Option<&serde_json::Value>,
+    condition: &db::TaskCondition,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    let Some(expected) = statement_reason(snapshot) else {
+        return false;
+    };
+    let Some(actual) = condition.integration_reason() else {
+        return true;
+    };
+    if actual.attempt_id() != expected.attempt_id() {
+        return true;
+    }
+    // Healthy heads state themselves at their deciding steps, avoiding
+    // extra writes for every phase. Released/suspended waits are exact.
+    let waiting = matches!(snapshot["state"].as_str(), Some("parked" | "quarantined"))
+        || (snapshot["state"] == "queued" && snapshot["queue_state"] != "open");
+    // A deferral already stated for this attempt stands: its writer (the
+    // park step, the import continuation, the result step) chose the typed
+    // cause and message with facts this snapshot does not carry, and each of
+    // them restates when the attempt parks again. Restating it from the
+    // snapshot would replace that cause and alternate with its writer.
+    waiting
+        && match (actual, &expected) {
+            (
+                api_types::IntegrationReason::Deferred { .. },
+                api_types::IntegrationReason::Deferred { .. },
+            ) => false,
+            _ => actual != &expected,
+        }
+}
+
+impl crate::TaskService {
+    async fn restate_integration_condition(&self, task: &db::Task) -> Result<bool> {
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let snapshot = db::integration_statement_in_tx(&mut tx, &task.id).await?;
+        let current = self
+            .db
+            .get_task_in_tx(&mut tx, &task.id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        if !statement_stale(snapshot.as_ref(), &current.condition) {
+            return Ok(false);
+        }
+        let Some(reason) = snapshot.as_ref().and_then(statement_reason) else {
+            return Ok(false);
+        };
+        if let Some(old) = current
+            .condition
+            .integration_reason()
+            .filter(|old| old.attempt_id() != reason.attempt_id())
+        {
+            self.db
+                .state_integration_condition_in_tx(
+                    &mut tx,
+                    &task.id,
+                    &db::ConditionStatement::IntegrationCleared {
+                        attempt_id: old.attempt_id().clone(),
+                    },
+                )
+                .await?;
+        }
+        let intervention = reason.requires_intervention();
+        self.db
+            .state_integration_condition_in_tx(
+                &mut tx,
+                &task.id,
+                &db::ConditionStatement::Integration { reason },
+            )
+            .await?;
+        if intervention {
+            let task = self
+                .db
+                .get_task_in_tx(&mut tx, &task.id)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            super::IntegrationSteps::new(self.clone())
+                .raise_interruption_in_tx(&mut tx, &task)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(true)
     }
 }

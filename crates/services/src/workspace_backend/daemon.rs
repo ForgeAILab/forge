@@ -2,39 +2,29 @@ use std::sync::Arc;
 
 use api_types::{
     WorkspaceCleanupParams, WorkspaceDescribeParams, WorkspaceDiffFileStatus, WorkspaceDiffParams,
-    WorkspaceHandleReference, WorkspaceMergeParams, WorkspaceMutationFence,
-    WorkspaceOperationExpected, WorkspacePrepareParams, WorkspacePreparedState,
-    WorkspaceReadParams, WorkspaceResetParams, WorkspaceReviewedMergeParams, WorkspaceRunParams,
+    WorkspaceHandleReference, WorkspaceMutationFence, WorkspaceOperationExpected,
+    WorkspacePrepareParams, WorkspacePreparedState, WorkspaceReadParams, WorkspaceResetParams,
+    WorkspaceRunParams,
 };
 use async_trait::async_trait;
 use db::{PlacementOwnerKind, SqliteDb, Workspace, WorkspacePlacement, WorkspaceRepo};
 
 use super::{
-    workspace_handle, CleanupAck, Diff, DiffSpec, MergeOutcome, MergeSpec, OutboxHarvest,
-    PrepareSpec, PreparedWorkspace, ResetSpec, Result, RunResult, RunSpec, WorkspaceBackend,
-    WorkspaceBackendError, WorkspaceRunPurpose, WorkspaceState,
+    workspace_handle, CleanupAck, Diff, DiffSpec, OutboxHarvest, PrepareSpec, PreparedWorkspace,
+    ResetSpec, Result, RunResult, RunSpec, WorkspaceBackend, WorkspaceBackendError,
+    WorkspaceRunPurpose, WorkspaceState,
 };
 use crate::{
     daemon_transport::{
         workspace_client::{DaemonWorkspaceClient, WorkspaceClientError},
         DaemonConnectionRegistry,
     },
-    integration_effects::rpc::validate_merge_result,
     ServiceError,
 };
-
-struct MergeReplyRecord<'a> {
-    request: &'a serde_json::Value,
-    result: &'a api_types::WorkspaceMergeResult,
-    execution_id: &'a str,
-    attempt: Option<&'a db::TaskStep>,
-    operation_id: &'a str,
-}
 
 pub struct DaemonWorkspaceBackend {
     db: Arc<SqliteDb>,
     client: DaemonWorkspaceClient,
-    integration_locks: workspace::RepoCacheLockManager,
 }
 
 impl DaemonWorkspaceBackend {
@@ -42,32 +32,7 @@ impl DaemonWorkspaceBackend {
         Self {
             db: Arc::clone(&db),
             client: DaemonWorkspaceClient::new(registry).with_receipts(Arc::clone(&db)),
-            integration_locks: workspace::RepoCacheLockManager::new(),
         }
-    }
-
-    /// Consume validated owner facts with today's receipt transaction, then
-    /// finish the Task operation and acknowledge the retained owner journal.
-    async fn record_merge_reply(
-        &self,
-        placement: &WorkspacePlacement,
-        daemon_id: &str,
-        record: MergeReplyRecord<'_>,
-    ) -> Result<()> {
-        validate_merge_result(record.request, record.result)
-            .map_err(|error| Self::error(placement, None, error))?;
-        let value = serde_json::to_value(record.result).expect("merge result serializes");
-        self.client
-            .retain_merge_result(daemon_id, record.request, &value, record.execution_id)
-            .await
-            .map_err(|error| Self::error(placement, None, error))?;
-        if let Some(step) = record.attempt {
-            self.db
-                .finish_remote_task_operation(step, record.operation_id)
-                .await?;
-        }
-        self.client.acknowledge_recorded(daemon_id, &value).await;
-        Ok(())
     }
 
     fn owner<'a>(&self, placement: &'a WorkspacePlacement) -> Result<(&'a str, &'a str)> {
@@ -560,173 +525,6 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
         Ok(result.bytes)
     }
 
-    async fn merge(
-        &self,
-        placement: &WorkspacePlacement,
-        spec: &MergeSpec,
-    ) -> Result<MergeOutcome> {
-        use db::{RepoRepo, ReviewConformanceRepo, TaskRepo};
-
-        let _integration_lock = self
-            .integration_locks
-            .acquire(&placement.repo_location_id)
-            .await;
-        let workspace = self.workspace(placement).await?;
-        RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repo", &workspace.repo_id))?;
-        let task = TaskRepo::get_by_id(&*self.db, &placement.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", &placement.task_id))?;
-        if task.parent_task_id.is_some() {
-            return Err(ServiceError::invalid_operation("subtasks do not merge").into());
-        }
-        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("merge has no implementation execution")
-            })?;
-        if execution.workspace_id.as_deref() != Some(&workspace.id) {
-            return Err(
-                ServiceError::conflict("merge differs from the implementation workspace").into(),
-            );
-        }
-        let expected = self.current_expected(placement).await?;
-        self.db.protect_step_integration().await?;
-        let guard = match self.db.lock_review_integration(&placement.task_id).await {
-            Ok(guard) => guard,
-            Err(db::DbError::Check(reason)) => return Ok(MergeOutcome::ReviewRequired { reason }),
-            Err(error) => return Err(error.into()),
-        };
-        let contract = guard.contract.clone();
-        if let Some(contract) = &contract {
-            if expected
-                != (WorkspaceOperationExpected::BaseSha {
-                    sha: contract.commit_sha.clone(),
-                })
-            {
-                return Ok(MergeOutcome::ReviewRequired {
-                    reason: "reviewed commit changed since review; fresh review required".into(),
-                });
-            }
-        }
-        let target_sha = contract.as_ref().map_or_else(
-            || spec.expected_target_sha.clone(),
-            |contract| contract.base_sha.clone(),
-        );
-        if target_sha.is_empty() {
-            return Err(ServiceError::invalid_operation(
-                "remote merge requires an expected target SHA",
-            )
-            .into());
-        }
-        // Persist the intent without holding the authority transaction, then
-        // reacquire and compare the frozen authority before sending the RPC.
-        guard.release().await?;
-        let params = WorkspaceReviewedMergeParams {
-            merge: WorkspaceMergeParams {
-                fence: self.fence(placement, db::new_uuid_v4(), expected)?,
-                workspace_handle: workspace_handle(placement)?.to_owned(),
-                repo_location_id: placement.repo_location_id.clone(),
-                target_branch: spec.target_branch.clone(),
-                expected_target_sha: target_sha,
-                handed_off_paths: spec.handed_off_paths.clone(),
-            },
-            reviewed_commit_sha: contract
-                .as_ref()
-                .map(|contract| contract.commit_sha.clone()),
-            candidate_transfer_key: None,
-        };
-        let daemon_id = self.owner(placement)?.0;
-
-        let request = serde_json::to_value(&params).expect("merge serializes");
-        let retained = self
-            .client
-            .retained_merge_result(&request, &execution.id)
-            .await
-            .map_err(|error| Self::error(placement, None, error))?;
-        let (request, retained_result) = match retained {
-            Some((request, result)) => (request, Some(result)),
-            None => (
-                self.client
-                    .remember_mutation(
-                        daemon_id,
-                        api_types::METHOD_WORKSPACE_MERGE,
-                        request,
-                        Some(&execution.id),
-                    )
-                    .await
-                    .map_err(|error| Self::error(placement, None, error))?,
-                None,
-            ),
-        };
-        let params: WorkspaceReviewedMergeParams = serde_json::from_value(request.clone())
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid retained merge: {error}"))
-            })?;
-        self.db.protect_step_integration().await?;
-        let guard = match self.db.lock_review_integration(&placement.task_id).await {
-            Ok(guard) => guard,
-            Err(db::DbError::Check(reason)) => return Ok(MergeOutcome::ReviewRequired { reason }),
-            Err(error) => return Err(error.into()),
-        };
-        if guard.contract != contract {
-            return Ok(MergeOutcome::ReviewRequired {
-                reason: "review authority changed before integration".into(),
-            });
-        }
-        // The socket reader persists heartbeats before reading RPC replies.
-        // Keep the frozen authority check outside the transport exchange so
-        // its SQLite write lock cannot block the reply behind a heartbeat.
-        guard.release().await?;
-        let attempt = db::task_writer::current_task_step();
-        if let Some(step) = &attempt {
-            self.db
-                .register_remote_task_operation(step, placement, &params.merge.fence.operation_id)
-                .await?;
-        }
-        let result = match retained_result {
-            Some(result) => Ok(result),
-            None => self.client.merge(daemon_id, params.clone()).await,
-        };
-        let result = match result {
-            Ok(result) => result,
-            Err(WorkspaceClientError::Daemon(error)) => {
-                self.client
-                    .retain_error(
-                        daemon_id,
-                        api_types::METHOD_WORKSPACE_MERGE,
-                        &request,
-                        &error,
-                    )
-                    .await
-                    .map_err(|error| Self::error(placement, None, error))?;
-                return Err(Self::error(
-                    placement,
-                    None,
-                    WorkspaceClientError::Daemon(error),
-                ));
-            }
-            Err(error) => return Err(Self::error(placement, None, error)),
-        };
-        self.record_merge_reply(
-            placement,
-            daemon_id,
-            MergeReplyRecord {
-                request: &request,
-                result: &result,
-                execution_id: &execution.id,
-                attempt: attempt.as_ref(),
-                operation_id: &params.merge.fence.operation_id,
-            },
-        )
-        .await?;
-        Ok(crate::integration_effects::merge::owner_merge_outcome(
-            result.outcome,
-            &spec.target_branch,
-        ))
-    }
-
     async fn reset(
         &self,
         placement: &WorkspacePlacement,
@@ -900,113 +698,7 @@ mod tests {
         DaemonWorkspaceBackend {
             db: Arc::new(SqliteDb::new(pool)),
             client: DaemonWorkspaceClient::new(Arc::clone(&daemon.registry)),
-            integration_locks: workspace::RepoCacheLockManager::new(),
         }
-    }
-
-    #[tokio::test]
-    async fn merge_reply_is_not_blocked_by_heartbeat_persistence() {
-        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
-        db::run_migrations(&pool).await.unwrap();
-        let db = Arc::new(SqliteDb::new(pool));
-        sqlx::raw_sql(
-            "INSERT INTO project (id, name, created_at, updated_at)
-             VALUES ('project-test', 'merge', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO repo (id, project_id, name, remote_url, default_branch, created_at, updated_at)
-             VALUES ('repo-test', 'project-test', 'repo', '', 'main', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             UPDATE project SET primary_repo_id = 'repo-test' WHERE id = 'project-test';
-             INSERT INTO task (id, project_id, title, status, created_at, updated_at)
-             VALUES ('task-test', 'project-test', 'merge', 'merging', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at)
-             VALUES ('workspace-test', 'task-test', 'repo-test', '', 'task/test', 'ready', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO execution (id, task_id, role, status, workspace_id, after_sha, created_at, updated_at)
-             VALUES ('execution-test', 'task-test', 'coder', 'completed', 'workspace-test', 'candidate', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO daemon (id, machine_id, hostname, os, arch, status, created_at, updated_at)
-             VALUES ('daemon-test', 'machine-test', 'host', 'linux', 'x86_64', 'online', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, created_at, updated_at)
-             VALUES ('runtime-test', 'daemon-test', 'local', '/owner', 'ready', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO repo_location (id, repo_id, owner_kind, daemon_id, runtime_id, path, kind, status, created_at, updated_at)
-             VALUES ('location-test', 'repo-test', 'daemon', 'daemon-test', 'runtime-test', '/owner/repo', 'primary_checkout', 'ready', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');
-             INSERT INTO workspace_placement (id, workspace_id, task_id, owner_kind, daemon_id, runtime_id, repo_location_id,
-                execution_daemon_id, workspace_handle, generation, state, selected_by, selection_reason, created_at, updated_at)
-             VALUES ('placement-test', 'workspace-test', 'task-test', 'daemon', 'daemon-test', 'runtime-test', 'location-test',
-                'daemon-test', 'workspace-handle', 1, 'ready', 'scheduler', '{}', '2026-09-30T00:00:00Z', '2026-09-30T00:00:00Z');",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (connection, mut outbound) =
-            crate::daemon_transport::DaemonConnection::new(DAEMON_ID.to_owned());
-        registry.register(DAEMON_ID.to_owned(), connection);
-        let capabilities: Vec<_> = api_types::DAEMON_REQUIRED_CAPABILITIES
-            .iter()
-            .copied()
-            .chain(std::iter::once(api_types::DAEMON_CAPABILITY_WORKSPACE))
-            .collect();
-        registry.dispatch_incoming(DAEMON_ID, api_types::DaemonFrame::Notification {
-            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
-            params: json!({"protocol_revision": api_types::DAEMON_PROTOCOL_REVISION, "capabilities": capabilities}),
-        });
-        let replies = Arc::clone(&registry);
-        let heartbeat_db = Arc::clone(&db);
-        let peer = tokio::spawn(async move {
-            while let Some(api_types::DaemonFrame::Request { id, method, params }) =
-                outbound.recv().await
-            {
-                let result = match method.as_str() {
-                    api_types::METHOD_WORKSPACE_DESCRIBE => {
-                        json!({"workspace_handle": "workspace-handle", "exists": true, "head_sha": "candidate", "dirty": false,
-                        "branch": "task/test", "locked": false, "generation": 1, "active_execution_ids": [], "journaled_execution_ids": []})
-                    }
-                    api_types::METHOD_WORKSPACE_MERGE => {
-                        // The real socket reader touches the daemon before
-                        // dispatching a response queued behind a heartbeat.
-                        let mut heartbeat = db::begin_immediate(heartbeat_db.pool()).await.unwrap();
-                        sqlx::query("UPDATE daemon SET last_report_at = ? WHERE id = ?")
-                            .bind(db::now_rfc3339())
-                            .bind(DAEMON_ID)
-                            .execute(&mut *heartbeat)
-                            .await
-                            .unwrap();
-                        heartbeat.commit().await.unwrap();
-                        json!({"entry_id": "merge-entry", "operation_id": params["operation_id"],
-                            "outcome": {"kind": "done", "before_sha": "target", "after_sha": "candidate", "branch": "main"},
-                            "diffstat": {"files_changed": 1, "total_additions": 1, "total_deletions": 0}})
-                    }
-                    api_types::METHOD_JOURNAL_ACK => {
-                        json!({"entry_id": params["entry_id"], "acknowledged": true})
-                    }
-                    other => panic!("unexpected workspace request: {other}"),
-                };
-                replies
-                    .dispatch_incoming(DAEMON_ID, api_types::DaemonFrame::Response { id, result });
-            }
-        });
-        let backend = DaemonWorkspaceBackend::new(Arc::clone(&db), registry);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            backend.merge(
-                &placement(),
-                &MergeSpec {
-                    target_branch: "main".to_owned(),
-                    expected_target_sha: "target".to_owned(),
-                    handed_off_paths: Vec::new(),
-                },
-            ),
-        )
-        .await;
-        peer.abort();
-        assert_eq!(
-            result
-                .expect("heartbeat persistence must not block merge replies")
-                .unwrap(),
-            MergeOutcome::Done {
-                before_sha: "target".to_owned(),
-                after_sha: "candidate".to_owned(),
-                branch: "main".to_owned(),
-            }
-        );
     }
 
     #[test]

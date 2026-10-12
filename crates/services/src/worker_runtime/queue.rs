@@ -110,6 +110,7 @@ impl db::task_writer::TaskStepExecutor for TaskStepWorker {
     }
 }
 /// How long `drain` waits for the head drivers it stopped.
+#[cfg(any(test, feature = "test-support"))]
 const DRAIN_DRIVER_JOIN: Duration = Duration::from_secs(30);
 
 impl TaskStepWorker {
@@ -436,6 +437,7 @@ impl TaskStepWorker {
     /// Where the runtime's own queue worker is running, drain only waits for
     /// it. Head drivers drain started itself stop when it returns; a head
     /// they leave mid-way is taken over at its lease expiry.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn drain(&self, task_id: &str) -> Result<db::Task> {
         let stop = tokio_util::sync::CancellationToken::new();
         let mut drivers = JoinSet::new();
@@ -455,6 +457,7 @@ impl TaskStepWorker {
         }
         drained
     }
+    #[cfg(any(test, feature = "test-support"))]
     async fn drain_with(
         &self,
         task_id: &str,
@@ -659,6 +662,7 @@ impl TaskStepWorker {
     /// and something else swept the queue.
     ///
     /// The flag: the Task is a queued member of a queue that is not open.
+    #[cfg(any(test, feature = "test-support"))]
     async fn integration_head_task(&self, task_id: &str) -> Result<(Option<String>, bool)> {
         /// State, queue state, head Task, claimable, holds the slot, in its entry.
         type Member = (String, Option<String>, Option<String>, bool, bool, bool);

@@ -1107,11 +1107,11 @@ impl HeadDriver {
         }
         if facts.worktree_dirty {
             return self
-                .park(
-                    &a,
-                    ParkReason::WorktreeDirty,
-                    "the Task checkout has uncommitted changes",
-                )
+                .send_back(&a, S::Ejected, |a| {
+                    a.failure_kind = Some(IntegrationFailureKind::OwnerRequired);
+                    a.failure_message =
+                        Some("worktree_dirty: the Task checkout has uncommitted changes".into());
+                })
                 .await;
         }
         if facts.target_dirty {

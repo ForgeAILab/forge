@@ -362,21 +362,6 @@ impl DaemonWorkspaceClient {
         }
     }
 
-    pub async fn merge(
-        &self,
-        daemon_id: &str,
-        params: WorkspaceReviewedMergeParams,
-    ) -> Result<WorkspaceMergeResult> {
-        self.request(
-            daemon_id,
-            METHOD_WORKSPACE_MERGE,
-            &params,
-            self.timeout,
-            true,
-        )
-        .await
-    }
-
     pub async fn diff(
         &self,
         daemon_id: &str,
@@ -691,46 +676,6 @@ impl DaemonWorkspaceClient {
         self.retain_receipt(daemon_id, method, &params, &intent, "intent")
             .await?;
         Ok(params)
-    }
-
-    pub(crate) async fn retained_merge_result(
-        &self,
-        params: &Value,
-        execution_id: &str,
-    ) -> Result<Option<(Value, WorkspaceMergeResult)>> {
-        let Some(db) = &self.db else { return Ok(None) };
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT intent.outcome_json, result.outcome_json FROM command_receipt result
-             JOIN command_receipt intent ON intent.scope_type = result.scope_type
-               AND intent.scope_id = result.scope_id AND intent.correlation_id = result.correlation_id
-               AND intent.operation = 'daemon.workspace.merge.intent'
-             WHERE result.operation = 'daemon.workspace.merge'
-               AND json_extract(result.outcome_json, '$.metadata.placement_id') = ?
-               AND json_extract(result.outcome_json, '$.metadata.generation') = ?
-               AND json_extract(result.outcome_json, '$.owner_result.outcome.kind') = 'done'
-             ORDER BY result.committed_at DESC, result.id DESC",
-        )
-        .bind(params["placement_id"].as_str())
-        .bind(params["generation"].as_i64())
-        .fetch_all(db.pool())
-        .await
-        .map_err(ServiceError::from)?;
-        for (intent, result) in rows {
-            let intent: Value = serde_json::from_str(&intent)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            let result: Value = serde_json::from_str(&result)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            let request = &intent["owner_result"]["request"];
-            if intent["owner_result"]["implementation_execution_id"].as_str() == Some(execution_id)
-                && mutation_identity(METHOD_WORKSPACE_MERGE, request)
-                    == mutation_identity(METHOD_WORKSPACE_MERGE, params)
-            {
-                let result = serde_json::from_value(result["owner_result"].clone())
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-                return Ok(Some((request.clone(), result)));
-            }
-        }
-        Ok(None)
     }
 
     pub(crate) async fn retain_merge_result(

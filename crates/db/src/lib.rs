@@ -90,3 +90,5 @@ pub use repository::{
 
 pub mod check_run;
 pub use check_run::*;
+
+pub use sqlite::integration_statement_in_tx;

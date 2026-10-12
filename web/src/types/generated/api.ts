@@ -1,3 +1,5 @@
+import type { IntegrationHeadCheckEvidence } from './bindings/IntegrationHeadCheckEvidence'
+export type { IntegrationHeadCheckEvidence } from './bindings/IntegrationHeadCheckEvidence'
 import type { TaskCondition } from './bindings/TaskCondition'
 import type { MachineDisk } from './bindings/MachineDisk'
 import type { DiskFloor } from './bindings/DiskFloor'
@@ -859,6 +861,7 @@ export interface AuditorVerdictEntry {
 }
 
 export interface ReviewDetails {
+  execution?: { integration_checks: IntegrationHeadCheckEvidence[]; [key: string]: unknown } | null
   conformance: ReviewConformance
   ci_steps: StepResultEntry[]
   auditor?: AuditorVerdictEntry | null

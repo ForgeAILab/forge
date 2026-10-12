@@ -100,13 +100,6 @@ pub struct Diff {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeSpec {
-    pub target_branch: String,
-    pub expected_target_sha: String,
-    pub handed_off_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetSpec {
     pub expected_head_sha: String,
     pub base_ref: String,
@@ -236,6 +229,15 @@ impl From<WorkspaceBackendError> for ServiceError {
 }
 
 #[async_trait]
+/// Workspace operations do not grant integration authority. Merge effects
+/// require the queue's generation fence and Task-step permit.
+///
+/// ```compile_fail
+/// use services::workspace_backend::{WorkspaceBackend, MergeSpec};
+/// fn old_merge(backend: &dyn WorkspaceBackend, placement: &db::WorkspacePlacement, spec: &MergeSpec) {
+///     let _future = backend.merge(placement, spec);
+/// }
+/// ```
 pub trait WorkspaceBackend: Send + Sync {
     fn daemon_client(
         &self,
@@ -258,8 +260,6 @@ pub trait WorkspaceBackend: Send + Sync {
         rel_path: &str,
         limit: u64,
     ) -> Result<Vec<u8>>;
-    async fn merge(&self, placement: &WorkspacePlacement, spec: &MergeSpec)
-        -> Result<MergeOutcome>;
     async fn reset(
         &self,
         placement: &WorkspacePlacement,

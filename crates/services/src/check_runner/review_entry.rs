@@ -2,7 +2,7 @@
 //! which then waits suspended; the delivered result wakes that step and the
 //! hook settles the Review from the result, under the step's own authority.
 use super::consumer::{CheckApplication, CheckConsumerFamily, CheckVerdict};
-use crate::Result;
+use crate::{Result, ServiceError};
 use async_trait::async_trait;
 use db::{CheckDeliveryRepo, ReviewRepo, ReviewStatus, SqliteDb};
 use std::sync::Arc;
@@ -222,4 +222,73 @@ async fn fence_remote_run(
     };
     crate::remote_cancel::cancel_operations(db, daemons, &[operation]).await?;
     Ok(())
+}
+
+pub(crate) struct ReviewCiIdentityInput<'a> {
+    pub task: &'a db::Task,
+    pub workspace: &'a db::Workspace,
+    pub placement: &'a db::WorkspacePlacement,
+    pub commit_sha: String,
+    pub state_config: &'a serde_json::Value,
+    pub dirty: bool,
+    pub target_branch: Option<&'a str>,
+}
+
+/// The one identity builder for Review CI and integration-head CI.
+pub(crate) async fn review_ci_identity(
+    db: &SqliteDb,
+    input: ReviewCiIdentityInput<'_>,
+) -> Result<Option<db::CheckRunIdentity>> {
+    let environment = review::contract::project_environment(db, &input.task.id)
+        .await
+        .map_err(ServiceError::invalid_operation)?;
+    let repo = db::RepoRepo::get_by_id(db, &input.workspace.repo_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("repo", &input.workspace.repo_id))?;
+    let target = match input.target_branch {
+        Some(target) => target.to_owned(),
+        None => {
+            crate::merge_service::target_branch(&input.task.merge_config, &repo.default_branch)?
+        }
+    };
+    let target = target.strip_prefix("refs/heads/").unwrap_or(&target);
+    let source = serde_json::json!({
+        "task_id": input.task.id, "project_id": input.task.project_id,
+        "repo_id": input.workspace.repo_id, "target_branch": target,
+    });
+    let spec = review::check_spec::build_check_spec(
+        api_types::CheckPurpose::EntryCi,
+        &review::check_spec::CheckSpecConfiguration {
+            source: &source,
+            entry_state_config: Some(input.state_config),
+            environment: &environment,
+            hooks: &[],
+            hook_test_index: None,
+            single_environment_check: None,
+            event: api_types::LifecycleEvent::BeforeWork,
+            role: "",
+            owner_is_daemon: input.placement.owner_kind == db::PlacementOwnerKind::Daemon,
+            canonical_policy: true,
+            workspace: Some(review::check_spec::CheckWorkspaceIdentity {
+                workspace_id: &input.workspace.id,
+                generation: u64::try_from(input.placement.generation)
+                    .map_err(|_| ServiceError::invalid_operation("invalid workspace generation"))?,
+            }),
+            queue_head_bundle: None,
+        },
+    )
+    .map_err(ServiceError::invalid_operation)?;
+    if spec.commands.is_empty() {
+        return Ok(None);
+    }
+    let mut inputs = super::policy::digest_input(db, spec, &environment.env).await?;
+    if input.dirty {
+        inputs.environment_identity = api_types::CheckEnvironmentIdentity::NotAttested;
+    }
+    Ok(Some(db::CheckRunIdentity {
+        project_id: input.task.project_id.clone(),
+        repo_id: input.workspace.repo_id.clone(),
+        commit_sha: input.commit_sha,
+        inputs,
+    }))
 }

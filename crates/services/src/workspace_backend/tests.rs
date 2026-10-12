@@ -1,15 +1,11 @@
 use super::*;
-use crate::{
-    daemon_transport::{DaemonConnection, DaemonConnectionRegistry},
-    MergeService,
-};
-use db::{SqliteDb, WorkspacePlacementRepo};
-use events::EventBus;
+use crate::daemon_transport::{DaemonConnection, DaemonConnectionRegistry};
+use db::SqliteDb;
 use serde_json::json;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn workspace_backend_large_ci_tail_preserves_server_placement_verdict() {
+async fn shared_check_executor_large_ci_tail_preserves_owner_verdict() {
     let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let db = Arc::new(SqliteDb::new(pool));
@@ -92,26 +88,42 @@ async fn workspace_backend_large_ci_tail_preserves_server_placement_verdict() {
     .execute(db.pool())
     .await
     .unwrap();
-    let server_placement = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
-        .await
-        .unwrap()
-        .unwrap();
-    let embedded = embedded::EmbeddedWorkspaceBackend::new(
-        db.clone(),
-        Arc::new(MergeService::new(
-            db.clone(),
-            Arc::new(EventBus::default()),
-            root.path().to_path_buf(),
-        )),
-        root.path().to_path_buf(),
-    );
     for (index, exit) in [0, 7].into_iter().enumerate() {
-        let server = embedded.run(&server_placement, &spec(exit)).await.unwrap();
+        // CI verdict/tail semantics now belong to the check executor,
+        // rather than the deleted unlimited raw workspace.run branch.
+        let spec =
+            check_executor::legacy_ci_spec(&spec(exit).command, &Default::default(), 0, false);
+        let receipt = crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
+            operation_id: "large-ci-tail",
+            spec: &spec,
+            target: check_executor::CheckoutTarget::Workspace(root.path()),
+            owner: api_types::CheckOwnerIdentity {
+                owner_kind: "server".into(),
+                machine_id: None,
+                runtime_id: "server".into(),
+            },
+            input_revisions: None,
+            environment: &Default::default(),
+            deadline: None,
+            cancel: &tokio_util::sync::CancellationToken::new(),
+            permit: &check_executor::CheckPermit::already_admitted(),
+            cleanup: check_executor::CleanupPlan {
+                commands: &[],
+                timeout: check_executor::CLEANUP_TIMEOUT,
+            },
+            output_limit: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+        let server = receipt.commands.into_iter().next().unwrap();
         // The shared check executor keeps the last 1 MiB per stream.
         assert_eq!(server.stdout_tail.len(), 1024 * 1024);
         assert!(server.stdout_tail.ends_with("last failure line\n"));
-        assert_eq!(remote_results[index].exit_code, server.exit_code);
-        assert_eq!(remote_results[index].exit_code == 0, server.exit_code == 0);
+        assert_eq!(Some(remote_results[index].exit_code), server.exit_code);
+        assert_eq!(
+            remote_results[index].exit_code == 0,
+            server.exit_code == Some(0)
+        );
         assert!(remote_results[index]
             .stdout_tail
             .ends_with("last failure line\n"));

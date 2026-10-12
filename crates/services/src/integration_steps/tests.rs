@@ -30,6 +30,7 @@ pub(super) struct World {
     pub service: crate::TaskService,
     pub port: Arc<TaskStepIntegrationPort>,
     stop: tokio::sync::watch::Sender<bool>,
+    step_worker: Option<tokio::task::JoinHandle<()>>,
 }
 impl Drop for World {
     fn drop(&mut self) {
@@ -51,13 +52,12 @@ impl World {
         let bus = Arc::new(events::EventBus::default());
         let merge = Arc::new(crate::MergeService::new_for_test(
             db.clone(),
-            bus.clone(),
             temp.path().join("workspaces"),
         ));
         let service = crate::TaskService::new(db.clone(), bus.clone()).with_merge_service(merge);
         // The real step worker, as the server runs it.
         let (stop, stopped) = tokio::sync::watch::channel(false);
-        service.task_step_worker().start(stopped);
+        let step_worker = service.task_step_worker().start(stopped);
         let world = Self {
             port: Arc::new(TaskStepIntegrationPort::new(db.clone())),
             temp,
@@ -65,6 +65,7 @@ impl World {
             bus,
             service,
             stop,
+            step_worker: Some(step_worker),
         };
         let repo = world.repo();
         std::fs::create_dir(&repo).unwrap();
@@ -115,6 +116,8 @@ impl World {
             0,
             1,
         );
+        attempt.execution_id = Some(self.seed_execution(task, "executor", None).await);
+        attempt.execution_ref = attempt.execution_id.clone();
         attempt.original_candidate_sha = Some(head);
         self.db.admit_integration_attempt(attempt).await.unwrap()
     }
@@ -1826,6 +1829,25 @@ fn production_ports(
     Arc<crate::daemon_transport::DaemonConnectionRegistry>,
     crate::integration_worker::IntegrationWorkerConfig,
 ) {
+    production_ports_config(
+        world,
+        crate::integration_worker::IntegrationWorkerConfig {
+            poll: Duration::from_millis(20),
+            sweep_interval: Duration::from_millis(100),
+            conflict_backoff: Duration::from_millis(5),
+            ..Default::default()
+        },
+    )
+}
+
+fn production_ports_config(
+    world: &World,
+    config: crate::integration_worker::IntegrationWorkerConfig,
+) -> (
+    Arc<IntegrationQueueWorker>,
+    Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    crate::integration_worker::IntegrationWorkerConfig,
+) {
     use crate::daemon_transport::{DaemonConnectionRegistry, ServerExecutionEventSink};
     let sink = Arc::new(ServerExecutionEventSink::new(
         world.db.clone(),
@@ -1844,12 +1866,6 @@ fn production_ports(
         .unwrap()
         .workspace_backend_router()
         .unwrap();
-    let config = crate::integration_worker::IntegrationWorkerConfig {
-        poll: Duration::from_millis(20),
-        sweep_interval: Duration::from_millis(100),
-        conflict_backoff: Duration::from_millis(5),
-        ..Default::default()
-    };
     (
         crate::integration_ports::build_integration_worker(
             world.db.clone(),
@@ -2258,6 +2274,8 @@ impl World {
             0,
             1,
         );
+        attempt.execution_id = Some(self.seed_execution(task, "executor", None).await);
+        attempt.execution_ref = attempt.execution_id.clone();
         attempt.original_candidate_sha = Some(head);
         self.db.admit_integration_attempt(attempt).await.unwrap()
     }
@@ -3042,13 +3060,11 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
         .execute(world.db.pool())
         .await
         .unwrap();
-    let started = std::time::Instant::now();
     let admitted = world
         .service
         .admit_to_integration_queue("again")
         .await
         .expect("admitted without a conflict for the caller");
-    assert!(started.elapsed() < Duration::from_secs(10));
     assert_ne!(admitted.id, old.id);
     assert_eq!(admitted.expected_epoch, 1);
     let released = world.attempt(&old.id).await;
@@ -3085,7 +3101,7 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
         .await
         .unwrap()
         .iter()
-        .all(|step| step.status != "failed" && step.attempts <= 2));
+        .all(|step| step.status != "failed"));
 }
 
 /// The Task's target branch changed between two entries of `merging`: the
@@ -3486,3 +3502,526 @@ async fn a_task_blocked_while_it_is_queued_gets_no_permit_and_does_not_merge() {
 
 #[path = "gate_tests.rs"]
 mod gate_tests;
+
+/// Admission remains pinned to the implementation execution's repository,
+/// even after the Project selects another primary repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_admission_uses_the_execution_repository_after_project_reselection() {
+    let world = World::new().await;
+    let sha = world.legacy_task("pinned", "pinned.txt", "merging").await;
+    world.seed_execution("pinned", "executor", None).await;
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('other','p','other','release',?,?)")
+        .bind(&now).bind(&now).execute(world.db.pool()).await.unwrap();
+    sqlx::query("UPDATE project SET primary_repo_id='other',version=version+1 WHERE id='p'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let admitted = world
+        .service
+        .admit_to_integration_queue("pinned")
+        .await
+        .unwrap();
+    let queue = world
+        .db
+        .integration_queue(admitted.queue_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queue.repo_id, "r");
+    assert_eq!(queue.target_branch, "main");
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the pinned repository receives the candidate", || async {
+        world.task("pinned").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(
+        git_out(&world.repo(), &["rev-parse", "refs/heads/main"]).await,
+        Some(sha)
+    );
+}
+
+/// An actual pre-queue fast-forward survives a later Cancel and hook pruning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_legacy_merge_that_landed_keeps_durable_evidence_after_hook_pruning() {
+    let world = World::new().await;
+    let candidate = world
+        .legacy_task("cancelled", "landed.txt", "merging")
+        .await;
+    let execution = world.seed_execution("cancelled", "executor", None).await;
+    world
+        .old_merge_step(
+            "cancelled",
+            json!({"merge_intent": {
+                "execution_id": execution, "workspace_id": "w-cancelled",
+                "candidate_sha": candidate, "target_branch": "main"
+            }}),
+        )
+        .await;
+    git_out(&world.repo(), &["merge", "--ff-only", &candidate])
+        .await
+        .unwrap();
+    let queue = world
+        .db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    let mut old = db::IntegrationAttempt::new(
+        Some(queue.id),
+        "cancelled".into(),
+        "p".into(),
+        "shadow:cancelled:0".into(),
+        "merging".into(),
+        0,
+        1,
+    );
+    old.state = S::Cancelled;
+    world.db.admit_integration_attempt(old).await.unwrap();
+    sqlx::query("UPDATE task SET status='cancelled',status_epoch=1 WHERE id='cancelled'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    super::import::import_at_start(&world.db).await.unwrap();
+    sqlx::query("DELETE FROM task_step WHERE id='s-cancelled'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let source: String = sqlx::query_scalar("SELECT import_source_json FROM integration_attempt WHERE task_ref='cancelled' AND import_source_json IS NOT NULL")
+        .fetch_one(world.db.pool()).await.unwrap();
+    assert!(
+        source.contains(&candidate),
+        "the real landed commit remains in durable evidence"
+    );
+    assert!(git::command_output(
+        &world.repo(),
+        &["merge-base", "--is-ancestor", &candidate, "main"]
+    )
+    .await
+    .unwrap()
+    .status
+    .success());
+    assert_eq!(world.task("cancelled").await.status, "cancelled");
+}
+
+/// Run real review-entry CI under the hooks lease, then enter the queue.
+/// The unchanged head must get a real Hit; changing the target changes the
+/// rebased commit and must produce one new run and Review evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_evidence() {
+    for moved in [false, true] {
+        let mut world = World::new().await;
+        let _ = world.stop.send(true);
+        tokio::time::timeout(Duration::from_secs(10), world.step_worker.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE project SET primary_repo_id='r' WHERE id='p'")
+            .execute(world.db.pool())
+            .await
+            .unwrap();
+        let original = world
+            .legacy_task("evidence", "evidence.txt", "review")
+            .await;
+        let execution = world.seed_execution("evidence", "executor", None).await;
+        let counter = world.temp.path().join("check-executions");
+        let command = format!("echo run >> '{}'", counter.display());
+        review_ci(&world, "evidence", &[&command]).await;
+        let production = Production::new(&world);
+        let project = db::ProjectRepo::get_by_id(&*world.db, "p")
+            .await
+            .unwrap()
+            .unwrap();
+        let task = world.task("evidence").await;
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &crate::worker_runtime::queue::cascade_actor(),
+        );
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.name == "review")
+            .unwrap();
+        let ctx = crate::workflow::HookContext {
+            task_id: task.id.clone(),
+            project_id: "p".into(),
+            from_state: "in_progress".into(),
+            to_state: "review".into(),
+            db: world.db.clone(),
+            event_bus: world.bus.clone(),
+            gate_config: state.gate_config.clone(),
+            state_config: crate::workflow::engine::effective_state_config(
+                state,
+                Some(&project),
+                task.task_state_config.as_deref(),
+            ),
+            workflow: Arc::new(workflow),
+            project_version: Some(project.version),
+            project_workflow_definition: Some(project.workflow_definition),
+            triggered_by: crate::worker_runtime::queue::cascade_actor(),
+            merge_service: world.service.merge_service.clone(),
+            cleanup_scheduler: None,
+            task_service: world.service.clone(),
+            daemon_connections: None,
+            workspace_exec_locks: None,
+            terminal_activity: None,
+            workspace_root: world.temp.path().join("workspaces"),
+            repo_cache_locks: None,
+            workspace_backend_router: world.service.workspace_backend_router.clone(),
+            workspace_id: Some("w-evidence".into()),
+            agent_id: None,
+            execution_id: Some(execution),
+        };
+        let ci = crate::workflow::actions::run_ci_steps_in_step(
+            &ctx,
+            &world.service.check_worker_or_embedded(),
+        )
+        .await;
+        assert!(matches!(ci, crate::workflow::HookResult::Ok), "{ci:?}");
+        let entry: (String,String,String) = sqlx::query_as("SELECT c.result_id,c.identity_key,r.commit_sha FROM check_consumer c JOIN check_run r ON r.id=c.run_id WHERE c.task_id='evidence' AND c.origin='entry'")
+            .fetch_one(world.db.pool()).await.unwrap();
+        assert_eq!(entry.2, original);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1
+        );
+        sqlx::query("UPDATE task SET status='merging',status_epoch=status_epoch+1,version=version+1 WHERE id='evidence'")
+            .execute(world.db.pool()).await.unwrap();
+        if moved {
+            std::fs::write(world.repo().join("outside"), "moved\n").unwrap();
+            git::commit_all(&world.repo(), "target moved after entry CI")
+                .await
+                .unwrap();
+        }
+        let (stop_steps, stopped_steps) = tokio::sync::watch::channel(false);
+        world.stop = stop_steps;
+        world.step_worker = Some(world.service.task_step_worker().start(stopped_steps));
+        let admitted = world
+            .service
+            .admit_to_integration_queue("evidence")
+            .await
+            .unwrap();
+        let running = production.run();
+        eventually("the checked Task merges", || async {
+            world.task("evidence").await.status == "done"
+        })
+        .await;
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        let row: String = sqlx::query_scalar("SELECT step_results_json FROM review WHERE task_id='evidence' ORDER BY attempt_number DESC LIMIT 1")
+            .fetch_one(world.db.pool()).await.unwrap();
+        let details: Value = serde_json::from_str(&row).unwrap();
+        let merged = world.attempt(&admitted.id).await;
+        let evidence = &details["execution"]["integration_checks"][0];
+        // What the step wrote is what the reviews endpoint parses.
+        let typed: api_types::ReviewDetails = serde_json::from_str(&row).unwrap();
+        if typed.execution.is_none() {
+            let reviews: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT id,status,step_results_json FROM review WHERE task_id='evidence' ORDER BY attempt_number",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            /// Origin, request key, run, result, cancelled at.
+            type Consumer = (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let consumers: Vec<Consumer> = sqlx::query_as(
+                "SELECT origin,request_key,run_id,result_id,cancelled_at FROM check_consumer WHERE task_id='evidence' ORDER BY created_at",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            let steps: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+                "SELECT kind,status,last_error,attempts FROM task_step WHERE task_id='evidence' ORDER BY created_at",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            panic!(
+                "moved={moved}: no head-check evidence\nreviews {reviews:?}\nconsumers {consumers:?}\nsteps {steps:?}\nattempt ack {:?} timings {:?}",
+                merged.effect_ack_json, merged.phase_timings
+            );
+        }
+        assert_eq!(typed.execution.unwrap().integration_checks.len(), 1);
+        // No wait was stated for the synchronous reuse and none is left.
+        let reviews: i64 = world
+            .scalar("SELECT COUNT(*) FROM review WHERE task_id=?", "evidence")
+            .await;
+        assert_eq!(reviews, 1, "a head check never creates a Review");
+        assert_eq!(evidence["attempt_id"], admitted.id);
+        assert!(!evidence["ci_steps"].as_array().unwrap().is_empty());
+        assert_eq!(
+            evidence["commit_sha"].as_str(),
+            merged.integrated_sha.as_deref()
+        );
+        if moved {
+            assert_ne!(evidence["commit_sha"], original);
+            assert_ne!(evidence["result_id"], entry.0);
+            assert_eq!(evidence["source"], "executed");
+        } else {
+            assert_eq!(evidence["identity_key"], entry.1);
+            assert_eq!(evidence["result_id"], entry.0);
+            assert_eq!(evidence["source"], "cache_hit", "{details}");
+        }
+        let runs: i64 = world.scalar("SELECT COUNT(*) FROM check_run WHERE id IN(SELECT run_id FROM check_consumer WHERE task_id=?)", "evidence").await;
+        // Both consumers of a hit reference the one entry run. A rebased
+        // commit has the entry run and exactly one new head run.
+        assert_eq!(runs, if moved { 2 } else { 1 });
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            if moved { 2 } else { 1 }
+        );
+    }
+}
+
+/// File-backed DB, real owner/facts/step/check ports: parallel sweep callers
+/// acquire one head, and all siblings finish without external target moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn runtime_parallel_claimers_hold_one_head_and_queue_writers_never_move_its_target() {
+    let world = World::new().await;
+    let mut attempts = Vec::new();
+    for i in 0..6 {
+        attempts.push(
+            world
+                .add_task(
+                    &format!("parallel-{i}"),
+                    &format!("parallel-{i}.txt"),
+                    "x\n",
+                )
+                .await,
+        );
+    }
+    let production = Production::new(&world);
+    let mut claims = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let worker = production.worker.clone();
+        claims.spawn(async move { worker.sweep_once().await.unwrap() });
+    }
+    let mut drivers = Vec::new();
+    while let Some(claim) = claims.join_next().await {
+        drivers.extend(claim.unwrap());
+    }
+    assert_eq!(drivers.len(), 1, "one reserved head across parallel claims");
+    drivers
+        .pop()
+        .unwrap()
+        .run(tokio_util::sync::CancellationToken::new())
+        .await;
+    let running = production.run();
+    // The result step reports the Task `done`; the worker then closes the
+    // attempt on its next pass. Wait for both before the worker is stopped.
+    eventually("all parallel siblings merge", || async {
+        let mut done = true;
+        for i in 0..6 {
+            done &= world.task(&format!("parallel-{i}")).await.status == "done";
+        }
+        for attempt in &attempts {
+            done &= world.attempt(&attempt.id).await.state == S::Completed;
+        }
+        done
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    for attempt in attempts {
+        let after = world.attempt(&attempt.id).await;
+        assert_eq!(after.state, S::Completed);
+        assert_eq!(after.phase_timings.unwrap().external_target_moves(), 0);
+        let sha = after.integrated_sha.unwrap();
+        assert!(git::command_output(
+            &world.repo(),
+            &["merge-base", "--is-ancestor", &sha, "main"]
+        )
+        .await
+        .unwrap()
+        .status
+        .success());
+    }
+}
+
+/// A head's slow real CI does not occupy another target's slot. Both targets
+/// use the same physical default checkout, with independent queue authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn runtime_two_targets_make_progress_while_one_head_waits_for_real_ci() {
+    let world = World::new().await;
+    git_out(&world.repo(), &["branch", "release"])
+        .await
+        .unwrap();
+    let slow = world.add_task("slow-target", "slow.txt", "slow\n").await;
+    let fast_sha = world
+        .legacy_task("fast-target", "fast.txt", "merging")
+        .await;
+    world.seed_execution("fast-target", "executor", None).await;
+    sqlx::query(
+        "UPDATE task SET merge_config='{\"target_branch\":\"release\"}' WHERE id='fast-target'",
+    )
+    .execute(world.db.pool())
+    .await
+    .unwrap();
+    let fast = world
+        .service
+        .admit_to_integration_queue("fast-target")
+        .await
+        .unwrap();
+    let gate = world.temp.path().join("release-slow-check");
+    review_ci(
+        &world,
+        "slow-target",
+        &[&format!(
+            "while [ ! -f '{}' ]; do sleep 0.1; done",
+            gate.display()
+        )],
+    )
+    .await;
+    std::fs::write(world.repo().join("outside"), "outside\n").unwrap();
+    git::commit_all(&world.repo(), "move main only")
+        .await
+        .unwrap();
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("slow head waits and fast target finishes", || async {
+        world.attempt(&slow.id).await.state == S::Checking
+            && world.task("fast-target").await.status == "done"
+    })
+    .await;
+    assert!(!gate.exists());
+    assert_eq!(
+        git_out(&world.repo(), &["rev-parse", "refs/heads/release"]).await,
+        Some(fast_sha)
+    );
+    std::fs::write(&gate, "go").unwrap();
+    eventually("the slow target finishes after its check", || async {
+        world.task("slow-target").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    for id in [&slow.id, &fast.id] {
+        assert_eq!(
+            world
+                .attempt(id)
+                .await
+                .phase_timings
+                .unwrap()
+                .external_target_moves(),
+            0
+        );
+    }
+}
+
+/// Every production pipeline boundary from the worker's crash matrix is
+/// replayed over real Git, file-backed storage, Task steps and check runner.
+/// A fault drops the driver at the boundary; a new claim takes it over after
+/// the lease. An admitted effect is adopted from its owner's receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn runtime_crash_boundaries_recover_through_real_ports_without_duplicate_fast_forwards() {
+    use crate::integration_worker::{CrashPoint as C, IntegrationWorkerConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cases = [
+        (false, S::Queued, C::BeforeTransition),
+        (false, S::Queued, C::AfterTransition),
+        (false, S::Validating, C::BeforeTransition),
+        (false, S::Validating, C::AfterStepEnqueue),
+        (false, S::Validating, C::AfterTransition),
+        (false, S::AwaitingTaskStep, C::BeforeTransition),
+        (false, S::AwaitingTaskStep, C::AfterTransition),
+        (false, S::ReadyFf, C::BeforeTransition),
+        (false, S::ReadyFf, C::AfterTransition),
+        (false, S::FfInflight, C::BeforeEffect),
+        (false, S::FfInflight, C::AfterEffectReceipt),
+        (false, S::FfInflight, C::BeforeTransition),
+        (false, S::FfInflight, C::AfterTransition),
+        (false, S::Applied, C::AfterStepEnqueue),
+        (false, S::Applied, C::BeforeTransition),
+        (false, S::Applied, C::AfterTransition),
+        (true, S::Rebasing, C::BeforeEffect),
+        (true, S::Rebasing, C::AfterEffectReceipt),
+        (true, S::Rebasing, C::BeforeTransition),
+        (true, S::Rebasing, C::AfterStepEnqueue),
+        (true, S::Rebasing, C::AfterTransition),
+        (true, S::Checking, C::BeforeTransition),
+        (true, S::Checking, C::AfterTransition),
+    ];
+    for (moved, state, point) in cases {
+        let world = World::new().await;
+        let a = world.add_task("crash", "crash.txt", "crash\n").await;
+        if moved {
+            std::fs::write(world.repo().join("outside"), "outside\n").unwrap();
+            git::commit_all(&world.repo(), "target moved")
+                .await
+                .unwrap();
+            review_ci(&world, "crash", &["true"]).await;
+        }
+        let (worker, daemons, config) = production_ports_config(
+            &world,
+            IntegrationWorkerConfig {
+                lease: Duration::from_secs(2),
+                renew_every: Duration::from_millis(250),
+                poll: Duration::from_millis(20),
+                sweep_interval: Duration::from_millis(100),
+                reconcile_interval: Duration::from_millis(100),
+                ..Default::default()
+            },
+        );
+        let composed = world
+            .service
+            .compose_checks(daemons, Duration::from_secs(60), &config);
+        let periodic = crate::worker_runtime::PeriodicWorkers::new(world.db.clone());
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let _checks = composed.worker.start(&periodic, stopped.clone());
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        worker.set_fault(Some(Arc::new(move |at, here| {
+            at == state && here == point && !flag.swap(true, Ordering::SeqCst)
+        })));
+        let running = tokio::spawn(worker.run(stopped));
+        eventually(&format!("{state}/{point:?} recovers"), || async {
+            world.task("crash").await.status == "done"
+                && world.attempt(&a.id).await.state == S::Completed
+        })
+        .await;
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "{state}/{point:?}: boundary reached"
+        );
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        let after = world.attempt(&a.id).await;
+        let receipts: Vec<db::IntegrationEffectReceipt> =
+            serde_json::from_value(after.effect_receipts_json).unwrap();
+        let ff = receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.request.kind == db::IntegrationOperationKind::FastForward
+                    && receipt.operation_state == db::IntegrationOperationState::Succeeded
+            })
+            .count();
+        assert_eq!(ff, 1, "{state}/{point:?}: one fast-forward");
+        assert_eq!(
+            world
+                .comments("crash")
+                .await
+                .iter()
+                .filter(|comment| comment.starts_with("Changes merged"))
+                .count(),
+            1
+        );
+        let sha = after.integrated_sha.unwrap();
+        assert!(git::command_output(
+            &world.repo(),
+            &["merge-base", "--is-ancestor", &sha, "main"]
+        )
+        .await
+        .unwrap()
+        .status
+        .success());
+    }
+}

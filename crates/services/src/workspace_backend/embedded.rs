@@ -12,14 +12,11 @@ use db::{
 use workspace::{RepoCacheLockManager, WorkspaceError, WorkspaceManager};
 
 use super::{
-    CleanupAck, Diff, DiffSpec, MergeOutcome, MergeSpec, OutboxHarvest, PrepareSpec,
-    PreparedWorkspace, ResetSpec, ResolvedWorkspace, Result, RunResult, RunSpec, WorkspaceBackend,
-    WorkspaceBackendError, WorkspaceBackendRouter, WorkspaceState,
+    CleanupAck, Diff, DiffSpec, OutboxHarvest, PrepareSpec, PreparedWorkspace, ResetSpec,
+    ResolvedWorkspace, Result, RunResult, RunSpec, WorkspaceBackend, WorkspaceBackendError,
+    WorkspaceBackendRouter, WorkspaceState,
 };
-use crate::{
-    merge_service::{MergeService, WorkspaceMergeInput},
-    ServiceError,
-};
+use crate::{merge_service::MergeService, ServiceError};
 
 /// Where the repository a workspace was created from is right now.
 enum RecordedRepoSource {
@@ -557,29 +554,6 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
             error => ServiceError::invalid_operation(error.to_string()),
         })
         .map_err(Into::into)
-    }
-
-    async fn merge(
-        &self,
-        placement: &WorkspacePlacement,
-        spec: &MergeSpec,
-    ) -> Result<MergeOutcome> {
-        let workspace = self.workspace(placement).await?;
-        let location = self.location(placement, &workspace).await?;
-        let source = self.repo_source(&location).await?;
-        let effect_workspace = super::effect_workspace(placement);
-        Ok(self
-            .merge_service
-            .merge_workspace(
-                &placement.task_id,
-                WorkspaceMergeInput {
-                    workspace: &effect_workspace,
-                    worktree_path: self.path(placement, &workspace),
-                    repo_path: Path::new(&source),
-                    spec,
-                },
-            )
-            .await?)
     }
 
     async fn reset(

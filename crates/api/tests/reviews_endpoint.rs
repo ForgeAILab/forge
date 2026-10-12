@@ -209,7 +209,6 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     let event_bus = Arc::new(EventBus::new(256));
     let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
-        Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
     let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(
@@ -434,4 +433,32 @@ fn test_jwt() -> String {
         &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
     .expect("encode test jwt")
+}
+
+#[tokio::test]
+async fn review_returns_head_check_evidence_without_losing_entry_ci_or_execution_metadata() {
+    let workspace_root = common::TestDir::new("forge-review-head-evidence");
+    let harness = test_app(workspace_root.path()).await;
+    let step = json!({"index":0,"command":"true","exit_code":0,"stderr_tail":"","output_tail":""});
+    let review_id = seed_review(&harness.state.db, json!({
+        "ci_steps": [step.clone()],
+        "execution": {"existing":"kept", "integration_checks":[{
+            "attempt_id":"head-attempt", "commit_sha":"a".repeat(40),
+            "consumer_id":"head-consumer", "run_id":"entry-run", "result_id":"entry-result",
+            "identity_key":"same-identity", "outcome":"pass", "source":"cache_hit", "ci_steps":[step]
+        }]}
+    }).to_string()).await;
+    let review: ReviewResponse = json_empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/reviews/{review_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(review.details.ci_steps.len(), 1);
+    assert_eq!(review.step_results.len(), 1);
+    let execution = review.details.execution.unwrap();
+    assert_eq!(execution.other["existing"], "kept");
+    assert_eq!(execution.integration_checks[0].result_id, "entry-result");
+    assert_eq!(execution.integration_checks[0].source, "cache_hit");
 }

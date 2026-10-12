@@ -547,7 +547,6 @@ impl ForgeRuntimeBuilder {
         let merge_service = self.merge_service.unwrap_or_else(|| {
             Arc::new(MergeService::new(
                 Arc::clone(&self.db),
-                Arc::clone(&self.event_bus),
                 workspace_root.clone(),
             ))
         });

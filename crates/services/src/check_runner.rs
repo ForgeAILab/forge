@@ -37,31 +37,23 @@ impl CheckRunner {
     }
 
     pub async fn request(&self, request: CheckRunRequest) -> Result<RequestedCheck> {
-        if request.identity.inputs.spec.commands.len() > 64 {
-            return Err(ServiceError::invalid_operation(
-                "check owner accepts at most 64 commands",
-            ));
-        }
-        // Results are delivered as Task steps and the worker cancels a
-        // consumer whose Task epoch moved, so a consumer without a Task
-        // could never be woken: refuse it instead of scheduling a run that
-        // is cancelled on first sight.
-        if request.task_id.is_none() {
-            return Err(ServiceError::invalid_operation(
-                "check consumers are Task steps: a request needs its Task",
-            ));
-        }
-        if request.request_key.len() > 512 {
-            return Err(ServiceError::invalid_operation(
-                "check consumer key exceeds 512 bytes",
-            ));
-        }
-        if !(1..=86_400).contains(&request.wall_timeout_seconds) {
-            return Err(ServiceError::invalid_operation(
-                "check owner wall timeout must be 1 through 86400 seconds",
-            ));
-        }
+        validate_request(&request)?;
         let requested = self.store.request_check_run(request).await?;
+        self.interpret(requested).await
+    }
+
+    pub(crate) async fn try_reuse(
+        &self,
+        request: CheckRunRequest,
+    ) -> Result<Option<RequestedCheck>> {
+        validate_request(&request)?;
+        match self.store.reuse_check_run(request).await? {
+            Some(requested) => self.interpret(requested).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn interpret(&self, requested: db::RequestedCheckRun) -> Result<RequestedCheck> {
         let consumer = requested.consumer;
         let run = self
             .store
@@ -120,3 +112,31 @@ impl CheckRunner {
 
 #[cfg(test)]
 mod tests;
+
+fn validate_request(request: &CheckRunRequest) -> Result<()> {
+    if request.identity.inputs.spec.commands.len() > 64 {
+        return Err(ServiceError::invalid_operation(
+            "check owner accepts at most 64 commands",
+        ));
+    }
+    // Results are delivered as Task steps and the worker cancels a
+    // consumer whose Task epoch moved, so a consumer without a Task
+    // could never be woken: refuse it instead of scheduling a run that
+    // is cancelled on first sight.
+    if request.task_id.is_none() {
+        return Err(ServiceError::invalid_operation(
+            "check consumers are Task steps: a request needs its Task",
+        ));
+    }
+    if request.request_key.len() > 512 {
+        return Err(ServiceError::invalid_operation(
+            "check consumer key exceeds 512 bytes",
+        ));
+    }
+    if !(1..=86_400).contains(&request.wall_timeout_seconds) {
+        return Err(ServiceError::invalid_operation(
+            "check owner wall timeout must be 1 through 86400 seconds",
+        ));
+    }
+    Ok(())
+}

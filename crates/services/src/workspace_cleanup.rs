@@ -112,11 +112,7 @@ pub trait WorkspaceCleanupObserver: Send + Sync {
 
 impl WorkspaceCleanupScheduler {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, workspace_root: PathBuf) -> Self {
-        let merge_service = Arc::new(MergeService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-            workspace_root.clone(),
-        ));
+        let merge_service = Arc::new(MergeService::new(Arc::clone(&db), workspace_root.clone()));
         let router = Arc::new(WorkspaceBackendRouter::new(Arc::new(
             EmbeddedWorkspaceBackend::new(Arc::clone(&db), merge_service, workspace_root.clone()),
         )));

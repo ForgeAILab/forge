@@ -6346,6 +6346,25 @@ new REST check execution or result-application route, and daemon protocol 5 is
 unchanged. Review-entry CI, and with it the review `retry` re-run, runs on this
 runner; the `checks` section of the status (above) is its operator summary.
 
+
+### Integration head checks in Review evidence
+
+Review `details.execution.integration_checks` contains the newest 64 head-check
+results recorded by integration Task steps. Each result names its attempt,
+commit, consumer, run, result and check identity, plus command-shaped `ci_steps`
+evidence. `source` says how the head came by the result: `executed` (a run
+scheduled for this head: a rebased commit), `cache_hit` (the head was recorded
+as a second consumer of a certified passed run of the same commit, target,
+commands and environment, normally the Review's own entry check), or
+`review_authority` (the passed Review's entry result itself, when its policy is
+frozen or unattested and so not reusable by anyone else). These records
+preserve the Review's original CI and conformance evidence and grant no new
+review authority. An unchanged reviewed commit launches no second check run;
+a rebased commit runs its own check. The record is added to the Task's newest
+Review. A Task that reached its merge state with no Review gets none: a check
+result never creates a Review, and its verdict is on the integration attempt.
+Older rows may have `execution: null`.
+
 ### Native Task registry contracts (3.8 F)
 
 The existing `forge_scope_read` and `forge_scope_propose` tool names remain.

@@ -150,8 +150,14 @@ impl AuthorityBoundProvider {
                     denial => denial,
                 })
         });
+        // The Project Agent's Task commands always named a paused or archived
+        // caller as such; "revoked" is the lost binding or ceiling.
+        let identity_paused = matches!(result, Err(AuthorityDenial::Revoked))
+            && operation_registry::task_proposals::IDS.contains(&operation)
+            && self.db.agent_identity_paused(actor).await.unwrap_or(false);
         result.map_err(|denial| {
             let cause = match denial {
+                AuthorityDenial::Revoked if identity_paused => api_types::DeniedBy::IdentityPaused,
                 AuthorityDenial::PermissionMissing(permission) => {
                     api_types::DeniedBy::PermissionMissing(permission)
                 }

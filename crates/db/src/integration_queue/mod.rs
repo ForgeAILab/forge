@@ -614,6 +614,7 @@ pub const INTEGRATION_TRANSITIONS: &[(IntegrationAttemptState, &[IntegrationAtte
         &[
             IntegrationAttemptState::Applied,
             IntegrationAttemptState::NeedsReview,
+            IntegrationAttemptState::Ejected,
             IntegrationAttemptState::Parked,
             IntegrationAttemptState::Rebasing,
             // Unchanged target: nothing to rebase or re-check, the reviewed
@@ -989,7 +990,6 @@ pub(crate) async fn suspend_queues_for_deleted_location(
     tx: &mut Transaction<'_, Sqlite>,
     location_id: &str,
 ) -> Result<u64> {
-    settle_removed_integration_owner(tx, Some(location_id), None).await?;
     Ok(sqlx::query("UPDATE integration_queue SET target_location_id=NULL,target_owner_json=NULL,lease_owner=NULL,lease_until=NULL,state=CASE WHEN state IN ('open','suspended') THEN 'suspended' ELSE state END,last_error_kind='target_unconfigured',last_error='target repo location deleted',revision=revision+1,updated_at=? WHERE target_location_id=?")
         .bind(now_rfc3339())
         .bind(location_id)

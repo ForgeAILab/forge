@@ -10,7 +10,9 @@ use std::{
 };
 use tempfile::tempdir;
 
-fn env_lock() -> &'static Mutex<()> {
+/// Every test that loads configuration reads the process environment, so
+/// each one holds this lock and starts from `clear_forge_env`.
+pub(crate) fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -677,7 +679,7 @@ fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
     );
 }
 
-fn clear_forge_env() {
+pub(crate) fn clear_forge_env() {
     for key in [
         "FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS",
         "FORGE_SERVER_CHECK_RETENTION_DAYS",
@@ -711,6 +713,11 @@ fn clear_forge_env() {
         "FORGE_CORS_ORIGINS",
         "FORGE_MEDIA_UPLOAD_LIMIT_BYTES",
         "FORGE_SCAFFOLD_COMMAND",
+        "FORGE_SERVER_MAX_CONCURRENT_RUNS",
+        "FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS",
+        "FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS",
+        "FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS",
+        "FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS",
     ] {
         env::remove_var(key);
     }

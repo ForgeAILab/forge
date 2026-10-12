@@ -1320,7 +1320,6 @@ async fn test_app_with_reviewer(workspace_root: &Path, reviewer_passes: bool) ->
     let event_bus = Arc::new(EventBus::new(256));
     let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
-        Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
     let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(

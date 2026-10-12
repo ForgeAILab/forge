@@ -243,7 +243,30 @@ impl TaskCheckConsumers {
         }
         Ok(requested)
     }
+    /// Record `request` as a consumer of an existing certified, reusable
+    /// pass of its identity, or do nothing (`None`): never schedules or
+    /// joins a run.
+    pub(crate) async fn try_reuse(
+        &self,
+        request: TaskCheckRequest,
+    ) -> Result<Option<RequestedCheck>> {
+        if !db::task_writer::owns_task(&request.task_id) {
+            return Err(ServiceError::invalid_operation(
+                "a check is requested from inside its Task's step",
+            ));
+        }
+        // The answer exists and the asking step applies it itself: no wait
+        // is stated for it (nothing would be waiting, and only a delivery
+        // could clear it).
+        let request = self.prepare_request(request).await?;
+        self.runner.try_reuse(request).await
+    }
     async fn request_run(&self, request: TaskCheckRequest) -> Result<RequestedCheck> {
+        self.runner
+            .request(self.prepare_request(request).await?)
+            .await
+    }
+    async fn prepare_request(&self, request: TaskCheckRequest) -> Result<db::CheckRunRequest> {
         if request.authority.is_empty() || request.authority.contains('|') {
             return Err(ServiceError::invalid_operation(
                 "check consumer authority must be a non-empty reference without '|'",
@@ -257,19 +280,17 @@ impl TaskCheckConsumers {
             ));
         }
         let request_key = request.request_key();
-        self.runner
-            .request(db::CheckRunRequest {
-                identity: request.identity,
-                request_key,
-                task_id: Some(request.task_id),
-                status_epoch: request.status_epoch,
-                origin: request.origin,
-                purpose: request.purpose,
-                workspace_id: request.workspace_id,
-                machine_id: request.machine_id,
-                wall_timeout_seconds: request.wall_timeout_seconds,
-            })
-            .await
+        Ok(db::CheckRunRequest {
+            identity: request.identity,
+            request_key,
+            task_id: Some(request.task_id),
+            status_epoch: request.status_epoch,
+            origin: request.origin,
+            purpose: request.purpose,
+            workspace_id: request.workspace_id,
+            machine_id: request.machine_id,
+            wall_timeout_seconds: request.wall_timeout_seconds,
+        })
     }
 
     /// The verdict a consumer has been answered with, read by the step that

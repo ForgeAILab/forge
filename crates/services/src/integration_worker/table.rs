@@ -94,7 +94,7 @@ pub const HEAD_TABLE: &[HeadStateRow] = &[
         state: S::Validating,
         action: HeadAction::Validate,
         success: &[S::AwaitingTaskStep, S::Rebasing, S::Applied],
-        failure: &[S::NeedsReview, S::Parked, S::Cancelled],
+        failure: &[S::NeedsReview, S::Ejected, S::Parked, S::Cancelled],
         timeout: HeadTimeout::Validate,
         on_timeout: Some(S::Parked),
         cancel: CancelRule::Now,

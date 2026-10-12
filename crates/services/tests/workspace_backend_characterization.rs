@@ -17,8 +17,8 @@ use events::EventBus;
 use serde_json::json;
 use services::{
     workspace_backend::{
-        DiffSpec, EmbeddedWorkspaceBackend, MergeSpec, PrepareSpec, ResetSpec, RunSpec,
-        WorkspaceBackend, WorkspaceBackendError, WorkspaceBackendRouter, WorkspaceRunPurpose,
+        DiffSpec, EmbeddedWorkspaceBackend, PrepareSpec, ResetSpec, RunSpec, WorkspaceBackend,
+        WorkspaceBackendError, WorkspaceBackendRouter, WorkspaceRunPurpose,
     },
     MergeOutcome, MergeService, ServiceError,
 };
@@ -98,50 +98,6 @@ async fn table_digests(db: &SqliteDb) -> BTreeMap<String, String> {
         }
     }
     digests
-}
-
-async fn assert_execution_evidence_writes(
-    db: &SqliteDb,
-    mut before: BTreeMap<String, String>,
-    mut after: BTreeMap<String, String>,
-    updates: i64,
-) {
-    // Pin the existing trigger effects instead of excluding their entire data.
-    for table in [
-        "execution",
-        "project",
-        "usage_ledger_revision",
-        "usage_changed_execution",
-    ] {
-        assert_ne!(before.remove(table), after.remove(table), "{table}");
-    }
-    for key in [
-        "project::list_revision",
-        "usage_ledger_revision::execution_revision",
-    ] {
-        let old: i64 = before.remove(key).unwrap().parse().unwrap();
-        let new: i64 = after.remove(key).unwrap().parse().unwrap();
-        assert_eq!(new, old + updates, "{key}");
-    }
-    let revision: i64 = sqlx::query_scalar("SELECT execution_revision FROM usage_ledger_revision")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    let changed: Vec<(String, i64)> =
-        sqlx::query_as("SELECT id,revision FROM usage_changed_execution")
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(changed, vec![(EXECUTION_ID.into(), revision)]);
-    let changed_tables: Vec<_> = before
-        .keys()
-        .filter(|key| before.get(*key) != after.get(*key))
-        .collect();
-    assert!(
-        changed_tables.is_empty(),
-        "unexpected changes: {changed_tables:?}"
-    );
-    assert_eq!(before, after);
 }
 
 struct Fixture {
@@ -352,7 +308,6 @@ fn execution(id: &str, role: &str, status: ExecutionStatus) -> CreateExecution {
 fn merge_service(db: &Arc<SqliteDb>, fixture: &Fixture) -> Arc<MergeService> {
     Arc::new(MergeService::new_for_test(
         Arc::clone(db),
-        Arc::new(EventBus::new(16)),
         fixture.temp.path().join("worktrees"),
     ))
 }
@@ -463,34 +418,6 @@ async fn reviewer_prompt_bytes_for_server_workspace() {
         prompt.as_bytes(),
         include_bytes!("fixtures/server_workspace_reviewer.prompt.snap")
     );
-}
-
-#[tokio::test]
-async fn clean_merge_outcome() {
-    let fixture = fixture().await;
-    let db = seed(&fixture, None).await;
-    embedded(&db, &fixture).await;
-    let before = table_digests(&db).await;
-    let outcome = merge_service(&db, &fixture).merge(TASK_ID).await.unwrap();
-    assert_eq!(
-        outcome,
-        MergeOutcome::Done {
-            before_sha: fixture.base_sha.clone(),
-            after_sha: fixture.candidate_sha.clone(),
-            branch: "main".to_owned(),
-        }
-    );
-    assert_eq!(
-        git::get_current_sha(&fixture.repo).await.unwrap(),
-        fixture.candidate_sha
-    );
-    let execution = ExecutionRepo::get_by_id(&*db, EXECUTION_ID)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.before_sha, Some(fixture.candidate_sha.clone()));
-    assert_eq!(execution.after_sha, Some(fixture.candidate_sha));
-    assert_execution_evidence_writes(&db, before, table_digests(&db).await, 2).await;
 }
 
 #[tokio::test]
@@ -723,93 +650,6 @@ async fn owner_harvested_outbox_ingests_bytes_without_owner_paths_and_replays_on
 }
 
 #[tokio::test]
-async fn conflict_merge_outcome_and_abort() {
-    let fixture = fixture().await;
-    std::fs::write(fixture.worktree.join("file.txt"), "task change\n").unwrap();
-    let candidate = commit(&fixture.worktree, "task change").await;
-    std::fs::write(fixture.repo.join("file.txt"), "target change\n").unwrap();
-    let target = commit(&fixture.repo, "target change").await;
-    let db = seed(&fixture, None).await;
-    embedded(&db, &fixture).await;
-    let before = table_digests(&db).await;
-    let outcome = merge_service(&db, &fixture).merge(TASK_ID).await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Conflict {
-        target_branch: "main".to_owned(),
-        details: "Auto-merging file.txt\nCONFLICT (content): Merge conflict in file.txt\nAutomatic merge failed; fix conflicts and then commit the result.\n".to_owned(),
-        conflict_paths: vec![PathBuf::from("file.txt")],
-    });
-    assert_eq!(git::get_current_sha(&fixture.repo).await.unwrap(), target);
-    assert!(git::is_worktree_clean(&fixture.repo).await.unwrap());
-    assert!(!git::detect_interrupted_merge(&fixture.repo).await.unwrap());
-    let execution = ExecutionRepo::get_by_id(&*db, EXECUTION_ID)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.before_sha, Some(candidate));
-    assert_eq!(execution.after_sha, None);
-    assert_execution_evidence_writes(&db, before, table_digests(&db).await, 1).await;
-}
-
-#[tokio::test]
-async fn dirty_target_merge_outcome_preserves_target() {
-    let fixture = fixture().await;
-    std::fs::write(fixture.repo.join("file.txt"), "uncommitted target\n").unwrap();
-    let db = seed(&fixture, None).await;
-    embedded(&db, &fixture).await;
-    let before = table_digests(&db).await;
-    assert_eq!(
-        merge_service(&db, &fixture).merge(TASK_ID).await.unwrap(),
-        MergeOutcome::TargetDirty {
-            files: vec!["file.txt".to_owned()]
-        }
-    );
-    assert_eq!(
-        git::get_current_sha(&fixture.repo).await.unwrap(),
-        fixture.base_sha
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.repo.join("file.txt")).unwrap(),
-        "uncommitted target\n"
-    );
-    let execution = ExecutionRepo::get_by_id(&*db, EXECUTION_ID)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(execution.before_sha, None);
-    assert_eq!(execution.after_sha, None);
-    assert_eq!(before, table_digests(&db).await);
-}
-
-#[tokio::test]
-async fn dirty_task_merge_writes_nothing() {
-    let fixture = fixture().await;
-    let db = seed(&fixture, None).await;
-    embedded(&db, &fixture).await;
-    std::fs::write(fixture.worktree.join("file.txt"), "uncommitted task\n").unwrap();
-    let before = table_digests(&db).await;
-    let bus = Arc::new(EventBus::new(16));
-    let mut events = bus.subscribe();
-    let service =
-        MergeService::new_for_test(db.clone(), bus, fixture.temp.path().join("worktrees"));
-    assert_eq!(
-        service.merge(TASK_ID).await.unwrap(),
-        MergeOutcome::Dirty {
-            files: vec!["file.txt".into()]
-        }
-    );
-    assert_eq!(before, table_digests(&db).await);
-    assert!(events.try_recv().is_err());
-    assert_eq!(
-        git::get_current_sha(&fixture.worktree).await.unwrap(),
-        fixture.candidate_sha
-    );
-    assert_eq!(
-        git::get_current_sha(&fixture.repo).await.unwrap(),
-        fixture.base_sha
-    );
-}
-
-#[tokio::test]
 async fn server_rebase_clean_conflict_and_restart_write_nothing() {
     for case in ["clean", "conflict", "restart", "abort"] {
         let fixture = fixture().await;
@@ -853,14 +693,14 @@ async fn server_rebase_clean_conflict_and_restart_write_nothing() {
         assert_eq!(before, table_digests(&db).await);
         if case == "clean" {
             let head = git::get_current_sha(&fixture.worktree).await.unwrap();
-            assert_eq!(
-                merge_service(&db, &fixture).merge(TASK_ID).await.unwrap(),
-                MergeOutcome::Done {
-                    before_sha: target,
-                    after_sha: head,
-                    branch: "main".into(),
-                }
-            );
+            assert!(git::command_output(
+                &fixture.worktree,
+                &["merge-base", "--is-ancestor", &target, &head]
+            )
+            .await
+            .unwrap()
+            .status
+            .success());
         }
     }
 }
@@ -965,31 +805,6 @@ async fn embedded_workspace_operations_delegate_to_existing_paths() {
 }
 
 #[tokio::test]
-async fn embedded_merge_reuses_the_merge_service_outcome() {
-    let fixture = fixture().await;
-    let db = seed(&fixture, None).await;
-    let (backend, placement) = embedded(&db, &fixture).await;
-    assert_eq!(
-        backend
-            .merge(
-                &placement,
-                &MergeSpec {
-                    target_branch: "main".to_owned(),
-                    expected_target_sha: fixture.base_sha.clone(),
-                    handed_off_paths: Vec::new(),
-                }
-            )
-            .await
-            .unwrap(),
-        MergeOutcome::Done {
-            before_sha: fixture.base_sha.clone(),
-            after_sha: fixture.candidate_sha.clone(),
-            branch: "main".to_owned(),
-        }
-    );
-}
-
-#[tokio::test]
 async fn configured_router_selects_daemon_backend_from_placement() {
     use services::workspace_backend as ws;
 
@@ -1018,14 +833,6 @@ async fn configured_router_selects_daemon_backend_from_placement() {
         }
 
         async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
-            unreachable!("routing does not perform workspace I/O")
-        }
-
-        async fn merge(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &MergeSpec,
-        ) -> ws::Result<MergeOutcome> {
             unreachable!("routing does not perform workspace I/O")
         }
 
@@ -1243,8 +1050,8 @@ async fn merge_primitives_return_facts_without_any_table_or_event_write() {
         {
             outcome
         } else {
-            let (before_sha, head_sha) =
-                merge_heads(&fixture.repo, &fixture.worktree).await.unwrap();
+            let before_sha = git::get_current_sha(&fixture.repo).await.unwrap();
+            let head_sha = git::get_current_sha(&fixture.worktree).await.unwrap();
             let tip = target_tip(&fixture.repo, "main").await.unwrap();
             let branch = workspace::task_branch_name(TASK_ID);
             let input = MergeEffectInput {

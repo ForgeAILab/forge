@@ -696,6 +696,7 @@ impl TaskService {
     /// The queue worker `drain` pumps. The runtime composes it before any
     /// step runs; a service built without a runtime composes the same worker
     /// here, with the check runtime on the same timers.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn integration_worker_or_embedded(
         &self,
     ) -> Arc<crate::integration_worker::IntegrationQueueWorker> {
@@ -811,7 +812,6 @@ impl TaskService {
         let merge_service = self.merge_service.clone().unwrap_or_else(|| {
             Arc::new(MergeService::new(
                 Arc::clone(&self.db),
-                Arc::clone(&self.event_bus),
                 self.workspace_root.clone(),
             ))
         });
@@ -2519,6 +2519,7 @@ impl TaskService {
         *cached = Some(worker.clone());
         worker
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn drain(&self, task_id: &str) -> Result<Task> {
         self.task_step_worker().drain(task_id).await
     }

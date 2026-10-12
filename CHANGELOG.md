@@ -8,6 +8,57 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A dirty Task checkout returns to its coder through the merge-fix budget.**
+  The queue uses the same failure/cascade path as the pre-queue merge hook,
+  rather than parking the Task for its owner. A red head check also charges
+  one merge fix; a dirty default checkout remains an owner intervention and
+  spends no Task retry budget.
+
+- **The integration reconciler repairs missing or stale Task conditions.** A
+  current attempt remains the source for a released/suspended wait, including
+  its typed cause and owner action. Repair runs under the Task-step lease and
+  does not replay custom hooks or re-admit a healthy attempt. Ready placement
+  bindings also repair a missed reconnect wake through ordinary admission.
+
+- **Review and queue-head CI use one commit/target identity builder.** The
+  target branch is included in the check identity, so cached results from the
+  previous identity do not become hits after upgrade. An unchanged reviewed
+  commit reuses a passed entry check without launching another run; a rebased
+  commit is checked under its new identity. Head results appear in Review
+  `details.execution.integration_checks`, with exact commit, run, result and
+  command evidence. Original CI and conformance authority stay intact. The
+  queue head of an unchanged commit is recorded as a second consumer
+  (`origin = integration`) of the Review's passed run, with no run, wait or
+  applied delivery of its own; a Task with no Review gets no evidence row,
+  and a check result never creates a Review.
+
+- **A parked merge is re-bound only to a verified placement.** When the
+  machine that owns a Task's checkout reconnects under another runtime id, or
+  the Task's placement was verified under another generation, a queued or
+  parked attempt that still names the old binding is superseded by one bound
+  to the ready placement (it keeps its place in line). Before, the rebase was
+  refused as a foreign owner and the Task parked on `target_not_ready` with
+  no end. A placement that is not `ready` proves nothing: the attempt keeps
+  its binding, and the owner's Retry puts that same attempt back in line.
+
+- **The obsolete direct merge service and workspace-backend merge APIs are
+  removed.** Integration effects require a queue claim and a Task-step permit.
+  Synchronous queue pumping through `drain` is available only to tests using
+  `test-support`; production runs the shared integration worker. The daemon's
+  `workspace.merge` message remains the queue's fast-forward operation, so its
+  wire revision is unchanged. Raw Review workspace commands without explicit
+  limits now use a finite 1800-second / 1-MiB bound; CI verdict/tail handling
+  belongs to the durable check runner.
+
+- **Parked merge attempts refresh verified owner bindings after recovery.** A
+  daemon runtime or placement generation change supersedes a released attempt
+  while retaining its queue position and reviewed commit. Retry uses the same
+  admission rule; unsettled effects retain their original reconciliation owner.
+- **Cancelled legacy merges retain their possible-effect evidence.** A terminal
+  shadow attempt no longer suppresses import of a surviving legacy merge intent.
+  The import snapshot survives hook-step pruning, including when the storage
+  importer cannot yet prove whether the candidate landed.
+
 - **Native Task tools refuse fields they do not declare.** The Task reads
   (`task.summary`, `work.read`, `events.read`, `inbox.read`,
   `commitments.read`, `delivery.read`, `memory.read`, `decisions.read`), the
@@ -39,6 +90,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the version conflict. It used to report success and leave a "had no effect"
   comment. A command accepted while the Task was in the merge queue still
   settles as before when the merge lands first.
+
 - **Deleting a repository, a repo location or a Project, and changing a
   repository's default location, is refused while a merge into it is
   unresolved (`409 integration_unresolved`).** "Unresolved" is a merge whose
@@ -1339,6 +1391,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   accept. A Task run's `work.read` marks its offers
   `available_actions_informational` (a Task run has no workflow action).
   `task.evidence` results name the execution and role they were stored under.
+  Refusals keep their class: a paused or archived Project Agent's Task command
+  is refused as `identity_paused` (a lost binding or ceiling is
+  `authority_revoked`), and a Task command or record whose payload names a
+  server-derived field (`project_id`, `permission`, ...) is a correctable
+  `validation_error` that states the contract, not a policy refusal. Authority
+  is decided before the payload is read, so a caller without the permission
+  gets the denial, not a payload diagnostic. A Project Chat keeps its reminder
+  for an operation it was refused for a permission the chat never holds
+  (`review.request`). A Task session's turn is admitted only while a running
+  execution of its identity serves the session's role, as the session itself
+  always was.
 - **Smaller tool prefix on every Task and Project Agent turn.** Estimated
   from the serialized definitions (bytes / 4): coder 1,516 → 1,164 tokens,
   reviewer 1,208 → 989, planner 1,360 → 1,008, ready Project Agent

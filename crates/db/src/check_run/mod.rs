@@ -223,6 +223,7 @@ pub struct CheckRunCounts {
 #[async_trait]
 pub trait CheckRunRepo: Send + Sync {
     async fn request_check_run(&self, request: CheckRunRequest) -> Result<RequestedCheckRun>;
+    async fn reuse_check_run(&self, request: CheckRunRequest) -> Result<Option<RequestedCheckRun>>;
     async fn check_run(&self, id: &str) -> Result<Option<StoredCheckRun>>;
     async fn find_live_check_run(
         &self,
@@ -375,129 +376,12 @@ fn validate_times(now: &str, until: &str) -> Result<()> {
 #[async_trait]
 impl CheckRunRepo for SqliteDb {
     async fn request_check_run(&self, request: CheckRunRequest) -> Result<RequestedCheckRun> {
-        let key = request.identity.key()?;
-        let input = json(&request.identity.inputs, CHECK_INPUT_BYTES)?;
-        if request.request_key.is_empty() || request.status_epoch < 0 {
-            return Err(DbError::Check("invalid check consumer identity".into()));
-        }
-        let wall_timeout = i64::try_from(request.wall_timeout_seconds)
-            .ok()
-            .filter(|seconds| *seconds > 0)
-            .ok_or_else(|| DbError::Check("check wall timeout must be positive".into()))?;
-        // A worktree- or Task-scoped identity is only this requester's to ask for.
-        match &request.identity.inputs.spec.scope {
-            CheckScope::Commit => {}
-            CheckScope::Workspace { workspace_id, .. } => {
-                if request.workspace_id.as_ref() != Some(workspace_id) {
-                    return Err(DbError::Check(
-                        "check scope names a different workspace than the request".into(),
-                    ));
-                }
-            }
-            CheckScope::Task { task_id } => {
-                if request.task_id.as_ref() != Some(task_id) {
-                    return Err(DbError::Check(
-                        "check scope names a different Task than the request".into(),
-                    ));
-                }
-            }
-        }
-        let mut tx = begin_immediate(self.pool()).await?;
-        // Reject contradictory scope even though individual FK references exist.
-        let project: String = sqlx::query_scalar("SELECT project_id FROM repo WHERE id=?")
-            .bind(&request.identity.repo_id)
-            .fetch_optional(&mut *tx)
+        self.request_check_run_inner(request, false)
             .await?
-            .ok_or(DbError::NotFound)?;
-        if project != request.identity.project_id {
-            return Err(DbError::Check("check repo is outside Project".into()));
-        }
-        if let Some(task) = &request.task_id {
-            let project: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id=?")
-                .bind(task)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(DbError::NotFound)?;
-            if project != request.identity.project_id {
-                return Err(DbError::Check("check Task is outside Project".into()));
-            }
-        }
-        if let Some(workspace) = &request.workspace_id {
-            let repo: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id=?")
-                .bind(workspace)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(DbError::NotFound)?;
-            if repo != request.identity.repo_id {
-                return Err(DbError::Check("check workspace is outside repo".into()));
-            }
-        }
-        if let Some(row) = sqlx::query("SELECT * FROM check_consumer WHERE request_key=?")
-            .bind(&request.request_key)
-            .fetch_optional(&mut *tx)
-            .await?
-        {
-            let consumer = map_consumer(row)?;
-            if consumer.identity_key != key
-                || consumer.task_id != request.task_id
-                || consumer.status_epoch != request.status_epoch
-                || consumer.origin != request.origin
-                || consumer.purpose != Some(request.purpose)
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-            tx.commit().await?;
-            return Ok(RequestedCheckRun {
-                consumer,
-                disposition: CheckRequestDisposition::Idempotent,
-            });
-        }
-        let now = now_rfc3339();
-        let hit = if request.identity.inputs.reusable_inputs() {
-            sqlx::query(REUSABLE)
-                .bind(&key)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(map_result)
-                .transpose()?
-        } else {
-            None
-        };
-        let (run_id, result_id, disposition) = if let Some(result) = hit {
-            (
-                result.run_id,
-                Some(result.id),
-                CheckRequestDisposition::Reused,
-            )
-        } else if let Some(row) = sqlx::query(LIVE)
-            .bind(&key)
-            .fetch_optional(&mut *tx)
-            .await?
-        {
-            (map_run(row)?.id, None, CheckRequestDisposition::Joined)
-        } else {
-            let id = new_uuid_v4();
-            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,workspace_id,machine_id,applied_timeout_seconds,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)")
-                .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.identity.commit_sha)
-                .bind(request.identity.inputs.digest().map_err(DbError::Check)?).bind(&key).bind(input).bind(request.identity.inputs.reusable_inputs())
-                .bind(new_uuid_v4()).bind(&request.workspace_id).bind(&request.machine_id).bind(wall_timeout).bind(&now).bind(&now).execute(&mut *tx).await?;
-            (id, None, CheckRequestDisposition::Scheduled)
-        };
-        let id = new_uuid_v4();
-        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.task_id).bind(request.status_epoch)
-            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(now).execute(&mut *tx).await?;
-        let consumer = map_consumer(
-            sqlx::query("SELECT * FROM check_consumer WHERE id=?")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?,
-        )?;
-        tx.commit().await?;
-        Ok(RequestedCheckRun {
-            consumer,
-            disposition,
-        })
+            .ok_or(DbError::NotFound)
+    }
+    async fn reuse_check_run(&self, request: CheckRunRequest) -> Result<Option<RequestedCheckRun>> {
+        self.request_check_run_inner(request, true).await
     }
     async fn check_run(&self, id: &str) -> Result<Option<StoredCheckRun>> {
         sqlx::query("SELECT * FROM check_run WHERE id=?")
@@ -768,3 +652,145 @@ impl CheckRunRepo for SqliteDb {
 
 #[cfg(test)]
 mod tests;
+
+impl SqliteDb {
+    async fn request_check_run_inner(
+        &self,
+        request: CheckRunRequest,
+        reuse_only: bool,
+    ) -> Result<Option<RequestedCheckRun>> {
+        let key = request.identity.key()?;
+        let input = json(&request.identity.inputs, CHECK_INPUT_BYTES)?;
+        if request.request_key.is_empty() || request.status_epoch < 0 {
+            return Err(DbError::Check("invalid check consumer identity".into()));
+        }
+        let wall_timeout = i64::try_from(request.wall_timeout_seconds)
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| DbError::Check("check wall timeout must be positive".into()))?;
+        // A worktree- or Task-scoped identity is only this requester's to ask for.
+        match &request.identity.inputs.spec.scope {
+            CheckScope::Commit => {}
+            CheckScope::Workspace { workspace_id, .. } => {
+                if request.workspace_id.as_ref() != Some(workspace_id) {
+                    return Err(DbError::Check(
+                        "check scope names a different workspace than the request".into(),
+                    ));
+                }
+            }
+            CheckScope::Task { task_id } => {
+                if request.task_id.as_ref() != Some(task_id) {
+                    return Err(DbError::Check(
+                        "check scope names a different Task than the request".into(),
+                    ));
+                }
+            }
+        }
+        let mut tx = begin_immediate(self.pool()).await?;
+        // Reject contradictory scope even though individual FK references exist.
+        let project: String = sqlx::query_scalar("SELECT project_id FROM repo WHERE id=?")
+            .bind(&request.identity.repo_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if project != request.identity.project_id {
+            return Err(DbError::Check("check repo is outside Project".into()));
+        }
+        if let Some(task) = &request.task_id {
+            let project: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id=?")
+                .bind(task)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::NotFound)?;
+            if project != request.identity.project_id {
+                return Err(DbError::Check("check Task is outside Project".into()));
+            }
+        }
+        if let Some(workspace) = &request.workspace_id {
+            let repo: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id=?")
+                .bind(workspace)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::NotFound)?;
+            if repo != request.identity.repo_id {
+                return Err(DbError::Check("check workspace is outside repo".into()));
+            }
+        }
+        if let Some(row) = sqlx::query("SELECT * FROM check_consumer WHERE request_key=?")
+            .bind(&request.request_key)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let consumer = map_consumer(row)?;
+            if consumer.identity_key != key
+                || consumer.task_id != request.task_id
+                || consumer.status_epoch != request.status_epoch
+                || consumer.origin != request.origin
+                || consumer.purpose != Some(request.purpose)
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+            if reuse_only {
+                let reusable: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_result r JOIN check_run run ON run.id=r.run_id WHERE r.id=? AND r.certified=1 AND r.cacheable=1 AND r.outcome='pass' AND run.cacheable=1 AND run.state='succeeded')")
+                    .bind(&consumer.result_id).fetch_one(&mut *tx).await?;
+                if !reusable {
+                    return Ok(None);
+                }
+            }
+            tx.commit().await?;
+            return Ok(Some(RequestedCheckRun {
+                consumer,
+                disposition: CheckRequestDisposition::Idempotent,
+            }));
+        }
+        let now = now_rfc3339();
+        let hit = if request.identity.inputs.reusable_inputs() {
+            sqlx::query(REUSABLE)
+                .bind(&key)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(map_result)
+                .transpose()?
+        } else {
+            None
+        };
+        if reuse_only && hit.is_none() {
+            return Ok(None);
+        }
+        let (run_id, result_id, disposition) = if let Some(result) = hit {
+            (
+                result.run_id,
+                Some(result.id),
+                CheckRequestDisposition::Reused,
+            )
+        } else if let Some(row) = sqlx::query(LIVE)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            (map_run(row)?.id, None, CheckRequestDisposition::Joined)
+        } else {
+            let id = new_uuid_v4();
+            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,workspace_id,machine_id,applied_timeout_seconds,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)")
+                .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.identity.commit_sha)
+                .bind(request.identity.inputs.digest().map_err(DbError::Check)?).bind(&key).bind(input).bind(request.identity.inputs.reusable_inputs())
+                .bind(new_uuid_v4()).bind(&request.workspace_id).bind(&request.machine_id).bind(wall_timeout).bind(&now).bind(&now).execute(&mut *tx).await?;
+            (id, None, CheckRequestDisposition::Scheduled)
+        };
+        let id = new_uuid_v4();
+        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.task_id).bind(request.status_epoch)
+            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(now).execute(&mut *tx).await?;
+        let consumer = map_consumer(
+            sqlx::query("SELECT * FROM check_consumer WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        tx.commit().await?;
+        Ok(Some(RequestedCheckRun {
+            consumer,
+            disposition,
+        }))
+    }
+}

@@ -324,7 +324,8 @@ pub struct StepResultResponse {
     pub finished_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 pub struct StepResultEntry {
     pub index: usize,
     pub command: String,
@@ -345,8 +346,33 @@ pub struct AuditorVerdictEntry {
     pub reason: Option<String>,
 }
 
+/// Exact check-result evidence appended by an integration Task step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct IntegrationHeadCheckEvidence {
+    pub attempt_id: String,
+    pub commit_sha: String,
+    pub consumer_id: String,
+    pub run_id: String,
+    pub result_id: String,
+    pub identity_key: String,
+    pub outcome: String,
+    pub source: String,
+    pub ci_steps: Vec<StepResultEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ReviewExecutionEvidence {
+    #[serde(default)]
+    pub integration_checks: Vec<IntegrationHeadCheckEvidence>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReviewDetails {
+    #[serde(default)]
+    pub execution: Option<ReviewExecutionEvidence>,
     #[serde(default)]
     pub conformance: crate::ReviewConformance,
     #[serde(default)]

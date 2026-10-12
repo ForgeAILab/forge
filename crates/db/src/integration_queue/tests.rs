@@ -928,3 +928,41 @@ fn malformed_checkpoint_results_and_contradictory_current_entries_are_quarantine
         IntegrationImportDisposition::Quarantined
     );
 }
+
+#[tokio::test]
+async fn integration_import_retains_legacy_merge_intent_after_shadow_cancel_and_step_pruning() {
+    let db = fixture().await;
+    seed_delivery(&db, "a").await;
+    let step = seeded_step(&db, "a", "done").await;
+    sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES(?,0,?,?)")
+        .bind(&step.id).bind(FIXED_TIME)
+        .bind(serde_json::json!({"merge_intent":{"candidate_sha":"landed-candidate","target_branch":"main"}}).to_string())
+        .execute(db.pool()).await.unwrap();
+    let q = db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    let mut old = admission(&q, "a", "shadow:a:0");
+    old.state = IntegrationAttemptState::Cancelled;
+    db.admit_integration_attempt(old).await.unwrap();
+    sqlx::query("UPDATE task SET status='cancelled',status_epoch=1 WHERE id='a'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.import_integration_pass(100).await.unwrap();
+    let raw: Option<String> = sqlx::query_scalar("SELECT import_source_json FROM integration_attempt WHERE task_ref='a' AND import_source_json IS NOT NULL")
+        .fetch_optional(db.pool()).await.unwrap();
+    assert!(
+        raw.as_deref()
+            .is_some_and(|raw| raw.contains("landed-candidate")),
+        "the only possible-landed proof must be retained"
+    );
+    sqlx::query("DELETE FROM task_step WHERE id=?")
+        .bind(&step.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let retained: String = sqlx::query_scalar("SELECT import_source_json FROM integration_attempt WHERE task_ref='a' AND import_source_json IS NOT NULL")
+        .fetch_one(db.pool()).await.unwrap();
+    assert!(retained.contains("landed-candidate"));
+}

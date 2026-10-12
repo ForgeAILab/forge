@@ -588,10 +588,22 @@ impl TaskDispatcher {
         // superseded attempt leaves a witness and no row.
         f.missing_merge_entry = t.parent_task_id.is_none()
             && merge_state
-            && !r.integration_owned
-            && !f.blocking
+            && (!r.integration_owned
+                || crate::integration_steps::reconcile::statement_stale(
+                    r.integration_statement.as_ref(),
+                    &r.condition,
+                ))
+            && (!f.blocking
+                || crate::integration_steps::reconcile::statement_stale(
+                    r.integration_statement.as_ref(),
+                    &r.condition,
+                ))
             && !f.paused
-            && crate::integration_steps::gate::task_row_gate(t).is_none();
+            && (crate::integration_steps::gate::task_row_gate(t).is_none()
+                || crate::integration_steps::reconcile::statement_stale(
+                    r.integration_statement.as_ref(),
+                    &r.condition,
+                ));
         Prepared {
             read: r,
             workflow: w,

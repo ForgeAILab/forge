@@ -900,9 +900,6 @@ async fn request_entry_check(
             return Err(failed(error.to_string()));
         }
     };
-    let environment = ::review::contract::project_environment(&ctx.db, &ctx.task_id)
-        .await
-        .map_err(failed)?;
     let resolved = resolve_workspace(ctx, &workspace)
         .await
         .map_err(|error| failed(error.to_string()))?;
@@ -928,42 +925,23 @@ async fn request_entry_check(
     let commit_sha = state
         .head_sha
         .ok_or_else(|| failed("review workspace has no HEAD".to_owned()))?;
-    let source = json!({
-        "task_id": task.id, "project_id": task.project_id, "repo_id": workspace.repo_id,
-    });
-    // A daemon-owned checkout gets its owner's frozen policy from the
-    // builder: it always runs and its result is never reused.
-    let spec = ::review::check_spec::build_check_spec(
-        api_types::CheckPurpose::EntryCi,
-        &::review::check_spec::CheckSpecConfiguration {
-            source: &source,
-            entry_state_config: Some(&ctx.state_config),
-            environment: &environment,
-            hooks: &[],
-            hook_test_index: None,
-            single_environment_check: None,
-            event: api_types::LifecycleEvent::BeforeWork,
-            role: "",
-            owner_is_daemon: daemon,
-            canonical_policy: true,
-            workspace: Some(::review::check_spec::CheckWorkspaceIdentity {
-                workspace_id: &workspace.id,
-                generation: u64::try_from(resolved.placement.generation)
-                    .map_err(|_| failed("invalid workspace generation".to_owned()))?,
-            }),
-            queue_head_bundle: None,
+    let Some(identity) = crate::check_runner::review_entry::review_ci_identity(
+        &ctx.db,
+        crate::check_runner::review_entry::ReviewCiIdentityInput {
+            task,
+            workspace: &workspace,
+            placement: &resolved.placement,
+            commit_sha,
+            state_config: &ctx.state_config,
+            dirty,
+            target_branch: None,
         },
     )
-    .map_err(failed)?;
-    if spec.commands.is_empty() {
+    .await
+    .map_err(|error| failed(error.to_string()))?
+    else {
         return Ok(EntryCheck::NothingToRun);
-    }
-    let mut inputs = crate::check_runner::policy::digest_input(&ctx.db, spec, &environment.env)
-        .await
-        .map_err(|error| failed(error.to_string()))?;
-    if dirty {
-        inputs.environment_identity = api_types::CheckEnvironmentIdentity::NotAttested;
-    }
+    };
     let status_epoch = db::CheckDeliveryRepo::live_task_epoch(&*ctx.db, &task.id)
         .await
         .map_err(|error| failed(error.to_string()))?
@@ -975,12 +953,7 @@ async fn request_entry_check(
             authority: review.id.clone(),
             origin: db::CheckConsumerOrigin::Entry,
             purpose: api_types::CheckPurpose::EntryCi,
-            identity: db::CheckRunIdentity {
-                project_id: task.project_id.clone(),
-                repo_id: workspace.repo_id.clone(),
-                commit_sha,
-                inputs,
-            },
+            identity,
             workspace_id: Some(workspace.id.clone()),
             machine_id: resolved.placement.daemon_id.clone().filter(|_| daemon),
             wall_timeout_seconds: entry_check_wall_seconds(&task.id),
