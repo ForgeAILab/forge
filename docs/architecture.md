@@ -4812,10 +4812,22 @@ write locks around Git/RPC. The queue fast-forwards through the integration
 owners (`ServerIntegrationOwner::merge` and the daemon's fenced
 `workspace.merge`), after a short Task-step authorization transaction.
 
-Queue/member reads, web labels and `integration.updated` are live. The storage
-receipt pruner is available, but no production periodic job calls
-`prune_integration_evidence` yet; transfer cleanup and owner-journal
-acknowledgment already run.
+Queue/member reads, web labels and `integration.updated` are live. Retention
+(3.2 D3c): `StorageMaintenanceWorker::prune_integration_evidence` runs in the
+hourly slot of check retention, under the same `server.check_retention_days`
+(30; `0` disables), at most 20 batches of 100 attempts. It calls
+`IntegrationActivationRepo::prune_integration_evidence`, which empties
+`effect_receipts_json`, `operation_receipts_json` and `observations_json` of
+an attempt that finished before the cutoff. Deny-by-default: the attempt is
+terminal and not current, has no effect intent, no pending / running /
+uncertain operation and no uncertain receipt, its Task has no current attempt,
+and its queue is neither quarantined nor names it as head. **No attempt row is
+deleted**: the row is the queue's history (states, commits, timings, lineage),
+and a Review's `execution.integration_checks` and a settled Task's
+`integration_lineage` witness name it by id; what a Review quotes of a head
+check is stored in the Review itself. `integration_queues.finished_with_receipts`
+in operations status counts finished attempts that still hold receipts.
+Transfer cleanup and owner-journal acknowledgment run as before.
 
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same
