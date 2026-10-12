@@ -109,7 +109,52 @@ pub struct CreateProjectFromCharterApprovalInput {
 /// approval and returns the committed receipt. The retry is admitted only
 /// when the approval is consumed *and* the committed handoff carries this
 /// exact idempotency key, so a real conflict is never retried into success.
+///
+/// One creation per approval runs at a time in this process. The response
+/// carries the Project as it stands once this call's provisioning pass is
+/// over, so an overlapping submission that ran beside the first one's
+/// provisioning could read the Project before its repository was linked
+/// while the first read it after (or fail the replay's own Project
+/// comparison). The later submission therefore waits for the earlier one to
+/// finish and then replays its receipt against the settled Project.
 pub async fn create_project_from_charter_approval(
+    db: Arc<SqliteDb>,
+    input: CreateProjectFromCharterApprovalInput,
+) -> Result<CreatedProjectFromCharterApproval> {
+    let flight = creation_flight(&db, &input.approval_id);
+    let _one_creation_per_approval = flight.lock().await;
+    let mut created = create_project_from_charter_approval_once(Arc::clone(&db), input).await?;
+    // Provisioning links the repository after the atomic create commits; the
+    // caller is told about the Project that exists now, not the row as it
+    // was inside the create transaction.
+    created.project = ProjectRepo::get_by_id(&*db, &created.project.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("project", created.project.id.clone()))?;
+    Ok(created)
+}
+
+type CreationFlights = std::sync::Mutex<
+    std::collections::HashMap<(usize, String), std::sync::Weak<tokio::sync::Mutex<()>>>,
+>;
+
+/// The in-process lock of one approval's creation, per database.
+fn creation_flight(db: &Arc<SqliteDb>, approval_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static FLIGHTS: std::sync::OnceLock<CreationFlights> = std::sync::OnceLock::new();
+    let mut flights = FLIGHTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    flights.retain(|_, flight| flight.strong_count() > 0);
+    let key = (Arc::as_ptr(db) as usize, approval_id.to_owned());
+    if let Some(flight) = flights.get(&key).and_then(std::sync::Weak::upgrade) {
+        return flight;
+    }
+    let flight = Arc::new(tokio::sync::Mutex::new(()));
+    flights.insert(key, Arc::downgrade(&flight));
+    flight
+}
+
+async fn create_project_from_charter_approval_once(
     db: Arc<SqliteDb>,
     input: CreateProjectFromCharterApprovalInput,
 ) -> Result<CreatedProjectFromCharterApproval> {

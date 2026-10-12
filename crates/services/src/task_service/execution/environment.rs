@@ -1067,7 +1067,12 @@ mod tests {
         due.next_check_at = Some("2026-01-01T00:00:00Z".into());
         db.put_readiness(due, Some(version)).await.unwrap();
         let dispatcher = crate::TaskDispatcher::new(db.clone(), events, service.clone());
-        dispatcher.check_once().await.unwrap();
+        // Only the due-row scan, not a whole pass: a pass goes on to
+        // dispatch, and when the re-check it started clears the pause before
+        // the pass reads the Project, the same pass relaunches the waiting
+        // Server Task, whose probe fails again and writes the Server row
+        // back to `not_ready` before the reset can be read below.
+        dispatcher.sync_due_environment_checks().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if ProjectRepo::get_by_id(&*db, &project.id)

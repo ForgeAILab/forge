@@ -6477,11 +6477,21 @@ async fn finish_environment_recheck(dispatcher: &TaskDispatcher, project_id: &st
         .unwrap()
         .remove(project_id)
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), job)
-        .await
+    // The job ends when its check does (released by the test, or at the
+    // check's own timeout): no second clock here.
+    job.await.unwrap().unwrap();
+}
+
+/// The Project's re-check job is still running: its check is blocked on a
+/// file only the test writes, so a pass that returned while this holds did
+/// not wait for the check.
+fn environment_recheck_runs(dispatcher: &TaskDispatcher, project_id: &str) -> bool {
+    dispatcher
+        .environment_rechecks
+        .lock()
         .unwrap()
-        .unwrap()
-        .unwrap();
+        .get(project_id)
+        .is_some_and(|job| !job.is_finished())
 }
 
 #[tokio::test]
@@ -6499,30 +6509,31 @@ async fn environment_recheck_is_single_flight_off_tick_and_stale_result_preserve
     let task = seed_task(&db, &other, "unrelated admission", "todo", 0).await;
     assign_role(&db, &task.id, "coder", &agent).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once_and_drain())
-            .await
-            .unwrap()
-            .unwrap(),
-        1
+    // Off the tick: the pass admits the unrelated Task and returns while the
+    // check it started is still blocked. A pass that waited for the check
+    // would return only after the check's timeout, with the job finished.
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
+    assert!(
+        environment_recheck_runs(&dispatcher, &project_id),
+        "the pass returned before its environment check ended"
     );
     tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !repo_dir.path().join("starts").exists() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once_and_drain())
-            .await
-            .unwrap()
-            .unwrap(),
-        0
+    while !repo_dir.path().join("starts").exists() {
+        assert!(
+            environment_recheck_runs(&dispatcher, &project_id),
+            "the environment check ended without starting its command"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Single flight: a second pass starts no second check and does not wait
+    // for the first.
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
+    assert!(
+        environment_recheck_runs(&dispatcher, &project_id),
+        "the second pass returned before the environment check ended"
     );
     assert!(matches!(
         dispatcher

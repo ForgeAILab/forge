@@ -12,7 +12,7 @@ use db::{EnvironmentMachine, ProjectMachineReadinessRepo, ProjectRepo};
 use std::collections::HashSet;
 
 impl TaskDispatcher {
-    pub(super) async fn sync_due_environment_checks(&self) -> Result<HashSet<String>> {
+    pub(crate) async fn sync_due_environment_checks(&self) -> Result<HashSet<String>> {
         let finished: Vec<_> = {
             let mut jobs = self
                 .environment_rechecks

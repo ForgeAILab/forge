@@ -2761,9 +2761,18 @@ async fn a_task_whose_entry_check_runs_offers_cancel_and_no_hold() {
         let outcome: Result<(), String> = async {
             world.apply(&Action::Create).await?;
             world.quiesce().await?;
-            // A check that takes long enough to be looked at while it runs.
+            // A check that runs until this test has looked at it: it ends
+            // when the gate file appears, not after a time the look has to
+            // fit into. (It also ends when the model directory is removed,
+            // so a failed case leaves no process behind.)
+            let gate = world.dir.path().join("entry-check-may-end");
             sqlx::query("UPDATE task SET task_state_config=json_set(task_state_config,'$.review.ci_steps',json_array(?)) WHERE id=?")
-                .bind(format!("sleep 4 && test -f {}", deliverable(0)))
+                .bind(format!(
+                    "until [ -e '{gate}' ] || [ ! -d '{dir}' ]; do sleep 0.05; done; test -f {file}",
+                    gate = gate.display(),
+                    dir = world.dir.path().display(),
+                    file = deliverable(0)
+                ))
                 .bind(&world.tasks[0])
                 .execute(&world.live().pool)
                 .await
@@ -2829,6 +2838,7 @@ async fn a_task_whose_entry_check_runs_offers_cancel_and_no_hold() {
                     "a Task whose entry check runs (pause {pause:?}) offers {verbs:?}, expected only cancel"
                 ));
             }
+            std::fs::write(&gate, b"").map_err(|error| error.to_string())?;
             let _ = steps.await;
             // `drive_to_settlement` resumes the Project.
             if pause == Some(PauseKind::Agents) {
@@ -4288,11 +4298,26 @@ async fn second_review_entry_after_a_rebase() {
                 "expected exactly one Task to be rebased by the merge queue, got {rebased:?}"
             ));
         };
-        // Every check the Task asked for ran, finished and was applied, and
-        // one of them ran on the rebased commit that landed: the entry check
-        // of a second review entry, or the queue's head check.
-        let checks: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(
-            "SELECT c.origin, r.commit_sha, r.state, c.applied_at, c.status_epoch
+        // Every check the Task asked for ran, finished and its verdict was
+        // used, and one of them ran on the rebased commit that landed: the
+        // entry check of a second review entry, or the queue's head check.
+        //
+        // A verdict is used in one of two orders. The delivery step applies
+        // it (`applied_at`) and wakes the waiting entry step. Or the entry
+        // step reads the stored result itself first (the run ended before
+        // the step looked, or the step's wake deadline came before the
+        // delivery sweep): it settles the Review and the Task leaves the
+        // status entry, so the delivery that follows is superseded as stale
+        // and `applied_at` stays empty. What shows the verdict was used then
+        // is the Review that asked for the check: passed, with the check's
+        // commands recorded on it.
+        let checks: Vec<(String, String, String, Option<String>, i64, bool)> = sqlx::query_as(
+            "SELECT c.origin, r.commit_sha, r.state, c.applied_at, c.status_epoch,
+                    c.origin = 'entry' AND EXISTS(
+                        SELECT 1 FROM review v
+                        WHERE v.task_id = c.task_id AND v.status = 'passed'
+                          AND c.request_key LIKE '%|' || v.id
+                          AND json_array_length(v.step_results_json, '$.ci_steps') > 0)
              FROM check_consumer c JOIN check_run r ON r.id = c.run_id
              WHERE c.task_id = ? ORDER BY c.created_at, c.rowid",
         )
@@ -4302,7 +4327,15 @@ async fn second_review_entry_after_a_rebase() {
         .map_err(sql)?;
         if checks
             .iter()
-            .any(|(_, _, state, applied, _)| state != "succeeded" || applied.is_none())
+            .any(|(origin, _, state, applied, _, read_by_entry)| {
+                // In either order the entry's Review carries the result.
+                state != "succeeded"
+                    || if origin == "entry" {
+                        !read_by_entry
+                    } else {
+                        applied.is_none()
+                    }
+            })
         {
             return Err(format!("a check did not run and settle: {checks:?}"));
         }
