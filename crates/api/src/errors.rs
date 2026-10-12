@@ -383,6 +383,22 @@ impl From<ServiceError> for ApiError {
                 message: "nested subtasks are unsupported".to_string(),
                 details: None,
             },
+            ServiceError::LeadRequiresNativeProfile { task_id, role } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "LEAD_REQUIRES_NATIVE_PROFILE",
+                message: format!(
+                    "the lead of coordination root {task_id} must be a native Agent; assign a native Agent to its `{role}` role"
+                ),
+                details: Some(json!({ "task_id": task_id, "role": role })),
+            },
+            ServiceError::LeadRoleNotSupported { task_id, role } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "LEAD_ROLE_NOT_SUPPORTED",
+                message: format!(
+                    "the planning role `{role}` of this workflow cannot lead coordination root {task_id}; only the built-in `planner` role is supported"
+                ),
+                details: Some(json!({ "task_id": task_id, "role": role })),
+            },
             ServiceError::SubtaskParentClosed {
                 parent_task_id,
                 state,

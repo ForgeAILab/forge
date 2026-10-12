@@ -288,20 +288,16 @@ impl TaskDispatcher {
                     }
                 }
 
-                let is_coordination_root =
-                    crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
-                let sequence_complete = is_coordination_root
-                    && crate::task_hierarchy::coordination_root_sequence_complete(
-                        &self.db, &task, workflow,
-                    )
-                    .await?;
-                let needs_recovery_advance = sequence_complete
-                    && workflow.canonical_phase_for_state(&task.status)
-                        != api_types::CanonicalPhase::Review
-                    && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
-                if is_coordination_root
-                    && (crate::task_service::coordination_review_pending(&task)
-                        || needs_recovery_advance)
+                let children = crate::task_hierarchy::children_if_root(&self.db, &task).await?;
+                let is_coordination_root = !children.is_empty();
+                let root_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(workflow);
+                if is_coordination_root && root_policy.root_advance_due(
+                    &task,
+                    &children,
+                    &db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?,
+                    crate::task_service::coordination_review_pending(&task),
+                    crate::task_hierarchy::root_planning_run_live(&self.db, &task, &root_policy).await?,
+                )
                 {
                     dispatched += self.advance_coordination_root_once(&task).await?;
                     return Ok(());

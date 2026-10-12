@@ -1386,6 +1386,15 @@ async fn dispatcher_inherits_root_default_coder_without_copying_it_to_subtask() 
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
+    // The first pass starts the coordination root (todo -> in_progress);
+    // its first subtask is dispatched on the next.
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("the root starts"),
+        1
+    );
     assert_eq!(
         dispatcher
             .check_once_and_drain()
@@ -1489,6 +1498,15 @@ async fn dispatcher_prefers_subtask_coder_over_root_default() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
+    // The first pass starts the coordination root (todo -> in_progress);
+    // its first subtask is dispatched on the next.
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("the root starts"),
+        1
+    );
     assert_eq!(
         dispatcher
             .check_once_and_drain()
@@ -1566,6 +1584,15 @@ async fn changing_root_default_wakes_and_dispatches_unstarted_subtask() {
         .expect("child reloads")
         .expect("child exists");
     assert!(deferred_dispatch::dispatch_disposition_for_test(&woken_child).is_none());
+    // The first pass starts the coordination root (todo -> in_progress);
+    // its first subtask is dispatched on the next.
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("the root starts"),
+        1
+    );
     assert_eq!(
         dispatcher
             .check_once_and_drain()
@@ -10469,5 +10496,7 @@ async fn unchanged_reconciliation_does_not_enqueue_a_second_step() {
 
 #[path = "tests/equivalence.rs"]
 mod equivalence;
+#[path = "tests/root_lead.rs"]
+mod root_lead;
 #[path = "tests/scheduler.rs"]
 mod scheduler;

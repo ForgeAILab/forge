@@ -237,6 +237,10 @@ fn condition_park(condition: &TaskCondition) -> Next {
         ParkReason::Dependencies { .. } => (Owner::ProjectAgent, Action::CompleteDependencies),
         ParkReason::Children { .. } => (Owner::ProjectAgent, Action::SettleChildren),
         ParkReason::Parent { cause, .. } if cause == "held" => (Owner::User, Action::ReleaseHold),
+        // The root's lead is planning; its success releases the subtask.
+        ParkReason::Parent { cause, .. } if cause == "planning" => {
+            (Owner::Worker, Action::WaitForOwner)
+        }
         ParkReason::Parent { .. } => (Owner::ProjectAgent, Action::SettleChildren),
         ParkReason::Agent { .. } => (Owner::User, Action::RepairAndRetry),
         ParkReason::Environment { .. } | ParkReason::PlacementDenied { .. } => {
@@ -443,25 +447,20 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // admission attempt meets the dependency gate, which writes the visible
     // refusal (and blocks on a cancelled dependency) exactly as before.
     if let Some((parent_id, cause)) = &f.parent_wait {
-        return if cause == "held" {
-            park(
-                Reason::ParentWait {
-                    parent_id: parent_id.clone(),
-                    cause: cause.clone(),
-                },
-                Owner::User,
-                Action::ReleaseHold,
-            )
-        } else {
-            park(
-                Reason::ParentWait {
-                    parent_id: parent_id.clone(),
-                    cause: cause.clone(),
-                },
-                Owner::ProjectAgent,
-                Action::SettleChildren,
-            )
+        let (owner, recovery) = match cause.as_str() {
+            "held" => (Owner::User, Action::ReleaseHold),
+            // The root's lead is planning; its success releases the subtask.
+            "planning" => (Owner::Worker, Action::WaitForOwner),
+            _ => (Owner::ProjectAgent, Action::SettleChildren),
         };
+        return park(
+            Reason::ParentWait {
+                parent_id: parent_id.clone(),
+                cause: cause.clone(),
+            },
+            owner,
+            recovery,
+        );
     }
     if !f.child_ready || (f.root && !f.root_role_allowed) {
         return park(

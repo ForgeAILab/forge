@@ -211,7 +211,7 @@ impl TaskService {
     ) -> Result<TaskRoleAssignment> {
         let mut task = self.validate_reassignable_task(&input.task_id).await?;
         super::execution::ensure_plan_publication_transition_authority(&task, None)?;
-        self.ensure_coordination_root_role_allowed(&task, &input.role_name)
+        self.ensure_coordination_root_role_allowed(&task, &input)
             .await?;
         if input.assignee_type == Some(AssigneeKind::Agent) {
             if let Some(identity_id) = input.assignee_id.as_deref() {
@@ -610,15 +610,34 @@ impl TaskService {
     async fn ensure_coordination_root_role_allowed(
         &self,
         task: &Task,
-        role_name: &str,
+        input: &CreateTaskRoleAssignment,
     ) -> Result<()> {
         if !crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await? {
             return Ok(());
         }
-        if self.root_role_assignment_allowed(task, role_name).await? {
+        let workflow = self.workflow_for_task(task).await?;
+        let policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
+        if !policy.allows_assignment(&input.role_name) {
+            return Err(crate::task_hierarchy::root_assignment_denied());
+        }
+        if policy.planning_role() != Some(input.role_name.as_str()) {
             return Ok(());
         }
-        Err(crate::task_hierarchy::root_assignment_denied())
+        // The planning role on a coordination root is its lead.
+        let backend_kind = match (&input.assignee_type, input.assignee_id.as_deref()) {
+            (Some(AssigneeKind::Agent), Some(agent_id)) => {
+                db::AgentRepo::get_by_id(&*self.db, agent_id)
+                    .await?
+                    .map(|agent| agent.backend_kind)
+            }
+            _ => None,
+        };
+        crate::task_hierarchy::ensure_lead_assignable(
+            &task.id,
+            &input.role_name,
+            input.assignee_id.as_ref().and(input.assignee_type.as_ref()),
+            backend_kind.as_deref(),
+        )
     }
 
     /// Resolve whether `role_name` could be assigned if `task` is, or becomes,

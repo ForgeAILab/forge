@@ -24,6 +24,7 @@ impl TaskService {
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
             if task.status != request.target_status {
+                self.start_coordination_root_of(&task_id).await;
                 return self
                     .request_task_command(
                         &task_id,

@@ -374,6 +374,13 @@ async fn task_response_inner(
         .cloned()
         .map(task_role_assignment_response)
         .collect();
+    let effective_lead =
+        services::task_hierarchy::effective_lead(db, &task, &task_role_assignments, workflow)
+            .await?
+            .map(|resolved| api_types::EffectiveLeadResponse {
+                assignment: task_role_assignment_response(resolved.assignment),
+                source: resolved.source,
+            });
     let effective_coder = services::task_hierarchy::effective_coder_assignment(db, &task).await?;
     let effective_coder_source = effective_coder.as_ref().map(|resolved| resolved.source);
     let effective_coder =
@@ -496,6 +503,7 @@ async fn task_response_inner(
         role_assignments,
         effective_coder,
         effective_coder_source,
+        effective_lead,
         remaining_retries,
         retry_limits,
         available_actions: offers,

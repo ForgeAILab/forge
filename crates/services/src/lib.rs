@@ -476,6 +476,16 @@ pub enum ServiceError {
         state: String,
     },
 
+    /// The planning role on a coordination root is its lead, and a lead is
+    /// a native Agent: its Task tools exist only in native sessions.
+    #[error("the lead of coordination root {task_id} must be a native Agent; assign a native Agent to its `{role}` role")]
+    LeadRequiresNativeProfile { task_id: String, role: String },
+
+    /// The native host runs Task roles by name; a planning gate whose role
+    /// is not the built-in planner cannot run as a lead yet.
+    #[error("the planning role `{role}` of this workflow cannot lead coordination root {task_id}; only the built-in `planner` role is supported")]
+    LeadRoleNotSupported { task_id: String, role: String },
+
     #[error("workspace reset required for task {task_id}: {reason}")]
     WorkspaceResetRequired { task_id: String, reason: String },
 

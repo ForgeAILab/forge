@@ -1053,6 +1053,8 @@ async fn reassign_parent_coder_changes_coordination_root_default_worker() {
         "changing the default worker must not execute the root"
     );
 
+    // The planning role on a coordination root is its lead, and a lead is
+    // a native Agent: a CLI Agent and a person are refused with a typed error.
     let planner_result = service
         .reassign_role(
             role_assignment_input(&root.id, "planner", Some(agent_b), None),
@@ -1060,10 +1062,169 @@ async fn reassign_parent_coder_changes_coordination_root_default_worker() {
             false,
         )
         .await;
+    assert!(
+        matches!(
+            &planner_result,
+            Err(ServiceError::LeadRequiresNativeProfile { task_id, role })
+                if *task_id == root.id && role == "planner"
+        ),
+        "{planner_result:?}"
+    );
+    let person = service
+        .reassign_role(
+            role_assignment_input(&root.id, "planner", None, Some("user-1".to_owned())),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(&person, Err(ServiceError::LeadRequiresNativeProfile { .. })),
+        "{person:?}"
+    );
+    // A role the root policy does not know is still refused as before.
+    let unknown = service
+        .reassign_role(
+            role_assignment_input(&root.id, "auditor", Some(seed_agent(&db).await), None),
+            false,
+            false,
+        )
+        .await;
     assert!(matches!(
-        planner_result,
+        unknown,
         Err(ServiceError::InvalidOperation { .. })
     ));
+}
+
+/// A native Agent may be assigned as the lead of a coordination root, and
+/// the same planner on a Task without subtasks is unchanged.
+#[tokio::test]
+async fn a_native_planner_is_assignable_as_the_lead_of_a_coordination_root() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let native = crate::test_support::seed_native_agent(&db).await;
+    let cli = seed_agent(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
+
+    let lead = service
+        .reassign_role(
+            role_assignment_input(&root.id, "planner", Some(native.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("a native planner leads the root");
+    assert_eq!(lead.assignee_id.as_deref(), Some(native.as_str()));
+    let root = TaskRepo::get_by_id(&*db, &root.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    let resolved = crate::task_hierarchy::root_lead(&db, &root, &workflow)
+        .await
+        .expect("lead resolves")
+        .expect("the root has a lead");
+    assert_eq!(resolved.assignee_id.as_deref(), Some(native.as_str()));
+
+    // What a Task response reports: the root's own row, and the same row
+    // for its subtask as inherited from the root.
+    let root_rows = TaskRoleAssignmentRepo::list_by_task(&*db, &root.id)
+        .await
+        .unwrap();
+    let own = crate::task_hierarchy::effective_lead(&db, &root, &root_rows, &workflow)
+        .await
+        .unwrap()
+        .expect("the root reports its lead");
+    assert_eq!(own.source, api_types::EffectiveCoderSource::Own);
+    assert_eq!(own.assignment.assignee_id.as_deref(), Some(native.as_str()));
+    let child = TaskRepo::list_subtasks_ordered(&*db, &root.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let inherited = crate::task_hierarchy::effective_lead(
+        &db,
+        &child,
+        &[],
+        &WorkflowEngine::resolve_subtask_workflow(),
+    )
+    .await
+    .unwrap()
+    .expect("the subtask reports its root's lead");
+    assert_eq!(
+        inherited.source,
+        api_types::EffectiveCoderSource::InheritedFromRoot
+    );
+    assert_eq!(inherited.assignment.task_id, root.id);
+
+    // A planner on a Task that coordinates nothing is not a lead: any Agent
+    // may hold it, as before.
+    let plain = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    service
+        .reassign_role(
+            role_assignment_input(&plain.id, "planner", Some(cli), None),
+            false,
+            false,
+        )
+        .await
+        .expect("a CLI planner on an ordinary Task is unchanged");
+    let plain_rows = TaskRoleAssignmentRepo::list_by_task(&*db, &plain.id)
+        .await
+        .unwrap();
+    assert!(
+        crate::task_hierarchy::effective_lead(&db, &plain, &plain_rows, &workflow)
+            .await
+            .unwrap()
+            .is_none(),
+        "a Task without subtasks reports no lead"
+    );
+}
+
+/// v1 runs a lead only under the built-in `planner` role name.
+#[tokio::test]
+async fn a_planning_role_that_is_not_planner_cannot_lead_a_coordination_root() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for role in &mut workflow.roles {
+        if role.name == "planner" {
+            role.name = "architect".to_owned();
+        }
+    }
+    for state in &mut workflow.states {
+        if state.role.as_deref() == Some("planner") {
+            state.role = Some("architect".to_owned());
+        }
+    }
+    sqlx::query("UPDATE project SET workflow_definition = ?, updated_at = ? WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(now_rfc3339())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let native = crate::test_support::seed_native_agent(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
+
+    let refused = service
+        .reassign_role(
+            role_assignment_input(&root.id, "architect", Some(native), None),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(ServiceError::LeadRoleNotSupported { task_id, role })
+                if *task_id == root.id && role == "architect"
+        ),
+        "{refused:?}"
+    );
 }
 
 #[tokio::test]

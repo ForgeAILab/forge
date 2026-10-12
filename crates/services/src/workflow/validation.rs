@@ -356,6 +356,7 @@ fn is_known_prompt_builder_id(builder_id: &str) -> bool {
         builder_id,
         "generic.default.v2"
             | "planner.default.v2"
+            | "planner.coordination.v1"
             | "coder.implementation.v2"
             | "coder.review_fix.v2"
             | "coder.merge_fix.v2"

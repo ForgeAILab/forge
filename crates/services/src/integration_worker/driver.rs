@@ -178,6 +178,43 @@ fn landed(a: &IntegrationAttempt, facts: &HeadFacts) -> bool {
             .is_none_or(|sha| sha == facts.candidate_head)
 }
 
+/// The Task's checkout is off the commit the attempt names because this
+/// attempt's own rebase moved it: its last rebase succeeded from exactly that
+/// commit, without a conflict, and was never applied. Applying a rebase
+/// records the rebased commit as the candidate; a head that left the slot
+/// between the receipt and that write (it waited for its placement until the
+/// step wait ran out and parked `owner_offline`, or its session ended there)
+/// still names the commit it was admitted with. Its next round validates
+/// first, and must not read that as a candidate somebody changed: nobody
+/// did, and the Task would go back to review for a commit the queue made.
+/// The rebased commit is checked before it merges, like any rebase.
+///
+/// While the target has not moved since that rebase, the checkout must also
+/// stand on it; one that does not was changed after the rebase.
+fn rebased_and_not_applied(
+    a: &IntegrationAttempt,
+    admitted: Option<&str>,
+    facts: &HeadFacts,
+) -> bool {
+    receipts(a)
+        .into_iter()
+        .rev()
+        .find(|receipt| receipt.request.kind == IntegrationOperationKind::Rebase)
+        .is_some_and(|receipt| {
+            receipt.operation_state == IntegrationOperationState::Succeeded
+                && receipt.request.witness["expected_head_sha"].as_str() == admitted
+                && (receipt.request.witness["expected_target_sha"].as_str()
+                    != Some(&facts.target_tip)
+                    || facts.target_in_candidate)
+                && matches!(
+                    serde_json::from_value::<OwnerRebaseReceipt>(receipt.result),
+                    Ok(OwnerRebaseReceipt::Completed {
+                        outcome: WorkspaceOwnerOperationOutcome::Rebased
+                    })
+                )
+        })
+}
+
 fn receipts(attempt: &IntegrationAttempt) -> Vec<IntegrationEffectReceipt> {
     serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap_or_default()
 }
@@ -1097,6 +1134,7 @@ impl HeadDriver {
         if admitted
             .as_deref()
             .is_some_and(|sha| sha != facts.candidate_head)
+            && !rebased_and_not_applied(&a, admitted.as_deref(), &facts)
         {
             return self
                 .send_back(&a, S::NeedsReview, |a| {

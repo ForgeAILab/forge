@@ -442,6 +442,8 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::Conflict(_)
         | ServiceError::NestedSubtaskUnsupported
         | ServiceError::SubtaskParentClosed { .. }
+        | ServiceError::LeadRequiresNativeProfile { .. }
+        | ServiceError::LeadRoleNotSupported { .. }
         | ServiceError::WorkspaceResetRequired { .. }
         | ServiceError::TerminalSessionLimit { .. }
         | ServiceError::TerminalNotFound => (

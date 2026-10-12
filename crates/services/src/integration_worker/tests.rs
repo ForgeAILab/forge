@@ -1527,10 +1527,17 @@ async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check
                 .actions("a")
                 .contains(&IntegrationStepAction::RequestCheck));
         } else {
-            // In steps shorter than the lease, so the session keeps it.
+            // In steps shorter than the lease, so the session keeps it, and
+            // only until the head has parked. The test clock is the wall
+            // clock plus an offset: on a slow host the step wait runs out a
+            // few steps early, and steps taken after the park reach its
+            // retry (`a_rebased_head_parked_for_its_owner_continues_from_its_
+            // rebase_when_asked_again` is that order).
             let step = (pump.worker.config.renew_every.as_secs() as i64).max(1);
             let mut waited = 0;
-            while waited <= pump.worker.config.step_wait.as_secs() as i64 {
+            while waited <= pump.worker.config.step_wait.as_secs() as i64
+                && world.attempt(&a.id).await.state != S::Parked
+            {
                 world.clock.advance(step);
                 waited += step;
                 world.settle(&mut pump).await;
@@ -1561,6 +1568,100 @@ async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check
                 "an owner wait counts no retry: {journal:?}"
             );
         }
+    }
+}
+
+/// A rebased head that waited for its placement and parked `owner_offline`
+/// is asked again by the sweep. Its checkout stands on the rebased commit;
+/// the attempt still names the commit it was admitted with (the rebase was
+/// never applied), and the receipt of the rebase says why. The new round
+/// validates first: it continues from that rebase. It does not send the Task
+/// back to review for a candidate "changed after it was admitted", which
+/// nobody changed, and it does not rebase again.
+///
+/// This is the order a throttled host produced in the test above: the test
+/// clock is the wall clock plus an offset, so the step wait ran out a few
+/// passes early and the passes left over reached the retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebased_head_parked_for_its_owner_continues_from_its_rebase_when_asked_again() {
+    let rebases = |attempt: &IntegrationAttempt| {
+        serde_json::from_value::<Vec<db::IntegrationEffectReceipt>>(
+            attempt.effect_receipts_json.clone(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|receipt| receipt.request.kind == db::IntegrationOperationKind::Rebase)
+        .count()
+    };
+    let due = |parked: &IntegrationAttempt, world: &World| {
+        let at = DateTime::parse_from_rfc3339(parked.available_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        (at - world.clock.now()).num_seconds().max(0) + 1
+    };
+    for ready_when_asked_again in [false, true] {
+        let world = World::new().await;
+        let a = world.add_task("r", "a", "a.txt", "a\n").await;
+        world.external_commit("r", "outside").await;
+        world.facts.placement_down.store(true, Ordering::SeqCst);
+        let mut pump = Pump::new(world.worker());
+        world.settle(&mut pump).await;
+        let admitted = world.attempt(&a.id).await;
+        assert_eq!(admitted.state, S::Rebasing);
+        // Past the step wait, in steps shorter than the lease so the
+        // session keeps it: the head parks.
+        let step = (pump.worker.config.renew_every.as_secs() as i64).max(1);
+        let mut waited = 0;
+        while waited <= pump.worker.config.step_wait.as_secs() as i64
+            && world.attempt(&a.id).await.state != S::Parked
+        {
+            world.clock.advance(step);
+            waited += step;
+            world.settle(&mut pump).await;
+        }
+        let parked = world.attempt(&a.id).await;
+        assert_eq!(parked.state, S::Parked, "{:?}", parked.failure_message);
+        assert_eq!(rebases(&parked), 1);
+        assert_eq!(
+            parked.candidate_sha, admitted.candidate_sha,
+            "the rebase was never applied"
+        );
+        // The sweep asks again.
+        world
+            .facts
+            .placement_down
+            .store(!ready_when_asked_again, Ordering::SeqCst);
+        world.clock.advance(due(&parked, &world));
+        world.settle(&mut pump).await;
+        let asked = world.attempt(&a.id).await;
+        assert_ne!(
+            asked.state,
+            S::NeedsReview,
+            "its own rebase is not a changed candidate: {:?}",
+            asked.failure_message
+        );
+        assert_eq!(rebases(&asked), 1, "the rebase was not repeated");
+        if !ready_when_asked_again {
+            // Waiting for the placement again, in the slot.
+            assert_eq!(asked.state, S::Rebasing, "{:?}", asked.failure_message);
+            assert!(!world
+                .steps
+                .actions("a")
+                .contains(&IntegrationStepAction::RequestCheck));
+            world.facts.placement_down.store(false, Ordering::SeqCst);
+            world.settle(&mut pump).await;
+        }
+        let merged = world.attempt(&a.id).await;
+        assert_eq!(merged.state, S::Completed, "{:?}", merged.failure_message);
+        assert_eq!(rebases(&merged), 1, "the rebase was not repeated");
+        assert!(world
+            .steps
+            .actions("a")
+            .contains(&IntegrationStepAction::RequestCheck));
+        assert_eq!(
+            merged.checks_commit_sha, merged.integrated_sha,
+            "the rebased commit was checked before it merged"
+        );
     }
 }
 

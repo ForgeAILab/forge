@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::workflow::default_roles;
 
 pub mod coder_prompt;
+pub mod coordination_prompt;
 pub mod generic_prompt;
 pub mod loader;
 pub mod planner_prompt;
@@ -26,6 +27,8 @@ pub const BUILDER_ID_WORKER_REVIEW_FIX_V1: &str = "worker.review_fix.v1";
 pub const BUILDER_ID_WORKER_MERGE_FIX_V1: &str = "worker.merge_fix.v1";
 pub const BUILDER_ID_REVIEWER_CONFORMANCE_V1: &str = "reviewer.conformance.v1";
 pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
+/// The lead of a coordination root: the planner run on a root with subtasks.
+pub const BUILDER_ID_PLANNER_COORDINATION_V1: &str = "planner.coordination.v1";
 pub const BUILDER_ID_READ_ONLY_TASK_V1: &str = "task.read_only.v1";
 pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
 
@@ -207,7 +210,7 @@ static DEFAULT_ROLE_BUILDERS: OnceLock<DefaultRoleBuilderMap> = OnceLock::new();
 fn registry() -> &'static BuilderRegistry {
     PROMPT_BUILDERS.get_or_init(|| {
         let mut builders: HashMap<String, Arc<dyn PromptBuilder>> = HashMap::new();
-        let defaults: [Arc<dyn PromptBuilder>; 10] = [
+        let defaults: [Arc<dyn PromptBuilder>; 11] = [
             Arc::new(coder_prompt::CoderImplementationPromptBuilder),
             Arc::new(coder_prompt::CoderReviewFixPromptBuilder),
             Arc::new(coder_prompt::CoderMergeFixPromptBuilder),
@@ -216,6 +219,7 @@ fn registry() -> &'static BuilderRegistry {
             Arc::new(worker_prompt::WorkerMergeFixPromptBuilder),
             Arc::new(reviewer_prompt::ReviewerPromptBuilder),
             Arc::new(planner_prompt::PlannerPromptBuilder),
+            Arc::new(coordination_prompt::CoordinationPlannerPromptBuilder),
             Arc::new(read_only_task_prompt::ReadOnlyTaskPromptBuilder),
             Arc::new(generic_prompt::GenericPromptBuilder),
         ];
@@ -330,6 +334,13 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             description: "Planning prompt for structured implementation plans.",
         },
         PromptBuilderRegistryEntry {
+            id: BUILDER_ID_PLANNER_COORDINATION_V1,
+            label: "Planner (Coordination Lead)",
+            compatible_role_hints: &[default_roles::PLANNER],
+            description:
+                "Lead prompt for a root Task with subtasks: reviews the ordered breakdown before the subtasks run.",
+        },
+        PromptBuilderRegistryEntry {
             id: BUILDER_ID_READ_ONLY_TASK_V1,
             label: "Read-only Task",
             compatible_role_hints: &[default_roles::CODER, default_roles::WORKER],
@@ -431,6 +442,14 @@ pub fn build_effective_prompt(
         );
     if read_only_worker {
         selection.builder_id = BUILDER_ID_READ_ONLY_TASK_V1.to_owned();
+    }
+    // The planner run on a root Task that has subtasks is its lead: it plans
+    // through the breakdown, not through a checklist of its own.
+    if selection.builder_id == BUILDER_ID_PLANNER_DEFAULT_V2
+        && dispatch_ctx.task.parent_task_id.is_none()
+        && !dispatch_ctx.sub_tasks.is_empty()
+    {
+        selection.builder_id = BUILDER_ID_PLANNER_COORDINATION_V1.to_owned();
     }
     let base_prompt = resolve_prompt_builder(&selection.builder_id).build(dispatch_ctx);
     let prompt = apply_prompt_overrides(base_prompt, &dispatch_ctx.state_config);

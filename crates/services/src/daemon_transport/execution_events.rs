@@ -127,6 +127,7 @@ impl ServerExecutionEventSink {
                     &workspace_task_id,
                     &execution.id,
                 );
+                crate::task_service::logs::create_execution_log(&path)?;
                 ExecutionRepo::update(
                     &*self.db,
                     UpdateExecution {
@@ -1106,6 +1107,55 @@ mod tests {
         assert_eq!(
             terminal_record_disposition(&record, "different-daemon", &fingerprint),
             DaemonTerminalDisposition::Conflict
+        );
+    }
+
+    /// The first log frame of a remote execution records the log path on
+    /// the row and only then writes the line. A read between the two found a
+    /// claimed path with no file, which the logs route answers 404
+    /// (`execution.logs_unavailable`): the file exists, empty, from the
+    /// moment the row names it.
+    #[tokio::test]
+    async fn a_remote_log_path_is_recorded_with_its_file_already_there() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let (_, _, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET logs_path = NULL WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let sink = ServerExecutionEventSink::new(
+            db.clone(),
+            Arc::new(EventBus::default()),
+            root.path().to_path_buf(),
+        );
+        let frame: api_types::ExecutionLogNotification = serde_json::from_value(json!({
+            "execution_id": execution.id,
+            "seq": 1,
+            "stream": "stdout",
+            "line": "first line",
+            "ts": "2026-09-08T00:00:01Z"
+        }))
+        .unwrap();
+        // The writer exists; nothing has been written through it yet.
+        let _writer = sink.writer_for(&frame, &execution).await.unwrap();
+        let recorded = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .logs_path
+            .expect("the log path is recorded");
+        assert!(std::path::Path::new(&recorded).starts_with(root.path()));
+        assert_eq!(
+            std::fs::read(&recorded).expect("the recorded log file exists"),
+            b""
         );
     }
 

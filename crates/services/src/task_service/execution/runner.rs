@@ -564,11 +564,7 @@ impl TaskService {
         let logs_path = self
             .resolve_execution_logs_path(&execution, &task, &workspace, &execution_id)
             .await?;
-        if let Some(parent) = std::path::Path::new(&logs_path).parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ServiceError::invalid_operation(format!("failed to create log directory: {error}"))
-            })?;
-        }
+        crate::task_service::logs::create_execution_log(&logs_path)?;
 
         let launch_activity_at = now_rfc3339();
         ExecutionRepo::update(

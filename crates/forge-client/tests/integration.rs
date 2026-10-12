@@ -586,6 +586,7 @@ fn task_response(
         role_assignments: Vec::new(),
         effective_coder: None,
         effective_coder_source: None,
+        effective_lead: None,
         remaining_retries: HashMap::new(),
         retry_limits: HashMap::new(),
         available_actions: Vec::new(),

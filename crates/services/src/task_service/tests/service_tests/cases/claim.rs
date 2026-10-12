@@ -643,7 +643,7 @@ async fn claim_uses_inherited_root_coder_without_copying_assignment() {
     )
     .await
     .expect("root default worker assigns");
-
+    // Claiming the first subtask of a root still in `todo` starts the root.
     let claimed = service
         .claim_task(subtask.id.clone(), Assignee::Agent(agent_id.clone()), None)
         .await

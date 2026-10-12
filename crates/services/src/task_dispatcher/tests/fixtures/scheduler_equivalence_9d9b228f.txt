@@ -13,6 +13,11 @@
 #                       now carries a visible annotation naming its owner action
 #   MissedWakeRepair    work the base only re-drove at startup is re-driven on
 #                       an ordinary pass
+#   RootKickoff         (plan 3.10 stage 1) a coordination root with a subtask left to run
+#                       moves to its implementation state (the base left it in `todo`), so
+#                       its row, the pass's status events and the queued count differ; and a
+#                       completion flag on a root that still has a subtask left is no longer
+#                       attempted and refused as an aggregate-review advance
 #   IdleTickQuiescence  the dispatcher does no work on an idle tick; no recorded
 #                       outcome differs, so no line names it
 #   IntegrationQueueOwned  (plan 3.2 stage D2b) a Task in `merging` belongs to the
@@ -1069,3 +1074,61 @@ wake refusal_none_todo (after): dv=0 status=todo ann=- B=- F=- E=- meta=[dispatc
 @OwnSlotIsNoWait startup queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
 @OwnSlotIsNoWait steady machine_cap RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
 @OwnSlotIsNoWait steady queued_recovery_valid_waiting RUN: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=0
+@RootKickoff load/startup round0 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1"]
+@RootKickoff load/startup round0 (running): ["S02@A1", "S05@A2", "S08@A1", "S11@A2"] slots=[active=4 parked=0 queued=23 limit=6]
+@RootKickoff load/startup round0 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round0 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round0 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round1 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/startup round1 (running): ["S08@A1", "S11@A2", "S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/startup round1 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round1 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round1 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round2 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/startup round2 (running): ["S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/startup round2 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round2 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round2 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round3 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/startup round3 (running): [] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/startup round3 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round3 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round3 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round4 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/startup round4 (running): [] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/startup round4 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round4 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/startup round4 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round0 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1"]
+@RootKickoff load/steady round0 (running): ["S02@A1", "S05@A2", "S08@A1", "S11@A2"] slots=[active=4 parked=0 queued=23 limit=6]
+@RootKickoff load/steady round0 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round0 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round0 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round1 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/steady round1 (running): ["S08@A1", "S11@A2", "S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/steady round1 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round1 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round1 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round2 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/steady round2 (running): ["S14@A1", "S17@A2"] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/steady round2 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round2 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round2 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round3 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/steady round3 (running): [] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/steady round3 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round3 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round3 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round4 (admission order): ["S02", "S05", "S08", "S11", "R0", "R2", "R1", "S14", "S17"]
+@RootKickoff load/steady round4 (running): [] slots=[active=6 parked=0 queued=21 limit=6]
+@RootKickoff load/steady round4 R0: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round4 R1: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff load/steady round4 R2: status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff steady children_seq (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+@RootKickoff steady children_seq (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+@RootKickoff steady children_seq R: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff steady root_flag_children_incomplete R: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[coordination_review_pending] disp=[-] execs=[] hooks=0
+@RootKickoff startup children_seq (events): {"task.execution_launched": 1, "task.role_agent_dispatched": 1, "task.status_changed": 2}
+@RootKickoff startup children_seq (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=1 limit=5]
+@RootKickoff startup children_seq R: from=todo dv=1 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
+@RootKickoff startup root_flag_children_incomplete R: from=in_progress dv=0 status=in_progress ann=- B=- F=- E=- meta=[coordination_review_pending] disp=[-] execs=[] hooks=0

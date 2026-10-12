@@ -3,7 +3,9 @@
 #[cfg(test)]
 use std::collections::HashSet;
 
-use api_types::{CanonicalPhase, EffectiveCoderSource, StateKind, WorkflowDefinition};
+use api_types::{
+    CanonicalPhase, EffectiveCoderSource, StateDefinition, StateKind, WorkflowDefinition,
+};
 use db::{ProjectRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo};
 use sqlx::SqliteConnection;
 
@@ -12,14 +14,59 @@ use crate::{
     Result, ServiceError,
 };
 
+/// The workflow's planning state: the first gate with a role, outside the
+/// review phase, on the path a Task takes from an initial state to the first
+/// implementation (`Active`) state. A coordination root runs its lead there.
+pub(crate) fn planning_state(workflow: &WorkflowDefinition) -> Option<&StateDefinition> {
+    for initial in workflow
+        .states
+        .iter()
+        .filter(|state| state.kind == StateKind::Initial)
+    {
+        let mut cursor = initial.name.as_str();
+        for _ in 0..workflow.states.len() {
+            let Some(next) = workflow
+                .outgoing_trigger_targets(cursor)
+                .filter(|(trigger, _)| !trigger.system_only())
+                .find_map(|(_, target)| {
+                    workflow.states.iter().find(|state| {
+                        state.name == target
+                            && matches!(state.kind, StateKind::Active | StateKind::Gate)
+                    })
+                })
+            else {
+                break;
+            };
+            if next.kind == StateKind::Active {
+                break;
+            }
+            if next.canonical_phase != Some(CanonicalPhase::Review)
+                && effective_role(next).is_some()
+            {
+                return Some(next);
+            }
+            cursor = next.name.as_str();
+        }
+    }
+    None
+}
+
+/// Whether the native host can run `role` as a root's lead. It maps Task
+/// roles by literal name, so v1 supports only the built-in planner.
+pub(crate) fn lead_role_supported(role: &str) -> bool {
+    role == crate::workflow::default_roles::PLANNER
+}
+
 /// Workflow roles that may exist on a coordination root.
 pub(crate) struct RootRolePolicy<'a> {
     workflow: &'a WorkflowDefinition,
     implementation_role: Option<&'a str>,
+    planning: Option<&'a StateDefinition>,
 }
 
 impl<'a> RootRolePolicy<'a> {
-    /// Derive the root implementation and aggregate-review roles exactly once.
+    /// Derive the root implementation, planning and aggregate-review roles
+    /// exactly once.
     pub(crate) fn for_workflow(workflow: &'a WorkflowDefinition) -> Self {
         let implementation_role = workflow
             .states
@@ -33,15 +80,33 @@ impl<'a> RootRolePolicy<'a> {
                     .find(|state| state.kind == StateKind::Active)
                     .and_then(effective_role)
             });
+        // The implementation role is never executed on a root, so a planning
+        // gate that names it has no lead.
+        let planning = planning_state(workflow).filter(|state| {
+            effective_role(state).is_some_and(|role| {
+                role != crate::workflow::default_roles::CODER && implementation_role != Some(role)
+            })
+        });
         Self {
             workflow,
             implementation_role,
+            planning,
         }
     }
 
     /// Return the workflow's implementation role for root-policy decisions.
     pub(crate) fn implementation_role(&self) -> Option<&'a str> {
         self.implementation_role
+    }
+
+    /// The state in which a coordination root runs its lead.
+    pub(crate) fn planning_state(&self) -> Option<&'a str> {
+        self.planning.map(|state| state.name.as_str())
+    }
+
+    /// The role a coordination root's lead holds: the planning state's role.
+    pub(crate) fn planning_role(&self) -> Option<&'a str> {
+        self.planning.and_then(effective_role)
     }
 
     /// Return whether `role` is declared by an aggregate review gate.
@@ -56,13 +121,17 @@ impl<'a> RootRolePolicy<'a> {
     /// Return whether `role` may be assigned to a coordination root.
     pub(crate) fn allows_assignment(&self, role: &str) -> bool {
         role == crate::workflow::default_roles::CODER
+            || self.planning_role() == Some(role)
             || (self.implementation_role() != Some(role) && self.is_aggregate_review_role(role))
     }
 
     /// Return the only role that may execute on a coordination root in
-    /// `state_name`: the state's effective role while it is the aggregate
-    /// review phase, and none otherwise.
+    /// `state_name`: the lead in the planning state, the state's effective
+    /// role while it is the aggregate review phase, and none otherwise.
     pub(crate) fn execution_role_for_state(&self, state_name: &str) -> Option<&'a str> {
+        if self.planning_state() == Some(state_name) {
+            return self.planning_role();
+        }
         if self.workflow.canonical_phase_for_state(state_name) != CanonicalPhase::Review {
             return None;
         }
@@ -79,12 +148,262 @@ impl<'a> RootRolePolicy<'a> {
             && self.implementation_role() != Some(role)
             && self.execution_role_for_state(state_name) == Some(role)
     }
+
+    /// Whether `role` runs on coordination root `root_id` in `state_name`
+    /// with the rows it has now: [`Self::allows_execution`], and in the
+    /// planning state only while a lead is assigned. A planning root whose
+    /// lead was removed runs nothing; the root advance moves it on.
+    pub(crate) fn runs_role(
+        &self,
+        root_id: &str,
+        state_name: &str,
+        role: &str,
+        assignments: &[TaskRoleAssignment],
+    ) -> bool {
+        self.allows_execution(state_name, role)
+            && (self.planning_state() != Some(state_name)
+                || self.lead(root_id, assignments).is_some())
+    }
+
+    /// The lead of a coordination root: the Agent assigned to the planning
+    /// role on the root's own row. THE resolver for "does this root have a
+    /// lead"; every reader goes through it (or its database form,
+    /// [`root_lead`]), over the rows it already loaded.
+    pub(crate) fn lead<'r>(
+        &self,
+        root_id: &str,
+        assignments: &'r [TaskRoleAssignment],
+    ) -> Option<&'r TaskRoleAssignment> {
+        let role = self.planning_role()?;
+        assignments.iter().find(|assignment| {
+            assignment.task_id == root_id
+                && assignment.role_name == role
+                && assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                && assignment.assignee_id.is_some()
+        })
+    }
+
+    /// Whether a coordination root rests in `state_name` for its lead: the
+    /// planning state, with a lead assigned. The root advance never moves a
+    /// root out of such a state; the lead's execution does.
+    pub(crate) fn lead_holds_state(
+        &self,
+        root_id: &str,
+        state_name: &str,
+        assignments: &[TaskRoleAssignment],
+    ) -> bool {
+        self.planning_state() == Some(state_name) && self.lead(root_id, assignments).is_some()
+    }
+
+    /// Whether a planning-role execution is running on a root that sits in
+    /// its planning state. The root rests there until that run ends, lead
+    /// assigned or not: its settlement moves the root on.
+    pub(crate) fn planning_run_live<'e>(
+        &self,
+        root_status: &str,
+        running_roles: impl IntoIterator<Item = &'e str>,
+    ) -> bool {
+        self.planning_state() == Some(root_status)
+            && self
+                .planning_role()
+                .is_some_and(|role| running_roles.into_iter().any(|running| running == role))
+    }
+
+    /// Whether the level-triggered root advance has work for this root:
+    /// kickoff (a root that has not reached implementation and has a subtask
+    /// left to run), or completion (every subtask is terminal and the root
+    /// has not reached aggregate review, or an advance is flagged pending).
+    /// Never while the lead holds the root's state, whatever flag an earlier
+    /// advance left behind, and never while a planning run is live on the
+    /// root (`planning_run_live`, see [`Self::planning_run_live`]): a lead
+    /// removed mid-run must not release the subtasks beside its planner.
+    pub(crate) fn root_advance_due(
+        &self,
+        root: &Task,
+        children: &[Task],
+        assignments: &[TaskRoleAssignment],
+        review_pending: bool,
+        planning_run_live: bool,
+    ) -> bool {
+        if children.is_empty()
+            || planning_run_live
+            || self.lead_holds_state(&root.id, &root.status, assignments)
+        {
+            return false;
+        }
+        let Some(state) = self
+            .workflow
+            .states
+            .iter()
+            .find(|state| state.name == root.status)
+        else {
+            return false;
+        };
+        let review_phase = state.canonical_phase == Some(CanonicalPhase::Review);
+        match state.kind {
+            StateKind::Initial | StateKind::Gate | StateKind::Active => {}
+            _ => return false,
+        }
+        if child_sequence_complete(children, self.workflow) {
+            return review_pending || !review_phase;
+        }
+        // Kickoff: only from a state before implementation. A completion
+        // flag left on a root that has since been given another subtask
+        // describes nothing: that subtask runs first.
+        state.kind != StateKind::Active && !review_phase
+    }
+
+    /// The next state of a root advance out of `from`, or none when the
+    /// workflow has no forward route. A root with a lead enters the planning
+    /// state when it is next; otherwise the implementation state is preferred
+    /// over a gate, as before.
+    pub(crate) fn advance_target(&self, from: &str, lead_assigned: bool) -> Option<String> {
+        let candidates: Vec<&StateDefinition> = self
+            .workflow
+            .outgoing_trigger_targets(from)
+            .filter_map(|(_, target)| {
+                self.workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == target)
+                    .filter(|state| {
+                        !matches!(state.kind, StateKind::Backlog | StateKind::Terminal)
+                            && state.canonical_phase != Some(CanonicalPhase::Review)
+                    })
+            })
+            .collect();
+        if lead_assigned {
+            if let Some(planning) = candidates
+                .iter()
+                .find(|state| self.planning_state() == Some(state.name.as_str()))
+            {
+                return Some(planning.name.clone());
+            }
+        }
+        candidates
+            .into_iter()
+            .max_by_key(|state| state.kind == StateKind::Active)
+            .map(|state| state.name.clone())
+    }
+}
+
+/// Database form of [`RootRolePolicy::planning_run_live`].
+pub(crate) async fn root_planning_run_live(
+    db: &SqliteDb,
+    root: &Task,
+    policy: &RootRolePolicy<'_>,
+) -> Result<bool> {
+    if policy.planning_state() != Some(root.status.as_str()) {
+        return Ok(false);
+    }
+    let running = db::ExecutionRepo::list_running_by_task(db, &root.id).await?;
+    Ok(policy.planning_run_live(
+        &root.status,
+        running.iter().map(|execution| execution.role.as_str()),
+    ))
+}
+
+/// Database form of [`RootRolePolicy::lead`] for a coordination root.
+pub async fn root_lead(
+    db: &SqliteDb,
+    root: &Task,
+    workflow: &WorkflowDefinition,
+) -> Result<Option<TaskRoleAssignment>> {
+    if root.parent_task_id.is_some() {
+        return Ok(None);
+    }
+    let policy = RootRolePolicy::for_workflow(workflow);
+    let Some(role) = policy.planning_role() else {
+        return Ok(None);
+    };
+    let row = TaskRoleAssignmentRepo::get_by_task_and_role(db, &root.id, role).await?;
+    Ok(row.filter(|row| policy.lead(&root.id, std::slice::from_ref(row)).is_some()))
+}
+
+/// The lead a Task response reports: a coordination root's own lead, and for
+/// a subtask its root's. `own_rows` and `task_workflow` are what the caller
+/// already loaded for `task`; nothing more is read unless a lead may exist.
+pub async fn effective_lead(
+    db: &SqliteDb,
+    task: &Task,
+    own_rows: &[TaskRoleAssignment],
+    task_workflow: &WorkflowDefinition,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+        // A root resolves under the Project workflow, which is its own.
+        let policy = RootRolePolicy::for_workflow(task_workflow);
+        let Some(lead) = policy.lead(&task.id, own_rows) else {
+            return Ok(None);
+        };
+        if !coordination_root_has_subtasks(db, task).await? {
+            return Ok(None);
+        }
+        return Ok(Some(EffectiveCoderAssignment {
+            assignment: lead.clone(),
+            source: EffectiveCoderSource::Own,
+        }));
+    };
+    let root_rows = TaskRoleAssignmentRepo::list_by_task(db, parent_task_id).await?;
+    if !root_rows.iter().any(|row| {
+        row.role_name != crate::workflow::default_roles::CODER && row.assignee_id.is_some()
+    }) {
+        return Ok(None);
+    }
+    let (_, workflow) = coordination_root_context(db, parent_task_id).await?;
+    Ok(RootRolePolicy::for_workflow(&workflow)
+        .lead(parent_task_id, &root_rows)
+        .map(|lead| EffectiveCoderAssignment {
+            assignment: lead.clone(),
+            source: EffectiveCoderSource::InheritedFromRoot,
+        }))
+}
+
+/// Admit an assignee for the lead (the planning role) of coordination root
+/// `task_id`. `backend_kind` is the assigned Agent's, and `None` for a
+/// person. An empty assignment is always admitted: it removes the lead.
+pub(crate) fn ensure_lead_assignable(
+    task_id: &str,
+    role: &str,
+    assignee_type: Option<&db::AssigneeKind>,
+    backend_kind: Option<&str>,
+) -> Result<()> {
+    if assignee_type.is_none() {
+        return Ok(());
+    }
+    if !lead_role_supported(role) {
+        return Err(ServiceError::LeadRoleNotSupported {
+            task_id: task_id.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    if assignee_type != Some(&db::AssigneeKind::Agent) || backend_kind != Some("native") {
+        return Err(ServiceError::LeadRequiresNativeProfile {
+            task_id: task_id.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether an existing assignment row stays on a Task that becomes a
+/// coordination root: the roles the policy admits, and the planning role only
+/// with an assignee that may lead (conversion never fails; it strips).
+pub(crate) fn root_keeps_assignment(
+    policy: &RootRolePolicy<'_>,
+    task_id: &str,
+    role: &str,
+    assignee_type: Option<&db::AssigneeKind>,
+    backend_kind: Option<&str>,
+) -> bool {
+    policy.allows_assignment(role)
+        && (policy.planning_role() != Some(role)
+            || ensure_lead_assignable(task_id, role, assignee_type, backend_kind).is_ok())
 }
 
 /// Error returned when a role may not be assigned to a coordination root.
 pub(crate) fn root_assignment_denied() -> ServiceError {
     ServiceError::invalid_operation(
-        "coordination roots accept only the coder default worker and aggregate review roles",
+        "coordination roots accept only the coder default worker, the planning role (the lead) and aggregate review roles",
     )
 }
 
@@ -302,7 +621,7 @@ pub(crate) async fn ensure_subtask_dispatch_order(db: &SqliteDb, task: &Task) ->
     let (parent, workflow) = coordination_root_context(db, parent_task_id).await?;
     if !coordination_root_allows_child_dispatch(&parent, &workflow) {
         return Err(ServiceError::invalid_operation(format!(
-            "subtask {} cannot start while coordination root {} is blocked, terminal, or in aggregate review",
+            "subtask {} cannot start while coordination root {} is blocked or not in its implementation state",
             task.id, parent_task_id
         )));
     }
@@ -362,36 +681,15 @@ pub(crate) fn ensure_parent_accepts_subtasks(
     Ok(())
 }
 
-/// Return whether a root state permits its next child to dispatch.
+/// Return whether a root state permits its next child to dispatch: an
+/// unblocked root in an implementation (`Active`) state. A root that plans,
+/// or has not started, holds its children; `merge_failed` is `Active` and
+/// runs a corrective subtask.
 pub(crate) fn coordination_root_allows_child_dispatch(
     parent: &Task,
     workflow: &WorkflowDefinition,
 ) -> bool {
-    if root_blocked(parent) {
-        return false;
-    }
-    let Some(state) = workflow
-        .states
-        .iter()
-        .find(|state| state.name == parent.status)
-    else {
-        return false;
-    };
-    if matches!(state.kind, StateKind::Backlog | StateKind::Terminal) {
-        return false;
-    }
-    !(state.kind == StateKind::Gate && state.canonical_phase == Some(CanonicalPhase::Review))
-}
-
-/// Return whether a coordination root's non-empty child sequence is complete.
-#[cfg(test)]
-pub(crate) async fn coordination_root_sequence_complete(
-    db: &SqliteDb,
-    task: &Task,
-    workflow: &WorkflowDefinition,
-) -> Result<bool> {
-    let children = children_if_root(db, task).await?;
-    Ok(child_sequence_complete(&children, workflow))
+    !root_blocked(parent) && workflow.state_kind(&parent.status) == Some(StateKind::Active)
 }
 
 /// Require every child to finish before aggregate review or terminal entry.
@@ -592,7 +890,11 @@ mod tests {
         assert!(policy.is_aggregate_review_role("reviewer"));
         assert!(policy.allows_assignment("reviewer"));
         assert!(policy.allows_assignment("coder"));
-        assert!(!policy.allows_assignment("planner"));
+        // The planning role is the root's lead.
+        assert_eq!(policy.planning_state(), Some(default_states::PLANNING));
+        assert_eq!(policy.planning_role(), Some("planner"));
+        assert!(policy.allows_assignment("planner"));
+        assert!(!policy.allows_assignment("auditor"));
 
         workflow
             .states
@@ -615,6 +917,12 @@ mod tests {
         assert!(!policy.allows_execution(default_states::REVIEW, "coder"));
         assert!(!policy.allows_execution(default_states::IN_PROGRESS, "coder"));
         assert!(!policy.allows_execution(default_states::IN_PROGRESS, "reviewer"));
+        // The lead runs in the planning state and nowhere else.
+        assert!(policy.allows_execution(default_states::PLANNING, "planner"));
+        assert!(!policy.allows_execution(default_states::IN_PROGRESS, "planner"));
+        assert!(!policy.allows_execution(default_states::REVIEW, "planner"));
+        assert!(!policy.allows_execution(default_states::PLANNING, "coder"));
+        assert!(!policy.allows_execution(default_states::PLANNING, "reviewer"));
 
         // A custom workflow that renames the aggregate reviewer must keep
         // assignment and execution in agreement, not fall back to "reviewer".
@@ -631,11 +939,156 @@ mod tests {
         assert!(!policy.allows_execution(default_states::REVIEW, "reviewer"));
     }
 
+    fn assignment(task_id: &str, role: &str, agent: Option<&str>) -> TaskRoleAssignment {
+        TaskRoleAssignment {
+            id: format!("{task_id}-{role}"),
+            task_id: task_id.to_owned(),
+            role_name: role.to_owned(),
+            assignee_type: agent.map(|_| db::AssigneeKind::Agent),
+            assignee_id: agent.map(str::to_owned),
+            created_at: "2026-09-28T00:00:00Z".to_owned(),
+            updated_at: "2026-09-28T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// The planning state is found by position, not by name, and a planning
+    /// gate that names the implementation role has no lead.
     #[test]
-    fn task_hierarchy_child_dispatch_requires_a_live_non_review_root() {
+    fn task_hierarchy_planning_state_is_the_first_role_gate_before_implementation() {
+        let mut workflow = crate::workflow::default_workflow::default_workflow();
+        assert_eq!(
+            planning_state(&workflow).map(|state| state.name.as_str()),
+            Some(default_states::PLANNING)
+        );
+        for state in &mut workflow.states {
+            if state.name == default_states::PLANNING {
+                state.name = "design".to_owned();
+                state.role = Some("architect".to_owned());
+            }
+            for trigger in state.triggers.values_mut() {
+                if trigger.to == default_states::PLANNING {
+                    trigger.to = "design".to_owned();
+                }
+            }
+        }
+        let policy = RootRolePolicy::for_workflow(&workflow);
+        assert_eq!(policy.planning_state(), Some("design"));
+        assert_eq!(policy.planning_role(), Some("architect"));
+        assert!(policy.allows_assignment("architect"));
+        assert!(policy.allows_execution("design", "architect"));
+        assert!(!lead_role_supported("architect"));
+        assert!(lead_role_supported("planner"));
+
+        for state in &mut workflow.states {
+            if state.name == "design" {
+                state.role = Some("coder".to_owned());
+            }
+        }
+        let policy = RootRolePolicy::for_workflow(&workflow);
+        assert_eq!(policy.planning_state(), None);
+        assert!(!policy.allows_execution("design", "coder"));
+    }
+
+    #[test]
+    fn task_hierarchy_root_lead_is_the_agent_on_the_roots_own_planning_row() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        let policy = RootRolePolicy::for_workflow(&workflow);
+        let rows = vec![
+            assignment("root", "coder", Some("worker")),
+            assignment("other", "planner", Some("someone")),
+        ];
+        assert!(policy.lead("root", &rows).is_none());
+        assert!(!policy.lead_holds_state("root", default_states::PLANNING, &rows));
+        let unassigned = vec![assignment("root", "planner", None)];
+        assert!(policy.lead("root", &unassigned).is_none());
+        let rows = vec![assignment("root", "planner", Some("lead"))];
+        assert_eq!(
+            policy
+                .lead("root", &rows)
+                .and_then(|row| row.assignee_id.as_deref()),
+            Some("lead")
+        );
+        assert!(policy.lead_holds_state("root", default_states::PLANNING, &rows));
+        assert!(!policy.lead_holds_state("root", default_states::IN_PROGRESS, &rows));
+    }
+
+    /// Kickoff and completion are one level-triggered fact, and the lead's
+    /// state is never advanced past, whatever flag is left on the root.
+    #[test]
+    fn task_hierarchy_root_advance_covers_kickoff_and_completion_and_never_the_leads_state() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        let policy = RootRolePolicy::for_workflow(&workflow);
+        let open = vec![task("child", default_states::TODO, Some("root"))];
+        let closed = vec![task("child", default_states::DONE, Some("root"))];
+        let lead = vec![assignment("root", "planner", Some("lead"))];
+        let due = |status: &str, children: &[Task], rows: &[TaskRoleAssignment], pending| {
+            policy.root_advance_due(&task("root", status, None), children, rows, pending, false)
+        };
+        // A planning run still live on a root whose lead was removed holds
+        // the root exactly as the lead did.
+        assert!(policy.planning_run_live("planning", ["planner"]));
+        assert!(!policy.planning_run_live("planning", ["reviewer"]));
+        assert!(!policy.planning_run_live("in_progress", ["planner"]));
+        assert!(!policy.root_advance_due(&task("root", "planning", None), &open, &[], false, true));
+        // Kickoff, with and without a lead.
+        assert!(due("todo", &open, &[], false));
+        assert!(due("todo", &open, &lead, false));
+        assert!(due("planning", &open, &[], false));
+        assert!(!due("planning", &open, &lead, false));
+        assert!(!due("in_progress", &open, &lead, false));
+        assert!(!due("backlog", &open, &[], false));
+        assert!(!due("review", &open, &[], false));
+        assert!(!due("todo", &[], &[], false));
+        // Completion.
+        assert!(due("in_progress", &closed, &lead, false));
+        assert!(due("planning", &closed, &[], false));
+        assert!(!due("review", &closed, &[], false));
+        assert!(!due("done", &closed, &[], false));
+        // The last subtask was cancelled while the lead plans: the flag an
+        // earlier advance set does not starve the planner.
+        assert!(!due("planning", &closed, &lead, false));
+        assert!(!due("planning", &closed, &lead, true));
+        assert!(due("planning", &closed, &[], true));
+        assert!(due("review", &closed, &[], true));
+        // A stale completion flag on a root with a subtask left is not work.
+        assert!(!due("in_progress", &open, &[], true));
+
+        assert_eq!(
+            policy.advance_target("todo", true).as_deref(),
+            Some("planning")
+        );
+        assert_eq!(
+            policy.advance_target("todo", false).as_deref(),
+            Some("in_progress")
+        );
+        assert_eq!(
+            policy.advance_target("planning", false).as_deref(),
+            Some("in_progress")
+        );
+    }
+
+    #[test]
+    fn task_hierarchy_child_dispatch_requires_a_live_implementing_root() {
         let workflow = crate::workflow::default_workflow::default_workflow();
         let mut root = task("root", default_states::IN_PROGRESS, None);
         assert!(coordination_root_allows_child_dispatch(&root, &workflow));
+        // A root that has not started, or plans, holds its children; a root
+        // repairing a failed merge runs its corrective subtask.
+        for (status, allowed) in [
+            ("backlog", false),
+            ("todo", false),
+            ("planning", false),
+            ("merge_failed", true),
+            ("merging", false),
+        ] {
+            root.status = status.to_owned();
+            assert_eq!(
+                coordination_root_allows_child_dispatch(&root, &workflow),
+                allowed,
+                "{status}"
+            );
+        }
+        root.status = default_states::IN_PROGRESS.to_owned();
 
         root.status = default_states::REVIEW.to_owned();
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));

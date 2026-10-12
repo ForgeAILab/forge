@@ -651,8 +651,12 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     // other state, its release launches nothing: it lets its subtasks run.
     let root_role_refused = snapshot.coordination_root
         && role.is_some_and(|role| {
-            !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
-                .allows_execution(&task.status, role)
+            !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow).runs_role(
+                &task.id,
+                &task.status,
+                role,
+                &snapshot.role_assignments,
+            )
         });
     if held {
         if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() && !root_role_refused

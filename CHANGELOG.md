@@ -8,6 +8,48 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A coordination root moves to `in_progress` when it has a subtask to run,
+  and its subtasks run only while it is there.** A root Task with subtasks
+  used to rest in `todo` while its subtasks ran. It now moves to its
+  implementation state (`in_progress`) on the dispatcher's first pass, lead
+  or not, and a subtask starts only while the root is in `in_progress` (or
+  `merge_failed`, for a corrective subtask). Roots already in `todo` move on
+  the first pass after upgrade; a subtask that is running is not interrupted.
+  Board columns and automation keyed on a root's status see the change.
+  Claiming, moving or transitioning the first subtask by hand starts the root
+  first. Nothing that ran before now waits for a person: a root without a
+  lead passes a planning gate that asks for approval as it always did, and
+  the first subtask is dispatched from the root's own move (measured: two
+  dispatcher passes from the dirty set, no sweep interval). One wait is new:
+  the subtasks of a root that has an unfinished dependency now wait for that
+  dependency with the root (the root shows `dispatch_refusal` for
+  `coordination_root_advance`, its subtasks `parent { cause:
+  not_coordinating }`) and start when it completes; before, they ran while
+  the root sat in `todo`. No migration.
+
+- **Coordination roots accept the planning role: the root's lead.** The
+  workflow's planning role (`planner` in the built-in workflow) can be
+  assigned on a root that has subtasks, and survives the conversion of a Task
+  into a coordination root. It runs on the root as ordinary `planner`
+  executions while the root is in `planning`: at kickoff the root goes
+  `todo -> planning`, the lead reviews the breakdown
+  (prompt `planner.coordination.v1`), and its success moves the root to
+  `in_progress`. A lead must be a native Agent under the role name `planner`;
+  other assignments are refused with `422 LEAD_REQUIRES_NATIVE_PROFILE` or
+  `422 LEAD_ROLE_NOT_SUPPORTED`. A Project whose default assignments give
+  Tasks a native planner therefore gets a lead on every Task that is later
+  split into subtasks; when that Project's planning gate also requires a
+  person's approval, such a root waits for the approval of its lead's kickoff
+  before its subtasks start (Approve on the root), as an ordinary Task there
+  waits for its plan. Remove the planner from the root to run it without a
+  lead. A root without a planner is unchanged apart from the entry above. `TaskResponse.effective_lead` (`{ assignment, source }`) reports
+  the lead of a root and of its subtasks.
+
+- **New condition value `parent.cause = planning`.** A subtask whose root is
+  planning is `parked` on `parent { cause: planning }` until the planner
+  finishes. Clients that enumerate `cause` (`held`, `blocked`,
+  `not_coordinating`) must render it as a wait that needs no action.
+
 - **REST no longer documents or maps `503 check_environment_unavailable`.**
   No REST handler could return it: the check environment is read only inside
   Task steps and the check worker, and the Task states the cause (review
@@ -3074,6 +3116,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A merge the queue rebased itself is no longer sent back to review when
+  it is asked again.** A head that had rebased and then waited for its
+  checkout's machine until the step wait ran out parked `owner_offline`
+  with the rebase recorded and not yet applied: its checkout stood on the
+  rebased commit while the attempt still named the commit it was admitted
+  with. The retry validated first, read that as "the candidate commit
+  changed after it was admitted" and moved the Task to review for a commit
+  nobody had changed. Validation now recognises the attempt's own
+  succeeded, conflict-free rebase from exactly that commit and continues:
+  the rebase is not repeated and the rebased commit is checked before it
+  merges. A checkout changed after that rebase still goes to review.
+- **`GET /api/v1/executions/{id}/logs` no longer answers 404 for a remote
+  execution whose first log line is being written.** The log path was
+  recorded on the execution before the file existed, and a read between the
+  two got `execution.logs_unavailable`. The file is created, empty, when the
+  path is recorded (at launch, and when a daemon's first log frame arrives),
+  so a started execution that has not logged yet reads as an empty page.
 
 - **A merge attempt that holds its queue's slot is not handed back to
   admission at every reconciler pass.** An attempt whose placement binding

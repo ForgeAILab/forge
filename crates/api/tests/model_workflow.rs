@@ -1619,12 +1619,127 @@ impl World {
                 _ => {}
             }
         }
+        self.check_roots(false).await?;
+        Ok(())
+    }
+
+    /// The coordination-root invariants of plan 3.10 stage 1, for roots with
+    /// and without a planner (the lead).
+    ///
+    /// (k) holds in every committed state. (g), (h), (i) and (j) are checked
+    /// where nothing is left for the dispatcher to do: a root restored from
+    /// an older release may hold a running subtask in `todo` until its first
+    /// pass, and a stopping execution is still `running` until it reports.
+    ///
+    /// What is real and what is vacuous here. (g) is real: with the product
+    /// mutated back to the old rule (a subtask of a `todo` root dispatches
+    /// and the root is not kicked off) `a_coordination_root_merges_through_
+    /// the_queue` fails on it. The no-lead halves of (h) and (k) are real for
+    /// the same roots. (i), (j) and the lead halves of (h) and (k) are
+    /// VACUOUS: the model has no native-runtime stub, so no root in it ever
+    /// has a lead or a planner execution. They need `Action::AssignLead` and
+    /// a scripted native planner (stage 3/4). Until then the lead cases are
+    /// proven at the dispatcher level, in
+    /// `services::task_dispatcher::tests::root_lead` (the upgrade matrix and
+    /// the lead-removed-while-planning case, which checks (g) and (h) with a
+    /// running planner).
+    async fn check_roots(&self, quiescent: bool) -> Result<(), String> {
+        let pool = &self.live().pool;
+        let rows = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(pool)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        const ROOT: &str = "r.parent_task_id IS NULL AND r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = r.id AND c.deleted_at IS NULL)";
+        const LEAD: &str = "EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = r.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
+        // (k) a root without a planner never runs one.
+        let ran: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT r.id FROM task r WHERE {ROOT} AND NOT {LEAD} AND EXISTS (SELECT 1 FROM execution e WHERE e.task_id = r.id AND e.role = 'planner' AND e.status = 'running')"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !ran.is_empty() {
+            return Err(format!("(k) roots without a planner run one: {ran:?}"));
+        }
+        if !quiescent {
+            return Ok(());
+        }
+        // (k) ... and never rests in `planning`.
+        let resting: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT r.id FROM task r WHERE {ROOT} AND NOT {LEAD} AND r.status = 'planning'
+               AND json_extract(r.condition_json, '$.kind') = 'clear'"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !resting.is_empty() {
+            return Err(format!(
+                "(k) roots without a planner rest in planning: {resting:?}"
+            ));
+        }
+        // (g) no subtask runs while its root is not in an implementation state.
+        let early = rows(
+            "SELECT c.id || ' under ' || r.status FROM task c JOIN task r ON r.id = c.parent_task_id
+             WHERE c.deleted_at IS NULL AND r.status NOT IN ('in_progress', 'merge_failed')
+               AND EXISTS (SELECT 1 FROM execution e WHERE e.task_id = c.id AND e.status = 'running')",
+        )
+        .await?;
+        if !early.is_empty() {
+            return Err(format!(
+                "(g) subtasks run while their root does not implement: {early:?}"
+            ));
+        }
+        // (h) one running execution between a root and its subtasks: the
+        // planner on the root counts.
+        let crowded = rows(
+            "SELECT r.id FROM task r WHERE r.parent_task_id IS NULL AND r.deleted_at IS NULL
+               AND (SELECT COUNT(*) FROM execution e JOIN task t ON t.id = e.task_id
+                    WHERE e.status = 'running' AND (t.id = r.id OR t.parent_task_id = r.id)
+                      AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = r.id)) > 1",
+        )
+        .await?;
+        if !crowded.is_empty() {
+            return Err(format!(
+                "(h) roots with more than one running execution in their tree: {crowded:?}"
+            ));
+        }
+        // (i) a root that plans for its lead is never parked on its children.
+        let stranded: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT r.id FROM task r WHERE {ROOT} AND {LEAD} AND r.status = 'planning'
+               AND json_extract(r.condition_json, '$.primary.kind') = 'children'"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !stranded.is_empty() {
+            return Err(format!(
+                "(i) planning roots parked on their children: {stranded:?}"
+            ));
+        }
+        // (j) a subtask of a planning root is held by a typed park.
+        let unheld = rows(
+            "SELECT c.id || ' ' || COALESCE(c.condition_json, '') FROM task c JOIN task r ON r.id = c.parent_task_id
+             WHERE c.deleted_at IS NULL AND r.deleted_at IS NULL AND r.status = 'planning'
+               AND c.status IN ('todo', 'in_progress')
+               AND NOT (COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') = 'parent'
+                        AND json_extract(c.condition_json, '$.primary.cause') IN ('planning', 'held', 'blocked'))
+               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure')",
+        )
+        .await?;
+        if !unheld.is_empty() {
+            return Err(format!(
+                "(j) subtasks of a planning root without a parent park: {unheld:?}"
+            ));
+        }
         Ok(())
     }
 
     /// The invariants of a quiescent state. Returns one line per Task.
     async fn check_quiescent(&mut self) -> Result<String, String> {
         self.check_committed().await?;
+        self.check_roots(true).await?;
         // (a) the dispatcher's own "owned or parked" assertion.
         bounded(
             &self.probe,

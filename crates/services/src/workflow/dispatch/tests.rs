@@ -1169,3 +1169,59 @@ fn implementation_prompts_list_the_checks_that_gate_review() {
         .system;
     assert!(!system.contains("Required checks:"));
 }
+
+/// A planner run on a root Task with subtasks is its lead: the coordination
+/// builder replaces the default planner builder, carries the breakdown with
+/// states as user-role input, and asks for no checklist plan.
+#[test]
+fn a_planner_on_a_coordination_root_gets_the_lead_prompt() {
+    let mut ctx = fake_context(default_roles::PLANNER);
+    ctx.state_name = default_states::PLANNING.to_string();
+    let state = DispatchIntent {
+        builder_id: Some(BUILDER_ID_PLANNER_DEFAULT_V2.to_owned()),
+        execution_policy: None,
+        prompt_config: json!({}),
+    };
+    let (plain, selection) = build_effective_prompt(&ctx, None, Some(&state));
+    assert_eq!(selection.builder_id, BUILDER_ID_PLANNER_DEFAULT_V2);
+    assert!(plain.user.contains("Plan task: Add dispatch context"));
+
+    let mut first = fake_task("child-1", "Add the schema", Some("Migration and model."));
+    first.parent_task_id = Some("task-1".to_owned());
+    first.status = default_states::TODO.to_owned();
+    let mut second = fake_task("child-2", "Wire the endpoint", None);
+    second.parent_task_id = Some("task-1".to_owned());
+    second.status = default_states::TODO.to_owned();
+    ctx.sub_tasks = vec![first, second];
+    let (lead, selection) = build_effective_prompt(&ctx, None, Some(&state));
+    assert_eq!(
+        selection.builder_id,
+        super::BUILDER_ID_PLANNER_COORDINATION_V1
+    );
+    assert!(lead.system.contains("Lead doctrine:"));
+    assert!(lead.system.contains(FAILURE_TAXONOMY_LINE));
+    // Volatile state is user-role input, never part of the stable prefix.
+    assert!(!lead.system.contains("Add the schema"));
+    assert!(lead
+        .user
+        .contains("Lead this feature: Add dispatch context"));
+    assert!(lead.user.contains("1. [todo] Add the schema"));
+    assert!(lead.user.contains("   Migration and model."));
+    assert!(lead.user.contains("2. [todo] Wire the endpoint"));
+    assert!(!lead.user.contains("plan.md"));
+    // The doctrine stays within its budget (about 1,200 tokens).
+    assert!(lead.system.len() < 4_800, "{}", lead.system.len());
+
+    assert!(lead.user.contains("no subtask has started"));
+    // A breakdown already under way is not described as a kickoff.
+    ctx.sub_tasks[0].status = default_states::DONE.to_owned();
+    let (late, _) = build_effective_prompt(&ctx, None, Some(&state));
+    assert!(!late.user.contains("no subtask has started"));
+    assert!(late.user.contains("1. [done] Add the schema"));
+    assert_eq!(late.system, lead.system, "the stable prefix does not move");
+
+    // A subtask's own planner is not a lead.
+    ctx.task.parent_task_id = Some("root".to_owned());
+    let (_, selection) = build_effective_prompt(&ctx, None, Some(&state));
+    assert_eq!(selection.builder_id, BUILDER_ID_PLANNER_DEFAULT_V2);
+}
