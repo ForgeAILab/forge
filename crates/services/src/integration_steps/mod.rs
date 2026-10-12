@@ -45,9 +45,9 @@ pub(crate) mod admission;
 pub(crate) mod gate;
 pub mod import;
 mod port;
-mod proof;
 #[cfg(test)]
 pub(crate) mod preemption_tests;
+mod proof;
 pub(crate) mod reconcile;
 mod send_back;
 mod settle;
