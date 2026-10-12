@@ -28,7 +28,7 @@ use executors::ExecutorKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::{
+use services::{
     agent_service::{cli_runtime_source_enabled, compute_effective_status, EffectiveStatus},
     workflow::{default_autonomous_workflow::default_autonomous_workflow, default_roles},
     Result, ServiceError,
@@ -325,7 +325,7 @@ struct CandidateEvaluation {
 #[derive(Clone)]
 pub struct SoloBootstrapService {
     db: Arc<SqliteDb>,
-    embedded_agents: Option<Arc<crate::EmbeddedAgentService>>,
+    embedded_agents: Option<Arc<services::EmbeddedAgentService>>,
     config_providers: config::ProviderDeclarations,
 }
 
@@ -352,7 +352,7 @@ impl SoloBootstrapService {
     /// declarations are ignored and Solo keeps its CLI-harness-only candidate
     /// set.
     #[must_use]
-    pub fn with_embedded_agents(mut self, service: Arc<crate::EmbeddedAgentService>) -> Self {
+    pub fn with_embedded_agents(mut self, service: Arc<services::EmbeddedAgentService>) -> Self {
         self.embedded_agents = Some(service);
         self
     }
@@ -372,7 +372,7 @@ impl SoloBootstrapService {
         let request = normalize_request(request)?;
         let (idempotency_key, input_digest) = bootstrap_identity(&request)?;
         let workflow = default_autonomous_workflow();
-        crate::workflow::validation::validate_workflow(&workflow)?;
+        services::workflow::validation::validate_workflow(&workflow)?;
         let workflow_json = serde_json::to_string(&workflow).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "autonomous_v1 workflow is not serializable: {error}"
@@ -872,7 +872,7 @@ impl SoloBootstrapService {
                 None => {
                     match embedded
                         .connect_api_key_credential(
-                            crate::embedded_agent_service::ConnectApiKeyCredential {
+                            services::embedded_agent_service::ConnectApiKeyCredential {
                                 owner_user_id: owner_id.to_owned(),
                                 provider: declaration.kind.clone(),
                                 label: label.clone(),
@@ -903,24 +903,27 @@ impl SoloBootstrapService {
                     continue;
                 }
                 if let Err(error) = embedded
-                    .create_agent_from_entry(crate::embedded_agent_service::CreateEmbeddedAgent {
-                        owner_user_id: owner_id.to_owned(),
-                        name,
-                        description: Some(format!(
-                            "Config-declared provider agent ({})",
-                            declaration.kind
-                        )),
-                        credential_id: credential_id.clone(),
-                        model: model.model.clone(),
-                        reasoning_effort: model.reasoning_effort.clone(),
-                        system_prompt: None,
-                        account_permission_ceiling:
-                            crate::embedded_agent_service::default_profile_tool_policy(),
-                        tool_policy: crate::embedded_agent_service::default_profile_tool_policy(),
-                        context_tokens: model.context_tokens,
-                        max_input_tokens: model.max_input_tokens,
-                        max_output_tokens: model.max_output_tokens,
-                    })
+                    .create_agent_from_entry(
+                        services::embedded_agent_service::CreateEmbeddedAgent {
+                            owner_user_id: owner_id.to_owned(),
+                            name,
+                            description: Some(format!(
+                                "Config-declared provider agent ({})",
+                                declaration.kind
+                            )),
+                            credential_id: credential_id.clone(),
+                            model: model.model.clone(),
+                            reasoning_effort: model.reasoning_effort.clone(),
+                            system_prompt: None,
+                            account_permission_ceiling:
+                                services::embedded_agent_service::default_profile_tool_policy(),
+                            tool_policy:
+                                services::embedded_agent_service::default_profile_tool_policy(),
+                            context_tokens: model.context_tokens,
+                            max_input_tokens: model.max_input_tokens,
+                            max_output_tokens: model.max_output_tokens,
+                        },
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1555,9 +1558,9 @@ impl SoloBootstrapService {
         if binding.state != PROJECT_AGENT_BINDING_SETUP_STATE {
             return Ok(binding.clone());
         }
-        let agent_chat_service = crate::AgentChatService::new(Arc::clone(&self.db));
+        let agent_chat_service = services::AgentChatService::new(Arc::clone(&self.db));
         agent_chat_service
-            .set_project_binding(crate::SetProjectAgentBindingInput {
+            .set_project_binding(services::SetProjectAgentBindingInput {
                 actor_user_id: metadata.owner_id.clone(),
                 project_id: project.id.clone(),
                 identity_id: Some(identity_id.to_owned()),
@@ -2420,7 +2423,7 @@ mod tests {
                 permission_policy: Some("scoped_proposals".to_owned()),
                 prompt_template: None,
                 capabilities_json: "[]".to_owned(),
-                tool_policy_json: crate::embedded_agent_service::default_profile_tool_policy()
+                tool_policy_json: services::embedded_agent_service::default_profile_tool_policy()
                     .to_string(),
                 config_json: "{}".to_owned(),
                 credential_ref: Some(handle_id.clone()),
@@ -2821,8 +2824,8 @@ mod tests {
         // typed Agent Chat admission path can now accept a user message, but
         // the Project remains Charter-gated and therefore has no Task
         // mutation authority.
-        let admitted = crate::AgentChatService::new(Arc::clone(&db))
-            .send_message(crate::SendAgentChatMessageInput {
+        let admitted = services::AgentChatService::new(Arc::clone(&db))
+            .send_message(services::SendAgentChatMessageInput {
                 actor_user_id: selected.owner_id.clone(),
                 chat_id: selected.project_chat_id.clone(),
                 content: "Please explain the Project Charter adoption choices.".to_owned(),

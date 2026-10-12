@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::{
+use services::{
     agent_chat_service::{
         AgentChatService, CancelAgentChatTurnInput, RetryAgentChatTurnInput,
         SendAgentChatMessageInput,
@@ -2657,7 +2657,7 @@ mod tests {
                 evidence: e,
             },
         ] {
-            let mut task = crate::task_actions::tests::snapshot("in_progress", None).task;
+            let mut task = services::task_actions::test_support::snapshot("in_progress", None).task;
             task.condition = c;
             let expected = serde_json::to_value(super::task_interruption(&task)).unwrap();
             task.error_annotation = Some(

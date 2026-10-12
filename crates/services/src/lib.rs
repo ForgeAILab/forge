@@ -89,8 +89,6 @@ pub mod repo_location;
 pub mod runtime;
 pub mod shared_media_cleanup;
 pub mod shutdown;
-pub mod solo_bootstrap;
-pub mod solo_session;
 pub mod task_actions;
 pub mod task_diagnostics;
 pub use task_actions::{available_actions, ActionCaller, TaskSnapshot};
@@ -602,14 +600,14 @@ impl ServiceError {
         )
     }
 
-    pub(crate) fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
+    pub fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         Self::NotFound {
             entity,
             id: id.into(),
         }
     }
 
-    pub(crate) fn invalid_operation(message: impl Into<String>) -> Self {
+    pub fn invalid_operation(message: impl Into<String>) -> Self {
         Self::InvalidOperation {
             message: message.into(),
         }
@@ -641,7 +639,7 @@ impl ServiceError {
         }
     }
 
-    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+    pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
     }
 

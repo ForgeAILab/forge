@@ -9,25 +9,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::bootstrap::{
+    SoloAgentAvailability, SoloAgentCandidate, SoloAgentCandidateInput,
+    SoloAuthenticatedAgentRegistration, SoloBootstrapReadiness, SoloBootstrapRequest,
+    SoloBootstrapResult, SoloBootstrapService,
+};
+use crate::session::{
+    SoloActivityCursor, SoloActivityKind, SoloActivityPage, SoloAttentionSnapshot,
+    SoloCharterApprovalAuthorization, SoloCharterApprovalInput, SoloCharterApprovalTarget,
+    SoloInteractionAnswerInput, SoloInteractionAnswerValue, SoloMessageAuthor, SoloMessageStatus,
+    SoloOperationOutcome, SoloProjectReadiness, SoloRetryTurnInput, SoloReviewDecision,
+    SoloReviewDecisionInput, SoloSendMessageInput, SoloSessionService, SoloSessionSnapshot,
+    SoloTaskSnapshot, SoloTurnSnapshot, SoloTurnStatus,
+};
 use db::DbError;
 use events::ForgeEvent;
 use executors::{AdapterRegistry, AvailabilityStatus, ExecutorKind};
-use services::{
-    solo_bootstrap::{
-        SoloAgentAvailability, SoloAgentCandidate, SoloAgentCandidateInput,
-        SoloAuthenticatedAgentRegistration, SoloBootstrapReadiness, SoloBootstrapRequest,
-        SoloBootstrapResult, SoloBootstrapService,
-    },
-    solo_session::{
-        SoloActivityCursor, SoloActivityKind, SoloActivityPage, SoloAttentionSnapshot,
-        SoloCharterApprovalAuthorization, SoloCharterApprovalInput, SoloCharterApprovalTarget,
-        SoloInteractionAnswerInput, SoloInteractionAnswerValue, SoloMessageAuthor,
-        SoloMessageStatus, SoloOperationOutcome, SoloProjectReadiness, SoloRetryTurnInput,
-        SoloReviewDecision, SoloReviewDecisionInput, SoloSendMessageInput, SoloSessionService,
-        SoloSessionSnapshot, SoloTaskSnapshot, SoloTurnSnapshot, SoloTurnStatus,
-    },
-    EmbeddedDaemon, RuntimeSupervisor, ServiceError,
-};
+use services::{EmbeddedDaemon, RuntimeSupervisor, ServiceError};
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
 use crate::backend::{
@@ -856,7 +854,7 @@ fn to_backend_snapshot(
 /// approved revision. Approval finalization intentionally leaves both
 /// pointers on the approved revision, so projecting `approval_target` by
 /// itself would create a phantom amendment card after a successful adoption.
-fn has_pending_charter_approval(charter: &services::solo_session::SoloCharterSnapshot) -> bool {
+fn has_pending_charter_approval(charter: &crate::session::SoloCharterSnapshot) -> bool {
     charter.approval_target.is_some()
         && charter.current_draft_revision_id.as_deref()
             != charter.current_approved_revision_id.as_deref()
@@ -995,9 +993,7 @@ fn to_setup_agent_snapshot(candidate: &SoloAgentCandidate) -> SetupAgentSnapshot
     }
 }
 
-fn to_message_snapshot(
-    message: &services::solo_session::SoloChatMessageSnapshot,
-) -> MessageSnapshot {
+fn to_message_snapshot(message: &crate::session::SoloChatMessageSnapshot) -> MessageSnapshot {
     MessageSnapshot {
         id: message.id.clone(),
         sequence: message.sequence,
@@ -1299,11 +1295,11 @@ fn safe_public_service_detail(detail: String, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use services::solo_session::SoloTaskExecutionSnapshot;
+    use crate::session::SoloTaskExecutionSnapshot;
 
     fn approval_target() -> SoloCharterApprovalTarget {
         SoloCharterApprovalTarget {
-            kind: services::solo_session::SoloCharterApprovalKind::Adoption,
+            kind: crate::session::SoloCharterApprovalKind::Adoption,
             project_id: "project".to_owned(),
             charter_id: "charter".to_owned(),
             revision_id: "revision".to_owned(),
@@ -1325,8 +1321,8 @@ mod tests {
         draft: Option<&str>,
         approved: Option<&str>,
         with_target: bool,
-    ) -> services::solo_session::SoloCharterSnapshot {
-        services::solo_session::SoloCharterSnapshot {
+    ) -> crate::session::SoloCharterSnapshot {
+        crate::session::SoloCharterSnapshot {
             id: "charter".to_owned(),
             project_id: Some("project".to_owned()),
             version: 3,

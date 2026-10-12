@@ -13,15 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::bootstrap::{
+    SoloAgentCandidateInput, SoloAuthenticatedAgentRegistration, SoloBootstrapRequest,
+    SoloBootstrapResult, SoloBootstrapService,
+};
+use crate::session::{SoloSessionDependencies, SoloSessionScope, SoloSessionService};
 use config::{ConfigOverrides, ForgeConfig};
 use db::{Daemon, DaemonRepo, DaemonStatus, SqliteDb};
 use executors::{AdapterRegistry, AvailabilityStatus, ExecutorKind};
 use services::{
-    solo_bootstrap::{
-        SoloAgentCandidateInput, SoloAuthenticatedAgentRegistration, SoloBootstrapRequest,
-        SoloBootstrapResult, SoloBootstrapService,
-    },
-    solo_session::{SoloSessionDependencies, SoloSessionScope, SoloSessionService},
     EmbeddedDaemon, ForgeRuntime, ForgeRuntimeBuilder, RuntimeAssemblyMode, RuntimeSupervisor,
     ServiceError,
 };
