@@ -19,6 +19,11 @@ const UNRESOLVED_STEP_RETENTION_DAYS: i64 = 30;
 const CHECK_PRUNE_BATCH: i64 = 100;
 const CHECK_PRUNE_MAX_BATCHES: usize = 20;
 
+// Receipts of finished merge attempts share the hourly slot and the same
+// retention setting: at most 20 batches of 100 attempts per hour.
+const INTEGRATION_PRUNE_BATCH: u32 = 100;
+const INTEGRATION_PRUNE_MAX_BATCHES: usize = 20;
+
 pub struct StorageMaintenanceWorker {
     db: Arc<SqliteDb>,
     last_step_prune: std::sync::Mutex<Option<tokio::time::Instant>>,
@@ -70,6 +75,7 @@ impl StorageMaintenanceWorker {
             if self.step_prune_due() {
                 self.prune_steps(shutdown).await?;
                 self.prune_check_history(shutdown).await?;
+                self.prune_integration_evidence(shutdown).await?;
             }
             db::incremental_vacuum(self.db.pool()).await?;
         }
@@ -153,6 +159,50 @@ impl StorageMaintenanceWorker {
     }
 }
 
+impl StorageMaintenanceWorker {
+    /// Empty the owner receipts and observations of merge attempts that
+    /// finished more than `server.check_retention_days` ago
+    /// (`db::IntegrationActivationRepo::prune_integration_evidence` holds
+    /// the rule for what may go: never a current attempt, an unsettled or
+    /// uncertain effect, an attempt of a Task that is merging again, or the
+    /// evidence of a quarantined queue). The attempt row stays: its states,
+    /// commits and timings are the queue's history, and a Review's
+    /// `integration_checks` and a settled Task's lineage name it by id.
+    /// Nothing is emptied when retention is zero.
+    async fn prune_integration_evidence(&self, shutdown: &watch::Receiver<bool>) -> Result<u64> {
+        let mut total = 0;
+        if self.check_retention_days == 0 {
+            return Ok(total);
+        }
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::days(i64::from(self.check_retention_days)))
+        .to_rfc3339();
+        for _ in 0..INTEGRATION_PRUNE_MAX_BATCHES {
+            if *shutdown.borrow() {
+                break;
+            }
+            let pruned = db::IntegrationActivationRepo::prune_integration_evidence(
+                &*self.db,
+                &cutoff,
+                INTEGRATION_PRUNE_BATCH,
+            )
+            .await?;
+            total += pruned;
+            if pruned < u64::from(INTEGRATION_PRUNE_BATCH) {
+                break;
+            }
+        }
+        if total != 0 {
+            tracing::info!(
+                attempts = total,
+                retention_days = self.check_retention_days,
+                "integration attempt receipts pruned"
+            );
+        }
+        Ok(total)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +258,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results, 1);
+    }
+
+    /// The same setting bounds the receipts of finished merge attempts: one
+    /// that finished before the cutoff is emptied on the hourly pass and its
+    /// row stays; a recent one, the Task's current attempt and one with an
+    /// unsettled effect are kept; zero keeps everything. Operations status
+    /// counts what is still stored.
+    #[tokio::test]
+    async fn merge_attempt_receipts_are_emptied_after_the_configured_days_and_rows_stay() {
+        use db::{IntegrationActivationRepo, IntegrationQueueRepo};
+        let db = database().await;
+        let old = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let recent = (chrono::Utc::now() - chrono::Duration::days(29)).to_rfc3339();
+        sqlx::raw_sql("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'); INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('r','p','repo','main','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');").execute(db.pool()).await.unwrap();
+        let queue = db.create_or_get_integration_queue("r", "main").await.unwrap();
+        const RECEIPTS: &str = "effect_receipts_json='[{\"kind\":\"rebase\"}]',operation_receipts_json='[{\"kind\":\"worker_park\"}]',observations_json='[{\"target\":\"a\"}]'";
+        for task in ["old", "recent", "current", "unsettled"] {
+            sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p',?,'merging','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+                .bind(task).bind(task).execute(db.pool()).await.unwrap();
+            let attempt = db
+                .admit_integration_attempt(db::IntegrationAttempt::new(
+                    Some(queue.id.clone()),
+                    task.into(),
+                    "p".into(),
+                    format!("admit:{task}:0"),
+                    "merging".into(),
+                    0,
+                    1,
+                ))
+                .await
+                .unwrap();
+            let finished = match task {
+                "current" => String::new(),
+                "unsettled" => format!(",state='cancelled',current=0,completed_at='{old}',effect_intent_json='{{\"kind\":\"merge\"}}'"),
+                "recent" => format!(",state='cancelled',current=0,completed_at='{recent}'"),
+                _ => format!(",state='cancelled',current=0,completed_at='{old}'"),
+            };
+            sqlx::query(&format!(
+                "UPDATE integration_attempt SET {RECEIPTS}{finished} WHERE id=?"
+            ))
+            .bind(&attempt.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let stored = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT task_ref FROM integration_attempt WHERE effect_receipts_json<>'[]' AND operation_receipts_json<>'[]' AND observations_json<>'[]' ORDER BY task_ref",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        let (_tx, rx) = watch::channel(false);
+        let forever = StorageMaintenanceWorker::new(Arc::clone(&db)).with_check_retention_days(0);
+        forever.maintain_once(&rx).await.unwrap();
+        assert_eq!(stored().await, ["current", "old", "recent", "unsettled"]);
+        assert_eq!(db.integration_evidence_retained().await.unwrap(), 3);
+        StorageMaintenanceWorker::new(Arc::clone(&db))
+            .maintain_once(&rx)
+            .await
+            .unwrap();
+        assert_eq!(stored().await, ["current", "recent", "unsettled"]);
+        // The finished rows are the queue's history: none is deleted.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_attempt")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 4);
+        assert_eq!(db.integration_evidence_retained().await.unwrap(), 2);
     }
 
     #[tokio::test]

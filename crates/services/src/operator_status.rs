@@ -545,6 +545,10 @@ impl OperatorStatusService {
             heads: integration_backlog(integration_ages.heads),
             parked: integration_backlog(integration_ages.parked),
             timings: integration_timing_status(&integration_samples),
+            finished_with_receipts: db::IntegrationActivationRepo::integration_evidence_retained(
+                &*self.db,
+            )
+            .await?,
         };
         let check_counts = self.db.check_run_counts().await?;
         let check_summary = self.db.check_operator_summary().await?;

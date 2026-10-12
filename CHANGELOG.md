@@ -2736,6 +2736,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Merge-queue receipts have a retention period.** The hourly storage pass
+  now empties the owner receipts and observations of merge attempts that
+  finished more than `server.check_retention_days` ago (default 30; `0`
+  keeps them). The attempt row stays, and a current attempt, an unsettled or
+  unknown effect, a Task that is merging again and a quarantined queue's
+  evidence are never touched. `GET /api/v1/operations/status` adds
+  `integration_queues.finished_with_receipts` (finished attempts whose
+  receipts are still stored); `IntegrationQueueStatus` in the generated
+  TypeScript types gains the field.
+
 - **Merge queue reads (3.2 stage D3a).** `GET
   /api/v1/repos/{id}/integration-queues` lists a repository's merge queues,
   one per target branch (`items`, opaque `cursor`, `has_more`): the queue's

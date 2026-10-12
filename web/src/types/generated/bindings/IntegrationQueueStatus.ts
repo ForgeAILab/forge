@@ -17,4 +17,14 @@ heads: IntegrationBacklog,
 /**
  * Members whose merge stopped, aged from when it did.
  */
-parked: IntegrationBacklog, timings: IntegrationTimingStatus, };
+parked: IntegrationBacklog, timings: IntegrationTimingStatus, 
+/**
+ * Finished merge attempts whose owner receipts and observations are
+ * still stored. The hourly retention pass empties them once the attempt
+ * finished more than `server.check_retention_days` ago (`0` keeps them);
+ * it never touches a current attempt, an unsettled effect or the
+ * evidence of a quarantined queue, and it deletes no attempt row. A
+ * number that keeps growing past the retention period means the pass is
+ * not running or a guard holds the rows.
+ */
+finished_with_receipts: number, };
