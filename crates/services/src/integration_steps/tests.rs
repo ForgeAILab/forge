@@ -3714,9 +3714,34 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
         let row: String = sqlx::query_scalar("SELECT step_results_json FROM review WHERE task_id='evidence' ORDER BY attempt_number DESC LIMIT 1")
             .fetch_one(world.db.pool()).await.unwrap();
         let details: Value = serde_json::from_str(&row).unwrap();
+        let merged = world.attempt(&admitted.id).await;
         let evidence = &details["execution"]["integration_checks"][0];
         // What the step wrote is what the reviews endpoint parses.
         let typed: api_types::ReviewDetails = serde_json::from_str(&row).unwrap();
+        if typed.execution.is_none() {
+            let reviews: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT id,status,step_results_json FROM review WHERE task_id='evidence' ORDER BY attempt_number",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            let consumers: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT origin,request_key,run_id,result_id,cancelled_at FROM check_consumer WHERE task_id='evidence' ORDER BY created_at",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            let steps: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+                "SELECT kind,status,last_error,attempts FROM task_step WHERE task_id='evidence' ORDER BY created_at",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            panic!(
+                "moved={moved}: no head-check evidence\nreviews {reviews:?}\nconsumers {consumers:?}\nsteps {steps:?}\nattempt ack {:?} timings {:?}",
+                merged.effect_ack_json, merged.phase_timings
+            );
+        }
         assert_eq!(typed.execution.unwrap().integration_checks.len(), 1);
         // No wait was stated for the synchronous reuse and none is left.
         let reviews: i64 = world
@@ -3725,7 +3750,6 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
         assert_eq!(reviews, 1, "a head check never creates a Review");
         assert_eq!(evidence["attempt_id"], admitted.id);
         assert!(!evidence["ci_steps"].as_array().unwrap().is_empty());
-        let merged = world.attempt(&admitted.id).await;
         assert_eq!(
             evidence["commit_sha"].as_str(),
             merged.integrated_sha.as_deref()
