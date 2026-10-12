@@ -25,16 +25,18 @@ import sys
 # filters), unit-b skips every one of them (libtest ANDs --skip), so no test is
 # lost or run twice.
 # The last CI runs with `task_service::` alone took about 390s (408 tests) and
-# 475s (1813 tests). unit-a cannot go below one serial test,
-# task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix:
-# locally at 3cd105cb with four threads it took 281.4s of the 284.1s that
-# `task_service::` alone needed, so three of unit-a's four threads were mostly
-# idle. The two modules added here fill them (per-test sums of a six-thread run
-# of all 2169 tests: 628s / 1555s before, 1123s / 1060s now). Measured locally
-# with four threads: 299.4s (627 tests) / 208.6s (1542 tests); with
-# `task_dispatcher::` alone added, 280.7s / 363.4s. Scaled from the CI figures
-# that predicts about 410s / 300s. Test counts alone would mislead the split,
-# and a third unit shard would not lower the longest one below that test.
+# 475s (1813 tests). `task_dispatcher::` and `workspace_root::` were added
+# when unit-a was bounded by one serial test,
+# task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix
+# (about 300s on one thread, three threads mostly idle). That test and the
+# other serial loops are now parallel cases (longest case about 25s), and a
+# shard's wall time is its summed per-test time over four threads again.
+# Measured locally with four threads, one run each on a shared machine:
+# 348s / 198s before the split, 176s (689 tests) / 204s (1542 tests) after.
+# Per-test sums of one four-thread run of all 2231 tests (411s): 793s / 847s.
+# No module moves that closer: `usage_projection::` (60s) gives 853s / 788s,
+# and the smaller ones change less than a run varies. What bounds unit-b is
+# the `integration_steps::` and `integration_worker::` modules (515s).
 SERVICES_UNIT_FILTERS = ["task_service::", "task_dispatcher::", "workspace_root::"]
 SERVICES_UNIT_A = ["-p", "services", "--lib", "--", *SERVICES_UNIT_FILTERS]
 SERVICES_UNIT_B = ["-p", "services", "--lib", "--",

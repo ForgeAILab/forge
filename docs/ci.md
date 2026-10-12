@@ -462,6 +462,43 @@ Scaled from the CI figures this predicts about 410 s / 300 s, against
 test, which is also why a third unit shard would not lower it; splitting or
 speeding up that test is the next step. Confirm with the first CI run.
 
+That test is now split, with the other serial loops over independent cases.
+Each old test name is a module, so it still selects all of its cases as a
+libtest filter, and each case has its own database or install:
+
+| Old test | Cases | Old time | Longest case |
+| --- | --- | --- | --- |
+| `task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix` | 27, one per failure kind | 306.7 s | 23.5 s |
+| `workspace_root::migrate::tests::a_crash_at_any_step_of_a_copy_move_is_finished_by_a_rerun` | 6, by step index (44 steps) | 152.9 s | 22.8 s |
+| `workspace_root::migrate::tests::a_crash_at_any_step_of_a_rename_move_is_finished_by_a_rerun` | 6, by step index (26 steps) | 99.1 s | 11.7 s |
+| `task_service::tests::task_actions::every_offer_applies_and_every_absent_verb_returns_current_offers` | 9, one per state | 42.1 s | 3.2 s |
+| `task_dispatcher::tests::equivalence::scheduler_equivalence_shapes_steady` | 8, by shape index | 40.7 s | 5.3 s |
+| `task_dispatcher::tests::equivalence::scheduler_equivalence_shapes_startup` | 8, by shape index | 40.7 s | 5.4 s |
+
+Times are from one run of each unit shard with four threads before and after
+(`--report-time`), on a shared machine; the services lib went from 2169 to
+2231 tests (58 more cases and four tests that prove each set of cases covers
+what the old loop did). The matrix cases write
+`db-matrix.parts/<nn>-<kind>.txt` and rebuild the combined `db-matrix.txt` in
+the evidence directory (`FORGE_TASK_ACTION_EVIDENCE_DIR`, else
+`$TMPDIR/forge-task-actions`); a filtered run ends it with a `MATRIX_PARTIAL`
+line. Sorted, the combined file is identical to the unsplit test's, with the
+same totals (745 snapshots, 1877 accepted, 1815 applied, 62 restored).
+
+| | unit-a | unit-b |
+| --- | --- | --- |
+| before the split (`2e75beaf`) | 348.3 s, 627 tests | 197.9 s, 1542 tests |
+| after the split | 175.8 s, 689 tests | 203.6 s, 1542 tests |
+
+The filter pair is unchanged. A shard's wall time is again its summed per-test
+time over four threads (700.9 s / 811.5 s in those two runs). In one
+four-thread run of all 2231 tests (410.8 s) the sums were 793 s / 847 s;
+moving `usage_projection::` (60 s) to unit-a gives 853 s / 788 s, which is no
+closer, and one run of that pair measured 203.8 s / 238.0 s under a heavier
+load. Smaller modules move less than a run varies. unit-b is now bounded by
+`integration_steps::` and `integration_worker::` (515 s of its 847 s), whose
+longest tests are single scenarios of 25 to 70 s.
+
 The history of the earlier split follows. The green CI run
 [38219902459](https://github.com/ForgeAILab/forge/actions/runs/38219902459)
 recorded 508.55 seconds for services lib tests. Inferring start times from
