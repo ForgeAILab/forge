@@ -125,6 +125,10 @@ impl IntegrationStepPort for TaskStepIntegrationPort {
         Ok(())
     }
 
+    async fn continue_queued_imports(&self) -> Result<u32> {
+        super::import::enqueue_missing_continuations(&self.db, true).await
+    }
+
     async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState> {
         let status: Option<String> =
             sqlx::query_scalar("SELECT status FROM task_step WHERE task_id=? AND causation_key=?")

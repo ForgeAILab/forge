@@ -61,7 +61,7 @@ pub struct ImportReport {
 
 /// Current attempts nothing has continued yet: imported rows and shadow
 /// rows, of Tasks that still exist, without their continuation step.
-const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
+const UNCONTINUED: &str = "SELECT a.id,a.state FROM integration_attempt a \
     WHERE a.current=1 AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
       AND EXISTS(SELECT 1 FROM task t WHERE t.id=a.task_ref AND t.deleted_at IS NULL) \
       AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref \
@@ -118,22 +118,39 @@ pub async fn import_at_start(db: &Arc<SqliteDb>) -> Result<ImportReport> {
             break;
         }
     }
-    let ids: Vec<String> = sqlx::query_scalar(UNCONTINUED)
+    report.continuations = enqueue_missing_continuations(db, false).await?;
+    Ok(report)
+}
+
+/// Enqueue the continuation step of every current pre-queue attempt that has
+/// none. `queued_only`: only of `queued` attempts, the rows whose claim
+/// waits for a settled continuation (`claimable_member`). The queue worker's
+/// sweep asks that way, so a row whose settled step was pruned is continued
+/// again without a restart and history rows get no new step.
+pub(crate) async fn enqueue_missing_continuations(
+    db: &Arc<SqliteDb>,
+    queued_only: bool,
+) -> Result<u32> {
+    let ids: Vec<(String, String)> = sqlx::query_as(UNCONTINUED)
         .fetch_all(db.pool())
         .await
         .map_err(db::DbError::from)?;
-    for id in ids {
+    let mut enqueued = 0;
+    for (id, state) in ids {
+        if queued_only && state != "queued" {
+            continue;
+        }
         match enqueue_continuation(db, &id).await {
-            Ok(true) => report.continuations += 1,
+            Ok(true) => enqueued += 1,
             Ok(false) => {}
-            // One unreadable row must not stop the others; the next start
-            // lists it again.
+            // One unreadable row must not stop the others; the next sweep
+            // or start lists it again.
             Err(error) => {
                 tracing::warn!(target: "services::integration_steps", attempt_id = %id, %error, "integration import continuation was not enqueued");
             }
         }
     }
-    Ok(report)
+    Ok(enqueued)
 }
 
 async fn enqueue_continuation(db: &Arc<SqliteDb>, attempt_id: &str) -> Result<bool> {

@@ -198,6 +198,12 @@ pub trait IntegrationStepPort: Send + Sync {
     /// worker reads it while it waits for an acknowledgment, so a step that
     /// can never answer is asked again instead of waited out.
     async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState>;
+    /// Enqueue the import continuation of every `queued` pre-queue attempt
+    /// that has none (its settled step was pruned): such a row is claimable
+    /// only once a continuation has settled. Returns how many were enqueued.
+    async fn continue_queued_imports(&self) -> Result<u32> {
+        Ok(0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

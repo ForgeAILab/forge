@@ -2481,3 +2481,46 @@ async fn an_imported_landed_row_whose_proof_fails_parks_for_its_owner_after_a_bo
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
+
+/// A pre-queue `queued` attempt is claimable only once its import
+/// continuation has settled. When that settled step is gone (step retention
+/// pruned it) the row used to wait for the next start to enqueue the
+/// continuation again. The queue worker's sweep now enqueues it, so the Task
+/// merges without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_pre_queue_queued_row_without_its_continuation_step_is_continued_by_the_worker() {
+    let world = World::new().await;
+    let a = world.reconciled("pruned", "pruned.txt").await;
+    // The row as the importer left it: bound, `queued`, and with no
+    // continuation step in the Task's step queue any more.
+    world
+        .set(
+            &a.id,
+            "import_source_json='{\"version\":1,\"priority\":10}'",
+        )
+        .await;
+    let key = format!("integration-import:{}", a.id);
+    let continuations = || async {
+        world
+            .db
+            .task_steps("pruned")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.causation_key == key)
+            .count()
+    };
+    assert_eq!(continuations().await, 0);
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .until("pruned", "the Task merges without a restart", || async {
+            world.task("pruned").await.status == "done"
+        })
+        .await;
+    assert_eq!(continuations().await, 1, "one continuation, enqueued once");
+    assert_eq!(world.merges("pruned").await, 1);
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
