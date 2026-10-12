@@ -214,6 +214,74 @@ impl CoordinationToolProvider {
             tracing::warn!(operation, %error, "denied proposal was not recorded");
         }
     }
+    pub(super) async fn try_project_command_replay(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: &Value,
+    ) -> Result<Option<Value>, AgentHostError> {
+        let Some(spec) = CATALOG.lookup(operation) else {
+            return Ok(None);
+        };
+        if spec.receipt_replay && arguments["payload"]["action"] != "capture" {
+            let Some(key) = arguments
+                .get("dedupe_key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return Ok(None);
+            };
+            let Some(correlation) = arguments
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return Ok(None);
+            };
+            if !arguments["payload"].is_object() {
+                return Ok(None);
+            }
+            let target = self
+                .authorization
+                .direct_project_target(scope)
+                .await
+                .map_err(native_scope_error)?;
+            let replay_input = ExecuteDirectProjectCommandInput {
+                actor_identity_id: actor.to_owned(),
+                scope_type: scope_type_name(scope.scope_type).to_owned(),
+                scope_id: scope.scope_id.clone(),
+                project_id: target,
+                operation: operation.to_owned(),
+                payload: arguments["payload"].clone(),
+                idempotency_key: key.to_owned(),
+                correlation_id: correlation.to_owned(),
+                causation_id: arguments
+                    .get("causation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                causation_depth: arguments
+                    .get("causation_depth")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                requested_permission: spec
+                    .authority
+                    .permission(scope_type_name(scope.scope_type))
+                    .unwrap_or_default()
+                    .to_owned(),
+            };
+            if let Some(result) = self
+                .project_actions
+                .replay_direct_input(&replay_input)
+                .await
+                .map_err(service_error)?
+            {
+                return Ok(Some(direct_project_command_value(result)));
+            }
+        }
+        Ok(None)
+    }
+
     // Independently captured caller, scope/session, operation/envelope and
     // prepared/admission facts mirror the public provider boundary.
     #[allow(clippy::too_many_arguments)]
@@ -227,6 +295,12 @@ impl CoordinationToolProvider {
         prepared: bool,
         admitted_authority: Option<&operation_registry::authority::EffectiveAuthority>,
     ) -> Result<Value, AgentHostError> {
+        if let Some(result) = self
+            .try_project_command_replay(actor, scope, operation, &arguments)
+            .await?
+        {
+            return Ok(result);
+        }
         // Current authority precedes every payload diagnostic. Stored preparations
         // keep their exact arguments; only fresh calls consult the current spec.
         let resolved;

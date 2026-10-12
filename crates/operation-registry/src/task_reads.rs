@@ -152,7 +152,8 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             "",
             &[StructuralConstraint::ClosedObject],
             |c, i| Box::pin(c.memory_read(i)),
-        ),
+        )
+        .outside_inquiry(),
         OperationSpec::typed(
             "decisions.read",
             MEMORY,
@@ -163,6 +164,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             "",
             &[StructuralConstraint::ClosedObject],
             |c, i| Box::pin(c.decisions_read(i)),
-        ),
+        )
+        .outside_inquiry(),
     ]
 }

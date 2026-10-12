@@ -7,7 +7,7 @@ use forge_agent_host::PROJECT_REVIEW_CONFIG_OPERATION;
 use operation_registry::{legacy_proposals as legacy, project_proposals as project};
 
 impl Context<'_> {
-    async fn project_command(&self, operation: &str) -> Result<Value, AgentHostError> {
+    pub(super) async fn project_command(&self, operation: &str) -> Result<Value, AgentHostError> {
         let arguments = self.proposal_arguments.expect("proposal envelope");
         let spec = registered_proposals::CATALOG
             .lookup(operation)
@@ -139,5 +139,47 @@ impl legacy::LegacyProposalContext<AgentHostError> for Context<'_> {
     }
     async fn pending_session(&self, _: legacy::Session) -> Result<Value, AgentHostError> {
         self.pending("session.action").await
+    }
+}
+
+#[async_trait]
+impl operation_registry::project_commands::ProjectCommandContext<AgentHostError> for Context<'_> {
+    async fn charter_adoption(
+        &self,
+        _: operation_registry::project_commands::CharterAdoption,
+    ) -> Result<Value, AgentHostError> {
+        self.project_command(PROJECT_CHARTER_ADOPTION_OPERATION)
+            .await
+    }
+    async fn project_evidence(
+        &self,
+        _: operation_registry::project_commands::Evidence,
+    ) -> Result<Value, AgentHostError> {
+        let arguments = self.proposal_arguments.expect("evidence envelope");
+        if arguments["payload"]["action"] == "capture" {
+            let mut envelope = arguments.clone();
+            envelope["payload"] = self
+                .provider
+                .capture_project_evidence_asset(
+                    self.actor_identity_id,
+                    self.scope,
+                    arguments["payload"].clone(),
+                    arguments,
+                )
+                .await?;
+            let context = Context {
+                proposal_arguments: Some(&envelope),
+                ..*self
+            };
+            context.project_command(PROJECT_EVIDENCE_OPERATION).await
+        } else {
+            self.project_command(PROJECT_EVIDENCE_OPERATION).await
+        }
+    }
+    async fn readiness(
+        &self,
+        _: operation_registry::project_commands::Readiness,
+    ) -> Result<Value, AgentHostError> {
+        self.project_command(PROJECT_READINESS_OPERATION).await
     }
 }

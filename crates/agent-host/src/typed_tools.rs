@@ -207,6 +207,19 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
 
+    /// Retrieve an exact committed response without authorizing a fresh effect.
+    /// The domain service must verify principal, scope, operation, key and digest.
+    async fn replay_proposal(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: &Value,
+    ) -> Result<Option<Value>, AgentHostError> {
+        let _ = (actor, scope, operation, arguments);
+        Ok(None)
+    }
+
     /// Check current Main proposal authority before revealing payload contracts.
     async fn proposal_denial(
         &self,
@@ -1434,103 +1447,51 @@ fn non_task_operations(
     project_agent_chat: bool,
     project_charter_setup_required: bool,
 ) -> (Vec<String>, Vec<String>) {
-    match scope_type {
-        CanonicalScopeType::Account => (
-            vec![
-                "account.summary".to_owned(),
-                // Main/account reads are bounded projections.  They do not
-                // expose another Agent Chat's history or private memory.
-                "discovery.read".to_owned(),
-                "portfolio.read".to_owned(),
-                "inbox.read".to_owned(),
-                "commitments.read".to_owned(),
-                "delivery.read".to_owned(),
-            ],
-            // Main/account mutation authority is exposed only through the
-            // typed orchestration surface below. Public research is a
-            // separate direct read-only tool when configured.
-            Vec::new(),
-        ),
-        CanonicalScopeType::Project => {
-            let reads = vec![
-                "project.summary".to_owned(),
-                "work.read".to_owned(),
-                "decisions.read".to_owned(),
-                "events.read".to_owned(),
-                "memory.read".to_owned(),
-                "inbox.read".to_owned(),
-                "commitments.read".to_owned(),
-                "delivery.read".to_owned(),
-            ];
-            let mut proposals = if project_charter_setup_required {
-                // Legacy setup is intentionally limited to conversation. The
-                // typed adoption operation is exposed separately below.
-                vec!["message.send".to_owned()]
-            } else {
-                vec![
-                    "message.send".to_owned(),
-                    "commitment.update".to_owned(),
-                    "memory.publish".to_owned(),
-                    "memory.supersede".to_owned(),
-                    "review.request".to_owned(),
-                    "session.action".to_owned(),
-                ]
-            };
-            proposals.extend(operation_names_for_surface(
-                OperationSurface::Coordination,
-                project_charter_setup_required,
-                OperationExposure::GenericProposal,
-            ));
-            (reads, proposals)
-        }
-        CanonicalScopeType::AgentChat => {
-            let mut reads = vec![
-                "agent_chat.summary".to_owned(),
-                "events.read".to_owned(),
-                "decisions.read".to_owned(),
-                "memory.read".to_owned(),
-                "inbox.read".to_owned(),
-                "commitments.read".to_owned(),
-                "delivery.read".to_owned(),
-            ];
-            let mut operations = Vec::new();
-            if project_agent_chat {
-                // A Project Agent proposes this Project's Tasks, so it must be
-                // able to enumerate them. Without this read it saw only
-                // aggregate counts and re-created work it had already created.
-                reads.push("work.read".to_owned());
-                if project_charter_setup_required {
-                    operations.push("message.send".to_owned());
-                } else {
-                    operations.extend([
-                        "message.send".to_owned(),
-                        "commitment.update".to_owned(),
-                        "memory.publish".to_owned(),
-                        "memory.supersede".to_owned(),
-                        "session.action".to_owned(),
-                    ]);
-                }
-                operations.extend(operation_names_for_surface(
-                    OperationSurface::Coordination,
-                    project_charter_setup_required,
-                    OperationExposure::GenericProposal,
-                ));
-            } else {
-                // A Main Chat receives the global portfolio/discovery
-                // surface.  Message, memory, commitment, session,
-                // lifecycle, and handoff mutations are deliberately absent:
-                // Main mutations use the typed Charter/create contract and
-                // Project creation atomically delivers the bounded handoff.
-                reads.extend([
-                    "discovery.read".to_owned(),
-                    "portfolio.read".to_owned(),
-                    "project.summary".to_owned(),
-                ]);
-            }
-            (reads, operations)
-        }
-        CanonicalScopeType::Task => (Vec::new(), Vec::new()),
+    let project_chat = ProjectChatToolContext {
+        is_project_agent_chat: project_agent_chat,
+        charter_setup_required: project_charter_setup_required,
+    };
+    let permissions = operation_registry::READ_CATALOG
+        .iter()
+        .chain(operation_registry::PROPOSAL_CATALOG.iter())
+        .flat_map(|spec| {
+            spec.authority
+                .permissions
+                .iter()
+                .map(|(_, permission)| (*permission).to_owned())
+        })
+        .collect();
+    if scope_type == CanonicalScopeType::Task {
+        return (Vec::new(), Vec::new());
     }
+    let names = |catalog: &operation_registry::OperationCatalog<std::convert::Infallible>,
+                 aggregate| {
+        catalog
+            .iter()
+            .filter(|spec| {
+                spec.surfaces
+                    .iter()
+                    .any(|surface| surface.native_aggregate == aggregate)
+            })
+            .map(|spec| spec.id.to_owned())
+            .collect::<Vec<_>>()
+    };
+    (
+        filter_operations(
+            scope_type,
+            &names(&operation_registry::READ_CATALOG, "forge_scope_read"),
+            &permissions,
+            project_chat,
+            None,
+        ),
+        filter_operations(
+            scope_type,
+            &names(&operation_registry::PROPOSAL_CATALOG, "forge_scope_propose"),
+            &permissions,
+            project_chat,
+            None,
+        ),
+    )
 }
 
 fn public_search_scope(
@@ -2258,34 +2219,12 @@ impl ForgeScopeProposeTool {
         let schema = if self.reject_authority_overrides {
             portable_const_schema(orchestration_proposal_schema(&self.operations))
         } else {
-            let registered = self
-                .operations
-                .iter()
-                .any(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some());
-            let mut payload_property = if registered {
-                json!({"type":"object"})
-            } else {
-                json!({"type":["object","null"]})
-            };
+            let mut payload_property = json!({"type":"object"});
             let guidance = coordination_payload_guidance(&self.operations);
             if !guidance.is_empty() {
                 payload_property["description"] = json!(guidance);
             }
             let payload_properties = coordination_payload_properties(&self.operations);
-            // Hand operations on this tool still need their payload fields
-            // declared: a provider that only surfaces declared properties
-            // strips the rest. Registered operations rely on their generated
-            // contract line and the flat aliases, so their fields are not
-            // repeated inside `payload`.
-            let hand_operations = self
-                .operations
-                .iter()
-                .filter(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_none())
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if let Some(properties) = coordination_payload_properties(&hand_operations) {
-                payload_property["properties"] = properties;
-            }
             let mut schema = json!({
                 "type": "object",
                 "required": ["operation", "payload", "dedupe_key", "correlation_id"],
@@ -2303,11 +2242,6 @@ impl ForgeScopeProposeTool {
                 },
                 "additionalProperties": false
             });
-            if !registered {
-                for field in ["dedupe_key", "correlation_id"] {
-                    schema["properties"][field]["type"] = json!(["string", "null"]);
-                }
-            }
             // Provider-friendly aliases. Normalization removes these and builds
             // the canonical payload object, so the service boundary still
             // sees exactly one envelope shape.
@@ -2362,7 +2296,16 @@ impl Tool for ForgeScopeProposeTool {
             ));
         }
         let registered = operation_registry::PROPOSAL_CATALOG.lookup(operation);
-        if registered.is_some() {
+        let replay = if registered.is_some_and(|spec| spec.receipt_replay) {
+            self.provider
+                .replay_proposal(&self.actor_identity_id, &self.scope, operation, &arguments)
+                .await
+                .map_err(host_error_to_runtime)?
+                .is_some()
+        } else {
+            false
+        };
+        if !replay && registered.is_some() {
             if let Err(error) = self
                 .provider
                 .proposal_denial(&self.actor_identity_id, &self.scope, operation)
@@ -2378,7 +2321,7 @@ impl Tool for ForgeScopeProposeTool {
                 );
             }
         }
-        if registered.is_some() {
+        if !replay && registered.is_some() {
             // Preparation refuses everything the registered dispatch guard
             // refuses, so a call never prepares and then fails at dispatch.
             reject_authority_overrides(&arguments)?;
@@ -2386,8 +2329,9 @@ impl Tool for ForgeScopeProposeTool {
                 return Err(authority_override_refusal());
             }
         }
-        if operation == MAIN_CHARTER_DRAFT_OPERATION
-            || operation == PROJECT_CHARTER_ADOPTION_OPERATION
+        if !replay
+            && (operation == MAIN_CHARTER_DRAFT_OPERATION
+                || operation == PROJECT_CHARTER_ADOPTION_OPERATION)
         {
             // The server renders the canonical Charter view itself; a
             // model-supplied render can never match it byte-for-byte, so
@@ -2402,13 +2346,13 @@ impl Tool for ForgeScopeProposeTool {
                 return Err(RuntimeError::tool(format!("{field} cannot be empty")));
             }
         }
-        if self.reject_authority_overrides || registered.is_some() {
+        if !replay && (self.reject_authority_overrides || registered.is_some()) {
             if registered.is_none() {
                 reject_authority_overrides(&arguments)?;
             }
             validate_orchestration_proposal_arguments(operation, &arguments)?;
         }
-        if let Some(spec) = registered {
+        if let Some(spec) = registered.filter(|_| !replay) {
             arguments["payload"] = spec
                 .normalize_arguments(&arguments["payload"])
                 .map_err(RuntimeError::tool)?;
@@ -3947,10 +3891,19 @@ mod tests {
             missing.as_object_mut().unwrap().remove(field);
             for arguments in [missing.clone(), json!({"parameters": missing})] {
                 let normalized = tool.normalize_arguments(arguments).unwrap();
-                assert!(
-                    !validator.is_valid(&normalized),
-                    "missing {field} must fail schema validation"
-                );
+                if field == "payload" {
+                    assert!(
+                        tool.prepare(normalized, &test_preparation_context("missing-payload"))
+                            .await
+                            .is_err(),
+                        "the registry refuses the empty payload's missing fields"
+                    );
+                } else {
+                    assert!(
+                        !validator.is_valid(&normalized),
+                        "missing {field} must fail schema validation"
+                    );
+                }
             }
         }
         // The envelope carries the same shape, not a looser one: a wrong type
@@ -3985,16 +3938,15 @@ mod tests {
             .await
             .expect_err("an enveloped call missing dedupe_key is refused in prepare");
         assert!(refused.to_string().contains("dedupe_key"), "{refused}");
-        // The schema declares `dedupe_key` nullable, so an explicit null
-        // passes validation and `prepare` is the only guard.
+        // The generated envelope and preparation both refuse a null idempotency key.
         let mut null_dedupe = plain.clone();
         null_dedupe["dedupe_key"] = Value::Null;
         let null_dedupe = tool
             .normalize_arguments(json!({"parameters": null_dedupe}))
             .unwrap();
         assert!(
-            validator.is_valid(&null_dedupe),
-            "the retained readiness hand envelope remains nullable"
+            !validator.is_valid(&null_dedupe),
+            "the registry envelope requires a non-null idempotency key"
         );
         let refused = tool
             .prepare(null_dedupe, &test_preparation_context("envelope"))
@@ -4992,8 +4944,8 @@ mod tests {
             "integer"
         );
         assert_eq!(
-            evidence["properties"]["expected_milestone_version"]["minimum"],
-            1
+            evidence["properties"]["expected_milestone_version"]["minimum"].as_f64(),
+            Some(1.0)
         );
         let release = orchestration_payload_schema(PROJECT_RELEASE_OPERATION);
         assert_eq!(

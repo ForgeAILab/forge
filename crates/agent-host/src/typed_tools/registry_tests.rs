@@ -39,6 +39,10 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("memory.supersede", "PC", true),
         ("review.request", "P", true),
         ("session.action", "PC", true),
+        ("project.summary", "MP", false),
+        ("project.charter.adoption", "PC", false),
+        ("project.evidence", "PC", true),
+        ("project.readiness", "PC", true),
         ("task.summary", "T", false),
         ("task.plan", "T", false),
         ("task.worklog", "T", false),
@@ -52,8 +56,8 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("inbox.read", "AMPCT", false),
         ("commitments.read", "AMPCT", false),
         ("delivery.read", "AMPCT", false),
-        ("memory.read", "AMPCT", false),
-        ("decisions.read", "AMPCT", false),
+        ("memory.read", "MPCT", false),
+        ("decisions.read", "MPCT", false),
     ];
     let specs = READ_CATALOG
         .iter()
@@ -415,7 +419,7 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
         .split("pub(crate) fn portable_const_schema")
         .next()
         .unwrap();
-    assert!(payloads.contains("PROJECT_CHARTER_ADOPTION_OPERATION =>"));
+    assert!(!payloads.contains("PROJECT_CHARTER_ADOPTION_OPERATION =>"));
     assert!(!payloads.contains("MAIN_CHARTER_DRAFT_OPERATION =>"));
     let validators = include_str!("../typed_tools.rs")
         .split("fn validate_orchestration_read_arguments")

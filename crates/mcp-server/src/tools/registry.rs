@@ -2,8 +2,8 @@
 use super::handlers;
 use crate::{error::McpToolError, protocol::McpContext, state::AppState};
 use db::{
-    AgentChatRepo, AgentHandoffRepo, AgentRepo, AgentSessionRepo, ProjectMemberRepo, ProjectRepo,
-    UserRepo,
+    AgentChatRepo, AgentHandoffRepo, AgentRepo, AgentSessionRepo, ExecutionRepo, ProjectMemberRepo,
+    ProjectRepo, TaskRepo, UserRepo,
 };
 use operation_registry::{
     authority::{
@@ -187,21 +187,25 @@ pub(crate) async fn authorize_resource(
     let user_id = context.user_id.as_deref().unwrap_or_default();
     let mut authority = mcp_authority(user_id, context.project_id.as_deref());
     if let Some(rule) = &spec.field_authority {
-        if arguments
-            .get(rule.field)
-            .is_some_and(|value| !value.is_null())
-        {
-            if UserRepo::get_user_by_id(&*state.db, user_id)
-                .await?
-                .is_some_and(|user| user.is_admin)
-            {
-                authority.ceiling.insert(rule.permission.into());
+        if rule.applies(arguments) {
+            if rule.permission == "mcp_account_admin" {
+                if UserRepo::get_user_by_id(&*state.db, user_id)
+                    .await?
+                    .is_some_and(|user| user.is_admin)
+                {
+                    authority.ceiling.insert(rule.permission.into());
+                }
+            } else if let Some(project_id) = arguments.get("project_id").and_then(Value::as_str) {
+                load_project_facts(state, &mut authority, project_id, user_id).await?;
             }
             authority.evaluate(rule).map_err(|_| {
                 McpToolError::new(-32003, rule.denial_message)
                     .with_data(json!({"code":rule.denial_code}))
             })?;
         }
+    }
+    if let Some(reference) = spec.agent_reference {
+        authorize_agent_reference(state, reference, arguments, context).await?;
     }
     let get = |field: &str| arguments.get(field).and_then(Value::as_str);
     match spec.resource {
@@ -295,108 +299,350 @@ pub(crate) async fn authorize_resource(
     Ok(())
 }
 
+pub(super) async fn require_usable_agent(
+    state: &AppState,
+    project_id: &str,
+    agent_id: &str,
+    context: &McpContext,
+) -> Result<(), McpToolError> {
+    let user_id = context.user_id.as_deref().unwrap_or_default();
+    if state
+        .db
+        .list_agents_usable_in_project(project_id, user_id)
+        .await?
+        .iter()
+        .any(|agent| agent.id == agent_id)
+    {
+        Ok(())
+    } else {
+        Err(McpToolError::not_found("agent", agent_id.to_owned()))
+    }
+}
+pub(super) async fn require_task_agent(
+    state: &AppState,
+    task_id: &str,
+    agent_id: &str,
+    context: &McpContext,
+) -> Result<(), McpToolError> {
+    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
+    require_usable_agent(state, &task.project_id, agent_id, context).await
+}
+async fn authorize_agent_reference(
+    state: &AppState,
+    reference: operation_registry::mcp::AgentReference,
+    arguments: &Value,
+    context: &McpContext,
+) -> Result<(), McpToolError> {
+    use operation_registry::mcp::AgentReference;
+    let get = |field| arguments.get(field).and_then(Value::as_str);
+    match reference {
+        AgentReference::Task { task, agent } => {
+            if let (Some(task), Some(agent)) = (get(task), get(agent)) {
+                require_task_agent(state, task, agent, context).await?;
+            }
+        }
+        AgentReference::SubTasks {
+            parent,
+            items,
+            agent,
+        } => {
+            if let Some(parent) = get(parent) {
+                for child in arguments
+                    .get(items)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(agent) = child.get(agent).and_then(Value::as_str) {
+                        require_task_agent(state, parent, agent, context).await?;
+                    }
+                }
+            }
+        }
+        AgentReference::Execution { execution, agent } => {
+            if let (Some(execution), Some(agent)) = (get(execution), get(agent)) {
+                let execution = ExecutionRepo::get_by_id(&*state.db, execution)
+                    .await?
+                    .ok_or_else(|| McpToolError::not_found("execution", execution.to_owned()))?;
+                require_task_agent(state, &execution.task_id, agent, context).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct HandlerContext<'a> {
+    state: &'a AppState,
+    context: &'a McpContext,
+}
+#[async_trait::async_trait]
+impl operation_registry::mcp::McpHandlerContext<McpToolError> for HandlerContext<'_> {
+    async fn project_escalate(
+        &self,
+        params: operation_registry::mcp::ProjectEscalateParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_project_escalate(self.state, params, self.context).await
+    }
+    async fn update_project_lifecycle_hooks(
+        &self,
+        params: operation_registry::mcp::UpdateProjectLifecycleHooksParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_update_project_lifecycle_hooks(self.state, params, self.context).await
+    }
+    async fn update_project(
+        &self,
+        params: operation_registry::mcp::UpdateProjectParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_update_project(self.state, params, self.context).await
+    }
+    async fn get_project(
+        &self,
+        params: operation_registry::mcp::GetProjectParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_project(self.state, params).await
+    }
+    async fn follow_up_execution(
+        &self,
+        params: operation_registry::mcp::FollowUpExecutionParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_follow_up_execution(self.state, params, self.context).await
+    }
+    async fn reorder_sub_tasks(
+        &self,
+        params: operation_registry::mcp::ReorderSubTasksParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_reorder_sub_tasks(self.state, params).await
+    }
+    async fn create_sub_tasks(
+        &self,
+        params: operation_registry::mcp::CreateSubTasksParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_create_sub_tasks(self.state, params, self.context).await
+    }
+    async fn remove_task_dependency(
+        &self,
+        params: operation_registry::mcp::RemoveTaskDependencyParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_remove_task_dependency(self.state, params).await
+    }
+    async fn add_task_dependency(
+        &self,
+        params: operation_registry::mcp::AddTaskDependencyParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_add_task_dependency(self.state, params).await
+    }
+    async fn transition_task(
+        &self,
+        params: operation_registry::mcp::TransitionTaskParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_transition_task(self.state, params, self.context).await
+    }
+    async fn update_task(
+        &self,
+        params: operation_registry::mcp::UpdateTaskParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_update_task(self.state, params).await
+    }
+    async fn task_action(
+        &self,
+        params: operation_registry::mcp::TaskActionParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::task_action(self.state, params, self.context).await
+    }
+    async fn assign_agent(
+        &self,
+        params: operation_registry::mcp::AssignAgentParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_assign_agent(self.state, params, self.context).await
+    }
+    async fn create_task(
+        &self,
+        params: operation_registry::mcp::CreateTaskParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_create_task(self.state, params).await
+    }
+    async fn list_sub_tasks(
+        &self,
+        params: operation_registry::mcp::ListSubTasksParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_sub_tasks(self.state, params).await
+    }
+    async fn list_task_dependents(
+        &self,
+        params: operation_registry::mcp::ListTaskDependenciesParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_task_dependents(self.state, params).await
+    }
+    async fn list_task_dependencies(
+        &self,
+        params: operation_registry::mcp::ListTaskDependenciesParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_task_dependencies(self.state, params).await
+    }
+    async fn list_executions(
+        &self,
+        params: operation_registry::mcp::ListExecutionsParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_executions(self.state, params).await
+    }
+    async fn get_task_diff(
+        &self,
+        params: operation_registry::mcp::GetTaskParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_task_diff(self.state, params).await
+    }
+    async fn memory_get(
+        &self,
+        params: operation_registry::mcp::MemoryGetParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_memory_get(self.state, params, self.context).await
+    }
+    async fn memory_search(
+        &self,
+        params: operation_registry::mcp::MemorySearchParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_memory_search(self.state, params, self.context).await
+    }
+    async fn preview_prompt(
+        &self,
+        params: operation_registry::mcp::PreviewPromptParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_preview_prompt(self.state, params).await
+    }
+    async fn get_task(
+        &self,
+        params: operation_registry::mcp::GetTaskParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_task(self.state, params, self.context).await
+    }
+    async fn list_tasks(
+        &self,
+        params: operation_registry::mcp::ListTasksParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_tasks(self.state, params).await
+    }
+    async fn register_agent(
+        &self,
+        params: operation_registry::mcp::RegisterAgentParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_register_agent(self.state, params, self.context).await
+    }
+    async fn list_agents(
+        &self,
+        params: operation_registry::mcp::ListAgentsParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_agents(self.state, params, self.context).await
+    }
+    async fn list_projects(
+        &self,
+        params: operation_registry::mcp::ListProjectsParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_projects(self.state, params, self.context).await
+    }
+    async fn create_project(
+        &self,
+        params: operation_registry::mcp::CreateProjectParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_create_project(self.state, params, self.context).await
+    }
+    async fn list_agent_profiles(
+        &self,
+        params: operation_registry::mcp::ListAgentProfilesParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_agent_profiles(self.state, params, self.context).await
+    }
+    async fn list_agent_sessions(
+        &self,
+        params: operation_registry::mcp::ListAgentSessionsParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_agent_sessions(self.state, params, self.context).await
+    }
+    async fn get_agent_session(
+        &self,
+        params: operation_registry::mcp::GetAgentSessionParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_agent_session(self.state, params, self.context).await
+    }
+    async fn get_main_agent(
+        &self,
+        params: operation_registry::mcp::GetMainAgentParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_main_agent(self.state, params, self.context).await
+    }
+    async fn bind_main_agent(
+        &self,
+        params: operation_registry::mcp::BindMainAgentParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_set_main_agent(self.state, params, self.context).await
+    }
+    async fn get_project_agent(
+        &self,
+        params: operation_registry::mcp::GetProjectAgentParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_project_agent(self.state, params, self.context).await
+    }
+    async fn bind_project_agent(
+        &self,
+        params: operation_registry::mcp::BindProjectAgentParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_set_project_agent(self.state, params, self.context).await
+    }
+    async fn get_integration_queue(
+        &self,
+        params: operation_registry::mcp::GetIntegrationQueueParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_integration_queue(self.state, params, self.context).await
+    }
+    async fn list_agent_chats(
+        &self,
+        params: operation_registry::mcp::ListAgentChatsParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_agent_chats(self.state, params, self.context).await
+    }
+    async fn get_agent_chat(
+        &self,
+        params: operation_registry::mcp::GetAgentChatParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_agent_chat(self.state, params, self.context).await
+    }
+    async fn list_agent_chat_messages(
+        &self,
+        params: operation_registry::mcp::ListAgentChatMessagesParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_agent_chat_messages(self.state, params, self.context).await
+    }
+    async fn send_agent_chat_message(
+        &self,
+        params: operation_registry::mcp::SendAgentChatMessageParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_send_agent_chat_message(self.state, params, self.context).await
+    }
+    async fn list_agent_handoffs(
+        &self,
+        params: operation_registry::mcp::ListAgentHandoffsParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_list_agent_handoffs(self.state, params, self.context).await
+    }
+    async fn get_agent_handoff(
+        &self,
+        params: operation_registry::mcp::GetAgentHandoffParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_get_agent_handoff(self.state, params, self.context).await
+    }
+    async fn create_agent_handoff(
+        &self,
+        params: operation_registry::mcp::CreateAgentHandoffParams,
+    ) -> Result<Value, McpToolError> {
+        handlers::forge_create_agent_handoff(self.state, params, self.context).await
+    }
+}
+
 pub(crate) async fn dispatch(
     state: &AppState,
     input: McpInput,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    match input {
-        McpInput::ProjectEscalate(params) => {
-            handlers::forge_project_escalate(state, params, context).await
-        }
-        McpInput::UpdateProjectLifecycleHooks(params) => {
-            handlers::forge_update_project_lifecycle_hooks(state, params, context).await
-        }
-        McpInput::UpdateProject(params) => {
-            handlers::forge_update_project(state, params, context).await
-        }
-        McpInput::GetProject(params) => handlers::forge_get_project(state, params).await,
-        McpInput::FollowUpExecution(params) => {
-            handlers::forge_follow_up_execution(state, params).await
-        }
-        McpInput::ReorderSubTasks(params) => handlers::forge_reorder_sub_tasks(state, params).await,
-        McpInput::CreateSubTasks(params) => handlers::forge_create_sub_tasks(state, params).await,
-        McpInput::RemoveTaskDependency(params) => {
-            handlers::forge_remove_task_dependency(state, params).await
-        }
-        McpInput::AddTaskDependency(params) => {
-            handlers::forge_add_task_dependency(state, params).await
-        }
-        McpInput::TransitionTask(params) => handlers::forge_transition_task(state, params).await,
-        McpInput::UpdateTask(params) => handlers::forge_update_task(state, params).await,
-        McpInput::TaskAction(params) => handlers::task_action(state, params, context).await,
-        McpInput::AssignAgent(params) => handlers::forge_assign_agent(state, params).await,
-        McpInput::CreateTask(params) => handlers::forge_create_task(state, params).await,
-        McpInput::ListSubTasks(params) => handlers::forge_list_sub_tasks(state, params).await,
-        McpInput::ListTaskDependents(params) => {
-            handlers::forge_list_task_dependents(state, params).await
-        }
-        McpInput::ListTaskDependencies(params) => {
-            handlers::forge_list_task_dependencies(state, params).await
-        }
-        McpInput::ListExecutions(params) => handlers::forge_list_executions(state, params).await,
-        McpInput::GetTaskDiff(params) => handlers::forge_get_task_diff(state, params).await,
-        McpInput::MemoryGet(params) => handlers::forge_memory_get(state, params, context).await,
-        McpInput::MemorySearch(params) => {
-            handlers::forge_memory_search(state, params, context).await
-        }
-        McpInput::PreviewPrompt(params) => handlers::forge_preview_prompt(state, params).await,
-        McpInput::GetTask(params) => handlers::forge_get_task(state, params, context).await,
-        McpInput::ListTasks(params) => handlers::forge_list_tasks(state, params).await,
-        McpInput::RegisterAgent(params) => {
-            handlers::forge_register_agent(state, params, context).await
-        }
-        McpInput::ListAgents(params) => handlers::forge_list_agents(state, params, context).await,
-        McpInput::ListProjects(params) => {
-            handlers::forge_list_projects(state, params, context).await
-        }
-        McpInput::CreateProject(params) => {
-            handlers::forge_create_project(state, params, context).await
-        }
-        McpInput::ListAgentProfiles(params) => {
-            handlers::forge_list_agent_profiles(state, params, context).await
-        }
-        McpInput::ListAgentSessions(params) => {
-            handlers::forge_list_agent_sessions(state, params, context).await
-        }
-        McpInput::GetAgentSession(params) => {
-            handlers::forge_get_agent_session(state, params, context).await
-        }
-        McpInput::GetMainAgent(params) => {
-            handlers::forge_get_main_agent(state, params, context).await
-        }
-        McpInput::BindMainAgent(params) => {
-            handlers::forge_set_main_agent(state, params, context).await
-        }
-        McpInput::GetProjectAgent(params) => {
-            handlers::forge_get_project_agent(state, params, context).await
-        }
-        McpInput::BindProjectAgent(params) => {
-            handlers::forge_set_project_agent(state, params, context).await
-        }
-        McpInput::GetIntegrationQueue(params) => {
-            handlers::forge_get_integration_queue(state, params, context).await
-        }
-        McpInput::ListAgentChats(params) => {
-            handlers::forge_list_agent_chats(state, params, context).await
-        }
-        McpInput::GetAgentChat(params) => {
-            handlers::forge_get_agent_chat(state, params, context).await
-        }
-        McpInput::ListAgentChatMessages(params) => {
-            handlers::forge_list_agent_chat_messages(state, params, context).await
-        }
-        McpInput::SendAgentChatMessage(params) => {
-            handlers::forge_send_agent_chat_message(state, params, context).await
-        }
-        McpInput::ListAgentHandoffs(params) => {
-            handlers::forge_list_agent_handoffs(state, params, context).await
-        }
-        McpInput::GetAgentHandoff(params) => {
-            handlers::forge_get_agent_handoff(state, params, context).await
-        }
-        McpInput::CreateAgentHandoff(params) => {
-            handlers::forge_create_agent_handoff(state, params, context).await
-        }
-    }
+    input.dispatch(&HandlerContext { state, context }).await
 }

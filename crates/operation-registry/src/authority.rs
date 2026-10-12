@@ -117,6 +117,7 @@ impl TaskRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalRule {
     BoundIdentity,
+    MainOrProjectScope,
     TaskRecord,
     ProjectOrTask,
     TaskPlan,
@@ -213,6 +214,13 @@ impl EffectiveAuthority {
             return Err(AuthorityDenial::Revoked);
         }
         let principal_ok = match requirement.principal_rule() {
+            PrincipalRule::MainOrProjectScope => match &self.principal {
+                Principal::MainAgent { .. } => {
+                    self.scope_type == "agent_chat" && self.binding_id.is_some()
+                }
+                Principal::ProjectAgent { .. } => self.scope_type == "project",
+                _ => false,
+            },
             PrincipalRule::BoundIdentity => match &self.principal {
                 Principal::MainAgent { .. } => {
                     self.scope_type == "account"
@@ -412,6 +420,9 @@ impl<E> AuthorityRequirement for &crate::OperationSpec<E> {
         self.authority.principal
     }
     fn permission(&self, scope: &str) -> RequiredPermission<'_> {
+        if scope == "account" && !self.inquiry_exposed {
+            return RequiredPermission::Unavailable;
+        }
         self.authority
             .permission(scope)
             .map_or(RequiredPermission::Unavailable, RequiredPermission::Named)
@@ -522,16 +533,76 @@ mod tests {
                 .join(",")
         };
         for (scope, workspace, project_chat, setup, expected) in [
-            ("account", "deny", false, false, "propose_discovery,propose_handoff,propose_project,read_account"),
-            ("account", "account_scratch", false, false, "propose_discovery,read_account"),
-            ("project", "deny", false, true, "propose_message,propose_project,read_memory,read_project"),
-            ("project", "project_verify", false, false, "propose_commitment,propose_decision,propose_memory,propose_message,propose_project,propose_review,propose_session,propose_task,read_memory,read_project"),
-            ("agent_chat", "deny", false, false, "propose_discovery,propose_handoff,propose_message,propose_project,read_agent_chat,read_memory"),
-            ("agent_chat", "deny", false, true, "propose_discovery,propose_handoff,propose_message,propose_project,read_agent_chat,read_memory"),
-            ("agent_chat", "project_verify", true, true, "propose_message,propose_project,read_agent_chat,read_memory"),
-            ("agent_chat", "project_verify", true, false, "propose_commitment,propose_memory,propose_message,propose_project,propose_session,propose_task,read_agent_chat,read_memory"),
-            ("task", "task_read", false, false, "read_memory,read_task,task_read"),
-            ("task", "task_write", false, false, "read_memory,read_task,task_read,task_write"),
+            (
+                "account",
+                "deny",
+                false,
+                false,
+                "propose_discovery,propose_handoff,propose_project,read_account",
+            ),
+            (
+                "account",
+                "account_scratch",
+                false,
+                false,
+                "propose_discovery,read_account",
+            ),
+            (
+                "project",
+                "deny",
+                false,
+                true,
+                "propose_message,propose_project,read_memory,read_project",
+            ),
+            (
+                "project",
+                "project_verify",
+                false,
+                false,
+                "propose_commitment,propose_decision,propose_memory,propose_message,propose_project,propose_review,propose_session,propose_task,read_memory,read_project",
+            ),
+            (
+                "agent_chat",
+                "deny",
+                false,
+                false,
+                "propose_discovery,propose_handoff,propose_message,propose_project,read_agent_chat,read_memory",
+            ),
+            (
+                "agent_chat",
+                "deny",
+                false,
+                true,
+                "propose_discovery,propose_handoff,propose_message,propose_project,read_agent_chat,read_memory",
+            ),
+            (
+                "agent_chat",
+                "project_verify",
+                true,
+                true,
+                "propose_message,propose_project,read_agent_chat,read_memory",
+            ),
+            (
+                "agent_chat",
+                "project_verify",
+                true,
+                false,
+                "propose_commitment,propose_memory,propose_message,propose_project,propose_session,propose_task,read_agent_chat,read_memory",
+            ),
+            (
+                "task",
+                "task_read",
+                false,
+                false,
+                "read_memory,read_task,task_read",
+            ),
+            (
+                "task",
+                "task_write",
+                false,
+                false,
+                "read_memory,read_task,task_read,task_write",
+            ),
             ("task", "deny", false, false, ""),
             ("agent", "deny", false, false, ""),
         ] {

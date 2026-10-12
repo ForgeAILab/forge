@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use api_types::{LifecycleEvent, LifecycleHookDef, ProjectSettings, WorkflowDefinition};
-use db::{ProjectMemberRepo, SqliteDb};
+use db::{ProjectMemberRepo, ProjectRepo, SqliteDb};
 use serde_json::Value;
 
 use crate::{Result, ServiceError};
@@ -38,6 +38,22 @@ pub async fn validate_project_settings(
     project_id: Option<&str>,
     user_id: Option<&str>,
 ) -> Result<()> {
+    if operation_registry::mcp::contains_script_hooks(settings) {
+        if let (Some(project_id), Some(user_id)) = (project_id, user_id) {
+            let owner = ProjectRepo::get_by_id(db, project_id)
+                .await?
+                .is_some_and(|project| project.owner_id.as_deref() == Some(user_id));
+            let admin = ProjectMemberRepo::get_member(db, project_id, user_id)
+                .await?
+                .is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin"));
+            if !owner && !admin {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "Script lifecycle hooks require the Project owner or admin role."
+                        .into(),
+                });
+            }
+        }
+    }
     let settings: ProjectSettings = serde_json::from_value(settings.clone())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid settings: {error}")))?;
     if !(1..=86400).contains(&settings.placement.provision_timeout_seconds) {

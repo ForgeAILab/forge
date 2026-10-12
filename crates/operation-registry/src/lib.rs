@@ -8,6 +8,7 @@ pub mod legacy_proposals;
 pub mod main_proposals;
 pub mod main_reads;
 pub mod mcp;
+pub mod project_commands;
 pub mod project_proposals;
 pub mod project_reads;
 pub mod scope_reads;
@@ -42,6 +43,7 @@ pub trait OperationContext<E>:
     + main_reads::MainReadContext<E>
     + main_proposals::MainProposalContext<E>
     + project_proposals::ProjectProposalContext<E>
+    + project_commands::ProjectCommandContext<E>
     + legacy_proposals::LegacyProposalContext<E>
     + hand_proposals::HandProposalContext<E>
     + task_reads::TaskReadContext<E>
@@ -56,6 +58,7 @@ impl<
             + main_reads::MainReadContext<E>
             + main_proposals::MainProposalContext<E>
             + project_proposals::ProjectProposalContext<E>
+            + project_commands::ProjectCommandContext<E>
             + legacy_proposals::LegacyProposalContext<E>
             + hand_proposals::HandProposalContext<E>
             + task_reads::TaskReadContext<E>
@@ -201,6 +204,8 @@ impl TypedInputContract {
 }
 
 pub struct OperationSpec<E> {
+    pub receipt_replay: bool,
+    pub inquiry_exposed: bool,
     pub id: &'static str,
     pub input: TypedInputContract,
     pub authority: AuthorityRule,
@@ -332,6 +337,8 @@ impl<E: Send + 'static> OperationSpec<E> {
             .unwrap()
             .sort_by(|a, b| a.as_str().cmp(&b.as_str()));
         Self {
+            receipt_replay: false,
+            inquiry_exposed: true,
             id,
             authority,
             effect,
@@ -356,6 +363,16 @@ impl<E: Send + 'static> OperationSpec<E> {
                 })
             }),
         }
+    }
+    /// Receipt retrieval is an exact, principal-bound read, before admission
+    /// of a new effect. The consumer's command service owns digest comparison.
+    pub fn outside_inquiry(mut self) -> Self {
+        self.inquiry_exposed = false;
+        self
+    }
+    pub fn with_receipt_replay(mut self) -> Self {
+        self.receipt_replay = true;
+        self
     }
     pub fn canonical_schema(&self) -> Value {
         let mut schema = self.input.schema.clone();
@@ -453,6 +470,7 @@ pub fn registered_operations() -> Vec<&'static str> {
         registered_reads(),
         main_proposals::IDS.to_vec(),
         project_proposals::IDS.to_vec(),
+        project_commands::IDS.to_vec(),
         legacy_proposals::IDS.to_vec(),
         hand_proposals::IDS.to_vec(),
         task_records::IDS.to_vec(),
@@ -481,6 +499,7 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
     let ids = [
         main_proposals::IDS,
         project_proposals::IDS,
+        project_commands::IDS,
         legacy_proposals::IDS,
         hand_proposals::IDS,
         task_records::IDS,
@@ -491,6 +510,7 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
         main_proposals::specs()
             .into_iter()
             .chain(project_proposals::specs())
+            .chain(project_commands::specs())
             .chain(legacy_proposals::specs())
             .chain(hand_proposals::specs())
             .chain(task_records::specs())

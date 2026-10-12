@@ -8,7 +8,6 @@
 
 #[cfg(test)]
 use forge_agent_host::PROJECT_CURRENT_STATE_OPERATION;
-use operation_registry::authority::permission_set;
 mod project_proposals;
 mod registered_proposals;
 mod registered_reads;
@@ -1256,7 +1255,9 @@ impl CoordinationToolProvider {
                     } else if summary.trim().is_empty() {
                         Err("summary is required".to_owned())
                     } else if summary.trim().chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
-                        Err(format!("summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"))
+                        Err(format!(
+                            "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
+                        ))
                     } else {
                         self.append_outbox_worklog(
                             input,
@@ -1373,16 +1374,16 @@ impl CoordinationToolProvider {
                 "text/plain".to_owned(),
             ),
             (Some(_), Some(_), _) => {
-                return Err("supply either path or content, not both".to_owned())
+                return Err("supply either path or content, not both".to_owned());
             }
             (Some(_), None, None) => {
-                return Err("owner did not supply captured artifact bytes".to_owned())
+                return Err("owner did not supply captured artifact bytes".to_owned());
             }
             _ => {
                 return Err(
                     "evidence requires either a path with captured bytes or inline content"
                         .to_owned(),
-                )
+                );
             }
         };
         if bytes.is_empty() {
@@ -2515,253 +2516,6 @@ impl CoordinationToolProvider {
         }))
     }
 
-    async fn propose(
-        &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-        runtime_session_id: &str,
-        operation: &str,
-        arguments: Value,
-    ) -> Result<Value, AgentHostError> {
-        if registered_proposals::CATALOG.lookup(operation).is_some() {
-            return self
-                .registered_proposal(
-                    actor_identity_id,
-                    scope,
-                    runtime_session_id,
-                    operation,
-                    arguments,
-                    false,
-                    None,
-                )
-                .await;
-        }
-        let payload = arguments
-            .get("payload")
-            .filter(|value| value.is_object())
-            .cloned()
-            .ok_or_else(|| {
-                // The schema requires `payload`, so a call that omits it
-                // (and supplies no flat fields to lift into one) is refused
-                // by schema validation before it reaches this code. The
-                // property is still declared nullable (a cross-provider
-                // compatibility choice), so an explicit `"payload": null`
-                // does arrive here. Naming the expected shape is the only
-                // thing that lets the model correct the call; the bare
-                // message left the Agent with a non-retryable dead end.
-                let operation_hint = arguments
-                    .get("operation")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<operation>");
-                AgentHostError::Unsupported(format!(
-                    "proposal payload must be an object: put this operation's own fields \
-                     inside a `payload` object, as {{\"operation\": \"{operation_hint}\", \
-                     \"payload\": {{ ...fields... }}, \"dedupe_key\": \"...\", \
-                     \"correlation_id\": \"...\"}}. The `payload` property description \
-                     lists the fields each operation takes."
-                ))
-            })?;
-        let descriptor = operation_descriptor(scope.scope_type, operation, Some(&payload));
-        let classification = descriptor.classification;
-        match classification {
-            OperationClassification::Query => {
-                return Err(AgentHostError::Unsupported(
-                    "read-only Forge operations execute through the query tool".to_owned(),
-                ));
-            }
-            OperationClassification::Denied => {
-                return Err(AgentHostError::StructuredOutcome(Box::new(
-                    OrchestrationOutcome::terminal_denial(
-                        operation,
-                        outcome_scope(scope),
-                        correlation_id(&arguments, operation, scope),
-                        DeniedBy::OperationNotInScope,
-                    ),
-                )));
-            }
-            OperationClassification::DirectCommand
-            | OperationClassification::ApprovalRequiredAction => {}
-        }
-        validate_proposal_payload(operation, &payload).map_err(|_| {
-            AgentHostError::Unsupported(
-                "proposal payload does not match the typed operation schema".to_owned(),
-            )
-        })?;
-        // `project.evidence` capture stores the artifact the Project Agent's
-        // own verification run produced as a Project media asset, then
-        // continues as the bounded attach it now is. The asset exists before
-        // the attach command runs; an attach failure leaves an unreferenced
-        // Project asset for media GC, never a dangling attachment.
-        let payload = if operation == PROJECT_EVIDENCE_OPERATION
-            && payload.get("action").and_then(Value::as_str) == Some("capture")
-        {
-            self.capture_project_evidence_asset(actor_identity_id, scope, payload, &arguments)
-                .await?
-        } else {
-            payload
-        };
-        if classification == OperationClassification::DirectCommand {
-            let requested_permission = descriptor.required_permission.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "direct command has no canonical permission descriptor".to_owned(),
-                )
-            })?;
-            // Both halves are read off the catalog: a coordination command
-            // admitted under this permission, or a Project-orchestration
-            // operation. Re-listing the coordination names here was the
-            // second place a new operation had to be registered, and missing
-            // it failed with "no canonical target derivation" — a message
-            // that names neither the operation nor the list.
-            let target_id = if forge_agent_host::is_coordination_direct_command(
-                operation,
-                requested_permission,
-            ) || forge_agent_host::is_project_orchestration_operation(operation)
-            {
-                Some(
-                    self.authorization
-                        .direct_project_target(scope)
-                        .await
-                        .map_err(native_scope_error)?,
-                )
-            } else {
-                return Err(AgentHostError::Authority(
-                    "direct command has no canonical target derivation".to_owned(),
-                ));
-            };
-            let dedupe_key = required_argument(&arguments, "dedupe_key")?;
-            let correlation_id = required_argument(&arguments, "correlation_id")?;
-            let causation_id = arguments
-                .get("causation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let causation_depth = arguments
-                .get("causation_depth")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            return self
-                .execute_direct_command(
-                    actor_identity_id,
-                    scope,
-                    operation,
-                    payload,
-                    requested_permission,
-                    target_id,
-                    dedupe_key,
-                    correlation_id,
-                    causation_id,
-                    causation_depth,
-                )
-                .await;
-        }
-        let project_chat_target = if operation == TASK_PROPOSE_OPERATION
-            && scope.scope_type == CanonicalScopeType::AgentChat
-        {
-            Some(
-                self.project_chat_task_target(actor_identity_id, scope)
-                    .await?,
-            )
-        } else {
-            None
-        };
-        // Generic coordination mutations are not an alternate Main/account
-        // authority path.  They are admitted only for a bound Project (or a
-        // Task reviewer for review requests), and every Project mutation is
-        // blocked until a user-approved Charter adoption is current.  The
-        // setup exception is the bounded message channel plus the typed
-        // adoption operation handled below.
-        match operation {
-            "message.propose" => {
-                let _ = self
-                    .authorization
-                    .project_orchestration_target(actor_identity_id, scope)
-                    .await
-                    .map_err(native_scope_error)?;
-            }
-            "commitment.propose" | "review.propose"
-                if scope.scope_type != CanonicalScopeType::Task =>
-            {
-                let _ = self
-                    .authorization
-                    .project_orchestration_target(actor_identity_id, scope)
-                    .await
-                    .map_err(native_scope_error)?;
-            }
-            _ => {}
-        }
-        let requested_permission =
-            operation_permission(scope.scope_type, operation).ok_or_else(|| {
-                AgentHostError::Authority(
-                    "proposal operation has no canonical permission descriptor".to_owned(),
-                )
-            })?;
-        let (target_type, target_id) = match operation {
-            PROJECT_CHARTER_ADOPTION_OPERATION => {
-                let project_id = self
-                    .authorization
-                    .project_orchestration_target(actor_identity_id, scope)
-                    .await
-                    .map_err(native_scope_error)?;
-                (Some("project".to_owned()), Some(project_id))
-            }
-            PROJECT_EVIDENCE_OPERATION | PROJECT_READINESS_OPERATION => {
-                let project_id = self
-                    .authorization
-                    .project_orchestration_target(actor_identity_id, scope)
-                    .await
-                    .map_err(native_scope_error)?;
-                (Some("project".to_owned()), Some(project_id))
-            }
-            "message.propose" => (
-                Some(scope_type_name(scope.scope_type).to_owned()),
-                Some(scope.scope_id.clone()),
-            ),
-            TASK_PROPOSE_OPERATION if scope.scope_type == CanonicalScopeType::Project => {
-                (Some("project".to_owned()), Some(scope.scope_id.clone()))
-            }
-            TASK_PROPOSE_OPERATION if project_chat_target.is_some() => {
-                let project_id = project_chat_target.as_deref().ok_or_else(|| {
-                    AgentHostError::Authority("Project Agent Chat has no owning Project".to_owned())
-                })?;
-                let _ = project_id;
-                (Some("project".to_owned()), project_chat_target)
-            }
-            "review.propose"
-                if matches!(
-                    scope.scope_type,
-                    CanonicalScopeType::Project
-                        | CanonicalScopeType::AgentChat
-                        | CanonicalScopeType::Task
-                ) && (scope.scope_type != CanonicalScopeType::Task
-                    || scope.workspace_access == WorkspaceAccess::TaskRead) =>
-            {
-                (
-                    Some(scope_type_name(scope.scope_type).to_owned()),
-                    Some(scope.scope_id.clone()),
-                )
-            }
-            "commitment.propose" => (
-                Some(scope_type_name(scope.scope_type).to_owned()),
-                Some(scope.scope_id.clone()),
-            ),
-            _ => {
-                return Err(AgentHostError::Authority(
-                    "proposal operation is not admitted for this scope".into(),
-                ));
-            }
-        };
-        self.enqueue_action(
-            actor_identity_id,
-            scope,
-            operation,
-            arguments,
-            payload,
-            requested_permission,
-            target_type,
-            target_id,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn enqueue_action(
         &self,
@@ -2912,23 +2666,7 @@ impl CoordinationToolProvider {
                 })
                 .await
                 .map_err(service_error)?;
-            let requires_user_authorization = result
-                .result
-                .get("requires_user_authorization")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            return Ok(json!({
-                "operation": result.operation,
-                "status": "succeeded",
-                "replayed": result.replayed,
-                "materialized": true,
-                "domain_committed": true,
-                "receipt_id": result.receipt_id,
-                "event_id": result.event_id,
-                "domain_result": result.result,
-                "agent_action_execution_id": result.agent_action_execution_id,
-                "requires_user_authorization": requires_user_authorization,
-            }));
+            return Ok(direct_project_command_value(result));
         }
 
         Err(AgentHostError::Authority(
@@ -3260,57 +2998,6 @@ impl CoordinationToolProvider {
             "materialized": false,
             "persisted": false,
         }))
-    }
-
-    async fn project_chat_task_target(
-        &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-    ) -> Result<String, AgentHostError> {
-        let row = sqlx::query(
-            "SELECT chat.kind, chat.project_id, binding.permission_ceiling_json
-             FROM agent_chat AS chat
-             LEFT JOIN project_agent_binding AS binding
-               ON binding.project_id = chat.project_id
-              AND binding.identity_id = ?
-              AND binding.state = 'active'
-             WHERE chat.id = ?
-             LIMIT 1",
-        )
-        .bind(actor_identity_id)
-        .bind(&scope.scope_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?
-        .ok_or_else(|| AgentHostError::Authority("Agent Chat scope is unavailable".to_owned()))?;
-        let kind = row
-            .try_get::<String, _>("kind")
-            .map_err(|_| AgentHostError::ProtectedPersistence)?;
-        if kind != "project" {
-            return Err(AgentHostError::Authority(
-                "Main Agent Chat cannot manage Tasks".to_owned(),
-            ));
-        }
-        let project_id = row
-            .try_get::<Option<String>, _>("project_id")
-            .map_err(|_| AgentHostError::ProtectedPersistence)?
-            .ok_or_else(|| {
-                AgentHostError::Authority("Project Agent Chat has no owning Project".to_owned())
-            })?;
-        let ceiling = row
-            .try_get::<Option<String>, _>("permission_ceiling_json")
-            .map_err(|_| AgentHostError::ProtectedPersistence)?
-            .ok_or_else(|| {
-                AgentHostError::Authority(
-                    "Project Agent Chat binding does not admit Task management".to_owned(),
-                )
-            })?;
-        if !permission_set(&ceiling).contains("propose_task") {
-            return Err(AgentHostError::Authority(
-                "permission propose_task is outside the server-issued identity/profile/scope ceiling".to_owned(),
-            ));
-        }
-        Ok(project_id)
     }
 
     /// Convert a native service result into the stable model-facing envelope.
@@ -3665,7 +3352,7 @@ impl CoordinationToolProvider {
                             &arguments,
                             error,
                         )
-                        .await)
+                        .await);
                 }
             };
             Some(&resolved)
@@ -3724,19 +3411,9 @@ impl CoordinationToolProvider {
                 }
             }
         } else {
-            match operation {
-                "project.summary" => {
-                    if scope.scope_type == CanonicalScopeType::AgentChat {
-                        self.project_summary_read(actor_identity_id, scope, arguments)
-                            .await
-                    } else {
-                        self.summary(actor_identity_id, scope).await
-                    }
-                }
-                _ => Err(AgentHostError::Unsupported(
-                    "Forge read operation is not implemented".to_owned(),
-                )),
-            }
+            Err(AgentHostError::Unsupported(
+                "Forge read operation is not implemented".to_owned(),
+            ))
         };
         if operation_contract(operation).is_some() {
             match result {
@@ -3816,14 +3493,9 @@ impl CoordinationToolProvider {
             )
             .await
         } else {
-            self.propose(
-                actor_identity_id,
-                scope,
-                runtime_session_id,
-                operation,
-                arguments.clone(),
-            )
-            .await
+            Err(AgentHostError::Unsupported(
+                "Forge proposal operation is not implemented".to_owned(),
+            ))
         };
         if operation_contract(operation).is_some() {
             match result {
@@ -3987,7 +3659,7 @@ impl ForgeToolProvider for CoordinationToolProvider {
                         &arguments,
                         service_error(error),
                     )
-                    .await)
+                    .await);
             }
         };
         let id = db::new_uuid_v4();
@@ -4082,6 +3754,26 @@ impl ForgeToolProvider for CoordinationToolProvider {
             .await
     }
 
+    async fn replay_proposal(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: &Value,
+    ) -> Result<Option<Value>, AgentHostError> {
+        self.try_project_command_replay(actor, scope, operation, arguments)
+            .await?
+            .map(|result| {
+                Self::structured_success(
+                    operation,
+                    scope,
+                    &correlation_id(arguments, operation, scope),
+                    result,
+                    false,
+                )
+            })
+            .transpose()
+    }
     async fn proposal_denial(
         &self,
         actor_identity_id: &str,
@@ -4173,6 +3865,17 @@ fn action_value(action: &AgentAction) -> Value {
 /// and without them the `CorrectInput` retry instruction names no correction,
 /// which leaves a wrong payload unfixable and invites the model to narrate a
 /// success it never got.
+fn direct_project_command_value(
+    result: crate::project_agent_actions::DirectProjectCommandResult,
+) -> Value {
+    let requires_user_authorization = result
+        .result
+        .get("requires_user_authorization")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    json!({"operation":result.operation,"status":"succeeded","replayed":result.replayed,"materialized":true,"domain_committed":true,"receipt_id":result.receipt_id,"event_id":result.event_id,"domain_result":result.result,"agent_action_execution_id":result.agent_action_execution_id,"requires_user_authorization":requires_user_authorization})
+}
+
 fn typed_command_payload<T: serde::de::DeserializeOwned>(
     operation: &str,
     scope: &CanonicalScope,
@@ -4680,10 +4383,12 @@ fn native_denial_cause(reason: &str, permission: Option<&str>) -> DeniedBy {
         | "requested permission is outside the Agent Chat binding ceiling"
         | "direct Project command permission is outside the account ceiling"
         | "direct Project command permission is outside the selected profile ceiling"
-        | "direct Project command permission is outside the active binding ceiling" => {
-            permission.map(|name| DeniedBy::PermissionMissing(name.to_owned())).unwrap_or(DeniedBy::Unspecified)
+        | "direct Project command permission is outside the active binding ceiling" => permission
+            .map(|name| DeniedBy::PermissionMissing(name.to_owned()))
+            .unwrap_or(DeniedBy::Unspecified),
+        "actor identity has no active binding in the requested scope or is paused or archived" => {
+            DeniedBy::AuthorityRevoked
         }
-        "actor identity has no active binding in the requested scope or is paused or archived" => DeniedBy::AuthorityRevoked,
         "actor identity is paused or archived"
         | "Project Agent is paused or archived"
         | "direct Project command principal is paused or archived"
@@ -4691,20 +4396,38 @@ fn native_denial_cause(reason: &str, permission: Option<&str>) -> DeniedBy {
         "direct Project command has no selected active profile" => DeniedBy::ProfileNotSelected,
         "the bound Project has no approved Charter"
         | "Project orchestration remains blocked until a user-approved Charter adoption is committed"
-        | "direct Project command is blocked by current Charter state" => DeniedBy::CharterNotAdopted,
+        | "direct Project command is blocked by current Charter state" => {
+            DeniedBy::CharterNotAdopted
+        }
         "the Task workflow no longer admits writes in its terminal state" => DeniedBy::TaskTerminal,
         "reviewer assignments cannot perform Task writes" => DeniedBy::ReviewerReadOnly,
-        "protected mutation requires an independent approval" => DeniedBy::IndependentApprovalRequired,
-        "genesis.start requires an explicit user request to create or start a new Project" => DeniedBy::UserRequestRequired,
-        "genesis.start requires the currently leased Main Chat turn" => DeniedBy::LeasedTurnRequired,
-        "Project Charter adoption is not valid for the current Project state" => DeniedBy::CharterAdoptionNotApplicable,
+        "protected mutation requires an independent approval" => {
+            DeniedBy::IndependentApprovalRequired
+        }
+        "genesis.start requires an explicit user request to create or start a new Project" => {
+            DeniedBy::UserRequestRequired
+        }
+        "genesis.start requires the currently leased Main Chat turn" => {
+            DeniedBy::LeasedTurnRequired
+        }
+        "Project Charter adoption is not valid for the current Project state" => {
+            DeniedBy::CharterAdoptionNotApplicable
+        }
         "query operations execute through the read boundary" => DeniedBy::ReadBoundaryRequired,
-        "direct command is not admitted for this permission or payload" => DeniedBy::DirectCommandNotAdmitted,
+        "direct command is not admitted for this permission or payload" => {
+            DeniedBy::DirectCommandNotAdmitted
+        }
         "the Task assignment does not admit review proposals" => DeniedBy::ReviewAssignmentRequired,
-        "direct Project commands require the propose_project permission" => DeniedBy::PermissionMissing("propose_project".to_owned()),
+        "direct Project commands require the propose_project permission" => {
+            DeniedBy::PermissionMissing("propose_project".to_owned())
+        }
         "Product Genesis start requires propose_discovery"
-        | "Main Charter draft requires the propose_discovery permission" => DeniedBy::PermissionMissing("propose_discovery".to_owned()),
-        "operation is denied by the canonical native operation catalog" => DeniedBy::OperationNotInScope,
+        | "Main Charter draft requires the propose_discovery permission" => {
+            DeniedBy::PermissionMissing("propose_discovery".to_owned())
+        }
+        "operation is denied by the canonical native operation catalog" => {
+            DeniedBy::OperationNotInScope
+        }
         _ => DeniedBy::Unspecified,
     }
 }
@@ -6818,7 +6541,9 @@ mod tests {
                     &scope,
                     operation,
                     &json!({}),
-                    AgentHostError::Authority(reason.expect("real evaluator cause")),
+                    AgentHostError::Authority(reason.unwrap_or_else(|| {
+                        panic!("real evaluator allowed {operation}/{permission}")
+                    })),
                 )
                 .await;
             let AgentHostError::StructuredOutcome(outcome) = error else {

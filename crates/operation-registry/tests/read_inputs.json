@@ -61,5 +61,6 @@
   "commitments.read": {},
   "delivery.read": {},
   "memory.read": {},
-  "decisions.read": {}
+  "decisions.read": {},
+  "project.summary": {}
 }

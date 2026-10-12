@@ -139,6 +139,127 @@ fn serialized_tool_definitions() {
     assert_eq!(Value::Object(actual), snapshot, "native schema snapshot");
 }
 
+/// Actual composed aggregates must expose one spec per operation, and the
+/// union of role surfaces must reach the entire native catalog.
+#[test]
+fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
+    let permissions = operation_registry::READ_CATALOG
+        .iter()
+        .chain(operation_registry::PROPOSAL_CATALOG.iter())
+        .flat_map(|spec| {
+            spec.authority
+                .permissions
+                .iter()
+                .map(|(_, permission)| (*permission).to_owned())
+        })
+        .collect();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut reached = BTreeSet::new();
+    for (scope_type, access, role, project, setup) in [
+        (
+            CanonicalScopeType::AgentChat,
+            WorkspaceAccess::AccountScratch,
+            None,
+            false,
+            false,
+        ),
+        (
+            CanonicalScopeType::Account,
+            WorkspaceAccess::AccountScratch,
+            None,
+            false,
+            false,
+        ),
+        (
+            CanonicalScopeType::AgentChat,
+            WorkspaceAccess::Deny,
+            None,
+            true,
+            false,
+        ),
+        (
+            CanonicalScopeType::AgentChat,
+            WorkspaceAccess::Deny,
+            None,
+            true,
+            true,
+        ),
+        (
+            CanonicalScopeType::Project,
+            WorkspaceAccess::Deny,
+            None,
+            true,
+            false,
+        ),
+        (
+            CanonicalScopeType::Task,
+            WorkspaceAccess::TaskWrite,
+            Some("worker"),
+            false,
+            false,
+        ),
+        (
+            CanonicalScopeType::Task,
+            WorkspaceAccess::TaskRead,
+            Some("reviewer"),
+            false,
+            false,
+        ),
+        (
+            CanonicalScopeType::Task,
+            WorkspaceAccess::TaskRead,
+            Some("planner"),
+            false,
+            false,
+        ),
+    ] {
+        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
+            "identity",
+            scope(scope_type, access),
+            role,
+            (access != WorkspaceAccess::Deny).then(|| workspace.path().to_str().unwrap()),
+            &permissions,
+            ProjectChatToolContext {
+                is_project_agent_chat: project,
+                charter_setup_required: setup,
+            },
+            Some(Arc::new(ConfiguredSearchProvider)),
+            ScopeToolRuntime::default(),
+        )
+        .unwrap();
+        let mut surface = BTreeSet::new();
+        for tool in composition.tools() {
+            let spec = tool.spec();
+            for operation in spec.input_schema["properties"]["operation"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let id = operation.as_str().unwrap();
+                assert!(
+                    surface.insert(id.to_owned()),
+                    "duplicate {id} on {scope_type:?}/{role:?}/{setup}"
+                );
+                let contracts = operation_registry::READ_CATALOG
+                    .iter()
+                    .chain(operation_registry::PROPOSAL_CATALOG.iter())
+                    .filter(|spec| spec.id == id)
+                    .count();
+                assert_eq!(contracts, 1, "{id}");
+                reached.insert(id.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        reached,
+        operation_registry::registered_operations()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "no unreachable spec"
+    );
+}
+
 /// Estimated-prefix ceilings per native surface, in compact UTF-8 bytes (the
 /// unit `scripts/measure-tool-definitions.py` prints; tokens = ceil(bytes / 4)).
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
@@ -156,8 +277,8 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // `content_digest`, `render_digest`). That line keeps the whole nested
     // Charter shape (about 3,000 bytes): the description is the only place
     // a Main model is shown it, so it is not a saving to take.
-    ("main", 8_891),
-    ("inquiry", 4_181),
+    ("main", 8_650),
+    ("inquiry", 3_980),
     // 24,252 and 25,501 at 435ff088, less 382: the pending proposals' eleven
     // root aliases are no longer declared (-156; arguments are normalized
     // before schema validation, and the flat fields are still lifted by
@@ -179,7 +300,7 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
     // and the same two descriptions (-226). The hand Charter adoption
     // schema dominates (12,418 bytes).
-    ("project_setup", 15_782),
+    ("project_setup", 15_500),
     // 6,062 / 4,829 / 5,437 before the Task operations were registered.
     // Each includes 40 bytes for the evidence kinds a run can name
     // (screenshot, walkthrough_video, log, report, other): the hand prose
@@ -193,6 +314,7 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
 /// reliably accept. Advertised native schemas must not use them; a
 /// per-operation contract is enforced by the operation registry instead.
 const FORBIDDEN_SCHEMA_KEYWORDS: &[&str] = &[
+    "oneOf",
     "allOf",
     "anyOf",
     "not",
@@ -204,11 +326,6 @@ const FORBIDDEN_SCHEMA_KEYWORDS: &[&str] = &[
     "dependentSchemas",
     "patternProperties",
 ];
-/// `oneOf` predates the registry: four nullable-variant fields of the Charter
-/// draft content in the setup surface's `forge_project_orchestration_propose`
-/// at 172338b3. Tolerated exactly there, by count, until that schema moves.
-const PRE_EXISTING_ONE_OF: &[(&str, usize)] = &[("project_setup", 4)];
-
 fn schema_keyword_uses(value: &Value, keyword: &str) -> usize {
     match value {
         Value::Object(map) => map
@@ -261,15 +378,6 @@ fn advertised_native_schemas_use_only_the_portable_keyword_set() {
                 );
             }
         }
-        let allowed = PRE_EXISTING_ONE_OF
-            .iter()
-            .find(|(name, _)| name == surface)
-            .map_or(0, |(_, count)| *count);
-        assert_eq!(
-            schema_keyword_uses(definitions, "oneOf"),
-            allowed,
-            "{surface} `oneOf` uses"
-        );
     }
     // The walker itself: keywords are found at any depth, property names are not.
     let probe = json!({"properties":{"if":{"type":"string"},"x":{"items":{"allOf":[{"not":{}}]}}}});

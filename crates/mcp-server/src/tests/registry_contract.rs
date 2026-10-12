@@ -13,6 +13,21 @@ pub(super) fn base_admitted(grant: &str, name: &str) -> bool {
         .expect("every grant/role/tool has a frozen row")
 }
 
+pub(super) fn admitted_after_consolidation(grant: &str, name: &str) -> bool {
+    if name == "forge_update_project_lifecycle_hooks" {
+        matches!(
+            grant,
+            "account"
+                | "account_admin"
+                | "project_admin"
+                | "project_member_owner"
+                | "project_owner"
+        )
+    } else {
+        base_admitted(grant, name)
+    }
+}
+
 #[test]
 fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admission() {
     run_async(async {
@@ -127,10 +142,20 @@ fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admis
                 .collect::<Vec<_>>();
             let before_bytes = serde_json::to_vec(&before).unwrap().len();
             let after_bytes = serde_json::to_vec(&listed["tools"]).unwrap().len();
-            println!("MCP_ROLE_PREFIX {grant} before_tools={} after_tools={} before_bytes={before_bytes} after_bytes={after_bytes} before_tokens={} after_tokens={}",before.len(),names.len(),before_bytes.div_ceil(4),after_bytes.div_ceil(4));
+            println!(
+                "MCP_ROLE_PREFIX {grant} before_tools={} after_tools={} before_bytes={before_bytes} after_bytes={after_bytes} before_tokens={} after_tokens={}",
+                before.len(),
+                names.len(),
+                before_bytes.div_ceil(4),
+                after_bytes.div_ceil(4)
+            );
+            println!(
+                "TOOL_DEFINITIONS mcp_grant_{grant} {}",
+                serde_json::to_string(&listed["tools"]).unwrap()
+            );
             for spec in CATALOG.iter() {
                 let name = spec.name;
-                let expected = base_admitted(grant, name);
+                let expected = admitted_after_consolidation(grant, name);
                 assert_eq!(
                     names.contains(name),
                     expected,
@@ -525,6 +550,11 @@ fn both_settings_paths_validate_agent_usability_for_the_authenticated_user() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        sqlx::query("UPDATE project SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
         let project = ProjectRepo::get_by_id(&*state.db, &project_id)
             .await
             .unwrap()
@@ -584,6 +614,11 @@ fn unknown_nested_fields_fail_before_any_handler_effect() {
         let state = sqlite_state().await;
         let root = seed_task(&state).await;
         let (project_id, _) = seed_project_repo(&state).await;
+        sqlx::query("UPDATE project SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
         let execution_id = seed_execution(&state, root.id.clone()).await;
         for (tool, arguments) in [
             (
@@ -820,5 +855,275 @@ fn a_foreign_task_execution_or_project_answers_exactly_like_a_missing_one() {
                 .unwrap(),
         );
         assert_eq!(before, after, "no refused reference had an effect");
+    });
+}
+
+#[test]
+fn lifecycle_scripts_require_project_admin_on_both_mcp_paths_and_shared_rest_validation() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let hooks = json!({"before_work":[{"type":"script","command":"echo proof","timeout_seconds":60,"blocking":false}]});
+        let settings = json!({"lifecycle_hooks":hooks});
+        let before = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let context = McpContext {
+            user_id: Some("mcp-test-user".into()),
+            project_id: Some(project_id.clone()),
+        };
+        for name in [
+            "forge_update_project",
+            "forge_update_project_lifecycle_hooks",
+        ] {
+            let mut arguments = json!({"project_id":project_id,"version":before.version});
+            arguments[if name == "forge_update_project" {
+                "settings"
+            } else {
+                "lifecycle_hooks"
+            }] = if name == "forge_update_project" {
+                settings.clone()
+            } else {
+                hooks.clone()
+            };
+            assert!(
+                dispatch_with_context(
+                    &state,
+                    &context,
+                    "tools/call",
+                    json!({"name":name,"arguments":arguments})
+                )
+                .await
+                .is_err(),
+                "{name}: ownerless visibility grants no command authority"
+            );
+        }
+        let workflow = services::workflow::engine::WorkflowEngine::resolve_workflow(
+            &before.workflow_definition,
+        );
+        assert!(
+            matches!(
+                services::project_settings::validate_project_settings(
+                    &state.db,
+                    &settings,
+                    &workflow,
+                    Some(&project_id),
+                    Some("mcp-test-user")
+                )
+                .await,
+                Err(services::ServiceError::AuthorizationDenied { .. })
+            ),
+            "REST uses this same effect validator"
+        );
+        let after = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before, "nothing persisted on denial");
+        ProjectMemberRepo::add_member(
+            &*state.db,
+            CreateProjectMember {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                user_id: "mcp-test-user".into(),
+                role: "admin".into(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        for name in [
+            "forge_update_project",
+            "forge_update_project_lifecycle_hooks",
+        ] {
+            let version = ProjectRepo::get_by_id(&*state.db, &project_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version;
+            let mut arguments = json!({"project_id":project_id,"version":version});
+            arguments[if name == "forge_update_project" {
+                "settings"
+            } else {
+                "lifecycle_hooks"
+            }] = if name == "forge_update_project" {
+                settings.clone()
+            } else {
+                hooks.clone()
+            };
+            dispatch_with_context(
+                &state,
+                &context,
+                "tools/call",
+                json!({"name":name,"arguments":arguments}),
+            )
+            .await
+            .unwrap();
+        }
+    });
+}
+
+#[test]
+fn assignment_subtask_and_follow_up_agent_references_match_rest_usability_and_hide_foreign_ids() {
+    run_async(async {
+        let state = sqlite_state().await;
+        seed_chat_account(&state).await;
+        let task = seed_task(&state).await;
+        let execution = seed_execution(&state, task.id.clone()).await;
+        let agent = seed_agent(&state, "foreign-reference").await;
+        sqlx::query(
+            "UPDATE agent_identity SET owner_id='chat-user',visibility='account' WHERE id=?",
+        )
+        .bind(&agent.id)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        assert!(!state
+            .db
+            .list_agents_usable_in_project(&task.project_id, "mcp-test-user")
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == agent.id));
+        for name in [
+            "forge_assign_agent",
+            "forge_create_sub_tasks",
+            "forge_follow_up_execution",
+        ] {
+            let mut errors = Vec::new();
+            for id in [agent.id.as_str(), "missing-agent"] {
+                let arguments = match name {
+                    "forge_assign_agent" => json!({"task_id":task.id,"agent_id":id}),
+                    "forge_create_sub_tasks" => {
+                        json!({"parent_task_id":task.id,"subtasks":[{"title":"Child","assignee_id":id}]})
+                    }
+                    _ => json!({"execution_id":execution,"message":"continue","agent_id":id}),
+                };
+                let error = call_tool_error(&state, name, arguments).await;
+                assert_eq!(error.code, -32004, "{name}");
+                errors.push(error.message.replace(id, "<id>"));
+            }
+            assert_eq!(
+                errors[0], errors[1],
+                "{name}: inaccessible and missing agent are indistinguishable"
+            );
+        }
+        assert_eq!(
+            TaskRepo::list_subtasks_ordered(&*state.db, &task.id)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            ExecutionRepo::list_by_task(
+                &*state.db,
+                &task.id,
+                PageRequest {
+                    cursor: None,
+                    limit: 10,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc
+                }
+            )
+            .await
+            .unwrap()
+            .items
+            .len(),
+            1
+        );
+        sqlx::query("UPDATE agent_identity SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&agent.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        assert!(state
+            .db
+            .list_agents_usable_in_project(&task.project_id, "mcp-test-user")
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == agent.id));
+        sqlx::query("UPDATE project SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&task.project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE execution SET status='completed' WHERE id=?")
+            .bind(&execution)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        call_tool(
+            &state,
+            "forge_assign_agent",
+            json!({"task_id":task.id,"agent_id":agent.id}),
+        )
+        .await;
+    });
+}
+
+#[test]
+fn scoped_dependency_listing_never_names_a_foreign_id_loaded_from_storage() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let foreign = seed_task(&state).await;
+        TaskDependencyRepo::add_dependency(&*state.db, &task.id, &foreign.id, &now_rfc3339())
+            .await
+            .unwrap();
+        let context = McpContext {
+            user_id: Some("mcp-test-user".into()),
+            project_id: Some(task.project_id.clone()),
+        };
+        let error = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({"name":"forge_list_task_dependencies","arguments":{"task_id":task.id}}),
+        )
+        .await
+        .unwrap_err();
+        let error = error.into_response(Value::Null).error.unwrap();
+        assert_eq!(error.code, -32004);
+        assert_eq!(error.message, format!("task not found: {}", task.id));
+        assert!(!serde_json::to_string(&error).unwrap().contains(&foreign.id));
+    });
+}
+
+#[test]
+fn transition_and_get_project_actions_use_the_same_delegated_actor() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let changed = call_tool(
+            &state,
+            "forge_transition_task",
+            json!({"task_id":task.id,"status":"in_progress","version":task.version}),
+        )
+        .await;
+        let read = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+        let actor =
+            api_types::Actor::delegated_user("mcp-test-user", api_types::UserActionSource::Api);
+        let snapshot = state
+            .task_service
+            .task_action_snapshot(&task.id, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            changed["available_actions"],
+            json!(services::available_actions(&snapshot))
+        );
+        assert_eq!(changed["available_actions"], read["available_actions"]);
     });
 }

@@ -95,7 +95,13 @@ pub(super) async fn forge_create_task(
         .as_ref()
         .is_some_and(|parent| params.depends_on_ids.contains(parent))
     {
-        return Err(invalid_field_error("depends_on_ids", "must not contain parent_task_id; parentage shares a workspace, dependencies gate execution", Some(json!({"type":"array","items":{"type":"string"},"uniqueItems":true,"excludes":"parent_task_id"}))));
+        return Err(invalid_field_error(
+            "depends_on_ids",
+            "must not contain parent_task_id; parentage shares a workspace, dependencies gate execution",
+            Some(
+                json!({"type":"array","items":{"type":"string"},"uniqueItems":true,"excludes":"parent_task_id"}),
+            ),
+        ));
     }
     if ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
@@ -160,7 +166,14 @@ pub(super) async fn forge_create_task(
 pub(super) async fn forge_create_sub_tasks(
     state: &AppState,
     params: CreateSubTasksParams,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    for subtask in &params.subtasks {
+        if let Some(agent_id) = &subtask.assignee_id {
+            super::registry::require_task_agent(state, &params.parent_task_id, agent_id, context)
+                .await?;
+        }
+    }
     let inputs = params
         .subtasks
         .into_iter()
@@ -500,7 +513,9 @@ pub(super) async fn forge_memory_get(
 pub(super) async fn forge_assign_agent(
     state: &AppState,
     params: AssignAgentParams,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    super::registry::require_task_agent(state, &params.task_id, &params.agent_id, context).await?;
     let assignment = state
         .task_service
         .assign_agent_to_task(&params.task_id, &params.agent_id)
@@ -606,6 +621,7 @@ pub(super) async fn forge_update_task(
 pub(super) async fn forge_transition_task(
     state: &AppState,
     params: TransitionTaskParams,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     // The transition runs under the workflow policy of the MCP system
     // component, as it always has: defined edges only, dependency and
@@ -627,17 +643,22 @@ pub(super) async fn forge_transition_task(
             },
         )
         .await?;
-    transition_task_value(state, task.task, task.pending_steps).await
+    let actor = Actor::delegated_user(
+        authenticated_user(context)?,
+        api_types::UserActionSource::Api,
+    );
+    transition_task_value(state, task.task, task.pending_steps, &actor).await
 }
 
 async fn transition_task_value(
     state: &AppState,
     task: db::Task,
     pending_steps: i64,
+    actor: &Actor,
 ) -> Result<Value, McpToolError> {
     let snapshot = state
         .task_service
-        .task_action_snapshot_for_task(task, &Actor::user(api_types::UserActionSource::Api))
+        .task_action_snapshot_for_task(task, actor)
         .await?;
     let mut value = task_snapshot_value(snapshot)?;
     value["pending_steps"] = json!(pending_steps);
@@ -858,7 +879,14 @@ pub(super) async fn forge_update_project_lifecycle_hooks(
 pub(super) async fn forge_follow_up_execution(
     state: &AppState,
     params: FollowUpExecutionParams,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    if let Some(agent_id) = &params.agent_id {
+        let execution = ExecutionRepo::get_by_id(&*state.db, &params.execution_id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("execution", params.execution_id.clone()))?;
+        super::registry::require_task_agent(state, &execution.task_id, agent_id, context).await?;
+    }
     let overrides = params.overrides.map(|o| ExecutionOverrides {
         model_id: o.model_id,
         reasoning_effort: o.reasoning_effort,
@@ -1900,7 +1928,14 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        let value = transition_task_value(&state, committed, 1).await.unwrap();
+        let value = transition_task_value(
+            &state,
+            committed,
+            1,
+            &Actor::delegated_user("mcp-test-user", api_types::UserActionSource::Api),
+        )
+        .await
+        .unwrap();
         assert_eq!(value["status"], "todo");
         assert_eq!(value["version"], 1);
         assert_eq!(value["pending_steps"], 1);

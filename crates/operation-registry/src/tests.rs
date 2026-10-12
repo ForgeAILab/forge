@@ -11,6 +11,7 @@ fn catalog_is_complete_unique_and_deterministic() {
         registered_reads().len()
             + main_proposals::IDS.len()
             + project_proposals::IDS.len()
+            + project_commands::IDS.len()
             + legacy_proposals::IDS.len()
             + hand_proposals::IDS.len()
             + task_records::IDS.len()
@@ -117,6 +118,7 @@ fn contract_lines_are_generated_from_the_spec() {
             "project.charter: no arguments",
             "project.current_state: {limit?}",
             "project.observations: {limit?, task_id?}",
+            "project.summary: {project_id?}",
             "repo.integration_queue: {limit?, target_branch?}",
             "skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
             "task.summary: no arguments",
@@ -214,6 +216,9 @@ impl RecordingContext {
 impl scope_reads::ScopeReadContext<&'static str> for RecordingContext {
     async fn account_summary(&self, _: NoArguments) -> Result<Value, &'static str> {
         self.record("account.summary")
+    }
+    async fn project_summary(&self, _: scope_reads::ProjectSummary) -> Result<Value, &'static str> {
+        self.record("project.summary")
     }
     async fn chat_summary(&self, _: NoArguments) -> Result<Value, &'static str> {
         self.record("agent_chat.summary")
@@ -1273,4 +1278,72 @@ async fn task_command_contracts_decode_hand_shapes_and_dispatch_every_variant() 
         }
     }
     assert_eq!(context.0.lock().unwrap().len(), 7);
+}
+
+#[async_trait::async_trait]
+impl project_commands::ProjectCommandContext<&'static str> for RecordingContext {
+    async fn charter_adoption(
+        &self,
+        _: project_commands::CharterAdoption,
+    ) -> Result<Value, &'static str> {
+        self.record("project.charter.adoption")
+    }
+    async fn project_evidence(&self, _: project_commands::Evidence) -> Result<Value, &'static str> {
+        self.record("project.evidence")
+    }
+    async fn readiness(&self, _: project_commands::Readiness) -> Result<Value, &'static str> {
+        self.record("project.readiness")
+    }
+}
+
+#[tokio::test]
+async fn receipt_project_commands_have_one_typed_contract_and_dispatch() {
+    let hand: Value = serde_json::from_str(include_str!("../tests/hand_inputs.json")).unwrap();
+    let mut adoption = hand["charter.draft"].clone();
+    adoption["action"] = json!("draft_revision");
+    adoption["expected_charter_version"] = json!(0);
+    for field in [
+        "genesis_session_id",
+        "change_summary",
+        "source_refs",
+        "content_digest",
+        "render_digest",
+    ] {
+        adoption.as_object_mut().unwrap().remove(field);
+    }
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    let catalog = proposal_catalog();
+    for (id, input) in [
+        ("project.charter.adoption", adoption),
+        (
+            "project.evidence",
+            json!({"action":"attach","milestone_id":"m","expected_milestone_version":1,"asset_id":"a","checksum":"sum","acceptance_check_ids":["check"],"caption":"Proof","kind":"log"}),
+        ),
+        (
+            "project.readiness",
+            json!({"action":"evaluate","milestone_id":"m","milestone_version":1}),
+        ),
+    ] {
+        let spec = catalog.lookup(id).unwrap();
+        assert!(spec.receipt_replay);
+        assert!(
+            jsonschema::validator_for(&spec.canonical_schema())
+                .unwrap()
+                .is_valid(&input),
+            "{id}"
+        );
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            id
+        );
+        let mut invalid = input;
+        invalid["foreign_scope"] = json!("foreign");
+        assert!(spec.dispatch(&context, invalid).await.is_err(), "{id}");
+    }
+    let all = registered_operations();
+    assert_eq!(
+        all.iter().collect::<BTreeSet<_>>().len(),
+        all.len(),
+        "no cross-catalog collision"
+    );
 }

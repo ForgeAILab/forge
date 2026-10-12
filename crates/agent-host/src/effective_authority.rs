@@ -37,13 +37,7 @@ pub fn authority_bound_provider(
     })
 }
 impl AuthorityBoundProvider {
-    async fn check(
-        &self,
-        actor: &str,
-        scope: &CanonicalScope,
-        operation: &str,
-        fresh_effect: bool,
-    ) -> Result<(), AgentHostError> {
+    fn assert_context(&self, actor: &str, scope: &CanonicalScope) -> Result<(), AgentHostError> {
         let scope_type = match scope.scope_type {
             crate::CanonicalScopeType::Account => "account",
             crate::CanonicalScopeType::Project => "project",
@@ -55,12 +49,6 @@ impl AuthorityBoundProvider {
                 "invocation scope differs from admitted authority".into(),
             ));
         }
-        let spec = operation_registry::READ_CATALOG
-            .lookup(operation)
-            .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation));
-        let Some(spec) = spec else {
-            return Ok(());
-        };
         let identity = match &self.admitted.principal {
             operation_registry::authority::Principal::MainAgent { identity_id }
             | operation_registry::authority::Principal::ProjectAgent { identity_id, .. }
@@ -78,6 +66,22 @@ impl AuthorityBoundProvider {
                 "invocation identity differs from admitted authority".into(),
             ));
         }
+        Ok(())
+    }
+    async fn check(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        fresh_effect: bool,
+    ) -> Result<(), AgentHostError> {
+        self.assert_context(actor, scope)?;
+        let Some(spec) = operation_registry::READ_CATALOG
+            .lookup(operation)
+            .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+        else {
+            return Ok(());
+        };
         let current = if fresh_effect {
             let current = if let operation_registry::authority::Principal::TaskAgent {
                 runtime_session_id: Some(runtime),
@@ -205,6 +209,25 @@ impl ForgeToolProvider for AuthorityBoundProvider {
             .read_admitted(actor, scope, operation, arguments, &authority)
             .await
     }
+    async fn replay_proposal(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: &Value,
+    ) -> Result<Option<Value>, AgentHostError> {
+        self.assert_context(actor, scope)?;
+        if operation_registry::PROPOSAL_CATALOG
+            .lookup(operation)
+            .is_some_and(|spec| spec.receipt_replay)
+        {
+            self.inner
+                .replay_proposal(actor, scope, operation, arguments)
+                .await
+        } else {
+            Ok(None)
+        }
+    }
     async fn proposal_denial(
         &self,
         actor: &str,
@@ -243,6 +266,12 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
+        if let Some(result) = self
+            .replay_proposal(actor, scope, operation, &arguments)
+            .await?
+        {
+            return Ok(result);
+        }
         self.check(actor, scope, operation, true).await?;
         let authority = self
             .remaining
@@ -263,6 +292,12 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
+        if let Some(result) = self
+            .replay_proposal(actor, scope, operation, &arguments)
+            .await?
+        {
+            return Ok(result);
+        }
         self.check(actor, scope, operation, true).await?;
         let authority = self
             .remaining
