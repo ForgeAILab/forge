@@ -3725,7 +3725,15 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             .fetch_all(world.db.pool())
             .await
             .unwrap();
-            let consumers: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            /// Origin, request key, run, result, cancelled at.
+            type Consumer = (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let consumers: Vec<Consumer> = sqlx::query_as(
                 "SELECT origin,request_key,run_id,result_id,cancelled_at FROM check_consumer WHERE task_id='evidence' ORDER BY created_at",
             )
             .fetch_all(world.db.pool())
