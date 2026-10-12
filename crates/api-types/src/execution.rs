@@ -39,7 +39,7 @@ pub struct ExecutionInterruptionResponse {
 }
 
 /// The closed set of Task condition commands. Session launches use the session API.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "verb", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export, tag = "verb", rename_all = "snake_case")]
 pub enum TaskAction {

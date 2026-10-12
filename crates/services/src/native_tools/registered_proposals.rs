@@ -38,6 +38,8 @@ impl CoordinationToolProvider {
                 match scope.workspace_access {
                     WorkspaceAccess::AccountScratch => "account_scratch",
                     WorkspaceAccess::ProjectVerify => "project_verify",
+                    WorkspaceAccess::TaskRead => "task_read",
+                    WorkspaceAccess::TaskWrite => "task_write",
                     _ => "deny",
                 },
             )
@@ -212,10 +214,14 @@ impl CoordinationToolProvider {
             tracing::warn!(operation, %error, "denied proposal was not recorded");
         }
     }
+    // Independently captured caller, scope/session, operation/envelope and
+    // prepared/admission facts mirror the public provider boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn registered_proposal(
         &self,
         actor: &str,
         scope: &CanonicalScope,
+        runtime_session_id: &str,
         operation: &str,
         mut arguments: Value,
         prepared: bool,
@@ -223,6 +229,24 @@ impl CoordinationToolProvider {
     ) -> Result<Value, AgentHostError> {
         // Current authority precedes every payload diagnostic. Stored preparations
         // keep their exact arguments; only fresh calls consult the current spec.
+        let resolved;
+        let admitted_authority =
+            if scope.scope_type == CanonicalScopeType::Task && admitted_authority.is_none() {
+                resolved = self
+                    .db
+                    .resolve_task_effective_authority(
+                        actor,
+                        None,
+                        &scope.scope_id,
+                        workspace_access_name(scope.workspace_access),
+                        runtime_session_id,
+                    )
+                    .await
+                    .map_err(|_| AgentHostError::ProtectedPersistence)?;
+                Some(&resolved)
+            } else {
+                admitted_authority
+            };
         if let Some(admitted) = admitted_authority {
             self.main_proposal_binding(actor, scope, operation).await?;
             self.evaluate_registered_authority(
@@ -243,6 +267,15 @@ impl CoordinationToolProvider {
             ));
         }
         let spec = CATALOG.lookup(operation).expect("registered proposal");
+        if !prepared
+            && operation_registry::task_records::IDS
+                .iter()
+                .chain(operation_registry::task_proposals::IDS)
+                .any(|id| *id == operation)
+            && arguments.get("causation_depth").is_some_and(Value::is_null)
+        {
+            arguments.as_object_mut().unwrap().remove("causation_depth");
+        }
         if !prepared {
             const FIELDS: &[&str] = &[
                 "operation",
@@ -302,6 +335,7 @@ impl CoordinationToolProvider {
             actor_identity_id: actor,
             scope,
             proposal_arguments: Some(&arguments),
+            runtime_session_id: Some(runtime_session_id),
             admitted_authority,
         };
         spec.dispatch_prepared(&context, payload)

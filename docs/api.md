@@ -5207,9 +5207,8 @@ tool error the model can correct in the same turn, naming the operation, the
 field and the expected contract, for example ``skill.section: argument
 `section` is required; expected skill.section: {section: one of ...}``. The
 remaining read operations retain their current schemas and validation.
-Provider-wrapped `parameters` calls still normalize before validation. MCP
-Task/Project schemas remain unchanged; the account, identity and Chat MCP
-projection below derives schemas and strict typed decoding from the registry.
+Provider-wrapped `parameters` calls still normalize before validation. All MCP
+descriptors below derive schemas and strict typed decoding from the registry.
 
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
@@ -5391,33 +5390,32 @@ Project/Chat/handoff/Task references remain restricted to that same bound
 Project. The credential acts as the authenticated delegated user, not the
 bound Project Agent.
 
-The account, identity, Agent binding, Chat and handoff tools use typed contracts
-in `operation-registry::mcp`. Each description is one generated summary line
+All 43 MCP tools use typed contracts in `operation-registry::mcp`. Each description is one generated summary line
 with the admitted fields. Names and result shapes are unchanged. Unknown fields
-on these 18 tools map to one `-32602` contract error. The in-band result has
+on any tool map to one `-32602` contract error. The in-band result has
 `structuredContent.code = "validation_error"` and bounded `details` carrying
 `code = "mcp_contract_invalid"`, the operation name and the expected contract. A
 mistyped value is described by its JSON type and never quoted back. Arguments
-must be a JSON object. The
-registry checks delegated authority before reporting contract details. Required
+must be a JSON object. The registry checks delegated authority before reporting contract details. Required
 integer arguments retain MCP's strict JSON integer spelling; native integer
 coercions do not apply.
 
-The same evaluator determines the moved tools' connection-level advertisement
+The same evaluator determines every tool's connection-level advertisement
 and call admission. For a Project-constrained grant it loads the bound Project's
 current role on each list/call; a global administrator does not acquire a Project
 role through that status alone:
 
-| Grant / role | Moved tools offered |
+| Grant / role | Tools offered |
 |---|---|
-| Account grant | All 18 names; each referenced identity, Project, Chat and handoff is authorized on call |
-| Project owner or Project `owner` / `admin` member | All ten Project-classified moved tools |
-| Project ordinary member | Those ten except `forge_set_project_agent` |
-| Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
-| Project not visible to the user | No moved tools |
+| Account grant | 40 names; memory reads and escalation require a bound Project; references are authorized on call |
+| Exact Project owner | All 35 Project-classified names |
+| Project `owner` / `admin` member, without exact ownership | 34 names; escalation requires `project.owner_id` |
+| Project ordinary member | 33 names; no binding setter or escalation |
+| Visible Project without owner/member authority | 26 names: the 24 Task/Project visibility APIs (including memory and integration queue), `forge_list_projects`, and `forge_list_agent_chats`; no escalation or member-only identity/Chat/handoff tools |
+| Project not visible to the user | No tools |
 
-`forge_get_integration_queue` is a nineteenth registry-built tool, added with
-the merge-queue reads rather than moved: Project-classified, and offered to
+`forge_get_integration_queue` was added with the merge-queue reads rather
+than moved from a hand-written descriptor: Project-classified, and offered to
 every grant whose Project is visible to the user (the rule of `GET
 /api/v1/repos/{id}/integration-queues`), with or without owner/member
 authority. An account grant names the Project; a Project the user cannot see
@@ -5431,10 +5429,14 @@ account administrators and only the existing null no-op to other users.
 Its conditional field authority is also evaluated before
 contract decoding; a non-null value from a non-admin still returns `-32003`
 `admin_required`. A null or omitted daemon field retains its former meaning.
-The 24 unmoved Task/Project descriptors and their grant filtering retain the
-base behavior, including `forge_project_escalate`'s separate owner check.
+All 24 Task/Project tools now use the same projection. Memory tools and
+`forge_project_escalate` are omitted/refused for account grants. Escalation is
+also omitted/refused for any user other than the exact Project owner, even an
+`owner` or `admin` member. The service rechecks ownership in its transaction.
+Other Task/Project tools retain the existing Project-visibility admission rule;
+this change does not add a member-only write policy.
 
-A role denial on a moved tool is `-32001` with `data.code = "mcp_scope_denied"`
+A role denial on a catalog tool is `-32001` with `data.code = "mcp_scope_denied"`
 for both grant kinds. A reference the user may not use answers exactly like a
 missing one: an identity or session of another account is `-32004`
 (`agent_identity not found` / `agent_session not found`, naming only the id
@@ -5460,6 +5462,45 @@ refuse protected embedded registration and malformed permission documents.
 non-negative constraint. `forge_list_agent_chats` and
 `forge_list_agent_handoffs` retain their reserved, ignored `cursor` / `limit`
 fields and return all authorized records, with their existing result shapes.
+
+Task/Project contracts also refuse unknown root fields, unknown child fields,
+unknown execution override fields, and unknown lifecycle-hook fields. Optional
+nulls retain their existing omission meaning except `forge_create_task`'s
+`parent_task_id`, `priority`, and `type`, which still require non-null values if
+present. `forge_list_tasks.status` accepts a comma-separated string, an array
+of strings, or null; workflow state names are open strings on both Task listing
+and transition. `sort_by` includes the already accepted `board_position`.
+Memory `layer` advertises 1, 2, or 3; unsigned memory limits/budgets and positive
+follow-up deadlines advertise their decoder bounds. `settings` remains opaque
+JSON at the wire boundary; shared settings validation still requires a valid
+Project settings document.
+
+Task `action` and lifecycle-hook schemas advertise portable discriminator/field
+unions rather than conditional schemas. Exact variant fields are enforced by
+typed decoding: `send_back` requires `guidance`; only `retry` accepts
+`fresh_session`, `refresh_workspace`, and `reset_budget`, along with optional
+`guidance`; only
+`approve` accepts `override`. Optional action parameters accept null. Always
+copy a currently offered `available_actions` command and its meaningful
+parameters. Hook discriminators remain `script` and `plugin`, and lifecycle
+event names remain the five existing names.
+
+`forge_transition_task` keeps its MCP system attribution
+(`triggered_by="system"`) and the workflow policy that goes with it: only
+edges the workflow defines, with the dependency and conflict-marker gates
+enforced and no user override. `forge_task_action` keeps its delegated-user
+actor. Both Project settings tools pass the authenticated user to shared
+validation, so assigned agents must be usable by that user in the Project,
+just as on REST. Task reads retain their typed integration summaries and
+current `available_actions`; queue and offer eligibility are unchanged.
+
+A Task, parent, dependency, sub-task or Execution id outside what the
+credential may use answers `-32004` exactly like an id that does not exist,
+naming only the id that was sent: a Project-constrained credential cannot tell
+a Task of another Project from a missing one (even in a Project its user can
+see), and an Execution of such a Task is `execution not found`, never the Task
+behind it. A `project_id` other than the bound Project is refused the same way
+whether or not that Project exists.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and
@@ -6294,8 +6335,77 @@ runner; the `checks` section of the status (above) is its operator summary.
 Review `details.execution.integration_checks` contains the newest 64 head-check
 results recorded by integration Task steps. Each result names its attempt,
 commit, consumer, run, result and check identity, plus command-shaped `ci_steps`
-evidence. `source` is `executed`, `cache_hit`, or `review_authority` (the already
-passed Review's result under a frozen or unattested policy). These records
+evidence. `source` says how the head came by the result: `executed` (a run
+scheduled for this head: a rebased commit), `cache_hit` (the head was recorded
+as a second consumer of a certified passed run of the same commit, target,
+commands and environment, normally the Review's own entry check), or
+`review_authority` (the passed Review's entry result itself, when its policy is
+frozen or unattested and so not reusable by anyone else). These records
 preserve the Review's original CI and conformance evidence and grant no new
 review authority. An unchanged reviewed commit launches no second check run;
-a rebased commit runs its own check. Older rows may have `execution: null`.
+a rebased commit runs its own check. The record is added to the Task's newest
+Review. A Task that reached its merge state with no Review gets none: a check
+result never creates a Review, and its verdict is on the integration attempt.
+Older rows may have `execution: null`.
+
+### Native Task registry contracts (3.8 F)
+
+The existing `forge_scope_read` and `forge_scope_propose` tool names remain.
+Task reads have closed per-operation arguments: `task.summary` accepts `{}`;
+`work.read`, `events.read`, `inbox.read`, `commitments.read`, `delivery.read`
+accept optional `limit`; `memory.read` and `decisions.read` accept optional
+`query` and `limit`. Null optional values retain their default meaning. Work
+limits clamp to 1–50 rows; memory limits clamp to 1–20 rows and queries truncate
+to 512 characters. A foreign field or a non-object argument is refused.
+
+`task.plan` requires `action: "write"`. `task.worklog` and `task.evidence`
+each have one action (`append`, `capture`); it may be sent, omitted or null, as
+before. Unknown payload fields are refused, so a payload cannot name an
+execution, role or identity. All three are written under the one running
+execution of the calling session's identity and role on that Task: a call with
+no such execution, or with more than one, is refused and writes nothing. The
+execution's recorded session id is not compared, so a resumed execution keeps
+working after its Task session is recreated. A `task.worklog` retried with the
+same `correlation_id` and the same entry returns the first entry; the same
+`correlation_id` with a different entry is refused (send a new one).
+`task.evidence` has no idempotency key: each accepted call stores an asset. Plan content is limited to 1,048,576 UTF-8 bytes,
+with a Markdown checklist; summary is limited to 4,000 characters. Evidence
+accepts custom nonempty kind strings, stores them as `other` with the label
+retained, and requires exactly one nonblank `path` or `content`. Path evidence
+is read from the execution's workspace (the Task's when the execution recorded
+none). Evidence results also identify the
+execution and role. These observations are not validation attestations.
+
+Planner and implementation Task sessions can write a plan. Reviewer sessions
+can record worklogs/evidence and cannot write a plan. No Task session can apply
+a workflow action. Native Task sessions exist for the `worker`/`coder`,
+`reviewer` and `planner` roles only, as before.
+
+Ready Project Agents use typed `task.propose`, `task.adaptive`,
+`task.dependency`, and `task.action`. `task.propose` has no `action: create`
+field: that field was advertised but its decoder rejected it. The contract
+includes the decoder's existing parentage, configuration, assignment, governance
+and traceability fields. Requirement ownership remains explicit through
+`review_requirement_ids`. These commands still use the existing domain
+transactions and receipt replay.
+
+Native Project `work.read` returns `action_schema` beside each Task's
+`available_actions` and version. The schema comes from those offers, including
+allowed boolean values and presets; copy an offered verb and parameters and
+supply that version to `task.action`. The eight names remain `start`, `hold`,
+`release`, `retry`, `send_back`, `approve`, `restart`, `cancel`. Agents cannot
+set `approve.override=true`. Task-run work reads mark offers informational and
+return a null action schema; displaying an offer grants no command capability.
+
+The canonical proposal envelope requires nonblank string `dedupe_key` and
+`correlation_id`. Optional `causation_id` can be null. For Task operations,
+explicit null `causation_depth` is normalized as omission (depth zero), matching
+the former handler. Flat Task fields and provider `parameters` wrapping still
+normalize to the canonical envelope. Stored preparations retain their original
+arguments on replay. REST and MCP shapes are unchanged by this native migration.
+
+Fresh native Hold/Cancel calls require a current offer and version. An unoffered
+terminal command returns `action_unavailable` instead of reporting a successful
+no-op. Commands admitted before integration completed retain their existing
+queued no-op settlement behavior. Project read-only or setup sessions also mark
+workflow offers informational and omit an executable action schema.

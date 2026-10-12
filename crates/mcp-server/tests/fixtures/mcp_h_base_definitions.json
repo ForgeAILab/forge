@@ -495,22 +495,16 @@
       "name": "forge_transition_task"
     },
     {
-      "description": "Register an account-owned agent executor from account-scoped MCP. Pinning a daemon requires an administrator.",
+      "description": "Register an executor. {daemon_id?,executor_type,name}",
       "inputSchema": {
         "properties": {
           "daemon_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "executor_type": {
-            "enum": [
-              "shell",
-              "codex",
-              "claude_code",
-              "cursor",
-              "gemini",
-              "opencode",
-              "smith"
-            ],
             "type": "string"
           },
           "name": {
@@ -518,56 +512,75 @@
           }
         },
         "required": [
-          "name",
-          "executor_type"
+          "executor_type",
+          "name"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_register_agent"
     },
     {
-      "description": "List the authenticated account's agents plus global agents from account-scoped MCP.",
+      "description": "List executors. {cursor?,limit?,status?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "status": {
             "enum": [
               "idle",
               "busy",
               "error",
-              "offline"
+              "offline",
+              null
             ],
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agents"
     },
     {
-      "description": "List projects.",
+      "description": "List Projects. {cursor?,limit?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_projects"
     },
     {
-      "description": "Create a project owned by the authenticated MCP user. The creator is atomically added as the Project owner and can immediately manage Project-local resources.",
+      "description": "Create an owned Project. {name}",
       "inputSchema": {
         "properties": {
           "name": {
@@ -577,7 +590,8 @@
         "required": [
           "name"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_create_project"
     },
@@ -902,7 +916,7 @@
       "name": "forge_reorder_sub_tasks"
     },
     {
-      "description": "List immutable executable profiles for an account-owned agent identity. Protected credentials are never returned.",
+      "description": "List owned profiles. {identity_id}",
       "inputSchema": {
         "properties": {
           "identity_id": {
@@ -912,12 +926,13 @@
         "required": [
           "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_profiles"
     },
     {
-      "description": "List scope-bound sessions for an account-owned agent identity without exposing protected session state.",
+      "description": "List owned sessions. {identity_id}",
       "inputSchema": {
         "properties": {
           "identity_id": {
@@ -927,12 +942,13 @@
         "required": [
           "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_sessions"
     },
     {
-      "description": "Get one scope-bound agent session without exposing protected runtime state or credentials.",
+      "description": "Get an owned session. {session_id}",
       "inputSchema": {
         "properties": {
           "session_id": {
@@ -942,26 +958,26 @@
         "required": [
           "session_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_agent_session"
     },
     {
-      "description": "Inspect the account's singular Main Agent binding and setup state. The authenticated MCP account supplies authority.",
+      "description": "Get the Main binding. no arguments",
       "inputSchema": {
         "properties": {},
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_main_agent"
     },
     {
-      "description": "Propose replacement of the account's singular Main Agent binding using optimistic concurrency.",
+      "description": "Replace the Main binding. {autonomy_policy?,expected_version,identity_id}",
       "inputSchema": {
         "properties": {
-          "autonomy_policy": {
-            "type": "object"
-          },
+          "autonomy_policy": {},
           "expected_version": {
             "type": "integer"
           },
@@ -970,15 +986,16 @@
           }
         },
         "required": [
-          "identity_id",
-          "expected_version"
+          "expected_version",
+          "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_set_main_agent"
     },
     {
-      "description": "Inspect the singular Project Agent binding for an authorized Project.",
+      "description": "Read binding. {project_id}",
       "inputSchema": {
         "properties": {
           "project_id": {
@@ -988,26 +1005,23 @@
         "required": [
           "project_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_project_agent"
     },
     {
-      "description": "Propose replacement of a Project's singular Project Agent binding using optimistic concurrency.",
+      "description": "Replace binding. {autonomy_policy?,expected_version,identity_id,permission_ceiling?,project_id,subscriptions?,wake_budget?}",
       "inputSchema": {
         "properties": {
-          "autonomy_policy": {
-            "type": "object"
-          },
+          "autonomy_policy": {},
           "expected_version": {
             "type": "integer"
           },
           "identity_id": {
             "type": "string"
           },
-          "permission_ceiling": {
-            "type": "object"
-          },
+          "permission_ceiling": {},
           "project_id": {
             "type": "string"
           },
@@ -1018,58 +1032,74 @@
             "type": "array"
           },
           "wake_budget": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
-          "project_id",
+          "expected_version",
           "identity_id",
-          "expected_version"
+          "project_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_set_project_agent"
     },
     {
-      "description": "Read the merge queues of an authorized Project's repository, one per target branch: the queue state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position, wait reason, action hint and timings.",
+      "description": "Read the merge queues of a Project's repository: who is merging, who waits, and why. {limit?,project_id,target_branch?}",
       "inputSchema": {
         "properties": {
           "limit": {
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "project_id": {
             "type": "string"
           },
           "target_branch": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "project_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_integration_queue"
     },
     {
-      "description": "List the authenticated account's Main chat and authorized Project Agent chats; no Room or arbitrary thread is exposed.",
+      "description": "List all. {cursor?,limit?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_chats"
     },
     {
-      "description": "Inspect one authorized Agent Chat and redaction-safe turn state.",
+      "description": "Read Chat. {chat_id}",
       "inputSchema": {
         "properties": {
           "chat_id": {
@@ -1079,36 +1109,47 @@
         "required": [
           "chat_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_agent_chat"
     },
     {
-      "description": "List immutable messages for one authorized Agent Chat, including bounded provenance and handoff references.",
+      "description": "Read messages. {before_sequence?,chat_id,cursor?,limit?}",
       "inputSchema": {
         "properties": {
           "before_sequence": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "chat_id": {
             "type": "string"
           },
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
           "chat_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_chat_messages"
     },
     {
-      "description": "Send one user message to an authorized singular Agent Chat. Forge admits the responder and turn from the bound scope.",
+      "description": "Send message. {chat_id,content,dedupe_key?}",
       "inputSchema": {
         "properties": {
           "chat_id": {
@@ -1118,26 +1159,36 @@
             "type": "string"
           },
           "dedupe_key": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "chat_id",
           "content"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_send_agent_chat_message"
     },
     {
-      "description": "List immutable Main-to-Project handoff records for an authorized Project.",
+      "description": "List all. {cursor?,limit?,project_id}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "project_id": {
             "type": "string"
@@ -1146,12 +1197,13 @@
         "required": [
           "project_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_handoffs"
     },
     {
-      "description": "Inspect one authorized handoff's bounded content, provenance, and delivery outcome.",
+      "description": "Read handoff. {handoff_id,project_id}",
       "inputSchema": {
         "properties": {
           "handoff_id": {
@@ -1162,15 +1214,16 @@
           }
         },
         "required": [
-          "project_id",
-          "handoff_id"
+          "handoff_id",
+          "project_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_agent_handoff"
     },
     {
-      "description": "Publish a bounded, deduplicated Main-to-Project handoff. Forge guards content and derives target authority from the authenticated scope.",
+      "description": "Publish handoff. {content,dedupe_key,project_id,source_message_id?,source_turn_job_id?}",
       "inputSchema": {
         "properties": {
           "content": {
@@ -1183,18 +1236,25 @@
             "type": "string"
           },
           "source_message_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source_turn_job_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "project_id",
           "content",
-          "dedupe_key"
+          "dedupe_key",
+          "project_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_create_agent_handoff"
     }
@@ -1692,22 +1752,16 @@
       "name": "forge_transition_task"
     },
     {
-      "description": "Register an account-owned agent executor from account-scoped MCP. Pinning a daemon requires an administrator.",
+      "description": "Register an executor. {daemon_id?,executor_type,name}",
       "inputSchema": {
         "properties": {
           "daemon_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "executor_type": {
-            "enum": [
-              "shell",
-              "codex",
-              "claude_code",
-              "cursor",
-              "gemini",
-              "opencode",
-              "smith"
-            ],
             "type": "string"
           },
           "name": {
@@ -1715,56 +1769,75 @@
           }
         },
         "required": [
-          "name",
-          "executor_type"
+          "executor_type",
+          "name"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_register_agent"
     },
     {
-      "description": "List the authenticated account's agents plus global agents from account-scoped MCP.",
+      "description": "List executors. {cursor?,limit?,status?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "status": {
             "enum": [
               "idle",
               "busy",
               "error",
-              "offline"
+              "offline",
+              null
             ],
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agents"
     },
     {
-      "description": "List projects.",
+      "description": "List Projects. {cursor?,limit?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_projects"
     },
     {
-      "description": "Create a project owned by the authenticated MCP user. The creator is atomically added as the Project owner and can immediately manage Project-local resources.",
+      "description": "Create an owned Project. {name}",
       "inputSchema": {
         "properties": {
           "name": {
@@ -1774,7 +1847,8 @@
         "required": [
           "name"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_create_project"
     },
@@ -2095,7 +2169,7 @@
       "name": "forge_reorder_sub_tasks"
     },
     {
-      "description": "List immutable executable profiles for an account-owned agent identity. Protected credentials are never returned.",
+      "description": "List owned profiles. {identity_id}",
       "inputSchema": {
         "properties": {
           "identity_id": {
@@ -2105,12 +2179,13 @@
         "required": [
           "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_profiles"
     },
     {
-      "description": "List scope-bound sessions for an account-owned agent identity without exposing protected session state.",
+      "description": "List owned sessions. {identity_id}",
       "inputSchema": {
         "properties": {
           "identity_id": {
@@ -2120,12 +2195,13 @@
         "required": [
           "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_sessions"
     },
     {
-      "description": "Get one scope-bound agent session without exposing protected runtime state or credentials.",
+      "description": "Get an owned session. {session_id}",
       "inputSchema": {
         "properties": {
           "session_id": {
@@ -2135,26 +2211,26 @@
         "required": [
           "session_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_agent_session"
     },
     {
-      "description": "Inspect the account's singular Main Agent binding and setup state. The authenticated MCP account supplies authority.",
+      "description": "Get the Main binding. no arguments",
       "inputSchema": {
         "properties": {},
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_main_agent"
     },
     {
-      "description": "Propose replacement of the account's singular Main Agent binding using optimistic concurrency.",
+      "description": "Replace the Main binding. {autonomy_policy?,expected_version,identity_id}",
       "inputSchema": {
         "properties": {
-          "autonomy_policy": {
-            "type": "object"
-          },
+          "autonomy_policy": {},
           "expected_version": {
             "type": "integer"
           },
@@ -2163,15 +2239,16 @@
           }
         },
         "required": [
-          "identity_id",
-          "expected_version"
+          "expected_version",
+          "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_set_main_agent"
     },
     {
-      "description": "Inspect the singular Project Agent binding for an authorized Project.",
+      "description": "Read binding. {project_id?}",
       "inputSchema": {
         "properties": {
           "project_id": {
@@ -2179,26 +2256,23 @@
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_project_agent"
     },
     {
-      "description": "Propose replacement of a Project's singular Project Agent binding using optimistic concurrency.",
+      "description": "Replace binding. {autonomy_policy?,expected_version,identity_id,permission_ceiling?,project_id?,subscriptions?,wake_budget?}",
       "inputSchema": {
         "properties": {
-          "autonomy_policy": {
-            "type": "object"
-          },
+          "autonomy_policy": {},
           "expected_version": {
             "type": "integer"
           },
           "identity_id": {
             "type": "string"
           },
-          "permission_ceiling": {
-            "type": "object"
-          },
+          "permission_ceiling": {},
           "project_id": {
             "type": "string"
           },
@@ -2209,55 +2283,71 @@
             "type": "array"
           },
           "wake_budget": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
-          "identity_id",
-          "expected_version"
+          "expected_version",
+          "identity_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_set_project_agent"
     },
     {
-      "description": "Read the merge queues of an authorized Project's repository, one per target branch: the queue state and why it is not open, the Task being merged, and the members in queue order with their state, phase, position, wait reason, action hint and timings.",
+      "description": "Read the merge queues of a Project's repository: who is merging, who waits, and why. {limit?,project_id?,target_branch?}",
       "inputSchema": {
         "properties": {
           "limit": {
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "project_id": {
             "type": "string"
           },
           "target_branch": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_integration_queue"
     },
     {
-      "description": "List the authenticated account's Main chat and authorized Project Agent chats; no Room or arbitrary thread is exposed.",
+      "description": "List all. {cursor?,limit?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_chats"
     },
     {
-      "description": "Inspect one authorized Agent Chat and redaction-safe turn state.",
+      "description": "Read Chat. {chat_id}",
       "inputSchema": {
         "properties": {
           "chat_id": {
@@ -2267,36 +2357,47 @@
         "required": [
           "chat_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_agent_chat"
     },
     {
-      "description": "List immutable messages for one authorized Agent Chat, including bounded provenance and handoff references.",
+      "description": "Read messages. {before_sequence?,chat_id,cursor?,limit?}",
       "inputSchema": {
         "properties": {
           "before_sequence": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "chat_id": {
             "type": "string"
           },
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
           "chat_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_chat_messages"
     },
     {
-      "description": "Send one user message to an authorized singular Agent Chat. Forge admits the responder and turn from the bound scope.",
+      "description": "Send message. {chat_id,content,dedupe_key?}",
       "inputSchema": {
         "properties": {
           "chat_id": {
@@ -2306,38 +2407,49 @@
             "type": "string"
           },
           "dedupe_key": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "chat_id",
           "content"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_send_agent_chat_message"
     },
     {
-      "description": "List immutable Main-to-Project handoff records for an authorized Project.",
+      "description": "List all. {cursor?,limit?,project_id?}",
       "inputSchema": {
         "properties": {
           "cursor": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "project_id": {
             "type": "string"
           }
         },
         "required": [],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_list_agent_handoffs"
     },
     {
-      "description": "Inspect one authorized handoff's bounded content, provenance, and delivery outcome.",
+      "description": "Read handoff. {handoff_id,project_id?}",
       "inputSchema": {
         "properties": {
           "handoff_id": {
@@ -2350,12 +2462,13 @@
         "required": [
           "handoff_id"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_get_agent_handoff"
     },
     {
-      "description": "Publish a bounded, deduplicated Main-to-Project handoff. Forge guards content and derives target authority from the authenticated scope.",
+      "description": "Publish handoff. {content,dedupe_key,project_id?,source_message_id?,source_turn_job_id?}",
       "inputSchema": {
         "properties": {
           "content": {
@@ -2368,17 +2481,24 @@
             "type": "string"
           },
           "source_message_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source_turn_job_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "content",
           "dedupe_key"
         ],
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false
       },
       "name": "forge_create_agent_handoff"
     }

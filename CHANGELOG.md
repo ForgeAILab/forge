@@ -26,7 +26,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   commit reuses a passed entry check without launching another run; a rebased
   commit is checked under its new identity. Head results appear in Review
   `details.execution.integration_checks`, with exact commit, run, result and
-  command evidence. Original CI and conformance authority stay intact.
+  command evidence. Original CI and conformance authority stay intact. The
+  queue head of an unchanged commit is recorded as a second consumer
+  (`origin = integration`) of the Review's passed run, with no run, wait or
+  applied delivery of its own; a Task with no Review gets no evidence row,
+  and a check result never creates a Review.
+
+- **A parked merge is re-bound only to a verified placement.** When the
+  machine that owns a Task's checkout reconnects under another runtime id, or
+  the Task's placement was verified under another generation, a queued or
+  parked attempt that still names the old binding is superseded by one bound
+  to the ready placement (it keeps its place in line). Before, the rebase was
+  refused as a foreign owner and the Task parked on `target_not_ready` with
+  no end. A placement that is not `ready` proves nothing: the attempt keeps
+  its binding, and the owner's Retry puts that same attempt back in line.
 
 - **The obsolete direct merge service and workspace-backend merge APIs are
   removed.** Integration effects require a queue claim and a Task-step permit.
@@ -45,6 +58,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   shadow attempt no longer suppresses import of a surviving legacy merge intent.
   The import snapshot survives hook-step pruning, including when the storage
   importer cannot yet prove whether the candidate landed.
+
+- **Native Task tools refuse fields they do not declare.** The Task reads
+  (`task.summary`, `work.read`, `events.read`, `inbox.read`,
+  `commitments.read`, `delivery.read`, `memory.read`, `decisions.read`), the
+  Task records (`task.plan`, `task.worklog`, `task.evidence`) and the Project
+  Agent's `task.action`, `task.propose`, `task.dependency` and `task.adaptive`
+  now have closed contracts on the native tools. An argument or payload field
+  that is not in the operation's contract is refused with the contract in the
+  message; it used to be ignored on the reads, the records and `task.action`
+  (for example a `task_id` argument to `task.summary`, or a field beside
+  `task_id`/`action`/`version` in a `task.action` payload). A read `limit`
+  that is negative, fractional or not a number is refused instead of replaced
+  by the default; `"10"` and `10.0` are still read as 10, and `null` still
+  means the default. REST and MCP are unchanged.
+- **A Task record needs exactly one running execution.** `task.worklog` and
+  `task.evidence` are written under the one running execution of the calling
+  session's identity and role on that Task, as `task.plan` already was. With
+  none, or with more than one, the call is refused and nothing is written. A
+  worklog entry used to take the latest running execution, or was stored with
+  no execution and role at all.
+- **A `correlation_id` reused for a different worklog entry is refused.**
+  `task.worklog` returned the first entry written under that
+  `correlation_id` and reported success, so the second entry was dropped
+  without a trace. The same entry retried under the same id still returns the
+  first one; a different entry now needs a new `correlation_id`.
+- **A native `hold` or `cancel` that is not a current offer is refused.** A
+  Project Agent's `task.action` with `hold` or `cancel` on a Task that does
+  not offer it (a Task that is already done, for example) returns
+  `action_unavailable` with the current offers, and a stale `version` returns
+  the version conflict. It used to report success and leave a "had no effect"
+  comment. A command accepted while the Task was in the merge queue still
+  settles as before when the merge lands first.
 
 - **Deleting a repository, a repo location or a Project, and changing a
   repository's default location, is refused while a merge into it is
@@ -598,6 +643,69 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   revealed that it exists). `forge_get_agent_session` answers another
   account's session as `agent_session not found: <the id sent>` instead of
   naming that account's identity id.
+- **The MCP Task and Project tools refuse undeclared arguments (3.8 slice
+  H).** All 43 MCP tools are now generated from the operation registry and
+  closed. Of the 24 Task / Project tools, `forge_create_task`,
+  `forge_reorder_sub_tasks` and `forge_project_escalate` already refused
+  unknown fields; the other 21 ignored them and now answer `-32602` with
+  `data.code = "mcp_contract_invalid"`, the operation and the expected fields.
+  Fields a client may have been sending that are now refused:
+  - `project_id` on the tools keyed by a Task or Execution id
+    (`forge_get_task`, `forge_preview_prompt`, `forge_assign_agent`,
+    `forge_task_action`, `forge_get_task_diff`, `forge_list_executions`,
+    `forge_update_task`, `forge_transition_task`, the four dependency tools,
+    `forge_create_sub_tasks`, `forge_list_sub_tasks`,
+    `forge_follow_up_execution`) and on `forge_memory_get`. It was never read
+    there, also with a Project-constrained credential;
+  - `cursor` and `limit` on `forge_list_task_dependencies`,
+    `forge_list_task_dependents`, `forge_list_sub_tasks` and
+    `forge_get_task_diff`, which return everything;
+  - `reason` and `source` on `forge_transition_task`, and `status`,
+    `assignee_id`, `parent_task_id` or `depends_on_ids` on
+    `forge_update_task` (none of them was ever applied);
+  - any field beside `task_id`, `action` and `version` on
+    `forge_task_action`, and any field beside `verb` in a `start` action (for
+    example `reason`), which was ignored while every other verb already
+    refused unknown fields;
+  - unknown fields inside `subtasks[]`, `overrides` and a lifecycle hook
+    entry.
+  Every field the old schemas advertised is still accepted, `null` still
+  stands for an omitted optional (except `parent_task_id`, `priority` and
+  `type` on `forge_create_task`, which were already refused as `null`), and
+  integers keep their strict JSON spelling. Malformed input on
+  `forge_create_task` and `forge_follow_up_execution` now gets the same
+  `mcp_contract_invalid` correction instead of their hand-written field
+  messages.
+- **`tools/list` offers a Task / Project tool only where a call can succeed
+  (3.8 slice H).** An account credential no longer lists
+  `forge_memory_search`, `forge_memory_get` or `forge_project_escalate` (40
+  tools instead of 43): all three need a Project-constrained credential and
+  were refused on every call. `forge_project_escalate` is listed only for the
+  exact Project owner (`project.owner_id`), not for an `owner` / `admin`
+  member, who was likewise always refused. A credential constrained to a
+  Project its user cannot see lists no tools. Calling an omitted tool answers
+  `-32001` with `data.code = "mcp_scope_denied"` (in-band `policy_denied`)
+  before its arguments are read; these calls used to fail with `-32602` or
+  `-32004`. Nothing that worked is removed: every other Task / Project tool
+  keeps the rule it had, a Project visible to the user, with no new
+  member-only write rule.
+- **A Project-constrained MCP credential cannot tell a Task of another Project
+  from a missing one (3.8 slice H).** A `task_id`, `parent_task_id`,
+  `depends_on_id`, `depends_on_ids` or `ordered_ids` entry outside the bound
+  Project answers `-32004` `task not found: <the id sent>` (previously
+  `-32602` "task does not belong to scoped MCP project" with that Task's id
+  and the Project id, which confirmed that it exists). An `execution_id` the
+  credential may not use answers `execution not found: <the id sent>`
+  (previously an error that named the Task behind the Execution), for account
+  credentials as well.
+- **MCP Project settings updates check that assigned agents are usable by the
+  caller (3.8 slice H).** `forge_update_project` (with `settings`) and
+  `forge_update_project_lifecycle_hooks` pass the authenticated user to the
+  shared settings validation, as REST does. A settings document that assigns a
+  role to an agent this user cannot use in the Project is refused with
+  "agent not usable in this project" and nothing is written; this includes a
+  lifecycle-hook replacement on a Project whose stored settings already hold
+  such an assignment.
 
 - **Registered native Project calls refuse undeclared fields (3.8 slice E).**
   `project.current_state`, `project.observations`, `project.review_config`,
@@ -1272,6 +1380,34 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Native Task operations come from the operation registry.** The Task
+  reads, `task.plan` / `task.worklog` / `task.evidence`, and the Project
+  Agent's `task.action` (all eight verbs), `task.propose`, `task.dependency`
+  and `task.adaptive` are typed registry operations with one contract, one
+  decode and one authority decision each. Names, parameter names, effects,
+  receipts and the workflow offers are unchanged. A Project Agent's
+  `work.read` now also returns `action_schema` beside each Task's
+  `available_actions`: the exact `task.action` argument the current offers
+  accept. A Task run's `work.read` marks its offers
+  `available_actions_informational` (a Task run has no workflow action).
+  `task.evidence` results name the execution and role they were stored under.
+- **Smaller tool prefix on every Task and Project Agent turn.** Estimated
+  from the serialized definitions (bytes / 4): coder 1,516 → 1,164 tokens,
+  reviewer 1,208 → 989, planner 1,360 → 1,008, ready Project Agent
+  5,987 → 4,326. Main Chat (+85), inquiry (+53) and Project setup (+66) grow
+  slightly: their shared reads now state their arguments.
+- **Every MCP tool is generated from the operation registry (3.8 slice H).**
+  `tools/list`, the input schemas, the grant and role admission, the
+  reference checks and the typed decode of all 43 tools come from one catalog;
+  the hand-written descriptors, the second dispatch table, the duplicated
+  parameter structs and the scope-name list are gone. Names, argument names
+  and result shapes are unchanged. Descriptions are one generated line plus
+  the field list, so `forge_create_task` and `forge_create_sub_tasks` no
+  longer carry the merge-friendly planning guidance in their descriptions.
+  The serialized catalog shrinks from 18,198 to 13,915 bytes for an account
+  credential and from 16,060 to 13,060 for a Project owner.
+  `forge_transition_task` is unchanged: it still runs as the MCP system
+  component, on defined workflow edges only and without the user override.
 - The owner's override on a Task in its merge state is labelled **Mark done
   without merging** (it was "Advance Task"): it ends the Task as done, merges
   nothing and cancels its place in the merge queue.
@@ -2794,6 +2930,29 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **`task.propose` no longer advertises `action: "create"`.** The native
+  schema declared the field as required and the command refused it. The
+  contract now lists what the command accepts, including parentage,
+  configuration, role assignments, governance and traceability fields.
+- **Task record limits are stated in the unit that is enforced**: plan content
+  in UTF-8 bytes (1,048,576), worklog summary in characters (4,000).
+  `task.evidence` states that a `kind` outside the five it names is stored as
+  `other` with its label kept, which is what it always did.
+- **`task.evidence` reads a file from the run's own workspace.** A child Task
+  that runs in its root's workspace could not capture a file by `path`.
+- **MCP Task and Project schemas describe what the tools accept (3.8 slice
+  H).** Optional strings, integers and booleans advertise `null`;
+  `forge_list_tasks.status` advertises its comma-separated string, array and
+  `null` forms and `sort_by` the already accepted `board_position`;
+  `forge_transition_task.status` and status filters are open strings, so
+  custom workflow states are no longer hidden behind a fixed list;
+  `forge_update_project.settings` is opaque JSON; memory `layer` advertises 1
+  to 3 and the memory and deadline integers their bounds. With a
+  Project-constrained credential `forge_memory_search` no longer marks
+  `project_id` required, since the bound Project was always filled in.
+  A contract correction names the field and the accepted type and never
+  quotes the value that was sent.
 
 - **Changing a repository's default location is refused over the API while a
   merge is unresolved.** The `409 integration_unresolved` guard for the

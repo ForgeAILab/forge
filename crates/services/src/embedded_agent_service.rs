@@ -1836,7 +1836,8 @@ impl EmbeddedAgentService {
             .authorize_scope(actor_user_id, &identity, scope_request)
             .await?;
         let allowed = if canonical.scope_type == CanonicalScopeType::Task {
-            // Task caller authority remains execution-bound until slice F.
+            // A preview for an identity, not a session: Task authority itself
+            // also needs the running execution, which no preview has.
             let account_json: String = sqlx::query_scalar(
                 "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
             )

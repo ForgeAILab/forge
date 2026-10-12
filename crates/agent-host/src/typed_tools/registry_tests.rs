@@ -39,6 +39,21 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("memory.supersede", "PC", true),
         ("review.request", "P", true),
         ("session.action", "PC", true),
+        ("task.summary", "T", false),
+        ("task.plan", "T", false),
+        ("task.worklog", "T", false),
+        ("task.evidence", "T", false),
+        ("task.action", "PC", true),
+        ("task.propose", "PC", true),
+        ("task.adaptive", "PC", true),
+        ("task.dependency", "PC", true),
+        ("work.read", "PCT", false),
+        ("events.read", "MPCT", false),
+        ("inbox.read", "AMPCT", false),
+        ("commitments.read", "AMPCT", false),
+        ("delivery.read", "AMPCT", false),
+        ("memory.read", "AMPCT", false),
+        ("decisions.read", "AMPCT", false),
     ];
     let specs = READ_CATALOG
         .iter()
@@ -129,6 +144,8 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                             4 => Principal::TaskAgent {
                                 identity_id: "task".into(),
                                 execution_id: "exec".into(),
+                                role: operation_registry::authority::TaskRole::Planner,
+                                runtime_session_id: None,
                             },
                             _ => Principal::SystemComponent {
                                 name: "system".into(),
@@ -146,6 +163,8 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                         });
                         let native_principal = if matches!(key, 'P' | 'C') {
                             kind == 1
+                        } else if key == 'T' {
+                            kind == 4
                         } else {
                             kind == 0
                         };
@@ -581,11 +600,27 @@ async fn integer_spellings_are_admitted_at_preparation() {
 fn each_registered_proposal_projects_only_its_own_fields() {
     for spec in operation_registry::PROPOSAL_CATALOG.iter() {
         let one = BTreeSet::from([spec.id.to_owned()]);
-        assert!(
-            coordination_payload_properties(&one).is_none(),
-            "registered contracts need no advertised root aliases: {}",
-            spec.id
-        );
+        let aliases = coordination_payload_properties(&one);
+        let task = operation_registry::task_proposals::IDS.contains(&spec.id)
+            || operation_registry::task_records::IDS.contains(&spec.id);
+        if task {
+            assert_eq!(
+                aliases
+                    .as_ref()
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
+                spec.input.schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert!(aliases.is_none(), "{}", spec.id);
+        }
         let tool = ForgeScopeProposeTool::new(
             "actor".into(),
             scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
@@ -597,21 +632,31 @@ fn each_registered_proposal_projects_only_its_own_fields() {
             assert_eq!(schema["properties"][field]["type"], "string");
         }
         assert_eq!(schema["properties"]["payload"]["type"], "object");
+        let mut expected = BTreeSet::from([
+            "causation_depth",
+            "causation_id",
+            "correlation_id",
+            "dedupe_key",
+            "operation",
+            "payload",
+        ]);
+        if task {
+            expected.extend(
+                spec.input.schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str),
+            );
+        }
         assert_eq!(
             schema["properties"]
                 .as_object()
                 .unwrap()
                 .keys()
                 .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "causation_depth",
-                "causation_id",
-                "correlation_id",
-                "dedupe_key",
-                "operation",
-                "payload"
-            ]
+                .collect::<BTreeSet<_>>(),
+            expected
         );
     }
 }
@@ -705,5 +750,56 @@ fn registry_field_canonicalization_does_not_depend_on_root_aliases() {
         let normalized = tool.normalize_arguments(Value::Object(flat)).unwrap();
         assert_eq!(normalized["payload"], inputs[*id]);
         assert_eq!(normalized.as_object().unwrap().len(), 4);
+    }
+}
+
+#[test]
+fn task_role_advertisement_matches_evaluator_and_never_grants_workflow_commands() {
+    use operation_registry::authority::{AuthorityFacts, EffectiveAuthority, Principal, TaskRole};
+    for role in [TaskRole::Worker, TaskRole::Reviewer, TaskRole::Planner] {
+        for active in [false, true] {
+            for granted in [false, true] {
+                let permissions = if granted {
+                    BTreeSet::from(["task_read".into(), "read_task".into()])
+                } else {
+                    BTreeSet::new()
+                };
+                let authority = EffectiveAuthority::resolve(AuthorityFacts {
+                    principal: Principal::TaskAgent {
+                        identity_id: "agent".into(),
+                        execution_id: "exec".into(),
+                        role,
+                        runtime_session_id: Some("session".into()),
+                    },
+                    scope_type: "task".into(),
+                    scope_id: "task".into(),
+                    profile_id: "profile".into(),
+                    layers: vec![permissions.clone()],
+                    binding_id: None,
+                    setup_required: false,
+                    active,
+                });
+                for spec in operation_registry::PROPOSAL_CATALOG.iter() {
+                    let expected = active
+                        && granted
+                        && (matches!(spec.id, "task.worklog" | "task.evidence")
+                            || (spec.id == "task.plan" && role.can_write_plan()));
+                    assert_eq!(
+                        authority.evaluate(spec).is_ok(),
+                        expected,
+                        "{} {role:?}",
+                        spec.id
+                    );
+                    let advertised = filter_operations(
+                        CanonicalScopeType::Task,
+                        &[spec.id.into()],
+                        &permissions,
+                        ProjectChatToolContext::default(),
+                        Some(&authority),
+                    );
+                    assert_eq!(!advertised.is_empty(), expected, "{} {role:?}", spec.id);
+                }
+            }
+        }
     }
 }

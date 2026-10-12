@@ -1,0 +1,1640 @@
+{
+  "base": "bab42a97",
+  "oracle": "Frozen base advertisement and effective grant/role acceptance, separately. project_owner is exact project.owner_id; memberships and referenced objects are separately checked. H resolves mismatches without changing effective authority.",
+  "rows": {
+    "forge_project_escalate": {
+      "account": {
+        "listed": true,
+        "callable": false
+      },
+      "project_public": {
+        "listed": true,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": false
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": false
+      }
+    },
+    "forge_create_task": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_tasks": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_get_task": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_preview_prompt": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_memory_search": {
+      "account": {
+        "listed": true,
+        "callable": false
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": false
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_memory_get": {
+      "account": {
+        "listed": true,
+        "callable": false
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": false
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_assign_agent": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_task_action": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_get_task_diff": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_executions": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_update_task": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_transition_task": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_register_agent": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_list_agents": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_list_projects": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_create_project": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_get_project": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_update_project": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_update_project_lifecycle_hooks": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_follow_up_execution": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_add_task_dependency": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_remove_task_dependency": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_task_dependencies": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_task_dependents": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_create_sub_tasks": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_sub_tasks": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_reorder_sub_tasks": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": true,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_agent_profiles": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_list_agent_sessions": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_get_agent_session": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_get_main_agent": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_set_main_agent": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_owner": {
+        "listed": false,
+        "callable": false
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": false,
+        "callable": false
+      }
+    },
+    "forge_get_project_agent": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_set_project_agent": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": false,
+        "callable": false
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_get_integration_queue": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_agent_chats": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_get_agent_chat": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_agent_chat_messages": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_send_agent_chat_message": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_list_agent_handoffs": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_get_agent_handoff": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    },
+    "forge_create_agent_handoff": {
+      "account": {
+        "listed": true,
+        "callable": true
+      },
+      "project_public": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member": {
+        "listed": true,
+        "callable": true
+      },
+      "project_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_owner": {
+        "listed": true,
+        "callable": true
+      },
+      "project_invisible": {
+        "listed": false,
+        "callable": false
+      },
+      "account_admin": {
+        "listed": true,
+        "callable": true
+      },
+      "project_global_admin": {
+        "listed": false,
+        "callable": false
+      },
+      "project_member_owner": {
+        "listed": true,
+        "callable": true
+      }
+    }
+  }
+}

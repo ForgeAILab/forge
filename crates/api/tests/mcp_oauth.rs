@@ -142,8 +142,9 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
     );
     let body = response_json(response).await;
     assert_eq!(body["result"]["isError"], true);
-    // An inaccessible Project is indistinguishable from a missing one.
-    assert_eq!(body["result"]["structuredContent"]["code"], "not_found");
+    // Catalog authority rejects this invisible bound Project before any
+    // argument diagnostics or resource lookup. Missing bindings deny alike.
+    assert_eq!(body["result"]["structuredContent"]["code"], "policy_denied");
     assert_eq!(body["result"]["structuredContent"]["status"], "failed");
     assert_eq!(
         body["result"]["structuredContent"]["operation"],
@@ -158,9 +159,22 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
     );
     assert_eq!(
         body["result"]["structuredContent"]["safe_message"],
-        "the requested resource was not found"
+        "the caller is not authorized for this operation"
     );
     assert!(!body.to_string().contains("project not accessible"));
+    let missing = mcp_post(
+        &harness.app,
+        "/mcp?project_id=missing-project",
+        Some(&access_token),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forge_list_tasks","arguments":{}}}),
+    ).await;
+    let missing = response_json(missing).await;
+    for field in ["code", "status", "safe_message"] {
+        assert_eq!(
+            missing["result"]["structuredContent"][field],
+            body["result"]["structuredContent"][field]
+        );
+    }
 }
 
 #[tokio::test]

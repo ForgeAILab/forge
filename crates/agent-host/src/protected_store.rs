@@ -1,3 +1,4 @@
+#[cfg(test)]
 use operation_registry::authority::permission_set;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -387,17 +388,11 @@ impl SqliteProtectedRuntimeStore {
         let identity_id: String = row
             .try_get("identity_id")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let account_permission_ceiling: String = row
-            .try_get("account_permission_ceiling")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let identity_paused: i64 = row
             .try_get("paused")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let identity_archived_at: Option<String> = row
             .try_get("archived_at")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let profile_tool_policy: String = row
-            .try_get("tool_policy_json")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let scope_type: String = row
             .try_get("scope_type")
@@ -553,55 +548,56 @@ impl SqliteProtectedRuntimeStore {
                 "native session Project authority is no longer active".to_owned(),
             ));
         }
-        let authority = if scope.scope_type != crate::CanonicalScopeType::Task {
+        let authority = {
             let profile_id: String = row
                 .try_get("profile_id")
                 .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-            let authority = self
-                .db
-                .resolve_effective_authority(
-                    &identity_id,
-                    Some(&profile_id),
-                    scope_type_name(scope.scope_type),
-                    &scope.scope_id,
-                    workspace_access_name(scope.workspace_access),
-                )
-                .await
-                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            let authority = if scope.scope_type == crate::CanonicalScopeType::Task {
+                if let Some(runtime) = runtime_session_id {
+                    self.db
+                        .resolve_task_effective_authority(
+                            &identity_id,
+                            Some(&profile_id),
+                            &scope.scope_id,
+                            workspace_access_name(scope.workspace_access),
+                            runtime,
+                        )
+                        .await
+                } else {
+                    self.db
+                        .resolve_effective_authority(
+                            &identity_id,
+                            Some(&profile_id),
+                            "task",
+                            &scope.scope_id,
+                            workspace_access_name(scope.workspace_access),
+                        )
+                        .await
+                }
+            } else {
+                self.db
+                    .resolve_effective_authority(
+                        &identity_id,
+                        Some(&profile_id),
+                        scope_type_name(scope.scope_type),
+                        &scope.scope_id,
+                        workspace_access_name(scope.workspace_access),
+                    )
+                    .await
+            }
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
             if !authority.active {
                 return Err(crate::AgentHostError::Authority(
                     "session binding is no longer active".to_owned(),
                 ));
             }
             Some(authority)
-        } else {
-            None
         };
-        let allowed_permissions = if let Some(authority) = &authority {
-            authority.ceiling.clone()
-        } else {
-            let mut allowed_permissions = permission_set(&account_permission_ceiling);
-            intersect_permissions(
-                &mut allowed_permissions,
-                &permission_set(&profile_tool_policy),
-            );
-            intersect_permissions(
-                &mut allowed_permissions,
-                &scope_permission_set(
-                    scope.scope_type,
-                    scope.workspace_access,
-                    agent_chat_project_id.is_some(),
-                    project_charter_setup_required,
-                ),
-            );
-            if let Some(binding_permissions) = binding_permission_ceiling {
-                intersect_permissions(
-                    &mut allowed_permissions,
-                    &permission_set(&binding_permissions),
-                );
-            }
-            allowed_permissions
-        };
+        let allowed_permissions = authority
+            .as_ref()
+            .expect("resolved session authority")
+            .ceiling
+            .clone();
         Ok(crate::RuntimeScopeBinding {
             identity_id,
             scope,

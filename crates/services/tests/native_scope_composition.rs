@@ -2192,9 +2192,11 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
         "{direct:?}"
     );
 
+    // `inbox.read` moved onto the registry with the other scope-bound
+    // coordination reads; a Main Chat reads it through the same tool.
     assert!(operation_registry::READ_CATALOG
         .lookup("inbox.read")
-        .is_none());
+        .is_some());
     let composition = ScopeToolComposition::for_scope_with_permissions(
         AGENT_ID,
         fixture.main_scope,
@@ -3420,4 +3422,156 @@ async fn pending_legacy_replay_cannot_claim_a_receiptless_completed_effect() {
         .await
         .unwrap_err();
     assert!(!format!("{error:?}").contains("status: Succeeded"));
+}
+
+/// Frozen hand-adapter fields on 433a00ab. Bypass new normalization to commit
+/// the old command input, then replay it through the new native boundary.
+#[tokio::test]
+async fn task_registry_replays_hand_proposal_and_adaptive_receipts_exactly() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(true).await;
+    let service = TaskService::new_for_test(f.db.clone(), Arc::new(EventBus::new(256)));
+    let stored: Value = serde_json::from_str(r#"{"operation":"task.propose","payload":{"title":"Scope composition task","description":"A native Task proposal exercised through Project scope.","task_type":"planning_task","review_requirement_ids":[],"priority":3,"merge_config":null,"role_assignments":null,"governance":null},"dedupe_key":"pre-change-task-proposal","correlation_id":"correlation-pre-change-task-proposal"}"#).unwrap();
+    let payload: services::TaskProposalPayload =
+        serde_json::from_value(stored["payload"].clone()).unwrap();
+    let base = service
+        .execute_task_proposal_direct(services::DirectTaskProposalInput {
+            actor_identity_id: AGENT_ID.into(),
+            executor_type: "agent".into(),
+            executor_id: AGENT_ID.into(),
+            source_scope_type: "project".into(),
+            source_scope_id: PROJECT_ID.into(),
+            project_id: PROJECT_ID.into(),
+            payload,
+            idempotency_key: "pre-change-task-proposal".into(),
+            correlation_id: "correlation-pre-change-task-proposal".into(),
+            causation_id: None,
+            causation_depth: 0,
+            policy_result: "allowed".into(),
+            preflight_policy_result: Some("allowed".into()),
+            preflight_policy_reason: None,
+            policy_revision: None,
+            policy_digest: None,
+            requested_permission: "propose_task".into(),
+        })
+        .await
+        .unwrap();
+    let frozen: String = sqlx::query_scalar("SELECT outcome_json FROM command_receipt WHERE id=?")
+        .bind(&base.receipt.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    for prepared in [false, true] {
+        let result = if prepared {
+            ForgeToolProvider::propose_prepared(
+                &f.provider,
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                TASK_PROPOSE_OPERATION,
+                stored.clone(),
+            )
+            .await
+        } else {
+            ForgeToolProvider::propose(
+                &f.provider,
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                TASK_PROPOSE_OPERATION,
+                stored.clone(),
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(result["receipt_id"], base.receipt.id);
+        assert_eq!(result["result"]["input_digest"], base.receipt.input_digest);
+        assert_eq!(result["result"]["event_id"], base.receipt.event_id);
+        assert_eq!(result["result"]["domain_result"]["task_id"], base.task.id);
+        assert_eq!(result["replayed"], true);
+        let current: String =
+            sqlx::query_scalar("SELECT outcome_json FROM command_receipt WHERE id=?")
+                .bind(&base.receipt.id)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(current, frozen);
+    }
+    let board = db::TaskBoardRepo::board_revision(&*f.db, PROJECT_ID)
+        .await
+        .unwrap();
+    let adaptive = json!({"operation":"task.adaptive","payload":{"action":"replace","source_task_id":base.task.id,
+        "expected_task_version":base.task.version,"expected_board_revision":board,"rationale":"reshape","title":"Replacement"},
+        "dedupe_key":"pre-change-adaptive","correlation_id":"correlation-pre-change-adaptive"});
+    let base_adaptive = service
+        .execute_adaptive_task_command(services::AdaptiveTaskCommand {
+            project_id: PROJECT_ID.into(),
+            source_task_id: base.task.id.clone(),
+            expected_task_version: base.task.version,
+            expected_board_revision: board,
+            operation: services::task_service::AdaptiveTaskOperation::Replace {
+                title: "Replacement".into(),
+                description: None,
+            },
+            rationale: "reshape".into(),
+            actor_type: "agent".into(),
+            actor_id: AGENT_ID.into(),
+            policy_result: "allowed".into(),
+            policy_revision: None,
+            policy_digest: None,
+            requested_permission: Some("propose_task".into()),
+            idempotency_key: "pre-change-adaptive".into(),
+            correlation_id: "correlation-pre-change-adaptive".into(),
+            causation_id: None,
+            causation_depth: 0,
+        })
+        .await
+        .unwrap();
+    let frozen: String = sqlx::query_scalar("SELECT outcome_json FROM command_receipt WHERE id=?")
+        .bind(&base_adaptive.receipt.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    for prepared in [false, true] {
+        let result = if prepared {
+            ForgeToolProvider::propose_prepared(
+                &f.provider,
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                TASK_ADAPTIVE_OPERATION,
+                adaptive.clone(),
+            )
+            .await
+        } else {
+            ForgeToolProvider::propose(
+                &f.provider,
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                TASK_ADAPTIVE_OPERATION,
+                adaptive.clone(),
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(result["receipt_id"], base_adaptive.receipt.id);
+        assert_eq!(
+            result["result"]["input_digest"],
+            base_adaptive.receipt.input_digest
+        );
+        assert_eq!(result["result"]["event_id"], base_adaptive.receipt.event_id);
+        assert_eq!(
+            result["result"]["domain_result"]["board_revision"],
+            base_adaptive.board_revision
+        );
+        assert_eq!(result["replayed"], true);
+        let current: String =
+            sqlx::query_scalar("SELECT outcome_json FROM command_receipt WHERE id=?")
+                .bind(&base_adaptive.receipt.id)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(current, frozen);
+    }
 }

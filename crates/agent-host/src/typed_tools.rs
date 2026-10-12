@@ -8,7 +8,7 @@
 //! composes the tools.
 
 #[cfg(test)]
-use crate::PROJECT_CURRENT_STATE_OPERATION;
+use crate::{PROJECT_CURRENT_STATE_OPERATION, TASK_PLAN_OPERATION};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -50,8 +50,7 @@ use crate::{
     AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION, OperationExposure,
-        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, TASK_EVIDENCE_OPERATION,
-        TASK_PLAN_OPERATION, TASK_WORKLOG_OPERATION, operation_names_for_surface,
+        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -491,7 +490,7 @@ impl ScopeToolComposition {
         runtime: ScopeToolRuntime,
     ) -> Result<Self, AgentHostError> {
         scope.validate()?;
-        let admitted_authority = provider
+        let mut admitted_authority = provider
             .as_ref()
             .and_then(|provider| provider.admitted_authority())
             .cloned();
@@ -504,6 +503,28 @@ impl ScopeToolComposition {
             .clone()
             .unwrap_or_else(|| Arc::new(CommandAllowlist::builtin()));
         let actor_identity_id = actor_identity_id.into();
+        if scope.scope_type == CanonicalScopeType::Task && admitted_authority.is_none() {
+            use operation_registry::authority::{
+                AuthorityFacts, EffectiveAuthority, Principal, TaskRole,
+            };
+            if let Some(role) = task_role.and_then(TaskRole::parse) {
+                admitted_authority = Some(EffectiveAuthority::resolve(AuthorityFacts {
+                    principal: Principal::TaskAgent {
+                        identity_id: actor_identity_id.clone(),
+                        execution_id: "projection".into(),
+                        role,
+                        runtime_session_id: None,
+                    },
+                    scope_type: "task".into(),
+                    scope_id: scope.scope_id.clone(),
+                    profile_id: String::new(),
+                    layers: vec![allowed_permissions.clone()],
+                    binding_id: None,
+                    setup_required: false,
+                    active: true,
+                }));
+            }
+        }
         if actor_identity_id.trim().is_empty() {
             return Err(AgentHostError::Authority(
                 "native tool composition requires a server-issued identity".to_owned(),
@@ -612,7 +633,7 @@ impl ScopeToolComposition {
                     }
                 }
                 if let Some(provider) = provider {
-                    let (read_operations, propose_operations) = task_operations(role);
+                    let (read_operations, propose_operations) = task_operations();
                     let read_operations = filter_operations(
                         scope.scope_type,
                         &read_operations,
@@ -1597,35 +1618,17 @@ fn orchestration_descriptor(
     }
 }
 
-fn task_operations(role: TaskToolRole) -> (Vec<String>, Vec<String>) {
-    let read = vec![
-        "task.summary".to_owned(),
-        "work.read".to_owned(),
-        "decisions.read".to_owned(),
-        "events.read".to_owned(),
-        "memory.read".to_owned(),
-        "inbox.read".to_owned(),
-        "commitments.read".to_owned(),
-        "delivery.read".to_owned(),
-    ];
-    // Task mutation/review workflow remains in the existing executor and
-    // review services.  Native Worker/reviewer tools never provide a second
-    // Task mutation or workflow path; the reviewer receives read/validation
-    // only, while Worker writes through the bounded worktree tools above.
-    //
-    // Task-scoped execution records are the exception. Evidence and worklog
-    // capture what this run observed; task.plan stages an execution-scoped
-    // candidate outside the repository and becomes canonical only after
-    // successful settlement. Reviewers may record observations but cannot
-    // author or replace the implementation plan.
-    let mut propose = vec![
-        TASK_EVIDENCE_OPERATION.to_owned(),
-        TASK_WORKLOG_OPERATION.to_owned(),
-    ];
-    if matches!(role, TaskToolRole::Planner | TaskToolRole::Worker) {
-        propose.push(TASK_PLAN_OPERATION.to_owned());
-    }
-    (read, propose)
+fn task_operations() -> (Vec<String>, Vec<String>) {
+    (
+        operation_registry::task_reads::IDS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect(),
+        operation_registry::task_records::IDS
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect(),
+    )
 }
 
 fn filter_operations(
@@ -1648,7 +1651,14 @@ fn filter_operations(
                 use operation_registry::authority::{
                     AuthorityFacts, EffectiveAuthority, Principal,
                 };
-                let principal = if scope_type == CanonicalScopeType::Project
+                let principal = if scope_type == CanonicalScopeType::Task {
+                    Principal::TaskAgent {
+                        identity_id: String::new(),
+                        execution_id: "projection".into(),
+                        role: operation_registry::authority::TaskRole::Planner,
+                        runtime_session_id: None,
+                    }
+                } else if scope_type == CanonicalScopeType::Project
                     || project_chat.is_project_agent_chat
                 {
                     Principal::ProjectAgent {
@@ -1827,6 +1837,14 @@ fn null_registered_payload_is_empty(arguments: &mut Value) {
             object.insert("payload".to_owned(), json!({}));
         }
     }
+    if (operation_registry::task_records::IDS
+        .contains(&arguments["operation"].as_str().unwrap_or_default())
+        || operation_registry::task_proposals::IDS
+            .contains(&arguments["operation"].as_str().unwrap_or_default()))
+        && arguments.get("causation_depth").is_some_and(Value::is_null)
+    {
+        arguments.as_object_mut().unwrap().remove("causation_depth");
+    }
 }
 
 /// Canonicalize provider-friendly flat coordination fields into `payload`.
@@ -1943,22 +1961,7 @@ impl ForgeScopeReadTool {
         } else {
             "Read one bounded Forge resource from the current canonical scope.".to_owned()
         };
-        let schema = if self.reject_authority_overrides {
-            portable_const_schema(orchestration_read_schema(&self.operations))
-        } else {
-            json!({
-                "type": "object",
-                "required": ["operation"],
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": self.operations.iter().collect::<Vec<_>>(),
-                    },
-                    "arguments": {"type": "object"}
-                },
-                "additionalProperties": false
-            })
-        };
+        let schema = portable_const_schema(orchestration_read_schema(&self.operations));
         ToolSpec::new(
             self.tool_name,
             description,
@@ -2296,7 +2299,7 @@ impl ForgeScopeProposeTool {
                     "dedupe_key": {"type": "string", "minLength": 1, "description": "Required non-null idempotency key"},
                     "correlation_id": {"type": "string", "minLength": 1, "description": "Required non-null correlation id"},
                     "causation_id": string_or_null_schema(),
-                    "causation_depth": {"type": ["integer", "null"], "minimum": 0, "maximum": 8}
+                    "causation_depth": {"type": "integer", "minimum": 0, "maximum": 8}
                 },
                 "additionalProperties": false
             });
@@ -4001,7 +4004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_plan_schema_is_visible_null_tolerant_and_lifts_flat_payload_fields() {
+    async fn task_plan_schema_is_compact_nonnullable_and_lifts_flat_payload_fields() {
         let root = tempfile::tempdir().expect("Task workspace");
         let composition = ScopeToolComposition::for_scope_with_permissions(
             "planner-1",
@@ -4027,29 +4030,31 @@ mod tests {
         let guidance = spec.input_schema["properties"]["payload"]["description"]
             .as_str()
             .expect("Task payload guidance");
-        for visible_contract in ["task.plan", "action", "content", "checklist", "1 MiB"] {
+        for visible_contract in [
+            "task.plan",
+            "action",
+            "content",
+            "checklist",
+            "1048576 UTF-8 bytes",
+        ] {
             assert!(
                 guidance.contains(visible_contract),
                 "Task plan guidance must visibly name {visible_contract}: {guidance}"
             );
         }
-        assert!(
-            spec.input_schema["properties"]["action"]["description"]
-                .as_str()
-                .is_some_and(|description| {
-                    description.contains("task.plan") && description.contains("write")
-                }),
-            "the provider-visible flat action alias must describe task.plan/write"
+        assert_eq!(
+            spec.input_schema["properties"]["action"]["type"],
+            json!(["null", "string"])
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["content"]["type"],
+            json!(["null", "string"])
         );
         assert!(
-            spec.input_schema["properties"]["content"]["description"]
-                .as_str()
-                .is_some_and(|description| {
-                    description.contains("task.plan") && description.contains("checklist")
-                }),
-            "the provider-visible flat content alias must describe the plan checklist"
+            spec.input_schema["properties"]["payload"]
+                .get("properties")
+                .is_none()
         );
-
         let validator = jsonschema::validator_for(&spec.input_schema).expect("Task tool schema");
         let explicit_null_envelope = json!({
             "parameters": {
@@ -4062,14 +4067,12 @@ mod tests {
             }
         });
         assert!(
-            validator
-                .validate(
-                    &tool
-                        .normalize_arguments(explicit_null_envelope.clone())
-                        .unwrap()
-                )
-                .is_ok(),
-            "Gemini-style explicit nulls must reach prepare for an in-turn correction"
+            !validator.is_valid(
+                &tool
+                    .normalize_arguments(explicit_null_envelope.clone())
+                    .unwrap()
+            ),
+            "registered envelope refuses null identifiers in its advertised schema"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
             root: "<none>".to_owned(),

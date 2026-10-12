@@ -13,10 +13,15 @@ fn catalog_is_complete_unique_and_deterministic() {
             + project_proposals::IDS.len()
             + legacy_proposals::IDS.len()
             + hand_proposals::IDS.len()
+            + task_records::IDS.len()
+            + task_proposals::IDS.len()
     );
     assert_eq!(
         ids.len(),
-        scope_reads::IDS.len() + project_reads::IDS.len() + main_reads::IDS.len()
+        scope_reads::IDS.len()
+            + project_reads::IDS.len()
+            + main_reads::IDS.len()
+            + task_reads::IDS.len()
     );
     assert!(READ_CATALOG.lookup("project.current_state").is_some());
     assert!(OperationCatalog::<()>::new(scope_reads::specs(), &registered_reads()).is_err());
@@ -99,15 +104,23 @@ fn contract_lines_are_generated_from_the_spec() {
             "charter.diff: {base_revision_id, candidate_revision_id, charter_id, genesis_session_id?}",
             "charter.read: {charter_id?, genesis_session_id?, revision_id?}",
             "charter.readiness: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}",
+            "commitments.read: {limit?}",
+            "decisions.read: {limit?, query?}",
+            "delivery.read: {limit?}",
             "discovery.read: {limit?}",
+            "events.read: {limit?}",
             "genesis.project_agents.read: {genesis_session_id?}",
+            "inbox.read: {limit?}",
             "inquiry.run: {context?, question, title}",
+            "memory.read: {limit?, query?}",
             "portfolio.read: {limit?}",
             "project.charter: no arguments",
             "project.current_state: {limit?}",
             "project.observations: {limit?, task_id?}",
             "repo.integration_queue: {limit?, target_branch?}",
             "skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
+            "task.summary: no arguments",
+            "work.read: {limit?}",
         ]
     );
     // Derived from the canonical schema, so the line cannot state a field,
@@ -405,11 +418,18 @@ async fn integer_fields_decode_integer_valued_strings_and_floats_as_the_integer(
         [
             ("charter.approval_target", "expected_charter_version"),
             ("charter.readiness", "expected_charter_version"),
+            ("commitments.read", "limit"),
+            ("decisions.read", "limit"),
+            ("delivery.read", "limit"),
             ("discovery.read", "limit"),
+            ("events.read", "limit"),
+            ("inbox.read", "limit"),
+            ("memory.read", "limit"),
             ("portfolio.read", "limit"),
             ("project.current_state", "limit"),
             ("project.observations", "limit"),
             ("repo.integration_queue", "limit"),
+            ("work.read", "limit"),
         ]
     );
     let catalog = read_catalog();
@@ -1048,4 +1068,209 @@ fn hand_main_payload_byte_limits_and_ignored_actions_are_explicit() {
             .unwrap_err()
             .contains("serialized UTF-8 bytes"));
     }
+}
+
+#[async_trait::async_trait]
+impl task_reads::TaskReadContext<&'static str> for RecordingContext {
+    async fn task_summary(&self, _: NoArguments) -> Result<Value, &'static str> {
+        self.record("task.summary")
+    }
+    async fn work_read(&self, input: task_reads::ListArguments) -> Result<Value, &'static str> {
+        self.record_decoded("work.read", input.limit)
+    }
+    async fn events_read(&self, input: task_reads::ListArguments) -> Result<Value, &'static str> {
+        self.record_decoded("events.read", input.limit)
+    }
+    async fn inbox_read(&self, input: task_reads::ListArguments) -> Result<Value, &'static str> {
+        self.record_decoded("inbox.read", input.limit)
+    }
+    async fn commitments_read(
+        &self,
+        input: task_reads::ListArguments,
+    ) -> Result<Value, &'static str> {
+        self.record_decoded("commitments.read", input.limit)
+    }
+    async fn delivery_read(&self, input: task_reads::ListArguments) -> Result<Value, &'static str> {
+        self.record_decoded("delivery.read", input.limit)
+    }
+    async fn memory_read(&self, input: task_reads::MemoryArguments) -> Result<Value, &'static str> {
+        self.record_decoded("memory.read", input.limit)
+    }
+    async fn decisions_read(
+        &self,
+        input: task_reads::MemoryArguments,
+    ) -> Result<Value, &'static str> {
+        self.record_decoded("decisions.read", input.limit)
+    }
+}
+
+#[async_trait::async_trait]
+impl task_records::TaskRecordContext<&'static str> for RecordingContext {
+    async fn task_plan(&self, _: task_records::Plan) -> Result<Value, &'static str> {
+        self.record("task.plan")
+    }
+    async fn task_worklog(&self, _: task_records::Worklog) -> Result<Value, &'static str> {
+        self.record("task.worklog")
+    }
+    async fn task_evidence(&self, _: task_records::Evidence) -> Result<Value, &'static str> {
+        self.record("task.evidence")
+    }
+}
+
+#[tokio::test]
+async fn task_records_have_closed_typed_contracts_and_dispatch_each_input() {
+    let catalog = proposal_catalog();
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    for (id, input) in [
+        (
+            "task.plan",
+            json!({"action":"write","content":"- [ ] implement"}),
+        ),
+        (
+            "task.worklog",
+            json!({"action":"append","kind":"validation","summary":"passed"}),
+        ),
+        (
+            "task.evidence",
+            json!({"action":"capture","kind":"custom","caption":"output","content":"OK"}),
+        ),
+    ] {
+        let spec = catalog.lookup(id).unwrap();
+        spec.validate_arguments(&input).unwrap();
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            id
+        );
+        for field in [
+            "identity_id",
+            "execution_id",
+            "task_id",
+            "role",
+            "scope",
+            "unrelated",
+        ] {
+            let mut forged = input.clone();
+            forged[field] = json!("forged");
+            assert!(spec.validate_arguments(&forged).is_err(), "{id} {field}");
+        }
+        for field in spec.input.schema["required"].as_array().unwrap() {
+            let mut missing = input.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove(field.as_str().unwrap());
+            assert!(spec.validate_arguments(&missing).is_err(), "{id} {field}");
+        }
+        let mut wrong_action = input.clone();
+        wrong_action["action"] = json!("wrong");
+        assert!(spec.validate_arguments(&wrong_action).is_err());
+    }
+    assert_eq!(context.0.lock().unwrap().len(), task_records::IDS.len());
+}
+
+#[test]
+fn task_record_byte_character_and_source_constraints_match_acceptance() {
+    let plan = PROPOSAL_CATALOG.lookup("task.plan").unwrap();
+    plan.validate_arguments(&json!({"action":"write","content":"é".repeat(524288)}))
+        .unwrap();
+    assert!(plan
+        .validate_arguments(&json!({"action":"write","content":"é".repeat(524289)}))
+        .unwrap_err()
+        .contains("UTF-8 bytes"));
+    let worklog = PROPOSAL_CATALOG.lookup("task.worklog").unwrap();
+    worklog
+        .validate_arguments(
+            &json!({"action":"append","kind":"progress","summary":"é".repeat(4000)}),
+        )
+        .unwrap();
+    assert!(worklog
+        .validate_arguments(
+            &json!({"action":"append","kind":"progress","summary":"é".repeat(4001)})
+        )
+        .is_err());
+    let evidence = PROPOSAL_CATALOG.lookup("task.evidence").unwrap();
+    let mut input = json!({"action":"capture","kind":"test","caption":"result"});
+    for (path, content, accepted) in [
+        (Value::Null, Value::Null, false),
+        (json!("proof.txt"), Value::Null, true),
+        (Value::Null, json!("OK"), true),
+        (json!("proof.txt"), json!("OK"), false),
+    ] {
+        input["path"] = path;
+        input["content"] = content;
+        assert_eq!(evidence.validate_arguments(&input).is_ok(), accepted);
+    }
+}
+
+#[async_trait::async_trait]
+impl task_proposals::TaskProposalContext<&'static str> for RecordingContext {
+    async fn task_action(&self, _: task_proposals::Action) -> Result<Value, &'static str> {
+        self.record("task.action")
+    }
+    async fn task_propose(&self, _: task_proposals::Proposal) -> Result<Value, &'static str> {
+        self.record("task.propose")
+    }
+    async fn task_dependency(&self, _: task_proposals::Dependency) -> Result<Value, &'static str> {
+        self.record("task.dependency")
+    }
+    async fn task_adaptive(&self, _: task_proposals::Adaptive) -> Result<Value, &'static str> {
+        self.record("task.adaptive")
+    }
+}
+
+#[tokio::test]
+async fn task_command_contracts_decode_hand_shapes_and_dispatch_every_variant() {
+    let catalog = proposal_catalog();
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    for (id, input) in [
+        (
+            "task.propose",
+            json!({"title":"Task","review_requirement_ids":[],"task_type":"planning_task","priority":3,"governance":null,"merge_config":null,"role_assignments":null}),
+        ),
+        (
+            "task.action",
+            json!({"task_id":"task","action":{"verb":"cancel"},"version":1}),
+        ),
+        (
+            "task.dependency",
+            json!({"action":"add","task_id":"task","depends_on_task_id":"prerequisite","rationale":"order"}),
+        ),
+        (
+            "task.dependency",
+            json!({"action":"remove","task_id":"task","depends_on_task_id":"prerequisite","rationale":"reshape"}),
+        ),
+        (
+            "task.adaptive",
+            json!({"action":"split","source_task_id":"task","expected_task_version":1,"expected_board_revision":0,"rationale":"split","items":[{"title":"Child"}]}),
+        ),
+        (
+            "task.adaptive",
+            json!({"action":"sequence","source_task_id":"task","expected_task_version":1,"expected_board_revision":0,"rationale":"order","ordered_task_ids":["child"]}),
+        ),
+        (
+            "task.adaptive",
+            json!({"action":"replace","source_task_id":"task","expected_task_version":1,"expected_board_revision":0,"rationale":"reshape","title":"Replacement"}),
+        ),
+    ] {
+        let spec = catalog.lookup(id).unwrap();
+        assert!(
+            jsonschema::validator_for(&spec.canonical_schema())
+                .unwrap()
+                .is_valid(&input),
+            "{id}"
+        );
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            id
+        );
+        let mut unknown = input.clone();
+        unknown["foreign_scope"] = json!("other");
+        assert!(spec.normalize_arguments(&unknown).is_err(), "{id}");
+        if id == "task.propose" {
+            let mut false_discriminator = input;
+            false_discriminator["action"] = json!("create");
+            assert!(spec.normalize_arguments(&false_discriminator).is_err());
+        }
+    }
+    assert_eq!(context.0.lock().unwrap().len(), 7);
 }

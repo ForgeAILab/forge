@@ -11,14 +11,14 @@ use serde_json::{Value, json};
 
 use crate::operation_catalog::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_READINESS_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_READINESS_OPERATION, TASK_ADAPTIVE_OPERATION,
 };
 #[cfg(test)]
 use crate::{
     MAIN_GENESIS_START_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
+    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -234,6 +234,22 @@ fn advertised_proposal_line(
         }
         return spec.contract_line();
     }
+    if operation_registry::task_proposals::IDS.contains(&spec.id) {
+        return format!(
+            "{}: {}; {} Payload <=65536 serialized UTF-8 bytes.",
+            spec.id,
+            schema_signature(&spec.input.schema, 0),
+            spec.guidance
+        );
+    }
+    if operation_registry::task_records::IDS.contains(&spec.id) {
+        return format!(
+            "{}; {} {}",
+            spec.contract_line(),
+            spec.summary,
+            spec.guidance
+        );
+    }
     format!(
         "{}; {} Payload <=65536 serialized UTF-8 bytes.",
         spec.contract_line(),
@@ -288,153 +304,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1}}),
             &["action", "milestone_id", "milestone_version"],
         ),
-        TASK_PROPOSE_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"create"},
-                "title":{"type":"string","minLength":1},
-                "description":{"type":"string","minLength":1},
-                "priority":{"type":"integer"},
-                "task_type":{"type":"string","enum":["task","planning_task","discovery"]},
-                "plan_item_id":string_or_null_schema(),
-                "milestone_id":string_or_null_schema(),
-                "capability_class":string_or_null_schema(),
-                "risk_class":string_or_null_schema(),
-                "review_requirement_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"Exact non-universal requirement IDs from the approved Charter that this Task owns, copied verbatim from selectable_review_requirements in the project.charter read. Do not construct these strings: an ID that does not match the catalog exactly is rejected and no Task is created. Task acceptance, linked-Document acceptance, and universal Project exclusions/non-claims are included automatically."},
-                "depends_on_task_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"Optional prerequisite Task ids in this Project. These are prerequisite DAG edges only: they do not create a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before this Task can dispatch."}
-            }),
-            &["action", "title", "review_requirement_ids"],
-            "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state. review_requirement_ids is an explicit ownership decision: list only non-universal Charter requirements this Task directly owns, or use [] when it owns none. Copy each ID verbatim from selectable_review_requirements in the project.charter read rather than constructing it. depends_on_task_ids expresses prerequisite DAG edges only: it does not create a parent/child hierarchy or workspace sharing. Project-wide completion is evaluated at milestone readiness.",
-        ),
-        TASK_ACTION_OPERATION => described_object_schema(
-            json!({ "task_id":{"type":"string","minLength":1}, "action":api_types::task_action_schema(), "version":{"type":"integer","minimum":1} }),
-            &["task_id", "action", "version"],
-            "Apply a Task's current available_actions. Copy an offered action and supply its Task version. retry queues work, restart returns interrupted work to the initial state, and cancel ends obsolete work. Agents cannot override a gate. Unavailable actions return current offers; use them instead of repeating a denial.",
-        ),
-        TASK_PLAN_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"write"},
-                "content":{"type":"string","minLength":1,"maxLength":1048576,"description":"The complete Markdown checklist candidate for this execution. Use `- [ ]` for pending items and `- [x]` for completed items."}
-            }),
-            &["action", "content"],
-            "Write this execution's complete plan candidate as a Markdown checklist. Forge stages the candidate outside the repository and publishes it as the Task's canonical plan only after this execution completes successfully. Planner and Worker sessions may replace their own candidate; reviewers cannot write a plan.",
-        ),
-        TASK_WORKLOG_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"append"},
-                "kind":{"type":"string","enum":["progress","decision","validation","blocker"],"description":"progress: a meaningful slice landed. decision: a choice you made and why. validation: what you ran and what it reported. blocker: what stopped you and what you need."},
-                "summary":{"type":"string","minLength":1,"maxLength":4000,"description":"One concise user-visible update in your own words."}
-            }),
-            &["action", "kind", "summary"],
-            "Append one entry to this Task's worklog, which the next role reads in its dispatch context. Write after a meaningful milestone -- initial approach, a completed slice, validation results, a deviation, a blocker -- not for every tool call or file edit. Forge derives the Task, execution, role, and identity from your session and posts the final completion summary itself, so no separate handoff entry is needed. A worklog entry never moves the Task and never satisfies an acceptance check: proof of behaviour is a captured artifact, not prose.",
-        ),
-        TASK_EVIDENCE_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"capture"},
-                "kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},
-                "caption":{"type":"string","minLength":1,"description":"What this artifact shows, in your own words."},
-                "path":{"type":["string","null"],"minLength":1,"description":"Workspace-relative path of a file this run produced (screenshot, recording, report). Omit when supplying inline content."},
-                "content":{"type":["string","null"],"minLength":1,"description":"Verbatim captured output for a log or report -- the exact stdout/stderr you observed, not a summary. Omit when supplying a path."},
-                "filename":{"type":["string","null"],"minLength":1,"description":"Display filename for inline content. Defaults to a name derived from the kind."}
-            }),
-            &["action", "kind", "caption"],
-            "Capture one artifact this Task run actually produced and register it as authoritative evidence bound to this Task. Supply exactly one of `path` (a file in the Task workspace) or `content` (verbatim captured output). The server stores the bytes, computes the checksum, and returns the asset id a milestone evidence attachment references. Never describe an observation you did not make: this records what the run produced, not what you expect it to produce.",
-        ),
-
-        TASK_DEPENDENCY_OPERATION => described_object_schema(
-            json!({
-                "action":{"type":"string","enum":["add","remove"]},
-                "task_id":{"type":"string","minLength":1,"description":"The dependent Task: the one that waits."},
-                "depends_on_task_id":{"type":"string","minLength":1,"description":"The prerequisite Task it waits for."},
-                "rationale":{"type":"string","minLength":1,"description":"Why the graph is changing shape."}
-            }),
-            &["action", "task_id", "depends_on_task_id", "rationale"],
-            "Add or remove one prerequisite edge between two Tasks in the bound Project. This is a DAG edge only: it creates no parent/child hierarchy and no shared workspace. Adding an edge refuses a cancelled prerequisite and a cycle; removing the last cancelled prerequisite clears the dependency block it caused. Use this to re-plan an existing graph instead of cancelling and recreating Tasks, which changes their ids.",
-        ),
-        TASK_ADAPTIVE_OPERATION => {
-            let child = object_schema(
-                json!({
-                    "title":{"type":"string","minLength":1},
-                    "description":string_or_null_schema(),
-                    "assignee_id":string_or_null_schema()
-                }),
-                &["title"],
-            );
-            let split = described_object_schema(
-                json!({
-                    "action":{"const":"split"},
-                    "source_task_id":{"type":"string","minLength":1},
-                    "expected_task_version":{"type":"integer","minimum":1},
-                    "expected_board_revision":{"type":"integer","minimum":0},
-                    "rationale":{"type":"string","minLength":1},
-                    "items":{"type":"array","minItems":1,"items":child}
-                }),
-                &[
-                    "action",
-                    "source_task_id",
-                    "expected_task_version",
-                    "expected_board_revision",
-                    "rationale",
-                    "items",
-                ],
-                "task.adaptive split creates ordered direct children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
-            );
-            let sequence = described_object_schema(
-                json!({
-                    "action":{"const":"sequence"},
-                    "source_task_id":{"type":"string","minLength":1},
-                    "expected_task_version":{"type":"integer","minimum":1},
-                    "expected_board_revision":{"type":"integer","minimum":0},
-                    "rationale":{"type":"string","minLength":1},
-                    "ordered_task_ids":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}
-                }),
-                &[
-                    "action",
-                    "source_task_id",
-                    "expected_task_version",
-                    "expected_board_revision",
-                    "rationale",
-                    "ordered_task_ids",
-                ],
-                "task.adaptive sequence manages the order of existing direct children under the coordination root; it manages child order only and does not create a dependency graph.",
-            );
-            let replace = object_schema(
-                json!({
-                    "action":{"const":"replace"},
-                    "source_task_id":{"type":"string","minLength":1},
-                    "expected_task_version":{"type":"integer","minimum":1},
-                    "expected_board_revision":{"type":"integer","minimum":0},
-                    "rationale":{"type":"string","minLength":1},
-                    "title":{"type":"string","minLength":1},
-                    "description":string_or_null_schema()
-                }),
-                &[
-                    "action",
-                    "source_task_id",
-                    "expected_task_version",
-                    "expected_board_revision",
-                    "rationale",
-                    "title",
-                ],
-            );
-            json!({
-                "type":"object",
-                "required":["action"],
-                "properties":{
-                    "action":{"type":"string","enum":["split","sequence","replace"]},
-                    "source_task_id":{"type":"string","minLength":1},
-                    "expected_task_version":{"type":"integer","minimum":1},
-                    "expected_board_revision":{"type":"integer","minimum":0},
-                    "rationale":{"type":"string","minLength":1},
-                    "items":{"type":"array","minItems":1,"items":child},
-                    "ordered_task_ids":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
-                    "title":{"type":"string","minLength":1},
-                    "description":string_or_null_schema()
-                },
-                "oneOf":[split,sequence,replace],
-                "additionalProperties":false,
-                "description":"Bounded Project Task adaptive command. split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only; it does not create a dependency graph. Forge derives Project, actor, permission, governance, and fixed execution boundaries from the authenticated binding and active baseline; those values cannot be supplied in the payload."
-            })
-        }
         _ => object_schema(json!({}), &[]),
     }
 }
@@ -632,81 +501,8 @@ pub(crate) fn orchestration_payload_summary(schema: &Value) -> String {
 /// errors return to the model in-turn.
 pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> String {
     let mut lines = Vec::new();
-    if operations.contains(TASK_PLAN_OPERATION) {
-        lines.push(concat!(
-            "task.plan — replace this execution's private plan candidate. Fields: ",
-            "action (required: \"write\"); content (required: the complete Markdown checklist, ",
-            "with at least one `- [ ]` or `- [x]` item and no more than 1 MiB). ",
-            "Forge binds the candidate to this native runtime session and publishes it only ",
-            "after the owning execution completes successfully."
-        ));
-    }
-    if operations.contains(TASK_WORKLOG_OPERATION) {
-        lines.push(concat!(
-            "task.worklog — append an execution worklog entry. Fields: kind (required: ",
-            "\"progress\", \"decision\", \"validation\", or \"blocker\"); summary ",
-            "(required, at most 4000 characters)."
-        ));
-    }
-    if operations.contains(TASK_EVIDENCE_OPERATION) {
-        lines.push(concat!(
-            "task.evidence — capture execution evidence. Fields: kind and caption (required); ",
-            "supply exactly one of workspace-relative path or inline content; filename is optional."
-        ));
-    }
     if operations.contains("task.propose") || operations.contains(TASK_ADAPTIVE_OPERATION) {
         lines.push(crate::MERGE_FRIENDLY_TASK_GUIDANCE);
-    }
-    if operations.contains("task.propose") {
-        lines.push(concat!(
-            "task.propose — create a Task in the bound Project. Fields: ",
-            "title (required); description (outcome, acceptance criteria, and owned repository-relative paths); ",
-            "priority (integer, higher runs sooner); ",
-            "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
-            "plan_item_id (optional traceability to a stable item in the active execution ",
-            "baseline, for example \"pi-2\"; when supplied, it must exist and may have only ",
-            "one non-cancelled Task); milestone_id (optional traceability, defaulting to the ",
-            "active baseline's primary milestone when one exists); ",
-            "capability_class (when supplied it must be one of the server-approved profiles: ",
-            "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
-            "\"planning_read\" — and, when the baseline declares allowed classes, also one of ",
-            "those); risk_class (only when the baseline declares allowed classes). ",
-            "depends_on_task_ids (optional accepted Task ids in this Project; these are ",
-            "prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; ",
-            "each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. ",
-            "Forge binds implementation authority to the Project's current approved Charter. ",
-            "Baseline references are optional traceability; never echo baseline ids or digests.",
-        ));
-    }
-    if operations.contains(TASK_ADAPTIVE_OPERATION) {
-        lines.push(concat!(
-            "task.adaptive — apply one bounded adaptive command to a Task in the bound Project. ",
-            "Fields: action (required: \"split\", \"sequence\", or \"replace\"); ",
-            "source_task_id, expected_task_version, expected_board_revision, and rationale ",
-            "(all required; read both from work.read — the Task's version and the top-level ",
-            "board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; ",
-            "split creates ordered direct children under a non-executing coordination root; children ",
-            "share the root workspace but keep independent agents, executions, and lifecycles ",
-            "and execute serially in the declared order. sequence manages that child order only and ",
-            "does not create a dependency graph. replace requires title and optional description. ",
-            "Project, scope, actor, permission, governance, and fixed-boundary values are server-derived ",
-            "and unknown fields are rejected."
-        ));
-    }
-    if operations.contains(TASK_ACTION_OPERATION) {
-        lines.push("task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n");
-    }
-
-    if operations.contains(TASK_DEPENDENCY_OPERATION) {
-        lines.push(concat!(
-            "task.dependency — add or remove one prerequisite edge between two Tasks in the ",
-            "bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task ",
-            "that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale ",
-            "(all required). This is a DAG edge only: no parent/child hierarchy and no shared ",
-            "workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the ",
-            "last cancelled prerequisite clears the dependency block it caused. Prefer this over ",
-            "cancelling and recreating Tasks, which changes their ids and orphans dependents."
-        ));
     }
     let mut lines = lines.into_iter().map(str::to_owned).collect::<Vec<_>>();
     lines.extend(
@@ -725,200 +521,113 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
     }
 }
 
-/// Declared payload properties for the generic coordination proposal
-/// surface. Several provider function-calling APIs (notably Gemini) surface
-/// only declared properties to the model, so the `task.propose` field
-/// contract — including optional `plan_item_id` traceability — must be visible as real schema properties,
-/// not only as description prose. The payload deliberately keeps
-/// `additionalProperties` open because every admitted operation shares this
-/// one envelope; each description names its owning operation.
+/// Portable aliases preserve nested fields for providers that strip undeclared
+/// object properties. Only the admitted specs contribute fields; exact selected
+/// contracts and offers still drive enforcement.
 pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> Option<Value> {
-    // Derived: any operation on the generic coordination envelope needs this
-    // surface. Listing the names here meant a new operation silently got a
-    // payload surface with none of its fields declared, which is invisible
-    // until a provider that only surfaces declared properties strips them.
-    let has_generic_coordination = operations.iter().any(|operation| {
-        crate::operation_catalog::is_coordination_generic_proposal(operation)
-            && operation_registry::PROPOSAL_CATALOG
-                .lookup(operation)
-                .is_none()
-    });
-    let has_task_execution_command = operations.iter().any(|operation| {
-        matches!(
-            operation.as_str(),
-            TASK_PLAN_OPERATION | TASK_WORKLOG_OPERATION | TASK_EVIDENCE_OPERATION
-        )
-    });
-    if !has_generic_coordination && !has_task_execution_command {
-        return None;
-    }
-    let mut properties = if has_generic_coordination {
-        json!({
-            "title": {
-                "type": ["string", "null"],
-                "description": "task.propose: required Task title."
-            },
-            "description": {
-                "type": ["string", "null"],
-                "description": "task.propose: outcome, acceptance criteria, and owned repository-relative paths."
-            },
-            "priority": {
-                "type": ["integer", "null"],
-                "description": "task.propose: integer; higher runs sooner."
-            },
-            "task_type": {
-                "type": ["string", "null"],
-                "description": "task.propose: \"task\" (implementation default), \"planning_task\", or \"discovery\"."
-            },
-            "plan_item_id": {
-                "type": ["string", "null"],
-                "description": concat!(
-                    "task.propose: optional traceability to a stable plan-item id in the ",
-                    "Project's active execution baseline (for example \"pi-2\"). When supplied, ",
-                    "the id must exist in that baseline. Each plan item admits exactly one ",
-                    "non-cancelled Task — never re-propose a plan item that already has one."
-                )
-            },
-            "milestone_id": {
-                "type": ["string", "null"],
-                "description": "task.propose: optional; defaults to the active baseline's primary milestone."
-            },
-            "task_id": {
-                "type": ["string", "null"],
-                "description": "task.action/task.dependency: required Task id in this Project."
-            },
-            "action": {
-                "type": ["string", "object", "null"],
-                "properties": {
-                    "verb": {"type":"string", "enum":["start","hold","release","retry","send_back","approve","restart","cancel"]},
-                    "reason": string_or_null_schema(),
-                    "guidance": string_or_null_schema(),
-                    "override": {"type":["boolean","null"]},
-                    "fresh_session": {"type":["boolean","null"]},
-                    "refresh_workspace": {"type":["boolean","null"]},
-                    "reset_budget": {"type":["boolean","null"]}
-                },
-                "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string."
-            },
-            "capability_class": {
-                "type": ["string", "null"],
-                "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\")."
-            },
-            "risk_class": {
-                "type": ["string", "null"],
-                "description": "task.propose: optional; only when the baseline declares allowed risk classes."
-            },
-            "review_requirement_ids": {
-                "type": ["array", "null"],
-                "items": {"type": "string", "minLength": 1},
-                "description": concat!(
-                    "task.propose: required. Exact non-universal requirement IDs from the ",
-                    "approved Charter that this Task owns, copied verbatim from ",
-                    "selectable_review_requirements in the project.charter read, or [] when ",
-                    "it owns none. Do not construct these strings: an ID that does not match ",
-                    "the catalog exactly is rejected and no Task is created."
-                )
-            },
-            "depends_on_task_ids": {
-                "type": ["array", "null"],
-                "items": {"type": "string", "minLength": 1},
-                "description": "task.propose: optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration."
+    fn projection(schemas: &[&Value], depth: usize) -> Value {
+        if depth > 8 {
+            return json!({});
+        }
+        let variants = schemas
+            .iter()
+            .flat_map(|schema| {
+                schema
+                    .get("oneOf")
+                    .or_else(|| schema.get("anyOf"))
+                    .and_then(Value::as_array)
+                    .map_or_else(|| vec![*schema], |values| values.iter().collect())
+            })
+            .collect::<Vec<_>>();
+        if variants.len() != schemas.len()
+            || variants
+                .iter()
+                .any(|v| v.get("oneOf").is_some() || v.get("anyOf").is_some())
+        {
+            return projection(&variants, depth + 1);
+        }
+        let mut kinds = BTreeSet::new();
+        let mut fields: std::collections::BTreeMap<&str, Vec<&Value>> =
+            std::collections::BTreeMap::new();
+        let mut items = Vec::new();
+        for schema in &variants {
+            match &schema["type"] {
+                Value::String(kind) => {
+                    kinds.insert(kind.clone());
+                }
+                Value::Array(types) => {
+                    kinds.extend(types.iter().filter_map(Value::as_str).map(str::to_owned))
+                }
+                _ => {
+                    kinds.insert("object".into());
+                }
             }
+            for (field, property) in schema["properties"].as_object().into_iter().flatten() {
+                fields.entry(field).or_default().push(property);
+            }
+            if let Some(item) = schema.get("items") {
+                items.push(item);
+            }
+        }
+        let mut result = json!({"type":if kinds.len() == 1 { json!(kinds.iter().next().unwrap()) } else { json!(kinds) }});
+        if !fields.is_empty() {
+            result["properties"] = Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(field, schemas)| (field.into(), projection(&schemas, depth + 1)))
+                    .collect(),
+            );
+        }
+        if kinds.contains("array") {
+            result["items"] = if items.is_empty() {
+                json!({})
+            } else {
+                projection(&items, depth + 1)
+            };
+        }
+        if variants.iter().all(|schema| schema["enum"].is_array()) {
+            let values = variants
+                .iter()
+                .flat_map(|schema| schema["enum"].as_array().unwrap().iter().cloned())
+                .collect::<Vec<_>>();
+            result["enum"] = json!(values);
+        }
+        result
+    }
+    let mut fields: std::collections::BTreeMap<&str, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    for operation in operations {
+        if !operation_registry::task_records::IDS.contains(&operation.as_str())
+            && !operation_registry::task_proposals::IDS.contains(&operation.as_str())
+        {
+            continue;
+        }
+        let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) else {
+            continue;
+        };
+        for (field, schema) in spec.input.schema["properties"].as_object().unwrap() {
+            fields.entry(field).or_default().push(schema);
+        }
+    }
+    let properties = fields
+        .into_iter()
+        .map(|(field, schemas)| {
+            let mut schema = projection(&schemas, 0);
+            if schema["type"].is_string() {
+                schema["type"] = json!([schema["type"].clone()]);
+            }
+            let kinds = schema["type"].as_array_mut().unwrap();
+            if !kinds.contains(&json!("null")) {
+                kinds.push(json!("null"));
+            }
+            kinds.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            if let Some(values) = schema.get_mut("enum").and_then(Value::as_array_mut) {
+                values.push(Value::Null);
+            }
+            (field.into(), schema)
         })
-    } else {
-        json!({})
-    };
-    if operations.contains(TASK_PLAN_OPERATION) {
-        properties["action"] = json!({
-            "type": ["string", "null"],
-            "description": "task.plan: required literal `write`; the server rejects every other action."
-        });
-        properties["content"] = json!({
-            "type": ["string", "null"],
-            "description": "task.plan: required complete Markdown checklist with at least one `- [ ]` or `- [x]` item, at most 1 MiB. task.evidence: alternatively, inline artifact text."
-        });
-    }
-    if operations.contains(TASK_WORKLOG_OPERATION) {
-        properties["kind"] = json!({
-            "type": ["string", "null"],
-            "description": "task.worklog: required progress, decision, validation, or blocker. task.evidence: required screenshot, walkthrough_video, log, report, or other."
-        });
-        properties["summary"] = json!({
-            "type": ["string", "null"],
-            "description": "task.worklog: required concise summary, at most 4000 characters."
-        });
-    }
-    if operations.contains(TASK_EVIDENCE_OPERATION) {
-        if properties.get("kind").is_none() {
-            properties["kind"] = json!({
-                "type": ["string", "null"],
-                "description": "task.evidence: required screenshot, walkthrough_video, log, report, or other."
-            });
-        }
-        properties["caption"] = json!({
-            "type": ["string", "null"],
-            "description": "task.evidence: required description of the captured artifact."
-        });
-        properties["path"] = json!({
-            "type": ["string", "null"],
-            "description": "task.evidence: workspace-relative artifact path; supply path or content, never both."
-        });
-        if properties.get("content").is_none() {
-            properties["content"] = json!({
-                "type": ["string", "null"],
-                "description": "task.evidence: inline artifact text; supply content or path, never both."
-            });
-        }
-        properties["filename"] = json!({
-            "type": ["string", "null"],
-            "description": "task.evidence: optional safe display filename without path separators."
-        });
-    }
-    if operations.contains(TASK_ADAPTIVE_OPERATION)
-        || operations.contains(TASK_DEPENDENCY_OPERATION)
-    {
-        properties["rationale"] = json!({
-            "type": ["string", "null"],
-            "description": "task.adaptive/task.dependency: required. Why the command is being issued — for task.dependency, why the graph is changing shape."
-        });
-    }
-    if operations.contains(TASK_DEPENDENCY_OPERATION) {
-        properties["depends_on_task_id"] = json!({
-            "type": ["string", "null"],
-            "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream."
-        });
-    }
-    if operations.contains(TASK_ACTION_OPERATION) {
-        properties["version"] = json!({"type":["integer","null"], "description":"task.action: required current Task version from the offered actions."});
-    }
-    if operations.contains(TASK_ADAPTIVE_OPERATION) {
-        properties["expected_task_version"] = json!({
-            "type": ["integer", "null"],
-            "description": "task.adaptive: Task version precondition. task.action uses version."
-        });
-    }
-    if operations.contains(TASK_ADAPTIVE_OPERATION) {
-        properties["source_task_id"] = json!({
-            "type": ["string", "null"],
-            "description": "task.adaptive: source Task id in the bound Project."
-        });
-        properties["expected_board_revision"] = json!({
-            "type": ["integer", "null"],
-            "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision)."
-        });
-
-        properties["items"] = json!({
-            "type": ["array", "null"],
-            "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
-            "items": orchestration_payload_schema(TASK_ADAPTIVE_OPERATION)["properties"]["items"]["items"].clone()
-        });
-        properties["ordered_task_ids"] = json!({
-            "type": ["array", "null"],
-            "description": "task.adaptive sequence: non-empty ordered direct-child Task ids; manages child order only and does not create a dependency graph.",
-            "items": {"type":"string","minLength":1}
-        });
-    }
-    Some(properties)
+        .collect::<serde_json::Map<_, _>>();
+    (!properties.is_empty()).then_some(Value::Object(properties))
 }
 
 // The declared envelope is a plain `type: object` schema: several provider
@@ -1100,6 +809,10 @@ pub(crate) fn validate_orchestration_proposal_arguments(
                 ));
             }
         }
+    }
+    if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+        spec.validate_arguments(&arguments["payload"])
+            .map_err(RuntimeError::tool)?;
     }
     if let Some(value) = object.get("causation_id") {
         if !value.is_null() && !value.is_string() {
@@ -1470,14 +1183,12 @@ mod tests {
         assert!(guidance.contains("prerequisite DAG edges only"));
         assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
         let properties = coordination_payload_properties(&operations).expect("flat properties");
-        assert!(
-            properties["depends_on_task_ids"]["description"]
-                .as_str()
-                .expect("flat prerequisite guidance")
-                .contains("prerequisite DAG edges only")
+        assert_eq!(
+            properties["depends_on_task_ids"]["type"],
+            json!(["array", "null"])
         );
         assert!(
-            properties["description"]["description"]
+            schema["properties"]["description"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("owned repository-relative paths")
@@ -1643,7 +1354,7 @@ mod tests {
         assert_eq!(schema["properties"]["action"]["const"], "write");
         assert_eq!(schema["properties"]["content"]["type"], "string");
         assert_eq!(schema["properties"]["content"]["minLength"], 1);
-        assert_eq!(schema["properties"]["content"]["maxLength"], 1_048_576);
+        assert!(schema["properties"]["content"].get("maxLength").is_none());
         assert_eq!(schema["required"], json!(["action", "content"]));
 
         let validator = jsonschema::validator_for(&schema).expect("Task plan schema compiles");
@@ -1652,10 +1363,13 @@ mod tests {
             "content": "- [ ] implement"
         })));
         assert!(!validator.is_valid(&json!({"action": "write", "content": ""})));
-        assert!(!validator.is_valid(&json!({
-            "action": "write",
-            "content": "x".repeat(1_048_577)
-        })));
+        let plan = operation_registry::PROPOSAL_CATALOG
+            .lookup(TASK_PLAN_OPERATION)
+            .unwrap();
+        assert!(
+            plan.validate_arguments(&json!({"action":"write", "content":"é".repeat(524_289)}))
+                .is_err()
+        );
         assert!(!validator.is_valid(&json!({
             "action": "append",
             "content": "- [ ] implement"
@@ -1753,17 +1467,10 @@ mod tests {
         assert!(properties.get("action").is_some());
         assert!(properties.get("source_task_id").is_some());
         assert!(properties.get("ordered_task_ids").is_some());
-        assert!(
-            properties["items"]["description"]
-                .as_str()
-                .expect("split property guidance")
-                .contains("non-executing coordination root")
-        );
-        assert!(
-            properties["ordered_task_ids"]["description"]
-                .as_str()
-                .expect("sequence property guidance")
-                .contains("does not create a dependency graph")
+        assert_eq!(properties["items"]["type"], json!(["array", "null"]));
+        assert_eq!(
+            properties["ordered_task_ids"]["type"],
+            json!(["array", "null"])
         );
     }
 
@@ -1776,20 +1483,21 @@ mod tests {
         .into_iter()
         .collect::<BTreeSet<_>>();
         let properties = coordination_payload_properties(&operations).expect("flat properties");
-        let action_description = properties["action"]["description"]
-            .as_str()
-            .expect("action guidance");
-
+        assert_eq!(
+            properties["action"]["type"],
+            json!(["null", "object", "string"])
+        );
+        let guidance = coordination_payload_guidance(&operations);
         for discriminator in [
-            "task.action: required closed verb object",
+            "task.action",
             "retry",
-            "task.adaptive: \"split\", \"sequence\", or \"replace\"",
+            "task.adaptive",
+            "split",
+            "sequence",
+            "replace",
             "cancel",
         ] {
-            assert!(
-                action_description.contains(discriminator),
-                "combined action guidance must name {discriminator}: {action_description}"
-            );
+            assert!(guidance.contains(discriminator), "{guidance}");
         }
     }
     #[test]
@@ -1883,11 +1591,11 @@ mod tests {
             .find(|tool| tool.spec().name == "forge_scope_propose")
             .unwrap();
         let schema = tool.spec().input_schema.clone();
-        assert_eq!(
-            schema["properties"]["action"]["properties"],
-            schema["properties"]["payload"]["properties"]["action"]["properties"]
+        assert!(
+            schema["properties"]["payload"].get("properties").is_none(),
+            "registered payload fields are declared once as generated root aliases"
         );
-        let action = &schema["properties"]["payload"]["properties"]["action"];
+        let action = &schema["properties"]["action"];
         for field in [
             "verb",
             "reason",

@@ -17,6 +17,7 @@ pub(super) struct Context<'a> {
     pub scope: &'a CanonicalScope,
     pub admitted_authority: Option<&'a operation_registry::authority::EffectiveAuthority>,
     pub proposal_arguments: Option<&'a Value>,
+    pub runtime_session_id: Option<&'a str>,
 }
 #[async_trait]
 impl operation_registry::scope_reads::ScopeReadContext<AgentHostError> for Context<'_> {
@@ -178,6 +179,79 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
     ) -> Result<Value, AgentHostError> {
         self.provider
             .inquiry_run(self.actor_identity_id, self.scope, input)
+            .await
+    }
+}
+
+#[async_trait]
+impl operation_registry::task_reads::TaskReadContext<AgentHostError> for Context<'_> {
+    async fn task_summary(&self, _: NoArguments) -> Result<Value, AgentHostError> {
+        self.provider
+            .summary(self.actor_identity_id, self.scope)
+            .await
+    }
+    async fn work_read(
+        &self,
+        input: operation_registry::task_reads::ListArguments,
+    ) -> Result<Value, AgentHostError> {
+        let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
+        self.provider
+            .read_work_for_admission(
+                self.actor_identity_id,
+                self.scope,
+                limit,
+                self.admitted_authority,
+            )
+            .await
+    }
+    async fn events_read(
+        &self,
+        input: operation_registry::task_reads::ListArguments,
+    ) -> Result<Value, AgentHostError> {
+        let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
+        self.provider.read_events(self.scope, limit).await
+    }
+    async fn inbox_read(
+        &self,
+        input: operation_registry::task_reads::ListArguments,
+    ) -> Result<Value, AgentHostError> {
+        let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
+        self.provider
+            .read_inbox(self.actor_identity_id, self.scope, limit)
+            .await
+    }
+    async fn commitments_read(
+        &self,
+        input: operation_registry::task_reads::ListArguments,
+    ) -> Result<Value, AgentHostError> {
+        let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
+        self.provider
+            .read_commitments(self.actor_identity_id, self.scope, limit)
+            .await
+    }
+    async fn delivery_read(
+        &self,
+        input: operation_registry::task_reads::ListArguments,
+    ) -> Result<Value, AgentHostError> {
+        let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
+        self.provider
+            .read_delivery(self.actor_identity_id, self.scope, limit)
+            .await
+    }
+    async fn memory_read(
+        &self,
+        input: operation_registry::task_reads::MemoryArguments,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .memory_read(self.actor_identity_id, self.scope, input, false)
+            .await
+    }
+    async fn decisions_read(
+        &self,
+        input: operation_registry::task_reads::MemoryArguments,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .memory_read(self.actor_identity_id, self.scope, input, true)
             .await
     }
 }

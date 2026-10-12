@@ -12,6 +12,8 @@ use operation_registry::authority::permission_set;
 mod project_proposals;
 mod registered_proposals;
 mod registered_reads;
+mod task_proposals;
+mod task_records;
 #[cfg(test)]
 use std::collections::BTreeSet;
 
@@ -41,16 +43,16 @@ use db::{
     CommandReceiptRepo, MemoryScopeGrant, SqliteDb, TaskBoardRepo,
 };
 use forge_agent_host::{
-    contains_adaptive_authority_override, contains_authority_override, operation_contract,
-    operation_descriptor, operation_permission, AgentHostError, CanonicalScope, CanonicalScopeType,
-    CommandObservation, ForgeToolProvider, OperationClassification, PublicSearchScope,
-    WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    contains_authority_override, operation_contract, operation_descriptor, operation_permission,
+    AgentHostError, CanonicalScope, CanonicalScopeType, CommandObservation, ForgeToolProvider,
+    OperationClassification, PublicSearchScope, WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
+    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION,
+    PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -77,142 +79,6 @@ use crate::{
     MainGenesisStartRequest, MainOrchestrationQueryService, OrchestrationAuthorizationService,
     ProjectOrchestrationActionService, TaskService,
 };
-
-/// Closed native payload for the bounded adaptive Task command.  The adapter
-/// owns only transport decoding; Project, actor, permission, governance, and
-/// fixed-boundary values are filled by the server and never accepted here.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum AdaptiveTaskPayload {
-    Split {
-        source_task_id: String,
-        expected_task_version: i64,
-        expected_board_revision: i64,
-        rationale: String,
-        items: Vec<AdaptiveTaskChildPayload>,
-    },
-    Sequence {
-        source_task_id: String,
-        expected_task_version: i64,
-        expected_board_revision: i64,
-        rationale: String,
-        ordered_task_ids: Vec<String>,
-    },
-    Replace {
-        source_task_id: String,
-        expected_task_version: i64,
-        expected_board_revision: i64,
-        rationale: String,
-        title: String,
-        description: Option<String>,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdaptiveTaskChildPayload {
-    title: String,
-    description: Option<String>,
-    assignee_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum TaskDependencyPayload {
-    Add {
-        task_id: String,
-        depends_on_task_id: String,
-        rationale: String,
-    },
-    Remove {
-        task_id: String,
-        depends_on_task_id: String,
-        rationale: String,
-    },
-}
-
-impl TaskDependencyPayload {
-    fn into_parts(self) -> (String, String, TaskDependencyAction, String) {
-        match self {
-            Self::Add {
-                task_id,
-                depends_on_task_id,
-                rationale,
-            } => (
-                task_id,
-                depends_on_task_id,
-                TaskDependencyAction::Add,
-                rationale,
-            ),
-            Self::Remove {
-                task_id,
-                depends_on_task_id,
-                rationale,
-            } => (
-                task_id,
-                depends_on_task_id,
-                TaskDependencyAction::Remove,
-                rationale,
-            ),
-        }
-    }
-}
-
-impl AdaptiveTaskPayload {
-    fn into_command_parts(self) -> (String, i64, i64, AdaptiveTaskOperation, String) {
-        match self {
-            Self::Split {
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                rationale,
-                items,
-            } => (
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                AdaptiveTaskOperation::Split {
-                    items: items
-                        .into_iter()
-                        .map(|item| AdaptiveTaskChild {
-                            title: item.title,
-                            description: item.description,
-                            assignee_id: item.assignee_id,
-                        })
-                        .collect(),
-                },
-                rationale,
-            ),
-            Self::Sequence {
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                rationale,
-                ordered_task_ids,
-            } => (
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                AdaptiveTaskOperation::Sequence { ordered_task_ids },
-                rationale,
-            ),
-            Self::Replace {
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                rationale,
-                title,
-                description,
-            } => (
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                AdaptiveTaskOperation::Replace { title, description },
-                rationale,
-            ),
-        }
-    }
-}
 
 type SessionDenialRows = BTreeMap<(String, String), Vec<db::ChatSessionDenial>>;
 
@@ -540,21 +406,17 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        arguments: operation_registry::task_reads::MemoryArguments,
         decision_only: bool,
     ) -> Result<Value, AgentHostError> {
         let query = arguments
-            .get("query")
-            .and_then(Value::as_str)
+            .query
+            .as_deref()
             .unwrap_or_default()
             .chars()
             .take(512)
             .collect::<String>();
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(10)
-            .clamp(1, 20) as u32;
+        let limit = arguments.limit.unwrap_or(10).clamp(1, 20) as u32;
         let visibility = match scope.scope_type {
             CanonicalScopeType::Account => vec!["account".to_owned(), "private".to_owned()],
             CanonicalScopeType::Project => vec!["project".to_owned(), "private".to_owned()],
@@ -611,30 +473,6 @@ impl CoordinationToolProvider {
             })
             .collect::<Vec<_>>();
         Ok(json!({"items": items, "has_more": has_more, "next_cursor": cursor}))
-    }
-
-    async fn scoped_rows(
-        &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-        operation: &str,
-        arguments: Value,
-    ) -> Result<Value, AgentHostError> {
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 50) as i64;
-        match operation {
-            "work.read" => self.read_work(actor_identity_id, scope, limit).await,
-            "events.read" => self.read_events(scope, limit).await,
-            "inbox.read" => self.read_inbox(actor_identity_id, scope, limit).await,
-            "commitments.read" => self.read_commitments(actor_identity_id, scope, limit).await,
-            "delivery.read" => self.read_delivery(actor_identity_id, scope, limit).await,
-            _ => Err(AgentHostError::Unsupported(
-                "Forge scoped read operation is not implemented".to_owned(),
-            )),
-        }
     }
 
     async fn discovery_read(
@@ -723,56 +561,46 @@ impl CoordinationToolProvider {
     /// scope, the execution and role from the run that is actually holding the
     /// workspace, and the identity from the session. An agent can write what it
     /// did; it cannot assert who it was or which run it belonged to.
+    async fn running_task_execution(
+        &self,
+        actor: &str,
+        runtime: &str,
+        scope: &CanonicalScope,
+    ) -> Result<(String, String, Option<String>), AgentHostError> {
+        // The same lookup the authority resolver admits the session with.
+        let execution = self
+            .db
+            .task_record_execution(actor, &scope.scope_id, runtime)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .ok_or_else(|| {
+                AgentHostError::Authority(
+                    "Task record requires one exact running execution for this native session"
+                        .into(),
+                )
+            })?;
+        Ok((execution.id, execution.role, execution.workspace_id))
+    }
+
     async fn execute_task_worklog_append(
         &self,
         actor_identity_id: &str,
+        runtime_session_id: &str,
         scope: &CanonicalScope,
         arguments: &Value,
-        payload: &Value,
+        payload: &operation_registry::task_records::Worklog,
     ) -> Result<Value, AgentHostError> {
-        if scope.scope_type != CanonicalScopeType::Task {
-            return Err(AgentHostError::Authority(
-                "a worklog entry belongs to a Task session".to_owned(),
-            ));
-        }
         let task_id = scope.scope_id.clone();
-        let kind = payload
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "progress" | "decision" | "validation" | "blocker"))
-            .ok_or_else(|| {
-                invalid_arguments(
-                    "kind must be progress, decision, validation, or blocker".to_owned(),
-                )
-            })?
-            .to_owned();
-        let summary = payload
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| invalid_arguments("summary is required".to_owned()))?;
-        if summary.chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
-            return Err(invalid_arguments(format!(
-                "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
-            )));
+        let kind = payload.kind.as_str().to_owned();
+        let summary = payload.summary.trim();
+        if summary.is_empty() {
+            return Err(invalid_arguments("summary is required".into()));
         }
-
-        // The run holding the workspace is the one that authored this entry.
-        let execution: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT id, role FROM execution
-             WHERE task_id = ? AND agent_id = ? AND status = 'running'
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(&task_id)
-        .bind(actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        let (execution_id, role) = match execution {
-            Some((id, role)) => (Some(id), role),
-            None => (None, None),
-        };
+        let (execution_id, role, _) = self
+            .running_task_execution(actor_identity_id, runtime_session_id, scope)
+            .await?;
+        let execution_id = Some(execution_id);
+        let role = Some(role);
 
         let idempotency_key = correlation_id(arguments, TASK_WORKLOG_OPERATION, scope);
         let now = db::now_rfc3339();
@@ -795,6 +623,16 @@ impl CoordinationToolProvider {
         )
         .await
         .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        // The key returns the entry it first wrote. Reporting that entry for
+        // a different one would tell the run its note was recorded when it
+        // was dropped.
+        if created.content != summary || created.worklog_kind.as_deref() != Some(kind.as_str()) {
+            return Err(invalid_arguments(
+                "correlation_id was already used for a different worklog entry on this Task; \
+                 send this entry with a new correlation_id"
+                    .to_owned(),
+            ));
+        }
 
         Ok(json!({
             "operation": TASK_WORKLOG_OPERATION,
@@ -810,30 +648,36 @@ impl CoordinationToolProvider {
     async fn execute_task_evidence_capture(
         &self,
         actor_identity_id: &str,
+        runtime_session_id: &str,
         scope: &CanonicalScope,
-        payload: &Value,
+        payload: &operation_registry::task_records::Evidence,
     ) -> Result<Value, AgentHostError> {
-        if scope.scope_type != CanonicalScopeType::Task {
-            return Err(AgentHostError::Authority(
-                "evidence capture requires a Task scope with a workspace".to_owned(),
-            ));
-        }
         let task_id = scope.scope_id.clone();
-        let (kind, caption) = evidence_kind_and_caption(payload).map_err(invalid_arguments)?;
+        let (execution_id, role, execution_workspace_id) = self
+            .running_task_execution(actor_identity_id, runtime_session_id, scope)
+            .await?;
+        let kind_and_caption = json!({"kind":payload.kind,"caption":payload.caption});
+        let (kind, caption) =
+            evidence_kind_and_caption(&kind_and_caption).map_err(invalid_arguments)?;
         let path = payload
-            .get("path")
-            .and_then(Value::as_str)
+            .path
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let content = payload
-            .get("content")
-            .and_then(Value::as_str)
+            .content
+            .as_deref()
             .filter(|value| !value.trim().is_empty());
         // One source of bytes, never both: a caller supplying each would leave
         // the stored artifact ambiguous about what was actually observed.
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
-                let workspace = self.task_workspace(&task_id).await?;
+                // The run's own workspace (a child Task runs in its root's);
+                // an execution that recorded none uses the Task's, exactly
+                // as the turn itself does.
+                let workspace = self
+                    .task_execution_workspace(&task_id, execution_workspace_id.as_deref())
+                    .await?;
                 let root = self.inspected_task_worktree(&task_id, &workspace).await?;
                 let resolved =
                     resolve_workspace_artifact(&root, path).map_err(invalid_arguments)?;
@@ -889,12 +733,12 @@ impl CoordinationToolProvider {
             )));
         }
         let filename = payload
-            .get("filename")
-            .and_then(Value::as_str)
+            .filename
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
             .map_or(default_name, str::to_owned);
-        let filename = match payload.get("kind").and_then(Value::as_str) {
+        let filename = match Some(payload.kind.as_str()) {
             Some(original_kind) if original_kind != kind => {
                 format!("[{}] {filename}", original_kind.replace(['/', '\\'], "_"))
             }
@@ -914,6 +758,8 @@ impl CoordinationToolProvider {
             "byte_size": stored.byte_size,
             "kind": kind,
             "caption": caption,
+            "execution_id": execution_id,
+            "role": role,
             "domain_committed": true,
         }))
     }
@@ -923,53 +769,12 @@ impl CoordinationToolProvider {
         actor_identity_id: &str,
         runtime_session_id: &str,
         scope: &CanonicalScope,
-        payload: &Value,
+        payload: &operation_registry::task_records::Plan,
     ) -> Result<Value, AgentHostError> {
-        if scope.scope_type != CanonicalScopeType::Task {
-            return Err(AgentHostError::Authority(
-                "a plan candidate belongs to a Task session".to_owned(),
-            ));
-        }
-        if payload.get("action").and_then(Value::as_str) != Some("write") {
-            return Err(invalid_arguments(
-                "task.plan action must be write".to_owned(),
-            ));
-        }
-        let content = payload
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| invalid_arguments("plan content is required".to_owned()))?;
-        let executions: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT e.id, e.role, e.workspace_id
-             FROM agent_session AS s
-             JOIN agent_context_scope AS scope ON scope.id = s.context_scope_id
-             JOIN execution AS e
-               ON e.task_id = scope.task_id AND e.agent_id = s.identity_id
-             WHERE s.runtime_session_id = ? AND s.identity_id = ?
-               AND scope.scope_type = 'task' AND scope.scope_id = ?
-               AND scope.task_id = ? AND e.status = 'running'
-               AND (
-                    (scope.task_role = 'planner' AND e.role = 'planner')
-                    OR (scope.task_role = 'worker' AND e.role IN ('worker', 'coder', 'executor'))
-               )
-             ORDER BY e.created_at DESC, e.id DESC LIMIT 2",
-        )
-        .bind(runtime_session_id)
-        .bind(actor_identity_id)
-        .bind(&scope.scope_id)
-        .bind(&scope.scope_id)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        let [(execution_id, role, workspace_id)] = executions.as_slice() else {
-            return Err(AgentHostError::Authority(
-                "task.plan requires one exact running execution for this native session".to_owned(),
-            ));
-        };
-        let execution_id = execution_id.clone();
-        let role = role.clone();
-        let workspace_id = workspace_id.clone();
+        let content = payload.content.as_str();
+        let (execution_id, role, workspace_id) = self
+            .running_task_execution(actor_identity_id, runtime_session_id, scope)
+            .await?;
         if !executors::task_role_can_write_plan(Some(&role)) {
             return Err(AgentHostError::Authority(
                 "task.plan is available only to planner and implementation roles".to_owned(),
@@ -1716,19 +1521,22 @@ impl CoordinationToolProvider {
         })
     }
 
-    async fn task_workspace(
+    async fn task_execution_workspace(
         &self,
         task_id: &str,
+        workspace_id: Option<&str>,
     ) -> Result<crate::workspace_backend::ResolvedWorkspace, AgentHostError> {
-        let workspace = db::WorkspaceRepo::get_by_task_id(&*self.db, task_id)
-            .await
-            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
-            .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
-            .ok_or_else(|| {
-                AgentHostError::Runtime(
-                    "this Task has no active workspace to capture an artifact from".to_owned(),
-                )
-            })?;
+        let workspace = match workspace_id {
+            Some(workspace_id) => db::WorkspaceRepo::get_by_id(&*self.db, workspace_id).await,
+            None => db::WorkspaceRepo::get_by_task_id(&*self.db, task_id).await,
+        }
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+        .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
+        .ok_or_else(|| {
+            AgentHostError::Runtime(
+                "this Task has no active workspace to capture an artifact from".to_owned(),
+            )
+        })?;
         let router = self
             .task_service_handle()
             .map(|service| service.workspace_backend_router())
@@ -2347,23 +2155,38 @@ impl CoordinationToolProvider {
         }))
     }
 
+    #[cfg(test)]
     async fn read_work(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
         limit: i64,
     ) -> Result<Value, AgentHostError> {
+        self.read_work_for_admission(actor_identity_id, scope, limit, None)
+            .await
+    }
+    async fn read_work_for_admission(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        limit: i64,
+        admitted: Option<&operation_registry::authority::EffectiveAuthority>,
+    ) -> Result<Value, AgentHostError> {
         // A Project Agent works from its Chat scope, so resolve that binding to
         // the Project whose Tasks it proposes; reading them is how it avoids
         // proposing the same work twice.
         let project_scope_id = match scope.scope_type {
             CanonicalScopeType::Project => Some(scope.scope_id.clone()),
-            CanonicalScopeType::AgentChat => Some(
-                self.authorization
+            CanonicalScopeType::AgentChat => Some(match admitted.map(|a| &a.principal) {
+                Some(operation_registry::authority::Principal::ProjectAgent {
+                    project_id, ..
+                }) => project_id.clone(),
+                _ => self
+                    .authorization
                     .project_orchestration_target(actor_identity_id, scope)
                     .await
                     .map_err(native_scope_error)?,
-            ),
+            }),
             _ => None,
         };
         let rows = match (scope.scope_type, project_scope_id.as_deref()) {
@@ -2486,6 +2309,16 @@ impl CoordinationToolProvider {
                 offers_by_task.insert(id.clone(), offers.available_actions);
             }
         }
+        let action_capable =
+            admitted.map_or(scope.scope_type != CanonicalScopeType::Task, |authority| {
+                authority
+                    .evaluate(
+                        operation_registry::PROPOSAL_CATALOG
+                            .lookup(TASK_ACTION_OPERATION)
+                            .unwrap(),
+                    )
+                    .is_ok()
+            });
         let items = rows
             .into_iter()
             .map(|row| {
@@ -2505,7 +2338,11 @@ impl CoordinationToolProvider {
                     "assignee_id": row.try_get::<Option<String>, _>("assignee_id").ok().flatten(),
                     "condition": condition,
                     "depends_on": depends_on,
-                    "available_actions": offers_by_task.remove(&id).unwrap_or_default(),
+                    "available_actions": offers_by_task.get(&id).cloned().unwrap_or_default(),
+                    "available_actions_informational": !action_capable,
+                    "action_schema": if !action_capable { Value::Null } else {
+                        operation_registry::task_proposals::offered_action_schema(offers_by_task.get(&id).map(Vec::as_slice).unwrap_or_default(), false)
+                    },
                     "latest_execution": latest_executions.remove(&id).unwrap_or(Value::Null),
                 })
             })
@@ -2688,7 +2525,15 @@ impl CoordinationToolProvider {
     ) -> Result<Value, AgentHostError> {
         if registered_proposals::CATALOG.lookup(operation).is_some() {
             return self
-                .registered_proposal(actor_identity_id, scope, operation, arguments, false, None)
+                .registered_proposal(
+                    actor_identity_id,
+                    scope,
+                    runtime_session_id,
+                    operation,
+                    arguments,
+                    false,
+                    None,
+                )
                 .await;
         }
         let payload = arguments
@@ -2742,21 +2587,6 @@ impl CoordinationToolProvider {
                 "proposal payload does not match the typed operation schema".to_owned(),
             )
         })?;
-        if operation == TASK_WORKLOG_OPERATION {
-            return self
-                .execute_task_worklog_append(actor_identity_id, scope, &arguments, &payload)
-                .await;
-        }
-        if operation == TASK_EVIDENCE_OPERATION {
-            return self
-                .execute_task_evidence_capture(actor_identity_id, scope, &payload)
-                .await;
-        }
-        if operation == TASK_PLAN_OPERATION {
-            return self
-                .execute_task_plan_write(actor_identity_id, runtime_session_id, scope, &payload)
-                .await;
-        }
         // `project.evidence` capture stores the artifact the Project Agent's
         // own verification run produced as a Project media asset, then
         // continues as the bounded attach it now is. The asset exists before
@@ -3059,294 +2889,6 @@ impl CoordinationToolProvider {
                 json!({"operation":operation,"status":"succeeded","materialized":true,"domain_committed":true,"domain_result":result,"correlation_id":correlation_id,"requires_user_authorization":false}),
             );
         }
-        if operation == TASK_ACTION_OPERATION {
-            let task_service = self.task_service_handle().ok_or_else(|| {
-                AgentHostError::Configuration("Task actions are not wired".to_owned())
-            })?;
-            let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority("Task action has no canonical Project".to_owned())
-            })?;
-            let task_id = payload
-                .get("task_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_arguments("task_id is required".to_owned()))?;
-            let task = db::TaskRepo::get_by_id(&*self.db, task_id, false)
-                .await
-                .map_err(|error| AgentHostError::Runtime(error.to_string()))?
-                .filter(|task| task.project_id == project_id)
-                .ok_or_else(|| {
-                    invalid_arguments("task_id must name a Task in this Project".to_owned())
-                })?;
-            let request: api_types::TaskActionRequest = serde_json::from_value(
-                json!({ "action": payload.get("action"), "version": payload.get("version") }),
-            )
-            .map_err(|error| invalid_arguments(error.to_string()))?;
-            let (policy, reason) = self
-                .actions
-                .evaluate_direct_command_policy(
-                    actor_identity_id,
-                    scope_type_name(scope.scope_type),
-                    &scope.scope_id,
-                    requested_permission,
-                    operation,
-                    None,
-                )
-                .await
-                .map_err(service_error)?;
-            if !matches!(policy, AgentActionPolicyResult::Allowed) {
-                return Err(AgentHostError::Authority(
-                    reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
-                ));
-            }
-            let unblocking = crate::project_escalation::is_unblocking_verb(request.action.verb());
-            let result = task_service
-                .perform_task_action_as(
-                    task.id,
-                    request.action,
-                    request.version,
-                    api_types::Actor::agent(actor_identity_id),
-                )
-                .await
-                .map_err(service_error)?;
-            if unblocking {
-                crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
-                    .record_unblocking_action(&project_id, actor_identity_id, &result.task.id)
-                    .await
-                    .map_err(service_error)?;
-            }
-            let offers = task_service
-                .task_action_offers(&result.task.id, &api_types::Actor::agent(actor_identity_id))
-                .await
-                .map_err(service_error)?;
-            return Ok(
-                json!({ "operation": operation, "status": "succeeded", "replayed": false, "materialized": true, "domain_committed": true, "correlation_id": correlation_id, "task_id": result.task.id, "task_status": result.task.status, "task_version": result.task.version, "available_actions": offers.available_actions, "requires_user_authorization": false }),
-            );
-        }
-
-        if operation == TASK_DEPENDENCY_OPERATION {
-            let Some(task_service) = self.task_service_handle() else {
-                return Err(AgentHostError::Configuration(
-                    "Task dependency execution is not wired to a TaskService".to_owned(),
-                ));
-            };
-            let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "Task dependency command has no server-derived Project target".to_owned(),
-                )
-            })?;
-            let payload: TaskDependencyPayload =
-                typed_command_payload(operation, scope, &correlation_id, payload)?;
-            let (task_id, depends_on_task_id, action, _rationale) = payload.into_parts();
-            let (policy_result, policy_reason) = self
-                .actions
-                .evaluate_direct_command_policy(
-                    actor_identity_id,
-                    scope_type_name(scope.scope_type),
-                    &scope.scope_id,
-                    requested_permission,
-                    operation,
-                    None,
-                )
-                .await
-                .map_err(service_error)?;
-            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
-                tracing::warn!(
-                    operation,
-                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
-                    "Task dependency command policy denied"
-                );
-                return Err(AgentHostError::Authority(
-                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
-                ));
-            }
-            let task = task_service
-                .perform_project_agent_dependency(
-                    &project_id,
-                    &task_id,
-                    &depends_on_task_id,
-                    action,
-                )
-                .await
-                .map_err(service_error)?;
-            return Ok(json!({
-                "operation": operation,
-                "status": "succeeded",
-                "replayed": false,
-                "materialized": true,
-                "domain_committed": true,
-                "correlation_id": correlation_id,
-                "task_id": task.id,
-                "task_status": task.status,
-                "task_version": task.version,
-                "condition": task.condition.public(),
-                "requires_user_authorization": false,
-            }));
-        }
-
-        if operation == TASK_ADAPTIVE_OPERATION {
-            let Some(task_service) = self.task_service_handle() else {
-                return Err(AgentHostError::Configuration(
-                    "Adaptive Task execution is not wired to a TaskService".to_owned(),
-                ));
-            };
-            let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "adaptive Task command has no server-derived Project target".to_owned(),
-                )
-            })?;
-            let adaptive_payload: AdaptiveTaskPayload =
-                typed_command_payload(operation, scope, &correlation_id, payload.clone())?;
-            let (
-                source_task_id,
-                expected_task_version,
-                expected_board_revision,
-                adaptive_operation,
-                rationale,
-            ) = adaptive_payload.into_command_parts();
-            let receipt_exists = self
-                .adaptive_receipt_exists(actor_identity_id, &project_id, &idempotency_key)
-                .await?;
-            let (policy_result, policy_reason) = if receipt_exists {
-                (AgentActionPolicyResult::Allowed, None)
-            } else {
-                self.actions
-                    .evaluate_direct_command_policy(
-                        actor_identity_id,
-                        scope_type_name(scope.scope_type),
-                        &scope.scope_id,
-                        requested_permission,
-                        operation,
-                        Some(&payload.to_string()),
-                    )
-                    .await
-                    .map_err(service_error)?
-            };
-            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
-                return Err(AgentHostError::Authority(
-                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
-                ));
-            }
-            let result: AdaptiveTaskCommandResult = task_service
-                .execute_adaptive_task_command(AdaptiveTaskCommand {
-                    project_id,
-                    source_task_id,
-                    expected_task_version,
-                    expected_board_revision,
-                    operation: adaptive_operation,
-                    rationale,
-                    actor_type: "agent".to_owned(),
-                    actor_id: actor_identity_id.to_owned(),
-                    policy_result: "allowed".to_owned(),
-                    policy_revision: None,
-                    policy_digest: None,
-                    requested_permission: Some(requested_permission.to_owned()),
-                    idempotency_key,
-                    correlation_id,
-                    causation_id,
-                    causation_depth,
-                })
-                .await
-                .map_err(service_error)?;
-            let task_ids = result
-                .tasks
-                .iter()
-                .map(|task| Value::String(task.id.clone()))
-                .collect::<Vec<_>>();
-            return Ok(json!({
-                "operation": operation,
-                "status": "succeeded",
-                "replayed": result.replayed,
-                "materialized": true,
-                "domain_committed": true,
-                "receipt_id": result.receipt.id,
-                "event_id": result.receipt.event_id,
-                "input_digest": result.receipt.input_digest,
-                "policy_result": result.receipt.policy_result,
-                "correlation_id": result.receipt.correlation_id,
-                "source_task_id": result.source_task.id,
-                "task_ids": task_ids,
-                "board_revision": result.board_revision,
-                "domain_result": {
-                    "source_task_id": result.source_task.id,
-                    "task_ids": result.tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>(),
-                    "board_revision": result.board_revision,
-                },
-                "action_id": Value::Null,
-                "agent_action_execution_id": Value::Null,
-                "requires_user_authorization": false,
-            }));
-        }
-
-        if operation == TASK_PROPOSE_OPERATION {
-            let Some(task_service) = self.task_service_handle() else {
-                return Err(AgentHostError::Configuration(
-                    "Task proposal execution is not wired to a TaskService".to_owned(),
-                ));
-            };
-            let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "direct task proposal has no server-derived Project target".to_owned(),
-                )
-            })?;
-            let payload: TaskProposalPayload =
-                typed_command_payload(operation, scope, &correlation_id, payload.clone())?;
-            let payload_json = serde_json::to_string(&payload).map_err(|_| {
-                AgentHostError::Unsupported("task proposal payload is invalid".to_owned())
-            })?;
-            let (policy_result, reason) = self
-                .actions
-                .evaluate_direct_command_policy(
-                    actor_identity_id,
-                    scope_type_name(scope.scope_type),
-                    &scope.scope_id,
-                    requested_permission,
-                    operation,
-                    Some(&payload_json),
-                )
-                .await
-                .map_err(service_error)?;
-            let result: TaskProposalCommandResult = task_service
-                .execute_task_proposal_direct(DirectTaskProposalInput {
-                    actor_identity_id: actor_identity_id.to_owned(),
-                    executor_type: "agent".to_owned(),
-                    executor_id: actor_identity_id.to_owned(),
-                    source_scope_type: scope_type_name(scope.scope_type).to_owned(),
-                    source_scope_id: scope.scope_id.clone(),
-                    project_id,
-                    payload,
-                    idempotency_key,
-                    correlation_id,
-                    causation_id,
-                    causation_depth,
-                    policy_result: "allowed".to_owned(),
-                    preflight_policy_result: Some(policy_result.to_string()),
-                    preflight_policy_reason: reason,
-                    policy_revision: None,
-                    policy_digest: None,
-                    requested_permission: requested_permission.to_owned(),
-                })
-                .await
-                .map_err(service_error)?;
-            return Ok(json!({
-                "operation": operation,
-                "status": "succeeded",
-                "replayed": result.replayed,
-                "materialized": true,
-                "domain_committed": true,
-                "receipt_id": result.receipt.id,
-                "event_id": result.receipt.event_id,
-                "input_digest": result.receipt.input_digest,
-                "policy_result": result.receipt.policy_result,
-                "correlation_id": result.receipt.correlation_id,
-                "domain_result": {
-                    "task_id": result.task.id,
-                    "task_status": result.task.status,
-                },
-                "agent_action_execution_id": Value::Null,
-                "requires_user_authorization": false,
-            }));
-        }
-
         if forge_agent_host::is_project_orchestration_operation(operation) {
             let project_id = target_id.ok_or_else(|| {
                 AgentHostError::Authority(
@@ -4171,6 +3713,7 @@ impl CoordinationToolProvider {
                 actor_identity_id,
                 scope,
                 proposal_arguments: None,
+                runtime_session_id: None,
                 admitted_authority: admitted,
             };
             match spec.dispatch(&context, arguments).await {
@@ -4182,28 +3725,13 @@ impl CoordinationToolProvider {
             }
         } else {
             match operation {
-                "memory.read" => {
-                    self.memory_read(actor_identity_id, scope, arguments, false)
-                        .await
-                }
-                "project.summary" | "task.summary" => {
-                    if operation == "project.summary"
-                        && scope.scope_type == CanonicalScopeType::AgentChat
-                    {
+                "project.summary" => {
+                    if scope.scope_type == CanonicalScopeType::AgentChat {
                         self.project_summary_read(actor_identity_id, scope, arguments)
                             .await
                     } else {
                         self.summary(actor_identity_id, scope).await
                     }
-                }
-                "decisions.read" => {
-                    self.memory_read(actor_identity_id, scope, arguments, true)
-                        .await
-                }
-                "work.read" | "events.read" | "inbox.read" | "commitments.read"
-                | "delivery.read" => {
-                    self.scoped_rows(actor_identity_id, scope, operation, arguments)
-                        .await
                 }
                 _ => Err(AgentHostError::Unsupported(
                     "Forge read operation is not implemented".to_owned(),
@@ -4276,12 +3804,11 @@ impl CoordinationToolProvider {
                 )
             })
             .unwrap_or(false);
-        let result = if (prepared || admitted_authority.is_some())
-            && registered_proposals::CATALOG.lookup(operation).is_some()
-        {
+        let result = if registered_proposals::CATALOG.lookup(operation).is_some() {
             self.registered_proposal(
                 actor_identity_id,
                 scope,
+                runtime_session_id,
                 operation,
                 arguments.clone(),
                 prepared,
@@ -5014,27 +4541,15 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
             "Forge proposal payload must be an object".to_owned(),
         ));
     }
-    if operation == TASK_PLAN_OPERATION {
-        let object = payload.as_object().expect("payload object checked above");
-        let content = object.get("content").and_then(Value::as_str);
-        let exact_shape = object.len() == 2
-            && object.get("action").and_then(Value::as_str) == Some("write")
-            && content.is_some_and(|content| {
-                !content.trim().is_empty()
-                    && content.len() as u64 <= crate::plan_artifact::MAX_PLAN_ARTIFACT_SIZE_BYTES
-            });
-        if !exact_shape {
-            return Err(AgentHostError::Authority(
-                "task.plan requires only action=write and non-empty content no larger than 1 MiB"
-                    .to_owned(),
-            ));
-        }
-    } else if serde_json::to_vec(payload)
-        .map(|bytes| bytes.len() > 64 * 1024)
-        .unwrap_or(true)
+    if operation_registry::PROPOSAL_CATALOG
+        .lookup(operation)
+        .is_none()
+        && serde_json::to_vec(payload)
+            .map(|bytes| bytes.len() > 64 * 1024)
+            .unwrap_or(true)
     {
         return Err(AgentHostError::Authority(
-            "Forge proposal payload is too large".to_owned(),
+            "Forge proposal payload is too large".into(),
         ));
     }
     if operation == "session.action" {
@@ -5062,36 +4577,6 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
         return Err(AgentHostError::Authority(
             "Forge orchestration scope and authority are server-derived".to_owned(),
         ));
-    }
-    if operation == TASK_ADAPTIVE_OPERATION {
-        if contains_adaptive_authority_override(payload) {
-            return Err(AgentHostError::Authority(
-                "adaptive Task Project, actor, governance, and fixed boundaries are server-derived"
-                    .to_owned(),
-            ));
-        }
-        serde_json::from_value::<AdaptiveTaskPayload>(payload.clone()).map_err(|_| {
-            AgentHostError::Authority(
-                "adaptive Task payload must be one closed split, sequence, or replace command"
-                    .to_owned(),
-            )
-        })?;
-    }
-    if operation == TASK_ACTION_OPERATION {
-        serde_json::from_value::<api_types::TaskActionRequest>(
-            json!({ "action": payload.get("action"), "version": payload.get("version") }),
-        )
-        .map_err(|_| {
-            invalid_arguments("Task action requires a closed verb and exact version".to_owned())
-        })?;
-    }
-    if operation == TASK_DEPENDENCY_OPERATION {
-        serde_json::from_value::<TaskDependencyPayload>(payload.clone()).map_err(|_| {
-            AgentHostError::Authority(
-                "Task dependency payload must contain add or remove, both Task ids, and a rationale"
-                    .to_owned(),
-            )
-        })?;
     }
     match operation {
         "project.lifecycle" => {
@@ -6171,6 +5656,181 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_task_registered_records_bind_exact_execution_and_refuse_forgery() {
+        let fixture = native_plan_fixture_with_permissions(
+            "coder",
+            "coder",
+            r#"["read_task","read_memory","task_read","task_write"]"#,
+        )
+        .await;
+        // A resumed execution carries its parent's session id from creation,
+        // and the Task session may have been recreated since (server restart,
+        // profile change). The run is still this session's: it is found by
+        // Task, identity, role and running status, never by that stale id.
+        sqlx::query("UPDATE execution SET agent_session_id='parent-runtime-session' WHERE id=?")
+            .bind(&fixture.execution_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        fixture
+            .provider
+            .set_media_root(fixture._temp.path().join("media"));
+        for (operation, payload) in [
+            (
+                TASK_PLAN_OPERATION,
+                json!({"action":"write","content":"- [ ] implement"}),
+            ),
+            (
+                TASK_WORKLOG_OPERATION,
+                json!({"action":"append","kind":"validation","summary":"passed"}),
+            ),
+            (
+                TASK_EVIDENCE_OPERATION,
+                json!({"action":"capture","kind":"custom","caption":"output","content":"OK"}),
+            ),
+        ] {
+            let arguments = json!({"operation":operation,"payload":payload,"dedupe_key":operation,"correlation_id":operation});
+            let result = ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                &fixture.runtime_session_id,
+                operation,
+                arguments.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["status"], "succeeded", "{result}");
+            let mut forged = arguments.clone();
+            forged["payload"]["execution_id"] = json!("forged");
+            assert!(ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                &fixture.runtime_session_id,
+                operation,
+                forged
+            )
+            .await
+            .is_err());
+            assert!(ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                "other-session",
+                operation,
+                arguments
+            )
+            .await
+            .is_err());
+        }
+        let comments: Vec<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT execution_id, role FROM task_comment WHERE task_id=?")
+                .bind(&fixture.task_id)
+                .fetch_all(fixture.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(
+            comments[0].0.as_deref(),
+            Some(fixture.execution_id.as_str())
+        );
+        assert_eq!(comments[0].1.as_deref(), Some("coder"));
+        let worklog = |payload: Value, key: &'static str| {
+            ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                &fixture.runtime_session_id,
+                TASK_WORKLOG_OPERATION,
+                json!({"operation":TASK_WORKLOG_OPERATION,"payload":payload,"dedupe_key":key,"correlation_id":key}),
+            )
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap()
+        };
+        let replay = worklog(
+            json!({"action":"append","kind":"validation","summary":"passed"}),
+            TASK_WORKLOG_OPERATION,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "succeeded");
+        assert_eq!(count().await, 1);
+        // The same key with a different entry is refused, not reported as
+        // the first entry: nothing is written and the first is unchanged.
+        let conflict = worklog(
+            json!({"action":"append","kind":"validation","summary":"failed"}),
+            TASK_WORKLOG_OPERATION,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{conflict:?}").contains("new correlation_id"),
+            "{conflict:?}"
+        );
+        assert_eq!(count().await, 1);
+        // The shapes runs sent before the operations were registered: no
+        // `action` (each operation has exactly one), and an explicit null.
+        for (payload, key) in [
+            (
+                json!({"kind":"progress","summary":"slice landed"}),
+                "no-action",
+            ),
+            (
+                json!({"action":null,"kind":"decision","summary":"chose B"}),
+                "null-action",
+            ),
+        ] {
+            let result = worklog(payload, key).await.unwrap();
+            assert_eq!(result["status"], "succeeded", "{result}");
+        }
+        assert_eq!(count().await, 3);
+        let evidence = ForgeToolProvider::propose(
+            &fixture.provider,
+            &fixture.agent_id,
+            &fixture.scope,
+            &fixture.runtime_session_id,
+            TASK_EVIDENCE_OPERATION,
+            json!({"operation":TASK_EVIDENCE_OPERATION,"payload":{"kind":"log","caption":"output","content":"OK","path":null,"filename":null},"dedupe_key":"evidence-no-action","correlation_id":"evidence-no-action"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence["status"], "succeeded", "{evidence}");
+        // A second running execution of the same role leaves no single run
+        // to attribute a record to: the record is refused, the read is not.
+        sqlx::query(
+            "INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at)
+             SELECT 'second-running', task_id, agent_id, role, status, created_at, updated_at
+             FROM execution WHERE id = ?",
+        )
+        .bind(&fixture.execution_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+        assert!(worklog(
+            json!({"kind":"progress","summary":"ambiguous"}),
+            "ambiguous"
+        )
+        .await
+        .is_err());
+        assert_eq!(count().await, 3);
+        let summary = ForgeToolProvider::read(
+            &fixture.provider,
+            &fixture.agent_id,
+            &fixture.scope,
+            "task.summary",
+            json!({}),
+        )
+        .await;
+        assert!(summary.is_ok(), "{summary:?}");
+    }
+
     fn assert_correctable_plan_validation(error: AgentHostError) {
         match error {
             AgentHostError::StructuredOutcome(outcome) => {
@@ -6195,7 +5855,10 @@ mod tests {
                 &fixture.agent_id,
                 &fixture.runtime_session_id,
                 &fixture.scope,
-                &json!({"action": "write", "content": "# Plan\n\n- [ ] implement it\n"}),
+                &serde_json::from_value(
+                    json!({"action": "write", "content": "# Plan\n\n- [ ] implement it\n"}),
+                )
+                .unwrap(),
             )
             .await
             .expect("owning planner session writes a plan candidate");
@@ -6229,7 +5892,10 @@ mod tests {
                 &fixture.agent_id,
                 &fixture.runtime_session_id,
                 &fixture.scope,
-                &json!({"action": "write", "content": "- [ ] must not publish\n"}),
+                &serde_json::from_value(
+                    json!({"action": "write", "content": "- [ ] must not publish\n"}),
+                )
+                .unwrap(),
             )
             .await
             .expect_err("reviewer session has no plan-write authority");
@@ -6270,7 +5936,8 @@ mod tests {
                 &fixture.agent_id,
                 &fixture.runtime_session_id,
                 &fixture.scope,
-                &json!({"action": "write", "content": "- [ ] ambiguous\n"}),
+                &serde_json::from_value(json!({"action": "write", "content": "- [ ] ambiguous\n"}))
+                    .unwrap(),
             )
             .await
             .expect_err("ambiguous execution authority fails closed");
@@ -6290,7 +5957,7 @@ mod tests {
                 &fixture.agent_id,
                 &fixture.runtime_session_id,
                 &fixture.scope,
-                &json!({"action": "write", "content": original}),
+                &serde_json::from_value(json!({"action": "write", "content": original})).unwrap(),
             )
             .await
             .expect("initial plan candidate writes");
@@ -6305,7 +5972,10 @@ mod tests {
                 &fixture.agent_id,
                 &fixture.runtime_session_id,
                 &fixture.scope,
-                &json!({"action": "write", "content": "# Plan without a checklist\n"}),
+                &serde_json::from_value(
+                    json!({"action": "write", "content": "# Plan without a checklist\n"}),
+                )
+                .unwrap(),
             )
             .await
             .expect_err("a checklist-free plan is invalid");
@@ -6497,8 +6167,12 @@ mod tests {
             .provider
             .execute_task_evidence_capture(
                 &fixture.agent_id,
+                &fixture.runtime_session_id,
                 &fixture.scope,
-                &json!({"kind": "test", "caption": "focused tests", "content": "OK"}),
+                &serde_json::from_value(
+                    json!({"action":"capture", "kind": "test", "caption": "focused tests", "content": "OK"}),
+                )
+                .unwrap(),
             )
             .await
             .expect("unknown kind captures");
@@ -7645,7 +7319,11 @@ mod tests {
             let mut payload = base.clone();
             payload[field] = json!("forbidden");
             assert!(
-                validate_proposal_payload(TASK_ADAPTIVE_OPERATION, &payload).is_err(),
+                registered_proposals::CATALOG
+                    .lookup(TASK_ADAPTIVE_OPERATION)
+                    .unwrap()
+                    .normalize_arguments(&payload)
+                    .is_err(),
                 "adaptive payload field {field} must be rejected"
             );
         }

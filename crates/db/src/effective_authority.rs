@@ -3,7 +3,7 @@
 use crate::{Result, SqliteDb};
 use operation_registry::authority::{
     parse_permissions, scope_permissions, AuthorityFacts, EffectiveAuthority, PermissionSet,
-    Principal,
+    Principal, TaskRole,
 };
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
@@ -24,6 +24,47 @@ impl SqliteDb {
             scope_type,
             scope_id,
             workspace,
+            None,
+        )
+        .await
+    }
+    /// The one running execution this native Task session writes records
+    /// under: `None` when the session is not this identity's Task session,
+    /// nothing is running for its role, or more than one execution is.
+    pub async fn task_record_execution(
+        &self,
+        identity_id: &str,
+        task_id: &str,
+        runtime_session_id: &str,
+    ) -> Result<Option<TaskRecordExecution>> {
+        let mut connection = self.pool().acquire().await?;
+        let caller = task_caller(
+            &mut connection,
+            task_id,
+            identity_id,
+            Some(runtime_session_id),
+        )
+        .await?;
+        Ok(caller.session.and(caller.execution))
+    }
+    /// Bind Task records to the one running execution of this native session.
+    pub async fn resolve_task_effective_authority(
+        &self,
+        identity_id: &str,
+        admitted_profile_id: Option<&str>,
+        task_id: &str,
+        workspace: &str,
+        runtime_session_id: &str,
+    ) -> Result<EffectiveAuthority> {
+        let mut connection = self.pool().acquire().await?;
+        load(
+            &mut connection,
+            identity_id,
+            admitted_profile_id,
+            "task",
+            task_id,
+            workspace,
+            Some(runtime_session_id),
         )
         .await
     }
@@ -43,6 +84,7 @@ impl SqliteDb {
             scope_type,
             scope_id,
             workspace,
+            None,
         )
         .await
     }
@@ -54,6 +96,7 @@ async fn load(
     scope_type: &str,
     scope_id: &str,
     workspace: &str,
+    runtime_session_id: Option<&str>,
 ) -> Result<EffectiveAuthority> {
     let row = sqlx::query(
             "SELECT i.owner_id, i.paused, i.archived_at, i.account_permission_ceiling,
@@ -101,7 +144,7 @@ async fn load(
                     .flatten()
                     == owner
         }),
-        "project" | "agent_chat" => true,
+        "project" | "agent_chat" | "task" => true,
         _ => false,
     };
     let mut binding_id = None;
@@ -137,7 +180,36 @@ async fn load(
     } else {
         active = false;
     }
-    let principal = if let Some(project_id) = project_id {
+    let principal = if scope_type == "task" {
+        let caller = task_caller(connection, scope_id, identity_id, runtime_session_id).await?;
+        // Admission keeps the rule Task sessions always had: a running
+        // execution of this identity that serves the session's role. Which
+        // execution a record is written under is a separate, stricter
+        // question: an ambiguous caller reads but cannot write a record.
+        active &= caller.admitted && caller.role.is_some();
+        if runtime_session_id.is_some() {
+            active &= caller.session.as_ref().is_some_and(|session| {
+                session.workspace_access == workspace
+                    && Some(&session.profile_id)
+                        == row.try_get::<String, _>("profile_id").ok().as_ref()
+            });
+        }
+        let role = caller.role;
+        let execution = caller.execution;
+        // Preserve the optional Project-binding ceiling a Task session held
+        // before Task authority joined this resolver.
+        if let Some(binding) = sqlx::query("SELECT b.id, b.permission_ceiling_json FROM project_agent_binding b JOIN task t ON t.project_id = b.project_id WHERE t.id = ? AND b.identity_id = ? AND b.state = 'active'")
+            .bind(scope_id).bind(identity_id).fetch_optional(&mut *connection).await? {
+            binding_id = Some(binding.try_get("id")?);
+            layers.push(layer("project_binding_permission_ceiling", &binding.try_get::<String, _>("permission_ceiling_json")?));
+        }
+        Principal::TaskAgent {
+            identity_id: identity_id.to_owned(),
+            execution_id: execution.map(|execution| execution.id).unwrap_or_default(),
+            role: role.unwrap_or(TaskRole::Reviewer),
+            runtime_session_id: runtime_session_id.map(str::to_owned),
+        }
+    } else if let Some(project_id) = project_id {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE id = ?")
             .bind(&project_id)
             .fetch_one(&mut *connection)
@@ -198,6 +270,117 @@ async fn load(
         setup_required: setup,
         active,
     }))
+}
+
+/// The running execution a Task record is written under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRecordExecution {
+    pub id: String,
+    /// The execution's own role name (`coder`, `reviewer`, ...), as stored.
+    pub role: String,
+    pub workspace_id: Option<String>,
+}
+struct TaskSession {
+    profile_id: String,
+    workspace_access: String,
+}
+struct TaskCaller {
+    session: Option<TaskSession>,
+    /// From the session scope when there is one, otherwise from the execution.
+    role: Option<TaskRole>,
+    /// At least one running execution of this identity serves the role.
+    admitted: bool,
+    /// Present only when exactly one does.
+    execution: Option<TaskRecordExecution>,
+}
+/// One lookup for Task session admission and Task record provenance. The
+/// execution's recorded session id is deliberately not compared: a resumed
+/// execution carries its parent's id from creation, and the Task session may
+/// have been rotated or recreated since (profile change, server restart).
+async fn task_caller(
+    connection: &mut SqliteConnection,
+    task_id: &str,
+    identity_id: &str,
+    runtime_session_id: Option<&str>,
+) -> Result<TaskCaller> {
+    let session = if let Some(runtime) = runtime_session_id {
+        sqlx::query(
+            "SELECT s.profile_id, c.task_role, c.workspace_access
+             FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id
+             WHERE s.runtime_session_id = ? AND s.identity_id = ?
+               AND c.scope_type = 'task' AND c.scope_id = ? AND c.task_id = ?",
+        )
+        .bind(runtime)
+        .bind(identity_id)
+        .bind(task_id)
+        .bind(task_id)
+        .fetch_optional(&mut *connection)
+        .await?
+    } else {
+        None
+    };
+    let session_role = session
+        .as_ref()
+        .and_then(|session| {
+            session
+                .try_get::<Option<String>, _>("task_role")
+                .ok()
+                .flatten()
+        })
+        .and_then(|role| TaskRole::parse(&role));
+    let rows = sqlx::query(
+        "SELECT id, role, workspace_id FROM execution
+         WHERE task_id = ? AND agent_id = ? AND status = 'running'
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(task_id)
+    .bind(identity_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut serving = Vec::new();
+    for row in rows {
+        let role: String = row.try_get("role")?;
+        let Some(parsed) = TaskRole::parse(&role) else {
+            continue;
+        };
+        if runtime_session_id.is_some() && session_role != Some(parsed) {
+            continue;
+        }
+        serving.push((
+            parsed,
+            TaskRecordExecution {
+                id: row.try_get("id")?,
+                role,
+                workspace_id: row.try_get("workspace_id")?,
+            },
+        ));
+    }
+    let admitted = !serving.is_empty();
+    let role = session_role.or_else(|| {
+        let first = serving.first().map(|(role, _)| *role)?;
+        serving
+            .iter()
+            .all(|(role, _)| *role == first)
+            .then_some(first)
+    });
+    let execution = if serving.len() == 1 {
+        serving.pop().map(|(_, execution)| execution)
+    } else {
+        None
+    };
+    Ok(TaskCaller {
+        session: session
+            .map(|session| -> Result<TaskSession> {
+                Ok(TaskSession {
+                    profile_id: session.try_get("profile_id")?,
+                    workspace_access: session.try_get("workspace_access")?,
+                })
+            })
+            .transpose()?,
+        role,
+        admitted,
+        execution,
+    })
 }
 
 #[cfg(test)]

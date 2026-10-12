@@ -1170,7 +1170,7 @@ pub struct DefaultRoleAssignment {
     pub assignee_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct InitialRoleAssignment {

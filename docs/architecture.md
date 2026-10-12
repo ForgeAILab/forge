@@ -67,9 +67,9 @@ checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 
 ### Native operation registry
 
-`operation-registry` is a leaf crate: Serde, schemars and async-trait, all of
-which the workspace already resolved. `agent-host`, `services`, `db` and
-`mcp-server` depend on it; it imports neither, so typed service handler registration does not
+`operation-registry` is below the host and services: Serde, schemars, async-trait
+and shared `api-types` value inputs, all already in the workspace. `agent-host`, `services`, `db` and
+`mcp-server` depend on it; it imports none of those consumers, so typed service handler registration does not
 create a dependency cycle. Specifications live in domain modules of that crate
 (`scope_reads`, `project_reads`, `main_reads`, `main_proposals`, `hand_proposals`), below `agent-host`, because `agent-host`
 builds the advertised schema and cannot depend on `services`. Each module owns
@@ -729,9 +729,8 @@ plan-artifact delivery instructions still require owned repository-relative
 paths and scope reporting. Scaffolded `AGENTS.md` carries it for implementation
 and follow-up proposals, retaining the worker's existing scope discipline.
 Native Task proposal/adaptive payload guidance carries one short reminder when
-either operation is admitted. MCP Task creation and sub-task descriptors share
-that same reminder: split along module boundaries, name each Task's owned files,
-and avoid Tasks that all edit one shared file. The full doctrine stays at the
+either operation is admitted. MCP Task creation descriptors carry compact hierarchy/workspace guidance;
+Task creation callers follow the ownership and split rules documented here. The full doctrine stays at the
 layout/planning surfaces above. Transport-only plan
 artifact instructions and argument field help retain their existing ownership
 requirements without another copy of the rule.
@@ -1843,40 +1842,59 @@ and preparation-time structural checks are derived from that contract; service
 adapters look up the same operation and permission metadata and retain only
 domain/lifecycle validation in the command service. The MCP registry
 contains no migrated dotted orchestration operation IDs. Its existing `forge_*`
-direct APIs remain separate contracts with unchanged effects and result shapes.
-`operation-registry::mcp` owns 18 account, identity, binding, Chat and handoff
-contracts, their required roles and resource classifications. Schemas and typed
-decoders derive from the same Serde/JsonSchema input structs. The MCP handlers
-accept those concrete types; they no longer duplicate parameter declarations or
-role predicates. Two effect-time re-checks stay in handlers, next to the write:
-identity ownership in `forge_set_main_agent` and the administrator flag for
-daemon pinning in `forge_register_agent`. Referenced-resource authorization
-reads named fields of a JSON object, so the decoder refuses any other argument
-shape. Task/Project MCP tools, including owner escalation, retain
-their existing descriptor/handler paths pending their separate migration.
+direct APIs remain separate contracts with unchanged names and result shapes.
+`operation-registry::mcp` owns all 43 direct MCP contracts (the 42 existing
+names plus the previously registered integration-queue read), their scope,
+required roles, resource-reference rules, schemas, and typed decoders. The Task
+and Project inputs live in `mcp/task.rs`; the registry remains independent of
+services, DB, and API types. Handlers take those concrete input types. Exhaustive
+conversions bind the eight Task condition commands, workflow triggers, and
+lifecycle hooks to the existing API/domain types. No handwritten descriptor or
+RPC scope-name list remains. Catalog order is stable.
 
-All 42 MCP names have one scope classification in the registry. A Project grant
-omits/refuses the same eight account-wide tools. MCP always resolves a
-`Principal::DelegatedUser`; Project binding never implies an Agent principal.
-RPC generates the moved part of `tools/list` for each connection using the same
-`EffectiveAuthority::evaluate` requirements as call admission. Project grants
-resolve visibility and member/admin facts for the bound Project; account grants
-retain all names and resolve role/ownership against each supplied reference.
-Conditional daemon pinning is declared on the registration contract and passed
-through that evaluator for both field advertisement and admission. Unmoved
-Task calls retain the original database admission path.
+MCP resolves `Principal::DelegatedUser`; a Project binding does not imply an
+Agent principal. The catalog and `EffectiveAuthority::evaluate` generate the
+entire `tools/list` per connection and govern known-name call admission. Project
+grants omit the eight account-wide tools, load current visibility/member/admin
+facts, and allow escalation only for the exact `project.owner_id`. Memory reads
+and escalation require a bound Project and are omitted/refused for account
+grants. Other Task/Project APIs retain their existing Project-visibility rule,
+including ownerless visible Projects; this migration adds no member-only write
+policy. Account grants resolve ownership and roles against supplied references.
+Conditional daemon pinning uses the same evaluator for field advertisement and
+admission.
 
 Call order is known-name lookup, delegated scope/role admission, Project scope
-binding, referenced-resource authorization, then strict typed contract decode
-and the original handler effect. Denial precedes contract diagnostics and
-owned-identity failures preserve missing/inaccessible equivalence. Each moved
-input is closed; a contract violation maps to MCP `-32602` with
-`mcp_contract_invalid`, operation and expected fields. The projection emits only
-portable base schema keywords and one description line. Optional nulls,
-opaque JSON policies, reserved ignored pagination, and strict integer spelling
-preserve handler acceptance. Domain services retain their transaction-time
-rechecks, CAS, content guards and permission-document validation. No native
-orchestration, Task effect, Agent credential or workflow policy is introduced.
+binding, referenced-resource authorization, strict typed contract decode, and
+handler effect. Reference rules in the catalog select Task, parent, dependency,
+child, and Execution binding checks. Denial precedes contract diagnostics;
+missing/inaccessible resources remain indistinguishable. All inputs are closed,
+including child inputs, follow-up overrides, condition-command variants, and
+lifecycle-hook variants. Contract errors use MCP `-32602` with the bounded
+`mcp_contract_invalid` correction. Strict JSON integer spelling is preserved.
+
+Each advertised descriptor has one generated summary line and its fields.
+Provider schemas use the portable base keywords. Tagged command/hook contracts
+remain exact in Serde; their advertised field union gives the discriminator
+values and fields, while current `available_actions` supplies meaningful Task
+parameters. Nullability, custom workflow state strings, comma-separated/list
+status filters, opaque policy/settings JSON, numeric bounds, and the accepted
+`board_position` sort now reflect handler acceptance. Handler/domain checks
+retain state, CAS, graph, content, and transaction-time authority invariants.
+
+`forge_transition_task` keeps `SystemComponent::Mcp` as its workflow actor:
+`Actor::is_user` selects the interactive override policy throughout the engine
+(undefined edges, dependency and conflict-marker gates, displaced runs), so a
+delegated MCP credential is not given it. `forge_task_action` keeps its
+delegated-user actor, which spends retry budgets. Both Project settings paths
+pass the authenticated user into shared validation, including assigned-agent
+usability checks. Under a Project-constrained grant a Task or Execution
+outside the bound Project is reported exactly like a missing one. Task reads continue consuming the
+existing typed integration summary and `available_actions`; merge states,
+queue-owned eligibility, integration commands, and Task-step writing are
+unchanged. Effect-time identity ownership and daemon-admin rechecks remain
+next to the corresponding writes; escalation's exact owner check remains in
+its service transaction.
 
 Native and MCP orchestration adapters expose those command results through one
 typed `OrchestrationOutcome` envelope. It carries `code`, `status`,
@@ -5645,6 +5663,17 @@ fenced intent can be explicitly settled by Retry: Git then decides whether the
 candidate is already contained or must queue again. Completed reporting is
 idempotent across restart; a pruned continuation is enqueued again at startup.
 
+A queued or parked attempt names the workspace, location, owner, runtime id
+and placement generation it was admitted with. When recovery has verified the
+Task's placement `ready` under another of these (a daemon back under a new
+runtime id, a re-placed Task), that binding is provably gone:
+`INTEGRATION_OWNED` stops counting the attempt, and the reconnect wake, the
+reconciler and the owner's Retry all replace it through the one admission
+function (`admission::binding_stale`). The successor keeps the place in line;
+the supersede transaction refuses a head or an attempt with an unsettled
+effect. A placement that is not `ready` proves nothing: the attempt keeps its
+binding and its park, and Retry puts that same attempt back in line.
+
 ### Fenced owners and object transfer
 
 `services::integration_ports` assembles real owner, facts, location,
@@ -5760,14 +5789,26 @@ a certified hit creates a consumer and no run. A matching passed Review under
 a frozen/unattested policy retains its own result as review authority without
 launching it again. A rebased commit is another identity and runs its check.
 A missing matching entry result preserves the existing unchanged-target skip;
-manual/agent review authority is still checked by settle.
+manual/agent review authority is still checked by settle. Only the `settle`
+step that is due for its `effect_seq` records a reuse; a stale or answered
+step writes no consumer. The reuse states no check wait on the Task (the
+answer exists and the step applies it itself), and the head consumer is never
+the applied delivery of a result: its delivery step finds no checking attempt
+and ends stale. The Review's entry consumer is found by the request key
+review entry asks with (`TaskCheckRequest::request_key`).
 
 The consuming Task step appends the newest 64 command-shaped results to
 `Review.details.execution.integration_checks`, with attempt, commit, consumer,
 run, result and identity references and source (`executed`, `cache_hit`, or
 `review_authority`). Original entry CI and immutable reviewer conformance are
 preserved; head evidence grants no new reviewer authority. The write is in the
-acknowledgment/permit transaction and is idempotent per attempt/result. The
+acknowledgment/permit transaction and is idempotent per attempt/result. It is
+an annotation of the Task's newest Review: a Task with no Review gets none (a
+check result never creates a Review row, which would read as review authority
+or as a spent attempt), and details that cannot take it are left as they are;
+neither fails the settle. `source` is read from the rows: the entry consumer
+itself is `review_authority`, the first consumer of its run is `executed`,
+any later consumer of a run is `cache_hit`. The
 existing execution envelope is accepted by strict REST/MCP readers; generated
 TypeScript exposes the new evidence. Raw Review workspace commands without
 explicit limits now use 1800 s / 1 MiB; verdict/tail handling belongs to the
@@ -9038,3 +9079,58 @@ exception for a `reviewer` execution without an Agent are deleted. A queued
 mutation step of that kind left by an upgrade is closed as `superseded` by
 `V202610110112`. The `review_runner` actor type on historical review events is
 kept for reading.
+
+### Native Task registry contracts (3.8 F)
+
+Task scope reads (`task.summary`, `work.read`, `decisions.read`, `events.read`,
+`memory.read`, `inbox.read`, `commitments.read`, `delivery.read`) use typed
+`task_reads` specifications. Shared coordination reads use those same specs in
+Main and Project scopes; defaults, null optional arguments, truncation and row
+limit clamping stay in their handlers. Unknown argument fields are refused.
+
+`task_records` owns `task.plan`, `task.worklog` and `task.evidence`.
+The shared authority resolver derives a Task principal from the native session's
+identity, Task, profile, workspace access and role. A Task session is admitted,
+as it always was, while a running execution of that identity serves its role
+(`worker` ↔ `worker`/`coder`/`executor`, `reviewer` ↔ `reviewer`/`auditor`,
+`planner` ↔ `planner`). The principal carries an execution only when exactly one
+does; with several, reads still work and records are refused. The execution's
+recorded session id is not part of the match: a resumed execution carries its
+parent's id from creation, and the Task session may have been rotated or
+recreated since. The admitted execution ID and role cannot change within a turn. Selected-profile changes can revoke authority, and cannot widen
+an admitted turn. Plan/worklog/evidence also recheck that execution at the write
+boundary. Worklog never chooses the latest of several executions or writes a
+comment with missing execution/role provenance, and a `correlation_id` reused
+for a different entry is refused instead of answered with the first entry.
+File evidence is read from that execution's workspace (the Task's when the
+execution recorded none). Planner and implementation roles can stage a plan;
+reviewers can record observations and cannot author a plan.
+
+`task_proposals` owns the Project Agent's eight-verb `task.action`,
+`task.dependency`, `task.adaptive` and `task.propose` contracts. It reuses the
+public typed Task action, assignment and governance inputs from `api-types`;
+that crate still has no internal dependencies. `operation-registry` depends on
+those shared value types, and never on services, persistence or a transport.
+Typed bindings convert the Task creation/adaptive inputs directly to existing
+commands. Command receipts, their canonical input bytes, reviewed objects,
+retry budgets, queue eligibility, Task-step writes and settlement are unchanged.
+Transaction-time current-policy/governance checks stay in the command boundary.
+
+`available_actions` remains the only source of verb/state eligibility. The
+parameter predicate used by Task action execution lives in the registry beside
+its per-offer schema projection. Native Project `work.read` returns that schema
+as `action_schema` beside each Task's current offers and version. It projects
+those offers, including boolean choices and presets, rather than reconstructing
+workflow or queue state. Task-run reads mark offers
+`available_actions_informational: true` and return a null `action_schema`:
+workers, reviewers and planners acquire no workflow mutation capability.
+
+Native Task schemas and flat aliases are derived from only the admitted specs.
+Aliases preserve nested fields for providers that strip undeclared properties;
+the payload contract is described once and enforced from the canonical schema.
+Native dispatch performs one typed Serde decode. Plan size is UTF-8 bytes,
+worklog summary size is characters, and evidence requires one nonblank source.
+Existing custom evidence kinds remain accepted and retain their label as
+`other`. Names, Task action parameter names and provider wrapper normalization
+are unchanged. Historical prepared calls keep their stored arguments and
+fingerprints and still run current authority and domain checks on invocation.

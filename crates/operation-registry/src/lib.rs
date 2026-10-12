@@ -11,6 +11,9 @@ pub mod mcp;
 pub mod project_proposals;
 pub mod project_reads;
 pub mod scope_reads;
+pub mod task_proposals;
+pub mod task_reads;
+pub mod task_records;
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -41,6 +44,9 @@ pub trait OperationContext<E>:
     + project_proposals::ProjectProposalContext<E>
     + legacy_proposals::LegacyProposalContext<E>
     + hand_proposals::HandProposalContext<E>
+    + task_reads::TaskReadContext<E>
+    + task_records::TaskRecordContext<E>
+    + task_proposals::TaskProposalContext<E>
 {
 }
 impl<
@@ -51,7 +57,10 @@ impl<
             + main_proposals::MainProposalContext<E>
             + project_proposals::ProjectProposalContext<E>
             + legacy_proposals::LegacyProposalContext<E>
-            + hand_proposals::HandProposalContext<E>,
+            + hand_proposals::HandProposalContext<E>
+            + task_reads::TaskReadContext<E>
+            + task_records::TaskRecordContext<E>
+            + task_proposals::TaskProposalContext<E>,
     > OperationContext<E> for T
 {
 }
@@ -98,6 +107,11 @@ pub struct SurfaceBinding {
 pub enum StructuralConstraint {
     ClosedObject,
     MaxSerializedBytes(usize),
+    MaxUtf8Bytes {
+        field: &'static str,
+        bound: usize,
+    },
+    ExactlyOne(&'static [&'static str]),
     NonNullableOptional(&'static str),
     UniqueItems(&'static str),
     AtLeastOne(&'static [&'static str]),
@@ -116,6 +130,7 @@ pub struct TypedInputContract {
     pub rust_type: &'static str,
     pub schema: Value,
     pub constraints: &'static [StructuralConstraint],
+    // Native input shape is checked from schema; its handler owns the one typed decode.
     decode: fn(Value) -> Result<(), String>,
 }
 impl TypedInputContract {
@@ -264,7 +279,9 @@ impl<E: Send + 'static> OperationSpec<E> {
                         }
                     }
                 }
-                StructuralConstraint::MaxSerializedBytes(_) => {}
+                StructuralConstraint::MaxSerializedBytes(_)
+                | StructuralConstraint::MaxUtf8Bytes { .. }
+                | StructuralConstraint::ExactlyOne(_) => {}
                 StructuralConstraint::NonNullableOptional(field) => {
                     if let Some(kinds) = schema["properties"][*field]["type"].as_array_mut() {
                         kinds.retain(|kind| kind != "null");
@@ -326,11 +343,7 @@ impl<E: Send + 'static> OperationSpec<E> {
                 rust_type: std::any::type_name::<I>(),
                 schema,
                 constraints,
-                decode: |value| {
-                    serde_json::from_value::<I>(value)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                },
+                decode: |_| Ok(()),
             },
             handler: Box::new(move |context, mut value| {
                 Box::pin(async move {
@@ -424,7 +437,13 @@ impl<E: Send + 'static> OperationCatalog<E> {
 /// A domain module adds its ids next to its specs; the catalog refuses a
 /// module whose specs and ids disagree and any id declared twice.
 pub fn registered_reads() -> Vec<&'static str> {
-    let mut ids = [scope_reads::IDS, project_reads::IDS, main_reads::IDS].concat();
+    let mut ids = [
+        scope_reads::IDS,
+        project_reads::IDS,
+        main_reads::IDS,
+        task_reads::IDS,
+    ]
+    .concat();
     ids.sort_unstable();
     ids
 }
@@ -436,6 +455,8 @@ pub fn registered_operations() -> Vec<&'static str> {
         project_proposals::IDS.to_vec(),
         legacy_proposals::IDS.to_vec(),
         hand_proposals::IDS.to_vec(),
+        task_records::IDS.to_vec(),
+        task_proposals::IDS.to_vec(),
     ]
     .concat();
     ids.sort_unstable();
@@ -446,7 +467,8 @@ pub fn read_catalog<E: Send + 'static>() -> OperationCatalog<E> {
         scope_reads::specs()
             .into_iter()
             .chain(project_reads::specs())
-            .chain(main_reads::specs()),
+            .chain(main_reads::specs())
+            .chain(task_reads::specs()),
         &registered_reads(),
     )
     .expect("complete read catalog")
@@ -461,6 +483,8 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
         project_proposals::IDS,
         legacy_proposals::IDS,
         hand_proposals::IDS,
+        task_records::IDS,
+        task_proposals::IDS,
     ]
     .concat();
     OperationCatalog::new(
@@ -468,7 +492,9 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
             .into_iter()
             .chain(project_proposals::specs())
             .chain(legacy_proposals::specs())
-            .chain(hand_proposals::specs()),
+            .chain(hand_proposals::specs())
+            .chain(task_records::specs())
+            .chain(task_proposals::specs()),
         &ids,
     )
     .expect("complete proposal catalog")

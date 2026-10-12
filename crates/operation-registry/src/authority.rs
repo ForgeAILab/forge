@@ -85,14 +85,41 @@ pub enum Principal {
     TaskAgent {
         identity_id: String,
         execution_id: String,
+        role: TaskRole,
+        runtime_session_id: Option<String>,
     },
     SystemComponent {
         name: String,
     },
 }
+/// Task roles come from the running execution, never the tool payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRole {
+    Worker,
+    Reviewer,
+    Planner,
+}
+impl TaskRole {
+    pub fn parse(role: &str) -> Option<Self> {
+        match role {
+            "worker" | "coder" | "executor" => Some(Self::Worker),
+            // The retired conformance pass ran as an `auditor` execution
+            // under the reviewer session; rows of it still exist.
+            "reviewer" | "auditor" => Some(Self::Reviewer),
+            "planner" => Some(Self::Planner),
+            _ => None,
+        }
+    }
+    pub fn can_write_plan(self) -> bool {
+        matches!(self, Self::Worker | Self::Planner)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalRule {
     BoundIdentity,
+    TaskRecord,
+    ProjectOrTask,
+    TaskPlan,
     OwnedMain,
     AgentAction,
     ProjectOrOwnedIdentity,
@@ -197,6 +224,20 @@ impl EffectiveAuthority {
                 Principal::TaskAgent { .. } => self.scope_type == "task",
                 _ => false,
             },
+            PrincipalRule::ProjectOrTask => match &self.principal {
+                Principal::ProjectAgent { .. } => {
+                    matches!(self.scope_type.as_str(), "project" | "agent_chat")
+                }
+                Principal::TaskAgent { .. } => self.scope_type == "task",
+                _ => false,
+            },
+            PrincipalRule::TaskRecord | PrincipalRule::TaskPlan => {
+                self.scope_type == "task"
+                    && matches!(&self.principal,
+                    Principal::TaskAgent { execution_id, role, .. }
+                    if !execution_id.is_empty() &&
+                       (requirement.principal_rule() == PrincipalRule::TaskRecord || role.can_write_plan()))
+            }
             PrincipalRule::OwnedMain => {
                 matches!(self.principal, Principal::MainAgent { .. })
                     && matches!(self.scope_type.as_str(), "account" | "agent_chat")
@@ -335,60 +376,6 @@ pub enum McpScopeRule {
     AccountInspection,
     BoundProject,
 }
-pub const MCP_OPERATIONS: &[(&str, McpScopeRule)] = &[
-    ("forge_create_task", McpScopeRule::BoundProject),
-    ("forge_create_sub_tasks", McpScopeRule::BoundProject),
-    ("forge_add_task_dependency", McpScopeRule::BoundProject),
-    ("forge_remove_task_dependency", McpScopeRule::BoundProject),
-    ("forge_list_task_dependencies", McpScopeRule::BoundProject),
-    ("forge_list_task_dependents", McpScopeRule::BoundProject),
-    ("forge_list_sub_tasks", McpScopeRule::BoundProject),
-    ("forge_reorder_sub_tasks", McpScopeRule::BoundProject),
-    ("forge_list_tasks", McpScopeRule::BoundProject),
-    ("forge_get_task", McpScopeRule::BoundProject),
-    ("forge_preview_prompt", McpScopeRule::BoundProject),
-    ("forge_memory_search", McpScopeRule::BoundProject),
-    ("forge_memory_get", McpScopeRule::BoundProject),
-    ("forge_assign_agent", McpScopeRule::BoundProject),
-    ("forge_task_action", McpScopeRule::BoundProject),
-    ("forge_get_task_diff", McpScopeRule::BoundProject),
-    ("forge_list_executions", McpScopeRule::BoundProject),
-    ("forge_update_task", McpScopeRule::BoundProject),
-    ("forge_transition_task", McpScopeRule::BoundProject),
-    ("forge_register_agent", McpScopeRule::AccountInspection),
-    ("forge_list_agents", McpScopeRule::AccountInspection),
-    ("forge_list_projects", McpScopeRule::BoundProject),
-    ("forge_get_project", McpScopeRule::BoundProject),
-    ("forge_create_project", McpScopeRule::AccountInspection),
-    ("forge_update_project", McpScopeRule::BoundProject),
-    (
-        "forge_update_project_lifecycle_hooks",
-        McpScopeRule::BoundProject,
-    ),
-    ("forge_follow_up_execution", McpScopeRule::BoundProject),
-    ("forge_list_agent_profiles", McpScopeRule::AccountInspection),
-    ("forge_list_agent_sessions", McpScopeRule::AccountInspection),
-    ("forge_get_agent_session", McpScopeRule::AccountInspection),
-    ("forge_get_main_agent", McpScopeRule::AccountInspection),
-    ("forge_set_main_agent", McpScopeRule::AccountInspection),
-    ("forge_project_escalate", McpScopeRule::BoundProject),
-    ("forge_get_project_agent", McpScopeRule::BoundProject),
-    ("forge_set_project_agent", McpScopeRule::BoundProject),
-    ("forge_get_integration_queue", McpScopeRule::BoundProject),
-    ("forge_list_agent_chats", McpScopeRule::BoundProject),
-    ("forge_get_agent_chat", McpScopeRule::BoundProject),
-    ("forge_list_agent_chat_messages", McpScopeRule::BoundProject),
-    ("forge_send_agent_chat_message", McpScopeRule::BoundProject),
-    ("forge_list_agent_handoffs", McpScopeRule::BoundProject),
-    ("forge_get_agent_handoff", McpScopeRule::BoundProject),
-    ("forge_create_agent_handoff", McpScopeRule::BoundProject),
-];
-pub fn mcp_scope_rule(name: &str) -> Option<McpScopeRule> {
-    MCP_OPERATIONS
-        .iter()
-        .find(|(id, _)| *id == name)
-        .map(|(_, rule)| *rule)
-}
 pub fn mcp_authority(user_id: &str, constrained_project: Option<&str>) -> EffectiveAuthority {
     EffectiveAuthority::resolve(AuthorityFacts {
         principal: Principal::DelegatedUser {
@@ -451,6 +438,22 @@ impl AuthorityRequirement for McpScopeRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn execution_roles_map_to_the_session_role_they_serve() {
+        for (role, expected) in [
+            ("worker", Some(TaskRole::Worker)),
+            ("coder", Some(TaskRole::Worker)),
+            ("executor", Some(TaskRole::Worker)),
+            ("reviewer", Some(TaskRole::Reviewer)),
+            ("auditor", Some(TaskRole::Reviewer)),
+            ("planner", Some(TaskRole::Planner)),
+            ("lead", None),
+            ("interactive", None),
+        ] {
+            assert_eq!(TaskRole::parse(role), expected, "{role}");
+        }
+        assert!(!TaskRole::Reviewer.can_write_plan());
+    }
     fn authority(permissions: &[&str]) -> EffectiveAuthority {
         EffectiveAuthority::resolve(AuthorityFacts {
             principal: Principal::MainAgent {
@@ -499,6 +502,8 @@ mod tests {
         reviewer.principal = Principal::TaskAgent {
             identity_id: "reviewer".into(),
             execution_id: "review-exec".into(),
+            role: TaskRole::Reviewer,
+            runtime_session_id: None,
         };
         reviewer.scope_type = "task".into();
         for spec in crate::main_proposals::CATALOG.iter() {

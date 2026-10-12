@@ -1,6 +1,7 @@
 use super::*;
 use crate::task_actions::{available_actions, TaskSnapshot};
 use api_types::{Offer, TaskAction, WorkflowTrigger};
+use operation_registry::task_proposals::action_parameters_allowed;
 
 tokio::task_local! { pub(crate) static TASK_ACTION_COMMAND: (); pub(crate) static TASK_ACTION_ACTOR: Actor; }
 
@@ -1423,65 +1424,6 @@ impl TaskService {
             .filter(|task| task.project_id == project_id)
             .ok_or_else(|| ServiceError::not_found("task", id.to_owned()))?;
         Ok(())
-    }
-}
-
-fn action_parameters_allowed(offer: &Offer, action: &TaskAction, owner: bool) -> bool {
-    let supports = |name: &str| {
-        offer
-            .parameters
-            .iter()
-            .any(|parameter| parameter.name == name)
-    };
-    let allows_bool = |name: &str, value: bool| {
-        offer
-            .parameters
-            .iter()
-            .find(|parameter| parameter.name == name)
-            .and_then(|parameter| parameter.boolean_values.as_ref())
-            .is_some_and(|values| values.contains(&value))
-    };
-    match action {
-        TaskAction::Approve {
-            override_checks, ..
-        } => {
-            (override_checks != &Some(true) || owner)
-                && (matches!(&offer.action, TaskAction::Approve { override_checks: offered, .. } if offered == override_checks)
-                    || override_checks.is_none()
-                    || override_checks.is_some_and(|value| allows_bool("override", value)))
-        }
-        TaskAction::Retry {
-            reason: _,
-            fresh_session,
-            refresh_workspace,
-            reset_budget,
-            guidance,
-        } => {
-            let TaskAction::Retry {
-                fresh_session: offered_fresh,
-                refresh_workspace: offered_refresh,
-                reset_budget: offered_reset,
-                ..
-            } = &offer.action
-            else {
-                return false;
-            };
-            let allowed = |name: &str, supplied: Option<bool>, preset: Option<bool>| {
-                supplied.is_none_or(|value| {
-                    if supports(name) {
-                        allows_bool(name, value)
-                    } else {
-                        preset == Some(value)
-                    }
-                })
-            };
-            allowed("fresh_session", *fresh_session, *offered_fresh)
-                && allowed("refresh_workspace", *refresh_workspace, *offered_refresh)
-                && allowed("reset_budget", *reset_budget, *offered_reset)
-                && (guidance.is_none() || supports("guidance"))
-        }
-        TaskAction::SendBack { .. } => true,
-        _ => true,
     }
 }
 

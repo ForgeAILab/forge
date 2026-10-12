@@ -282,6 +282,7 @@ dependencies = [
 name = "api-types"
 version = "0.13.12"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2509,6 +2510,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "operation-registry"
 version = "0.13.12"
 dependencies = [
+ "api-types",
  "async-trait",
  "jsonschema",
  "schemars",

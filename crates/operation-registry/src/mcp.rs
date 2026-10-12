@@ -1,4 +1,4 @@
-//! MCP account, identity and Chat contracts. These direct APIs are separate
+//! Direct MCP contracts, including the Task/Project inputs in `task`. They are separate
 //! from the native orchestration operations and retain their wire names.
 use crate::{
     authority::{AuthorityRequirement, McpScopeRule, PrincipalRule, RequiredPermission},
@@ -8,6 +8,10 @@ use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
+mod task;
+pub use task::*;
+#[cfg(test)]
+mod task_tests;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -166,6 +170,8 @@ pub enum RequiredRole {
     Project,
     Member,
     Admin,
+    Owner,
+    BoundProject,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceRule {
@@ -175,6 +181,15 @@ pub enum ResourceRule {
     Project,
     Chat,
     Handoff,
+    Task,
+    ParentTask,
+    CreateTask,
+    DependencyMutation,
+    Dependencies,
+    Dependents,
+    SubTasks,
+    ReorderSubTasks,
+    Execution,
 }
 
 /// A conditional field is advertised and admitted by the same evaluator.
@@ -209,6 +224,7 @@ pub struct McpOperation {
 impl McpOperation {
     pub fn descriptor(&self, constrained: bool, account_admin: bool) -> Value {
         let mut schema = self.input.schema.clone();
+        portable_projection(&mut schema);
         if constrained {
             schema["required"]
                 .as_array_mut()
@@ -233,7 +249,18 @@ impl McpOperation {
             if !arguments.is_object() {
                 return Err("arguments must be an object".to_owned());
             }
-            let input = (self.decode)(arguments.clone())?;
+            let input = (self.decode)(arguments.clone()).map_err(|detail| {
+                // Keep strict MCP Serde diagnostics, adding the contract's
+                // field path where its structural check can supply one.
+                if let Err(constraint) = self.input.normalize(&arguments) {
+                    if let Some((_, rest)) = constraint.split_once("argument `") {
+                        if let Some((field, _)) = rest.split_once('`') {
+                            return format!("{detail}; argument `{field}`");
+                        }
+                    }
+                }
+                detail
+            })?;
             self.input.normalize(&arguments)?;
             Ok(input)
         };
@@ -267,6 +294,13 @@ impl AuthorityRequirement for &McpOperation {
     }
     fn permission(&self, scope: &str) -> RequiredPermission<'_> {
         match self.role {
+            RequiredRole::Owner if scope == "project" => {
+                RequiredPermission::Named("mcp_project_owner")
+            }
+            RequiredRole::Owner | RequiredRole::BoundProject if scope != "project" => {
+                RequiredPermission::Unavailable
+            }
+            RequiredRole::BoundProject => RequiredPermission::Named("mcp_project_visible"),
             RequiredRole::Admin if scope == "project" => {
                 RequiredPermission::Named("mcp_project_admin")
             }
@@ -339,6 +373,19 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
             if let Some(items) = object.get_mut("items") {
                 portable(items);
             }
+            // schemars marks an optional enum nullable in `type` but leaves
+            // null out of its enumeration. Serde accepts that omission value.
+            if object
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.contains(&Value::String("null".into())))
+            {
+                if let Some(values) = object.get_mut("enum").and_then(Value::as_array_mut) {
+                    if !values.contains(&Value::Null) {
+                        values.push(Value::Null);
+                    }
+                }
+            }
         }
     }
     portable(&mut schema);
@@ -347,6 +394,54 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
     schema["additionalProperties"] = json!(false);
     // These were object-only advertisements for intentionally opaque JSON inputs.
     // Value's empty schema advertises exactly the input the existing handler accepts.
+    if name == "forge_create_task" {
+        schema["properties"]["type"]["enum"] =
+            json!(["task", "planning_task", "sub_task", "discovery"]);
+        schema["properties"]["depends_on_ids"]["uniqueItems"] = json!(true);
+    }
+    if name == "forge_reorder_sub_tasks" {
+        schema["properties"]["ordered_ids"]["uniqueItems"] = json!(true);
+    }
+    if matches!(name, "forge_memory_search" | "forge_memory_get") {
+        schema["properties"]["layer"]["enum"] = json!([1, 2, 3, null]);
+        schema["properties"]["layer"]["maximum"] = json!(255);
+    }
+    if name == "forge_memory_search" {
+        for field in ["limit", "token_budget"] {
+            schema["properties"][field]["maximum"] = json!(u32::MAX);
+        }
+    }
+    if name == "forge_follow_up_execution" {
+        // Option of an object is a nullable alternative in the derived schema.
+        fn deadline_bounds(schema: &mut Value) {
+            if schema["properties"].get("hard_deadline_seconds").is_some() {
+                schema["properties"]["hard_deadline_seconds"]["minimum"] = json!(1);
+                schema["properties"]["hard_deadline_seconds"]["maximum"] = json!(u32::MAX);
+            }
+            if let Some(variants) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+                for variant in variants {
+                    deadline_bounds(variant);
+                }
+            }
+        }
+        deadline_bounds(&mut schema["properties"]["overrides"]);
+    }
+    if name == "forge_project_escalate" {
+        schema["properties"]["need"]["minLength"] = json!(1);
+        schema["properties"]["need"]["maxLength"] = json!(4096);
+        schema["properties"]["task_ids"]["maxItems"] = json!(100);
+        schema["properties"]["dedupe_key"]["minLength"] = json!(1);
+    }
+    if name == "forge_list_tasks" {
+        schema["properties"]["sort_by"]["enum"] = json!([
+            "created_at",
+            "updated_at",
+            "priority",
+            "board_position",
+            "id",
+            null
+        ]);
+    }
     if name == "forge_list_agents" {
         schema["properties"]["status"]["enum"] = json!(["idle", "busy", "error", "offline", null]);
     }
@@ -364,7 +459,11 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
         }),
         role,
         resource,
-        scope: crate::authority::mcp_scope_rule(name).expect("scope-classified MCP operation"),
+        scope: if role == RequiredRole::Account {
+            McpScopeRule::AccountInspection
+        } else {
+            McpScopeRule::BoundProject
+        },
         input: TypedInputContract {
             rust_type: std::any::type_name::<I>(),
             schema,
@@ -375,7 +474,7 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
                     .map_err(|e| e.to_string())
             },
         },
-        // Use the concrete function generated by the registration macro below.
+        // Use the concrete typed variant constructor of this registration.
         decode: Box::new(move |value| {
             serde_json::from_value::<I>(value)
                 .map(wrap)
@@ -386,6 +485,30 @@ fn typed<I: DeserializeOwned + JsonSchema + 'static>(
 
 #[derive(Debug)]
 pub enum McpInput {
+    ProjectEscalate(ProjectEscalateParams),
+    UpdateProjectLifecycleHooks(UpdateProjectLifecycleHooksParams),
+    UpdateProject(UpdateProjectParams),
+    GetProject(GetProjectParams),
+    FollowUpExecution(FollowUpExecutionParams),
+    ReorderSubTasks(ReorderSubTasksParams),
+    CreateSubTasks(CreateSubTasksParams),
+    RemoveTaskDependency(RemoveTaskDependencyParams),
+    AddTaskDependency(AddTaskDependencyParams),
+    TransitionTask(TransitionTaskParams),
+    UpdateTask(UpdateTaskParams),
+    TaskAction(TaskActionParams),
+    AssignAgent(AssignAgentParams),
+    CreateTask(CreateTaskParams),
+    ListSubTasks(ListSubTasksParams),
+    ListTaskDependents(ListTaskDependenciesParams),
+    ListTaskDependencies(ListTaskDependenciesParams),
+    ListExecutions(ListExecutionsParams),
+    GetTaskDiff(GetTaskParams),
+    MemoryGet(MemoryGetParams),
+    MemorySearch(MemorySearchParams),
+    PreviewPrompt(PreviewPromptParams),
+    GetTask(GetTaskParams),
+    ListTasks(ListTasksParams),
     RegisterAgent(RegisterAgentParams),
     ListAgents(ListAgentsParams),
     ListProjects(ListProjectsParams),
@@ -409,6 +532,97 @@ pub enum McpInput {
 
 pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
     vec![
+        typed::<ProjectEscalateParams>(
+            "forge_project_escalate",
+            "Escalate a bounded blocker to the exact Project owner.",
+            RequiredRole::Owner,
+            ResourceRule::None,
+            McpInput::ProjectEscalate,
+        ),
+        typed::<CreateTaskParams>(
+            "forge_create_task",
+            "Create a Task; parent shares a workspace, dependencies gate execution.",
+            RequiredRole::Project,
+            ResourceRule::CreateTask,
+            McpInput::CreateTask,
+        ),
+        typed::<ListTasksParams>(
+            "forge_list_tasks",
+            "List Tasks with integration and retry summaries.",
+            RequiredRole::Project,
+            ResourceRule::None,
+            McpInput::ListTasks,
+        ),
+        typed::<GetTaskParams>(
+            "forge_get_task",
+            "Read a Task and its current available_actions.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::GetTask,
+        ),
+        typed::<PreviewPromptParams>(
+            "forge_preview_prompt",
+            "Preview a role prompt without starting execution.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::PreviewPrompt,
+        ),
+        typed::<MemorySearchParams>(
+            "forge_memory_search",
+            "Search Project memory as retrieved context.",
+            RequiredRole::BoundProject,
+            ResourceRule::None,
+            McpInput::MemorySearch,
+        ),
+        typed::<MemoryGetParams>(
+            "forge_memory_get",
+            "Read a Project memory item as context.",
+            RequiredRole::BoundProject,
+            ResourceRule::None,
+            McpInput::MemoryGet,
+        ),
+        typed::<AssignAgentParams>(
+            "forge_assign_agent",
+            "Assign the implementation worker without starting execution.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::AssignAgent,
+        ),
+        typed::<TaskActionParams>(
+            "forge_task_action",
+            "Apply a current available_actions command at an exact version.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::TaskAction,
+        ),
+        typed::<GetTaskParams>(
+            "forge_get_task_diff",
+            "Read the latest Task diff.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::GetTaskDiff,
+        ),
+        typed::<ListExecutionsParams>(
+            "forge_list_executions",
+            "List Task executions.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::ListExecutions,
+        ),
+        typed::<UpdateTaskParams>(
+            "forge_update_task",
+            "Edit mutable Task fields at an exact version.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::UpdateTask,
+        ),
+        typed::<TransitionTaskParams>(
+            "forge_transition_task",
+            "Transition a Task; pending_steps counts asynchronous follow-ups.",
+            RequiredRole::Project,
+            ResourceRule::Task,
+            McpInput::TransitionTask,
+        ),
         typed::<RegisterAgentParams>(
             "forge_register_agent",
             "Register an executor.",
@@ -436,6 +650,83 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
             RequiredRole::Account,
             ResourceRule::None,
             McpInput::CreateProject,
+        ),
+        typed::<GetProjectParams>(
+            "forge_get_project",
+            "Read Project settings, hooks, and version.",
+            RequiredRole::Project,
+            ResourceRule::None,
+            McpInput::GetProject,
+        ),
+        typed::<UpdateProjectParams>(
+            "forge_update_project",
+            "Edit Project fields and validated settings at an exact version.",
+            RequiredRole::Project,
+            ResourceRule::None,
+            McpInput::UpdateProject,
+        ),
+        typed::<UpdateProjectLifecycleHooksParams>(
+            "forge_update_project_lifecycle_hooks",
+            "Replace lifecycle hooks at an exact Project version.",
+            RequiredRole::Project,
+            ResourceRule::None,
+            McpInput::UpdateProjectLifecycleHooks,
+        ),
+        typed::<FollowUpExecutionParams>(
+            "forge_follow_up_execution",
+            "Resume a terminal interactive execution with a follow-up message.",
+            RequiredRole::Project,
+            ResourceRule::Execution,
+            McpInput::FollowUpExecution,
+        ),
+        typed::<AddTaskDependencyParams>(
+            "forge_add_task_dependency",
+            "Add a prerequisite gate without sharing a workspace.",
+            RequiredRole::Project,
+            ResourceRule::DependencyMutation,
+            McpInput::AddTaskDependency,
+        ),
+        typed::<RemoveTaskDependencyParams>(
+            "forge_remove_task_dependency",
+            "Remove a prerequisite gate without changing hierarchy.",
+            RequiredRole::Project,
+            ResourceRule::DependencyMutation,
+            McpInput::RemoveTaskDependency,
+        ),
+        typed::<ListTaskDependenciesParams>(
+            "forge_list_task_dependencies",
+            "List prerequisite Task IDs.",
+            RequiredRole::Project,
+            ResourceRule::Dependencies,
+            McpInput::ListTaskDependencies,
+        ),
+        typed::<ListTaskDependenciesParams>(
+            "forge_list_task_dependents",
+            "List dependent Task IDs.",
+            RequiredRole::Project,
+            ResourceRule::Dependents,
+            McpInput::ListTaskDependents,
+        ),
+        typed::<CreateSubTasksParams>(
+            "forge_create_sub_tasks",
+            "Create ordered children; they share the root workspace and run serially.",
+            RequiredRole::Project,
+            ResourceRule::ParentTask,
+            McpInput::CreateSubTasks,
+        ),
+        typed::<ListSubTasksParams>(
+            "forge_list_sub_tasks",
+            "List ordered children sharing the root workspace.",
+            RequiredRole::Project,
+            ResourceRule::SubTasks,
+            McpInput::ListSubTasks,
+        ),
+        typed::<ReorderSubTasksParams>(
+            "forge_reorder_sub_tasks",
+            "Reorder direct children; preserve the terminal prefix and active child.",
+            RequiredRole::Project,
+            ResourceRule::ReorderSubTasks,
+            McpInput::ReorderSubTasks,
         ),
         typed::<ListAgentProfilesParams>(
             "forge_list_agent_profiles",
@@ -552,3 +843,106 @@ pub fn lookup(name: &str) -> Option<&'static McpOperation> {
 
 #[cfg(test)]
 mod tests;
+
+/// Flatten typed alternatives only for provider advertisement. Serde retains
+/// the exact tagged contract, including per-variant required/closed fields.
+fn portable_projection(schema: &mut Value) {
+    if *schema == true {
+        *schema = json!({});
+    }
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    for key in ["$schema", "title", "default", "format", "propertyNames"] {
+        object.remove(key);
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(Value::Array(mut variants)) = object.remove(alternative) {
+            for variant in &mut variants {
+                portable_projection(variant);
+            }
+            let mut kinds = Vec::<Value>::new();
+            let mut values = Vec::<Value>::new();
+            let mut properties = serde_json::Map::new();
+            let mut required: Option<Vec<Value>> = None;
+            for variant in &variants {
+                let types = match &variant["type"] {
+                    Value::Array(types) => types.clone(),
+                    Value::String(kind) => vec![json!(kind)],
+                    _ => vec![],
+                };
+                for kind in types {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                if let Some(enumeration) = variant["enum"].as_array() {
+                    for value in enumeration {
+                        if !values.contains(value) {
+                            values.push(value.clone());
+                        }
+                    }
+                } else if variant["type"] == "null" {
+                    values.push(Value::Null);
+                }
+                if let Some(fields) = variant["properties"].as_object() {
+                    for (field, property) in fields {
+                        properties
+                            .entry(field.clone())
+                            .and_modify(|old: &mut Value| {
+                                if let (Some(old), Some(new)) = (
+                                    old.get_mut("enum").and_then(Value::as_array_mut),
+                                    property["enum"].as_array(),
+                                ) {
+                                    for value in new {
+                                        if !old.contains(value) {
+                                            old.push(value.clone());
+                                        }
+                                    }
+                                }
+                            })
+                            .or_insert_with(|| property.clone());
+                    }
+                    let fields = variant["required"].as_array().cloned().unwrap_or_default();
+                    match &mut required {
+                        None => required = Some(fields),
+                        Some(current) => current.retain(|field| fields.contains(field)),
+                    }
+                }
+            }
+            if !kinds.is_empty() {
+                object.insert(
+                    "type".into(),
+                    if kinds.len() == 1 {
+                        kinds.remove(0)
+                    } else {
+                        json!(kinds)
+                    },
+                );
+            }
+            if !properties.is_empty() {
+                object.insert("properties".into(), json!(properties));
+                object.insert("required".into(), json!(required.unwrap_or_default()));
+                object.insert("additionalProperties".into(), json!(false));
+            } else if !values.is_empty() {
+                object.insert("enum".into(), json!(values));
+            }
+        }
+    }
+    if let Some(value) = object.remove("const") {
+        object.insert("enum".into(), json!([value]));
+    }
+    if let Some(fields) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for value in fields.values_mut() {
+            portable_projection(value);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        portable_projection(items);
+    }
+    if let Some(additional) = object.get_mut("additionalProperties") {
+        if additional.is_object() {
+            portable_projection(additional);
+        }
+    }
+}

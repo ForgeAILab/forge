@@ -1227,7 +1227,7 @@ pub struct AdaptiveEnvelope {
 /// keeps the immutable copy in `project_task_governance`; the server derives
 /// `runnable` from Charter and repository readiness and never trusts a
 /// caller-provided flag.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, schemars::JsonSchema)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct TaskGovernanceRequest {

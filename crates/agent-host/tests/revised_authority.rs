@@ -534,9 +534,9 @@ fn project_scope_catalog_contains_task_proposal_but_no_workspace() {
 fn task_proposal_schema_declares_plan_item_binding_explicitly() {
     // Providers such as Gemini only surface declared properties to the
     // model; prose-only guidance loses `plan_item_id` and every proposal
-    // then materializes a silently unrunnable Task. The generic proposal
-    // payload must therefore declare the task.propose fields as real schema
-    // properties wherever task.propose is admitted.
+    // then materializes a silently unrunnable Task. The proposal tool must
+    // therefore declare the task.propose fields as real schema properties
+    // wherever task.propose is admitted.
     let project_scope = CanonicalScope {
         scope_type: CanonicalScopeType::Project,
         scope_id: "project-a".to_owned(),
@@ -564,15 +564,14 @@ fn task_proposal_schema_declares_plan_item_binding_explicitly() {
             .find(|tool| tool.spec().name == "forge_scope_propose")
             .expect("scope proposal tool exists")
             .spec();
-        let payload = spec
+        // The registered `task.propose` contract is described once, on the
+        // payload; its fields are declared as real root-level properties
+        // (the flat form every provider can send, lifted into `payload`).
+        let properties = spec
             .input_schema
             .get("properties")
-            .and_then(|properties| properties.get("payload"))
-            .expect("payload property exists");
-        let properties = payload
-            .get("properties")
             .and_then(Value::as_object)
-            .expect("task.propose payload fields are declared schema properties");
+            .expect("proposal tool declares properties");
         for field in [
             "title",
             "description",
@@ -585,22 +584,25 @@ fn task_proposal_schema_declares_plan_item_binding_explicitly() {
         ] {
             assert!(
                 properties.contains_key(field),
-                "payload schema must declare `{field}`"
+                "proposal schema must declare `{field}`"
             );
         }
-        let plan_item_description = properties
-            .get("plan_item_id")
+        let guidance = properties
+            .get("payload")
             .and_then(|schema| schema.get("description"))
             .and_then(Value::as_str)
-            .expect("plan_item_id carries usage guidance");
+            .expect("payload carries the per-operation contract");
         assert!(
-            plan_item_description.contains("optional traceability"),
-            "plan_item_id must be optional Task traceability: {plan_item_description}"
+            guidance.contains("plan_item_id: optional traceability"),
+            "plan_item_id must be optional Task traceability: {guidance}"
         );
         assert!(
-            plan_item_description.contains("execution baseline"),
-            "plan_item_id guidance identifies its optional baseline source: {plan_item_description}"
+            guidance.contains("execution baseline"),
+            "plan_item_id guidance identifies its optional baseline source: {guidance}"
         );
+        for value in ["planning_task", "discovery", "repository_write"] {
+            assert!(guidance.contains(value), "{value}: {guidance}");
+        }
     }
 }
 
