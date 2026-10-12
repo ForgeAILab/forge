@@ -149,6 +149,22 @@ impl<'a> RootRolePolicy<'a> {
             && self.execution_role_for_state(state_name) == Some(role)
     }
 
+    /// Whether `role` runs on coordination root `root_id` in `state_name`
+    /// with the rows it has now: [`Self::allows_execution`], and in the
+    /// planning state only while a lead is assigned. A planning root whose
+    /// lead was removed runs nothing; the root advance moves it on.
+    pub(crate) fn runs_role(
+        &self,
+        root_id: &str,
+        state_name: &str,
+        role: &str,
+        assignments: &[TaskRoleAssignment],
+    ) -> bool {
+        self.allows_execution(state_name, role)
+            && (self.planning_state() != Some(state_name)
+                || self.lead(root_id, assignments).is_some())
+    }
+
     /// The lead of a coordination root: the Agent assigned to the planning
     /// role on the root's own row. THE resolver for "does this root have a
     /// lead"; every reader goes through it (or its database form,
@@ -179,20 +195,40 @@ impl<'a> RootRolePolicy<'a> {
         self.planning_state() == Some(state_name) && self.lead(root_id, assignments).is_some()
     }
 
+    /// Whether a planning-role execution is running on a root that sits in
+    /// its planning state. The root rests there until that run ends, lead
+    /// assigned or not: its settlement moves the root on.
+    pub(crate) fn planning_run_live<'e>(
+        &self,
+        root_status: &str,
+        running_roles: impl IntoIterator<Item = &'e str>,
+    ) -> bool {
+        self.planning_state() == Some(root_status)
+            && self
+                .planning_role()
+                .is_some_and(|role| running_roles.into_iter().any(|running| running == role))
+    }
+
     /// Whether the level-triggered root advance has work for this root:
     /// kickoff (a root that has not reached implementation and has a subtask
     /// left to run), or completion (every subtask is terminal and the root
     /// has not reached aggregate review, or an advance is flagged pending).
     /// Never while the lead holds the root's state, whatever flag an earlier
-    /// advance left behind.
+    /// advance left behind, and never while a planning run is live on the
+    /// root (`planning_run_live`, see [`Self::planning_run_live`]): a lead
+    /// removed mid-run must not release the subtasks beside its planner.
     pub(crate) fn root_advance_due(
         &self,
         root: &Task,
         children: &[Task],
         assignments: &[TaskRoleAssignment],
         review_pending: bool,
+        planning_run_live: bool,
     ) -> bool {
-        if children.is_empty() || self.lead_holds_state(&root.id, &root.status, assignments) {
+        if children.is_empty()
+            || planning_run_live
+            || self.lead_holds_state(&root.id, &root.status, assignments)
+        {
             return false;
         }
         let Some(state) = self
@@ -249,6 +285,22 @@ impl<'a> RootRolePolicy<'a> {
             .max_by_key(|state| state.kind == StateKind::Active)
             .map(|state| state.name.clone())
     }
+}
+
+/// Database form of [`RootRolePolicy::planning_run_live`].
+pub(crate) async fn root_planning_run_live(
+    db: &SqliteDb,
+    root: &Task,
+    policy: &RootRolePolicy<'_>,
+) -> Result<bool> {
+    if policy.planning_state() != Some(root.status.as_str()) {
+        return Ok(false);
+    }
+    let running = db::ExecutionRepo::list_running_by_task(db, &root.id).await?;
+    Ok(policy.planning_run_live(
+        &root.status,
+        running.iter().map(|execution| execution.role.as_str()),
+    ))
 }
 
 /// Database form of [`RootRolePolicy::lead`] for a coordination root.
@@ -970,8 +1022,14 @@ mod tests {
         let closed = vec![task("child", default_states::DONE, Some("root"))];
         let lead = vec![assignment("root", "planner", Some("lead"))];
         let due = |status: &str, children: &[Task], rows: &[TaskRoleAssignment], pending| {
-            policy.root_advance_due(&task("root", status, None), children, rows, pending)
+            policy.root_advance_due(&task("root", status, None), children, rows, pending, false)
         };
+        // A planning run still live on a root whose lead was removed holds
+        // the root exactly as the lead did.
+        assert!(policy.planning_run_live("planning", ["planner"]));
+        assert!(!policy.planning_run_live("planning", ["reviewer"]));
+        assert!(!policy.planning_run_live("in_progress", ["planner"]));
+        assert!(!policy.root_advance_due(&task("root", "planning", None), &open, &[], false, true));
         // Kickoff, with and without a lead.
         assert!(due("todo", &open, &[], false));
         assert!(due("todo", &open, &lead, false));

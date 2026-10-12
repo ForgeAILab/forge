@@ -355,6 +355,13 @@ impl TaskDispatcher {
                 &r.children,
                 &r.assignments,
                 crate::task_service::coordination_review_pending(t),
+                root_policy.planning_run_live(
+                    &t.status,
+                    r.executions
+                        .iter()
+                        .filter(|e| e.status == ExecutionStatus::Running)
+                        .map(|e| e.role.as_str()),
+                ),
             );
         if let Some(parent) = &r.parent {
             let allowed =
@@ -386,7 +393,8 @@ impl TaskDispatcher {
             }
         }
         if let Some(role) = role {
-            f.root_role_allowed = !f.root || root_policy.allows_execution(&t.status, role);
+            f.root_role_allowed =
+                !f.root || root_policy.runs_role(&t.id, &t.status, role, &r.assignments);
             f.in_flight = r.executions.iter().any(|e| {
                 e.status == ExecutionStatus::Running
                     && helpers::execution_guard_roles(role).contains(&e.role.as_str())

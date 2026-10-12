@@ -179,13 +179,14 @@ impl TaskDispatcher {
                 if !children.is_empty() {
                     // The Project Agent coordinates this root through its child
                     // records. Only children receive implementation dispatches.
-                    if crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
-                        .root_advance_due(
-                            &task,
-                            &children,
-                            &db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?,
-                            crate::task_service::coordination_review_pending(&task),
-                        )
+                    let root_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(workflow);
+                    if root_policy.root_advance_due(
+                        &task,
+                        &children,
+                        &db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?,
+                        crate::task_service::coordination_review_pending(&task),
+                        crate::task_hierarchy::root_planning_run_live(&self.db, &task, &root_policy).await?,
+                    )
                     {
                         dispatched += self.advance_coordination_root_once(&task).await?;
                     }

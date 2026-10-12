@@ -290,14 +290,14 @@ impl TaskDispatcher {
 
                 let children = crate::task_hierarchy::children_if_root(&self.db, &task).await?;
                 let is_coordination_root = !children.is_empty();
-                if is_coordination_root
-                    && crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
-                        .root_advance_due(
-                            &task,
-                            &children,
-                            &db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?,
-                            crate::task_service::coordination_review_pending(&task),
-                        )
+                let root_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(workflow);
+                if is_coordination_root && root_policy.root_advance_due(
+                    &task,
+                    &children,
+                    &db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?,
+                    crate::task_service::coordination_review_pending(&task),
+                    crate::task_hierarchy::root_planning_run_live(&self.db, &task, &root_policy).await?,
+                )
                 {
                     dispatched += self.advance_coordination_root_once(&task).await?;
                     return Ok(());

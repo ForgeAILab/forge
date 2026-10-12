@@ -90,41 +90,47 @@ impl TaskService {
         if db::task_writer::current_task_step().is_some() {
             return;
         }
-        let started: Result<()> =
-            async {
-                let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
-                    return Ok(());
-                };
-                let Some(parent_task_id) = task.parent_task_id.as_deref() else {
-                    return Ok(());
-                };
-                let (parent, workflow) =
-                    crate::task_hierarchy::coordination_root_context(&self.db, parent_task_id)
-                        .await?;
-                if crate::task_hierarchy::root_blocked(&parent)
-                    || crate::task_hierarchy::coordination_root_allows_child_dispatch(
-                        &parent, &workflow,
-                    )
-                {
-                    return Ok(());
-                }
-                let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id).await?;
-                if project.is_none_or(|project| project.paused_at.is_some()) {
-                    return Ok(());
-                }
-                let children =
-                    crate::task_hierarchy::ordered_children(&self.db, parent_task_id).await?;
-                let assignments =
-                    TaskRoleAssignmentRepo::list_by_task(&*self.db, parent_task_id).await?;
-                if crate::task_hierarchy::child_sequence_complete(&children, &workflow)
-                    || !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
-                        .root_advance_due(&parent, &children, &assignments, false)
-                {
-                    return Ok(());
-                }
-                self.advance_coordination_root(parent_task_id).await
+        let started: Result<()> = async {
+            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
+                return Ok(());
+            };
+            let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+                return Ok(());
+            };
+            let (parent, workflow) =
+                crate::task_hierarchy::coordination_root_context(&self.db, parent_task_id).await?;
+            if crate::task_hierarchy::root_blocked(&parent)
+                || crate::task_hierarchy::coordination_root_allows_child_dispatch(
+                    &parent, &workflow,
+                )
+            {
+                return Ok(());
             }
-            .await;
+            let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id).await?;
+            if project.is_none_or(|project| project.paused_at.is_some()) {
+                return Ok(());
+            }
+            let children =
+                crate::task_hierarchy::ordered_children(&self.db, parent_task_id).await?;
+            let assignments =
+                TaskRoleAssignmentRepo::list_by_task(&*self.db, parent_task_id).await?;
+            let policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
+            let planning_run_live =
+                crate::task_hierarchy::root_planning_run_live(&self.db, &parent, &policy).await?;
+            if crate::task_hierarchy::child_sequence_complete(&children, &workflow)
+                || !policy.root_advance_due(
+                    &parent,
+                    &children,
+                    &assignments,
+                    false,
+                    planning_run_live,
+                )
+            {
+                return Ok(());
+            }
+            self.advance_coordination_root(parent_task_id).await
+        }
+        .await;
         if let Err(error) = started {
             tracing::debug!(%task_id, %error, "coordination root was not started ahead of its subtask");
         }
@@ -186,7 +192,14 @@ impl TaskService {
         let lead_assigned = crate::task_hierarchy::root_lead(&self.db, &parent, &workflow)
             .await?
             .is_some();
-        let lead_holds = |status: &str| lead_assigned && policy.planning_state() == Some(status);
+        // A planning run still live on the root holds it as the lead does,
+        // also when the lead was removed while it ran: the run's settlement
+        // moves the root on, and no subtask starts beside it.
+        let planning_run_live =
+            crate::task_hierarchy::root_planning_run_live(&self.db, &parent, &policy).await?;
+        let lead_holds = |status: &str| {
+            (lead_assigned || planning_run_live) && policy.planning_state() == Some(status)
+        };
         let reason = if complete {
             "ordered subtasks completed"
         } else {
@@ -251,12 +264,14 @@ impl TaskService {
             // a flag left set would starve the planner on every pass.
             self.set_coordination_review_pending(parent_task_id, false)
                 .await?;
-            crate::wake_task_dispatch(
-                &self.db,
-                parent_task_id,
-                "coordination root waits for its lead",
-            )
-            .await?;
+            if lead_assigned {
+                crate::wake_task_dispatch(
+                    &self.db,
+                    parent_task_id,
+                    "coordination root waits for its lead",
+                )
+                .await?;
+            }
             return Ok(());
         }
         let parent_kind = workflow.state_kind(&parent.status);

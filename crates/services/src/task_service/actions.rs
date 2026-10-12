@@ -1168,8 +1168,12 @@ impl TaskService {
         // the scheduler advances the root when its subtasks are complete.
         if snapshot.coordination_root
             && role.is_some_and(|role| {
-                !crate::task_hierarchy::RootRolePolicy::for_workflow(&snapshot.workflow)
-                    .allows_execution(&snapshot.task.status, role)
+                !crate::task_hierarchy::RootRolePolicy::for_workflow(&snapshot.workflow).runs_role(
+                    &snapshot.task.id,
+                    &snapshot.task.status,
+                    role,
+                    &snapshot.role_assignments,
+                )
             })
         {
             return Ok(snapshot.task);
