@@ -872,9 +872,11 @@ fn decision_condition(child: &Task) -> db::TaskCondition {
 
 /// A subtask parked needing a decision, and the identity of that park:
 /// it failed or was interrupted, and nothing clears that by itself. Never a
-/// hold (the owner's), a queued owner action, or any wait that ends on its
-/// own (capacity, an Agent, a machine, the environment, a dependency, a
-/// human decision, checks, its parent, a retry deadline, a run in flight).
+/// hold or a host environment that is not ready (the owner's), a queued
+/// owner action, or any wait that ends on its
+/// own (capacity, an Agent, a machine, the environment, an unfinished
+/// dependency, a human decision, checks, its parent, a retry deadline, a run
+/// in flight). A cancelled dependency does need a decision.
 ///
 /// The identity is the time the park was recorded, which the stored blocker
 /// carries and no restatement changes; a later park of the same subtask has
@@ -883,9 +885,18 @@ pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
     let condition = decision_condition(child);
     let since = match &condition {
         db::TaskCondition::Parked { primary, since, .. } => {
-            if matches!(
+            // The park's own reason decides, not a blocker recorded beside a
+            // wait that ends by itself or belongs to the owner.
+            if !matches!(
                 primary,
-                db::ParkReason::Held { .. } | db::ParkReason::HumanDecision { .. }
+                db::ParkReason::Failure { .. }
+                    | db::ParkReason::AgentTimeout { .. }
+                    | db::ParkReason::BudgetExhausted { .. }
+                    | db::ParkReason::EntryBlocked { .. }
+                    | db::ParkReason::Dependencies {
+                        cancelled: true,
+                        ..
+                    }
             ) {
                 return None;
             }
@@ -896,7 +907,10 @@ pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
     };
     let read = condition.read();
     if !(read.hard_failure || read.interruption_present)
-        || read.failure_kind == Some(api_types::FailureKind::ManualStop)
+        || matches!(
+            read.failure_kind,
+            Some(api_types::FailureKind::ManualStop | api_types::FailureKind::EnvironmentNotReady)
+        )
         || read.queued_command
     {
         return None;
@@ -1126,8 +1140,13 @@ mod replan_tests {
             Some(at)
         );
         assert_eq!(
-            subtask_decision_park(&parked("child", at, "execution_failed")).as_deref(),
+            subtask_decision_park(&parked("child", at, "executor_failed")).as_deref(),
             Some(at)
+        );
+        // The host's environment is the owner's to fix, not the lead's.
+        assert_eq!(
+            subtask_decision_park(&parked("child", at, "environment_not_ready")),
+            None
         );
         // The owner's hold is the owner's; a clear, running or waiting
         // subtask needs nothing.
@@ -1143,6 +1162,26 @@ mod replan_tests {
             subtask_decision_park(&task("child", default_states::TODO, Some("root"))),
             None
         );
+        // A dependency that is merely unfinished ends by itself; a cancelled
+        // one needs a decision.
+        let mut waiting = task("child", default_states::IN_PROGRESS, Some("root"));
+        waiting.condition = db::TaskCondition::Parked {
+            primary: db::ParkReason::Capacity {
+                scope: db::ConditionCapacityScope::Agent,
+            },
+            additional: Vec::new(),
+            resume: db::ConditionContinuation::Reconcile,
+            since: Some(at.to_owned()),
+            evidence: db::ConditionEvidence {
+                stated: true,
+                presentation: Some(db::ConditionRead {
+                    interruption_present: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        assert_eq!(subtask_decision_park(&waiting), None);
         // The identity survives a restatement of the stored condition and
         // changes with the next park.
         let mut restated = parked("child", at, "retry_exhausted");

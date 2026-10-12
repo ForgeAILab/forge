@@ -367,7 +367,7 @@ impl AttentionService {
                 // re-plan for it, or its lead is planning) wakes nobody.
                 // Level state: once the lead left the park in place, or the
                 // root itself parked, the next sweep admits the wake.
-                if self.lead_handles_blocker(&attention).await? {
+                if self.lead_handles_blocker(&attention).await {
                     continue;
                 }
                 let digest = wake_attention_incident_digest(&attention);
@@ -443,15 +443,23 @@ impl AttentionService {
 
     /// Whether an open blocker is a subtask's park that its root's lead
     /// handles (`task_hierarchy::lead_handles_subtask_park`).
-    async fn lead_handles_blocker(&self, attention: &AttentionProjection) -> Result<bool> {
+    async fn lead_handles_blocker(&self, attention: &AttentionProjection) -> bool {
         let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
         if details.get("entity_type").and_then(Value::as_str) != Some("task") {
-            return Ok(false);
+            return false;
         }
         let Some(task_id) = details.get("entity_id").and_then(Value::as_str) else {
-            return Ok(false);
+            return false;
         };
-        crate::task_hierarchy::lead_handles_subtask_park(&self.db, task_id).await
+        // Fail open: a blocker this filter cannot judge (its Task or root is
+        // gone) is the Project Agent's, and never stops the Project's sweep.
+        match crate::task_hierarchy::lead_handles_subtask_park(&self.db, task_id).await {
+            Ok(handled) => handled,
+            Err(error) => {
+                tracing::debug!(%task_id, %error, "lead filter could not judge a blocker; not suppressed");
+                false
+            }
+        }
     }
 
     /// One wake per Project window for every eligible blocker, with one directive.

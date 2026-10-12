@@ -5916,7 +5916,8 @@ pass; no wake is needed.
   (never `merge_failed`), whose first incomplete subtask is parked needing a
   decision. "Needing a decision" (`task_hierarchy::subtask_decision_park`) is
   a failure or interruption that nothing clears by itself; never the owner's
-  hold or manual stop, a queued owner action, a human decision, or any wait
+  hold or manual stop, a host environment that is not ready, a queued owner
+  action, a human decision, or any wait
   that ends on its own (capacity, an Agent, a machine, the environment, a
   dependency, checks, the parent, a retry deadline, a run in flight). The
   subtasks are sequential, so nothing runs beside the parked one: no running
