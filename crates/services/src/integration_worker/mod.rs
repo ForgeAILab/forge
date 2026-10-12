@@ -181,6 +181,7 @@ pub struct IntegrationQueueWorker {
     /// the Task's previous entry looks again at once instead of at its poll.
     released: Notify,
     /// How many heads this worker's drivers released.
+    #[cfg(test)]
     releases: std::sync::atomic::AtomicU64,
     /// The supervised loop ([`Self::run`]) is live in this process.
     running: std::sync::atomic::AtomicBool,
@@ -227,6 +228,7 @@ impl IntegrationQueueWorker {
             wake: Notify::new(),
             answered: Notify::new(),
             released: Notify::new(),
+            #[cfg(test)]
             releases: std::sync::atomic::AtomicU64::new(0),
             running: std::sync::atomic::AtomicBool::new(false),
             shared: Mutex::new(Shared::default()),
@@ -254,6 +256,7 @@ impl IntegrationQueueWorker {
     /// A driver of this worker released its head (the attempt left the
     /// slot). Only a wake: a waiter that misses it looks at its poll.
     pub(crate) fn notify_released(&self) {
+        #[cfg(test)]
         self.releases
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.released.notify_waiters();
@@ -264,6 +267,7 @@ impl IntegrationQueueWorker {
         self.released.notified()
     }
     /// Heads released by this worker's drivers so far.
+    #[cfg(test)]
     pub(crate) fn releases(&self) -> u64 {
         self.releases.load(std::sync::atomic::Ordering::Relaxed)
     }

@@ -316,28 +316,6 @@ pub(crate) async fn admit_released_or_replaced(
     }
 }
 
-/// Test-only: Tasks whose admission does not poll for the release of their
-/// old head. It then succeeds only when the driver's release wakes it.
-#[cfg(test)]
-pub(crate) mod test_poll {
-    use std::{collections::HashSet, sync::Mutex};
-    static DISABLED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    pub(crate) fn disable(task_id: &str) {
-        DISABLED
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashSet::new)
-            .insert(task_id.to_owned());
-    }
-    pub(super) fn disabled(task_id: &str) -> bool {
-        DISABLED
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|tasks| tasks.contains(task_id))
-    }
-}
-
 /// The commit the Task's review passed, when the admitted HEAD is a
 /// mechanical rebase of it that nothing has checked or reviewed since.
 /// `None`: the HEAD is the reviewed commit itself (every ordinary admission).
@@ -483,5 +461,27 @@ impl crate::TaskService {
             worker.notify_enqueued(attempt.queue_id.as_deref().unwrap_or_default());
         }
         Ok(attempt)
+    }
+}
+
+/// Test-only: Tasks whose admission does not poll for the release of their
+/// old head. It then succeeds only when the driver's release wakes it.
+#[cfg(test)]
+pub(crate) mod test_poll {
+    use std::{collections::HashSet, sync::Mutex};
+    static DISABLED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    pub(crate) fn disable(task_id: &str) {
+        DISABLED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(task_id.to_owned());
+    }
+    pub(super) fn disabled(task_id: &str) -> bool {
+        DISABLED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|tasks| tasks.contains(task_id))
     }
 }
