@@ -189,7 +189,7 @@ impl SqliteDb {
                 // A subtask reads two roles from its root: the default worker
                 // and the lead that holds its step check. Each row keeps its
                 // own `task_id`, so a reader tells own from inherited.
-                if a.task_id==r.task.id || (matches!(a.role_name.as_str(),"coder"|"planner") && Some(&a.task_id)==r.task.parent_task_id.as_ref()) { r.assignments.push(a.clone()); }
+                if a.task_id==r.task.id || ((a.role_name=="coder" || a.role_name==crate::inherited_subtask::STEP_CHECK_ROLE) && Some(&a.task_id)==r.task.parent_task_id.as_ref()) { r.assignments.push(a.clone()); }
             }
         }
         // Latest of each role, plus every running execution. Indexed by Task;

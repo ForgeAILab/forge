@@ -43,18 +43,15 @@ fn state(
 
 /// The role of the step-check gate. It is never assigned on a subtask: it
 /// resolves to the root's lead (`task_hierarchy::effective_role_assignment`).
-pub const STEP_CHECK_ROLE: &str = default_roles::PLANNER;
+pub const STEP_CHECK_ROLE: &str = db::inherited_subtask::STEP_CHECK_ROLE;
 
-/// Whether `state` belongs to the inherited subtask workflow.
+/// Whether `state` belongs to the inherited subtask workflow. The names live
+/// in `db::inherited_subtask` (the database decides role holders and workflow
+/// governance from them without loading a workflow); the test
+/// `the_database_names_are_this_workflow` fails when they and the definition
+/// below diverge.
 pub fn is_inherited_state(state: &str) -> bool {
-    matches!(
-        state,
-        default_states::TODO
-            | default_states::IN_PROGRESS
-            | default_states::LEAD_CHECK
-            | default_states::DONE
-            | default_states::CANCELLED
-    )
+    db::inherited_subtask::is_state(state)
 }
 
 /// The step check: an optional gate in the working phase between
@@ -277,6 +274,44 @@ mod tests {
         }
         assert!(!super::is_inherited_state(default_states::PLANNING));
         assert!(!super::is_inherited_state(default_states::REVIEW));
+    }
+
+    /// One source for the rule "who holds a subtask's step check": the
+    /// database reads state and role names from `db::inherited_subtask`, the
+    /// services derive them from this workflow. They must be the same set,
+    /// in both directions.
+    #[test]
+    fn the_database_names_are_this_workflow() {
+        let workflow = inherited_subtask_workflow();
+        let defined: Vec<&str> = workflow.states.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(defined, db::inherited_subtask::STATES);
+        for state in &workflow.states {
+            assert_eq!(
+                crate::workflow::effective_role(state),
+                db::inherited_subtask::role(&state.name),
+                "{}",
+                state.name
+            );
+        }
+        let gates: Vec<&str> = workflow
+            .states
+            .iter()
+            .filter(|s| s.kind == api_types::StateKind::Gate)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(gates, [db::inherited_subtask::STEP_CHECK_STATE]);
+        assert_eq!(
+            default_states::LEAD_CHECK,
+            db::inherited_subtask::STEP_CHECK_STATE
+        );
+        assert_eq!(
+            crate::workflow::default_roles::PLANNER,
+            db::inherited_subtask::STEP_CHECK_ROLE
+        );
+        assert!(workflow
+            .roles
+            .iter()
+            .any(|r| r.name == db::inherited_subtask::STEP_CHECK_ROLE));
     }
 
     #[test]

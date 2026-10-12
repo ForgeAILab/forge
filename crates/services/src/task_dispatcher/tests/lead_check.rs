@@ -15,6 +15,9 @@ struct StepExecutor {
     replies: Arc<std::sync::Mutex<VecDeque<String>>>,
     /// Keep implementation runs of this Task title running.
     hold_coder: Option<&'static str>,
+    /// A scripted reply that starts with `@hold:` is given only after this
+    /// gets a permit (a step check that is still running).
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait]
@@ -52,7 +55,13 @@ impl TaskExecutor for StepExecutor {
         }
         let reply = self.replies.lock().unwrap().pop_front();
         match reply {
-            Some(reply) => completed(Some(reply)),
+            Some(reply) => match reply.strip_prefix("@hold:") {
+                Some(held) => {
+                    self.release.acquire().await.unwrap().forget();
+                    completed(Some(held.to_owned()))
+                }
+                None => completed(Some(reply)),
+            },
             None => {
                 pending::<()>().await;
                 unreachable!()
@@ -71,6 +80,7 @@ struct Steps {
     coder: String,
     planner: String,
     dispatcher: TaskDispatcher,
+    release: Arc<tokio::sync::Semaphore>,
     _dirs: (TempDir, TempDir),
 }
 
@@ -85,7 +95,9 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
     let coder = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
     let planner = crate::test_support::seed_native_agent(&db).await;
     let event_bus = Arc::new(EventBus::new(64));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
     let task_executor: Arc<dyn TaskExecutor> = Arc::new(StepExecutor {
+        release: Arc::clone(&release),
         db: Arc::clone(&db),
         replies: Arc::new(std::sync::Mutex::new(
             replies.iter().map(|reply| (*reply).to_owned()).collect(),
@@ -110,6 +122,7 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
         coder,
         planner,
         dispatcher,
+        release,
         _dirs: (repo, workspace),
     }
 }
@@ -693,4 +706,540 @@ async fn a_step_resting_in_the_gate_under_a_lead_gets_its_check_from_stored_stat
             && prompt.contains("Check this finished step: first"),
         "{prompt}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review round: the cases the first pass left open.
+// ---------------------------------------------------------------------------
+
+const HELD_FAIL: &str =
+    "@hold:Late findings.\n{\"result\":\"fail\",\"reason\":\"a verdict nobody asked for\"}";
+const BLOCKED: &str =
+    "I could not open the repository.\n{\"result\":\"blocked\",\"reason\":\"no access\"}";
+
+async fn running_check(db: &db::SqliteDb, task: &str) -> bool {
+    executions(db, task)
+        .await
+        .last()
+        .is_some_and(|run| run == &("planner".to_owned(), "running".to_owned()))
+}
+
+async fn condition(db: &db::SqliteDb, task: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT COALESCE(condition_json, '') FROM task WHERE id=?")
+        .bind(task)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+/// Open Attention items about `task`, other than the follow-up every
+/// completed Task gets.
+async fn open_attention(steps: &Steps, task: &str) -> i64 {
+    let attention = crate::AttentionService::new(Arc::clone(&steps.db));
+    while attention.project_once(100).await.unwrap().processed_events > 0 {}
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection WHERE status = 'open'
+         AND attention_type != 'delivery_followup'
+         AND (scope_id = ?1 OR json_extract(details_json, '$.entity_id') = ?1
+              OR json_extract(details_json, '$.task_id') = ?1)",
+    )
+    .bind(task)
+    .fetch_one(steps.db.pool())
+    .await
+    .unwrap()
+}
+
+/// No lead: the skip is made by the entry into the gate (its own hook, in
+/// the step that entered it), never by a later dispatcher decision
+/// (`Step::SkipGate` is for a Task that rests in the gate).
+#[tokio::test]
+async fn without_a_lead_the_skip_is_the_entry_s_own_and_not_a_dispatcher_decision() {
+    let steps = steps(&[], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, false).await;
+    until(&steps, "the first subtask is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    let skips: Vec<(String, String)> = sqlx::query_as(
+        "SELECT triggered_by, trigger_reason FROM transition_log
+         WHERE task_id=? AND from_state='lead_check'",
+    )
+    .bind(&first.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(skips.len(), 1, "{skips:?}");
+    assert_eq!(
+        skips[0].1, "No planner role assigned; optional gate skipped",
+        "{skips:?}"
+    );
+    assert!(!skips[0].0.contains("task_dispatcher"), "{skips:?}");
+    // The skip is the cascade of the entry's own hook step: same chain, and
+    // no later decision step for the subtask.
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT kind, chain_id FROM task_step WHERE task_id=? AND expected_status='lead_check'
+         ORDER BY seq",
+    )
+    .bind(&first.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    let kinds: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+    assert_eq!(kinds, ["hooks", "cascade"], "{rows:?}");
+    assert_eq!(rows[0].1, rows[1].1, "one chain: {rows:?}");
+    // Nobody is asked for anything: no Attention item, no park.
+    let open = open_attention(&steps, &first.id).await;
+    let items: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT attention_type, status, summary, details_json FROM attention_projection",
+    )
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(open, 0, "{items:#?}");
+}
+
+/// A `planner` row on a subtask would hold nothing (the step check is the
+/// root's lead): assigning one is refused and names the root.
+#[tokio::test]
+async fn assigning_the_step_check_role_on_a_subtask_is_refused_and_names_the_root() {
+    let steps = steps(&[], Some("first")).await;
+    let (root, first, _second) = root_with_two_steps(&steps, false).await;
+    let now = now_rfc3339();
+    let refused = steps
+        .dispatcher
+        .task_service
+        .reassign_role(
+            db::CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: first.id.clone(),
+                role_name: crate::workflow::default_roles::PLANNER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(steps.planner.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            false,
+            false,
+        )
+        .await;
+    let error = refused.expect_err("the assignment is refused").to_string();
+    assert!(
+        error.contains("held by the lead of its root") && error.contains(&root.id),
+        "{error}"
+    );
+    assert_eq!(
+        count(
+            &steps.db,
+            "SELECT COUNT(*) FROM task_role_assignment WHERE task_id=? AND role_name='planner'",
+            &first.id
+        )
+        .await,
+        0
+    );
+}
+
+/// A `blocked` verdict is not a pass and not a return: the lead is asked
+/// again under the completion-guard bound and the subtask parks, typed.
+#[tokio::test]
+async fn a_blocked_verdict_parks_the_subtask_without_spending_a_return() {
+    let steps = steps(&[BLOCKED], None).await;
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the subtask is blocked", async || {
+        reload(&steps.db, &first.id)
+            .await
+            .condition
+            .read()
+            .interruption_present
+    })
+    .await;
+    let blocked = reload(&steps.db, &first.id).await;
+    assert_eq!(blocked.status, "lead_check");
+    assert_eq!(
+        blocked.condition.read().failure_kind,
+        Some(api_types::FailureKind::WorkflowGuardRejected)
+    );
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0);
+    assert_eq!(executions(&steps.db, &second.id).await, Vec::new());
+    assert!(
+        open_attention(&steps, &first.id).await >= 1,
+        "the park is shown"
+    );
+}
+
+/// The spent return budget: one budget check per entry, one typed park with
+/// an Attention item, and the owner's Retry opens a new window and has the
+/// LEAD check the work that is already there (validate first; the worker is
+/// not run again before anybody looked).
+#[tokio::test]
+async fn the_spent_budget_park_is_shown_once_and_retry_has_the_lead_check_the_work() {
+    let steps = steps(&[FAIL, FAIL, PASS], Some("second")).await;
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the subtask is parked", async || {
+        let task = reload(&steps.db, &first.id).await;
+        task.status == "lead_check" && task.condition.read().interruption_present
+    })
+    .await;
+    passes(&steps, 3).await;
+    let parked = reload(&steps.db, &first.id).await;
+    assert_eq!(
+        parked.condition.read().failure_kind,
+        Some(api_types::FailureKind::RetryExhausted)
+    );
+    // The budget is checked once per entry into the gate.
+    let hooks: Option<String> = sqlx::query_scalar(
+        "SELECT hook_results_json FROM transition_log
+         WHERE task_id=? AND to_state='lead_check' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(&first.id)
+    .fetch_one(steps.db.pool())
+    .await
+    .unwrap();
+    let hooks = hooks.unwrap_or_default();
+    assert_eq!(
+        hooks.matches("check_retry_budget").count(),
+        1,
+        "one budget check per entry: {hooks}"
+    );
+    assert_eq!(
+        open_attention(&steps, &first.id).await,
+        1,
+        "one Attention item"
+    );
+
+    steps
+        .dispatcher
+        .task_service
+        .perform_task_action(
+            &parked.id,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
+            parked.version,
+        )
+        .await
+        .expect("the owner retries the parked step");
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(
+        executions(&steps.db, &first.id).await,
+        vec![
+            ("coder".to_owned(), "completed".to_owned()),
+            ("planner".to_owned(), "completed".to_owned()),
+            ("coder".to_owned(), "completed".to_owned()),
+            ("planner".to_owned(), "completed".to_owned()),
+            ("coder".to_owned(), "completed".to_owned()),
+            ("planner".to_owned(), "completed".to_owned()),
+        ],
+        "Retry starts the lead's check of the last rework, not another rework\n{}",
+        dump(&steps.db).await
+    );
+    until(&steps, "the next step runs", async || {
+        !executions(&steps.db, &second.id).await.is_empty()
+    })
+    .await;
+}
+
+/// The lead is removed while its check runs: the run is stopped, its verdict
+/// (whatever it would have been) moves nothing, and the subtask passes the
+/// gate once, as under any root without a lead.
+#[tokio::test]
+async fn removing_the_lead_while_its_check_runs_stops_the_check_and_passes_the_step() {
+    let steps = steps(&[HELD_FAIL], Some("second")).await;
+    let (root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    steps
+        .dispatcher
+        .task_service
+        .remove_role(
+            &root.id,
+            crate::workflow::default_roles::PLANNER,
+            false,
+            false,
+        )
+        .await
+        .expect("the lead is removed");
+    // Without the run ever answering.
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    assert!(
+        !running_check(&steps.db, &first.id).await,
+        "the removed lead's run is stopped: {}",
+        dump(&steps.db).await
+    );
+    // A late answer changes nothing.
+    steps.release.add_permits(8);
+    passes(&steps, 4).await;
+    let hops = log(&steps.db, &first.id).await;
+    assert_eq!(
+        hops.iter().filter(|hop| hop.0 == "lead_check").count(),
+        1,
+        "{hops:?}"
+    );
+    assert_eq!(
+        hops.last(),
+        Some(&hop("lead_check", "done", Some("gate_skipped"), false))
+    );
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0);
+    until(&steps, "the next step runs", async || {
+        !executions(&steps.db, &second.id).await.is_empty()
+    })
+    .await;
+}
+
+/// Hold and Release on a subtask whose check is running: the hold stops the
+/// check and parks the subtask as held; the release has the lead check it
+/// again. No verdict of the stopped run moves it.
+#[tokio::test]
+async fn a_hold_on_a_step_in_the_gate_stops_the_check_and_release_starts_it_again() {
+    let steps = steps(&[HELD_FAIL, PASS], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    let service = &steps.dispatcher.task_service;
+    let resting = reload(&steps.db, &first.id).await;
+    service
+        .perform_task_action(
+            &first.id,
+            api_types::TaskAction::Hold { reason: None },
+            resting.version,
+        )
+        .await
+        .expect("a step in the gate is held");
+    passes(&steps, 3).await;
+    steps.release.add_permits(8);
+    passes(&steps, 3).await;
+    let held = reload(&steps.db, &first.id).await;
+    assert_eq!(held.status, "lead_check", "{}", dump(&steps.db).await);
+    assert!(!running_check(&steps.db, &first.id).await);
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0);
+    let offers = service.test_action_values(&first.id).await.unwrap();
+    assert!(
+        offers.contains(&api_types::TaskAction::Release { reason: None }),
+        "{offers:?}\n{}",
+        condition(&steps.db, &first.id).await
+    );
+    service
+        .perform_task_action(
+            &first.id,
+            api_types::TaskAction::Release { reason: None },
+            held.version,
+        )
+        .await
+        .expect("the step is released");
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(
+        log(&steps.db, &first.id).await.last(),
+        Some(&hop("lead_check", "done", None, false)),
+        "the lead's own pass, not a skip"
+    );
+}
+
+/// Cancelling a subtask in the gate ends the check; a late verdict moves
+/// nothing.
+#[tokio::test]
+async fn cancelling_a_step_in_the_gate_ends_the_check_and_drops_its_verdict() {
+    let steps = steps(&[HELD_FAIL], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    let resting = reload(&steps.db, &first.id).await;
+    steps
+        .dispatcher
+        .task_service
+        .perform_task_action(
+            &first.id,
+            api_types::TaskAction::Cancel { reason: None },
+            resting.version,
+        )
+        .await
+        .expect("a step in the gate is cancelled");
+    passes(&steps, 3).await;
+    steps.release.add_permits(8);
+    passes(&steps, 3).await;
+    assert_eq!(reload(&steps.db, &first.id).await.status, "cancelled");
+    assert!(!running_check(&steps.db, &first.id).await);
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0);
+    assert_eq!(
+        log(&steps.db, &first.id)
+            .await
+            .iter()
+            .filter(|hop| hop.0 == "lead_check")
+            .count(),
+        1
+    );
+}
+
+/// Cancelling the root while a subtask is in the gate ends the check and the
+/// subtask with it.
+#[tokio::test]
+async fn cancelling_the_root_ends_a_step_check_and_its_subtask() {
+    let steps = steps(&[HELD_FAIL], Some("second")).await;
+    let (root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    let resting = reload(&steps.db, &root.id).await;
+    steps
+        .dispatcher
+        .task_service
+        .perform_task_action(
+            &root.id,
+            api_types::TaskAction::Cancel { reason: None },
+            resting.version,
+        )
+        .await
+        .expect("the root is cancelled");
+    passes(&steps, 3).await;
+    steps.release.add_permits(8);
+    passes(&steps, 3).await;
+    assert_eq!(reload(&steps.db, &root.id).await.status, "cancelled");
+    for child in [&first, &second] {
+        assert_eq!(
+            reload(&steps.db, &child.id).await.status,
+            "cancelled",
+            "{}",
+            dump(&steps.db).await
+        );
+    }
+    assert!(!running_check(&steps.db, &first.id).await);
+}
+
+/// A root whose subtasks are running offers no Hold (as before this gate
+/// existed): a step in the gate is held on the subtask itself.
+#[tokio::test]
+async fn a_root_with_a_step_in_the_gate_offers_no_hold() {
+    let steps = steps(&[HELD_FAIL], Some("second")).await;
+    let (root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    let offers = steps
+        .dispatcher
+        .task_service
+        .test_action_values(&root.id)
+        .await
+        .unwrap();
+    assert!(
+        !offers.contains(&api_types::TaskAction::Hold { reason: None }),
+        "{offers:?}"
+    );
+}
+
+/// A Project pause while a check runs does not lose the step: after the
+/// resume the subtask reaches its verdict.
+#[tokio::test]
+async fn a_project_pause_during_a_step_check_does_not_strand_the_step() {
+    let steps = steps(&[HELD_FAIL, PASS, PASS], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    for paused_at in [Some(now_rfc3339()), None] {
+        let project = ProjectRepo::get_by_id(&*steps.db, &steps.project)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectRepo::update_at_version(
+            &*steps.db,
+            UpdateProject {
+                id: project.id.clone(),
+                name: None,
+                settings: None,
+                primary_repo_id: None,
+                paused_at: Some(paused_at),
+                updated_at: now_rfc3339(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .unwrap();
+        passes(&steps, 3).await;
+        steps.release.add_permits(8);
+        passes(&steps, 2).await;
+    }
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+}
+
+/// A subtask in the gate holds the one Project slot it held while it was
+/// implemented: the lead's check is that Task's run, not a second slot, and
+/// its root holds none beside it. A parked step holds none.
+#[tokio::test]
+async fn a_step_in_the_gate_holds_one_project_slot_and_a_parked_one_none() {
+    let steps = steps(&[HELD_FAIL, FAIL], None).await;
+    let project = ProjectRepo::get_by_id(&*steps.db, &steps.project)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings: serde_json::Value = serde_json::from_str(&project.settings).unwrap();
+    settings["max_active_tasks"] = serde_json::json!(1);
+    ProjectRepo::update_at_version(
+        &*steps.db,
+        UpdateProject {
+            id: project.id.clone(),
+            name: None,
+            settings: Some(settings.to_string()),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .unwrap();
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    // With a limit of one, the whole flow still runs: the check is admitted
+    // in the slot the subtask already holds.
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    let slots = async || {
+        let project = ProjectRepo::get_by_id(&*steps.db, &steps.project)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::task_dispatcher::slots::load_project_slots(&steps.db, &project)
+            .await
+            .unwrap()
+    };
+    let resting = slots().await;
+    assert_eq!((resting.active, resting.parked), (1, 0), "{resting:?}");
+    steps.release.add_permits(8);
+    until(
+        &steps,
+        "the subtask is parked on its spent budget",
+        async || {
+            let task = reload(&steps.db, &first.id).await;
+            task.status == "lead_check" && task.condition.read().interruption_present
+        },
+    )
+    .await;
+    let parked = slots().await;
+    assert_eq!(parked.parked, 1, "{parked:?}");
 }

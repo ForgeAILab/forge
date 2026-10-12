@@ -6,16 +6,53 @@ use crate::{
 };
 use std::collections::HashSet;
 
+/// The Task whose own row decides who holds `role_name` on `task_id`: the
+/// Task itself, except for the step-check role of a subtask in an inherited
+/// workflow state, which its root holds
+/// ([`crate::inherited_subtask::step_check_holder`], the one rule).
+pub(super) async fn assignment_holder_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+) -> Result<String> {
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT parent_task_id, status FROM task WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    Ok(row
+        .and_then(|(parent_task_id, status)| {
+            crate::inherited_subtask::step_check_holder(
+                parent_task_id.as_deref(),
+                &status,
+                role_name,
+            )
+            .map(str::to_owned)
+        })
+        .unwrap_or_else(|| task_id.to_owned()))
+}
+
 /// Load the assignment that authorizes an execution while holding the same
 /// writer transaction that will create it. Coder rows resolve child first,
 /// then direct parent. The step-check role of a subtask in an inherited
-/// workflow state (`planner`) is its root's row and never its own. Every
-/// other role remains Task-local.
+/// workflow state is its root's row and never its own
+/// ([`assignment_holder_in_tx`]). Every other role remains Task-local.
 pub(super) async fn effective_execution_assignment_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     task_id: &str,
     role_name: &str,
 ) -> Result<Option<SqliteRow>> {
+    let holder = assignment_holder_in_tx(transaction, task_id, role_name).await?;
+    if holder != task_id {
+        return Ok(sqlx::query(
+            "SELECT id, assignee_type, assignee_id, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&holder)
+        .bind(role_name)
+        .fetch_optional(&mut **transaction)
+        .await?);
+    }
     Ok(sqlx::query(
         "SELECT assignment.id,
                 assignment.assignee_type,
@@ -23,51 +60,20 @@ pub(super) async fn effective_execution_assignment_in_tx(
                 assignment.updated_at
          FROM task
          JOIN task_role_assignment AS assignment
-           ON assignment.role_name = ?1
-          AND CASE
-                WHEN ?1 = 'planner'
-                     AND task.parent_task_id IS NOT NULL
-                     AND task.status IN ('todo','in_progress','lead_check','done','cancelled')
-                THEN assignment.task_id = task.parent_task_id
-                ELSE assignment.task_id = task.id
-                     OR (?1 = 'coder'
-                         AND task.parent_task_id IS NOT NULL
-                         AND assignment.task_id = task.parent_task_id)
-              END
-         WHERE task.id = ?2
+           ON assignment.role_name = ?
+          AND (assignment.task_id = task.id
+               OR (? = 'coder'
+                   AND task.parent_task_id IS NOT NULL
+                   AND assignment.task_id = task.parent_task_id))
+         WHERE task.id = ?
          ORDER BY CASE WHEN assignment.task_id = task.id THEN 0 ELSE 1 END
          LIMIT 1",
     )
     .bind(role_name)
-    .bind(task_id)
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-/// The Task whose own row decides who holds `role_name` on `task_id`: the
-/// Task itself, except for the step-check role (`planner`) of a subtask in an
-/// inherited workflow state, which its root holds (the rule of
-/// [`effective_execution_assignment_in_tx`]).
-pub(super) async fn assignment_holder_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    task_id: &str,
-    role_name: &str,
-) -> Result<String> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT CASE
-                  WHEN ?1 = 'planner'
-                       AND parent_task_id IS NOT NULL
-                       AND status IN ('todo','in_progress','lead_check','done','cancelled')
-                  THEN parent_task_id
-                  ELSE id
-                END
-         FROM task WHERE id = ?2",
-    )
     .bind(role_name)
     .bind(task_id)
     .fetch_optional(&mut **transaction)
-    .await?
-    .unwrap_or_else(|| task_id.to_owned()))
+    .await?)
 }
 
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
@@ -163,17 +169,13 @@ async fn latest_execution_authority_matches_in_tx(
             role => role,
         };
         // The step-check role of a subtask in an inherited workflow state is
-        // held by its root's row and never its own (the rule of
-        // `effective_execution_assignment_in_tx`).
-        let assignment_task_id = match task.parent_task_id.as_deref() {
-            Some(parent_task_id)
-                if assignment_role == "planner"
-                    && super::inherited_subtask_workflow_state(&task.status) =>
-            {
-                parent_task_id
-            }
-            _ => task.id.as_str(),
-        };
+        // held by its root's row and never its own.
+        let assignment_task_id = crate::inherited_subtask::step_check_holder(
+            task.parent_task_id.as_deref(),
+            &task.status,
+            assignment_role,
+        )
+        .unwrap_or(task.id.as_str());
         let assignment = sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
             "SELECT assignee_type, assignee_id, updated_at
              FROM task_role_assignment

@@ -1781,17 +1781,9 @@ fn default_workflow_role(status: &str) -> Option<&'static str> {
 }
 
 fn inherited_subtask_workflow_state(status: &str) -> bool {
-    matches!(
-        status,
-        "todo" | "in_progress" | "lead_check" | "done" | "cancelled"
-    )
+    crate::inherited_subtask::is_state(status)
 }
 
 fn inherited_subtask_workflow_role(status: &str) -> Option<&'static str> {
-    match status {
-        "in_progress" => Some("coder"),
-        // The step check: the role is held by the root's lead.
-        "lead_check" => Some("planner"),
-        _ => None,
-    }
+    crate::inherited_subtask::role(status)
 }

@@ -9,6 +9,7 @@ pub use effective_authority::TaskRecordExecution;
 mod environment_readiness;
 mod error;
 mod ids;
+pub mod inherited_subtask;
 pub mod integration_queue;
 pub use integration_queue::*;
 pub mod machine_capacity;

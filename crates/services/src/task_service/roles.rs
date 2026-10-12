@@ -213,6 +213,21 @@ impl TaskService {
         super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         self.ensure_coordination_root_role_allowed(&task, &input)
             .await?;
+        // A subtask's step check is held by its root's lead and never by a
+        // row of its own: an assignment here would be accepted and then
+        // ignored, so it is refused and points at the root. (Clearing a row
+        // that predates the rule stays possible through `remove_role`.)
+        if input.assignee_type.is_some() && input.assignee_id.is_some() {
+            if let Some(root_task_id) =
+                crate::task_hierarchy::step_check_root(&task, &input.role_name)
+            {
+                return Err(ServiceError::StepCheckRoleHeldByRoot {
+                    task_id: task.id.clone(),
+                    root_task_id: root_task_id.to_owned(),
+                    role: input.role_name.clone(),
+                });
+            }
+        }
         if input.assignee_type == Some(AssigneeKind::Agent) {
             if let Some(identity_id) = input.assignee_id.as_deref() {
                 crate::ensure_execution_role_principal(
@@ -567,11 +582,34 @@ impl TaskService {
             return Ok(());
         }
         for child in crate::task_hierarchy::ordered_children(&self.db, root_id).await? {
-            if crate::task_hierarchy::step_check_root(&child, role_name).is_some()
-                && child.status == crate::workflow::default_states::LEAD_CHECK
+            if crate::task_hierarchy::step_check_root(&child, role_name).is_none()
+                || child.status != crate::workflow::default_states::LEAD_CHECK
             {
-                crate::wake_task_dispatch(&self.db, &child.id, "the root's lead changed").await?;
+                continue;
             }
+            // With no lead left, a check that is still running has nobody to
+            // answer for it: stop it, so the subtask passes the gate now and
+            // not when that run ends. (A replaced lead's run loses the role
+            // attempt and its verdict is dropped when it ends.)
+            if crate::task_hierarchy::effective_role_assignment(&self.db, &child, role_name)
+                .await?
+                .is_none()
+            {
+                for execution in ExecutionRepo::list_running_by_task(&*self.db, &child.id).await? {
+                    if execution.role != role_name {
+                        continue;
+                    }
+                    self.cancel_active_execution(
+                        &execution,
+                        "the root's lead was removed",
+                        db::StopReason::RoleReassigned,
+                        &api_types::Actor::user(api_types::UserActionSource::RoleReassignment),
+                        db::ResumePolicy::None,
+                    )
+                    .await?;
+                }
+            }
+            crate::wake_task_dispatch(&self.db, &child.id, "the root's lead changed").await?;
         }
         Ok(())
     }

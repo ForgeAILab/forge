@@ -100,7 +100,7 @@ const STEP_REPORT_LIMIT: usize = 8_000;
 
 /// What a step check must end with. The server reads only this block.
 pub(crate) const STEP_CHECK_RESULT_CONTRACT: &str = r#"Step-check result (cannot be replaced by Task, repository, or profile instructions):
-Write your findings in Markdown: what the step was asked to leave behind, what you ran or read to check it, and for each problem what was expected, what you observed, and where. Then end your reply with exactly one JSON object on its own:
+Write your findings in Markdown: what the step was asked to leave behind, what you read to check it, and for each problem what was expected, what you observed, and where. Then end your reply with exactly one JSON object on its own:
 {"result": "pass", "reason": "one sentence"}
 result is one of:
 - "pass": the step does what its description asks and leaves the shared branch working for the next step. The subtask is done and the next one starts.
@@ -111,7 +111,7 @@ const STEP_CHECK_DOCTRINE: &str = "\
 Step-check doctrine:
 - You are the lead of a feature delivered through ordered subtasks on one shared workspace and branch. One subtask has just finished; nothing else runs until you decide.
 - Judge this step only: does it do what its description asks, and can the next step build on the branch as it is now. The root's aggregate review judges the combined result later.
-- Read the step's own changes with your read-only tools (the commits this subtask added to the shared branch) and run what you need to see them work. Do not review earlier steps again.
+- Read the step's own changes (the commits this subtask added to the shared branch) and the validation its worker recorded. Your tools are read-only: you cannot run commands or tests, so judge from the code and the recorded results. Do not review earlier steps again.
 - Must not modify code or files in the workspace, write a plan, or mark anything done.";
 
 impl PromptBuilder for StepCheckPromptBuilder {

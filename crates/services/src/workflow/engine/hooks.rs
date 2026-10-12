@@ -55,10 +55,13 @@ pub(super) fn effective_after_enter_hooks(to_state: &StateDefinition) -> Vec<Hoo
             .as_ref()
             .and_then(|config| config.max_rejections)
             .is_some()
+        // A gate that already checks the budget on entry (before its
+        // dispatch, as the step check does) is not checked a second time.
         && !to_state
             .hooks
-            .after_enter
+            .on_enter
             .iter()
+            .chain(&to_state.hooks.after_enter)
             .any(|hook| hook.action == "check_retry_budget");
 
     let mut hooks = Vec::with_capacity(
