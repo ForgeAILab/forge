@@ -6210,7 +6210,8 @@ Additional kind keys are `merge_fix`, `execution`, `workflow_guard`,
 `automatic_review_recovery`, `review_ci_infrastructure`, and `report_correction`.
 A coordination root that has re-planned also reports `replan` (limit 5 per
 budget window: one per rejected aggregate review and one per parked subtask);
-no other Task has the key. When it is spent the root's condition is
+no other Task has the key. The limit is fixed: `retry_budgets.replan` is not
+read anywhere. When it is spent the root's condition is
 `budget_exhausted` with `budget_kind: "replan"`, and Retry with a new budget
 is the offered action.
 Merging's gate cap and the repair budget are separate constraints. Disabled

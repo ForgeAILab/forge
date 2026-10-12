@@ -880,9 +880,71 @@ async fn a_parked_subtask_with_a_live_run_is_not_replanned_until_the_run_ends() 
         .execute(lead.db.pool())
         .await
         .unwrap();
-    until(&lead, "the root re-plans once the run has ended", async || {
-        reload(&lead.db, &root.id).await.status == "planning"
-    })
+    until(
+        &lead,
+        "the root re-plans once the run has ended",
+        async || reload(&lead.db, &root.id).await.status == "planning",
+    )
     .await;
     assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+}
+
+/// A park the lead cannot fix (here: the subtask's workspace failed) spends
+/// no re-plan and no lead run. The root waits on its subtasks exactly as a
+/// root without a lead does, and the park is the Project Agent's at once.
+#[tokio::test]
+async fn a_park_the_lead_cannot_fix_leaves_the_root_alone_and_wakes_the_project_agent() {
+    let lead = lead_fixture(false).await;
+    let (root, child, _) = root_with_parked_child(&lead, true).await;
+    let current = reload(&lead.db, &child.id).await;
+    let at = now_rfc3339();
+    TaskRepo::update(
+        &*lead.db,
+        db::UpdateTask {
+            id: current.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::json!({
+                    "type": api_types::FailureKind::WorkspaceFailed,
+                    "blocking_reason": "workspace failed",
+                    "message": "the worktree could not be created",
+                    "blocked_at": at,
+                })
+                .to_string(),
+            )),
+            blocked_json: Some(Some(
+                serde_json::json!({
+                    "reason": "the worktree could not be created",
+                    "created_at": at,
+                    "kind": api_types::FailureKind::WorkspaceFailed,
+                    "source": null,
+                    "execution_id": null,
+                })
+                .to_string(),
+            )),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: at.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    passes(&lead, 3).await;
+
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    assert_eq!(log(&lead, &root.id).await, Vec::new());
+    assert_eq!(spent(&lead, &root.id, "replan").await, 0);
+    assert_eq!(executions(&lead.db, &root.id).await, Vec::new());
+    assert!(
+        park(&lead.db, &root.id).await.contains("Children"),
+        "{}",
+        park(&lead.db, &root.id).await
+    );
+    assert!(!crate::task_hierarchy::subtask_park_is_the_leads(&lead.db, &child.id).await);
 }

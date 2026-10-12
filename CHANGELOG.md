@@ -59,20 +59,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   to review when it ends. The review rejection limit is unchanged and still
   blocks the root in `review` when it is spent. The same root also goes
   `in_progress -> planning` when its current subtask parks needing a decision
-  (a failure or interruption nothing clears by itself; never a hold), once
-  per park: the lead runs with that subtask's failure in its input, subtasks
+  (the work failed, timed out, ran out of attempts, was refused entry or
+  lost a dependency; never a hold, and never a host, repository, workspace
+  or platform failure, which stay with the Project Agent and the owner),
+  once per park and never while that subtask still has a live run: the lead runs with that subtask's failure in its input, subtasks
   that have not started wait (`parent { cause: planning }`), and a running
   subtask is never interrupted. If the lead leaves the subtask parked, the
   root waits on its subtasks again and the Project Agent is woken for it;
   while the lead handles a subtask's park the Project Agent is not woken for
   that subtask. Each such planning entry spends the new `replan` budget
-  (5 per budget window). When it is spent the root parks where it is with
+  (5 per budget window, fixed: `retry_budgets` does not configure it). When
+  it is spent the root parks where it is with
   `budget_exhausted` / `budget_kind: "replan"`, and Retry with a new budget
   is the way on. Roots without a lead are unchanged: their rejection target,
   their wait on a parked subtask and the Project Agent's wakes are as before,
   and they never show a `replan` budget. Owner actions (send back, reopen for
-  a corrective subtask, retry) keep the workflow's configured target. No
-  migration.
+  a corrective subtask, retry) keep the workflow's configured target. Until
+  the lead operations ship, the lead cannot change the breakdown: a re-plan
+  costs one lead run and then hands the park to the Project Agent, or returns
+  the root to review. No migration.
 
 - **New values on existing fields: transition `bridge_kind = replan`,
   `budget_exhausted.budget_kind = replan`, budget key `replan`.** Transition
