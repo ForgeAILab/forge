@@ -104,7 +104,9 @@ impl TaskRole {
     pub fn parse(role: &str) -> Option<Self> {
         match role {
             "worker" | "coder" | "executor" => Some(Self::Worker),
-            "reviewer" => Some(Self::Reviewer),
+            // The retired conformance pass ran as an `auditor` execution
+            // under the reviewer session; rows of it still exist.
+            "reviewer" | "auditor" => Some(Self::Reviewer),
             "planner" => Some(Self::Planner),
             "lead" => Some(Self::Lead),
             _ => None,
@@ -438,6 +440,22 @@ impl AuthorityRequirement for McpScopeRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn execution_roles_map_to_the_session_role_they_serve() {
+        for (role, expected) in [
+            ("worker", Some(TaskRole::Worker)),
+            ("coder", Some(TaskRole::Worker)),
+            ("executor", Some(TaskRole::Worker)),
+            ("reviewer", Some(TaskRole::Reviewer)),
+            ("auditor", Some(TaskRole::Reviewer)),
+            ("planner", Some(TaskRole::Planner)),
+            ("interactive", None),
+        ] {
+            assert_eq!(TaskRole::parse(role), expected, "{role}");
+        }
+        assert!(!TaskRole::Reviewer.can_write_plan());
+        assert!(!TaskRole::Lead.can_write_plan());
+    }
     fn authority(permissions: &[&str]) -> EffectiveAuthority {
         EffectiveAuthority::resolve(AuthorityFacts {
             principal: Principal::MainAgent {

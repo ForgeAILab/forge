@@ -6339,21 +6339,28 @@ accept optional `limit`; `memory.read` and `decisions.read` accept optional
 limits clamp to 1–50 rows; memory limits clamp to 1–20 rows and queries truncate
 to 512 characters. A foreign field or a non-object argument is refused.
 
-Task record payloads require their advertised action: `task.plan` uses
-`write`, `task.worklog` uses `append`, and `task.evidence` uses `capture`.
-Unknown payload fields are refused. All three bind the exact running execution
-and role through the native session; worklog requires that provenance even when
-no execution can be found. Plan content is limited to 1,048,576 UTF-8 bytes,
+`task.plan` requires `action: "write"`. `task.worklog` and `task.evidence`
+each have one action (`append`, `capture`); it may be sent, omitted or null, as
+before. Unknown payload fields are refused, so a payload cannot name an
+execution, role or identity. All three are written under the one running
+execution of the calling session's identity and role on that Task: a call with
+no such execution, or with more than one, is refused and writes nothing. The
+execution's recorded session id is not compared, so a resumed execution keeps
+working after its Task session is recreated. A `task.worklog` retried with the
+same `correlation_id` and the same entry returns the first entry; the same
+`correlation_id` with a different entry is refused (send a new one).
+`task.evidence` has no idempotency key: each accepted call stores an asset. Plan content is limited to 1,048,576 UTF-8 bytes,
 with a Markdown checklist; summary is limited to 4,000 characters. Evidence
 accepts custom nonempty kind strings, stores them as `other` with the label
 retained, and requires exactly one nonblank `path` or `content`. Path evidence
-must belong to the execution's workspace. Evidence results also identify the
+is read from the execution's workspace (the Task's when the execution recorded
+none). Evidence results also identify the
 execution and role. These observations are not validation attestations.
 
-Planner and implementation Task sessions can write a plan. Reviewer and lead
-sessions can record worklogs/evidence and cannot write a plan or apply workflow
-actions. The lead toolset is read-only and has no validation command. `executor`
-uses the same implementation toolset as `worker` and `coder`.
+Planner and implementation Task sessions can write a plan. Reviewer sessions
+can record worklogs/evidence and cannot write a plan. No Task session can apply
+a workflow action. Native Task sessions exist for the `worker`/`coder`,
+`reviewer` and `planner` roles only, as before.
 
 Ready Project Agents use typed `task.propose`, `task.adaptive`,
 `task.dependency`, and `task.action`. `task.propose` has no `action: create`

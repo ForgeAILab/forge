@@ -567,25 +567,19 @@ impl CoordinationToolProvider {
         runtime: &str,
         scope: &CanonicalScope,
     ) -> Result<(String, String, Option<String>), AgentHostError> {
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT e.id, e.role, e.workspace_id FROM agent_session s
-             JOIN agent_context_scope c ON c.id = s.context_scope_id
-             JOIN execution e ON e.task_id = c.task_id AND e.agent_id = s.identity_id
-               AND (e.agent_session_id IS NULL OR e.agent_session_id = s.runtime_session_id)
-             WHERE s.runtime_session_id = ? AND s.identity_id = ?
-               AND c.scope_type = 'task' AND c.scope_id = ? AND c.task_id = ?
-               AND e.status = 'running'
-               AND ((c.task_role IN ('worker','coder','executor') AND e.role IN ('worker','coder','executor'))
-                 OR c.task_role = e.role)
-             ORDER BY e.created_at DESC, e.id DESC LIMIT 2")
-            .bind(runtime).bind(actor).bind(&scope.scope_id).bind(&scope.scope_id)
-            .fetch_all(self.db.pool()).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
-        let [execution] = rows.as_slice() else {
-            return Err(AgentHostError::Authority(
-                "Task record requires one exact running execution for this native session".into(),
-            ));
-        };
-        Ok(execution.clone())
+        // The same lookup the authority resolver admits the session with.
+        let execution = self
+            .db
+            .task_record_execution(actor, &scope.scope_id, runtime)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .ok_or_else(|| {
+                AgentHostError::Authority(
+                    "Task record requires one exact running execution for this native session"
+                        .into(),
+                )
+            })?;
+        Ok((execution.id, execution.role, execution.workspace_id))
     }
 
     async fn execute_task_worklog_append(
@@ -629,6 +623,16 @@ impl CoordinationToolProvider {
         )
         .await
         .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        // The key returns the entry it first wrote. Reporting that entry for
+        // a different one would tell the run its note was recorded when it
+        // was dropped.
+        if created.content != summary || created.worklog_kind.as_deref() != Some(kind.as_str()) {
+            return Err(invalid_arguments(
+                "correlation_id was already used for a different worklog entry on this Task; \
+                 send this entry with a new correlation_id"
+                    .to_owned(),
+            ));
+        }
 
         Ok(json!({
             "operation": TASK_WORKLOG_OPERATION,
@@ -668,12 +672,12 @@ impl CoordinationToolProvider {
         // the stored artifact ambiguous about what was actually observed.
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
-                let workspace_id = execution_workspace_id.as_deref().ok_or_else(|| {
-                    AgentHostError::Authority(
-                        "this execution has no workspace for artifact capture".into(),
-                    )
-                })?;
-                let workspace = self.task_execution_workspace(workspace_id).await?;
+                // The run's own workspace (a child Task runs in its root's);
+                // an execution that recorded none uses the Task's, exactly
+                // as the turn itself does.
+                let workspace = self
+                    .task_execution_workspace(&task_id, execution_workspace_id.as_deref())
+                    .await?;
                 let root = self.inspected_task_worktree(&task_id, &workspace).await?;
                 let resolved =
                     resolve_workspace_artifact(&root, path).map_err(invalid_arguments)?;
@@ -1519,17 +1523,20 @@ impl CoordinationToolProvider {
 
     async fn task_execution_workspace(
         &self,
-        workspace_id: &str,
+        task_id: &str,
+        workspace_id: Option<&str>,
     ) -> Result<crate::workspace_backend::ResolvedWorkspace, AgentHostError> {
-        let workspace = db::WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await
-            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
-            .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
-            .ok_or_else(|| {
-                AgentHostError::Runtime(
-                    "this Task has no active workspace to capture an artifact from".to_owned(),
-                )
-            })?;
+        let workspace = match workspace_id {
+            Some(workspace_id) => db::WorkspaceRepo::get_by_id(&*self.db, workspace_id).await,
+            None => db::WorkspaceRepo::get_by_task_id(&*self.db, task_id).await,
+        }
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+        .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
+        .ok_or_else(|| {
+            AgentHostError::Runtime(
+                "this Task has no active workspace to capture an artifact from".to_owned(),
+            )
+        })?;
         let router = self
             .task_service_handle()
             .map(|service| service.workspace_backend_router())
@@ -5657,9 +5664,11 @@ mod tests {
             r#"["read_task","read_memory","task_read","task_write"]"#,
         )
         .await;
-        // Production records this correlation on settlement, after the first
-        // native turn has already needed reads and records.
-        sqlx::query("UPDATE execution SET agent_session_id=NULL WHERE id=?")
+        // A resumed execution carries its parent's session id from creation,
+        // and the Task session may have been recreated since (server restart,
+        // profile change). The run is still this session's: it is found by
+        // Task, identity, role and running status, never by that stale id.
+        sqlx::query("UPDATE execution SET agent_session_id='parent-runtime-session' WHERE id=?")
             .bind(&fixture.execution_id)
             .execute(fixture.db.pool())
             .await
@@ -5728,16 +5737,98 @@ mod tests {
             Some(fixture.execution_id.as_str())
         );
         assert_eq!(comments[0].1.as_deref(), Some("coder"));
-        let replay = ForgeToolProvider::propose(&fixture.provider, &fixture.agent_id, &fixture.scope,
-            &fixture.runtime_session_id, TASK_WORKLOG_OPERATION,
-            json!({"operation":TASK_WORKLOG_OPERATION,"payload":{"action":"append","kind":"validation","summary":"passed"},"dedupe_key":TASK_WORKLOG_OPERATION,"correlation_id":TASK_WORKLOG_OPERATION})).await.unwrap();
+        let worklog = |payload: Value, key: &'static str| {
+            ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                &fixture.runtime_session_id,
+                TASK_WORKLOG_OPERATION,
+                json!({"operation":TASK_WORKLOG_OPERATION,"payload":payload,"dedupe_key":key,"correlation_id":key}),
+            )
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap()
+        };
+        let replay = worklog(
+            json!({"action":"append","kind":"validation","summary":"passed"}),
+            TASK_WORKLOG_OPERATION,
+        )
+        .await
+        .unwrap();
         assert_eq!(replay["status"], "succeeded");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
-            .bind(&fixture.task_id)
-            .fetch_one(fixture.db.pool())
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count().await, 1);
+        // The same key with a different entry is refused, not reported as
+        // the first entry: nothing is written and the first is unchanged.
+        let conflict = worklog(
+            json!({"action":"append","kind":"validation","summary":"failed"}),
+            TASK_WORKLOG_OPERATION,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{conflict:?}").contains("new correlation_id"),
+            "{conflict:?}"
+        );
+        assert_eq!(count().await, 1);
+        // The shapes runs sent before the operations were registered: no
+        // `action` (each operation has exactly one), and an explicit null.
+        for (payload, key) in [
+            (
+                json!({"kind":"progress","summary":"slice landed"}),
+                "no-action",
+            ),
+            (
+                json!({"action":null,"kind":"decision","summary":"chose B"}),
+                "null-action",
+            ),
+        ] {
+            let result = worklog(payload, key).await.unwrap();
+            assert_eq!(result["status"], "succeeded", "{result}");
+        }
+        assert_eq!(count().await, 3);
+        let evidence = ForgeToolProvider::propose(
+            &fixture.provider,
+            &fixture.agent_id,
+            &fixture.scope,
+            &fixture.runtime_session_id,
+            TASK_EVIDENCE_OPERATION,
+            json!({"operation":TASK_EVIDENCE_OPERATION,"payload":{"kind":"log","caption":"output","content":"OK","path":null,"filename":null},"dedupe_key":"evidence-no-action","correlation_id":"evidence-no-action"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence["status"], "succeeded", "{evidence}");
+        // A second running execution of the same role leaves no single run
+        // to attribute a record to: the record is refused, the read is not.
+        sqlx::query(
+            "INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at)
+             SELECT 'second-running', task_id, agent_id, role, status, created_at, updated_at
+             FROM execution WHERE id = ?",
+        )
+        .bind(&fixture.execution_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+        assert!(worklog(
+            json!({"kind":"progress","summary":"ambiguous"}),
+            "ambiguous"
+        )
+        .await
+        .is_err());
+        assert_eq!(count().await, 3);
+        let summary = ForgeToolProvider::read(
+            &fixture.provider,
+            &fixture.agent_id,
+            &fixture.scope,
+            "task.summary",
+            json!({}),
+        )
+        .await;
+        assert!(summary.is_ok(), "{summary:?}");
     }
 
     fn assert_correctable_plan_validation(error: AgentHostError) {

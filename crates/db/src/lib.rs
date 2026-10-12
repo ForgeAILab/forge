@@ -5,6 +5,7 @@ pub mod budget;
 mod chat_session_denials;
 mod connection;
 mod effective_authority;
+pub use effective_authority::TaskRecordExecution;
 mod environment_readiness;
 mod error;
 mod ids;

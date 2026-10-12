@@ -203,210 +203,6 @@
       "name": "forge_main_orchestration_read"
     }
   ],
-  "lead": [
-    {
-      "description": "Read a UTF-8 file inside the admitted Task Workspace.",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "path": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      },
-      "name": "forge_task_read"
-    },
-    {
-      "description": "List direct children of a directory inside the admitted Task Workspace. An optional glob filters entry names with * and ? wildcards.",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "glob": {
-            "maxLength": 256,
-            "minLength": 1,
-            "type": "string"
-          },
-          "path": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      },
-      "name": "forge_task_list"
-    },
-    {
-      "description": "Fetch web page or raw file content over HTTP/HTTPS in Markdown, text, or raw format. Returned content includes safety notices identifying it as untrusted external data.",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "format": {
-            "default": "markdown",
-            "description": "Format for returning the content: 'markdown' converts HTML to structured markdown; 'text' strips tags; 'raw'/'html' returns verbatim content.",
-            "enum": [
-              "markdown",
-              "text",
-              "raw",
-              "html"
-            ],
-            "type": "string"
-          },
-          "limit": {
-            "description": "Maximum characters or lines to return in the output to prevent context overflow.",
-            "minimum": 1,
-            "type": "integer"
-          },
-          "offset": {
-            "description": "Starting line offset (1-based) when reading paginated content.",
-            "minimum": 1,
-            "type": "integer"
-          },
-          "url": {
-            "description": "The absolute HTTP or HTTPS URL to fetch.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "url"
-        ],
-        "type": "object"
-      },
-      "name": "fetch"
-    },
-    {
-      "description": "Read one bounded Forge resource from the current canonical scope.",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "arguments": {
-            "description": "Arguments by operation:\n- commitments.read: {limit?}\n- decisions.read: {limit?, query?}\n- delivery.read: {limit?}\n- events.read: {limit?}\n- inbox.read: {limit?}\n- memory.read: {limit?, query?}\n- task.summary: no arguments\n- work.read: {limit?}",
-            "type": "object"
-          },
-          "operation": {
-            "enum": [
-              "commitments.read",
-              "decisions.read",
-              "delivery.read",
-              "events.read",
-              "inbox.read",
-              "memory.read",
-              "task.summary",
-              "work.read"
-            ],
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation"
-        ],
-        "type": "object"
-      },
-      "name": "forge_scope_read"
-    },
-    {
-      "description": "Submit a typed Forge proposal in the current canonical scope.",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "action": {
-            "enum": [
-              "capture",
-              "append",
-              null
-            ],
-            "type": [
-              "null",
-              "string"
-            ]
-          },
-          "caption": {
-            "type": [
-              "null",
-              "string"
-            ]
-          },
-          "causation_depth": {
-            "maximum": 8,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "causation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "content": {
-            "type": [
-              "null",
-              "string"
-            ]
-          },
-          "correlation_id": {
-            "description": "Required non-null correlation id",
-            "minLength": 1,
-            "type": "string"
-          },
-          "dedupe_key": {
-            "description": "Required non-null idempotency key",
-            "minLength": 1,
-            "type": "string"
-          },
-          "filename": {
-            "type": [
-              "null",
-              "string"
-            ]
-          },
-          "kind": {
-            "type": [
-              "null",
-              "string"
-            ]
-          },
-          "operation": {
-            "enum": [
-              "task.evidence",
-              "task.worklog"
-            ],
-            "type": "string"
-          },
-          "path": {
-            "type": [
-              "null",
-              "string"
-            ]
-          },
-          "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). Custom kinds are stored as other with their label retained.\n- task.worklog: {action: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. A worklog never moves a Task or satisfies an acceptance check.",
-            "type": "object"
-          },
-          "summary": {
-            "type": [
-              "null",
-              "string"
-            ]
-          }
-        },
-        "required": [
-          "operation",
-          "payload",
-          "dedupe_key",
-          "correlation_id"
-        ],
-        "type": "object"
-      },
-      "name": "forge_scope_propose"
-    }
-  ],
   "main": [
     {
       "description": "Read a UTF-8 file inside the admitted Task Workspace.",
@@ -849,7 +645,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). Custom kinds are stored as other with their label retained.\n- task.plan: {action: one of write, content}; Stage this execution's Markdown checklist; publish only on successful settlement. Content <=1048576 UTF-8 bytes and at least one Markdown checklist item; planner or implementation role only.\n- task.worklog: {action: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. A worklog never moves a Task or satisfies an acceptance check.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action?: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). kind: screenshot, walkthrough_video, log, report or other (another label is kept, stored as other).\n- task.plan: {action: one of write, content}; Stage this execution's Markdown checklist; publish only on successful settlement. Content <=1048576 UTF-8 bytes and at least one Markdown checklist item; planner or implementation role only.\n- task.worklog: {action?: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. It never moves a Task or satisfies an acceptance check.",
             "type": "object"
           },
           "summary": {
@@ -1139,7 +935,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.\n- task.action: {action: {verb: \"start\"}|{reason?: string|null, verb: \"hold\"}|{reason?: string|null, verb: \"release\"}|{fresh_session?: boolean|null, guidance?: string|null, reason?: string|null, refresh_workspace?: boolean|null, reset_budget?: boolean|null, verb: \"retry\"}|{guidance: string, verb: \"send_back\"}|{override?: boolean|null, reason?: string|null, verb: \"approve\"}|{reason?: string|null, verb: \"restart\"}|{reason?: string|null, verb: \"cancel\"}, task_id: string, version: integer}; Copy the verb and parameter choices from work.read. The Task action system alone owns state eligibility; no agent override=true. Payload <=65536 serialized UTF-8 bytes.\n- task.adaptive: {action: \"split\", expected_board_revision: integer, expected_task_version: integer, items: [{assignee_id?: string|null, description?: string|null, title: string}], rationale: string, source_task_id: string}|{action: \"sequence\", expected_board_revision: integer, expected_task_version: integer, ordered_task_ids: [string], rationale: string, source_task_id: string}|{action: \"replace\", description?: string|null, expected_board_revision: integer, expected_task_version: integer, rationale: string, source_task_id: string, title: string}; Read Task version and board_revision from work.read. split creates ordered direct children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially. sequence changes child order only; it does not create a dependency graph. Payload <=65536 serialized UTF-8 bytes.\n- task.dependency: {action: \"add\", depends_on_task_id: string, rationale: string, task_id: string}|{action: \"remove\", depends_on_task_id: string, rationale: string, task_id: string}; Both Tasks must belong to this Project; a dependency does not create parentage or workspace sharing. Payload <=65536 serialized UTF-8 bytes.\n- task.propose: {capability_class?: string|null, depends_on_task_ids?: [string], description?: string|null, governance?: {capability_class?: string|null, charter_revision_id?: string|null, document_revision_ids?: [string], milestone_id?: string|null, plan_item_id?: string|null, provenance?: object, risk_class?: string|null}|null, merge_config?: object, milestone_id?: string|null, parent_task_id?: string|null, plan_item_id?: string|null, priority?: integer|null, review_requirement_ids: [string], risk_class?: string|null, role_assignments?: [{assignee_id?: string|null, assignee_type: agent|user, role_name: string}]|null, task_state_config?: string|null, task_type?: string|null, title: string}; Copy review_requirement_ids verbatim from project.charter, or [] for none. Name owned repository-relative paths, give parallel Tasks disjoint files, and use dependencies to order shared-file edits. Depends-on IDs are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Configurations and assignments use their closed domain types. Payload <=65536 serialized UTF-8 bytes.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.\n- task.action: {action: {verb: \"start\"}|{reason?: string|null, verb: \"hold\"}|{reason?: string|null, verb: \"release\"}|{fresh_session?: boolean|null, guidance?: string|null, reason?: string|null, refresh_workspace?: boolean|null, reset_budget?: boolean|null, verb: \"retry\"}|{guidance: string, verb: \"send_back\"}|{override?: boolean|null, reason?: string|null, verb: \"approve\"}|{reason?: string|null, verb: \"restart\"}|{reason?: string|null, verb: \"cancel\"}, task_id: string, version: integer}; Copy the verb and parameter choices from work.read. The Task action system alone owns state eligibility; no agent override=true. Payload <=65536 serialized UTF-8 bytes.\n- task.adaptive: {action: \"split\", expected_board_revision: integer, expected_task_version: integer, items: [{assignee_id?: string|null, description?: string|null, title: string}], rationale: string, source_task_id: string}|{action: \"sequence\", expected_board_revision: integer, expected_task_version: integer, ordered_task_ids: [string], rationale: string, source_task_id: string}|{action: \"replace\", description?: string|null, expected_board_revision: integer, expected_task_version: integer, rationale: string, source_task_id: string, title: string}; Read Task version and board_revision from work.read. split creates ordered direct children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially. sequence changes child order only; it does not create a dependency graph. Payload <=65536 serialized UTF-8 bytes.\n- task.dependency: {action: \"add\", depends_on_task_id: string, rationale: string, task_id: string}|{action: \"remove\", depends_on_task_id: string, rationale: string, task_id: string}; Both Tasks must belong to this Project; a dependency does not create parentage or workspace sharing. Payload <=65536 serialized UTF-8 bytes.\n- task.propose: {capability_class?: string|null, depends_on_task_ids?: [string], description?: string|null, governance?: {capability_class?: string|null, charter_revision_id?: string|null, document_revision_ids?: [string], milestone_id?: string|null, plan_item_id?: string|null, provenance?: object, risk_class?: string|null}|null, merge_config?: object, milestone_id?: string|null, parent_task_id?: string|null, plan_item_id?: string|null, priority?: integer|null, review_requirement_ids: [string], risk_class?: string|null, role_assignments?: [{assignee_id?: string|null, assignee_type: agent|user, role_name: string}]|null, task_state_config?: string|null, task_type?: string|null, title: string}; Copy review_requirement_ids verbatim from project.charter, or [] for none. Name owned repository-relative paths, give parallel Tasks disjoint files, and use dependencies to order shared-file edits. Depends-on IDs are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. task_type: task (default), planning_task or discovery. plan_item_id: optional traceability to an item of the active execution baseline, e.g. pi-2. capability_class, when set: repository_write, repository_read, read_only, discovery_read or planning_read. priority: higher runs sooner. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
           },
           "plan_item_id": {
@@ -2751,7 +2547,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.\n- task.action: {action: {verb: \"start\"}|{reason?: string|null, verb: \"hold\"}|{reason?: string|null, verb: \"release\"}|{fresh_session?: boolean|null, guidance?: string|null, reason?: string|null, refresh_workspace?: boolean|null, reset_budget?: boolean|null, verb: \"retry\"}|{guidance: string, verb: \"send_back\"}|{override?: boolean|null, reason?: string|null, verb: \"approve\"}|{reason?: string|null, verb: \"restart\"}|{reason?: string|null, verb: \"cancel\"}, task_id: string, version: integer}; Copy the verb and parameter choices from work.read. The Task action system alone owns state eligibility; no agent override=true. Payload <=65536 serialized UTF-8 bytes.\n- task.adaptive: {action: \"split\", expected_board_revision: integer, expected_task_version: integer, items: [{assignee_id?: string|null, description?: string|null, title: string}], rationale: string, source_task_id: string}|{action: \"sequence\", expected_board_revision: integer, expected_task_version: integer, ordered_task_ids: [string], rationale: string, source_task_id: string}|{action: \"replace\", description?: string|null, expected_board_revision: integer, expected_task_version: integer, rationale: string, source_task_id: string, title: string}; Read Task version and board_revision from work.read. split creates ordered direct children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially. sequence changes child order only; it does not create a dependency graph. Payload <=65536 serialized UTF-8 bytes.\n- task.dependency: {action: \"add\", depends_on_task_id: string, rationale: string, task_id: string}|{action: \"remove\", depends_on_task_id: string, rationale: string, task_id: string}; Both Tasks must belong to this Project; a dependency does not create parentage or workspace sharing. Payload <=65536 serialized UTF-8 bytes.\n- task.propose: {capability_class?: string|null, depends_on_task_ids?: [string], description?: string|null, governance?: {capability_class?: string|null, charter_revision_id?: string|null, document_revision_ids?: [string], milestone_id?: string|null, plan_item_id?: string|null, provenance?: object, risk_class?: string|null}|null, merge_config?: object, milestone_id?: string|null, parent_task_id?: string|null, plan_item_id?: string|null, priority?: integer|null, review_requirement_ids: [string], risk_class?: string|null, role_assignments?: [{assignee_id?: string|null, assignee_type: agent|user, role_name: string}]|null, task_state_config?: string|null, task_type?: string|null, title: string}; Copy review_requirement_ids verbatim from project.charter, or [] for none. Name owned repository-relative paths, give parallel Tasks disjoint files, and use dependencies to order shared-file edits. Depends-on IDs are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Configurations and assignments use their closed domain types. Payload <=65536 serialized UTF-8 bytes.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.\n- task.action: {action: {verb: \"start\"}|{reason?: string|null, verb: \"hold\"}|{reason?: string|null, verb: \"release\"}|{fresh_session?: boolean|null, guidance?: string|null, reason?: string|null, refresh_workspace?: boolean|null, reset_budget?: boolean|null, verb: \"retry\"}|{guidance: string, verb: \"send_back\"}|{override?: boolean|null, reason?: string|null, verb: \"approve\"}|{reason?: string|null, verb: \"restart\"}|{reason?: string|null, verb: \"cancel\"}, task_id: string, version: integer}; Copy the verb and parameter choices from work.read. The Task action system alone owns state eligibility; no agent override=true. Payload <=65536 serialized UTF-8 bytes.\n- task.adaptive: {action: \"split\", expected_board_revision: integer, expected_task_version: integer, items: [{assignee_id?: string|null, description?: string|null, title: string}], rationale: string, source_task_id: string}|{action: \"sequence\", expected_board_revision: integer, expected_task_version: integer, ordered_task_ids: [string], rationale: string, source_task_id: string}|{action: \"replace\", description?: string|null, expected_board_revision: integer, expected_task_version: integer, rationale: string, source_task_id: string, title: string}; Read Task version and board_revision from work.read. split creates ordered direct children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially. sequence changes child order only; it does not create a dependency graph. Payload <=65536 serialized UTF-8 bytes.\n- task.dependency: {action: \"add\", depends_on_task_id: string, rationale: string, task_id: string}|{action: \"remove\", depends_on_task_id: string, rationale: string, task_id: string}; Both Tasks must belong to this Project; a dependency does not create parentage or workspace sharing. Payload <=65536 serialized UTF-8 bytes.\n- task.propose: {capability_class?: string|null, depends_on_task_ids?: [string], description?: string|null, governance?: {capability_class?: string|null, charter_revision_id?: string|null, document_revision_ids?: [string], milestone_id?: string|null, plan_item_id?: string|null, provenance?: object, risk_class?: string|null}|null, merge_config?: object, milestone_id?: string|null, parent_task_id?: string|null, plan_item_id?: string|null, priority?: integer|null, review_requirement_ids: [string], risk_class?: string|null, role_assignments?: [{assignee_id?: string|null, assignee_type: agent|user, role_name: string}]|null, task_state_config?: string|null, task_type?: string|null, title: string}; Copy review_requirement_ids verbatim from project.charter, or [] for none. Name owned repository-relative paths, give parallel Tasks disjoint files, and use dependencies to order shared-file edits. Depends-on IDs are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. task_type: task (default), planning_task or discovery. plan_item_id: optional traceability to an item of the active execution baseline, e.g. pi-2. capability_class, when set: repository_write, repository_read, read_only, discovery_read or planning_read. priority: higher runs sooner. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
           },
           "plan_item_id": {
@@ -3196,7 +2992,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). Custom kinds are stored as other with their label retained.\n- task.worklog: {action: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. A worklog never moves a Task or satisfies an acceptance check.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action?: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). kind: screenshot, walkthrough_video, log, report or other (another label is kept, stored as other).\n- task.worklog: {action?: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. It never moves a Task or satisfies an acceptance check.",
             "type": "object"
           },
           "summary": {
@@ -3448,7 +3244,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). Custom kinds are stored as other with their label retained.\n- task.plan: {action: one of write, content}; Stage this execution's Markdown checklist; publish only on successful settlement. Content <=1048576 UTF-8 bytes and at least one Markdown checklist item; planner or implementation role only.\n- task.worklog: {action: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. A worklog never moves a Task or satisfies an acceptance check.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- task.evidence: {action?: one of capture, caption, content?, filename?, kind, path?}; Capture bytes this execution observed; return the stored asset and checksum. Exactly one of path (inside this execution's workspace) or content (verbatim output). kind: screenshot, walkthrough_video, log, report or other (another label is kept, stored as other).\n- task.plan: {action: one of write, content}; Stage this execution's Markdown checklist; publish only on successful settlement. Content <=1048576 UTF-8 bytes and at least one Markdown checklist item; planner or implementation role only.\n- task.worklog: {action?: one of append, kind: one of progress|decision|validation|blocker, summary}; Append one concise observation with this execution's identity and role. Summary <=4000 characters. It never moves a Task or satisfies an acceptance check.",
             "type": "object"
           },
           "summary": {

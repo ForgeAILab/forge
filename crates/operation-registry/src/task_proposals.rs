@@ -141,7 +141,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             CONSTRAINTS, |c, i| Box::pin(c.task_action(i))),
         OperationSpec::typed("task.propose", AUTHORITY, EffectClass::DirectCommand, AvailabilityRule::ReadyOnly, SURFACES,
             "Create one Charter-bound Task with explicit requirement ownership and optional traceability.",
-            "Copy review_requirement_ids verbatim from project.charter, or [] for none. Name owned repository-relative paths, give parallel Tasks disjoint files, and use dependencies to order shared-file edits. Depends-on IDs are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Configurations and assignments use their closed domain types.",
+            "Copy review_requirement_ids verbatim from project.charter, or [] for none. Name owned repository-relative paths, give parallel Tasks disjoint files, and use dependencies to order shared-file edits. Depends-on IDs are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. task_type: task (default), planning_task or discovery. plan_item_id: optional traceability to an item of the active execution baseline, e.g. pi-2. capability_class, when set: repository_write, repository_read, read_only, discovery_read or planning_read. priority: higher runs sooner.",
             CONSTRAINTS, |c, i| Box::pin(c.task_propose(i))),
         OperationSpec::typed("task.dependency", AUTHORITY, EffectClass::DirectCommand, AvailabilityRule::ReadyOnly, SURFACES,
             "Add or remove one same-Project prerequisite edge.", "Both Tasks must belong to this Project; a dependency does not create parentage or workspace sharing.",

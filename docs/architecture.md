@@ -10149,16 +10149,23 @@ limit clamping stay in their handlers. Unknown argument fields are refused.
 
 `task_records` owns `task.plan`, `task.worklog` and `task.evidence`.
 The shared authority resolver derives a Task principal from the native session's
-identity, Task, profile, workspace access and role and its sole running execution.
-The execution's runtime correlation may be null before settlement; when present
-it must match the session. The admitted execution ID and role cannot change
-within a turn. Selected-profile changes can revoke authority, and cannot widen
+identity, Task, profile, workspace access and role. A Task session is admitted,
+as it always was, while a running execution of that identity serves its role
+(`worker` ↔ `worker`/`coder`/`executor`, `reviewer` ↔ `reviewer`/`auditor`,
+`planner` ↔ `planner`). The principal carries an execution only when exactly one
+does; with several, reads still work and records are refused. The execution's
+recorded session id is not part of the match: a resumed execution carries its
+parent's id from creation, and the Task session may have been rotated or
+recreated since. The admitted execution ID and role cannot change within a turn. Selected-profile changes can revoke authority, and cannot widen
 an admitted turn. Plan/worklog/evidence also recheck that execution at the write
 boundary. Worklog never chooses the latest of several executions or writes a
-comment with missing execution/role provenance. File evidence must come from
-that execution's workspace. Planner and implementation roles can stage a plan;
-reviewers and leads can record observations and cannot author a plan. Leads
-have read and observation tools, without repository writes or a validation tool.
+comment with missing execution/role provenance, and a `correlation_id` reused
+for a different entry is refused instead of answered with the first entry.
+File evidence is read from that execution's workspace (the Task's when the
+execution recorded none). Planner and implementation roles can stage a plan;
+reviewers can record observations and cannot author a plan. The evaluator knows
+a `lead` role (observations, no plan); no native Task session is composed for
+it.
 
 `task_proposals` owns the Project Agent's eight-verb `task.action`,
 `task.dependency`, `task.adaptive` and `task.propose` contracts. It reuses the
@@ -10177,7 +10184,7 @@ as `action_schema` beside each Task's current offers and version. It projects
 those offers, including boolean choices and presets, rather than reconstructing
 workflow or queue state. Task-run reads mark offers
 `available_actions_informational: true` and return a null `action_schema`:
-workers, reviewers, planners and leads acquire no workflow mutation capability.
+workers, reviewers and planners acquire no workflow mutation capability.
 
 Native Task schemas and flat aliases are derived from only the admitted specs.
 Aliases preserve nested fields for providers that strip undeclared properties;

@@ -2192,9 +2192,11 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
         "{direct:?}"
     );
 
+    // `inbox.read` moved onto the registry with the other scope-bound
+    // coordination reads; a Main Chat reads it through the same tool.
     assert!(operation_registry::READ_CATALOG
         .lookup("inbox.read")
-        .is_none());
+        .is_some());
     let composition = ScopeToolComposition::for_scope_with_permissions(
         AGENT_ID,
         fixture.main_scope,

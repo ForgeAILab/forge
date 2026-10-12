@@ -78,14 +78,6 @@ fn serialized_tool_definitions() {
             false,
         ),
         (
-            "lead",
-            CanonicalScopeType::Task,
-            WorkspaceAccess::TaskRead,
-            Some("lead"),
-            false,
-            false,
-        ),
-        (
             "planner",
             CanonicalScopeType::Task,
             WorkspaceAccess::TaskRead,
@@ -176,18 +168,25 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // name in the read tool's operation list and its generated contract
     // line. It is how a Project Agent sees where a Task is in the merge
     // queue and why it waits.
-    ("project", 17_080),
-    ("project_verify_solo", 18_329),
+    // 23,947 and 25,196 before the Task operations were registered. 17,080
+    // and 18,329 with their generated contracts, plus 222 for the values
+    // `task.propose` accepts that the hand prose named and a signature
+    // cannot: the three Task types, the capability profiles, what
+    // `plan_item_id` refers to and which way `priority` sorts. Without them
+    // the first proposal with a guessed value costs a turn.
+    ("project", 17_302),
+    ("project_verify_solo", 18_551),
     // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
     // and the same two descriptions (-226). The hand Charter adoption
     // schema dominates (12,418 bytes).
     ("project_setup", 15_782),
-    ("worker", 4_620),
-    ("reviewer", 3_920),
-    ("planner", 3_995),
-    // A lead execution now has the bounded read/record surface; no plan,
-    // command or validation tool. Its ceiling starts below the reviewer.
-    ("lead", 3_737),
+    // 6,062 / 4,829 / 5,437 before the Task operations were registered.
+    // Each includes 40 bytes for the evidence kinds a run can name
+    // (screenshot, walkthrough_video, log, report, other): the hand prose
+    // listed them, and a guessed kind is stored as `other`.
+    ("worker", 4_655),
+    ("reviewer", 3_955),
+    ("planner", 4_030),
 ];
 
 /// Schema keywords that provider function-declaration dialects do not

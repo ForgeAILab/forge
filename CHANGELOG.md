@@ -8,6 +8,37 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Native Task tools refuse fields they do not declare.** The Task reads
+  (`task.summary`, `work.read`, `events.read`, `inbox.read`,
+  `commitments.read`, `delivery.read`, `memory.read`, `decisions.read`), the
+  Task records (`task.plan`, `task.worklog`, `task.evidence`) and the Project
+  Agent's `task.action`, `task.propose`, `task.dependency` and `task.adaptive`
+  now have closed contracts on the native tools. An argument or payload field
+  that is not in the operation's contract is refused with the contract in the
+  message; it used to be ignored on the reads, the records and `task.action`
+  (for example a `task_id` argument to `task.summary`, or a field beside
+  `task_id`/`action`/`version` in a `task.action` payload). A read `limit`
+  that is negative, fractional or not a number is refused instead of replaced
+  by the default; `"10"` and `10.0` are still read as 10, and `null` still
+  means the default. REST and MCP are unchanged.
+- **A Task record needs exactly one running execution.** `task.worklog` and
+  `task.evidence` are written under the one running execution of the calling
+  session's identity and role on that Task, as `task.plan` already was. With
+  none, or with more than one, the call is refused and nothing is written. A
+  worklog entry used to take the latest running execution, or was stored with
+  no execution and role at all.
+- **A `correlation_id` reused for a different worklog entry is refused.**
+  `task.worklog` returned the first entry written under that
+  `correlation_id` and reported success, so the second entry was dropped
+  without a trace. The same entry retried under the same id still returns the
+  first one; a different entry now needs a new `correlation_id`.
+- **A native `hold` or `cancel` that is not a current offer is refused.** A
+  Project Agent's `task.action` with `hold` or `cancel` on a Task that does
+  not offer it (a Task that is already done, for example) returns
+  `action_unavailable` with the current offers, and a stale `version` returns
+  the version conflict. It used to report success and leave a "had no effect"
+  comment. A command accepted while the Task was in the merge queue still
+  settles as before when the merge lands first.
 - **Deleting a repository, a repo location or a Project, and changing a
   repository's default location, is refused while a merge into it is
   unresolved (`409 integration_unresolved`).** "Unresolved" is a merge whose
@@ -1297,6 +1328,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Native Task operations come from the operation registry.** The Task
+  reads, `task.plan` / `task.worklog` / `task.evidence`, and the Project
+  Agent's `task.action` (all eight verbs), `task.propose`, `task.dependency`
+  and `task.adaptive` are typed registry operations with one contract, one
+  decode and one authority decision each. Names, parameter names, effects,
+  receipts and the workflow offers are unchanged. A Project Agent's
+  `work.read` now also returns `action_schema` beside each Task's
+  `available_actions`: the exact `task.action` argument the current offers
+  accept. A Task run's `work.read` marks its offers
+  `available_actions_informational` (a Task run has no workflow action).
+  `task.evidence` results name the execution and role they were stored under.
+- **Smaller tool prefix on every Task and Project Agent turn.** Estimated
+  from the serialized definitions (bytes / 4): coder 1,516 → 1,164 tokens,
+  reviewer 1,208 → 989, planner 1,360 → 1,008, ready Project Agent
+  5,987 → 4,326. Main Chat (+85), inquiry (+53) and Project setup (+66) grow
+  slightly: their shared reads now state their arguments.
 - **Every MCP tool is generated from the operation registry (3.8 slice H).**
   `tools/list`, the input schemas, the grant and role admission, the
   reference checks and the typed decode of all 43 tools come from one catalog;
@@ -2832,6 +2879,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **`task.propose` no longer advertises `action: "create"`.** The native
+  schema declared the field as required and the command refused it. The
+  contract now lists what the command accepts, including parentage,
+  configuration, role assignments, governance and traceability fields.
+- **Task record limits are stated in the unit that is enforced**: plan content
+  in UTF-8 bytes (1,048,576), worklog summary in characters (4,000).
+  `task.evidence` states that a `kind` outside the five it names is stored as
+  `other` with its label kept, which is what it always did.
+- **`task.evidence` reads a file from the run's own workspace.** A child Task
+  that runs in its root's workspace could not capture a file by `path`.
 - **MCP Task and Project schemas describe what the tools accept (3.8 slice
   H).** Optional strings, integers and booleans advertise `null`;
   `forge_list_tasks.status` advertises its comma-separated string, array and

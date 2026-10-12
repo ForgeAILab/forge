@@ -46,7 +46,9 @@ pub struct Plan {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Worklog {
-    pub action: WorklogAction,
+    // The operation has one action; callers have always been free to omit it.
+    #[serde(default)]
+    pub action: Option<WorklogAction>,
     pub kind: WorklogKind,
     #[schemars(length(min = 1, max = 4000))]
     pub summary: String,
@@ -54,7 +56,8 @@ pub struct Worklog {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
-    pub action: EvidenceAction,
+    #[serde(default)]
+    pub action: Option<EvidenceAction>,
     // Custom non-empty kinds retain their label and are stored as `other`.
     #[schemars(length(min = 1))]
     pub kind: String,
@@ -90,12 +93,12 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             |c, i| Box::pin(c.task_plan(i))),
         OperationSpec::typed("task.worklog", AUTHORITY, EffectClass::DirectCommand, AvailabilityRule::Always, SURFACES,
             "Append one concise observation with this execution's identity and role.",
-            "Summary <=4000 characters. A worklog never moves a Task or satisfies an acceptance check.",
+            "Summary <=4000 characters. It never moves a Task or satisfies an acceptance check.",
             &[StructuralConstraint::ClosedObject, StructuralConstraint::MaxSerializedBytes(65536)],
             |c, i| Box::pin(c.task_worklog(i))),
         OperationSpec::typed("task.evidence", AUTHORITY, EffectClass::DirectCommand, AvailabilityRule::Always, SURFACES,
             "Capture bytes this execution observed; return the stored asset and checksum.",
-            "Exactly one of path (inside this execution's workspace) or content (verbatim output). Custom kinds are stored as other with their label retained.",
+            "Exactly one of path (inside this execution's workspace) or content (verbatim output). kind: screenshot, walkthrough_video, log, report or other (another label is kept, stored as other).",
             &[StructuralConstraint::ClosedObject, StructuralConstraint::MaxSerializedBytes(65536), StructuralConstraint::ExactlyOne(&["path", "content"])],
             |c, i| Box::pin(c.task_evidence(i))),
     ]

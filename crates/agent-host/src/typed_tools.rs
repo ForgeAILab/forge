@@ -322,22 +322,19 @@ pub enum TaskToolRole {
     /// May read the worktree only; plans are authored through Task
     /// metadata/native domain tools, never through worktree writes.
     Planner,
-    /// Task coordination observations, without plan authoring or validation.
-    Lead,
 }
 
 impl TaskToolRole {
     fn parse(scope: &CanonicalScope, role: Option<&str>) -> Result<Self, AgentHostError> {
         match (scope.workspace_access, role) {
-            (WorkspaceAccess::TaskWrite, Some("worker" | "coder" | "executor")) => Ok(Self::Worker),
+            (WorkspaceAccess::TaskWrite, Some("worker" | "coder")) => Ok(Self::Worker),
             (WorkspaceAccess::TaskRead, Some("reviewer")) => Ok(Self::Reviewer),
             (WorkspaceAccess::TaskRead, Some("planner")) => Ok(Self::Planner),
-            (WorkspaceAccess::TaskRead, Some("lead")) => Ok(Self::Lead),
             // A write-capable role bound to a server-issued read-only Task
             // workspace (planning/discovery records dispatch their workflow's
             // coder role but never receive write authority) composes the
             // read-only planner toolset instead of being rejected.
-            (WorkspaceAccess::TaskRead, Some("worker" | "coder" | "executor")) => Ok(Self::Planner),
+            (WorkspaceAccess::TaskRead, Some("worker" | "coder")) => Ok(Self::Planner),
             (WorkspaceAccess::TaskWrite, Some(other))
             | (WorkspaceAccess::TaskRead, Some(other)) => Err(AgentHostError::Authority(format!(
                 "Task workspace access is not valid for role `{other}`"
@@ -622,7 +619,7 @@ impl ScopeToolComposition {
                     }
                     // The planner surface is the read tool above only: no
                     // writes, no command spawn, no validation process.
-                    TaskToolRole::Planner | TaskToolRole::Lead => {}
+                    TaskToolRole::Planner => {}
                 }
                 // Reading public documentation is part of writing code against
                 // a dependency. It is the same authority the chat agents get,

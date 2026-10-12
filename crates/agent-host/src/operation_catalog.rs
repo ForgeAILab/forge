@@ -987,55 +987,6 @@ pub fn contains_authority_override(value: &Value) -> bool {
     }
 }
 
-/// Return whether an adaptive task payload attempts to provide a value that
-/// Forge must derive from the authenticated Project/Project-chat binding or
-/// the active execution governance.  These fields are operation-specific:
-/// they are intentionally not part of the generic authority list because
-/// some older proposal payloads still carry their own domain fields.
-#[must_use]
-pub fn contains_adaptive_authority_override(value: &Value) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor",
-        "actor_id",
-        "actor_identity_id",
-        "authority",
-        "charter_revision_id",
-        "credential",
-        "elevated_operations",
-        "executor",
-        "fixed_acceptance",
-        "fixed_boundary",
-        "fixed_boundary_digest",
-        "fixed_outcomes",
-        "fixed_risk_classes",
-        "forbidden_side_effects",
-        "governance",
-        "identity_id",
-        "permission",
-        "plan_item_id",
-        "project_id",
-        "provenance",
-        "repository_path",
-        "repository_url",
-        "risk_class",
-        "scope_id",
-        "scope_type",
-        "target_id",
-        "target_type",
-        "workspace",
-        "workspace_lease",
-        "workspace_path",
-    ];
-
-    match value {
-        Value::Object(object) => object.iter().any(|(key, nested)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_adaptive_authority_override(nested)
-        }),
-        Value::Array(values) => values.iter().any(contains_adaptive_authority_override),
-        _ => false,
-    }
-}
-
 // `OperationDescriptor` intentionally carries a static operation label so a
 // descriptor can be copied into an immutable tool registry.  Unknown names
 // are denied before this helper is normally observed; leaking a caller-owned
@@ -1348,20 +1299,5 @@ mod tests {
                 None
             );
         }
-    }
-
-    #[test]
-    fn adaptive_task_rejects_scope_and_governance_overrides() {
-        let payload = serde_json::json!({
-            "action": "split",
-            "source_task_id": "task-1",
-            "expected_task_version": 1,
-            "expected_board_revision": 1,
-            "rationale": "decompose",
-            "items": [{"title": "child"}],
-            "project_id": "other-project",
-            "governance": {"fixed_boundary_digest": "forged"}
-        });
-        assert!(contains_adaptive_authority_override(&payload));
     }
 }

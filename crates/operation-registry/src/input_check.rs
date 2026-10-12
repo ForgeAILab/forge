@@ -126,7 +126,10 @@ fn normalize_schema(schema: &Value, value: &Value, field: &str) -> Result<Value,
         return Err(format!("{label} must have type {}", schema["type"]));
     }
     if let Some(values) = schema["enum"].as_array() {
-        if !values.contains(&value) {
+        // An optional enumerated field declares `null` in its type, not in
+        // its value list; null there is the omitted field.
+        let omitted = value.is_null() && admits(schema, "null");
+        if !omitted && !values.contains(&value) {
             return Err(format!(
                 "{label} must be one of: {}",
                 values
