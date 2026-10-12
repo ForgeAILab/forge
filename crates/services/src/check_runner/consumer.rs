@@ -243,6 +243,9 @@ impl TaskCheckConsumers {
         }
         Ok(requested)
     }
+    /// Record `request` as a consumer of an existing certified, reusable
+    /// pass of its identity, or do nothing (`None`): never schedules or
+    /// joins a run.
     pub(crate) async fn try_reuse(
         &self,
         request: TaskCheckRequest,
@@ -252,13 +255,11 @@ impl TaskCheckConsumers {
                 "a check is requested from inside its Task's step",
             ));
         }
+        // The answer exists and the asking step applies it itself: no wait
+        // is stated for it (nothing would be waiting, and only a delivery
+        // could clear it).
         let request = self.prepare_request(request).await?;
-        let requested = self.runner.try_reuse(request).await?;
-        if let Some(requested) = &requested {
-            self.state_wait(&requested.consumer, CheckWaitPhase::Result)
-                .await?;
-        }
-        Ok(requested)
+        self.runner.try_reuse(request).await
     }
     async fn request_run(&self, request: TaskCheckRequest) -> Result<RequestedCheck> {
         self.runner

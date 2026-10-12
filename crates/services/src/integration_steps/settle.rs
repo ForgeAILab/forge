@@ -871,7 +871,19 @@ impl IntegrationSteps {
         let Some(attempt) = self.db.integration_attempt(&request.attempt_id).await? else {
             return Ok(None);
         };
-        if attempt.state != S::AwaitingTaskStep {
+        // Only the step that will write this `effect_seq`'s answer records a
+        // reuse: a stale or already answered step writes no consumer.
+        if !matches!(
+            db::integration_step_position(
+                &attempt,
+                request.generation,
+                request.effect_seq,
+                true,
+                IntegrationStepAction::Settle.as_str(),
+                &[S::AwaitingTaskStep],
+            ),
+            IntegrationStepPosition::Due
+        ) {
             return Ok(None);
         }
         let Some(task) = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await? else {
@@ -884,9 +896,55 @@ impl IntegrationSteps {
             return Ok(None);
         };
         let key = check.identity.key()?;
-        let prior: Option<(String,String,String)> = sqlx::query_as(
-            "SELECT c.id,c.run_id,c.result_id FROM check_consumer c JOIN check_result r ON r.id=c.result_id JOIN review v ON c.request_key='task-step/1|entry|'||v.task_id||'|'||c.status_epoch||'|'||v.id WHERE c.task_id=? AND c.origin='entry' AND c.identity_key=? AND r.outcome='pass' AND v.status='passed' ORDER BY v.attempt_number DESC,c.created_at DESC LIMIT 1")
-            .bind(&task.id).bind(&key).fetch_optional(self.db.pool()).await?;
+        let check_commit = check.identity.commit_sha.clone();
+        // The newest passed Review of this Task whose own entry check passed
+        // under exactly this identity (commit, target, commands, policy,
+        // environment, workspace). The consumer's key is rebuilt with the
+        // function review entry asks with, so the two cannot drift apart.
+        let reviews: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM review WHERE task_id=? AND status='passed' ORDER BY attempt_number DESC,id DESC LIMIT 16",
+        )
+        .bind(&task.id)
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut prior = None;
+        for review in reviews {
+            let row: Option<(String, i64)> = sqlx::query_as(
+                "SELECT c.id,c.status_epoch FROM check_consumer c JOIN check_result r ON r.id=c.result_id JOIN check_run run ON run.id=c.run_id WHERE c.task_id=?1 AND c.origin='entry' AND c.identity_key=?2 AND c.cancelled_at IS NULL AND r.outcome='pass' AND r.identity_key=?2 AND run.identity_key=?2 AND run.state='succeeded' AND substr(c.request_key,length(c.request_key)-length(?3))='|'||?3 ORDER BY c.created_at DESC,c.id DESC LIMIT 1",
+            )
+            .bind(&task.id)
+            .bind(&key)
+            .bind(&review)
+            .fetch_optional(self.db.pool())
+            .await?;
+            let Some((consumer_id, epoch)) = row else {
+                continue;
+            };
+            let expected = TaskCheckRequest {
+                task_id: task.id.clone(),
+                status_epoch: epoch,
+                authority: review,
+                origin: CheckConsumerOrigin::Entry,
+                purpose: CheckPurpose::EntryCi,
+                identity: check.identity.clone(),
+                workspace_id: None,
+                machine_id: None,
+                wall_timeout_seconds: check.wall_timeout_seconds,
+            }
+            .request_key();
+            let Some(delivery) = self.db.check_consumer_delivery(&consumer_id).await? else {
+                continue;
+            };
+            if delivery.consumer.request_key != expected {
+                continue;
+            }
+            if let (Some(run_id), Some(result_id)) =
+                (delivery.consumer.run_id, delivery.consumer.result_id)
+            {
+                prior = Some((consumer_id, run_id, result_id));
+                break;
+            }
+        }
         let Some((consumer_id, run_id, result_id)) = prior else {
             return Ok(None);
         };
@@ -936,7 +994,12 @@ impl IntegrationSteps {
                     .ok_or(db::DbError::NotFound)?,
             ),
         };
-        if result.identity_key != key || run.identity_key != key {
+        if result.identity_key != key
+            || run.identity_key != key
+            || result.run_id != run.id
+            || result.outcome != CheckResultOutcome::Pass
+            || run.identity.commit_sha != check_commit
+        {
             return Err(ServiceError::invalid_operation(
                 "the Review's check identity changed",
             ));
@@ -969,78 +1032,68 @@ impl IntegrationSteps {
         let row: Option<(String,String)> = sqlx::query_as("SELECT id,step_results_json FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1")
             .bind(&attempt.task_ref).fetch_optional(&mut **tx).await?;
         let (id, mut details) = match row {
-            Some((id, raw)) => (
-                id,
-                serde_json::from_str::<serde_json::Value>(&raw)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            ),
-            None => {
-                let execution: Option<String> = sqlx::query_scalar("SELECT id FROM execution WHERE task_id=? AND role IN ('executor','coder','worker') ORDER BY created_at DESC,id DESC LIMIT 1")
-                    .bind(&attempt.task_ref).fetch_optional(&mut **tx).await?;
-                let execution = attempt.execution_id.clone().or(execution).ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "the head check has no implementation execution for Review evidence",
-                    )
-                })?;
-                let id = db::new_uuid_v4();
-                let now = db::now_rfc3339();
-                sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,finished_at,created_at,updated_at) VALUES(?,?,?,1,?,'{}',?,?,?,?)")
-                    .bind(&id).bind(&attempt.task_ref).bind(execution)
-                    .bind(if result.outcome == CheckResultOutcome::Pass { "passed" } else { "failed" })
-                    .bind(&now).bind(&now).bind(&now).bind(&now).execute(&mut **tx).await?;
-                (id, serde_json::json!({"ci_steps": []}))
-            }
+            Some((id, raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(details) => (id, details),
+                Err(_) => return Ok(()),
+            },
+            // A Task that reached `merging` with no Review (the owner moved
+            // it, or its workflow has no review) has no Review to carry the
+            // evidence. A check result is not a Review: none is created from
+            // it (a `passed` row would read as review authority, a `failed`
+            // one as a spent review attempt). The verdict stays on the
+            // attempt's answer and on the consumer, run and result rows.
+            None => return Ok(()),
         };
+        // Evidence is an annotation: a Review whose details it cannot be
+        // added to (a pre-object array, say) must not fail the settle.
         if !details.is_object() {
-            return Err(ServiceError::invalid_operation(
-                "Review evidence is not an object",
-            ));
+            return Ok(());
         }
-        let execution = details
+        let Some(records) = details
             .as_object_mut()
-            .unwrap()
-            .entry("execution")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("Review execution evidence is not an object")
-            })?;
-        let records = execution
-            .entry("integration_checks")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("head-check evidence is not an array")
-            })?;
+            .and_then(|details| {
+                details
+                    .entry("execution")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .and_then(|execution| {
+                execution
+                    .entry("integration_checks")
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+            })
+        else {
+            return Ok(());
+        };
         if records
             .iter()
             .any(|record| record["attempt_id"] == attempt.id && record["result_id"] == result.id)
         {
             return Ok(());
         }
-        let consumer: Option<(String, String)> =
-            sqlx::query_as("SELECT origin,created_at FROM check_consumer WHERE id=?")
+        // How the head came by this result, from the rows themselves:
+        // `review_authority` is the passed Review's own entry consumer (the
+        // result is not a certified reusable one); `executed` is a run that
+        // was scheduled for this consumer (it is the run's first consumer);
+        // anything else is a consumer recorded on a run that already existed.
+        let origin: Option<String> =
+            sqlx::query_scalar("SELECT origin FROM check_consumer WHERE id=?")
                 .bind(&application.consumer_id)
                 .fetch_optional(&mut **tx)
                 .await?;
-        let reuse = consumer.as_ref().is_some_and(|(_, created)| {
-            let created = chrono::DateTime::parse_from_rfc3339(created).ok();
-            let finished = application
-                .run
-                .finished_at
-                .as_deref()
-                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
-            matches!((created, finished), (Some(created), Some(finished)) if created >= finished)
-        });
-        let source = if consumer
-            .as_ref()
-            .is_some_and(|(origin, _)| origin == "entry")
-        {
+        let first: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM check_consumer WHERE run_id=? ORDER BY created_at,rowid LIMIT 1",
+        )
+        .bind(&application.run.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let source = if origin.as_deref() == Some("entry") {
             "review_authority"
-        } else if reuse {
-            "cache_hit"
-        } else {
+        } else if first.as_deref() == Some(application.consumer_id.as_str()) {
             "executed"
+        } else {
+            "cache_hit"
         };
         let ci_steps: Vec<serde_json::Value> = result
             .commands

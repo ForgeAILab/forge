@@ -5865,7 +5865,7 @@ that failed. In the working state `ensure_parent_accepts_subtasks` admits a
 corrective subtask, which waits on `parent` / `held` until the root's
 `release`. The owner's manual pass of a failed review is review authority
 for integration, for a root and for any other Task:
-`ReviewConformanceRepo::lock_review_integration` returns no contract (as for
+`review_integration_authority_in_tx` returns no contract (as for
 a Task with no reviewer) when the latest passed review carries the
 `manual_override` a user wrote, instead of demanding a passed reviewer
 conformance the override by definition does not have. Pause refusals preserve the typed wait cause and
@@ -7420,9 +7420,10 @@ are independent of the conformance policy version.
 Acceptance and reviewer completion recheck the source digest using the version
 frozen in the contract; completion also validates current governing material.
 Acceptance rechecks source provenance inside the SQLite write transaction.
-Direct integration holds the authority write lock during the local git operation,
-compares source and target commits, fast-forwards only the immutable reviewed
-object, and checks the resulting head. Stale review authority and a clean target
+The queue's settle step checks authority in a short write transaction. Its
+owner then compares the frozen source/target commits and fast-forwards the exact
+object outside that transaction; the result step proves target ancestry before
+done. Stale review authority and a clean target
 rebase enter a typed review-refresh route; they do not consume merge-fix budget
 or dispatch a coder. Actual conflicts enter bounded merge repair. Changed content
 must receive a new semantic review, regardless of `review_passed_at`, except for
@@ -7463,8 +7464,8 @@ naming the contract execution, the rebased or repaired `commit_sha`, the target
 tip as `base_sha`, the kind (`clean_rebase` or `conflict_repair`) and the changed
 paths. The hook then posts a system comment and cascades to `merging`; the
 engine stops running `on_enter` hooks after a cascade, so no reviewer is
-dispatched. `lock_review_integration` keeps every existing check and exposes the
-effective candidate: the newest carry row whose `contract_execution_id` is the
+dispatched. `review_integration_authority_in_tx` keeps every existing check and exposes
+the effective candidate to settle: the newest carry row whose `contract_execution_id` is the
 current passed contract's, else the contract's own `commit_sha`/`base_sha`.
 Integration compares `HEAD` and the target tip with that candidate, so a newer
 real review (a different contract execution) supersedes

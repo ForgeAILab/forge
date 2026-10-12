@@ -3715,6 +3715,14 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             .fetch_one(world.db.pool()).await.unwrap();
         let details: Value = serde_json::from_str(&row).unwrap();
         let evidence = &details["execution"]["integration_checks"][0];
+        // What the step wrote is what the reviews endpoint parses.
+        let typed: api_types::ReviewDetails = serde_json::from_str(&row).unwrap();
+        assert_eq!(typed.execution.unwrap().integration_checks.len(), 1);
+        // No wait was stated for the synchronous reuse and none is left.
+        let reviews: i64 = world
+            .scalar("SELECT COUNT(*) FROM review WHERE task_id=?", "evidence")
+            .await;
+        assert_eq!(reviews, 1, "a head check never creates a Review");
         assert_eq!(evidence["attempt_id"], admitted.id);
         assert!(!evidence["ci_steps"].as_array().unwrap().is_empty());
         let merged = world.attempt(&admitted.id).await;

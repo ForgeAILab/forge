@@ -2494,15 +2494,58 @@ enum PauseKind {
 
 impl World {
     /// The states of the check runs the Task asked for, oldest first.
+    /// The states of the check RUNS a Task's consumers were answered by, one
+    /// entry per run. Two consumers of one run (the review entry and the
+    /// queue head that reuses its passed result) are one run.
     async fn check_runs(&self, index: usize) -> Result<Vec<String>, String> {
         sqlx::query_scalar(
-            "SELECT r.state FROM check_run r JOIN check_consumer c ON c.run_id = r.id
-             WHERE c.task_id = ? ORDER BY r.created_at, r.rowid",
+            "SELECT r.state FROM check_run r
+             WHERE r.id IN (SELECT c.run_id FROM check_consumer c WHERE c.task_id = ?)
+             ORDER BY r.created_at, r.rowid",
         )
         .bind(&self.tasks[index])
         .fetch_all(&self.live().pool)
         .await
         .map_err(|error| error.to_string())
+    }
+
+    /// The queue head of an unchanged commit and target is a recorded
+    /// consumer of the review entry's passed run: it never has a run of its
+    /// own, never a delivery that is applied a second time, and there is at
+    /// most one of it per merging entry.
+    async fn head_consumers_reuse_the_entry_run(&self, index: usize) -> Result<i64, String> {
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT origin, run_id, result_id, applied_at FROM check_consumer
+             WHERE task_id = ? ORDER BY created_at, rowid",
+        )
+        .bind(&self.tasks[index])
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let passed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT c.run_id, c.result_id FROM check_consumer c
+             JOIN check_result r ON r.id = c.result_id
+             WHERE c.task_id = ? AND c.origin = 'entry' AND r.outcome = 'pass'",
+        )
+        .bind(&self.tasks[index])
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut heads = 0;
+        for (origin, run, result, applied) in &rows {
+            if origin == "entry" {
+                continue;
+            }
+            heads += 1;
+            let reused = matches!((run, result), (Some(run), Some(result))
+                if passed.iter().any(|(r, s)| r == run && s == result));
+            if origin != "integration" || !reused || applied.is_some() {
+                return Err(format!(
+                    "a consumer beside the review entry is not a reuse of its passed run: {rows:?}"
+                ));
+            }
+        }
+        Ok(heads)
     }
 
     async fn pause_agents(&mut self, pause: bool) -> Result<(), String> {
@@ -2620,7 +2663,7 @@ async fn pause_with_two_slots_then_one(
                     return Err(format!("the check did not run to its end: {settled:?}"));
                 }
                 let applied: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+                    "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin='entry' AND applied_at IS NOT NULL",
                 )
                 .bind(&world.tasks[0])
                 .fetch_one(&world.live().pool)
@@ -2665,8 +2708,11 @@ async fn pause_with_two_slots_then_one(
             }
         }
         let runs = world.check_runs(0).await?;
-        if runs != ["succeeded"] {
-            return Err(format!("check runs after resume: {runs:?}, expected one"));
+        let heads = world.head_consumers_reuse_the_entry_run(0).await?;
+        if runs != ["succeeded"] || heads > 1 {
+            return Err(format!(
+                "check runs after resume: {runs:?} with {heads} head reuse(s), expected one run"
+            ));
         }
         Ok(())
     }
@@ -2894,7 +2940,7 @@ async fn a_hold_command_during_the_entry_check_is_resumed_by_its_release() {
         }
         let applied = count(
             &world,
-            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin='entry' AND applied_at IS NOT NULL",
         )
         .await?;
         if applied != 1 {
@@ -2941,7 +2987,11 @@ async fn a_held_task_in_review_refuses_a_system_re_entry_and_goes_on_by_itself_a
                 };
                 Ok::<_, String>((
                     count("SELECT COUNT(*) FROM review WHERE task_id = ?").await?,
-                    count("SELECT COUNT(*) FROM check_consumer WHERE task_id = ?").await?,
+                    // Review-entry requests. The queue head's recorded reuse
+                    // of the entry's passed run (origin `integration`, written
+                    // when the released Task merges) is not an entry that ran
+                    // again; that it has no run of its own is asserted below.
+                    count("SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin = 'entry'").await?,
                     count("SELECT COUNT(*) FROM task_step WHERE task_id = ? AND kind = 'hooks'")
                         .await?,
                     count("SELECT status_epoch FROM task WHERE id = ?").await?,
@@ -3021,6 +3071,13 @@ async fn a_held_task_in_review_refuses_a_system_re_entry_and_goes_on_by_itself_a
         if (released.0, released.1) != (held.0, held.1) {
             return Err(format!(
                 "the release ran the entry again: {held:?} -> {released:?}"
+            ));
+        }
+        let runs = world.check_runs(0).await?;
+        let heads = world.head_consumers_reuse_the_entry_run(0).await?;
+        if runs != ["succeeded"] || heads > 1 {
+            return Err(format!(
+                "the release ran a check again: runs {runs:?}, head reuses {heads}"
             ));
         }
         world.drive_to_settlement().await
@@ -3156,7 +3213,7 @@ async fn restart_with_two_slots_then_one(point: RestartPoint) {
                             .await
                             .map_err(sql)?;
                     let applied: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+                        "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin='entry' AND applied_at IS NOT NULL",
                     )
                     .bind(&task_id)
                     .fetch_one(&pool)
@@ -3229,15 +3286,22 @@ async fn restart_with_two_slots_then_one(point: RestartPoint) {
         }
         // One request, one run, one review attempt that passed: the restart
         // repeated nothing.
+        // The Task merged on an unchanged commit and target, so its queue
+        // head is a second CONSUMER of that one run (a recorded reuse), never
+        // a second run and never a second review-entry request.
         let runs = world.check_runs(0).await?;
-        let consumers: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM check_consumer WHERE task_id = ?")
-                .bind(&task_id)
-                .fetch_one(&world.live().pool)
-                .await
-                .map_err(sql)?;
-        if runs != ["succeeded"] || consumers != 1 {
-            return Err(format!("check runs {runs:?}, consumers {consumers}; expected one of each"));
+        let consumers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND origin = 'entry'",
+        )
+        .bind(&task_id)
+        .fetch_one(&world.live().pool)
+        .await
+        .map_err(sql)?;
+        let heads = world.head_consumers_reuse_the_entry_run(0).await?;
+        if runs != ["succeeded"] || consumers != 1 || heads > 1 {
+            return Err(format!(
+                "check runs {runs:?}, entry requests {consumers}, head reuses {heads}; expected one run, one request, at most one reuse"
+            ));
         }
         let reviews: Vec<String> =
             sqlx::query_scalar("SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number")
