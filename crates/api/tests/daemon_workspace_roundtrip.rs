@@ -7073,6 +7073,13 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
                 "task_step",
                 "task_schedule_dirty",
                 "daemon",
+                // Written by the harness's event consumers only, and only
+                // to move over events that exist. A consumer that first runs
+                // after the wait below (seen under load: `notifications`
+                // going from 0 to the newest setup event) is not a port
+                // write. That the ports emit no event is asserted on
+                // `domain_event` itself, by digest and by newest sequence.
+                "event_consumer_cursor",
             ]
             .iter()
             .any(|own| table == own || table.starts_with(&format!("{own}::")))
@@ -7106,6 +7113,29 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
         }
     }
     assert!(still >= 10, "the fixture's background writers settle");
+    let cursors = |database: std::sync::Arc<db::SqliteDb>| async move {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT consumer_name,last_sequence,version FROM event_consumer_cursor ORDER BY consumer_name",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        let events: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT sequence,event_type FROM domain_event ORDER BY sequence DESC LIMIT 6",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap_or_default();
+        format!("{rows:?} newest events {events:?}")
+    };
+    let cursors_before = cursors(database.clone()).await;
+    let newest_event = |database: std::sync::Arc<db::SqliteDb>| async move {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(sequence) FROM domain_event")
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
+    };
+    let events_before = newest_event(database.clone()).await;
 
     let facts = facts_port.head_facts(&attempt, &queue).await.unwrap();
     assert_eq!(facts.candidate_head, candidate);
@@ -7208,8 +7238,19 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
     assert!(integration_refs(&fixture.checkout).is_empty());
 
     let after = foreign(&database).await;
+    let cursors_after = cursors(database.clone()).await;
+    assert_eq!(
+        newest_event(database.clone()).await,
+        events_before,
+        "a port emitted a domain event"
+    );
+    assert!(before.contains_key("domain_event"), "events are digested");
     for (table, digest) in &before {
-        assert_eq!(after.get(table), Some(digest), "table `{table}` changed");
+        assert_eq!(
+            after.get(table),
+            Some(digest),
+            "table `{table}` changed\ncursors before {cursors_before}\ncursors after  {cursors_after}"
+        );
     }
     assert_eq!(after.len(), before.len());
     assert!(before.len() > 50, "the digest covers the schema");
