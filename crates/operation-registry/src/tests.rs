@@ -25,6 +25,22 @@ fn catalog_is_complete_unique_and_deterministic() {
             + task_reads::IDS.len()
     );
     assert!(READ_CATALOG.lookup("project.current_state").is_some());
+    // Building the proposal catalog checks its specs against the declared ids,
+    // so an id without a spec (or a spec without an id) fails here and not
+    // only where another crate first touches the catalog.
+    let proposals = PROPOSAL_CATALOG.iter().map(|s| s.id).collect::<Vec<_>>();
+    assert_eq!(
+        proposals.len() + ids.len(),
+        registered_operations().len(),
+        "every registered operation has exactly one spec"
+    );
+    for id in registered_operations() {
+        assert_eq!(
+            usize::from(ids.contains(&id)) + usize::from(proposals.contains(&id)),
+            1,
+            "{id} is a read or a proposal, never both and never neither"
+        );
+    }
     assert!(OperationCatalog::<()>::new(scope_reads::specs(), &registered_reads()).is_err());
     assert!(OperationCatalog::<()>::new(
         scope_reads::specs().into_iter().chain(scope_reads::specs()),
