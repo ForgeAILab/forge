@@ -8233,7 +8233,7 @@ This prevents a silent second execution of a certified key.
 
 | Run state | Automatic exit | Bound/policy |
 | --- | --- | --- |
-| `queued` | Admit to `running`; all consumers stale: `cancelled`; owner removed or slot wait expired: infrastructure failure | Slot wait 1,800 seconds per attempt (with two automatic retries a consumer waits at most about 90 minutes before its Task is answered "no verdict"). Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
+| `queued` | Admit to `running`; last consumer withdrawn: `cancelled` in the withdrawal's own transaction (`cancel_abandoned_check_consumer`, `cancel_project_check_consumers`: no slot has to free, no result row is written); all consumers stale by Task epoch: `cancelled` at admission; owner removed or slot wait expired: infrastructure failure | Slot wait 1,800 seconds per attempt (with two automatic retries a consumer waits at most about 90 minutes before its Task is answered "no verdict"). Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
 | `running` | Receipt to `cleaning`; lost reply or lost lease to `uncertain`; no consumers left: `cancelling`. A run taken over before its intent was stored launched nothing and settles as an infrastructure failure | Recorded wall limit (1–86,400 seconds) plus 65 seconds of settlement grace. Lease 60 seconds, renewed every 15; takeover within 60 seconds plus sweep delay. |
 | `cancelling` | Cancel reply with a receipt to `cleaning`; any other reply, or a lost lease, to `uncertain` | One cancel exchange, at most 61 seconds. |
 | `cleaning` | Immutable result to a terminal state; a lost lease to `uncertain`, which resumes from the retained receipt | One fenced transaction; takeover within 60 seconds plus sweep delay. |
@@ -8839,6 +8839,10 @@ finds its Task has left the entry:
 The check worker looks every second whether a running dispatch still has a
 live consumer (`CONSUMER_LIVENESS_INTERVAL`; the lease is renewed every 15 s)
 and cancels a run nobody waits for, so its machine slot is freed promptly.
+A `queued` run needs no worker for this: the write that withdraws its last
+consumer sets it `cancelled` in the same transaction, so a run waiting behind
+a full machine leaves `checks.by_state.queued` and `waiting_for_slot` at the
+withdrawal, not when a slot frees.
 An unreachable daemon keeps the run `uncertain` (slot and single-flight
 identity retained) until it confirms the stop, is removed, or passes the
 disconnected-owner bound. A Project is not deleted from under a live check

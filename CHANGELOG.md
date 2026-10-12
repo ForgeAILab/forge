@@ -3117,6 +3117,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A queued check run whose last consumer is withdrawn (a Hold or Cancel
+  during the entry check, a superseded step, a Project delete) is cancelled
+  in the withdrawal itself. It used to stay `queued` until a machine slot
+  freed, and `checks.by_state.queued` / `waiting_for_slot` in operations
+  status counted it meanwhile. Such a run has no result row.
+
 - **A caller that stops waiting for a database connection no longer closes
   it.** The pool pinged an idle connection before handing it out and held it
   outside the pool meanwhile: a request that disconnected, a step that was

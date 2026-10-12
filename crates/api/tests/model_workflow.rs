@@ -3258,34 +3258,30 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
             }
         }
         if just_asked {
-            // The request was withdrawn with the step that made it, and its
-            // attempt closed, before the slot frees.
+            // The request was withdrawn with the step that made it, its
+            // queued run cancelled with it, and its attempt closed, before
+            // the slot frees.
             let (consumers, reviews) = (list(CONSUMERS).await?, list(REVIEWS).await?);
-            if consumers != ["entry:queued:-:withdrawn"] || reviews != ["1:cancelled"] {
+            if consumers != ["entry:cancelled:-:withdrawn"] || reviews != ["1:cancelled"] {
                 return Err(format!(
                     "the request of the stopped step was not withdrawn: consumers {consumers:?} reviews {reviews:?}"
                 ));
             }
-            // The slot frees under the hold: the check worker looks at the
-            // queued run nobody waits for and cancels it instead of running
-            // it.
+            // The withdrawal cancelled the queued run nobody waits for, in
+            // the same write and while the machine is still full: no slot
+            // has to free for it.
+            let runs = world.check_runs(0).await?;
+            if runs != ["cancelled"] {
+                return Err(format!(
+                    "the run nobody waits for was not cancelled at the withdrawal: runs {runs:?} consumers {:?}",
+                    list(CONSUMERS).await?
+                ));
+            }
+            // The slot frees under the hold: nothing is left to run in it.
             world.apply(&Action::Finish(1, Outcome::Success)).await?;
-            let stopped = tokio::time::timeout(Duration::from_secs(45), async {
-                while world.check_runs(0).await? != ["cancelled"] {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Ok::<_, String>(())
-            })
-            .await;
-            match stopped {
-                Ok(done) => done?,
-                Err(_) => {
-                    return Err(format!(
-                        "the run nobody waits for was not cancelled: runs {:?} consumers {:?}",
-                        world.check_runs(0).await?,
-                        list(CONSUMERS).await?
-                    ))
-                }
+            let runs = world.check_runs(0).await?;
+            if runs != ["cancelled"] {
+                return Err(format!("the cancelled run changed after the slot freed: {runs:?}"));
             }
         }
         if slot_seam {
@@ -3321,7 +3317,8 @@ async fn hold_during_the_entry_check(finds: HoldFinds) -> Result<Vec<String>, St
             if task["status"] != "cancelled"
                 || runs != ["cancelled"]
                 || reviews != ["1:cancelled"]
-                || consumers != ["entry:cancelled:cancelled:withdrawn"]
+                // No result row: the queued run was never claimed.
+                || consumers != ["entry:cancelled:-:withdrawn"]
                 || count(DELIVERED).await? != 0
                 || count(REVIEWER_RUNS).await? != 0
                 || live != 0

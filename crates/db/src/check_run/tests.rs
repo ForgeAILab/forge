@@ -2284,3 +2284,87 @@ async fn a_reuse_only_hit_is_created_answered_and_gets_no_delivery_step() {
         .unwrap();
     assert_eq!(pruned.consumers, 1);
 }
+
+async fn run_state(db: &SqliteDb, id: &str) -> String {
+    sqlx::query_scalar("SELECT state FROM check_run WHERE id=?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+/// A queued run whose last consumer is withdrawn is cancelled in the
+/// withdrawal, with no check worker and no free slot, and the operator's
+/// backlog counts drop it at once. A run another consumer still waits for
+/// stays queued.
+#[tokio::test]
+async fn withdrawing_the_last_consumer_of_a_queued_run_cancels_it_at_once() {
+    let db = fixture().await;
+    seed_second_task(&db).await;
+    let first = db.request_check_run(request("one")).await.unwrap();
+    let mut other = request("two");
+    other.task_id = Some("t2".into());
+    let second = db.request_check_run(other).await.unwrap();
+    let run_id = first.consumer.run_id.clone().unwrap();
+    assert_eq!(second.consumer.run_id.as_deref(), Some(run_id.as_str()));
+    // The run already told its consumers it waits for a slot.
+    sqlx::query("UPDATE check_run SET capacity_wait_since=? WHERE id=?")
+        .bind(NOW)
+        .bind(&run_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db
+        .cancel_abandoned_check_consumer(&first.consumer.id)
+        .await
+        .unwrap());
+    assert_eq!(run_state(&db, &run_id).await, "queued");
+    assert_eq!(
+        db.check_operator_summary()
+            .await
+            .unwrap()
+            .waiting_for_slot
+            .0,
+        1
+    );
+    assert!(db
+        .cancel_abandoned_check_consumer(&second.consumer.id)
+        .await
+        .unwrap());
+    assert_eq!(run_state(&db, &run_id).await, "cancelled");
+    let summary = db.check_operator_summary().await.unwrap();
+    assert_eq!((summary.queued.0, summary.waiting_for_slot.0), (0, 0));
+    assert!(db.find_live_check_run(&identity()).await.unwrap().is_none());
+    // A second withdrawal of the same consumer changes nothing.
+    assert!(!db
+        .cancel_abandoned_check_consumer(&second.consumer.id)
+        .await
+        .unwrap());
+}
+
+/// Project deletion withdraws every consumer: a queued run is cancelled in
+/// the same write, a claimed one is left to the worker that holds its lease.
+#[tokio::test]
+async fn withdrawing_a_projects_consumers_cancels_its_queued_runs_and_leaves_claimed_ones() {
+    let db = fixture().await;
+    seed_second_task(&db).await;
+    let queued = db.request_check_run(request("one")).await.unwrap();
+    let queued_id = queued.consumer.run_id.clone().unwrap();
+    let claimed = db
+        .request_check_run(before_work("two", "t2", "w2"))
+        .await
+        .unwrap();
+    let claimed_id = claimed.consumer.run_id.clone().unwrap();
+    assert_ne!(queued_id, claimed_id);
+    let version: i64 = sqlx::query_scalar("SELECT version FROM check_run WHERE id=?")
+        .bind(&claimed_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    db.claim_check_run(&claimed_id, version, "worker", NOW, UNTIL)
+        .await
+        .unwrap();
+    assert_eq!(db.cancel_project_check_consumers("p").await.unwrap(), 2);
+    assert_eq!(run_state(&db, &queued_id).await, "cancelled");
+    assert_eq!(run_state(&db, &claimed_id).await, "running");
+}
