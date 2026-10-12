@@ -327,6 +327,8 @@ async fn unscoped_mcp_authorizes_projects_tasks_executions_and_dependency_refere
         .unwrap()["depends_on_ids"],
         json!([alice_task.id])
     );
+    // Under the constrained grant a Task of another Project is reported
+    // exactly like a missing one, although Bob could see it otherwise.
     assert_eq!(
         call_as(
             &state,
@@ -338,7 +340,7 @@ async fn unscoped_mcp_authorizes_projects_tasks_executions_and_dependency_refere
         .await
         .unwrap_err()
         .code,
-        -32602
+        -32004
     );
     for name in ["forge_add_task_dependency", "forge_remove_task_dependency"] {
         assert_eq!(
@@ -352,7 +354,7 @@ async fn unscoped_mcp_authorizes_projects_tasks_executions_and_dependency_refere
             .await
             .unwrap_err()
             .code,
-            -32602
+            -32004
         );
     }
 }
