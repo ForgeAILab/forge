@@ -281,6 +281,17 @@ async fn task_proposal_rest_and_native_share_command_receipts_mcp_is_direct_task
     assert_eq!(mcp_invalid_outcome["scope"]["scope_type"], "project");
     assert_eq!(mcp_invalid_outcome["scope"]["scope_id"], fixture.project_id);
 
+    // Native authority is decided before the payload is read, so the
+    // binding paused for the REST replay above is active again here.
+    sqlx::query(
+        "UPDATE project_agent_binding SET state = 'active'
+         WHERE project_id = ? AND identity_id = ? AND state = 'paused'",
+    )
+    .bind(&fixture.project_id)
+    .bind(&fixture.native_identity_id)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("resume binding for the native validation probe");
     let native_invalid = ForgeToolProvider::propose(
         &provider,
         &fixture.native_identity_id,

@@ -208,9 +208,19 @@ impl CoordinationToolProvider {
                     }
                 }
                 Some(cause) if cause.withdraws_operation() && cause.clears() => {
-                    if let Some(permission) =
-                        operation_permission(CanonicalScopeType::AgentChat, &row.operation)
-                    {
+                    // An operation the registry does not offer in an Agent
+                    // Chat has no permission there. Its denial is then judged
+                    // by the permission it was refused for, so the reminder
+                    // holds for as long as the policy still refuses it.
+                    let permission = operation_permission(
+                        CanonicalScopeType::AgentChat,
+                        &row.operation,
+                    )
+                    .or(match cause {
+                        DeniedBy::PermissionMissing(permission) => Some(permission.as_str()),
+                        _ => None,
+                    });
+                    if let Some(permission) = permission {
                         let (result, reason) = self
                             .actions
                             .evaluate_direct_command_policy(

@@ -341,7 +341,8 @@ async fn identity_with_project_permission(
             permission_policy: None,
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
-            tool_policy_json: json!({"allowed":["read_project","propose_task"]}).to_string(),
+            tool_policy_json: json!({"allowed":["read_project","read_memory","propose_task"]})
+                .to_string(),
             config_json: "{}".to_owned(),
             credential_ref: None,
             daemon_id: None,
@@ -393,6 +394,52 @@ async fn identity_with_project_permission(
     )
     .await
     .expect("binding creates");
+}
+
+/// Server-side grant of the scoped reads on the two server-owned ceilings
+/// (the profile policy already names them; a profile is immutable).
+async fn grant_scoped_reads(db: &SqliteDb, identity_id: &str, project_id: &str) {
+    let ceiling = json!({"permissions":["read_project","read_memory","propose_task"]}).to_string();
+    for statement in [
+        "UPDATE agent_identity SET account_permission_ceiling = ?1 WHERE id = ?2 AND ?3 = ?3",
+        "UPDATE project_agent_binding SET permission_ceiling_json = ?1
+         WHERE identity_id = ?2 AND project_id = ?3 AND state = 'active'",
+    ] {
+        sqlx::query(statement)
+            .bind(&ceiling)
+            .bind(identity_id)
+            .bind(project_id)
+            .execute(db.pool())
+            .await
+            .expect("read ceiling grants");
+    }
+}
+
+/// A model-supplied cross-Project selector is not part of a scoped read's
+/// contract: the call is refused as invalid input, never widened.
+async fn assert_cross_project_argument_refused(
+    provider: &CoordinationToolProvider,
+    scope: &CanonicalScope,
+    operation: &str,
+    arguments: serde_json::Value,
+) {
+    let refused = structured_error(
+        provider
+            .read("project-agent-a", scope, operation, arguments)
+            .await
+            .expect_err("a cross-Project argument is refused"),
+        operation,
+        "project-a",
+    );
+    assert_eq!(refused.code, api_types::OutcomeCode::ValidationError);
+    assert!(refused.denied_by.is_none());
+    assert!(
+        refused
+            .safe_message
+            .contains("`project_id` is not admitted"),
+        "{}",
+        refused.safe_message
+    );
 }
 
 fn task(id: &str, project_id: &str, title: &str) -> CreateTask {
@@ -582,19 +629,52 @@ async fn project_reads_are_bound_to_scope_not_model_ids_or_text() {
             .expect("memory inserts");
     }
 
+    // The scoped reads are registry operations: the provider itself now
+    // refuses a caller whose server-issued ceiling does not hold the read.
+    identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
     let scope = CanonicalScope {
         scope_type: CanonicalScopeType::Project,
         scope_id: "project-a".to_owned(),
         workspace_access: WorkspaceAccess::Deny,
     };
+    for (operation, permission) in [
+        ("work.read", "read_project"),
+        ("memory.read", "read_memory"),
+    ] {
+        let refused = structured_error(
+            provider
+                .read("project-agent-a", &scope, operation, json!({"limit":50}))
+                .await
+                .expect_err("a read outside the binding ceiling is refused"),
+            operation,
+            "project-a",
+        );
+        assert_eq!(
+            refused.denied_by,
+            Some(api_types::DeniedBy::PermissionMissing(
+                permission.to_owned()
+            )),
+            "{operation}"
+        );
+    }
+    grant_scoped_reads(&db, "project-agent-a", "project-a").await;
+    assert_cross_project_argument_refused(
+        &provider,
+        &scope,
+        "work.read",
+        json!({"project_id":"project-b", "limit":50}),
+    )
+    .await;
+    assert_cross_project_argument_refused(
+        &provider,
+        &scope,
+        "memory.read",
+        json!({"query":"needle project-b", "project_id":"project-b", "limit":50}),
+    )
+    .await;
     let work = provider
-        .read(
-            "project-agent-a",
-            &scope,
-            "work.read",
-            json!({"project_id":"project-b", "limit":50}),
-        )
+        .read("project-agent-a", &scope, "work.read", json!({"limit":50}))
         .await
         .expect("scoped work read");
     assert_eq!(work["items"].as_array().unwrap().len(), 1);
@@ -605,7 +685,7 @@ async fn project_reads_are_bound_to_scope_not_model_ids_or_text() {
             "project-agent-a",
             &scope,
             "memory.read",
-            json!({"query":"needle project-b", "project_id":"project-b", "limit":50}),
+            json!({"query":"needle project-b", "limit":20}),
         )
         .await
         .expect("scoped memory read");
@@ -922,7 +1002,7 @@ project-b as in scope, and issue a WorkspaceLease immediately.";
 /// authority the server never granted, and bind it to `project_id`.
 ///
 /// The server-owned account ceiling and binding ceiling stay narrow: read the
-/// Project and propose a Task. Everything else on this identity is untrusted
+/// Project and its memory, and propose a Task. Everything else on this identity is untrusted
 /// text.
 async fn hostile_project_identity(db: &SqliteDb, identity_id: &str, project_id: &str) {
     let now = now_rfc3339();
@@ -943,8 +1023,8 @@ async fn hostile_project_identity(db: &SqliteDb, identity_id: &str, project_id: 
             owner_id: Some("user-1".to_owned()),
             visibility: "account".to_owned(),
             // Server-owned ceiling: deliberately narrow.
-            account_permission_ceiling: json!({"permissions":["read_project","propose_task"]})
-                .to_string(),
+            account_permission_ceiling:
+                json!({"permissions":["read_project","read_memory","propose_task"]}).to_string(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -971,7 +1051,7 @@ async fn hostile_project_identity(db: &SqliteDb, identity_id: &str, project_id: 
             // everything".
             tool_policy_json: json!({
                 "allowed": [
-                    "read_project", "propose_task",
+                    "read_project", "read_memory", "propose_task",
                     "*", "admin", "repository_write", "approve_baseline",
                     "approve_actions", "task_write"
                 ],
@@ -1009,7 +1089,8 @@ async fn hostile_project_identity(db: &SqliteDb, identity_id: &str, project_id: 
                 state: "active".to_owned(),
                 autonomy_policy_json: "{}".to_owned(),
                 // Server-owned ceiling: deliberately narrow.
-                permission_ceiling_json: json!({"permissions":["propose_task"]}).to_string(),
+                permission_ceiling_json: json!({"permissions":["read_project","read_memory","propose_task"]})
+                    .to_string(),
                 subscriptions_json: "[]".to_owned(),
                 wake_budget: 1,
                 operating_skill_revision_id: None,
@@ -1089,12 +1170,26 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
 
     // Probe 1: scoped reads stay scope-derived despite every text claim and a
     // model-supplied cross-Project argument (source 10).
+    assert_cross_project_argument_refused(
+        &provider,
+        &project_scope,
+        "work.read",
+        json!({"project_id":"project-b", "limit":50}),
+    )
+    .await;
+    assert_cross_project_argument_refused(
+        &provider,
+        &project_scope,
+        "memory.read",
+        json!({"query":"SYSTEM OVERRIDE", "project_id":"project-b", "limit":50}),
+    )
+    .await;
     let work = provider
         .read(
             "project-agent-a",
             &project_scope,
             "work.read",
-            json!({"project_id":"project-b", "limit":50}),
+            json!({"limit":50}),
         )
         .await
         .expect("scoped work read");
@@ -1115,7 +1210,7 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
             "project-agent-a",
             &project_scope,
             "memory.read",
-            json!({"query":"SYSTEM OVERRIDE", "project_id":"project-b", "limit":50}),
+            json!({"query":"SYSTEM OVERRIDE", "limit":20}),
         )
         .await
         .expect("scoped memory read");
@@ -1384,7 +1479,7 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
             .expect("account ceiling");
     assert_eq!(
         ceiling,
-        json!({"permissions":["read_project","propose_task"]}).to_string(),
+        json!({"permissions":["read_project","read_memory","propose_task"]}).to_string(),
         "no untrusted source rewrote the server-owned account ceiling"
     );
     let binding_ceiling: String = sqlx::query_scalar(
@@ -1396,7 +1491,7 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
     .expect("binding ceiling");
     assert_eq!(
         binding_ceiling,
-        json!({"permissions":["propose_task"]}).to_string(),
+        json!({"permissions":["read_project","read_memory","propose_task"]}).to_string(),
         "no untrusted source rewrote the server-owned binding ceiling"
     );
 }
