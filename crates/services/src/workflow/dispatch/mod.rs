@@ -29,6 +29,8 @@ pub const BUILDER_ID_REVIEWER_CONFORMANCE_V1: &str = "reviewer.conformance.v1";
 pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
 /// The lead of a coordination root: the planner run on a root with subtasks.
 pub const BUILDER_ID_PLANNER_COORDINATION_V1: &str = "planner.coordination.v1";
+/// The step check: the root's lead run on a subtask in its `lead_check` gate.
+pub const BUILDER_ID_PLANNER_STEP_CHECK_V1: &str = "planner.step_check.v1";
 pub const BUILDER_ID_READ_ONLY_TASK_V1: &str = "task.read_only.v1";
 pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
 
@@ -210,7 +212,8 @@ static DEFAULT_ROLE_BUILDERS: OnceLock<DefaultRoleBuilderMap> = OnceLock::new();
 fn registry() -> &'static BuilderRegistry {
     PROMPT_BUILDERS.get_or_init(|| {
         let mut builders: HashMap<String, Arc<dyn PromptBuilder>> = HashMap::new();
-        let defaults: [Arc<dyn PromptBuilder>; 11] = [
+        let defaults: [Arc<dyn PromptBuilder>; 12] = [
+            Arc::new(coordination_prompt::StepCheckPromptBuilder),
             Arc::new(coder_prompt::CoderImplementationPromptBuilder),
             Arc::new(coder_prompt::CoderReviewFixPromptBuilder),
             Arc::new(coder_prompt::CoderMergeFixPromptBuilder),
@@ -341,6 +344,13 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
                 "Lead prompt for a root Task with subtasks: reviews the ordered breakdown before the subtasks run.",
         },
         PromptBuilderRegistryEntry {
+            id: BUILDER_ID_PLANNER_STEP_CHECK_V1,
+            label: "Planner (Step Check)",
+            compatible_role_hints: &[default_roles::PLANNER],
+            description:
+                "Lead prompt for one finished subtask: accepts the step or returns it with findings, as a result block.",
+        },
+        PromptBuilderRegistryEntry {
             id: BUILDER_ID_READ_ONLY_TASK_V1,
             label: "Read-only Task",
             compatible_role_hints: &[default_roles::CODER, default_roles::WORKER],
@@ -450,6 +460,15 @@ pub fn build_effective_prompt(
         && !dispatch_ctx.sub_tasks.is_empty()
     {
         selection.builder_id = BUILDER_ID_PLANNER_COORDINATION_V1.to_owned();
+    }
+    // A planner run on a subtask in an inherited workflow state is the step
+    // check, whatever builder the role would default to: it owes a result
+    // block, never a plan.
+    if dispatch_ctx.role == crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE
+        && dispatch_ctx.task.parent_task_id.is_some()
+        && crate::workflow::inherited_subtask_workflow::is_inherited_state(&dispatch_ctx.state_name)
+    {
+        selection.builder_id = BUILDER_ID_PLANNER_STEP_CHECK_V1.to_owned();
     }
     let base_prompt = resolve_prompt_builder(&selection.builder_id).build(dispatch_ctx);
     let prompt = apply_prompt_overrides(base_prompt, &dispatch_ctx.state_config);

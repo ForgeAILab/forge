@@ -763,10 +763,7 @@ impl TaskDispatcher {
         } else {
             self.task_service.ensure_task_runnable(task).await?;
         }
-        if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await?
-            && !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
-                .allows_execution(&state.name, role_name)
-        {
+        if !crate::task_hierarchy::root_runs_role(&self.db, task, workflow, role_name).await? {
             crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }

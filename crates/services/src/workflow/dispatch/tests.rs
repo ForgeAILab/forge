@@ -81,6 +81,23 @@ fn fake_review(attempt_number: i64, status: db::ReviewStatus) -> db::Review {
     }
 }
 
+fn fake_comment() -> db::TaskComment {
+    db::TaskComment {
+        id: "comment".to_owned(),
+        task_id: "task-1".to_owned(),
+        author_type: db::CommentAuthorType::Agent,
+        author_id: None,
+        author_name: "Agent".to_owned(),
+        content: String::new(),
+        execution_id: None,
+        role: None,
+        worklog_kind: None,
+        idempotency_key: None,
+        created_at: "2026-10-12T10:00:00Z".to_owned(),
+        updated_at: "2026-10-12T10:00:00Z".to_owned(),
+    }
+}
+
 fn fake_context(role: &str) -> AgentDispatchContext {
     AgentDispatchContext {
         task: fake_task(
@@ -1224,4 +1241,121 @@ fn a_planner_on_a_coordination_root_gets_the_lead_prompt() {
     ctx.task.parent_task_id = Some("root".to_owned());
     let (_, selection) = build_effective_prompt(&ctx, None, Some(&state));
     assert_eq!(selection.builder_id, BUILDER_ID_PLANNER_DEFAULT_V2);
+}
+
+/// The step check: a planner run on a subtask in the `lead_check` gate gets
+/// the step-check prompt whatever builder the state or role names. It carries
+/// one subtask, demands the result block, and asks for no plan.
+#[test]
+fn a_planner_on_a_subtask_in_the_step_check_gets_the_step_check_prompt() {
+    let mut ctx = fake_context(default_roles::PLANNER);
+    ctx.task.parent_task_id = Some("root".to_owned());
+    ctx.task.status = default_states::LEAD_CHECK.to_owned();
+    ctx.state_name = default_states::LEAD_CHECK.to_owned();
+    ctx.parent_task = Some(fake_task(
+        "root",
+        "Ship the importer",
+        Some("Root history."),
+    ));
+    let mut note = fake_comment();
+    note.author_name = "Coder One".to_owned();
+    note.content = "validation: cargo test -p importer: 12 passed".to_owned();
+    ctx.comments = vec![note];
+    for state in [
+        None,
+        Some(DispatchIntent {
+            builder_id: Some(BUILDER_ID_PLANNER_DEFAULT_V2.to_owned()),
+            execution_policy: None,
+            prompt_config: json!({}),
+        }),
+    ] {
+        let (prompt, selection) = build_effective_prompt(&ctx, None, state.as_ref());
+        assert_eq!(
+            selection.builder_id,
+            super::BUILDER_ID_PLANNER_STEP_CHECK_V1
+        );
+        assert!(prompt.system.contains("Step-check doctrine:"));
+        assert!(prompt
+            .system
+            .contains("{\"result\": \"pass\", \"reason\": \"one sentence\"}"));
+        assert!(prompt.system.contains(FAILURE_TAXONOMY_LINE));
+        // One subtask as user-role input; nothing of the root but its title.
+        assert!(!prompt.system.contains("Add dispatch context"));
+        assert!(prompt
+            .user
+            .contains("Check this finished step: Add dispatch context"));
+        assert!(prompt
+            .user
+            .contains("It is a subtask of: Ship the importer"));
+        assert!(prompt
+            .user
+            .contains("Build prompt context for workflow agents."));
+        assert!(prompt
+            .user
+            .contains("- Coder One: validation: cargo test -p importer: 12 passed"));
+        assert!(!prompt.user.contains("Root history."));
+        assert!(!prompt.user.contains("plan.md"));
+        assert_eq!(prompt.tools, vec!["read_files".to_owned()]);
+        assert!(prompt.system.len() < 4_800, "{}", prompt.system.len());
+    }
+    // The worker's reports are bounded, newest kept.
+    let mut many = Vec::new();
+    for index in 0..40 {
+        let mut comment = fake_comment();
+        comment.content = format!("report {index} {}", "x".repeat(600));
+        many.push(comment);
+    }
+    ctx.comments = many;
+    let (bounded, _) = build_effective_prompt(&ctx, None, None);
+    assert!(bounded.user.len() < 12_000, "{}", bounded.user.len());
+    assert!(bounded.user.contains("report 39 "));
+    assert!(!bounded.user.contains("report 0 "));
+    assert!(bounded.user.contains("[older reports left out]"));
+
+    // A subtask the Project workflow governs (a state the inherited workflow
+    // does not have) keeps its own planner prompt.
+    ctx.state_name = default_states::PLANNING.to_owned();
+    ctx.task.status = default_states::PLANNING.to_owned();
+    let (_, selection) = build_effective_prompt(&ctx, None, None);
+    assert_eq!(selection.builder_id, BUILDER_ID_PLANNER_DEFAULT_V2);
+}
+
+/// A step the lead returned: the worker's next implementation prompt carries
+/// the lead's findings, taken from the rejection that brought the subtask
+/// back, and only while that rejection is the current entry.
+#[test]
+fn a_returned_step_carries_the_leads_findings_into_the_implementation_prompt() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.task.parent_task_id = Some("root".to_owned());
+    let returned = db::TransitionLog {
+        id: "returned".to_owned(),
+        task_id: "task-1".to_owned(),
+        from_state: default_states::LEAD_CHECK.to_owned(),
+        to_state: default_states::IN_PROGRESS.to_owned(),
+        trigger_name: None,
+        triggered_by: "system:workflow".to_owned(),
+        bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateRejected),
+        trigger_reason: "The lead returned this step: the last row is dropped".to_owned(),
+        hook_results_json: None,
+        rejection: true,
+        created_at: "2026-10-12T10:00:00Z".to_owned(),
+    };
+    ctx.transition_log = vec![returned.clone()];
+    let user = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2)
+        .build(&ctx)
+        .user;
+    assert!(user.contains("The lead checked this step and returned it."));
+    assert!(user.contains("The lead returned this step: the last row is dropped"));
+
+    // A later entry that is not a return says nothing of it.
+    let mut later = returned;
+    later.id = "later".to_owned();
+    later.from_state = default_states::TODO.to_owned();
+    later.rejection = false;
+    later.bridge = Default::default();
+    ctx.transition_log.push(later);
+    let user = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2)
+        .build(&ctx)
+        .user;
+    assert!(!user.contains("returned it"));
 }

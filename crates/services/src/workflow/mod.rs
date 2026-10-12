@@ -241,6 +241,30 @@ pub(crate) fn action_role<'a>(workflow: &'a WorkflowDefinition, status: &str) ->
         })
 }
 
+/// Where an optional gate that nobody holds is skipped to: its Accept target
+/// when that is an implementation state or a terminal state other than
+/// cancellation; otherwise the first user trigger to an implementation state
+/// (what the skip did before a gate could sit in front of a terminal state).
+/// The Accept target is asked first so that a gate whose Reject returns to
+/// implementation is passed, never bounced.
+pub(crate) fn optional_gate_skip_target<'a>(
+    workflow: &'a api_types::WorkflowDefinition,
+    gate: &str,
+) -> Option<&'a StateDefinition> {
+    let state = |name: &str| workflow.states.iter().find(|state| state.name == name);
+    if let Some(accept) = workflow.auto_transition_target(gate).and_then(state) {
+        let terminal = accept.kind == StateKind::Terminal
+            && workflow.cancellation_state.as_deref() != Some(accept.name.as_str());
+        if accept.kind == StateKind::Active || terminal {
+            return Some(accept);
+        }
+    }
+    workflow
+        .outgoing_trigger_targets(gate)
+        .filter(|(trigger, _)| !trigger.system_only())
+        .find_map(|(_, to)| state(&to).filter(|state| state.kind == StateKind::Active))
+}
+
 pub fn effective_role(state: &StateDefinition) -> Option<&str> {
     if let Some(role) = state.role.as_deref() {
         return Some(role);

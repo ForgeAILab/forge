@@ -228,6 +228,13 @@ impl TaskService {
         let outbox_report = self
             .ingest_terminal_execution_outbox(&task, &execution)
             .await?;
+        // A step check has its own settlement: a verdict, never a plan (the
+        // lead's checklist exemption is for its run on the root only).
+        if Self::is_step_check(&task, &execution, current_state) {
+            return self
+                .settle_step_check(&task, &execution, &workflow, current_state)
+                .await;
+        }
         let Some(target) = workflow
             .auto_transition_target(&task.status)
             .map(str::to_owned)
@@ -673,7 +680,10 @@ impl TaskService {
         }
     }
 
-    async fn discard_brokered_execution_plan_stage(&self, execution: &Execution) -> Result<()> {
+    pub(super) async fn discard_brokered_execution_plan_stage(
+        &self,
+        execution: &Execution,
+    ) -> Result<()> {
         if !super::execution_uses_brokered_plan(execution) {
             return Ok(());
         }
@@ -834,7 +844,7 @@ impl TaskService {
         Ok(())
     }
 
-    async fn handle_executor_completion_guard_rejection(
+    pub(super) async fn handle_executor_completion_guard_rejection(
         &self,
         execution: &Execution,
         task: &Task,
@@ -1117,7 +1127,7 @@ impl TaskService {
         let _ = task;
         mutations
     }
-    async fn clear_workflow_guard_retry_metadata(&self, task: &Task) -> Result<()> {
+    pub(super) async fn clear_workflow_guard_retry_metadata(&self, task: &Task) -> Result<()> {
         TaskRepo::mutate_metadata(
             &*self.db,
             &task.id,
@@ -2856,6 +2866,8 @@ fn render_workflow_guard_follow_up_prompt(
 ) -> String {
     let checklist_instruction = if guard == "require_conflict_markers_resolved" {
         "Fix the files named above: remove every conflict marker line and keep the correct merged code, verify nothing else in them is still conflicted, then commit the result. Forge re-checks the committed HEAD before the task can go to review."
+    } else if guard == super::step_check::STEP_CHECK_RESULT_GUARD {
+        "End your reply with exactly one JSON object on its own: {\"result\": \"pass\", \"reason\": \"one sentence\"} or {\"result\": \"fail\", \"reason\": \"one sentence\"}. Do not write a plan and do not change files."
     } else if guard == "planning_plan_ready" {
         "Write a valid Markdown checklist using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness."
     } else {
@@ -2905,7 +2917,7 @@ fn render_automatic_review_recovery_prompt(
     )
 }
 
-async fn reviewer_final_message(execution: &Execution) -> Result<String> {
+pub(super) async fn reviewer_final_message(execution: &Execution) -> Result<String> {
     if let Some(logs_path) = execution.logs_path.as_deref() {
         let contents = match tokio::fs::read_to_string(logs_path).await {
             Ok(contents) => contents,

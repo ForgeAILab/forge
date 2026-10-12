@@ -304,12 +304,13 @@ impl TaskService {
         // the re-run would pass on its checks alone, so it is refused, as the
         // inline re-run refused it.
         if super::update::names_retired_auditor(task.task_state_config.as_deref())
-            && !TaskRoleAssignmentRepo::get_by_task_and_role(
-                &*self.db,
-                &task.id,
+            && !crate::task_hierarchy::effective_role_assignment(
+                &self.db,
+                &task,
                 crate::workflow::default_roles::REVIEWER,
             )
             .await?
+            .map(|resolved| resolved.assignment)
             .is_some_and(|assignment| {
                 assignment.assignee_type == Some(db::AssigneeKind::Agent)
                     && assignment.assignee_id.is_some()

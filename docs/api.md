@@ -2765,6 +2765,27 @@ with source `inherited_from_root` (and therefore the assignment's `task_id`
 continues to name the root). `role_assignments` remains the Task's persisted
 rows only; inherited defaults are never copied into that array or into storage.
 
+A subtask has one status its root's Project workflow does not have:
+`lead_check`, the step check between `in_progress` and `done` (display name
+"Lead Check", board column "In Progress", phase `working`). Every subtask
+passes through it. Under a root without a lead it is skipped in the same step
+that entered it (transition log: `in_progress → lead_check`, then
+`lead_check → done` with `bridge_kind: gate_skipped`); under a root with a
+lead the subtask rests there while the lead's `planner` execution on it runs,
+and returns to `in_progress` (`bridge_kind: gate_rejected`, `rejection: true`)
+when the lead fails the step. Its budget projection carries `lead_check` (the
+returns left, 2 by default). Clients that enumerate subtask statuses must
+render it. The prompt builder list gains `planner.step_check.v1`.
+
+Assigning the step-check role (`planner`) on a subtask in an inherited state
+is refused with `422 STEP_CHECK_ROLE_HELD_BY_ROOT` (`details.task_id`,
+`details.root_task_id`, `details.role`): the role is held by the root's lead,
+so assign `planner` on the root. Removing such a row stays possible. Removing
+the root's lead stops a step check that is still running; the subtask then
+passes the gate (`bridge_kind: gate_skipped`). `retry` on a subtask parked in
+`lead_check` with `retry_exhausted` opens a new budget window and starts the
+lead's check of the work that is already there.
+
 `TaskResponse.effective_lead` is `{ assignment, source }` or `null`: the lead
 of the coordination root this Task is (`source: own`) or belongs to
 (`source: inherited_from_root`; `assignment.task_id` names the root). The lead

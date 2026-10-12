@@ -482,6 +482,15 @@ impl TaskDispatcher {
         workflow: &WorkflowDefinition,
         task: &Task,
     ) -> Result<Option<InitialScheduleTarget>> {
+        // A gate in front of a terminal state (a step check) is skipped to
+        // that state by its own entry or by `Step::SkipGate`; it has no
+        // dispatch target, and its Reject target is never one.
+        if crate::workflow::optional_gate_skip_target(workflow, &task.status)
+            .is_some_and(|target| target.kind == StateKind::Terminal)
+            && workflow.state_kind(&task.status) == Some(StateKind::Gate)
+        {
+            return Ok(None);
+        }
         let mut cursor_state = task.status.clone();
         let mut target_kinds = vec![StateKind::Active, StateKind::Gate];
         let mut visited = HashSet::new();

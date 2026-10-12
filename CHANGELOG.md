@@ -45,6 +45,51 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   lead. A root without a planner is unchanged apart from the entry above. `TaskResponse.effective_lead` (`{ assignment, source }`) reports
   the lead of a root and of its subtasks.
 
+- **Subtasks gain the `lead_check` status: the lead's step check.** The
+  inherited subtask workflow is now `todo -> in_progress -> lead_check ->
+  done`. `lead_check` is an optional gate held by the root's lead. Under a
+  root **without** a lead nothing waits and nothing runs: the gate is skipped
+  in the step that entered it, and the only visible differences are one more
+  transition per finished subtask (`in_progress -> lead_check`, then
+  `lead_check -> done` with `bridge_kind: gate_skipped`, and their events)
+  and a status that clients enumerating subtask statuses must render. Under a
+  root **with** a lead, the lead runs a read-only `planner` execution on each
+  finished subtask (prompt `planner.step_check.v1`) and ends it with a result
+  block: `pass` moves the subtask to `done`; `fail` returns it to
+  `in_progress` and resumes the same worker thread with the findings. The
+  next subtask starts only after the step is accepted. Returns are limited by
+  the gate's `max_rejections` (2): the entry after the second return parks
+  the subtask as `retry_exhausted` with an Attention item, and the owner's
+  `retry` opens a new window. A step check is not a review: it creates no
+  Review row and no check run and spends no Review budget. The `planner` role
+  of a subtask in `todo`, `in_progress`, `lead_check`, `done` or `cancelled`
+  is the root's lead and nothing else. Assigning `planner` on such a subtask
+  is now refused with `422 STEP_CHECK_ROLE_HELD_BY_ROOT` (it was accepted and
+  never used); rows that already exist, including the ones Project default
+  role assignments copy onto every new Task, hold nothing as before and can
+  still be removed. Removing the root's lead stops a step check that is still
+  running and the subtask passes the gate. `retry` on a subtask parked in
+  `lead_check` starts the lead's check of the existing rework, not another
+  rework. No migration.
+
+- **A user acting on a subtask in a state the Project workflow does not have
+  is governed by the inherited subtask workflow.** Before, a user always
+  resolved the Project workflow for a subtask, even where that workflow does
+  not define the subtask's state. For the built-in workflow the only such
+  state is the new `lead_check`. Under a workflow that names its states
+  differently (the autonomous workflow's `ready`/`working`, or a custom one),
+  a user's manual transition of a subtask in `todo` or `in_progress` now
+  follows the inherited subtask workflow's triggers.
+
+- **An optional gate nobody holds is skipped to its Accept target.** It used
+  to be skipped to the first trigger target that is an implementation state,
+  whichever trigger named it. A custom workflow with an optional gate whose
+  Accept target is a terminal state other than cancellation (for example
+  `Accept -> done`, `Reject -> in_progress`) is now passed to that terminal
+  state when nobody holds its role, instead of being sent back to
+  implementation. Gates whose Accept target is an implementation state (the
+  built-in `planning`) behave as before.
+
 - **New condition value `parent.cause = planning`.** A subtask whose root is
   planning is `parked` on `parent { cause: planning }` until the planner
   finishes. Clients that enumerate `cause` (`held`, `blocked`,

@@ -458,12 +458,13 @@ impl TaskService {
             .and_then(|state| state.gate_config.as_ref())
             .is_some_and(|gate_config| gate_config.optional_when_unassigned())
         {
-            let planner_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-                &*self.db,
-                &task.id,
+            let planner_assignment = crate::task_hierarchy::effective_role_assignment(
+                &self.db,
+                task,
                 crate::workflow::default_roles::PLANNER,
             )
-            .await?;
+            .await?
+            .map(|resolved| resolved.assignment);
             let planner_assigned = planner_assignment.as_ref().is_some_and(|assignment| {
                 assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
             });

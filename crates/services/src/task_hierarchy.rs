@@ -142,8 +142,10 @@ impl<'a> RootRolePolicy<'a> {
             .and_then(effective_role)
     }
 
-    /// Return whether `role` may execute on a coordination root in `state_name`.
-    pub(crate) fn allows_execution(&self, state_name: &str, role: &str) -> bool {
+    /// Return whether `role` may execute on a coordination root in
+    /// `state_name` by the workflow alone. Readers ask [`Self::runs_role`],
+    /// which also requires the lead in the planning state.
+    fn allows_execution(&self, state_name: &str, role: &str) -> bool {
         role != crate::workflow::default_roles::CODER
             && self.implementation_role() != Some(role)
             && self.execution_role_for_state(state_name) == Some(role)
@@ -303,6 +305,30 @@ pub(crate) async fn root_planning_run_live(
     ))
 }
 
+/// Database form of [`RootRolePolicy::runs_role`] for `task` in its present
+/// state: true for anything that is not a coordination root, and for a root
+/// only when `role` runs on it now (its lead in the planning state, its
+/// aggregate review role in review).
+pub(crate) async fn root_runs_role(
+    db: &SqliteDb,
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    role: &str,
+) -> Result<bool> {
+    if !coordination_root_has_subtasks(db, task).await? {
+        return Ok(true);
+    }
+    let assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
+    Ok(
+        RootRolePolicy::for_workflow(workflow).runs_role(
+            &task.id,
+            &task.status,
+            role,
+            &assignments,
+        ),
+    )
+}
+
 /// Database form of [`RootRolePolicy::lead`] for a coordination root.
 pub async fn root_lead(
     db: &SqliteDb,
@@ -450,7 +476,56 @@ pub async fn effective_coder_assignment(
     }))
 }
 
-/// Resolve an execution role, applying root inheritance only to `coder`.
+/// The root whose lead holds `role` on `task`: `task` is a subtask governed
+/// by the inherited subtask workflow and `role` is that workflow's step-check
+/// role. Such a role is never read from the subtask's own rows: with no lead
+/// on the root nobody holds it, whatever row the subtask carries.
+pub(crate) fn step_check_root<'t>(task: &'t Task, role: &str) -> Option<&'t str> {
+    let parent_task_id = task.parent_task_id.as_deref()?;
+    (role == crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE
+        && crate::workflow::inherited_subtask_workflow::is_inherited_state(&task.status))
+    .then_some(parent_task_id)
+}
+
+/// In-memory form of the step-check resolution: the lead of `root_id` among
+/// `rows` (which hold the root's rows), when the Project workflow's planning
+/// role is the step-check role.
+pub(crate) fn step_check_lead<'r>(
+    project_workflow: &WorkflowDefinition,
+    root_id: &str,
+    rows: &'r [TaskRoleAssignment],
+) -> Option<&'r TaskRoleAssignment> {
+    let policy = RootRolePolicy::for_workflow(project_workflow);
+    (policy.planning_role() == Some(crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE))
+        .then(|| policy.lead(root_id, rows))
+        .flatten()
+}
+
+/// Database form of [`step_check_lead`] for the root `root_id`.
+async fn step_check_assignment(
+    db: &SqliteDb,
+    root_id: &str,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    let rows = TaskRoleAssignmentRepo::list_by_task(db, root_id).await?;
+    if !rows.iter().any(|row| {
+        row.role_name == crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE
+            && row.assignee_id.is_some()
+    }) {
+        return Ok(None);
+    }
+    let (_, workflow) = coordination_root_context(db, root_id).await?;
+    Ok(
+        step_check_lead(&workflow, root_id, &rows).map(|lead| EffectiveCoderAssignment {
+            assignment: lead.clone(),
+            source: EffectiveCoderSource::InheritedFromRoot,
+        }),
+    )
+}
+
+/// Resolve an execution role. THE resolver for "who holds this role on this
+/// Task": `coder` falls back from the subtask's row to its root's (the default
+/// worker), a subtask's step-check role is its root's lead and nothing else
+/// ([`step_check_root`]), and every other role is the Task's own row.
 pub async fn effective_role_assignment(
     db: &SqliteDb,
     task: &Task,
@@ -463,6 +538,9 @@ pub async fn effective_role_assignment(
     };
     if canonical_role == crate::workflow::default_roles::CODER {
         return effective_coder_assignment(db, task).await;
+    }
+    if let Some(root_id) = step_check_root(task, canonical_role) {
+        return step_check_assignment(db, root_id).await;
     }
     Ok(
         TaskRoleAssignmentRepo::get_by_task_and_role(db, &task.id, canonical_role)

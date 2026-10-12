@@ -2415,9 +2415,20 @@ impl TaskService {
             } else {
                 execution.role.as_str()
             };
-            let assignment =
+            // The own row is live ownership for every role but one: a
+            // subtask's step check is held by its root's lead, through the
+            // resolver. (A default worker stays admission authority only;
+            // see the inherited-coder arm below.)
+            let assignment = if crate::task_hierarchy::step_check_root(task, assignment_role)
+                .is_some()
+            {
+                crate::task_hierarchy::effective_role_assignment(&self.db, task, assignment_role)
+                    .await?
+                    .map(|resolved| resolved.assignment)
+            } else {
                 TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, assignment_role)
-                    .await?;
+                    .await?
+            };
             if let Some(assignment) = assignment {
                 if assignment.assignee_type.as_ref() != Some(&db::AssigneeKind::Agent)
                     || assignment.assignee_id.as_deref() != execution.agent_id.as_deref()

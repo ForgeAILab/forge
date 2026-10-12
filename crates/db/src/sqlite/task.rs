@@ -6,14 +6,53 @@ use crate::{
 };
 use std::collections::HashSet;
 
+/// The Task whose own row decides who holds `role_name` on `task_id`: the
+/// Task itself, except for the step-check role of a subtask in an inherited
+/// workflow state, which its root holds
+/// ([`crate::inherited_subtask::step_check_holder`], the one rule).
+pub(super) async fn assignment_holder_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+) -> Result<String> {
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT parent_task_id, status FROM task WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    Ok(row
+        .and_then(|(parent_task_id, status)| {
+            crate::inherited_subtask::step_check_holder(
+                parent_task_id.as_deref(),
+                &status,
+                role_name,
+            )
+            .map(str::to_owned)
+        })
+        .unwrap_or_else(|| task_id.to_owned()))
+}
+
 /// Load the assignment that authorizes an execution while holding the same
 /// writer transaction that will create it. Coder rows resolve child first,
-/// then direct parent; every other role remains Task-local.
+/// then direct parent. The step-check role of a subtask in an inherited
+/// workflow state is its root's row and never its own
+/// ([`assignment_holder_in_tx`]). Every other role remains Task-local.
 pub(super) async fn effective_execution_assignment_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     task_id: &str,
     role_name: &str,
 ) -> Result<Option<SqliteRow>> {
+    let holder = assignment_holder_in_tx(transaction, task_id, role_name).await?;
+    if holder != task_id {
+        return Ok(sqlx::query(
+            "SELECT id, assignee_type, assignee_id, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&holder)
+        .bind(role_name)
+        .fetch_optional(&mut **transaction)
+        .await?);
+    }
     Ok(sqlx::query(
         "SELECT assignment.id,
                 assignment.assignee_type,
@@ -129,12 +168,20 @@ async fn latest_execution_authority_matches_in_tx(
             "auditor" => "reviewer",
             role => role,
         };
+        // The step-check role of a subtask in an inherited workflow state is
+        // held by its root's row and never its own.
+        let assignment_task_id = crate::inherited_subtask::step_check_holder(
+            task.parent_task_id.as_deref(),
+            &task.status,
+            assignment_role,
+        )
+        .unwrap_or(task.id.as_str());
         let assignment = sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
             "SELECT assignee_type, assignee_id, updated_at
              FROM task_role_assignment
              WHERE task_id = ? AND role_name = ?",
         )
-        .bind(&task.id)
+        .bind(assignment_task_id)
         .bind(assignment_role)
         .fetch_optional(&mut **transaction)
         .await?;
@@ -728,11 +775,12 @@ async fn set_error_annotation_if_no_running_execution_inner(
     // execution's blocker. Interactive stops intentionally have no workflow
     // assignment dependency and pass `None` here.
     if let Some(role_name) = expected_assignment_role {
+        let holder = assignment_holder_in_tx(&mut transaction, id, role_name).await?;
         let actual_assignment = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
         )
-        .bind(id)
+        .bind(&holder)
         .bind(role_name)
         .fetch_optional(&mut *transaction)
         .await?
