@@ -5919,7 +5919,8 @@ pass; no wake is needed.
   hold or manual stop, a host environment that is not ready, a queued owner
   action, a human decision, or any wait
   that ends on its own (capacity, an Agent, a machine, the environment, a
-  dependency, checks, the parent, a retry deadline, a run in flight). The
+  dependency, checks, the parent, a retry deadline, a run in flight), and
+  never a park that records no time (it has no identity to dedupe on). The
   subtasks are sequential, so nothing runs beside the parked one: no running
   subtask is interrupted, and the subtasks that have not started are held by
   the planning root (`parent { cause: planning }`).

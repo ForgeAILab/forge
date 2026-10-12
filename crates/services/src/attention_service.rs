@@ -368,6 +368,7 @@ impl AttentionService {
                 // Level state: once the lead left the park in place, or the
                 // root itself parked, the next sweep admits the wake.
                 if self.lead_handles_blocker(&attention).await {
+                    tracing::debug!(attention_id = %attention.id, "subtask blocker left to its root's lead");
                     continue;
                 }
                 let digest = wake_attention_incident_digest(&attention);

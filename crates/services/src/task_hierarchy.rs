@@ -880,7 +880,7 @@ fn decision_condition(child: &Task) -> db::TaskCondition {
 ///
 /// The identity is the time the park was recorded, which the stored blocker
 /// carries and no restatement changes; a later park of the same subtask has
-/// a later one.
+/// a later one. A park that records no time is not re-planned.
 pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
     let condition = decision_condition(child);
     let since = match &condition {
@@ -915,15 +915,16 @@ pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
     {
         return None;
     }
-    Some(
-        since
-            .or_else(|| {
-                read.interruption
-                    .map(|interruption| interruption.created_at)
-            })
-            .or_else(|| read.diagnostic.and_then(|diagnostic| diagnostic.blocked_at))
-            .unwrap_or_else(|| "unrecorded".to_owned()),
-    )
+    // A park with no recorded time has no identity: one receipt would stand
+    // for every later park of the subtask. It is not re-planned; it is the
+    // Project Agent's.
+    since
+        .or_else(|| {
+            read.interruption
+                .map(|interruption| interruption.created_at)
+        })
+        .or_else(|| read.diagnostic.and_then(|diagnostic| diagnostic.blocked_at))
+        .filter(|at| !at.trim().is_empty())
 }
 
 impl RootRolePolicy<'_> {
@@ -1143,6 +1144,13 @@ mod replan_tests {
             subtask_decision_park(&parked("child", at, "executor_failed")).as_deref(),
             Some(at)
         );
+        // A park that records no time has no identity and is not re-planned.
+        let mut undated = task("child", default_states::IN_PROGRESS, Some("root"));
+        undated.error_annotation = Some(
+            serde_json::json!({"type": "executor_failed", "blocking_reason": "failed", "message": "failed"})
+                .to_string(),
+        );
+        assert_eq!(subtask_decision_park(&undated), None);
         // The host's environment is the owner's to fix, not the lead's.
         assert_eq!(
             subtask_decision_park(&parked("child", at, "environment_not_ready")),
