@@ -590,10 +590,10 @@ that are discovered or registered without editing a shared list. If a shared
 edit is unavoidable, one Task owns it and other Tasks depend on that Task.
 Work splits follow module boundaries, with owned modules/files named in each
 Task. Main applies this to Charter architecture constraints during Genesis
-(`forge.main.project-discovery/v2@7`). Its account baseline remains at @4,
-with no additional resident layout rule. Project
+(since `forge.main.project-discovery/v2@7`). Its account baseline carries no
+additional resident layout rule. Project
 standing invariants apply it to `task.propose`
-(`forge.project.orchestration/v1@20`); the on-demand document and Task sections
+(since `forge.project.orchestration/v1@20`); the on-demand document and Task sections
 apply it to architecture/execution plans and adaptive splitting. Planner runs
 receive it once in their system prompt for both native and outbox delivery;
 plan-artifact delivery instructions still require owned repository-relative

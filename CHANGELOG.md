@@ -23,16 +23,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   to replace the Task or escalate. It states that `action` is optional on
   `task.worklog` and `task.evidence`, and that each worklog entry takes a new
   `correlation_id`.
-- **Project lifecycle hooks and script hooks need the Project owner or an
-  admin member, on REST and MCP.** MCP `forge_update_project_lifecycle_hooks`
-  is no longer listed or callable for a caller who can only see the Project or
-  is a plain member, whether the grant is bound to the Project or to the
-  account. A settings document that contains a `script` lifecycle hook is
-  refused with `insufficient_role` (MCP `forge_update_project`) or `403`
-  (REST `PATCH /api/v1/projects/{id}`) for anyone else, including when the
-  hook is already stored and unchanged, and including an ownerless Project
-  with no admin member. Before, MCP let any caller who could see an ownerless
-  Project write a hook command, and REST did not check.
+- **Script lifecycle hooks need the Project owner or an admin member, on REST
+  and MCP; the MCP hooks tool is admin-only.** A settings document that
+  contains a `script` lifecycle hook is refused with `insufficient_role` (MCP
+  `forge_update_project`) or `403` (REST `PATCH /api/v1/projects/{id}`) for
+  anyone else, including when the hook is already stored and unchanged, and
+  including an ownerless Project with no admin member. MCP
+  `forge_update_project_lifecycle_hooks` is no longer listed or callable for
+  a caller who can only see the Project or is a plain member, whatever hook
+  type it sends and whether the grant is bound to the Project or to the
+  account; plugin hooks can still be set through `settings`. Before, MCP let
+  any caller who could see an ownerless Project write a hook command, and
+  REST did not check.
 - **MCP agent ids must be usable by the caller.** `forge_assign_agent.agent_id`,
   `forge_create_sub_tasks.subtasks[].assignee_id` and
   `forge_follow_up_execution.agent_id` are refused unless the agent is usable in
