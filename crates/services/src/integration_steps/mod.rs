@@ -215,24 +215,30 @@ impl IntegrationSteps {
         }
         let outcome = match request.action {
             IntegrationStepAction::RequestCheck => self.request_check(step, &request).await?,
-            IntegrationStepAction::Settle => {
-                let evidence = self.reuse_review_check(&request).await?;
-                let check = if evidence.is_some() {
-                    settle::CheckInput::Passed(db::IntegrationCheckTiming::Skipped {
-                        reason: db::IntegrationCiSkipReason::TargetUnchanged,
-                    })
-                } else {
-                    settle::CheckInput::NotRequested
-                };
-                self.settle(
-                    Some(step),
-                    &request,
-                    &[S::AwaitingTaskStep],
-                    check,
-                    evidence.as_ref(),
-                )
-                .await?
-            }
+            IntegrationStepAction::Settle => match self.reuse_review_check(&request).await? {
+                settle::HeadReuse::Early => StepOutcome::Retry("attempt is not waiting yet".into()),
+                reuse => {
+                    let evidence = match reuse {
+                        settle::HeadReuse::Found(application) => Some(application),
+                        _ => None,
+                    };
+                    let check = if evidence.is_some() {
+                        settle::CheckInput::Passed(db::IntegrationCheckTiming::Skipped {
+                            reason: db::IntegrationCiSkipReason::TargetUnchanged,
+                        })
+                    } else {
+                        settle::CheckInput::NotRequested
+                    };
+                    self.settle(
+                        Some(step),
+                        &request,
+                        &[S::AwaitingTaskStep],
+                        check,
+                        evidence.as_deref(),
+                    )
+                    .await?
+                }
+            },
             IntegrationStepAction::SendBack => self.send_back(step, &request).await?,
             IntegrationStepAction::Park => self.park(step, &request).await?,
             IntegrationStepAction::Clear => self.clear(step, &request).await?,

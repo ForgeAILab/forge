@@ -3784,10 +3784,15 @@ async fn runtime_parallel_claimers_hold_one_head_and_queue_writers_never_move_it
         .run(tokio_util::sync::CancellationToken::new())
         .await;
     let running = production.run();
+    // The result step reports the Task `done`; the worker then closes the
+    // attempt on its next pass. Wait for both before the worker is stopped.
     eventually("all parallel siblings merge", || async {
         let mut done = true;
         for i in 0..6 {
             done &= world.task(&format!("parallel-{i}")).await.status == "done";
+        }
+        for attempt in &attempts {
+            done &= world.attempt(&attempt.id).await.state == S::Completed;
         }
         done
     })

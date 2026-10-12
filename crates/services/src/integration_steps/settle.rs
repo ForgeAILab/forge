@@ -860,6 +860,14 @@ impl CheckConsumerFamily for IntegrationCheckFamily {
     }
 }
 
+/// What the `settle` step of an unchanged head found to reuse.
+pub(crate) enum HeadReuse {
+    /// The step is ahead of the worker's transition: it retries.
+    Early,
+    None,
+    Found(Box<CheckApplication>),
+}
+
 impl IntegrationSteps {
     /// An unchanged reviewed commit needs no new run. Try the runner's real
     /// certified cache hit; a frozen/unattested policy retains the passed
@@ -867,25 +875,40 @@ impl IntegrationSteps {
     pub(crate) async fn reuse_review_check(
         &self,
         request: &IntegrationStepRequest,
-    ) -> Result<Option<CheckApplication>> {
+    ) -> Result<HeadReuse> {
         let Some(attempt) = self.db.integration_attempt(&request.attempt_id).await? else {
-            return Ok(None);
+            return Ok(HeadReuse::None);
         };
         // Only the step that will write this `effect_seq`'s answer records a
-        // reuse: a stale or already answered step writes no consumer.
-        if !matches!(
-            db::integration_step_position(
-                &attempt,
-                request.generation,
-                request.effect_seq,
-                true,
-                IntegrationStepAction::Settle.as_str(),
-                &[S::AwaitingTaskStep],
-            ),
-            IntegrationStepPosition::Due
+        // reuse: a stale or already answered step writes no consumer. A step
+        // that arrived before the worker's transition is early for the reuse
+        // too: it must not be settled by a second read that finds it due,
+        // or the permit would be written without the reuse and its evidence.
+        match db::integration_step_position(
+            &attempt,
+            request.generation,
+            request.effect_seq,
+            true,
+            IntegrationStepAction::Settle.as_str(),
+            &[S::AwaitingTaskStep],
         ) {
-            return Ok(None);
+            IntegrationStepPosition::Due => {}
+            IntegrationStepPosition::NotYet => return Ok(HeadReuse::Early),
+            IntegrationStepPosition::Answered | IntegrationStepPosition::Stale => {
+                return Ok(HeadReuse::None)
+            }
         }
+        Ok(match self.reuse_review_check_due(request, attempt).await? {
+            Some(application) => HeadReuse::Found(Box::new(application)),
+            None => HeadReuse::None,
+        })
+    }
+
+    async fn reuse_review_check_due(
+        &self,
+        request: &IntegrationStepRequest,
+        attempt: IntegrationAttempt,
+    ) -> Result<Option<CheckApplication>> {
         let Some(task) = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await? else {
             return Ok(None);
         };

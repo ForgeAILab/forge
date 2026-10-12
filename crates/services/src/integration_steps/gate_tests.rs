@@ -2030,7 +2030,9 @@ async fn a_parked_attempt_is_rebound_only_when_its_ready_placement_names_another
         current.available_at.is_some(),
         "Retry did not put the parked attempt back in line"
     );
-    world.set(&first.id, "state='parked',available_at=NULL").await;
+    world
+        .set(&first.id, "state='parked',available_at=NULL")
+        .await;
     sqlx::query("UPDATE workspace_placement SET state='ready' WHERE id=?")
         .bind(&placement)
         .execute(world.db.pool())

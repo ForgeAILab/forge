@@ -2514,7 +2514,9 @@ impl World {
     /// own, never a delivery that is applied a second time, and there is at
     /// most one of it per merging entry.
     async fn head_consumers_reuse_the_entry_run(&self, index: usize) -> Result<i64, String> {
-        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        /// Origin, run, result, applied at.
+        type Consumer = (String, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Consumer> = sqlx::query_as(
             "SELECT origin, run_id, result_id, applied_at FROM check_consumer
              WHERE task_id = ? ORDER BY created_at, rowid",
         )

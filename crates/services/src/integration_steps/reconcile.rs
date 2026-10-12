@@ -503,7 +503,19 @@ pub(crate) fn statement_stale(
     // extra writes for every phase. Released/suspended waits are exact.
     let waiting = matches!(snapshot["state"].as_str(), Some("parked" | "quarantined"))
         || (snapshot["state"] == "queued" && snapshot["queue_state"] != "open");
-    waiting && actual != &expected
+    // A deferral already stated for this attempt stands: its writer (the
+    // park step, the import continuation, the result step) chose the typed
+    // cause and message with facts this snapshot does not carry, and each of
+    // them restates when the attempt parks again. Restating it from the
+    // snapshot would replace that cause and alternate with its writer.
+    waiting
+        && match (actual, &expected) {
+            (
+                api_types::IntegrationReason::Deferred { .. },
+                api_types::IntegrationReason::Deferred { .. },
+            ) => false,
+            _ => actual != &expected,
+        }
 }
 
 impl crate::TaskService {
