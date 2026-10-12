@@ -3060,11 +3060,17 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
         .execute(world.db.pool())
         .await
         .unwrap();
+    let started = std::time::Instant::now();
     let admitted = world
         .service
         .admit_to_integration_queue("again")
         .await
         .expect("admitted without a conflict for the caller");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "re-admission finishes within 10 s: {:?}",
+        started.elapsed()
+    );
     assert_ne!(admitted.id, old.id);
     assert_eq!(admitted.expected_epoch, 1);
     let released = world.attempt(&old.id).await;
@@ -3095,13 +3101,17 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
     let merged = world.attempt(&admitted.id).await;
     assert_eq!(merged.integrated_sha.as_deref(), Some(rebased.as_str()));
     assert_eq!(merged.checks_commit_sha.as_deref(), Some(rebased.as_str()));
-    assert!(world
-        .db
-        .task_steps("again")
-        .await
-        .unwrap()
-        .iter()
-        .all(|step| step.status != "failed"));
+    let steps = world.db.task_steps("again").await.unwrap();
+    assert!(
+        steps.iter().all(|step| step.status != "failed"),
+        "{steps:?}"
+    );
+    assert!(
+        steps.iter().all(|step| step.attempts <= 2),
+        "no step needs more than two attempts: {steps:?}; old {:?}; new {:?}",
+        world.attempt(&old.id).await.phase_timings,
+        merged.phase_timings
+    );
 }
 
 /// The Task's target branch changed between two entries of `merging`: the
@@ -3606,6 +3616,189 @@ async fn a_cancelled_legacy_merge_that_landed_keeps_durable_evidence_after_hook_
     assert_eq!(world.task("cancelled").await.status, "cancelled");
 }
 
+/// The server's login shell gives no environment: review entry cannot
+/// identify its check. Its first attempts are the hooks step's own (the
+/// opened attempt and the checkpoint stay, nothing is shown). After
+/// `ENVIRONMENT_ATTEMPTS` the Task states the review-CI infrastructure
+/// interruption with its cause and a deferred re-entry; the unstarted Review
+/// attempt is discarded, and no check, consumer or failed Review exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_review_entry_without_an_environment_answer_retries_then_states_the_interruption() {
+    use crate::workflow::HookAction as _;
+    let mut world = World::new().await;
+    let _ = world.stop.send(true);
+    tokio::time::timeout(Duration::from_secs(10), world.step_worker.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE project SET primary_repo_id='r' WHERE id='p'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.legacy_task("silent", "silent.txt", "review").await;
+    let execution = world.seed_execution("silent", "executor", None).await;
+    review_ci(&world, "silent", &["true"]).await;
+    let _production = Production::new(&world);
+    crate::check_runner::policy::silence_login_shell_for_test(&world.db, true)
+        .await
+        .unwrap();
+    let project = db::ProjectRepo::get_by_id(&*world.db, "p")
+        .await
+        .unwrap()
+        .unwrap();
+    let task = world.task("silent").await;
+    let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &crate::worker_runtime::queue::cascade_actor(),
+    );
+    let state = workflow
+        .states
+        .iter()
+        .find(|state| state.name == "review")
+        .unwrap();
+    let ctx = crate::workflow::HookContext {
+        task_id: task.id.clone(),
+        project_id: "p".into(),
+        from_state: "in_progress".into(),
+        to_state: "review".into(),
+        db: world.db.clone(),
+        event_bus: world.bus.clone(),
+        gate_config: state.gate_config.clone(),
+        state_config: crate::workflow::engine::effective_state_config(
+            state,
+            Some(&project),
+            task.task_state_config.as_deref(),
+        ),
+        workflow: Arc::new(workflow),
+        project_version: Some(project.version),
+        project_workflow_definition: Some(project.workflow_definition),
+        triggered_by: crate::worker_runtime::queue::cascade_actor(),
+        merge_service: world.service.merge_service.clone(),
+        cleanup_scheduler: None,
+        task_service: world.service.clone(),
+        daemon_connections: None,
+        workspace_exec_locks: None,
+        terminal_activity: None,
+        workspace_root: world.temp.path().join("workspaces"),
+        repo_cache_locks: None,
+        workspace_backend_router: world.service.workspace_backend_router.clone(),
+        workspace_id: Some("w-silent".into()),
+        agent_id: None,
+        execution_id: Some(execution),
+    };
+    db::TaskStepRepo::enqueue_step(
+        &*world.db,
+        &db::EnqueueTaskStep {
+            kind: "hooks".to_owned(),
+            id: "silent-entry".to_owned(),
+            task_id: "silent".to_owned(),
+            payload_json: "{}".to_owned(),
+            causation_step_id: None,
+            causation_key: "silent-entry".to_owned(),
+            chain_id: "silent-entry".to_owned(),
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "long".to_owned(),
+            available_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    let attempt = |attempts: i64| {
+        let (db, ctx) = (world.db.clone(), &ctx);
+        async move {
+            sqlx::query("UPDATE task_step SET status='claimed',claimed_by='silent-test',lease_until=?,attempts=? WHERE id='silent-entry'")
+                .bind(db::task_writer::lease_deadline())
+                .bind(attempts)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let step = db::TaskStepRepo::task_steps(&*db, "silent")
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|step| step.id == "silent-entry")
+                .unwrap();
+            db.start_hook(&step, 0).await.unwrap();
+            // As the step worker runs it: under the Task's step lease.
+            db::task_writer::in_task_step(
+                step.clone(),
+                crate::workflow::engine::durable::in_hook(
+                    db.clone(),
+                    step,
+                    0,
+                    crate::workflow::actions::RunCiSteps.execute(ctx),
+                ),
+            )
+            .await
+        }
+    };
+    let count = |sql: &'static str| {
+        let db = world.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+    };
+    const OPEN_REVIEWS: &str = "SELECT COUNT(*) FROM review WHERE task_id='silent'";
+    const CHECKS: &str = "SELECT (SELECT COUNT(*) FROM check_run)+(SELECT COUNT(*) FROM check_consumer)+(SELECT COUNT(*) FROM check_environment_attestation)";
+
+    // An early attempt: the step asks again; the Task shows nothing.
+    let (early, wait) = attempt(1).await;
+    assert!(
+        matches!(&early, crate::workflow::HookResult::Failed { reason } if reason.contains("login shell did not report")),
+        "{early:?}"
+    );
+    assert!(wait.is_none());
+    assert_eq!(count(OPEN_REVIEWS).await, 1, "the opened attempt is kept");
+    assert_eq!(count(CHECKS).await, 0);
+    let quiet = world.task("silent").await;
+    assert_eq!(quiet.error_annotation, None);
+    assert_eq!(quiet.version, task.version);
+
+    // The last quiet attempt is spent: the interruption is stated.
+    let (stated, wait) = attempt(crate::worker_runtime::queue::ENVIRONMENT_ATTEMPTS).await;
+    assert!(
+        matches!(&stated, crate::workflow::HookResult::Failed { reason } if reason.contains("login shell did not report")),
+        "{stated:?}"
+    );
+    assert!(wait.is_none());
+    assert_eq!(
+        count(OPEN_REVIEWS).await,
+        0,
+        "no command ran: the attempt is not a Review and spends no review budget"
+    );
+    assert_eq!(count(CHECKS).await, 0);
+    let interrupted = world.task("silent").await;
+    assert_eq!(interrupted.status, "review");
+    let annotation: serde_json::Value =
+        serde_json::from_str(interrupted.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["type"], "before_work_hook_failed");
+    assert_eq!(annotation["blocking_reason"], "review_ci_infrastructure");
+    assert!(annotation["message"]
+        .as_str()
+        .unwrap()
+        .contains("login shell did not report"));
+    let metadata: serde_json::Value =
+        serde_json::from_str(interrupted.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        metadata["deferred_dispatch"]["target_state"], "review",
+        "the Task re-enters review by itself: {metadata}"
+    );
+    assert_eq!(
+        count("SELECT spent FROM task_budget WHERE task_id='silent' AND kind='review_ci_infrastructure'").await,
+        1
+    );
+    crate::check_runner::policy::silence_login_shell_for_test(&world.db, false)
+        .await
+        .unwrap();
+}
+
 /// Run real review-entry CI under the hooks lease, then enter the queue.
 /// The unchanged head must get a real Hit; changing the target changes the
 /// rebased commit and must produce one new run and Review evidence.
@@ -3613,6 +3806,10 @@ async fn a_cancelled_legacy_merge_that_landed_keeps_durable_evidence_after_hook_
 async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_evidence() {
     for moved in [false, true] {
         let mut world = World::new().await;
+        sqlx::query("CREATE TABLE test_check_identity_inputs(input_json TEXT NOT NULL)")
+            .execute(world.db.pool())
+            .await
+            .unwrap();
         let _ = world.stop.send(true);
         tokio::time::timeout(Duration::from_secs(10), world.step_worker.take().unwrap())
             .await
@@ -3719,6 +3916,39 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
         // What the step wrote is what the reviews endpoint parses.
         let typed: api_types::ReviewDetails = serde_json::from_str(&row).unwrap();
         if typed.execution.is_none() {
+            let probes = crate::check_runner::policy::probe_log::describe(&world.db).await;
+            let identities: Vec<String> = sqlx::query_scalar(
+                "SELECT input_json FROM test_check_identity_inputs ORDER BY rowid",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            let identities: Vec<Value> = identities
+                .iter()
+                .map(|raw| serde_json::from_str(raw).unwrap())
+                .collect();
+            let differing_fields: Vec<_> = identities
+                .windows(2)
+                .flat_map(|pair| {
+                    let mut fields = Vec::new();
+                    for field in ["project_id", "repo_id", "commit_sha"] {
+                        if pair[0][field] != pair[1][field] {
+                            fields.push(field.to_owned());
+                        }
+                    }
+                    for field in [
+                        "spec",
+                        "environment",
+                        "environment_identity",
+                        "execution_revision",
+                    ] {
+                        if pair[0]["inputs"][field] != pair[1]["inputs"][field] {
+                            fields.push(format!("inputs.{field}"));
+                        }
+                    }
+                    fields
+                })
+                .collect();
             let reviews: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT id,status,step_results_json FROM review WHERE task_id='evidence' ORDER BY attempt_number",
             )
@@ -3746,7 +3976,7 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             .await
             .unwrap();
             panic!(
-                "moved={moved}: no head-check evidence\nreviews {reviews:?}\nconsumers {consumers:?}\nsteps {steps:?}\nattempt ack {:?} timings {:?}",
+                "moved={moved}: no head-check evidence\ndiffering fields {differing_fields:?}\nidentity inputs {identities:#?}\nprobes {probes}\nreviews {reviews:?}\nconsumers {consumers:?}\nsteps {steps:?}\nattempt ack {:?} timings {:?}",
                 merged.effect_ack_json, merged.phase_timings
             );
         }
@@ -3779,6 +4009,9 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             std::fs::read_to_string(&counter).unwrap().lines().count(),
             if moved { 2 } else { 1 }
         );
+        let probes = crate::check_runner::policy::probe_log::count(&world.db).await;
+        assert_eq!(probes, 1, "moved={moved}: review entry + merge probe once");
+        eprintln!("moved={moved}: review entry + merge probes={probes}, check runs={runs}");
     }
 }
 

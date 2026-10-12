@@ -8474,12 +8474,12 @@ What two runs with the same identity can still differ in:
 | Ignored files (build output, installed dependencies) | In the identity, by worktree: a canonical spec is scoped to its workspace and placement generation (`CheckScope::Workspace`), so a result only ever answers for the worktree that produced it. Accepted limit: within that worktree, ignored files that changed since the run are not seen. The run is deliberately in the Task worktree and not in a clean checkout, because a cold build on every review is the cost this work removes. |
 | Commands, order, working directory, per-command limit, stop rule, policy revision | In the identity (the spec digest). |
 | Project environment values | In the identity twice: each declared key as an opaque salted revision, and the whole Project environment inside the environment revision below. |
-| The owner's inherited environment | In the identity: `environment_revision` is a salted digest over every variable a login shell on the owner exports, by name and value, minus the denylist below. Read by one login shell per request and once more by the owner right before the run. |
+| The owner's inherited environment | In the identity: `environment_revision` is a salted digest over every variable a login shell on the owner exports, by name and value, minus the denylist below. Read once per owner environment generation and retained as a durable salted revision; identity construction and owner execution reuse it. |
 | Shell version, OS, architecture | In the identity (`shell_revision`; `ServerCheckExecutionInputs::identity`). |
 | Forge version | In the identity: `runner_revision` is the policy name and the workspace version, so every release starts with no reusable result. |
 | Machine | Not named. Only the server owner runs the policy, and every digest is keyed with a salt that lives in this installation's database, so a result cannot be found from another installation. A database moved to another machine reuses a result only if the whole inherited environment is identical there. |
 | Tool versions behind an unchanged `PATH` | Accepted limit: not probed. A compiler upgraded in place is not seen until the Forge version, the environment or the commit changes. |
-| The login profile's own non-determinism | Accepted limit: the probe and each step run the profile separately. A profile that exports something different on each run makes every run a miss if it does so in an exported variable, and is not seen otherwise. |
+| The login profile's own non-determinism | The owner generation assumes stable exported profile inputs. Steps still run the login profile; a nondeterministic profile is outside the controlled-input reuse contract. Restart the server after changing its profile to renew the inherited answer. |
 | Time and network (a step that downloads `latest`, a test that depends on the date) | Accepted limit: not seen. There is no per-Project switch to turn reuse off yet; one would be an optional field of the review config and is left to the cutover, where it first has an effect. |
 | Machine build budget (five variables Forge adds when neither the operator nor the Project sets them) and niceness | Not in the identity: they bound how fast a step runs. If the operator, the profile or the Project sets one of the variables, that value is in the identity like any other. |
 | Whole-run wall limit | Not in the identity (fixed per run when scheduled). A run stopped by it is never reusable. |
@@ -8513,24 +8513,53 @@ every identity: stored results are not found again and nothing else happens.
 The probe's output is parsed in memory and never logged.
 
 **The login-shell probe** (`check_executor::inherited_environment`) costs one
-login shell, the same as one step, per request and per run. It is bounded at
-ten seconds and its process group is stopped when the bound passes. A profile
-that hangs, ends the shell early or prints more than 4 MiB makes the probe
-answer nothing: the request is then unattested, the check runs exactly as
-before and its result is not reusable (one warning is logged, with no
-values). The probe does not read the shell's exit status, because a logout
-script may replace it; it reads its own start and end marks, so profile and
-logout output around them is ignored.
+login shell per server/installation/environment generation, at first use. A
+server start creates a new generation; restarting also picks up changed exported login
+profile inputs. Generation ids choose the durable attestation
+row, not the check digest: equal observed inputs still give equal identities
+across restarts. Tool versions and profile-sourced mutable dependencies are not
+probed; an in-place tool upgrade behind unchanged exported values remains
+unseen, as before. **A profile change is not seen until the server restarts**:
+before this, every identity build read the profile again. Until the restart
+checks keep the identity read at start and an earlier pass is still reused.
 
-**A changed environment is a miss, never a refusal.** Right before a run the
-owner computes the environment revision again from what the steps are about
-to inherit. If it is not the one the request named (a Project value was
-edited while the run was queued, the server restarted into another
-environment, the login shell did not answer), the run still executes with the
-environment in force, as entry CI always did, and the receipt attests
-nothing. `validate_receipt` accepts an unattested canonical receipt as a
-verdict and marks it not reusable; it still refuses a receipt that attests
-something other than the request named.
+The probe is bounded at ten seconds and its process group is stopped when the
+bound passes. It returns a typed reason for a timeout, incomplete output,
+excess output or failure to start. A missing answer returns
+`ReviewError::CheckEnvironmentUnavailable` (carried by `ServiceError::Review`,
+REST `503 check_environment_unavailable`) before an identity or consumer is
+admitted. No `NotAttested` identity is substituted, no check executes before
+the answer exists, and no passing Review can lose head evidence through a
+probe timeout. What the Task does without an answer:
+
+| Where | Bounded by | Landing |
+|---|---|---|
+| Review entry (`run_ci_steps`, automatic or the owner's re-run) | `ENVIRONMENT_ATTEMPTS` (4) attempts of the hooks step, 1 s doubling back-off; the opened attempt and the hook checkpoint stay | The unstarted Review attempt is discarded (no Review, no review budget) and the Task states `before_work_hook_failed` / `review_ci_infrastructure` with the cause. It re-enters review on the `review_ci_infrastructure` budget's back-off (5 entries); then `review_ci_infrastructure_exhausted` with `retry_hook` and an attention item. |
+| Merge head (`request_check`, `settle` reuse) | the Task-step transient rule: 8 attempts, 1 s doubling to 64 s; then the queue asks the step again `step_reasks` times | The attempt parks as `task_step_failed`; the step's `last_error` and the Task's `cascade_failed` annotation carry the cause. |
+
+The first complete answer is stored in `check_environment_attestation`, keyed
+by owner, environment generation and salt revision. Installation/generation
+single-flight also covers independently composed DB handles: concurrent identity
+builders do one successful probe and re-read its stored answer. The row holds
+only salted digests (the inherited environment and the shell version), never a
+name or a value; rows of generations that ended more than 30 days ago are
+removed when a new one is stored. Identity construction and owner execution reuse that answer and do no
+shell spawn. An unchanged Task's review entry plus merge previously used three
+probes (entry identity, owner execution, head identity); a rebased head used
+four. Both now use one on a cold generation and zero on a warm generation.
+Project values are combined with the stored inherited revision under the
+`forge.check-execution-environment/2` digest schema. Old digests simply miss.
+The probe reads its own start/end marks and ignores the shell exit status,
+which a logout script may replace.
+
+**A changed Project environment is a miss.** Right before a run the owner
+combines the stored inherited revision with the current Project values again.
+If it is not the request's environment revision, the run still executes with
+the Project environment in force and its receipt attests nothing.
+`validate_receipt` accepts that receipt as a verdict and marks it not reusable;
+it still refuses a receipt that attests something other than the request named.
+A lost salt invalidates the stored answer's salt key and renews the attestation.
+Frozen policies and a dirty checkout remain explicitly uncacheable.
 
 **The process tree is stopped when the run ends**, not after each step. Each
 step runs in its own process group and its descendants are left running when

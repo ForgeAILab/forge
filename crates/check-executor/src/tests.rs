@@ -721,7 +721,10 @@ async fn the_environment_probe_survives_a_noisy_profile_and_a_clobbered_exit_cod
     );
     // A profile that ends the shell before it answers: nothing is attested.
     std::fs::write(home.path().join(".bash_profile"), "exit 0\n").unwrap();
-    assert!(probe_environment(Some(home.path())).await.is_none());
+    assert_eq!(
+        probe_environment(Some(home.path())).await.err(),
+        Some(ProbeUnanswered::Incomplete)
+    );
 }
 /// Plan 3.4 F: a compiler wrapper the operator's own login environment
 /// names is inherited environment and stays in the identity, by value.

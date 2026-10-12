@@ -6069,3 +6069,92 @@ async fn registry_doctrine_cutover_adds_revisions_and_keeps_history_on_a_file_da
     let _ = fs::remove_file(&db_path);
     let _ = fs::remove_dir_all(&migration_dir);
 }
+
+/// `V202610120637` adds the owner environment attestation table to a
+/// populated file database and changes nothing else. The table holds opaque
+/// revisions only, and applying the bundle again is a no-op.
+#[tokio::test]
+async fn check_environment_attestation_migration_is_additive_on_a_file_database() {
+    let migration_dir = unique_temp_path("attestation-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration dir creates");
+    copy_migrations_up_to(202610120418, &migration_dir);
+    let db_path = unique_temp_path("attestation-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("migrations before the attestation apply");
+    assert!(!table_exists(&pool, "check_environment_attestation").await);
+    let now = "2026-10-12T00:00:00Z";
+    sqlx::query("INSERT INTO system_setting(key,value,updated_at) VALUES('check_value_revision_salt','existing-salt',?)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("an installation's salt exists before the migration");
+    let schema = |pool: db::SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT group_concat(type||':'||name||':'||COALESCE(sql,''),char(10)) FROM (SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE '%check_environment_attestation%' ORDER BY type,name)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("schema reads")
+    };
+    let before = schema(pool.clone()).await;
+
+    let all = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &all)
+        .await
+        .expect("the attestation migration applies to an existing database");
+    run_migrations_from(&pool, &all)
+        .await
+        .expect("applying the bundle again changes nothing");
+    assert_eq!(before, schema(pool.clone()).await);
+    let salt: String = sqlx::query_scalar(
+        "SELECT value FROM system_setting WHERE key='check_value_revision_salt'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("salt reads");
+    assert_eq!(salt, "existing-salt");
+    let columns: Vec<String> = sqlx::query("PRAGMA table_info(check_environment_attestation)")
+        .fetch_all(&pool)
+        .await
+        .expect("columns read")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    assert_eq!(
+        columns,
+        [
+            "owner_id",
+            "environment_generation",
+            "salt_revision",
+            "inherited_revision",
+            "shell_revision",
+            "created_at"
+        ]
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_environment_attestation")
+        .fetch_one(&pool)
+        .await
+        .expect("rows read");
+    assert_eq!(
+        rows, 0,
+        "the first identity build of the new process attests"
+    );
+    // The first answer of a generation is the one every reader gets.
+    let store = db::SqliteDb::new(pool.clone());
+    let answer = db::CheckEnvironmentAttestation {
+        inherited_revision: "a".repeat(64),
+        shell_revision: "b".repeat(64),
+    };
+    let stored = store
+        .store_check_environment_attestation("server", "generation", "salt-revision", &answer)
+        .await
+        .expect("answer stores");
+    assert_eq!(stored, answer);
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}
