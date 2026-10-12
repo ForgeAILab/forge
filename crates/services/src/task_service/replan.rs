@@ -56,8 +56,9 @@ impl TaskService {
     }
 
     /// Park `root` where it is: its lead may not plan again in this budget
-    /// window. The owner's retry with a fresh budget, or acting on the
-    /// subtask directly, is the way on.
+    /// window. The retry with a fresh budget on the root is the way on.
+    /// Acting on the subtask alone does not release the root: a blocked
+    /// root holds its subtasks (`parent { cause: blocked }`).
     pub(crate) async fn block_replan_exhausted(&self, root: &Task, trigger: &str) -> Result<Task> {
         let message = format!(
             "{REPLAN_EXHAUSTED_REASON}: the lead of this root already re-planned {} times; {trigger}",

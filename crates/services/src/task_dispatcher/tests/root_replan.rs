@@ -810,3 +810,45 @@ async fn the_wake_rule_holds_on_an_unreadable_root_and_releases_a_missing_one() 
         "an unreadable root holds the wake; it does not wake the Project Agent on a guess"
     );
 }
+
+/// Stage 2 gives the lead no tool that changes the breakdown, so a re-plan
+/// after a rejected review adds no work. The root must not rest anywhere on
+/// the way: its lead runs once, it implements with its sequence still
+/// complete, and it goes back to its aggregate review, where the Review
+/// budget bounds the loop. One re-plan and one rejection were charged.
+#[tokio::test]
+async fn a_lead_that_adds_no_work_sends_the_root_back_to_its_aggregate_review() {
+    let lead = lead_fixture(true).await;
+    let root = root_with_failed_review(&lead, true).await;
+    until(&lead, "the root is reviewed again", async || {
+        let entries = log(&lead, &root.id).await;
+        entries
+            .iter()
+            .any(|(from, to, _)| from == "planning" && to == "in_progress")
+            && entries.iter().any(|(from, to, _)| {
+                from == "in_progress" && to != "planning" && to != "in_progress"
+            })
+            && entries.iter().filter(|(_, to, _)| to == "review").count() >= 2
+    })
+    .await;
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    assert_eq!(spent(&lead, &root.id, "review").await, 1);
+    assert_eq!(
+        executions(&lead.db, &root.id)
+            .await
+            .iter()
+            .filter(|(role, _)| role == PLANNER)
+            .collect::<Vec<_>>(),
+        vec![&(PLANNER.to_owned(), "completed".to_owned())]
+    );
+    assert_eq!(
+        log(&lead, &root.id)
+            .await
+            .iter()
+            .filter(|(_, to, _)| to == "planning")
+            .count(),
+        1,
+        "the reviewed-again root does not re-plan for the old rejection: {:?}",
+        log(&lead, &root.id).await
+    );
+}

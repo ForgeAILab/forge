@@ -909,33 +909,43 @@ fn lead_decides_failure(kind: api_types::FailureKind) -> bool {
 /// a later one. A park that records no time is not re-planned.
 pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
     let condition = decision_condition(child);
-    let since = match &condition {
-        db::TaskCondition::Parked { primary, since, .. } => {
-            // The park's own reason decides, not a blocker recorded beside a
-            // wait that ends by itself or belongs to the owner.
-            if !matches!(
-                primary,
-                db::ParkReason::Failure { .. }
-                    | db::ParkReason::AgentTimeout { .. }
-                    | db::ParkReason::BudgetExhausted { .. }
-                    | db::ParkReason::EntryBlocked { .. }
-                    | db::ParkReason::Dependencies {
-                        cancelled: true,
-                        ..
-                    }
-            ) {
-                return None;
-            }
-            since.clone()
-        }
-        db::TaskCondition::Failed { since, .. } => since.clone(),
+    // The park's own reason decides, not a blocker recorded beside a wait
+    // that ends by itself or belongs to the owner.
+    let (reason, since) = match &condition {
+        db::TaskCondition::Parked { primary, since, .. } => (primary, since.clone()),
+        db::TaskCondition::Failed { failure, since, .. } => (failure, since.clone()),
         _ => return None,
     };
+    let decides = match reason {
+        db::ParkReason::Failure { failure_kind } => lead_decides_failure(*failure_kind),
+        db::ParkReason::AgentTimeout { .. }
+        | db::ParkReason::EntryBlocked { .. }
+        | db::ParkReason::Dependencies {
+            cancelled: true, ..
+        } => true,
+        // The subtask's attempts or its own gate ran out. A merge repair, a
+        // review-infrastructure or a re-plan budget is not a subtask's work.
+        db::ParkReason::BudgetExhausted { budget_kind, .. } => !matches!(
+            budget_kind,
+            Some(
+                db::budget::Kind::MergeFix
+                    | db::budget::Kind::ReviewCiInfrastructure
+                    | db::budget::Kind::Replan
+            )
+        ),
+        _ => false,
+    };
+    if !decides {
+        return None;
+    }
     let read = condition.read();
+    // The kind shown beside the park also has to be the lead's. A kind this
+    // build cannot name (`Unknown`, which is also how a timeout reads) says
+    // nothing either way; the reason above already decided.
     if !(read.hard_failure || read.interruption_present)
-        || read
-            .failure_kind
-            .is_some_and(|kind| !lead_decides_failure(kind))
+        || read.failure_kind.is_some_and(|kind| {
+            kind != api_types::FailureKind::Unknown && !lead_decides_failure(kind)
+        })
         || read.queued_command
     {
         return None;
@@ -1250,7 +1260,14 @@ mod replan_tests {
     #[test]
     fn a_park_the_lead_cannot_fix_is_not_replanned() {
         let at = "2026-10-12T01:00:00Z";
-        for kind in ["retry_exhausted", "executor_failed", "max_turns_exceeded"] {
+        for kind in [
+            "retry_exhausted",
+            "executor_failed",
+            "max_turns_exceeded",
+            "agent_timeout",
+            "ci_failed",
+            "workflow_guard_rejected",
+        ] {
             assert_eq!(
                 subtask_decision_park(&parked("child", at, kind)).as_deref(),
                 Some(at),
@@ -1276,6 +1293,7 @@ mod replan_tests {
             "workflow_loop",
             "environment_not_ready",
             "manual_stop",
+            "merge_fix_budget_exhausted",
             "some_kind_a_later_release_adds",
         ] {
             assert_eq!(

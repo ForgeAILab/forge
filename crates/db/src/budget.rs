@@ -25,7 +25,9 @@ pub enum Kind {
     /// A coordination root's entries into its planning state after kickoff:
     /// one per rejected aggregate review and one per parked subtask. Charged
     /// only on a root that has a lead, so it is not in [`Kind::PERSISTED`]:
-    /// no row exists, and nothing is projected, for any other Task.
+    /// no row exists, and nothing is projected, for any other Task. Its
+    /// limit is fixed ([`Kind::default_limit`]): `retry_budgets` does not
+    /// configure it, in any config, like the other system-owned kinds.
     Replan,
 }
 impl Kind {
@@ -1070,6 +1072,56 @@ mod tests {
         let db = SqliteDb::new(pool);
         let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
         (db, task)
+    }
+
+    /// The re-plan limit is fixed: no `retry_budgets` value, Task-wide or
+    /// per state, changes it, and what is projected is counted against it.
+    #[tokio::test]
+    async fn the_replan_limit_is_fixed_and_projected_only_once_spent() {
+        let (db, mut task) = fixture().await;
+        task.task_state_config = Some(
+            json!({"retry_budgets":{"replan":1},"in_progress":{"retry_budgets":{"replan":9}}})
+                .to_string(),
+        );
+        let merged = json!({"retry_budgets":{"replan":9}});
+        assert_eq!(limit(&task, Kind::Replan, None, None).unwrap(), 5);
+        assert_eq!(limit(&task, Kind::Replan, Some(&merged), None).unwrap(), 5);
+        assert!(!Kind::PERSISTED.contains(&Kind::Replan));
+        let workflow = WorkflowDefinition::default();
+        let before = projection(
+            &task,
+            &workflow,
+            &load(db.pool(), &task.id).await.unwrap(),
+            3,
+        )
+        .unwrap();
+        assert!(!before.contains_key("replan"), "{before:?}");
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(
+            charge(&mut tx, &task.id, "replan", 5, "replan:child:park")
+                .await
+                .unwrap()
+                .charged
+        );
+        tx.commit().await.unwrap();
+        assert!(
+            receipt_recorded(db.pool(), &task.id, "replan", "replan:child:park")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !receipt_recorded(db.pool(), &task.id, "replan", "replan:child:other")
+                .await
+                .unwrap()
+        );
+        let after = projection(
+            &task,
+            &workflow,
+            &load(db.pool(), &task.id).await.unwrap(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(after.get("replan"), Some(&4), "{after:?}");
     }
 
     #[tokio::test]
