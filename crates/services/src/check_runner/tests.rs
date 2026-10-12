@@ -3154,12 +3154,20 @@ async fn nothing_is_reused_when_the_commit_spec_environment_or_policy_differs() 
 
     // Another value of a variable the steps inherit from the owner.
     std::env::set_var(INHERITED, "two");
+    // An owner restart observes the changed inherited inputs in a new
+    // generation; identity builds do not re-probe inside a generation.
+    super::policy::renew_environment_generation_for_test(&f.store)
+        .await
+        .unwrap();
     let inherited = f.request("inherited", &step).await;
     assert_ne!(inherited.identity.key().unwrap(), base_key);
     let run = scheduled_fresh(f.ask(inherited).await);
     assert!(f.drive(&run).await.cacheable);
     assert_eq!(f.executions(), 4);
     std::env::set_var(INHERITED, "one");
+    super::policy::renew_environment_generation_for_test(&f.store)
+        .await
+        .unwrap();
 
     // An environment identity this owner does not have (a request stated
     // before a restart into another environment). The run still executes and
@@ -3223,6 +3231,9 @@ async fn a_step_inherits_the_owner_environment_and_a_moved_environment_is_only_a
     let queued = scheduled(f.ask(f.request("queued", &step).await).await);
     assert!(queued.cacheable);
     std::env::set_var(INHERITED, "two");
+    super::policy::renew_environment_generation_for_test(&f.store)
+        .await
+        .unwrap();
     let verdict = f.drive(&queued).await;
     assert_eq!(verdict.outcome, CheckResultOutcome::Pass);
     assert!(verdict.certified && !verdict.cacheable);
@@ -3230,6 +3241,9 @@ async fn a_step_inherits_the_owner_environment_and_a_moved_environment_is_only_a
     let now = f.ask(f.request("after", &step).await).await;
     assert!(matches!(now.outcome, CheckRequestOutcome::Scheduled(_)));
     std::env::set_var(INHERITED, "one");
+    super::policy::renew_environment_generation_for_test(&f.store)
+        .await
+        .unwrap();
     let back = f.ask(f.request("back", &step).await).await;
     assert!(matches!(&back.outcome, CheckRequestOutcome::Scheduled(run) if run.id != queued.id));
     assert_eq!(f.executions(), 2);

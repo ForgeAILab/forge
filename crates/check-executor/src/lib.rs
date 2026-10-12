@@ -93,19 +93,53 @@ const PROBE_START: &str = "forge-inherited-environment-start";
 const PROBE_END: &str = "forge-inherited-environment-end";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Why a probe gave no environment. Never carries a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeUnanswered {
+    /// The login shell could not be started or supervised.
+    NotStarted(String),
+    /// The shell was still running when [`PROBE_TIMEOUT`] passed.
+    TimedOut,
+    /// The shell printed more than the probe reads.
+    OutputTooLarge,
+    /// The shell ended without the probe's complete answer (a profile that
+    /// exits early, or output that is not text).
+    Incomplete,
+}
+impl std::fmt::Display for ProbeUnanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted(error) => write!(f, "the login shell did not start: {error}"),
+            Self::TimedOut => write!(
+                f,
+                "the login shell did not answer within {} s",
+                PROBE_TIMEOUT.as_secs()
+            ),
+            Self::OutputTooLarge => {
+                f.write_str("the login shell printed more than the probe reads")
+            }
+            Self::Incomplete => f.write_str("the login shell ended before it answered"),
+        }
+    }
+}
+static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many login-shell probes this process has started.
+pub fn environment_probes() -> u64 {
+    PROBES.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Read the inherited environment. One login shell per call, at most
 /// [`PROBE_TIMEOUT`]; its process group is stopped when the bound passes.
 ///
-/// `None` when the shell did not answer completely (a profile that hangs,
-/// exits early or prints more than the bound). The caller then attests
-/// nothing and the run is not reusable; steps run as they always did. The
-/// shell's exit status is deliberately not read: a logout script may replace
-/// it. Values are never logged.
-pub async fn inherited_environment() -> Option<InheritedEnvironment> {
+/// An error when the shell did not answer completely (a profile that hangs,
+/// exits early or prints more than the bound). The shell's exit status is
+/// deliberately not read: a logout script may replace it. Values are never
+/// logged.
+pub async fn inherited_environment() -> Result<InheritedEnvironment, ProbeUnanswered> {
     probe_environment(None).await
 }
 /// `home` replaces the inherited `HOME`, so a test can supply a profile.
-async fn probe_environment(home: Option<&Path>) -> Option<InheritedEnvironment> {
+async fn probe_environment(home: Option<&Path>) -> Result<InheritedEnvironment, ProbeUnanswered> {
+    PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // `compgen -e`: the exported names. Works on bash 3.2.
     let script = format!(
         "printf '%s\\0' {PROBE_START} \"$BASH_VERSION\"; for k in $(compgen -e); do printf '%s=%s\\0' \"$k\" \"${{!k}}\"; done; printf '%s\\0' {PROBE_END}"
@@ -128,13 +162,18 @@ async fn probe_environment(home: Option<&Path>) -> Option<InheritedEnvironment> 
         process_supervisor::CompletionPolicy::StopDescendants,
     )
     .await
-    .ok()?;
-    if output.termination != process_supervisor::Termination::Exited || output.stdout_truncated {
-        return None;
+    .map_err(|error| ProbeUnanswered::NotStarted(error.to_string()))?;
+    if output.termination != process_supervisor::Termination::Exited {
+        return Err(ProbeUnanswered::TimedOut);
     }
+    if output.stdout_truncated {
+        return Err(ProbeUnanswered::OutputTooLarge);
+    }
+    parse_probe(&output.stdout).ok_or(ProbeUnanswered::Incomplete)
+}
+fn parse_probe(stdout: &[u8]) -> Option<InheritedEnvironment> {
     // A profile may print before the probe does, and a logout script after.
-    let mut fields = output
-        .stdout
+    let mut fields = stdout
         .split(|byte| *byte == 0)
         .skip_while(|field| !field.ends_with(PROBE_START.as_bytes()));
     fields.next()?;

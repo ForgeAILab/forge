@@ -3060,11 +3060,17 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
         .execute(world.db.pool())
         .await
         .unwrap();
+    let started = std::time::Instant::now();
     let admitted = world
         .service
         .admit_to_integration_queue("again")
         .await
         .expect("admitted without a conflict for the caller");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "re-admission finishes within 10 s: {:?}",
+        started.elapsed()
+    );
     assert_ne!(admitted.id, old.id);
     assert_eq!(admitted.expected_epoch, 1);
     let released = world.attempt(&old.id).await;
@@ -3095,13 +3101,17 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
     let merged = world.attempt(&admitted.id).await;
     assert_eq!(merged.integrated_sha.as_deref(), Some(rebased.as_str()));
     assert_eq!(merged.checks_commit_sha.as_deref(), Some(rebased.as_str()));
-    assert!(world
-        .db
-        .task_steps("again")
-        .await
-        .unwrap()
-        .iter()
-        .all(|step| step.status != "failed"));
+    let steps = world.db.task_steps("again").await.unwrap();
+    assert!(
+        steps.iter().all(|step| step.status != "failed"),
+        "{steps:?}"
+    );
+    assert!(
+        steps.iter().all(|step| step.attempts <= 2),
+        "no step needs more than two attempts: {steps:?}; old {:?}; new {:?}",
+        world.attempt(&old.id).await.phase_timings,
+        merged.phase_timings
+    );
 }
 
 /// The Task's target branch changed between two entries of `merging`: the
@@ -3613,6 +3623,10 @@ async fn a_cancelled_legacy_merge_that_landed_keeps_durable_evidence_after_hook_
 async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_evidence() {
     for moved in [false, true] {
         let mut world = World::new().await;
+        sqlx::query("CREATE TABLE test_check_identity_inputs(input_json TEXT NOT NULL)")
+            .execute(world.db.pool())
+            .await
+            .unwrap();
         let _ = world.stop.send(true);
         tokio::time::timeout(Duration::from_secs(10), world.step_worker.take().unwrap())
             .await
@@ -3719,6 +3733,39 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
         // What the step wrote is what the reviews endpoint parses.
         let typed: api_types::ReviewDetails = serde_json::from_str(&row).unwrap();
         if typed.execution.is_none() {
+            let probes = crate::check_runner::policy::probe_log::describe(&world.db).await;
+            let identities: Vec<String> = sqlx::query_scalar(
+                "SELECT input_json FROM test_check_identity_inputs ORDER BY rowid",
+            )
+            .fetch_all(world.db.pool())
+            .await
+            .unwrap();
+            let identities: Vec<Value> = identities
+                .iter()
+                .map(|raw| serde_json::from_str(raw).unwrap())
+                .collect();
+            let differing_fields: Vec<_> = identities
+                .windows(2)
+                .flat_map(|pair| {
+                    let mut fields = Vec::new();
+                    for field in ["project_id", "repo_id", "commit_sha"] {
+                        if pair[0][field] != pair[1][field] {
+                            fields.push(field.to_owned());
+                        }
+                    }
+                    for field in [
+                        "spec",
+                        "environment",
+                        "environment_identity",
+                        "execution_revision",
+                    ] {
+                        if pair[0]["inputs"][field] != pair[1]["inputs"][field] {
+                            fields.push(format!("inputs.{field}"));
+                        }
+                    }
+                    fields
+                })
+                .collect();
             let reviews: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT id,status,step_results_json FROM review WHERE task_id='evidence' ORDER BY attempt_number",
             )
@@ -3746,7 +3793,7 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             .await
             .unwrap();
             panic!(
-                "moved={moved}: no head-check evidence\nreviews {reviews:?}\nconsumers {consumers:?}\nsteps {steps:?}\nattempt ack {:?} timings {:?}",
+                "moved={moved}: no head-check evidence\ndiffering fields {differing_fields:?}\nidentity inputs {identities:#?}\nprobes {probes}\nreviews {reviews:?}\nconsumers {consumers:?}\nsteps {steps:?}\nattempt ack {:?} timings {:?}",
                 merged.effect_ack_json, merged.phase_timings
             );
         }
@@ -3779,6 +3826,9 @@ async fn entry_ci_and_head_ci_share_identity_reuse_a_real_hit_and_record_review_
             std::fs::read_to_string(&counter).unwrap().lines().count(),
             if moved { 2 } else { 1 }
         );
+        let probes = crate::check_runner::policy::probe_log::count(&world.db).await;
+        assert_eq!(probes, 1, "moved={moved}: review entry + merge probe once");
+        eprintln!("moved={moved}: review entry + merge probes={probes}, check runs={runs}");
     }
 }
 

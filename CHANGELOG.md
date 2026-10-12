@@ -8,6 +8,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Check identities use a durable owner environment attestation.** Review
+  entry and merge reuse one complete login-shell answer per server environment
+  generation, removing repeated probes and load-dependent identity drift. An
+  absent answer fails typed and retries before admitting a check, instead of
+  building `NotAttested` and silently losing head-check Review evidence. A
+  server restart renews the generation; Project environment changes still
+  invalidate reuse. The environment digest schema changes, so older cached
+  checks miss once. The additive attestation migration preserves existing data
+  and stores only salted revisions and the shell version.
+
 - **A dirty Task checkout returns to its coder through the merge-fix budget.**
   The queue uses the same failure/cascade path as the pre-queue merge hook,
   rather than parking the Task for its owner. A red head check also charges

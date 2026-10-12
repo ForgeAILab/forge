@@ -260,6 +260,14 @@ impl WorkflowExecution<'_> {
             return Ok(DurableHook::Suspend(suspension));
         }
         if let HookResult::Failed { reason } = &result {
+            if hook.action == "run_ci_steps" && transient.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // No identity or consumer was admitted. Keep the hook's
+                // effects open and retry its environment initialization.
+                return Err(ServiceError::Review(
+                    ::review::ReviewError::CheckEnvironmentUnavailable,
+                ));
+            }
             if hook.action == "run_merge" && transient.load(std::sync::atomic::Ordering::Relaxed) {
                 // Leave the checkpoint open: the retried step resumes this
                 // hook from its recorded effects.

@@ -32,6 +32,10 @@ pub struct StepResult {
 
 #[derive(Debug, Error)]
 pub enum ReviewError {
+    /// No check may be admitted until the owner has a complete answer.
+    #[error("check environment attestation unavailable; retry before building a check identity")]
+    CheckEnvironmentUnavailable,
+
     #[error("workspace owner unavailable: daemon {daemon_id}")]
     OwnerUnavailable { daemon_id: String },
 

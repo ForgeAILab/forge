@@ -860,7 +860,12 @@ impl TaskStepWorker {
             self.settle(step, "superseded", Some(&error.to_string()), false)
                 .await
         } else if step.attempts < MAX_STEP_ATTEMPTS
-            && (database_busy(error) || (step.kind != "hooks" && retryable(error)))
+            && (database_busy(error)
+                || matches!(
+                    error,
+                    ServiceError::Review(::review::ReviewError::CheckEnvironmentUnavailable)
+                )
+                || (step.kind != "hooks" && retryable(error)))
         {
             // A hook that found the database busy wrote nothing in that
             // statement: it runs again from its checkpoints, as it does

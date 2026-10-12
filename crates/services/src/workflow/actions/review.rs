@@ -938,7 +938,15 @@ async fn request_entry_check(
         },
     )
     .await
-    .map_err(|error| failed(error.to_string()))?
+    .map_err(|error| {
+        if matches!(
+            error,
+            crate::ServiceError::Review(::review::ReviewError::CheckEnvironmentUnavailable)
+        ) {
+            crate::workflow::engine::durable::note_hook_failure(&ctx.task_id, &error);
+        }
+        failed(error.to_string())
+    })?
     else {
         return Ok(EntryCheck::NothingToRun);
     };
