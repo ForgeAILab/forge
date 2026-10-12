@@ -9,33 +9,42 @@ run, because a release tag needs a successful run on its exact commit.
 
 ## Rust jobs
 
-The Rust gates run as five parallel jobs, then one job that sums them up:
+The Rust gates run as seven parallel jobs, then one job that sums them up:
 
 | Job | Runs |
 | --- | --- |
 | `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
-| `Rust test (services)` | `cargo test -p services --all-targets --no-fail-fast` |
+| `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service::` |
+| `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service::` |
+| `Rust test (services-integration)` | `cargo test -p services --test '*' --examples --no-fail-fast -- --test-threads=4` |
 | `Rust test (api)` | `cargo test -p api --all-targets --no-fail-fast` |
 | `Rust test (db)` | `cargo test -p db --all-targets --no-fail-fast` |
 | `Rust test (rest)` | `cargo test --workspace --exclude services --exclude api --exclude db --all-targets --no-fail-fast` |
-| `Rust` | no work of its own; succeeds only if the five jobs above succeeded |
+| `Rust` | no work of its own; succeeds only if the seven jobs above succeeded |
 
 `Rust` is the name to use in branch protection. It also runs when a job it
 needs failed, was cancelled or was skipped, and fails in each of those cases.
 The matrix sets `fail-fast: false` and every shard keeps `--no-fail-fast`, so
 one red run still lists every failure.
 
-Each test job runs `./scripts/ci-rust.sh test <shard>`. The packages of a shard
-are written down once, in `scripts/ci_rust_shards.py`. `rest` is defined by
+Each test job runs `./scripts/ci-rust.sh test <shard>`. Its packages, targets
+and libtest filters are written down once, in `scripts/ci_rust_shards.py`.
+`rest` is defined by
 exclusion, so a new crate is tested there without an edit. The lint job runs
 `python3 scripts/ci_rust_shards.py check`, which reads `cargo metadata` and
-fails unless every workspace package is tested by exactly one shard, every
-package a shard names exists (cargo only warns about an unknown `--exclude`),
-and the workflow matrix lists exactly the shards the script defines. It prints
+fails unless every workspace package is covered, every package a shard names
+exists (cargo only warns about an unknown `--exclude`), and the workflow matrix
+lists exactly the shards the script defines. Services is the only partitioned
+package: its lib filters must be exact complements and its integration shard
+uses `--test '*' --examples`, because `--tests` also runs lib tests. This
+retains the example targets previously built by `--all-targets`; a new services
+bin or benchmark fails the check until it is assigned. Other packages
+remain in exactly one shard with `--all-targets`. It prints
 the package-to-shard table and compiles nothing, so it also runs locally.
 
-Run locally, `./scripts/ci-rust.sh` without arguments is unchanged: fmt, clippy
-and `cargo test --workspace --all-targets --no-fail-fast` in one pass.
+Run locally, `./scripts/ci-rust.sh` without arguments still runs fmt, clippy
+and `cargo test --workspace --all-targets --no-fail-fast` in one pass. Like
+the shards, its test stage now explicitly uses `--test-threads=4`.
 
 A shard resolves Cargo features for its own packages, where the single
 workspace run unified them across all members. The workspace's own test
@@ -58,7 +67,8 @@ runtime threads. With the default 2 MiB a deep dispatch future aborts the whole
 test binary on Linux, and the tests after it never run.
 
 CI builds with `CARGO_PROFILE_DEV_DEBUG=line-tables-only` (and the same for
-the test profile). The workspace links about 200 integration-test binaries;
+the test profile). After DB/services consolidation, the workspace still links
+over 100 integration-test binaries;
 with full debug info they fill the hosted runner's disk and the linker fails
 with `ld terminated with signal 7 [Bus error]`. Panics and backtraces still
 show file and line. The two variables are set in the job-level `env:` of the
@@ -220,9 +230,58 @@ first build. Cache misses pay this cost once; test execution avoids replay
 for subsequent fresh databases in each process.
 
 Each integration test binary is a separate process and pays for its own first
-replay. A shared testkit crate and per-crate integration binary consolidation
-are follow-ups; neither is part of the template change. Full workspace test
-execution remains a CI responsibility.
+replay. DB integration files now share `tests/main.rs`, with their original
+file stems as modules under `tests/suite/`. Services uses the same layout,
+except `project_provisioning_characterization` stays in a separate binary:
+its scaffold tests mutate `FORGE_SCAFFOLD_COMMAND` under their existing lock.
+`main_project_create_command` also stays separate to preserve its shared
+turn-log root and optional capture fixtures. Other fixtures use isolated pools,
+unique temporary paths, immutable statics or atomic filename counters. The
+API integration layout is unchanged. Full workspace test execution remains
+a CI responsibility.
+
+## Services unit split and integration inventory
+
+The two services unit shards share one filter constant in
+`scripts/ci_rust_shards.py`: `task_service::` and its exact `--skip` twin.
+All test shards use four libtest threads. The green CI run
+[38219902459](https://github.com/ForgeAILab/forge/actions/runs/38219902459)
+recorded 508.55 seconds for services lib tests. Inferring start times from
+libtest's alphabetical queue and the timestamped completions on four workers,
+then replaying the two queues separately, estimates 366.5 / 391.6 seconds
+(6.8% apart). These are estimates from observed durations, including contention
+and log batching, not instrumented per-test timings. Test counts alone
+(408 / 1808 including ignored tests in that run) would give a misleading split.
+Local validation at base `0adbb146` measured 239.92 / 277.75 seconds with
+four threads (15.8% apart), with both halves passing. The build-timings
+artifacts remain enabled to measure the new jobs in CI.
+
+For focused integration work, use the original file stem as a module filter:
+
+```bash
+cargo test -p db --test main file_backed_migration::test_name
+cargo test -p services --test main attention_service::test_name
+cargo test -p services --test project_provisioning_characterization test_name
+```
+
+To prove a consolidation preserves tests, record combined stdout and stderr
+before moving files, repeat after the change, and compare the names. The
+checker preserves unit names and normalizes only the old binary name into the
+new module prefix; it compares multisets, rejects duplicate identities and
+incomplete target listings, and includes ignored tests.
+
+```bash
+cargo test -p db --tests -- --list > db-before.log 2>&1
+# After moving files:
+cargo test -p db --tests -- --list > db-after.log 2>&1
+python3 scripts/check_integration_test_inventory.py db-before.log db-after.log
+# Repeat with -p services and services-{before,after}.log.
+```
+
+For changes to the consolidated harness, run each integration binary in full
+with `-- --test-threads=4` twice to check for order and process interference.
+Keep environment-mutating targets isolated unless every reader shares the
+same lock, and keep fixture include paths relative to their moved source.
 
 ## Frontend dependency cache
 

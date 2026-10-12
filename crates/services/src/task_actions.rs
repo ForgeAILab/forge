@@ -1893,9 +1893,13 @@ async fn owner_supports_resume(
 }
 #[cfg(test)]
 pub(crate) fn action_test_evidence_dir() -> std::path::PathBuf {
-    std::env::var_os("FORGE_TASK_ACTION_EVIDENCE_DIR")
+    let dir = std::env::var_os("FORGE_TASK_ACTION_EVIDENCE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("forge-task-actions"))
+        .unwrap_or_else(|| std::env::temp_dir().join("forge-task-actions"));
+    // Every writer may be the first in its process: the unit tests run in
+    // two CI shards, so no test can rely on another having made the directory.
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[cfg(test)]

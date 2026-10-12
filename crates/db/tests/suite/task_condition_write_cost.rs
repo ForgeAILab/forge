@@ -2,7 +2,7 @@
 //!
 //! Uses only API that exists on the base commit, so the same file runs on
 //! both sides of the change:
-//! `cargo test -p db --test task_condition_write_cost -- --ignored --nocapture`
+//! `cargo test -p db --test main task_condition_write_cost:: -- --ignored --nocapture`
 use db::{
     CreateProject, CreateTask, EnqueueTaskStep, ProjectRepo, SqliteDb, TaskMetadataMutation,
     TaskRepo, TaskStepRepo,

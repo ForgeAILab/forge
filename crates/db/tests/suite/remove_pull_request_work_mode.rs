@@ -3,7 +3,7 @@ use sqlx::Row;
 use std::{fs, path::Path};
 
 const MIGRATION: &str =
-    include_str!("../migrations/V202610010520__remove_pull_request_work_mode.sql");
+    include_str!("../../migrations/V202610010520__remove_pull_request_work_mode.sql");
 
 #[tokio::test]
 async fn migration_preserves_digest_provenance_and_scrubs_legacy_tokens() {

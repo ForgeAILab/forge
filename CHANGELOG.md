@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **DB and services integration-test target names are consolidated.** Use
+  `cargo test -p db --test main <old-target>::` or
+  `cargo test -p services --test main <old-target>::` for moved suites.
+  Services retains `project_provisioning_characterization` and
+  `main_project_create_command` as isolated targets. Original test names
+  remain under their target-named module; API test targets are unchanged.
+
 - **Agent doctrine moves to new revisions: Main baseline @5, Product Genesis
   @8, Project @22.** Migration `V202610120418` inserts Genesis @8 and Project
   @22 as new immutable revisions, moves the two current pointers, and moves
@@ -1441,6 +1448,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `check_environment_attestation` table; it holds salted digests only and
   changes no existing row. `503 check_environment_unavailable` is the REST
   code of a request that needs the answer before it exists.
+- Rust CI partitions services unit tests with complementary filters and runs
+  services integration tests in a separate shard. DB and services integration
+  suites share fewer link steps and migration templates; the required `Rust`
+  aggregate still waits for lint and every test shard.
 
 - **One registry drives the native and MCP tool surfaces.** Native host
   metadata, permission lists and the MCP dispatch table are generated from the
@@ -3024,7 +3035,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the one review entry had stored: the Task merged without its head-check
   Review evidence, or the same commit was checked again. An identity is now
   never built without the answer. Review entry asks again up to four times
-  within a few seconds without showing anything; after that the Task states
+  for up to about 47 seconds without showing anything; after that the Task states
   the `review_ci_infrastructure` interruption with the cause, re-enters review
   by itself on that budget's back-off and, once it is spent, waits with
   `retry_hook`. No Review attempt is recorded and no review budget is spent.

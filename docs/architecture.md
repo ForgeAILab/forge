@@ -5215,8 +5215,8 @@ least one row: that means a producer missed its write. A clean pass, and the
 rewrite after a mapping change, add no entry.
 
 **Cost.** Measured in a release build against `d6445863` with
-`crates/db/tests/task_condition_write_cost.rs` and
-`crates/db/tests/task_condition_producer_cost.rs`, interleaved on one machine:
+`crates/db/tests/suite/task_condition_write_cost.rs` and
+`crates/db/tests/suite/task_condition_producer_cost.rs`, interleaved on one machine:
 
 | Path | `d6445863` | this change | change |
 |---|---:|---:|---:|

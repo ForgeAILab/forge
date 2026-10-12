@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """The Rust test shards CI runs, and the proof that they cover the workspace.
 
-This file is the only place a shard's package list is written down:
+This file defines every shard's package, target and libtest selection:
 
-    ci_rust_shards.py args <shard>   cargo package selection, one argument per
+    ci_rust_shards.py args <shard>   cargo and libtest selection, one argument per
                                      line (read by scripts/ci-rust.sh)
     ci_rust_shards.py check          fail unless every workspace package is
-                                     tested by exactly one shard and the CI
-                                     matrix runs exactly these shards
+                                     covered once (services lib is partitioned)
+                                     and the CI matrix runs exactly these shards
 
 `check` only runs `cargo metadata --no-deps`; it compiles nothing.
 """
@@ -18,13 +18,21 @@ import re
 import subprocess
 import sys
 
-# Shard name -> packages. One shard is the catch-all (None): it takes every
-# workspace package no other shard names, so a new crate is tested without an
-# edit here. The three named crates hold most of the test time; see docs/ci.md.
+# Complementary filters stay adjacent and share one substring: every services
+# unit-test name contains it or does not, so no test is lost or run twice.
+# CI run 38219902459 completion timestamps predict 366.5s / 391.6s on four
+# workers (6.8% apart); local runs at 0adbb146 measured 239.92s / 277.75s
+# (15.8% apart). Test counts alone (408 / 1810 here) would mislead the split.
+SERVICES_UNIT_FILTER = "task_service::"
 SHARDS = {
-    "services": ["services"],
-    "api": ["api"],
-    "db": ["db"],
+    "services-unit-a": ["-p", "services", "--lib", "--", SERVICES_UNIT_FILTER],
+    "services-unit-b": ["-p", "services", "--lib", "--", "--skip", SERVICES_UNIT_FILTER],
+    # --tests includes the lib again; --test '*' selects integration bins only.
+    # Retain the examples that --all-targets previously built (no lib rerun).
+    "services-integration": ["-p", "services", "--test", "*", "--examples"],
+    "api": ["-p", "api", "--all-targets"],
+    "db": ["-p", "db", "--all-targets"],
+    # Catch-all by exclusion: a new workspace crate needs no edit here.
     "rest": None,
 }
 
@@ -33,28 +41,54 @@ WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 def named_packages():
-    return [pkg for pkgs in SHARDS.values() if pkgs is not None for pkg in pkgs]
+    return sorted({args[1] for args in SHARDS.values() if args is not None})
 
 
 def cargo_args(shard):
-    packages = SHARDS[shard]
-    args = []
-    if packages is None:
-        args.append("--workspace")
-        for pkg in named_packages():
-            args += ["--exclude", pkg]
-    else:
-        for pkg in packages:
-            args += ["-p", pkg]
+    args = SHARDS[shard]
+    if args is not None:
+        return list(args)
+    args = ["--workspace", "--all-targets"]
+    for pkg in named_packages():
+        args += ["--exclude", pkg]
     return args
 
 
 def selected(shard, workspace):
     """The packages cargo tests for this shard's arguments."""
-    packages = SHARDS[shard]
-    if packages is None:
+    args = SHARDS[shard]
+    if args is None:
         return set(workspace) - set(named_packages())
-    return set(packages)
+    return {args[1]}
+
+
+def coverage_errors(workspace):
+    errors = []
+    # The two selections must remain the exact filter/skip partition. The
+    # integration selection must never grow --tests or --all-targets.
+    expected = {
+        "services-unit-a": ["-p", "services", "--lib", "--", SERVICES_UNIT_FILTER],
+        "services-unit-b": ["-p", "services", "--lib", "--", "--skip", SERVICES_UNIT_FILTER],
+        "services-integration": ["-p", "services", "--test", "*", "--examples"],
+    }
+    for shard, args in expected.items():
+        if SHARDS.get(shard) != args:
+            errors.append(f"{shard} must select {args}")
+    for pkg, data in workspace.items():
+        owners = [s for s in SHARDS if pkg in selected(s, workspace)]
+        if pkg == "services":
+            if set(owners) != set(expected):
+                errors.append(f"services must be covered by {list(expected)}, got {owners}")
+            # Fail closed if services adds a bin or benchmark: the
+            # lib/integration/examples partition would otherwise omit it.
+            for target in data["targets"]:
+                if target["kind"] not in (["lib"], ["test"], ["example"], ["custom-build"]):
+                    errors.append(f"uncovered services target: {target['name']} {target['kind']}")
+        elif len(owners) != 1:
+            errors.append(f"package '{pkg}' is covered by {len(owners)} shards: {owners}")
+        elif "--all-targets" not in cargo_args(owners[0]):
+            errors.append(f"package '{pkg}' must include --all-targets")
+    return errors
 
 
 def workspace_packages():
@@ -90,11 +124,10 @@ def check():
         if pkg not in workspace:
             errors.append(f"shard package '{pkg}' is not a workspace package")
 
+    errors.extend(coverage_errors(workspace))
     rows = []
     for pkg in sorted(workspace):
         owners = [s for s in SHARDS if pkg in selected(s, workspace)]
-        if len(owners) != 1:
-            errors.append(f"package '{pkg}' is covered by {len(owners)} shards: {owners}")
         kinds = [k for t in workspace[pkg]["targets"] for k in t["kind"]]
         rows.append((pkg, ",".join(owners) or "-", kinds.count("test")))
 
@@ -106,9 +139,9 @@ def check():
             f"CI matrix runs {matrix}, but the shards defined here are {list(SHARDS)}"
         )
 
-    print(f"{'package':<22}{'shard':<10}integration test targets")
+    print(f"{'package':<22}{'shard(s)':<57}integration test targets")
     for pkg, owner, tests in rows:
-        print(f"{pkg:<22}{owner:<10}{tests}")
+        print(f"{pkg:<22}{owner:<57}{tests}")
     for shard in SHARDS:
         print(f"{shard} selects: {' '.join(cargo_args(shard))}")
 
@@ -117,7 +150,8 @@ def check():
             print(f"error: {error}", file=sys.stderr)
             print(f"::error title=Rust test shards::{error}")
         return 1
-    print(f"ok: {len(rows)} workspace packages, each in exactly one of {len(SHARDS)} shards")
+    print(f"ok: {len(rows)} workspace packages, covered without overlap across "
+          f"{len(SHARDS)} shards (services lib filter/skip)")
     return 0
 
 
