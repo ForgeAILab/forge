@@ -33,10 +33,17 @@ pub(crate) fn unbound(attempt: &IntegrationAttempt) -> bool {
     !bound(attempt)
 }
 
-/// A ready placement is recovery's verified binding. A released attempt
-/// can be replaced only after its effects are settled (the DB supersede
-/// fence checks that); it must not keep an obsolete runtime or generation.
-pub(crate) async fn binding_current(db: &SqliteDb, attempt: &IntegrationAttempt) -> Result<bool> {
+/// The attempt's binding is provably gone: the Task's placement is `ready`
+/// (recovery verified it, `recovery::reconcile_workspace_placement`) and
+/// names another workspace, location, owner, runtime or generation than the
+/// attempt was admitted with. A placement that is not ready proves nothing
+/// (its machine may only be away): the attempt keeps its binding and its
+/// park. This is the predicate of `INTEGRATION_OWNED` in `db::sqlite::schedule`.
+///
+/// A stale attempt is replaced through admission only; whether it is free
+/// to be replaced (not a head, no unsettled effect) is the supersede
+/// transaction's decision.
+pub(crate) async fn binding_stale(db: &SqliteDb, attempt: &IntegrationAttempt) -> Result<bool> {
     let Some(id) = attempt.placement_id.as_deref() else {
         return Ok(false);
     };
@@ -44,16 +51,16 @@ pub(crate) async fn binding_current(db: &SqliteDb, attempt: &IntegrationAttempt)
         return Ok(false);
     };
     Ok(placement.state == db::PlacementState::Ready
-        && attempt.workspace_id.as_deref() == Some(placement.workspace_id.as_str())
-        && attempt.repo_location_id.as_deref() == Some(placement.repo_location_id.as_str())
-        && attempt.owner_kind
-            == Some(match placement.owner_kind {
-                db::PlacementOwnerKind::Server => IntegrationOwnerKind::Server,
-                db::PlacementOwnerKind::Daemon => IntegrationOwnerKind::Daemon,
-            })
-        && attempt.daemon_id == placement.daemon_id
-        && attempt.runtime_id == placement.runtime_id
-        && attempt.placement_generation == Some(placement.generation))
+        && !(attempt.workspace_id.as_deref() == Some(placement.workspace_id.as_str())
+            && attempt.repo_location_id.as_deref() == Some(placement.repo_location_id.as_str())
+            && attempt.owner_kind
+                == Some(match placement.owner_kind {
+                    db::PlacementOwnerKind::Server => IntegrationOwnerKind::Server,
+                    db::PlacementOwnerKind::Daemon => IntegrationOwnerKind::Daemon,
+                })
+            && attempt.daemon_id == placement.daemon_id
+            && attempt.runtime_id == placement.runtime_id
+            && attempt.placement_generation == Some(placement.generation)))
 }
 
 /// Admit `task` (in `merging`) to its target's queue and return its current

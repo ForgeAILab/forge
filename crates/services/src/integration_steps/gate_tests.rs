@@ -1980,3 +1980,74 @@ async fn red_head_dirty_task_and_dirty_target_preserve_pre_queue_budget_outcomes
         }
     }
 }
+
+/// 1a, the other half: a binding is replaced only when it is provably gone.
+/// A placement that is not `ready` (its machine is away) proves nothing: the
+/// parked attempt keeps its binding, and the owner's Retry puts that same
+/// attempt back in line. Once recovery has verified the placement `ready`
+/// under another generation, the attempt is superseded by one bound to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_attempt_is_rebound_only_when_its_ready_placement_names_another_binding() {
+    let world = World::new().await;
+    world.legacy_task("bind", "bind.txt", "merging").await;
+    world.seed_execution("bind", "executor", None).await;
+    let first = world
+        .service
+        .admit_to_integration_queue("bind")
+        .await
+        .unwrap();
+    let placement = first.placement_id.clone().unwrap();
+    world.set(&first.id, "state='parked',placement_generation=placement_generation+7,failure_kind='infrastructure',failure_message='owner_offline: owner absent',available_at=NULL").await;
+    sqlx::query("UPDATE workspace_placement SET state='disconnected' WHERE id=?")
+        .bind(&placement)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let attempts = || async {
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                "bind",
+            )
+            .await
+    };
+    world.service.integration_owner_ready("bind").await.unwrap();
+    assert_eq!(attempts().await, 1, "an away machine's binding was stolen");
+    let task = world.task("bind").await;
+    world.service.retry_integration(&task).await.unwrap();
+    let current = world
+        .db
+        .current_integration_attempt("bind")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (attempts().await, current.id.as_str()),
+        (1, first.id.as_str()),
+        "Retry replaced the attempt of a machine that is only away"
+    );
+    assert!(
+        current.available_at.is_some(),
+        "Retry did not put the parked attempt back in line"
+    );
+    world.set(&first.id, "state='parked',available_at=NULL").await;
+    sqlx::query("UPDATE workspace_placement SET state='ready' WHERE id=?")
+        .bind(&placement)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.service.integration_owner_ready("bind").await.unwrap();
+    let rebound = world
+        .db
+        .current_integration_attempt("bind")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebound.predecessor_attempt_id.as_deref(),
+        Some(first.id.as_str())
+    );
+    assert_eq!(rebound.placement_generation, first.placement_generation);
+    assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
+    assert_eq!(rebound.queue_seq, first.queue_seq);
+}

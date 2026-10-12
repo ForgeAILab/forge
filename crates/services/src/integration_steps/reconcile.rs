@@ -164,7 +164,7 @@ impl crate::TaskService {
         }
         if matches!(current.state, S::Parked | S::Queued)
             && (admission::unbound(&current)
-                || !admission::binding_current(&self.db, &current).await?)
+                || admission::binding_stale(&self.db, &current).await?)
         {
             if let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? {
                 self.reconcile_integration_admission(&task).await?;
@@ -240,7 +240,7 @@ impl crate::TaskService {
             Some(attempt)
                 if attempt.state == S::Parked
                     && !admission::unbound(&attempt)
-                    && admission::binding_current(&self.db, &attempt).await? =>
+                    && !admission::binding_stale(&self.db, &attempt).await? =>
             {
                 self.db
                     .expedite_parked_integration_attempt(&task.id, &db::now_rfc3339(), true)
@@ -333,7 +333,7 @@ impl crate::TaskService {
             // transaction is the final authority for whether it is free.
             let rebind = match current {
                 Some(ref attempt) if matches!(attempt.state, S::Queued | S::Parked) => {
-                    !admission::binding_current(&self.db, attempt).await?
+                    admission::binding_stale(&self.db, attempt).await?
                 }
                 _ => false,
             };
