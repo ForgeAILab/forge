@@ -63,8 +63,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `retry` opens a new window. A step check is not a review: it creates no
   Review row and no check run and spends no Review budget. The `planner` role
   of a subtask in `todo`, `in_progress`, `lead_check`, `done` or `cancelled`
-  is the root's lead and nothing else; a `planner` row assigned directly on
-  such a subtask (inert before) stays inert. No migration.
+  is the root's lead and nothing else. Assigning `planner` on such a subtask
+  is now refused with `422 STEP_CHECK_ROLE_HELD_BY_ROOT` (it was accepted and
+  never used); rows that already exist, including the ones Project default
+  role assignments copy onto every new Task, hold nothing as before and can
+  still be removed. Removing the root's lead stops a step check that is still
+  running and the subtask passes the gate. `retry` on a subtask parked in
+  `lead_check` starts the lead's check of the existing rework, not another
+  rework. No migration.
+
+- **A user acting on a subtask in a state the Project workflow does not have
+  is governed by the inherited subtask workflow.** Before, a user always
+  resolved the Project workflow for a subtask, even where that workflow does
+  not define the subtask's state. For the built-in workflow the only such
+  state is the new `lead_check`. Under a workflow that names its states
+  differently (the autonomous workflow's `ready`/`working`, or a custom one),
+  a user's manual transition of a subtask in `todo` or `in_progress` now
+  follows the inherited subtask workflow's triggers.
 
 - **An optional gate nobody holds is skipped to its Accept target.** It used
   to be skipped to the first trigger target that is an implementation state,

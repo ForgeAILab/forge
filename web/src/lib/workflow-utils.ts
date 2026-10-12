@@ -408,6 +408,14 @@ export function getStateColors(
       text: 'text-orange-700 dark:text-orange-300',
       accent: 'border-l-orange-500',
     },
+    // The step check of a subtask: the root's lead checks the finished step.
+    // Still work in progress, so it keeps the working colour family.
+    lead_check: {
+      dot: 'bg-orange-400',
+      bg: 'bg-orange-50 dark:bg-orange-500/10',
+      text: 'text-orange-700 dark:text-orange-300',
+      accent: 'border-l-orange-400',
+    },
     review: {
       dot: 'bg-violet-400',
       bg: 'bg-violet-50 dark:bg-violet-500/10',
@@ -502,7 +510,7 @@ export function formatStateName(name: string): string {
   return name.replace(/_/g, ' ')
 }
 
-const ACTIVE_STATES = new Set(['in_progress', 'planning'])
+const ACTIVE_STATES = new Set(['in_progress', 'planning', 'lead_check'])
 const TERMINAL_STATES = new Set(['done', 'cancelled'])
 
 export function isActiveStatus(status: string): boolean {

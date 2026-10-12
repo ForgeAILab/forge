@@ -5967,8 +5967,38 @@ result-block parser (`review::contract::parse_assessment`: the last JSON
 object that names a result wins; `fixable_by` and `repeat` mean nothing here).
 The verdict is recorded once per run as a comment on the subtask and as the
 reason of the transition; the worker's next prompt carries the findings from
-that rejection. A step check that was already running when the lead was
-removed still settles with its verdict.
+that rejection.
+
+Retry on the spent-budget park opens a new budget window and re-enters the
+gate, so the lead checks the rework that is already in the workspace; the
+worker is not run again before anybody looked (validate first). The budget is
+checked once per entry (`check_retry_budget` on entry, before the dispatch; the
+auto-attached after-enter check is not added to a gate that already checks on
+entry). A subtask never enters a merge state (the inherited workflow has
+none), so merge-queue returns of the root never spend this budget.
+
+Removing the root's lead stops a step check that is still running
+(`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
+next dispatcher pass. A verdict of a run that no longer owns the role attempt
+(lead removed or replaced, subtask held, cancelled or moved) is dropped
+without a transition (`execution_owns_current_role_attempt`). A replaced
+lead's running check is not stopped: the subtask waits for that run to end
+(bounded by the execution timeout), then the new lead checks it. Hold on a
+subtask in the gate stops the check; Release has the lead check it again.
+Cancelling the subtask or its root ends the check. A subtask in the gate holds
+the one Project slot it held during implementation (the check is that Task's
+run); a parked one holds none. The lead's Agent is admitted by the same Agent
+and machine limits as any run.
+
+The step-check role cannot be assigned on a subtask
+(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`); rows that predate the rule (for example
+from Project default role assignments, which still copy every default role
+onto new Tasks) hold nothing and are left out of the action snapshot.
+
+The names the database needs of this workflow (its states, the step-check
+state and role) live in `db::inherited_subtask`; the services read them from
+there and `the_database_names_are_this_workflow` fails when the workflow
+definition and those names diverge.
 
 One resolver answers "who holds this role on this Task"
 (`task_hierarchy::effective_role_assignment`): `coder` falls back from the
@@ -6221,7 +6251,7 @@ membership, not on who started the original user move.
 | Root | any | any | Project |
 | Subtask | Not in inherited subtask workflow (e.g. `review`, `merging`) | any | Project |
 | Subtask | In shared subtask-workflow state (e.g. `in_progress`) | User (`user:*`) | Project |
-| Subtask | In an inherited state the Project workflow does not have (`lead_check`) | any | Inherited subtask workflow |
+| Subtask | In an inherited state the Project workflow does not have (`lead_check` for the built-in workflow; also `todo`/`in_progress` under a workflow that names its states differently, such as the autonomous one) | any | Inherited subtask workflow |
 | Subtask | In shared subtask-workflow state | Agent or system | Inherited subtask workflow |
 
 This aligns validation with the frontend, which presents target states from the

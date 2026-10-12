@@ -314,6 +314,164 @@ mod tests {
             .any(|r| r.name == db::inherited_subtask::STEP_CHECK_ROLE));
     }
 
+    fn shipped_workflows() -> Vec<(&'static str, api_types::WorkflowDefinition)> {
+        let parse = |name: &'static str, json: &str| {
+            let workflow: api_types::WorkflowDefinition =
+                serde_json::from_str(json).unwrap_or_else(|error| panic!("{name}: {error}"));
+            (name, workflow)
+        };
+        vec![
+            ("default", crate::workflow::default_workflow::default_workflow()),
+            (
+                "default_autonomous",
+                crate::workflow::default_autonomous_workflow::default_autonomous_workflow(),
+            ),
+            ("inherited_subtask", inherited_subtask_workflow()),
+            parse(
+                "fixture default_strict",
+                include_str!("../../tests/fixtures/default_strict_workflow.json"),
+            ),
+            parse(
+                "fixture legacy_custom",
+                include_str!("../../tests/fixtures/legacy_custom_workflow.json"),
+            ),
+            parse(
+                "spec default-autonomous",
+                include_str!(
+                    "../../../../docs/spec/forge-v2-autonomous-work-management/default-autonomous-workflow.json"
+                ),
+            ),
+        ]
+    }
+
+    /// "Skip to the Accept target" replaced "skip to the first trigger that
+    /// reaches an implementation state" for every optional gate. For every
+    /// optional gate of every workflow Forge ships or tests with, the target
+    /// is the one it was; the step check is the only gate the new rule
+    /// decides differently (the old rule would bounce it to implementation).
+    #[test]
+    fn the_skip_target_of_every_shipped_optional_gate_is_unchanged() {
+        let mut optional_gates = Vec::new();
+        for (name, workflow) in shipped_workflows() {
+            for gate in workflow.states.iter().filter(|state| {
+                state.kind == api_types::StateKind::Gate
+                    && state
+                        .gate_config
+                        .as_ref()
+                        .is_some_and(api_types::GateConfig::optional_when_unassigned)
+            }) {
+                let before = workflow
+                    .outgoing_trigger_targets(&gate.name)
+                    .filter(|(trigger, _)| !trigger.system_only())
+                    .find_map(|(_, to)| {
+                        workflow.states.iter().find(|state| {
+                            state.name == to && state.kind == api_types::StateKind::Active
+                        })
+                    })
+                    .map(|state| state.name.clone());
+                let now = crate::workflow::optional_gate_skip_target(&workflow, &gate.name)
+                    .map(|state| state.name.clone());
+                optional_gates.push(format!("{name}:{}", gate.name));
+                if name == "inherited_subtask" && gate.name == default_states::LEAD_CHECK {
+                    assert_eq!(before.as_deref(), Some(default_states::IN_PROGRESS));
+                    assert_eq!(now.as_deref(), Some(default_states::DONE));
+                } else {
+                    assert_eq!(now, before, "{name}:{}", gate.name);
+                }
+            }
+        }
+        // The planning gate of the built-in workflow is among them.
+        assert!(
+            optional_gates.contains(&"default:planning".to_owned())
+                && optional_gates.contains(&"inherited_subtask:lead_check".to_owned()),
+            "{optional_gates:?}"
+        );
+    }
+
+    /// Which workflow governs a Task. The step check changed one rule: a
+    /// user acting on a subtask gets the Project workflow only where that
+    /// workflow has the subtask's state. Every other (Task, actor) pair
+    /// resolves what it resolved before.
+    #[test]
+    fn only_a_user_on_a_subtask_in_a_state_the_project_lacks_resolves_differently() {
+        use crate::workflow::engine::WorkflowEngine;
+        let user = api_types::Actor::user(api_types::UserActionSource::Test);
+        let system = api_types::Actor::system(api_types::SystemComponent::Workflow);
+        let subtask = inherited_subtask_workflow();
+        let mut changed = Vec::new();
+        for (name, project) in shipped_workflows() {
+            if name == "inherited_subtask" {
+                continue;
+            }
+            let json = serde_json::to_string(&project).unwrap();
+            let mut statuses: Vec<String> = project.states.iter().map(|s| s.name.clone()).collect();
+            statuses.extend(subtask.states.iter().map(|s| s.name.clone()));
+            statuses.sort();
+            statuses.dedup();
+            for status in &statuses {
+                for parent in [None, Some("root".to_owned())] {
+                    for actor in [&user, &system] {
+                        let task = crate::workflow::engine::resolve_workflow_tests::task(
+                            parent.clone(),
+                            status,
+                        );
+                        let in_subtask = subtask.states.iter().any(|s| &s.name == status);
+                        // The rule before the step check.
+                        let before = if parent.is_none() || !in_subtask || actor.is_user() {
+                            &project
+                        } else {
+                            &subtask
+                        };
+                        let now = WorkflowEngine::resolve_workflow_for_task(&task, &json, actor);
+                        if &now != before {
+                            assert_eq!(now, subtask);
+                            changed.push((
+                                name,
+                                status.clone(),
+                                project.states.iter().any(|s| &s.name == status),
+                                actor.is_user(),
+                                parent.is_some(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // Every difference: a user, on a subtask, in an inherited state the
+        // Project workflow does not have (before, such a user resolved a
+        // workflow that does not define the state the subtask is in).
+        for (name, status, project_has_state, is_user, is_subtask) in &changed {
+            assert!(
+                *is_user && *is_subtask && !*project_has_state,
+                "{name} {status}"
+            );
+        }
+        let listed: Vec<String> = changed
+            .iter()
+            .map(|(name, status, ..)| format!("{name}:{status}"))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                // The built-in workflow: the step check alone.
+                "default:lead_check",
+                // The autonomous workflow names its states `ready`/`working`.
+                "default_autonomous:in_progress",
+                "default_autonomous:lead_check",
+                "default_autonomous:todo",
+                "fixture default_strict:lead_check",
+                "fixture legacy_custom:cancelled",
+                "fixture legacy_custom:done",
+                "fixture legacy_custom:in_progress",
+                "fixture legacy_custom:lead_check",
+                "fixture legacy_custom:todo",
+                "spec default-autonomous:in_progress",
+                "spec default-autonomous:lead_check",
+                "spec default-autonomous:todo",
+            ]
+        );
+    }
+
     #[test]
     fn inherited_subtask_workflow_has_no_merging_state() {
         assert!(!inherited_subtask_workflow()

@@ -2777,6 +2777,15 @@ when the lead fails the step. Its budget projection carries `lead_check` (the
 returns left, 2 by default). Clients that enumerate subtask statuses must
 render it. The prompt builder list gains `planner.step_check.v1`.
 
+Assigning the step-check role (`planner`) on a subtask in an inherited state
+is refused with `422 STEP_CHECK_ROLE_HELD_BY_ROOT` (`details.task_id`,
+`details.root_task_id`, `details.role`): the role is held by the root's lead,
+so assign `planner` on the root. Removing such a row stays possible. Removing
+the root's lead stops a step check that is still running; the subtask then
+passes the gate (`bridge_kind: gate_skipped`). `retry` on a subtask parked in
+`lead_check` with `retry_exhausted` opens a new budget window and starts the
+lead's check of the work that is already there.
+
 `TaskResponse.effective_lead` is `{ assignment, source }` or `null`: the lead
 of the coordination root this Task is (`source: own`) or belongs to
 (`source: inherited_from_root`; `assignment.task_id` names the root). The lead

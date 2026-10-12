@@ -1677,13 +1677,17 @@ impl World {
         }
         const LEAD: &str = "EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = r.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
         // No lead: a subtask never rests in the gate. A hold, a failure or a
-        // wait on its root is a rest with an owner; a clear condition is not.
+        // wait on its root is a rest with an owner; anything else is not: a
+        // clear condition, and equally a park that asks somebody to assign
+        // the role (the form a broken skip takes: mutation-tested by removing
+        // the gate's skip hook and the dispatcher's `gate_skip` fact).
         let resting: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT c.id || ' ' || COALESCE(c.condition_json, '') FROM task c JOIN task r ON r.id = c.parent_task_id
              WHERE c.deleted_at IS NULL AND r.deleted_at IS NULL AND c.status = 'lead_check'
                AND NOT {LEAD}
                AND r.status IN ('in_progress', 'merge_failed')
-               AND json_extract(c.condition_json, '$.kind') = 'clear'
+               AND COALESCE(json_extract(c.condition_json, '$.kind'), 'clear') != 'failed'
+               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure')
                AND json_extract(r.condition_json, '$.kind') = 'clear'
                AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = c.project_id AND p.paused_at IS NOT NULL)"
         ))
