@@ -33,7 +33,7 @@ cargo test
 
 # Specific crate
 cargo test -p db
-cargo test -p api --test happy_path
+cargo test -p api --test main happy_path::
 
 # Frontend
 cd web

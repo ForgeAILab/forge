@@ -34,7 +34,7 @@ cargo build                          # Build entire workspace
 cargo test                           # Full test suite (CI only)
 cargo test -p db --test main <module>::<test-filter> # Focused integration test
 cargo test -p db --lib <test-filter> # Focused unit test
-cargo test -p api --test happy_path <test-name>  # Run one relevant end-to-end case
+cargo test -p api --test main happy_path::<test-name>  # Run one relevant end-to-end case
 cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
 cargo clippy --workspace --all-targets -- -D warnings
@@ -44,14 +44,16 @@ FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Ru
 
 During local agent work, run only the focused tests directly related to the files and behavior being changed. Do not run a full crate, workspace, or all-target test suite locally; full-suite coverage belongs in CI. Expand to an adjacent focused test only when the change's impact analysis identifies that path as affected.
 
-DB and services integration tests are modules under `tests/suite/`, selected
+DB, services and most API integration tests are modules under `tests/suite/`, selected
 with `cargo test -p <crate> --test main <original-file-stem>::<test-name>`.
 Services keeps `project_provisioning_characterization` and
 `main_project_create_command` as separate targets for process isolation.
+API keeps seven process-isolated targets; see
+[docs/ci.md](docs/ci.md#api-binary-split-and-isolation) for the list.
 See [docs/ci.md](docs/ci.md#services-unit-split-and-integration-inventory) for
 inventory comparison and the services lib filter/skip partition.
 
-The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment. Run only the relevant named case locally; CI runs the complete test target. If you break it, you probably need to revisit the spec, not the test.
+The happy-path test (`crates/api/tests/suite/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment. Run only the relevant named case locally; CI runs the complete test target. If you break it, you probably need to revisit the spec, not the test.
 
 ### Running the server
 
@@ -88,7 +90,7 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 
 - **Read `docs/architecture.md` before changing service wiring, the workflow engine, or the task state machine.** That doc is the source of truth for the lifecycle, hook ordering, role assignment, and retry-budget rules.
 - **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Run `make types` to regenerate bindings in `web/src/types/generated/bindings/` and commit them with the other updates in the same change.
-- **State-machine changes** must keep `crates/api/tests/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
+- **State-machine changes** must keep `crates/api/tests/suite/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
 - **Migrations** after V149 are named `V{YYYYMMDDHHMM}__{name}.sql`, using the UTC time you create the file, so parallel branches never pick the same version. Add a new file; don't edit historical migrations even during beta — users have running databases. The runner refuses to start on two files with one version, or on a database that applied a different migration under a version the build uses.
 - **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
 - **Concurrency**: tasks and agents use a `version` column. Updates require `WHERE version = ?` and increment on success. Version mismatch → `DbError::VersionConflict` → HTTP 409.

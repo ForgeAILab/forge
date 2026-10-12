@@ -111,6 +111,7 @@ pub fn consumer_error_kind(error: &crate::ServiceError) -> WorkerErrorKind {
         | S::NotFound { .. }
         | S::AuthorizationDenied { .. } => WorkerErrorKind::Terminal,
         S::ExecutionAlreadyRunning { .. }
+        | S::Review(::review::ReviewError::CheckEnvironmentUnavailable)
         | S::RateLimited { .. }
         | S::DaemonUnavailable { .. }
         | S::DaemonNotReady { .. }

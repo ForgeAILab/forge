@@ -423,6 +423,7 @@ pub fn outcome_for_service_error_with_correction(
             None,
         ),
         ServiceError::DaemonNotReady { .. }
+        | ServiceError::Review(::review::ReviewError::CheckEnvironmentUnavailable)
         | ServiceError::DaemonUnavailable { .. }
         | ServiceError::PlacementUnavailable(_)
         | ServiceError::PrepareFailed { .. }

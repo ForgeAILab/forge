@@ -585,6 +585,15 @@ impl From<executors::ExecutorError> for ServiceError {
 }
 
 impl ServiceError {
+    /// Boundary projection of the typed owner-input failure. Transports do
+    /// not need a dependency on the lower-level Review error type.
+    pub fn is_check_environment_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Review(review::ReviewError::CheckEnvironmentUnavailable)
+        )
+    }
+
     pub(crate) fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         Self::NotFound {
             entity,

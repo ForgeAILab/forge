@@ -285,10 +285,20 @@ pub(crate) async fn review_ci_identity(
     if input.dirty {
         inputs.environment_identity = api_types::CheckEnvironmentIdentity::NotAttested;
     }
-    Ok(Some(db::CheckRunIdentity {
+    let identity = db::CheckRunIdentity {
         project_id: input.task.project_id.clone(),
         repo_id: input.workspace.repo_id.clone(),
         commit_sha: input.commit_sha,
         inputs,
-    }))
+    };
+    #[cfg(test)]
+    {
+        // Opt-in diagnostics for the load regression. Only opaque revisions
+        // and declared check inputs are recorded, never inherited values.
+        let _ = sqlx::query("INSERT INTO test_check_identity_inputs(input_json) VALUES(?)")
+            .bind(serde_json::to_string(&identity).expect("check identity serializes"))
+            .execute(db.pool())
+            .await;
+    }
+    Ok(Some(identity))
 }
