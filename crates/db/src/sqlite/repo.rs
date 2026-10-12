@@ -166,6 +166,11 @@ impl RepoRepo for SqliteDb {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(DbError::NotFound)?;
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut transaction,
+            crate::integration_queue::IntegrationGuardScope::Repo(id),
+        )
+        .await?;
         let in_use: bool = sqlx::query_scalar(
             "SELECT
                 EXISTS(

@@ -85,6 +85,9 @@ pub enum DbError {
     #[error("repo {repo_id} has active executions or workspace leases")]
     RepoInUse { repo_id: String },
 
+    #[error("integration_unresolved: the merge of Task {task_id} on {machine} has an unknown result or an effect still outstanding; reconnect that machine or remove it, then retry")]
+    IntegrationUnresolved { task_id: String, machine: String },
+
     #[error("project {project_id} has {running_executions} running execution(s), {active_leases} active workspace lease(s) and {live_check_runs} unfinished check run(s)")]
     ProjectInUse {
         project_id: String,

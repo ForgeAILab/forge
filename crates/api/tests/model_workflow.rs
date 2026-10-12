@@ -4757,6 +4757,37 @@ async fn pre_queue_upgraded(
         ));
     }
     eprintln!("UPGRADE {name}: settled: {}", settled.tasks.join("\n  "));
+    // One writer per merge across the upgrade: at no instant did more than
+    // one of the old merge's hooks step, the import continuation and the
+    // queue worker's driver hold a Task's merge.
+    use services::integration_worker::holders::{merge_holders, MergeHolder};
+    let holders_db = db::SqliteDb::new(world.live.as_ref().expect("the server is up").pool.clone());
+    for task in &world.tasks {
+        let (most, overlap, seen) = merge_holders(&holders_db, task);
+        eprintln!("UPGRADE {name}: merge holders of {task}: {seen:?}, at most {most} at once");
+        if most > 1 {
+            return Err(format!(
+                "{name}: two writers held the merge of {task} at once: {overlap:?} (seen {seen:?})"
+            ));
+        }
+    }
+    // The two shapes where the old merge's own step was still live at the
+    // upgrade: that step and the worker both acted, one after the other.
+    if take.is_none()
+        && matches!(
+            name,
+            "p05_rebase_target_no_outcome" | "p02_merge_intent_landed_no_outcome"
+        )
+    {
+        let (_, _, seen) = merge_holders(&holders_db, &world.tasks[world.tasks.len() - 1]);
+        for expected in [MergeHolder::LegacyHooksStep, MergeHolder::WorkerDriver] {
+            if !seen.contains(&expected) {
+                return Err(format!(
+                    "{name} ({variant}): {expected:?} never held the merge; seen {seen:?}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 

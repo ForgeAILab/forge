@@ -214,6 +214,98 @@ fn gate_code(attempt: &IntegrationAttempt) -> String {
         .to_owned()
 }
 
+/// `settle`'s own gate read. The head driver read the Task gate, found it
+/// open and asked for the decision; the owner's Hold lands before the step
+/// runs. The step is held here by the test (nothing runs it until it is
+/// asked), which is the seam between the driver's read and the step. The
+/// step reads the gate itself: no permit is written, no protected `result`
+/// step exists, the answer names the gate, and the Task did not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_between_the_drivers_gate_read_and_settle_writes_no_permit() {
+    let world = World::new().await;
+    let a = world.reconciled("t", "t.txt").await;
+    // The driver's side: gate read open, the head waits for the decision.
+    assert_eq!(
+        crate::integration_steps::gate::task_gate(&world.db, "t")
+            .await
+            .unwrap(),
+        None
+    );
+    let asked = world.place(&a.id, "awaiting_task_step", 1).await;
+    // The Hold lands now.
+    let held = world.act("t", TaskAction::Hold { reason: None }).await;
+    assert_eq!(held.status, "merging");
+    world.ask(&asked, IntegrationStepAction::Settle).await;
+    settled(&world, "t", IntegrationStepAction::Settle, "done").await;
+
+    let after = world.attempt(&a.id).await;
+    assert!(after.permit_json.is_none(), "no permit under a Hold");
+    let answer = ack(&after, IntegrationStepAction::Settle).expect("settle answered");
+    assert_eq!(answer.outcome, IntegrationStepOutcome::Infrastructure);
+    assert!(
+        answer
+            .message
+            .as_deref()
+            .is_some_and(crate::integration_worker::GateCause::parked_under),
+        "the answer names the gate: {:?}",
+        answer.message
+    );
+    assert!(world
+        .step("t", IntegrationStepAction::Result)
+        .await
+        .is_empty());
+    assert_eq!(world.task("t").await.status, "merging");
+    assert_eq!(world.merges("t").await, 0);
+}
+
+/// An attempt was sent back (`ejected`, `needs_review`) but its `send_back`
+/// step never moved the Task: the Task is still in the `merging` entry the
+/// attempt was admitted in, with an attempt nothing drives. The reconciler
+/// gives the Task a successor (same place in line), which merges; the
+/// sent-back row is history. Nothing is merged twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_sent_back_attempt_whose_task_stayed_in_the_entry_gets_a_successor() {
+    for state in ["ejected", "needs_review"] {
+        let world = World::new().await;
+        let attempt = world.reconciled("t", "t.txt").await;
+        world
+            .set(
+                &attempt.id,
+                &format!("state='{state}',failure_kind='infrastructure',failure_message='task_step_failed: send_back'"),
+            )
+            .await;
+        assert_eq!(world.task("t").await.status, "merging");
+        let production = Production::new(&world);
+        let running = production.run();
+        // The worker alone does not take it up: the row left the queue.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(world.task("t").await.status, "merging", "{state}");
+        assert_eq!(world.merges("t").await, 0, "{state}");
+        let dispatcher = dispatcher(&world).await;
+        world
+            .until("t", &format!("{state}: the successor merges"), || async {
+                dispatcher.reconcile_all().await.unwrap();
+                world.task("t").await.status == "done"
+            })
+            .await;
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        assert_eq!(world.merges("t").await, 1, "{state}");
+        let old = world.attempt(&attempt.id).await;
+        assert_eq!(old.state, S::Superseded, "{state}");
+        let successor = world
+            .db
+            .current_integration_attempt("t")
+            .await
+            .unwrap()
+            .map(|current| (current.id != attempt.id, current.queue_seq == old.queue_seq));
+        // The successor is the Task's record now, in the same place in line.
+        if let Some((different, same_seq)) = successor {
+            assert!(different && same_seq, "{state}");
+        }
+    }
+}
+
 /// Hold while queued, then Release. The held member is skipped (it leaves
 /// the slot at once, with no Git effect, no check and no counted retry), the
 /// member behind it merges, and the Release alone puts it back: it merges
@@ -810,6 +902,88 @@ async fn imported_owner_waits_are_admitted_by_the_sweep_once_their_block_is_lift
     }
 }
 
+/// Importer rows P16 (the workspace's owner is lost) and P17 (an accepted
+/// owner command or a sticky disposition was still to run): each ends in a
+/// typed condition its owner sees (`deferred` / `owner_required`), nothing
+/// merges by itself, and the action the Task offers for it (Retry) works:
+/// the Task is admitted again and merges, once. The legacy state is left as
+/// the old build wrote it; no sweep of the dispatcher runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn imported_lost_owner_and_accepted_command_rows_state_owner_required_and_retry_works() {
+    let rows: [(u64, &str); 2] = [
+        (
+            16,
+            "UPDATE workspace SET error='machine_removed' WHERE task_id='t'",
+        ),
+        (
+            17,
+            "UPDATE task SET metadata_json='{\"queued_recovery\":{\"id\":\"accepted\"}}' WHERE id='t'",
+        ),
+    ];
+    for (priority, seed) in rows {
+        let world = World::new().await;
+        world.legacy_task("t", "t.txt", "merging").await;
+        world.seed_execution("t", "executor", None).await;
+        sqlx::query(seed).execute(world.db.pool()).await.unwrap();
+        // The stored condition follows the row, as its writer left it.
+        let mut tx = db::begin_immediate(world.db.pool()).await.unwrap();
+        world
+            .db
+            .produce_condition_in_tx(&mut tx, "t", db::ConditionChange::Full)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let (imported, row) = world.imported("t").await;
+        assert_eq!(row, priority);
+        let production = Production::new(&world);
+        let running = production.run();
+        world
+            .until("t", &format!("P{priority}: the owner is told"), || async {
+                integration(&world.task("t").await)["kind"] == "deferred"
+            })
+            .await;
+        let stated = integration(&world.task("t").await);
+        assert_eq!(stated["cause"], "owner_required", "P{priority}: {stated}");
+        // Nothing moves it but its owner.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(world.task("t").await.status, "merging", "P{priority}");
+        assert_eq!(world.merges("t").await, 0, "P{priority}");
+        assert_eq!(world.attempt(&imported.id).await.state, S::Parked);
+        let offers = world.offers("t").await;
+        assert!(
+            offers.iter().any(|(verb, _)| verb == "retry"),
+            "P{priority}: the Task offers Retry: {offers:?}"
+        );
+        world
+            .act(
+                "t",
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+            )
+            .await;
+        world
+            .until(
+                "t",
+                &format!("P{priority}: the retried merge lands"),
+                || async { world.task("t").await.status == "done" },
+            )
+            .await;
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        assert_eq!(world.merges("t").await, 1, "P{priority}");
+        assert_eq!(
+            world.attempt(&imported.id).await.state,
+            S::Superseded,
+            "P{priority}: the imported row is history"
+        );
+    }
+}
+
 /// A merge that stopped for its owner (`retries_exhausted`, a dirty checkout,
 /// ...) states `deferred` on the Task and offers Retry; the Retry puts the
 /// same attempt back in line with its counted retries started again, and it
@@ -951,10 +1125,18 @@ impl World {
     /// merge, repair and done states renamed, and one more hook in front of
     /// `run_merge` on the merge state's entry.
     async fn rename_merge_states(&self) {
+        self.rename_states(false).await
+    }
+    /// The same, and with `every_role` the done, cancellation and review
+    /// states renamed too (`shipped`, `dropped`, `inspection`).
+    async fn rename_states(&self, every_role: bool) {
         let mut workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
         let rename = |name: &mut String| match name.as_str() {
             "merging" => *name = "landing".into(),
             "merge_failed" => *name = "fixing".into(),
+            "done" if every_role => *name = "shipped".into(),
+            "cancelled" if every_role => *name = "dropped".into(),
+            "review" if every_role => *name = "inspection".into(),
             _ => {}
         };
         for state in &mut workflow.states {
@@ -1011,6 +1193,138 @@ fn merge_outcome_targets_follow_the_workflows_own_state_names() {
     assert_eq!(role_target(&renamed, "landing", "done"), "shipped");
     assert_eq!(role_target(&renamed, "landing", "merge_failed"), "fixing");
     assert_eq!(role_target(&renamed, "landing", "review"), "inspection");
+}
+
+/// A workflow with TWO merge states: each reports a landed merge to its own
+/// `accept` target, also when the workflow still has a state named `done`,
+/// and each sends a repair to its own repair state.
+#[test]
+fn each_of_two_merge_states_has_its_own_outcome_targets() {
+    use super::super::reconcile::{merge_state, role_target};
+    let default = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
+    let mut two = default.clone();
+    let copy = |name: &str, as_name: &str| {
+        let mut state = default
+            .states
+            .iter()
+            .find(|state| state.name == name)
+            .unwrap_or_else(|| panic!("the default workflow has `{name}`"))
+            .clone();
+        state.name = as_name.into();
+        state
+    };
+    // A second line: `hotfix_merging` lands in `released` and is repaired in
+    // `hotfix_failed`.
+    let mut merging = copy("merging", "hotfix_merging");
+    for trigger in merging.triggers.values_mut() {
+        match trigger.to.as_str() {
+            "done" => trigger.to = "released".into(),
+            "merge_failed" => trigger.to = "hotfix_failed".into(),
+            _ => {}
+        }
+    }
+    two.states.push(merging);
+    two.states.push(copy("done", "released"));
+    two.states.push(copy("merge_failed", "hotfix_failed"));
+    assert!(merge_state(&two, "merging") && merge_state(&two, "hotfix_merging"));
+    assert_eq!(role_target(&two, "merging", "done"), "done");
+    assert_eq!(role_target(&two, "hotfix_merging", "done"), "released");
+    assert_eq!(role_target(&two, "merging", "merge_failed"), "merge_failed");
+    // Only where the default workflow's merge state names its repair by a
+    // `reject` trigger is the second line's own repair state found by it.
+    let own_reject = default
+        .outgoing_trigger_targets("merging")
+        .any(|(trigger, to)| trigger == api_types::WorkflowTrigger::Reject && to == "merge_failed");
+    if own_reject {
+        assert_eq!(
+            role_target(&two, "hotfix_merging", "merge_failed"),
+            "hotfix_failed"
+        );
+    }
+}
+
+/// A workflow of the Project's own in which NO state merges (`run_merge` is
+/// on no entry): a Task in a state that happens to be called `merging` was
+/// never merging, and the importer does not take it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_importer_takes_nothing_from_a_workflow_with_no_merge_state() {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", "merging").await;
+    world.seed_execution("t", "executor", None).await;
+    let mut workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow("{}");
+    for state in &mut workflow.states {
+        state
+            .hooks
+            .on_enter
+            .retain(|hook| hook.action != "run_merge");
+    }
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let pass = world.db.import_integration_pass(100).await.unwrap();
+    assert_eq!((pass.examined, pass.imported), (0, 0));
+    assert!(world
+        .db
+        .current_integration_attempt("t")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// An imported merge with an unknown result that nobody will ever report
+/// (its old operation is recorded `uncertain`, with no fenced intent) used
+/// to refuse its owner's Retry for good ("reconnect the machine or remove
+/// it") and, with it, every deletion of its repository. The owner's Retry
+/// now settles it explicitly: Git decides, and the Task merges once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_owners_retry_settles_an_imported_unknown_operation_and_the_task_merges_once() {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", "merging").await;
+    world.seed_execution("t", "executor", None).await;
+    let (imported, _) = world.imported("t").await;
+    // As the importer and the worker leave a merge whose old operation never
+    // reported and whose checkouts could not be read then.
+    sqlx::query("UPDATE integration_attempt SET state='quarantined',current_operation_state='uncertain',operation_id='old-merge',failure_kind='needs_fact',failure_message='integration result unknown',available_at=NULL,revision=revision+1 WHERE id=?")
+        .bind(&imported.id)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let refused = db::RepoRepo::delete(&*world.db, "r").await;
+    assert!(
+        matches!(&refused, Err(db::DbError::IntegrationUnresolved { task_id, .. }) if task_id == "t"),
+        "{refused:?}"
+    );
+    let production = Production::new(&world);
+    let running = production.run();
+    // The owner's Retry (`perform_task_action` reaches this through the
+    // `integration_retry` offer of the `deferred` statement; whether the
+    // import continuation has stated it yet is not what is under test).
+    world
+        .service
+        .retry_integration(&world.task("t").await)
+        .await
+        .expect("the Retry settles the old operation instead of refusing");
+    world
+        .until(
+            "t",
+            "the Task merges after the explicit settlement",
+            || async { world.task("t").await.status == "done" },
+        )
+        .await;
+    assert_eq!(world.merges("t").await, 1);
+    let old = world.attempt(&imported.id).await;
+    assert_eq!(
+        old.current_operation_state,
+        Some(db::IntegrationOperationState::Failed)
+    );
+    assert_eq!(
+        old.operation_receipts_json[0]["kind"],
+        "imported_operation_settled"
+    );
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
 
 /// A workflow whose merge and repair states have other names, and whose
@@ -1311,4 +1625,191 @@ async fn a_drain_ends_the_slot_of_a_task_that_left_its_entry() {
             .await
             .unwrap();
     assert_eq!(head, None, "the slot is free");
+}
+
+/// Every merge role renamed, at runtime: a Task in the renamed merge state
+/// merges through the queue and ends in the renamed done state; a Task
+/// cancelled out of the renamed merge state the old way is read by the
+/// start-time import by role (its state is called `dropped`) and gets its
+/// history row; a second start imports nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn renamed_done_cancelled_and_review_states_are_followed_by_role() {
+    let world = World::new().await;
+    world.rename_states(true).await;
+    world.legacy_task("t", "t.txt", "landing").await;
+    world.seed_execution("t", "executor", None).await;
+    world.touch("t").await;
+    // Cancelled out of the merge state before the queue existed.
+    world.legacy_task("c", "c.txt", "dropped").await;
+    world.seed_execution("c", "executor", None).await;
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('c-left','c','landing','dropped','user:api','cancelled',?)")
+        .bind(db::now_rfc3339())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.touch("c").await;
+    let report = super::super::import::import_at_start(&world.db)
+        .await
+        .unwrap();
+    assert!(
+        report.imported >= 2,
+        "both Tasks are read by role: {report:?}"
+    );
+    let history = world
+        .db
+        .integration_attempt(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT id FROM integration_attempt WHERE task_ref='c' ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.state, S::Cancelled, "a history row: {history:?}");
+    assert!(!history.current);
+    let again = super::super::import::import_at_start(&world.db)
+        .await
+        .unwrap();
+    assert_eq!(again.imported, 0, "{again:?}");
+
+    let production = Production::new(&world);
+    let running = production.run();
+    let dispatcher = dispatcher(&world).await;
+    world
+        .until("t", "the Task ends in the renamed done state", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            world.task("t").await.status == "shipped"
+        })
+        .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert!(world.on_main("t.txt").await);
+    assert!(!world.on_main("c.txt").await);
+    assert_eq!(world.task("c").await.status, "dropped");
+}
+
+/// Disk pressure at admission. The Task's worktree is gone and the disk is
+/// under its floor: making it again is refused. That is a wait, typed on the
+/// Task as its disk capacity wait: the Task is not blocked, not failed and
+/// not sent to repair, no attempt exists and nothing is charged. When the
+/// disk recovers the same sweep admits the Task and it merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn admission_under_the_disk_floor_waits_for_disk_and_merges_when_it_recovers() {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", "merging").await;
+    world.seed_execution("t", "executor", None).await;
+    world.touch("t").await;
+    std::fs::remove_dir_all(world.tree("t")).unwrap();
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    world.db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: Some("unclaimed".to_owned()),
+                compiler_cache_bytes: None,
+            })
+        }),
+    );
+    let admitted = world
+        .service
+        .reconcile_integration_admission(&world.task("t").await)
+        .await
+        .unwrap();
+    assert!(!admitted, "nothing is admitted under the disk floor");
+    let waiting = world.task("t").await;
+    assert_eq!(waiting.status, "merging");
+    assert!(
+        waiting.blocked_json.is_none() && waiting.failed_json.is_none(),
+        "a wait, not a block: {:?}",
+        waiting.blocked_json
+    );
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&waiting).is_some_and(|wait| {
+            wait.capability == "machine_capacity"
+                && wait.capacity_scope.as_deref() == Some(api_types::CAPACITY_SCOPE_DISK)
+        }),
+        "the Task states its disk wait: {:?}",
+        waiting.metadata_json
+    );
+    assert!(world
+        .db
+        .current_integration_attempt("t")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!world.tree("t").exists(), "no worktree under the floor");
+
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    let production = Production::new(&world);
+    let running = production.run();
+    let dispatcher = dispatcher(&world).await;
+    world
+        .until("t", "the Task merges once the disk recovered", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            let _ = world
+                .service
+                .reconcile_integration_admission(&world.task("t").await)
+                .await;
+            world.task("t").await.status == "done"
+        })
+        .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(world.merges("t").await, 1);
+}
+
+/// Manual approve authority in the merge state. The owner approves a Task
+/// that is held in `merging`: where the Task offers `approve`, performing it
+/// declares the Task done with nothing merged (the owner's override, as
+/// before the queue), and the Task's attempt is settled: it ends terminal
+/// and is not left parked or current behind a done Task. Where `approve` is
+/// not offered the Task stays put with its attempt parked under the Hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn approving_a_held_merging_task_settles_its_attempt() {
+    let world = World::new().await;
+    let attempt = world.reconciled("t", "t.txt").await;
+    world.act("t", TaskAction::Hold { reason: None }).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the held Task left the slot", || async {
+        world.attempt(&attempt.id).await.state == S::Parked
+    })
+    .await;
+    let offers = world.offers("t").await;
+    println!("held merging Task offers: {offers:?}");
+    if offers.iter().any(|(verb, _)| verb == "approve") {
+        let approved = world
+            .act(
+                "t",
+                TaskAction::Approve {
+                    reason: Some("landed by hand".into()),
+                    override_checks: None,
+                },
+            )
+            .await;
+        assert_eq!(approved.status, "done", "the owner's override");
+        assert_eq!(world.merges("t").await, 0, "nothing was merged");
+        assert!(!world.on_main("t.txt").await);
+        world
+            .until("t", "the attempt is settled", || async {
+                let settled = world.attempt(&attempt.id).await;
+                settled.state.terminal() && !settled.current
+            })
+            .await;
+        assert_eq!(world.attempt(&attempt.id).await.state, S::Cancelled);
+    } else {
+        assert_eq!(world.task("t").await.status, "merging");
+        assert_eq!(world.attempt(&attempt.id).await.state, S::Parked);
+    }
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }

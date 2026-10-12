@@ -1344,7 +1344,20 @@ fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
         ],
         authority: vec![ActionAuthority::Owner],
         reason: "state_advance_override".to_owned(),
-        label: "Advance Task".to_owned(),
+        // In a merge state the override ends the Task without its merge:
+        // the label says so before the owner confirms.
+        label: if snapshot.workflow.states.iter().any(|state| {
+            state.name == snapshot.task.status
+                && state
+                    .hooks
+                    .on_enter
+                    .iter()
+                    .any(|hook| hook.action == "run_merge")
+        }) {
+            "Mark done without merging".to_owned()
+        } else {
+            "Advance Task".to_owned()
+        },
         target_execution_id: None,
         propagates: false,
     });

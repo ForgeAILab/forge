@@ -140,6 +140,34 @@ impl World {
             .execute(self.db.pool()).await.unwrap();
         self.attempt(id).await
     }
+    /// The scripted worker's fast-forward: the target really takes the
+    /// attempt's candidate, and the attempt records it as `applied`.
+    pub async fn apply(&self, id: &str) {
+        let sha = self.attempt(id).await.candidate_sha.expect("candidate");
+        let repo = self.repo();
+        if git_out(
+            &repo,
+            &[
+                "-c",
+                "user.name=forge",
+                "-c",
+                "user.email=forge@example.invalid",
+                "merge",
+                "--no-edit",
+                &sha,
+            ],
+        )
+        .await
+        .is_none()
+        {
+            let _ = git_out(&repo, &["merge", "--abort"]).await;
+            git_out(&repo, &["update-ref", "refs/heads/main", &sha])
+                .await
+                .expect("target moves to the candidate");
+        }
+        self.set(id, "state='applied',integrated_sha=candidate_sha")
+            .await;
+    }
     pub async fn set(&self, id: &str, assignments: &str) {
         sqlx::query(&format!(
             "UPDATE integration_attempt SET {assignments},revision=revision+1 WHERE id=?"
@@ -410,9 +438,7 @@ async fn land(world: &World, task: &str, attempt_id: &str) -> IntegrationAttempt
     let asked = world.place(attempt_id, "awaiting_task_step", 1).await;
     world.ask(&asked, IntegrationStepAction::Settle).await;
     settled(world, task, IntegrationStepAction::Settle, "done").await;
-    world
-        .set(attempt_id, "state='applied',integrated_sha=candidate_sha")
-        .await;
+    world.apply(attempt_id).await;
     world.attempt(attempt_id).await
 }
 
@@ -522,6 +548,237 @@ async fn a_result_that_cannot_apply_never_dead_letters_and_is_rearmed() {
     })
     .await;
     assert!(ack(&world.attempt(&a.id).await, IntegrationStepAction::Result).is_some());
+}
+
+/// One `result` delivery by the real step worker at the attempt's present
+/// `effect_seq`: returns once the step answered or parked itself to ask
+/// again (`true`: answered).
+async fn deliver_result(world: &World, attempt: &IntegrationAttempt) -> bool {
+    world.ask(attempt, IntegrationStepAction::Result).await;
+    world
+        .port
+        .ready_result_step(&attempt.id, attempt.effect_seq)
+        .await
+        .unwrap();
+    let key = IntegrationQueueWorker::step_request(attempt, IntegrationStepAction::Result)
+        .causation_key();
+    let key = &key;
+    eventually(
+        "the result step answered or asks again later",
+        || async move {
+            let steps = world.db.task_steps(&attempt.task_ref).await.unwrap();
+            let step = steps
+                .iter()
+                .find(|step| &step.causation_key == key)
+                .unwrap();
+            step.status == "done"
+                || (step.status == "pending"
+                    && step.attempts > 0
+                    && step.available_at > db::now_rfc3339())
+        },
+    )
+    .await;
+    let steps = world.db.task_steps(&attempt.task_ref).await.unwrap();
+    steps
+        .iter()
+        .find(|step| &step.causation_key == key)
+        .unwrap()
+        .status
+        == "done"
+}
+fn reads(sha: &str) -> usize {
+    super::proof::test_reads::of(sha)
+}
+
+async fn unresolved(world: &World, task: &str) {
+    let task = world.task(task).await;
+    assert_eq!(task.status, "merging", "never done without the proof");
+    assert_eq!(integration(&task)["kind"], "deferred");
+    assert_eq!(integration(&task)["cause"], "unresolved_result");
+}
+
+/// Design rule: a Task is never reported merged unless the target contains
+/// its commit. The attempt's `integrated_sha` is only a claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_reports_done_only_when_the_target_owner_proves_the_commit() {
+    let world = World::new().await;
+    let main = |world: &World| {
+        let repo = world.repo();
+        async move {
+            git_out(&repo, &["rev-parse", "refs/heads/main"])
+                .await
+                .unwrap()
+        }
+    };
+    let base = main(&world).await;
+
+    // 1. Forged: the row says `applied` with the candidate as the merged
+    //    commit, and nothing ever moved the target.
+    let a = world.add_task("forged", "f1", "one\n").await;
+    let a = world.place(&a.id, "applied", 1).await;
+    world.set(&a.id, "integrated_sha=candidate_sha").await;
+    let a = world.attempt(&a.id).await;
+    assert!(deliver_result(&world, &a).await, "answered, not reported");
+    assert_eq!(reads(a.candidate_sha.as_deref().unwrap()), 1);
+    unresolved(&world, "forged").await;
+    assert!(
+        world.comments("forged").await.is_empty(),
+        "no merged comment"
+    );
+    let answer = ack(&world.attempt(&a.id).await, IntegrationStepAction::Result).unwrap();
+    assert_eq!(answer.outcome, IntegrationStepOutcome::NotLanded);
+
+    // 2. Mismatched: the row names a commit the target does contain (its
+    //    old tip), which is not the Task's commit.
+    let b = world.add_task("mismatched", "f2", "two\n").await;
+    let b = world.place(&b.id, "applied", 1).await;
+    world.set(&b.id, &format!("integrated_sha='{base}'")).await;
+    let b = world.attempt(&b.id).await;
+    let asked_before = reads(&base);
+    assert!(deliver_result(&world, &b).await);
+    // The merged commit, then the Task's own commit.
+    assert_eq!(reads(&base), asked_before + 1);
+    assert_eq!(reads(b.candidate_sha.as_deref().unwrap()), 1);
+    unresolved(&world, "mismatched").await;
+
+    // 3. A fast-forward receipt of another attempt, of a later claim
+    //    generation, or of another owner refuses the report with no Git
+    //    read at all, although the target contains the commit.
+    let c = world.add_task("receipt", "f3", "three\n").await;
+    let c = world.place(&c.id, "applied", 1).await;
+    world.apply(&c.id).await;
+    let c = world.attempt(&c.id).await;
+    let sha = c.candidate_sha.clone().unwrap();
+    let queue = world
+        .db
+        .integration_queue(c.queue_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = json!({"location_id":"l-r","owner_kind":"server","daemon_id":null,"runtime_id":null,"generation":1});
+    sqlx::query(
+        "UPDATE integration_queue SET target_location_id='l-r',target_owner_json=? WHERE id=?",
+    )
+    .bind(owner.to_string())
+    .bind(&queue.id)
+    .execute(world.db.pool())
+    .await
+    .unwrap();
+    let receipt = |attempt_id: &str, generation: i64, owner: Value, after: &str| {
+        json!([{
+            "request": {
+                "fence": {"queue_id": queue.id, "attempt_id": attempt_id, "generation": generation, "lease_owner": "w", "target_owner": owner},
+                "kind": "fast_forward",
+                "witness": {}
+            },
+            "result": {"kind": "completed", "outcome": {"Done": {"before_sha": base, "after_sha": after, "branch": "main"}}},
+            "operation_state": "succeeded",
+            "recorded_at": db::now_rfc3339()
+        }])
+        .to_string()
+    };
+    let other_owner = json!({"location_id":"l-r","owner_kind":"daemon","daemon_id":"d-other","runtime_id":"r","generation":1});
+    for (seq, (key, forged)) in [
+        (
+            "other-attempt",
+            receipt("someone-else", 1, owner.clone(), &sha),
+        ),
+        ("later-generation", receipt(&c.id, 7, owner.clone(), &sha)),
+        ("other-owner", receipt(&c.id, 1, other_owner, &sha)),
+        ("other-commit", receipt(&c.id, 1, owner.clone(), &base)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query("UPDATE integration_attempt SET effect_receipts_json=?,effect_seq=?,effect_ack_json=NULL,acknowledged_at=NULL,revision=revision+1 WHERE id=?")
+            .bind(forged)
+            .bind(seq as i64 + 2)
+            .bind(&c.id)
+            .execute(world.db.pool())
+            .await
+            .unwrap();
+        let c = world.attempt(&c.id).await;
+        assert!(deliver_result(&world, &c).await, "{key}");
+        assert_eq!(reads(&sha), 0, "{key}: refused before Git");
+        unresolved(&world, "receipt").await;
+        assert_eq!(
+            ack(&world.attempt(&c.id).await, IntegrationStepAction::Result)
+                .unwrap()
+                .outcome,
+            IntegrationStepOutcome::NotLanded,
+            "{key}"
+        );
+    }
+    // Its own receipt, from the target's owner: one read, reported.
+    sqlx::query("UPDATE integration_attempt SET effect_receipts_json=?,effect_seq=9,effect_ack_json=NULL,acknowledged_at=NULL,revision=revision+1 WHERE id=?")
+        .bind(receipt(&c.id, 1, owner.clone(), &sha))
+        .bind(&c.id)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let c = world.attempt(&c.id).await;
+    assert!(deliver_result(&world, &c).await);
+    assert_eq!(reads(&sha), 1, "the normal path costs one ancestry read");
+    assert_eq!(
+        ack(&world.attempt(&c.id).await, IntegrationStepAction::Result)
+            .unwrap()
+            .outcome,
+        IntegrationStepOutcome::Done
+    );
+    eventually("the proven Task is done", || async {
+        world.task("receipt").await.status == "done"
+    })
+    .await;
+
+    // 4. Rewound: the fast-forward landed and the target was then moved
+    //    back (a force-push).
+    let d = world.add_task("rewound", "f4", "four\n").await;
+    let d = world.place(&d.id, "applied", 1).await;
+    let before = main(&world).await;
+    world.apply(&d.id).await;
+    git_out(&world.repo(), &["reset", "--hard", &before])
+        .await
+        .unwrap();
+    let d = world.attempt(&d.id).await;
+    assert!(deliver_result(&world, &d).await);
+    assert_eq!(reads(d.candidate_sha.as_deref().unwrap()), 1);
+    unresolved(&world, "rewound").await;
+    assert!(world.comments("rewound").await.is_empty());
+    assert_eq!(
+        ack(&world.attempt(&d.id).await, IntegrationStepAction::Result)
+            .unwrap()
+            .outcome,
+        IntegrationStepOutcome::NotLanded
+    );
+}
+
+/// An owner that cannot be asked is not a "no": the step stays, the Task
+/// says why, and the proof is asked again on the result timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_target_owner_that_does_not_answer_keeps_the_result_step_asking() {
+    let world = World::new().await;
+    let a = world.add_task("mute", "f", "one\n").await;
+    let a = world.place(&a.id, "applied", 1).await;
+    world.apply(&a.id).await;
+    // The default checkout cannot be read (its owner is not answering).
+    let repo = world.repo();
+    let away = world.temp.path().join("repo-away");
+    std::fs::rename(&repo, &away).unwrap();
+    let a = world.attempt(&a.id).await;
+    assert!(
+        !deliver_result(&world, &a).await,
+        "no answer: the step asks again later"
+    );
+    unresolved(&world, "mute").await;
+    assert!(ack(&world.attempt(&a.id).await, IntegrationStepAction::Result).is_none());
+    assert_eq!(world.attempt(&a.id).await.state, S::Applied);
+    // The owner answers again.
+    std::fs::rename(&away, &repo).unwrap();
+    assert!(deliver_result(&world, &a).await);
+    eventually("the Task is done", || async {
+        world.task("mute").await.status == "done"
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -989,9 +1246,7 @@ async fn cancel_waits_behind_the_protected_result_step_and_the_merge_wins() {
     assert!(world.attempt(&a.id).await.cancel_requested_at.is_none());
 
     // The fast-forward lands; the result runs first.
-    world
-        .set(&a.id, "state='applied',integrated_sha=candidate_sha")
-        .await;
+    world.apply(&a.id).await;
     world.port.ready_result_step(&a.id, 1).await.unwrap();
     eventually("the merge was applied", || async {
         !world.transitions("t").await.is_empty()
@@ -1064,9 +1319,7 @@ async fn race_once(world: &World, task: &'static str) -> bool {
             1
         );
         // Finish the merge so the waiting Cancel (if any) can settle.
-        world
-            .set(&a.id, "state='applied',integrated_sha=candidate_sha")
-            .await;
+        world.apply(&a.id).await;
         world.port.ready_result_step(&a.id, 1).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while world.task(task).await.status != "done" {
@@ -1653,6 +1906,82 @@ async fn review_ci(world: &World, task: &str, steps: &[&str]) {
         .execute(world.db.pool())
         .await
         .unwrap();
+}
+
+/// The cost of the head check, measured. Each Task has a real `ci_steps`
+/// command. (a) Three Tasks that each reach the head with the target where
+/// their review left it merge with no head-check run at all. (b) Three Tasks
+/// reviewed on one base, with the target moved once from outside: every one
+/// of them is rebased (by the outside commit, then by the members ahead of
+/// it) and checked exactly once: one run per rebased commit, none repeated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn head_check_runs_are_zero_on_an_unchanged_target_and_one_per_rebased_task() {
+    let world = World::new().await;
+    let runs = || async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
+        )
+        .fetch_all(world.db.pool())
+        .await
+        .unwrap()
+    };
+    let production = Production::new(&world);
+    let running = production.run();
+    // (a) One at a time: each Task is cut from the tip it merges into.
+    for name in ["a1", "a2", "a3"] {
+        let file = format!("{name}.txt");
+        world.add_task(name, &file, "x\n").await;
+        review_ci(&world, name, &[&format!("test -f {file}")]).await;
+        production.worker.notify_answered();
+        eventually("an unrebased Task merges", || async {
+            world.task(name).await.status == "done"
+        })
+        .await;
+    }
+    assert_eq!(runs().await, vec![], "no head check on an unchanged target");
+
+    // (b) Three Tasks on one base, and the target moves once.
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let mut attempts = Vec::new();
+    for name in ["b1", "b2", "b3"] {
+        let file = format!("{name}.txt");
+        attempts.push(world.add_task(name, &file, "x\n").await);
+        review_ci(
+            &world,
+            name,
+            &[&format!("test -f {file}"), "test -f outside.txt"],
+        )
+        .await;
+    }
+    std::fs::write(world.repo().join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&world.repo(), "outside").await.unwrap();
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the rebased Tasks merge", || async {
+        let mut done = true;
+        for name in ["b1", "b2", "b3"] {
+            done &= world.task(name).await.status == "done";
+        }
+        done
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let ran = runs().await;
+    let mut expected = Vec::new();
+    for attempt in &attempts {
+        let merged = world.attempt(&attempt.id).await;
+        assert_ne!(merged.integrated_sha, merged.original_candidate_sha);
+        expected.push((merged.integrated_sha.clone().unwrap(), "pass".to_owned()));
+    }
+    let mut sorted = ran.clone();
+    sorted.sort();
+    expected.sort();
+    assert_eq!(
+        sorted, expected,
+        "exactly one run per rebased Task: {ran:?}"
+    );
 }
 
 /// D2 checklist item 11. Three Tasks through the real worker, the production

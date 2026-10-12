@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use api_types::{Actor, SystemComponent};
 use api_types::{
@@ -24,13 +21,19 @@ use db::{
 };
 use executors::ExecutionOverrides;
 use operation_registry::mcp::{
-    BindMainAgentParams, BindProjectAgentParams, CreateAgentHandoffParams, CreateProjectParams,
-    GetAgentChatParams, GetAgentHandoffParams, GetAgentSessionParams, GetMainAgentParams,
-    GetProjectAgentParams, ListAgentChatMessagesParams, ListAgentChatsParams,
-    ListAgentHandoffsParams, ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams,
-    ListProjectsParams, RegisterAgentParams, SendAgentChatMessageParams,
+    AddTaskDependencyParams, AssignAgentParams, BindMainAgentParams, BindProjectAgentParams,
+    CreateAgentHandoffParams, CreateProjectParams, CreateSubTasksParams, CreateTaskParams,
+    FollowUpExecutionParams, GetAgentChatParams, GetAgentHandoffParams, GetAgentSessionParams,
+    GetMainAgentParams, GetProjectAgentParams, GetProjectParams, GetTaskParams,
+    ListAgentChatMessagesParams, ListAgentChatsParams, ListAgentHandoffsParams,
+    ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams, ListExecutionsParams,
+    ListProjectsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
+    MemoryGetParams, MemorySearchParams, PreviewPromptParams, ProjectEscalateParams,
+    RegisterAgentParams, RemoveTaskDependencyParams, ReorderSubTasksParams,
+    SendAgentChatMessageParams, TaskActionParams, TransitionTaskParams,
+    UpdateProjectLifecycleHooksParams, UpdateProjectParams, UpdateTaskParams,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use services::{
     workflow::engine::WorkflowEngine, DiffService, MemoryAccessContext, MemorySearchResult,
     SetProjectAgentBindingInput,
@@ -39,14 +42,7 @@ use uuid::Uuid;
 
 use crate::{
     error::McpToolError,
-    params::{
-        page_request, parse_params, task_page_request, AddTaskDependencyParams, AssignAgentParams,
-        CreateSubTasksParams, CreateTaskParams, GetProjectParams, GetTaskParams,
-        ListExecutionsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
-        MemoryGetParams, MemorySearchParams, PreviewPromptParams, RemoveTaskDependencyParams,
-        ReorderSubTasksParams, TransitionTaskParams, UpdateProjectLifecycleHooksParams,
-        UpdateProjectParams, UpdateTaskParams,
-    },
+    params::{page_request, task_page_request},
     protocol::McpContext,
     state::AppState,
     values::{
@@ -60,10 +56,8 @@ const MEMORY_CONTEXT_NOTE: &str = "The following is retrieved context from the m
 
 pub(super) async fn forge_create_task(
     state: &AppState,
-    params: Value,
+    params: CreateTaskParams,
 ) -> Result<Value, McpToolError> {
-    validate_create_task_arguments(&params)?;
-    let params: CreateTaskParams = parse_params(params)?;
     if params.project_id.trim().is_empty() {
         return Err(invalid_field_error(
             "project_id",
@@ -95,6 +89,13 @@ pub(super) async fn forge_create_task(
                 })),
             ));
         }
+    }
+    if params
+        .parent_task_id
+        .as_ref()
+        .is_some_and(|parent| params.depends_on_ids.contains(parent))
+    {
+        return Err(invalid_field_error("depends_on_ids", "must not contain parent_task_id; parentage shares a workspace, dependencies gate execution", Some(json!({"type":"array","items":{"type":"string"},"uniqueItems":true,"excludes":"parent_task_id"}))));
     }
     if ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
@@ -158,9 +159,8 @@ pub(super) async fn forge_create_task(
 
 pub(super) async fn forge_create_sub_tasks(
     state: &AppState,
-    params: Value,
+    params: CreateSubTasksParams,
 ) -> Result<Value, McpToolError> {
-    let params: CreateSubTasksParams = parse_params(params)?;
     let inputs = params
         .subtasks
         .into_iter()
@@ -262,176 +262,10 @@ fn invalid_field_error(
     McpToolError::new(-32602, "invalid params").with_data(data)
 }
 
-fn validate_create_task_arguments(params: &Value) -> Result<(), McpToolError> {
-    let Some(object) = params.as_object() else {
-        return Err(
-            McpToolError::new(-32602, "invalid params").with_data(json!({
-                "details": "tool arguments must be an object"
-            })),
-        );
-    };
-
-    if !object.contains_key("project_id") {
-        return Err(invalid_field_error(
-            "project_id",
-            "is required",
-            Some(json!({
-                "type": "string",
-                "non_empty": true
-            })),
-        ));
-    }
-    if !object.contains_key("title") {
-        return Err(invalid_field_error(
-            "title",
-            "is required",
-            Some(json!({
-                "type": "string",
-                "non_empty": true
-            })),
-        ));
-    }
-
-    if let Some(value) = object.get("project_id") {
-        if !value.is_string() {
-            return Err(invalid_field_error(
-                "project_id",
-                "must be a string",
-                Some(json!({ "type": "string" })),
-            ));
-        }
-    }
-    if let Some(value) = object.get("title") {
-        if !value.is_string() {
-            return Err(invalid_field_error(
-                "title",
-                "must be a string",
-                Some(json!({ "type": "string" })),
-            ));
-        }
-    }
-    if let Some(value) = object.get("parent_task_id") {
-        if !value.is_string() {
-            return Err(invalid_field_error(
-                "parent_task_id",
-                "must be a string",
-                Some(json!({ "type": "string" })),
-            ));
-        }
-    }
-    if let Some(value) = object.get("depends_on_ids") {
-        let Some(dependency_ids) = value.as_array() else {
-            return Err(invalid_field_error(
-                "depends_on_ids",
-                "must be an array of unique, non-empty task id strings",
-                Some(json!({
-                    "type": "array",
-                    "items": { "type": "string", "non_empty": true },
-                    "uniqueItems": true
-                })),
-            ));
-        };
-        let mut unique = HashSet::with_capacity(dependency_ids.len());
-        for (index, dependency_id) in dependency_ids.iter().enumerate() {
-            let Some(dependency_id) = dependency_id.as_str() else {
-                return Err(invalid_field_error(
-                    "depends_on_ids",
-                    format!("item {index} must be a string"),
-                    Some(json!({
-                        "type": "array",
-                        "items": { "type": "string", "non_empty": true },
-                        "uniqueItems": true
-                    })),
-                ));
-            };
-            if dependency_id.trim().is_empty() {
-                return Err(invalid_field_error(
-                    "depends_on_ids",
-                    format!("item {index} must be non-empty"),
-                    Some(json!({
-                        "type": "array",
-                        "items": { "type": "string", "non_empty": true },
-                        "uniqueItems": true
-                    })),
-                ));
-            }
-            if !unique.insert(dependency_id) {
-                return Err(invalid_field_error(
-                    "depends_on_ids",
-                    format!("contains duplicate task id `{dependency_id}`"),
-                    Some(json!({
-                        "type": "array",
-                        "items": { "type": "string", "non_empty": true },
-                        "uniqueItems": true
-                    })),
-                ));
-            }
-        }
-        if object
-            .get("parent_task_id")
-            .and_then(Value::as_str)
-            .is_some_and(|parent_task_id| unique.contains(parent_task_id))
-        {
-            return Err(invalid_field_error(
-                "depends_on_ids",
-                "must not contain parent_task_id; parentage shares a workspace, while dependencies only gate execution",
-                Some(json!({
-                    "type": "array",
-                    "items": { "type": "string", "non_empty": true },
-                    "uniqueItems": true,
-                    "excludes": "parent_task_id"
-                })),
-            ));
-        }
-    }
-    if let Some(value) = object.get("priority") {
-        if !value.is_i64() {
-            return Err(invalid_field_error(
-                "priority",
-                "must be an integer in the accepted i64 range",
-                Some(json!({
-                    "type": "integer",
-                    "min": i64::MIN,
-                    "max": i64::MAX
-                })),
-            ));
-        }
-    }
-    if let Some(value) = object.get("type") {
-        let Some(task_type) = value.as_str() else {
-            return Err(invalid_field_error(
-                "type",
-                "must be one of the accepted values",
-                Some(json!({
-                    "type": "string",
-                    "enum": ["task", "planning_task", "sub_task", "discovery"]
-                })),
-            ));
-        };
-        if task_type != "task"
-            && task_type != "planning_task"
-            && task_type != "sub_task"
-            && task_type != "discovery"
-        {
-            return Err(invalid_field_error(
-                "type",
-                format!("unsupported value `{task_type}`"),
-                Some(json!({
-                    "type": "string",
-                    "enum": ["task", "planning_task", "sub_task", "discovery"]
-                })),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 pub(super) async fn forge_list_tasks(
     state: &AppState,
-    params: Value,
+    params: ListTasksParams,
 ) -> Result<Value, McpToolError> {
-    let params: ListTasksParams = parse_params(params)?;
     let page = TaskRepo::list(
         &*state.db,
         TaskListQuery {
@@ -458,10 +292,9 @@ pub(super) async fn forge_list_tasks(
 
 pub(super) async fn forge_get_task(
     state: &AppState,
-    params: Value,
+    params: GetTaskParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: GetTaskParams = parse_params(params)?;
     let actor = Actor::delegated_user(
         authenticated_user(context)?,
         api_types::UserActionSource::Api,
@@ -511,9 +344,8 @@ async fn task_with_offers(state: &AppState, task: db::Task) -> Result<Value, Mcp
 
 pub(super) async fn forge_preview_prompt(
     state: &AppState,
-    params: Value,
+    params: PreviewPromptParams,
 ) -> Result<Value, McpToolError> {
-    let params: PreviewPromptParams = parse_params(params)?;
     if params.role.trim().is_empty() {
         return Err(invalid_field_error(
             "role",
@@ -530,7 +362,12 @@ pub(super) async fn forge_preview_prompt(
         &state.workspace_backend_router,
         &params.task_id,
         params.role.trim(),
-        params.trigger,
+        params.trigger.map(|trigger| match trigger {
+            operation_registry::mcp::WorkflowTrigger::Accept => api_types::WorkflowTrigger::Accept,
+            operation_registry::mcp::WorkflowTrigger::Reject => api_types::WorkflowTrigger::Reject,
+            operation_registry::mcp::WorkflowTrigger::Fail => api_types::WorkflowTrigger::Fail,
+            operation_registry::mcp::WorkflowTrigger::Retry => api_types::WorkflowTrigger::Retry,
+        }),
     )
     .await?;
 
@@ -543,10 +380,9 @@ pub(super) async fn forge_preview_prompt(
 
 pub(super) async fn forge_memory_search(
     state: &AppState,
-    params: Value,
+    params: MemorySearchParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: MemorySearchParams = parse_params(params)?;
     if params.project_id.trim().is_empty() {
         return Err(invalid_field_error(
             "project_id",
@@ -611,10 +447,9 @@ pub(super) async fn forge_memory_search(
 
 pub(super) async fn forge_memory_get(
     state: &AppState,
-    params: Value,
+    params: MemoryGetParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: MemoryGetParams = parse_params(params)?;
     if params.id.trim().is_empty() {
         return Err(invalid_field_error(
             "id",
@@ -664,9 +499,8 @@ pub(super) async fn forge_memory_get(
 
 pub(super) async fn forge_assign_agent(
     state: &AppState,
-    params: Value,
+    params: AssignAgentParams,
 ) -> Result<Value, McpToolError> {
-    let params: AssignAgentParams = parse_params(params)?;
     let assignment = state
         .task_service
         .assign_agent_to_task(&params.task_id, &params.agent_id)
@@ -679,7 +513,7 @@ pub(super) async fn forge_assign_agent(
 
 pub(super) async fn task_action(
     state: &AppState,
-    params: Value,
+    params: TaskActionParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     // MCP credentials (PATs, sessions, OAuth tokens) all resolve to the user;
@@ -689,16 +523,12 @@ pub(super) async fn task_action(
         authenticated_user(context)?,
         api_types::UserActionSource::Api,
     );
-    let task_id = params
-        .get("task_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_field_error("task_id", "required", None))?;
-    let request: api_types::TaskActionRequest =
-        parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
-    let unblocking = services::project_escalation::is_unblocking_verb(request.action.verb());
+    let task_id = &params.task_id;
+    let action = task_action_input(params.action);
+    let unblocking = services::project_escalation::is_unblocking_verb(action.verb());
     let result = state
         .task_service
-        .perform_task_action_as(task_id, request.action, request.version, actor.clone())
+        .perform_task_action_as(task_id, action, params.version, actor.clone())
         .await?;
     if unblocking {
         // An MCP Project Agent's recovery during its blocker turn is an outcome.
@@ -722,9 +552,8 @@ pub(super) async fn task_action(
 
 pub(super) async fn forge_get_task_diff(
     state: &AppState,
-    params: Value,
+    params: GetTaskParams,
 ) -> Result<Value, McpToolError> {
-    let params: GetTaskParams = parse_params(params)?;
     let diff = DiffService::new_with_router(
         std::sync::Arc::clone(&state.db),
         std::sync::Arc::clone(&state.workspace_backend_router),
@@ -737,9 +566,8 @@ pub(super) async fn forge_get_task_diff(
 
 pub(super) async fn forge_list_executions(
     state: &AppState,
-    params: Value,
+    params: ListExecutionsParams,
 ) -> Result<Value, McpToolError> {
-    let params: ListExecutionsParams = parse_params(params)?;
     let page = ExecutionRepo::list_by_task(
         &*state.db,
         &params.task_id,
@@ -751,9 +579,8 @@ pub(super) async fn forge_list_executions(
 
 pub(super) async fn forge_update_task(
     state: &AppState,
-    params: Value,
+    params: UpdateTaskParams,
 ) -> Result<Value, McpToolError> {
-    let params: UpdateTaskParams = parse_params(params)?;
     let task = TaskRepo::update(
         &*state.db,
         UpdateTask {
@@ -778,18 +605,18 @@ pub(super) async fn forge_update_task(
 
 pub(super) async fn forge_transition_task(
     state: &AppState,
-    params: Value,
+    params: TransitionTaskParams,
 ) -> Result<Value, McpToolError> {
-    let params: TransitionTaskParams = parse_params(params)?;
-    // MCP currently carries no agent execution identity, so transitions made
-    // through this tool use the explicit MCP system component. If MCP context
-    // later exposes an agent id, this is the single attribution site to switch
-    // to Actor::Agent.
+    // The transition runs under the workflow policy of the MCP system
+    // component, as it always has: defined edges only, dependency and
+    // conflict-marker gates enforced, no user override. Attributing it to the
+    // delegated user would also hand the caller the interactive user's
+    // override policy, which `Actor::is_user` selects throughout the engine.
     let task = state
         .task_service
         .transition(
             params.task_id,
-            params.status.into(),
+            params.status,
             services::task_service::TransitionOptions {
                 bridge: Default::default(),
                 version: params.version,
@@ -935,9 +762,8 @@ pub(super) async fn forge_create_project(
 
 pub(super) async fn forge_get_project(
     state: &AppState,
-    params: Value,
+    params: GetProjectParams,
 ) -> Result<Value, McpToolError> {
-    let params: GetProjectParams = parse_params(params)?;
     let project = ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", params.project_id))?;
@@ -946,9 +772,9 @@ pub(super) async fn forge_get_project(
 
 pub(super) async fn forge_update_project(
     state: &AppState,
-    params: Value,
+    params: UpdateProjectParams,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: UpdateProjectParams = parse_params(params)?;
     if params
         .name
         .as_deref()
@@ -959,7 +785,7 @@ pub(super) async fn forge_update_project(
 
     let settings = match params.settings {
         Some(settings) => {
-            validate_project_settings(state, &params.project_id, &settings).await?;
+            validate_project_settings(state, &params.project_id, &settings, context).await?;
             Some(serialize_settings(&settings)?)
         }
         None => None,
@@ -984,9 +810,9 @@ pub(super) async fn forge_update_project(
 
 pub(super) async fn forge_update_project_lifecycle_hooks(
     state: &AppState,
-    params: Value,
+    params: UpdateProjectLifecycleHooksParams,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: UpdateProjectLifecycleHooksParams = parse_params(params)?;
     let project = ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", params.project_id.clone()))?;
@@ -1002,14 +828,15 @@ pub(super) async fn forge_update_project_lifecycle_hooks(
     let settings_object = settings
         .as_object_mut()
         .ok_or_else(|| McpToolError::new(-32602, "existing project settings must be an object"))?;
-    let hooks = serde_json::to_value(params.lifecycle_hooks).map_err(|error| {
-        McpToolError::new(
-            -32603,
-            format!("failed to serialize lifecycle hooks: {error}"),
-        )
-    })?;
+    let hooks =
+        serde_json::to_value(lifecycle_hooks_input(params.lifecycle_hooks)).map_err(|error| {
+            McpToolError::new(
+                -32603,
+                format!("failed to serialize lifecycle hooks: {error}"),
+            )
+        })?;
     settings_object.insert("lifecycle_hooks".to_owned(), hooks);
-    validate_project_settings(state, &project.id, &settings).await?;
+    validate_project_settings(state, &project.id, &settings, context).await?;
 
     let project = ProjectRepo::update_at_version(
         &*state.db,
@@ -1030,19 +857,22 @@ pub(super) async fn forge_update_project_lifecycle_hooks(
 
 pub(super) async fn forge_follow_up_execution(
     state: &AppState,
-    params: Value,
+    params: FollowUpExecutionParams,
 ) -> Result<Value, McpToolError> {
-    let params = params
-        .as_object()
-        .ok_or_else(|| McpToolError::new(-32602, "params must be an object"))?;
-    let execution_id = required_string_param(params, "execution_id")?;
-    let message = required_string_param(params, "message")?;
-    let agent_id = optional_string_param(params, "agent_id")?;
-    let overrides = optional_overrides_param(params, "overrides")?;
-
+    let overrides = params.overrides.map(|o| ExecutionOverrides {
+        model_id: o.model_id,
+        reasoning_effort: o.reasoning_effort,
+        permission_policy: o.permission_policy,
+        hard_deadline_seconds: o.hard_deadline_seconds,
+    });
     let launched = state
         .task_service
-        .follow_up_interactive_execution(execution_id, message, agent_id, overrides)
+        .follow_up_interactive_execution(
+            params.execution_id,
+            params.message,
+            params.agent_id,
+            overrides,
+        )
         .await?;
 
     let workspace = state
@@ -1073,22 +903,12 @@ pub(super) async fn forge_follow_up_execution(
     }))
 }
 
-/// Validates a settings document through the one shared implementation.
-///
-/// This used to be an MCP-local copy of the REST rules, and the two had
-/// drifted: REST checked an assigned agent is usable in the Project and an
-/// assigned user is a member, which this copy did not, while this copy
-/// checked a script hook's timeout, which REST did not. Both surfaces now ask
-/// `services::project_settings`.
-///
-/// The agent-usability check needs the acting user, and MCP tool handlers do
-/// not receive `McpContext` — only the Project reaches them — so that one
-/// check still does not run here. Everything else, membership included, now
-/// does.
+/// Validate settings with the authenticated delegated user, just as REST does.
 async fn validate_project_settings(
     state: &AppState,
     project_id: &str,
     settings: &Value,
+    context: &McpContext,
 ) -> Result<(), McpToolError> {
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
@@ -1099,7 +919,7 @@ async fn validate_project_settings(
         settings,
         &workflow,
         Some(project_id),
-        None,
+        Some(authenticated_user(context)?),
     )
     .await
     .map_err(McpToolError::from)
@@ -1108,90 +928,6 @@ async fn validate_project_settings(
 fn serialize_settings(settings: &Value) -> Result<String, McpToolError> {
     serde_json::to_string(settings)
         .map_err(|error| McpToolError::new(-32602, format!("invalid settings: {error}")))
-}
-
-fn required_string_param(
-    params: &Map<String, Value>,
-    key: &'static str,
-) -> Result<String, McpToolError> {
-    match params.get(key) {
-        Some(Value::String(value)) => Ok(value.clone()),
-        Some(_) => Err(McpToolError::new(-32602, format!("{key} must be a string"))),
-        None => Err(McpToolError::new(-32602, format!("{key} is required"))),
-    }
-}
-
-fn optional_string_param(
-    params: &Map<String, Value>,
-    key: &'static str,
-) -> Result<Option<String>, McpToolError> {
-    match params.get(key) {
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(McpToolError::new(-32602, format!("{key} must be a string"))),
-    }
-}
-
-fn optional_overrides_param(
-    params: &Map<String, Value>,
-    key: &'static str,
-) -> Result<Option<ExecutionOverrides>, McpToolError> {
-    let Some(value) = params.get(key) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
-    let Value::Object(overrides) = value else {
-        return Err(McpToolError::new(
-            -32602,
-            format!("{key} must be an object"),
-        ));
-    };
-    Ok(Some(ExecutionOverrides {
-        model_id: optional_overrides_field(overrides, "model_id")?,
-        reasoning_effort: optional_overrides_field(overrides, "reasoning_effort")?,
-        permission_policy: optional_overrides_field(overrides, "permission_policy")?,
-        hard_deadline_seconds: optional_u32_overrides_field(overrides, "hard_deadline_seconds")?,
-    }))
-}
-
-fn optional_u32_overrides_field(
-    overrides: &Map<String, Value>,
-    key: &'static str,
-) -> Result<Option<u32>, McpToolError> {
-    match overrides.get(key) {
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .map(Some)
-            .ok_or_else(|| {
-                McpToolError::new(
-                    -32602,
-                    format!("overrides.{key} must be a positive integer"),
-                )
-            }),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(McpToolError::new(
-            -32602,
-            format!("overrides.{key} must be a positive integer"),
-        )),
-    }
-}
-
-fn optional_overrides_field(
-    overrides: &Map<String, Value>,
-    key: &'static str,
-) -> Result<Option<String>, McpToolError> {
-    match overrides.get(key) {
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(McpToolError::new(
-            -32602,
-            format!("overrides.{key} must be a string"),
-        )),
-    }
 }
 
 fn non_empty_tools(tools: Vec<String>) -> Value {
@@ -1266,9 +1002,8 @@ fn parse_uuid_param(value: &str, field: &'static str) -> Result<Uuid, McpToolErr
 
 pub(super) async fn forge_add_task_dependency(
     state: &AppState,
-    params: Value,
+    params: AddTaskDependencyParams,
 ) -> Result<Value, McpToolError> {
-    let params: AddTaskDependencyParams = parse_params(params)?;
     state
         .task_service
         .add_task_dependency(&params.task_id, &params.depends_on_id)
@@ -1278,9 +1013,8 @@ pub(super) async fn forge_add_task_dependency(
 
 pub(super) async fn forge_remove_task_dependency(
     state: &AppState,
-    params: Value,
+    params: RemoveTaskDependencyParams,
 ) -> Result<Value, McpToolError> {
-    let params: RemoveTaskDependencyParams = parse_params(params)?;
     state
         .task_service
         .remove_task_dependency(&params.task_id, &params.depends_on_id)
@@ -1290,18 +1024,16 @@ pub(super) async fn forge_remove_task_dependency(
 
 pub(super) async fn forge_list_task_dependencies(
     state: &AppState,
-    params: Value,
+    params: ListTaskDependenciesParams,
 ) -> Result<Value, McpToolError> {
-    let params: ListTaskDependenciesParams = parse_params(params)?;
     let deps = TaskDependencyRepo::list_dependencies(&*state.db, &params.task_id).await?;
     Ok(json!({ "task_id": params.task_id, "depends_on_ids": deps }))
 }
 
 pub(super) async fn forge_list_task_dependents(
     state: &AppState,
-    params: Value,
+    params: ListTaskDependenciesParams,
 ) -> Result<Value, McpToolError> {
-    let params: ListTaskDependenciesParams = parse_params(params)?;
     let dependents = TaskDependencyRepo::list_dependents(&*state.db, &params.task_id).await?;
     Ok(json!({
         "depends_on_id": params.task_id,
@@ -1311,9 +1043,8 @@ pub(super) async fn forge_list_task_dependents(
 
 pub(super) async fn forge_list_sub_tasks(
     state: &AppState,
-    params: Value,
+    params: ListSubTasksParams,
 ) -> Result<Value, McpToolError> {
-    let params: ListSubTasksParams = parse_params(params)?;
     let subtasks = TaskRepo::list_subtasks_ordered(&*state.db, &params.parent_task_id).await?;
     Ok(json!({
         "parent_task_id": params.parent_task_id,
@@ -1323,9 +1054,8 @@ pub(super) async fn forge_list_sub_tasks(
 
 pub(super) async fn forge_reorder_sub_tasks(
     state: &AppState,
-    params: Value,
+    params: ReorderSubTasksParams,
 ) -> Result<Value, McpToolError> {
-    let params: ReorderSubTasksParams = parse_params(params)?;
     state
         .task_service
         .reorder_subtasks(params.parent_task_id.clone(), params.ordered_ids)
@@ -1966,7 +1696,7 @@ fn parse_json(value: &str) -> Value {
 
 pub(super) async fn forge_project_escalate(
     state: &AppState,
-    params: Value,
+    params: ProjectEscalateParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
@@ -1974,41 +1704,178 @@ pub(super) async fn forge_project_escalate(
         .project_id
         .as_deref()
         .ok_or_else(|| McpToolError::new(-32602, "project scope is required"))?;
-    let owner = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .is_some_and(|p| p.owner_id.as_deref() == Some(user_id));
-    if !owner {
-        return Err(McpToolError::new(
-            -32602,
-            "Project owner authentication is required",
-        ));
-    }
-    let mut payload = params;
-    let key = payload
-        .get("dedupe_key")
-        .and_then(Value::as_str)
-        .ok_or_else(|| McpToolError::new(-32602, "dedupe_key is required"))?
-        .to_owned();
-    payload
-        .as_object_mut()
-        .ok_or_else(|| McpToolError::new(-32602, "object required"))?
-        .remove("dedupe_key");
-    let request: api_types::ProjectEscalateRequest = parse_params(payload)?;
+    let request = api_types::ProjectEscalateRequest {
+        need: params.need,
+        task_ids: params.task_ids,
+    };
     Ok(serialize_public(
         services::project_escalation::ProjectEscalationService::new(state.db.clone())
             .escalate(
                 project_id,
                 services::project_escalation::EscalationAuthority::Owner(user_id),
                 request,
-                &key,
+                &params.dedupe_key,
             )
             .await?,
     ))
 }
 
+fn task_action_input(action: operation_registry::mcp::TaskAction) -> api_types::TaskAction {
+    use operation_registry::mcp::TaskAction as Input;
+    match action {
+        Input::Start {} => api_types::TaskAction::Start,
+        Input::Hold { reason } => api_types::TaskAction::Hold { reason },
+        Input::Release { reason } => api_types::TaskAction::Release { reason },
+        Input::Retry {
+            reason,
+            fresh_session,
+            refresh_workspace,
+            reset_budget,
+            guidance,
+        } => api_types::TaskAction::Retry {
+            reason,
+            fresh_session,
+            refresh_workspace,
+            reset_budget,
+            guidance,
+        },
+        Input::SendBack { guidance } => api_types::TaskAction::SendBack { guidance },
+        Input::Approve {
+            reason,
+            override_checks,
+        } => api_types::TaskAction::Approve {
+            reason,
+            override_checks,
+        },
+        Input::Restart { reason } => api_types::TaskAction::Restart { reason },
+        Input::Cancel { reason } => api_types::TaskAction::Cancel { reason },
+    }
+}
+
+fn lifecycle_hooks_input(
+    hooks: operation_registry::mcp::LifecycleHooks,
+) -> api_types::LifecycleHooks {
+    use operation_registry::mcp::{LifecycleEvent as Event, LifecycleHookDef as Hook};
+    hooks
+        .into_iter()
+        .map(|(event, hooks)| {
+            let event = match event {
+                Event::BeforeWork => api_types::LifecycleEvent::BeforeWork,
+                Event::OnWorkStart => api_types::LifecycleEvent::OnWorkStart,
+                Event::OnWorkStop => api_types::LifecycleEvent::OnWorkStop,
+                Event::OnTaskDone => api_types::LifecycleEvent::OnTaskDone,
+                Event::OnTaskCancel => api_types::LifecycleEvent::OnTaskCancel,
+            };
+            let hooks = hooks
+                .into_iter()
+                .map(|hook| match hook {
+                    Hook::Script {
+                        command,
+                        timeout_seconds,
+                        blocking,
+                    } => api_types::LifecycleHookDef::Script {
+                        command,
+                        timeout_seconds: timeout_seconds.get(),
+                        blocking,
+                    },
+                    Hook::Plugin {
+                        name,
+                        enabled,
+                        config,
+                    } => api_types::LifecycleHookDef::Plugin {
+                        name,
+                        enabled,
+                        config,
+                    },
+                })
+                .collect();
+            (event, hooks)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_task_commands_match_domain_serde_acceptance_and_convert_without_loss() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let contract = &operation_registry::mcp::lookup("forge_task_action")
+            .unwrap()
+            .input
+            .schema["properties"]["action"];
+        let domain = api_types::task_action_schema();
+        let fields = |schema: &Value| -> BTreeMap<String, BTreeSet<String>> {
+            schema["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|variant| {
+                    let verb = variant["properties"]["verb"]["const"]
+                        .as_str()
+                        .or_else(|| variant["properties"]["verb"]["enum"][0].as_str())
+                        .unwrap()
+                        .to_owned();
+                    (
+                        verb,
+                        variant["properties"]
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            fields(contract),
+            fields(&domain),
+            "every domain condition verb and field has a MCP input row"
+        );
+        for action in [
+            json!({"verb":"start"}),
+            json!({"verb":"hold","reason":null}),
+            json!({"verb":"release","reason":"resume"}),
+            json!({"verb":"retry","reason":"again","fresh_session":true,"refresh_workspace":false,"reset_budget":true,"guidance":"continue"}),
+            json!({"verb":"send_back","guidance":"fix"}),
+            json!({"verb":"approve","override":true,"reason":null}),
+            json!({"verb":"restart","reason":"again"}),
+            json!({"verb":"cancel"}),
+        ] {
+            let expected: api_types::TaskAction = serde_json::from_value(action.clone()).unwrap();
+            let decoded = operation_registry::mcp::lookup("forge_task_action")
+                .unwrap()
+                .decode(json!({"task_id":"t","action":action,"version":1}))
+                .unwrap();
+            let operation_registry::mcp::McpInput::TaskAction(params) = decoded else {
+                panic!("typed action")
+            };
+            assert_eq!(task_action_input(params.action), expected);
+        }
+        // The one acceptance difference, listed as a break: Serde ignores
+        // extra fields on an internally tagged unit variant, so REST accepts
+        // this `start`; the closed MCP contract refuses it.
+        let padded_start = json!({"verb":"start","reason":"now"});
+        assert!(serde_json::from_value::<api_types::TaskAction>(padded_start.clone()).is_ok());
+        assert!(operation_registry::mcp::lookup("forge_task_action")
+            .unwrap()
+            .decode(json!({"task_id":"t","action":padded_start,"version":1}))
+            .is_err());
+        for action in [
+            json!({"verb":"send_back"}),
+            json!({"verb":"cancel","reset_budget":true}),
+            json!({"verb":"new-integration-verb"}),
+            json!({"verb":"retry","unknown":true}),
+        ] {
+            assert!(serde_json::from_value::<api_types::TaskAction>(action.clone()).is_err());
+            assert!(operation_registry::mcp::lookup("forge_task_action")
+                .unwrap()
+                .decode(json!({"task_id":"t","action":action,"version":1}))
+                .is_err());
+        }
+    }
 
     #[tokio::test]
     async fn transition_response_keeps_committed_task_after_background_advance() {

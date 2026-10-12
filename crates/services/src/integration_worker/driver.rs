@@ -47,6 +47,11 @@ pub enum ParkReason {
     /// The Task's owner, Project or Agent stopped it (`TaskGate::Gated`).
     Gate(GateCause),
     TargetNotReady,
+    /// The machine that owns the Task's checkout is not connected, or its
+    /// placement is not `ready` again yet. No retry is counted: the wait ends
+    /// when the owner is back (`TaskService::integration_owner_ready` makes
+    /// the attempt due at once), and the sweep asks again meanwhile.
+    OwnerOffline,
     TargetDirty,
     WorktreeDirty,
     UnsupportedConflict,
@@ -55,6 +60,11 @@ pub enum ParkReason {
     RoundsExhausted,
     /// A deciding Task step settled without answering, again after re-asks.
     StepFailed,
+    /// The `result` step's proof failed: the owner of the target says the
+    /// target does not contain the commit this attempt recorded as merged
+    /// (the target was rewound after the fast-forward). The attempt is
+    /// validated again from the target as it is, on the counted retry timer.
+    NotLanded,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retry {
@@ -72,6 +82,7 @@ impl ParkReason {
             Self::Timeout => "timeout",
             Self::Gate(cause) => cause.code(),
             Self::TargetNotReady => "target_not_ready",
+            Self::OwnerOffline => "owner_offline",
             Self::TargetDirty => "target_dirty",
             Self::WorktreeDirty => "worktree_dirty",
             Self::UnsupportedConflict => "unsupported_conflict",
@@ -79,21 +90,36 @@ impl ParkReason {
             Self::ExternalMovesExhausted => "external_target_moves_exhausted",
             Self::RoundsExhausted => "rounds_exhausted",
             Self::StepFailed => "task_step_failed",
+            Self::NotLanded => "target_missing_commit",
         }
     }
     fn kind(self) -> IntegrationFailureKind {
         match self {
             Self::Infrastructure | Self::StepFailed => IntegrationFailureKind::Infrastructure,
             Self::Timeout => IntegrationFailureKind::Timeout,
-            Self::TargetNotReady => IntegrationFailureKind::TargetUnavailable,
+            Self::NotLanded => IntegrationFailureKind::NeedsFact,
+            Self::TargetNotReady | Self::OwnerOffline => IntegrationFailureKind::TargetUnavailable,
             _ => IntegrationFailureKind::OwnerRequired,
         }
     }
     fn retry(self) -> Retry {
         match self {
-            Self::Infrastructure | Self::Timeout | Self::StepFailed => Retry::Counted,
-            Self::Gate(_) | Self::TargetNotReady => Retry::Soon,
+            Self::Infrastructure | Self::Timeout | Self::StepFailed | Self::NotLanded => {
+                Retry::Counted
+            }
+            Self::Gate(_) | Self::TargetNotReady | Self::OwnerOffline => Retry::Soon,
             _ => Retry::Owner,
+        }
+    }
+    /// A failure to reach an owner machine is a wait for that machine, not
+    /// an infrastructure failure of the merge: it spends no counted retry.
+    fn unreached(error: &ServiceError) -> Self {
+        match error {
+            ServiceError::DaemonUnavailable { .. }
+            | ServiceError::DaemonTimeout { .. }
+            | ServiceError::DaemonNotReady { .. }
+            | ServiceError::DaemonUpgradeRequired { .. } => Self::OwnerOffline,
+            _ => Self::Infrastructure,
         }
     }
 }
@@ -187,6 +213,8 @@ pub struct HeadDriver {
     /// Location verifications this session requested after the owner refused
     /// the claim's target.
     verifications: u32,
+    /// Test instrumentation: this session holds the head Task's merge.
+    holding: Option<(String, super::holders::MergeHold)>,
     stop: CancellationToken,
 }
 
@@ -208,6 +236,7 @@ impl HeadDriver {
             reconcile_at: None,
             owner_link: None,
             verifications: 0,
+            holding: None,
             stop: CancellationToken::new(),
         }
     }
@@ -262,6 +291,7 @@ impl HeadDriver {
         match self.step().await {
             Err(error) if is_conflict(&error) => Ok(Pass::Wait(self.w.config.conflict_backoff)),
             Ok(pass @ (Pass::Released | Pass::Lost)) => {
+                self.holding = None;
                 if pass == Pass::Released {
                     // A session that took the head over (a restart, a lost
                     // lease) made no transfer itself, but the head it
@@ -328,6 +358,21 @@ impl HeadDriver {
         };
         self.head_seen = Some(head.clone());
         let a = w.attempt(&head).await?;
+        if self
+            .holding
+            .as_ref()
+            .is_none_or(|(task, _)| *task != a.task_ref)
+        {
+            self.holding = None;
+            self.holding = Some((
+                a.task_ref.clone(),
+                super::holders::hold(
+                    &w.db,
+                    &a.task_ref,
+                    super::holders::MergeHolder::WorkerDriver,
+                ),
+            ));
+        }
         let now = w.clock.now();
         if self.since.map(|(state, _)| state) != Some(a.state) {
             self.since = Some((a.state, now));
@@ -998,7 +1043,7 @@ impl HeadDriver {
             }
             Err(error) => {
                 return self
-                    .park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .park(&a, ParkReason::unreached(&error), &error.to_string())
                     .await
             }
         };
@@ -1153,7 +1198,7 @@ impl HeadDriver {
             Ok(facts) => facts,
             Err(error) => {
                 return self
-                    .park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .park(&a, ParkReason::unreached(&error), &error.to_string())
                     .await
             }
         };
@@ -1213,7 +1258,7 @@ impl HeadDriver {
                     return self
                         .park(
                             &a,
-                            ParkReason::Infrastructure,
+                            ParkReason::OwnerOffline,
                             "the Task's checkout is not ready on its machine",
                         )
                         .await;
@@ -1307,7 +1352,7 @@ impl HeadDriver {
                 // on; left in `rebasing` it would be re-claimed at every
                 // lease expiry for as long as the cause lasts.
                 return self
-                    .park(&now, ParkReason::Infrastructure, &error.to_string())
+                    .park(&now, ParkReason::unreached(&error), &error.to_string())
                     .await;
             }
         };
@@ -1347,7 +1392,7 @@ impl HeadDriver {
                         return self
                             .park(
                                 &a,
-                                ParkReason::Infrastructure,
+                                ParkReason::OwnerOffline,
                                 "the Task's checkout is not ready on its machine",
                             )
                             .await;
@@ -1523,6 +1568,7 @@ impl HeadDriver {
             IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
             IntegrationStepOutcome::Permit
             | IntegrationStepOutcome::NeedsReview
+            | IntegrationStepOutcome::NotLanded
             | IntegrationStepOutcome::Done => {
                 // The same acknowledgment is the settle decision; the next
                 // state consumes it.
@@ -1626,7 +1672,9 @@ impl HeadDriver {
             }
             IntegrationStepOutcome::CandidateCheckFailed => self.check_failed(&a, &ack).await,
             IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
-            IntegrationStepOutcome::Infrastructure | IntegrationStepOutcome::Done => {
+            IntegrationStepOutcome::Infrastructure
+            | IntegrationStepOutcome::NotLanded
+            | IntegrationStepOutcome::Done => {
                 // The step refused the permit under the Task gate.
                 if let Some(pass) = self.gated(&a).await? {
                     return Ok(pass);
@@ -2049,7 +2097,27 @@ impl HeadDriver {
             self.w.steps.ready_result_step(&a.id, a.effect_seq).await?;
         }
         let now = self.w.clock.now();
-        let mut done = IntegrationStepAck::current(&a, action).is_some();
+        let answer = IntegrationStepAck::current(&a, action);
+        if let Some(answer) = answer
+            .as_ref()
+            .filter(|answer| answer.outcome == IntegrationStepOutcome::NotLanded)
+        {
+            // The Task was not reported merged. The recorded result is
+            // dropped with the slot; the next validation reads the target.
+            let detail = answer
+                .message
+                .clone()
+                .unwrap_or_else(|| "the target does not contain the merged commit".into());
+            let a = self
+                .w
+                .advance(&a.id, S::Applied, |a| {
+                    a.integrated_sha = None;
+                    a.integrated_before_sha = None;
+                })
+                .await?;
+            return self.park(&a, ParkReason::NotLanded, &detail).await;
+        }
+        let mut done = answer.is_some();
         let due = self
             .result_checked
             .is_none_or(|at| now >= later(at, self.w.config.sweep_interval));

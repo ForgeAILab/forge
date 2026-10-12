@@ -1,12 +1,14 @@
-//! The frozen oracle records 33e2a974's scope and moved-handler roles,
-//! independently of the current registry. H's domain roles remain in H.
+//! Freeze bab42a97 advertisement separately from effective grant/role
+//! acceptance; H repairs advertised refusals without widening authority.
 use super::*;
 use std::collections::BTreeSet;
 
 pub(super) fn base_admitted(grant: &str, name: &str) -> bool {
-    let oracle: Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/mcp_base_authority.json")).unwrap();
-    oracle["rows"][name][grant]
+    let oracle: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/mcp_h_base_authority.json"
+    ))
+    .unwrap();
+    oracle["rows"][name][grant]["callable"]
         .as_bool()
         .expect("every grant/role/tool has a frozen row")
 }
@@ -14,12 +16,13 @@ pub(super) fn base_admitted(grant: &str, name: &str) -> bool {
 #[test]
 fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admission() {
     run_async(async {
-        use operation_registry::authority::MCP_OPERATIONS;
+        use operation_registry::mcp::CATALOG;
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
-        let oracle: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/mcp_base_authority.json"))
-                .unwrap();
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/mcp_h_base_authority.json"
+        ))
+        .unwrap();
         assert_eq!(
             oracle["rows"]
                 .as_object()
@@ -27,26 +30,49 @@ fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admis
                 .keys()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>(),
-            MCP_OPERATIONS.iter().map(|(name, _)| *name).collect()
+            CATALOG.iter().map(|spec| spec.name).collect()
         );
+        seed_chat_account(&state).await;
         let user_id = "mcp-test-user";
         for (grant, role) in [
             ("account", None),
+            ("account_admin", None),
             ("project_public", None),
+            ("project_global_admin", None),
             ("project_member", Some("member")),
             ("project_admin", Some("admin")),
-            ("project_owner", Some("owner")),
+            ("project_member_owner", Some("owner")),
+            ("project_owner", None),
+            ("project_invisible", None),
         ] {
-            if let Some(role) = role {
-                if ProjectMemberRepo::get_member(&*state.db, &project_id, user_id)
+            UserRepo::set_admin(
+                &*state.db,
+                user_id,
+                matches!(grant, "account_admin" | "project_global_admin"),
+            )
+            .await
+            .unwrap();
+            if ProjectMemberRepo::get_member(&*state.db, &project_id, user_id)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                ProjectMemberRepo::remove_member(&*state.db, &project_id, user_id)
                     .await
-                    .unwrap()
-                    .is_some()
-                {
-                    ProjectMemberRepo::remove_member(&*state.db, &project_id, user_id)
-                        .await
-                        .unwrap();
-                }
+                    .unwrap();
+            }
+            let owner = match grant {
+                "project_owner" => Some(user_id),
+                "project_invisible" => Some("chat-user"),
+                _ => None,
+            };
+            sqlx::query("UPDATE project SET owner_id=? WHERE id=?")
+                .bind(owner)
+                .bind(&project_id)
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            if let Some(role) = role {
                 let now = now_rfc3339();
                 ProjectMemberRepo::add_member(
                     &*state.db,
@@ -64,7 +90,7 @@ fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admis
             }
             let context = McpContext {
                 user_id: Some(user_id.into()),
-                project_id: (grant != "account").then(|| project_id.clone()),
+                project_id: (!grant.starts_with("account")).then(|| project_id.clone()),
             };
             let listed = dispatch_with_context(&state, &context, "tools/list", json!({}))
                 .await
@@ -75,7 +101,35 @@ fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admis
                 .iter()
                 .map(|tool| tool["name"].as_str().unwrap())
                 .collect::<BTreeSet<_>>();
-            for (name, _) in MCP_OPERATIONS {
+            let baseline: Value = serde_json::from_str(include_str!(
+                "../../tests/fixtures/mcp_h_base_definitions.json"
+            ))
+            .unwrap();
+            let surface = if grant.starts_with("account") {
+                "mcp_account"
+            } else {
+                "mcp_project"
+            };
+            let before = baseline[surface]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| {
+                    oracle["rows"][tool["name"].as_str().unwrap()][grant]["listed"] == true
+                })
+                .cloned()
+                .map(|mut tool| {
+                    if tool["name"] == "forge_register_agent" && grant != "account_admin" {
+                        tool["inputSchema"]["properties"]["daemon_id"] = json!({"type":"null"});
+                    }
+                    tool
+                })
+                .collect::<Vec<_>>();
+            let before_bytes = serde_json::to_vec(&before).unwrap().len();
+            let after_bytes = serde_json::to_vec(&listed["tools"]).unwrap().len();
+            println!("MCP_ROLE_PREFIX {grant} before_tools={} after_tools={} before_bytes={before_bytes} after_bytes={after_bytes} before_tokens={} after_tokens={}",before.len(),names.len(),before_bytes.div_ceil(4),after_bytes.div_ceil(4));
+            for spec in CATALOG.iter() {
+                let name = spec.name;
                 let expected = base_admitted(grant, name);
                 assert_eq!(
                     names.contains(name),
@@ -111,9 +165,25 @@ fn every_tool_has_a_frozen_scope_and_role_row_and_rpc_advertisement_equals_admis
 fn each_moved_rpc_refuses_unknown_fields_with_the_one_typed_contract_error() {
     run_async(async {
         let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        sqlx::query("UPDATE project SET owner_id='mcp-test-user' WHERE id=?")
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
         for spec in operation_registry::mcp::CATALOG.iter() {
-            let error = dispatch(
+            let bound_only = matches!(
+                spec.role,
+                operation_registry::mcp::RequiredRole::Owner
+                    | operation_registry::mcp::RequiredRole::BoundProject
+            );
+            let context = McpContext {
+                user_id: Some("mcp-test-user".into()),
+                project_id: bound_only.then(|| project_id.clone()),
+            };
+            let error = dispatch_with_context(
                 &state,
+                &context,
                 "tools/call",
                 json!({"name":spec.name,"arguments":{"unexpected":true}}),
             )
@@ -398,5 +468,357 @@ fn contract_corrections_do_not_echo_argument_values_and_need_an_object() {
         )
         .await;
         assert_eq!(error.code, -32602);
+    });
+}
+
+#[test]
+fn task_transition_keeps_the_mcp_system_policy_and_gains_no_user_override() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let execution_id = seed_execution(&state, task.id.clone()).await;
+        // No edge leads from the initial state straight to `done`. An
+        // interactive user may override that; an MCP credential may not.
+        let error = call_tool_error(
+            &state,
+            "forge_transition_task",
+            json!({"task_id":task.id,"status":"done","version":task.version}),
+        )
+        .await;
+        assert_eq!(error.code, -32010, "{}", error.message);
+        let unchanged = TaskRepo::get_by_id(&*state.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, task.status);
+        assert_eq!(unchanged.version, task.version);
+
+        call_tool(
+            &state,
+            "forge_transition_task",
+            json!({"task_id":task.id,"status":"in_progress","version":task.version}),
+        )
+        .await;
+        let payload: String = sqlx::query_scalar("SELECT payload_json FROM task_step WHERE task_id=? AND kind='hooks' ORDER BY seq DESC LIMIT 1")
+            .bind(&task.id).fetch_one(state.db.pool()).await.unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let actor: api_types::Actor = serde_json::from_value(payload["actor"].clone()).unwrap();
+        assert_eq!(
+            actor,
+            api_types::Actor::system(api_types::SystemComponent::Mcp),
+            "the transition runs under the MCP system policy"
+        );
+        let execution = ExecutionRepo::get_by_id(&*state.db, &execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            execution.status,
+            ExecutionStatus::Cancelled,
+            "only an interactive user's state move stops the displaced run"
+        );
+    });
+}
+
+#[test]
+fn both_settings_paths_validate_agent_usability_for_the_authenticated_user() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let settings = json!({"default_role_assignments":[{"role_name":"coder","assignee_type":"agent","assignee_id":"not-usable"}]});
+        let error = call_tool_error(
+            &state,
+            "forge_update_project",
+            json!({"project_id":project_id,"version":project.version,"settings":settings}),
+        )
+        .await;
+        assert!(
+            error.message.contains("agent not usable in this project"),
+            "{}",
+            error.message
+        );
+        let after = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, project.version);
+        assert_eq!(after.settings, project.settings);
+        // An existing, structurally valid assignment is rechecked even when
+        // only lifecycle hooks are being replaced.
+        sqlx::query("UPDATE project SET settings=? WHERE id=?")
+            .bind(settings.to_string())
+            .bind(&project_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let error = call_tool_error(
+            &state,
+            "forge_update_project_lifecycle_hooks",
+            json!({"project_id":project_id,"version":project.version,"lifecycle_hooks":{}}),
+        )
+        .await;
+        assert!(
+            error.message.contains("agent not usable in this project"),
+            "{}",
+            error.message
+        );
+        let after = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, project.version);
+        assert_eq!(
+            serde_json::from_str::<Value>(&after.settings).unwrap(),
+            settings
+        );
+    });
+}
+
+#[test]
+fn unknown_nested_fields_fail_before_any_handler_effect() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let root = seed_task(&state).await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let execution_id = seed_execution(&state, root.id.clone()).await;
+        for (tool, arguments) in [
+            (
+                "forge_create_sub_tasks",
+                json!({"parent_task_id":root.id,"subtasks":[{"title":"child","unknown":true}]}),
+            ),
+            (
+                "forge_follow_up_execution",
+                json!({"execution_id":execution_id,"message":"continue","overrides":{"unknown":true}}),
+            ),
+            (
+                "forge_update_project_lifecycle_hooks",
+                json!({"project_id":project_id,"version":1,"lifecycle_hooks":{"before_work":[{"type":"script","command":"true","unknown":true}]}}),
+            ),
+            (
+                "forge_task_action",
+                json!({"task_id":root.id,"version":root.version,"action":{"verb":"retry","unknown":true}}),
+            ),
+        ] {
+            let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+            let error = call_tool_error(&state, tool, arguments).await;
+            assert_eq!(error.code, -32602, "{tool}: {}", error.message);
+            assert_eq!(
+                error.data.unwrap()["code"],
+                "mcp_contract_invalid",
+                "{tool}"
+            );
+            let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+            assert_eq!(before, after);
+        }
+    });
+}
+
+/// Every id-taking Task/Project tool, with the id at the root and nested. The
+/// reference is refused before the handler, so the other arguments only have
+/// to satisfy nothing: the answer must not depend on whether the id exists.
+fn reference_calls(own_project: &str, own_task: &str, id: &str) -> Vec<(&'static str, Value)> {
+    let mut calls = vec![
+        ("forge_preview_prompt", json!({"task_id":id,"role":"coder"})),
+        ("forge_assign_agent", json!({"task_id":id,"agent_id":"a"})),
+        (
+            "forge_task_action",
+            json!({"task_id":id,"action":{"verb":"start"},"version":1}),
+        ),
+        ("forge_list_executions", json!({"task_id":id})),
+        ("forge_update_task", json!({"task_id":id,"version":1})),
+        (
+            "forge_transition_task",
+            json!({"task_id":id,"status":"in_progress","version":1}),
+        ),
+        (
+            "forge_add_task_dependency",
+            json!({"task_id":id,"depends_on_id":own_task}),
+        ),
+        (
+            "forge_add_task_dependency",
+            json!({"task_id":own_task,"depends_on_id":id}),
+        ),
+        (
+            "forge_remove_task_dependency",
+            json!({"task_id":id,"depends_on_id":own_task}),
+        ),
+        (
+            "forge_remove_task_dependency",
+            json!({"task_id":own_task,"depends_on_id":id}),
+        ),
+        (
+            "forge_create_sub_tasks",
+            json!({"parent_task_id":id,"subtasks":[{"title":"child"}]}),
+        ),
+        (
+            "forge_reorder_sub_tasks",
+            json!({"parent_task_id":id,"ordered_ids":[]}),
+        ),
+        (
+            "forge_reorder_sub_tasks",
+            json!({"parent_task_id":own_task,"ordered_ids":[id]}),
+        ),
+        (
+            "forge_create_task",
+            json!({"project_id":own_project,"title":"t","parent_task_id":id}),
+        ),
+        (
+            "forge_create_task",
+            json!({"project_id":own_project,"title":"t","depends_on_ids":[id]}),
+        ),
+        (
+            "forge_follow_up_execution",
+            json!({"execution_id":id,"message":"continue"}),
+        ),
+    ];
+    for name in [
+        "forge_get_task",
+        "forge_get_task_diff",
+        "forge_list_task_dependencies",
+        "forge_list_task_dependents",
+    ] {
+        calls.push((name, json!({"task_id":id})));
+    }
+    calls.push(("forge_list_sub_tasks", json!({"parent_task_id":id})));
+    for name in ["forge_get_project", "forge_list_tasks"] {
+        calls.push((name, json!({"project_id":id})));
+    }
+    calls.push(("forge_update_project", json!({"project_id":id,"version":1})));
+    calls.push((
+        "forge_update_project_lifecycle_hooks",
+        json!({"project_id":id,"version":1,"lifecycle_hooks":{}}),
+    ));
+    calls.push(("forge_memory_search", json!({"project_id":id,"query":"q"})));
+    calls
+}
+
+#[test]
+fn a_foreign_task_execution_or_project_answers_exactly_like_a_missing_one() {
+    run_async(async {
+        let state = sqlite_state().await;
+        seed_chat_account(&state).await;
+        let own = seed_task(&state).await;
+        let foreign = seed_task(&state).await;
+        let foreign_execution = seed_execution(&state, foreign.id.clone()).await;
+        let before: (i64, i64) = (
+            sqlx::query_scalar("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_dependency")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+        );
+        // A grant constrained to `own`'s Project while the other Project is
+        // visible to the user; then an account grant while it is not.
+        for constrained in [true, false] {
+            if !constrained {
+                sqlx::query("UPDATE project SET owner_id='chat-user' WHERE id=?")
+                    .bind(&foreign.project_id)
+                    .execute(state.db.pool())
+                    .await
+                    .unwrap();
+            }
+            let context = McpContext {
+                user_id: Some("mcp-test-user".into()),
+                project_id: constrained.then(|| own.project_id.clone()),
+            };
+            let missing = new_uuid_v4();
+            let mut compared = BTreeSet::new();
+            for (kind, existing) in [
+                ("task", foreign.id.as_str()),
+                ("execution", foreign_execution.as_str()),
+                ("project", foreign.project_id.as_str()),
+            ] {
+                let answers = |id: &str| {
+                    reference_calls(&own.project_id, &own.id, id)
+                        .into_iter()
+                        .filter(|(name, arguments)| match kind {
+                            "execution" => *name == "forge_follow_up_execution",
+                            "project" => arguments.get("project_id") == Some(&json!(id)),
+                            _ => {
+                                *name != "forge_follow_up_execution"
+                                    && arguments.get("project_id") != Some(&json!(id))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for ((name, there), (_, absent)) in
+                    answers(existing).into_iter().zip(answers(&missing))
+                {
+                    let mut seen = Vec::new();
+                    for (id, arguments) in [(existing, there), (missing.as_str(), absent)] {
+                        let error = dispatch_with_context(
+                            &state,
+                            &context,
+                            "tools/call",
+                            json!({"name":name,"arguments":arguments}),
+                        )
+                        .await
+                        .expect_err("a reference outside the grant is refused");
+                        let error = error.into_response(Value::Null).error.unwrap();
+                        seen.push((
+                            error.code,
+                            error.message.replace(id, "<id>"),
+                            error.data.map(|data| data.to_string().replace(id, "<id>")),
+                        ));
+                    }
+                    assert_eq!(seen[0], seen[1], "constrained={constrained} {name} {kind}");
+                    assert!(
+                        !format!("{:?}", seen[0]).contains(&foreign.id)
+                            && !format!("{:?}", seen[0]).contains(&foreign.project_id),
+                        "{name} names nothing but the id the caller sent"
+                    );
+                    compared.insert(name);
+                }
+            }
+            // Every Task/Project tool that takes an id is in the table.
+            let id_taking = operation_registry::mcp::CATALOG
+                .iter()
+                .filter(|spec| {
+                    let fields = spec.input.schema["properties"].as_object().unwrap();
+                    spec.resource != operation_registry::mcp::ResourceRule::None
+                        && ["task_id", "parent_task_id", "execution_id"]
+                            .iter()
+                            .any(|field| fields.contains_key(*field))
+                        || matches!(
+                            spec.name,
+                            "forge_get_project"
+                                | "forge_list_tasks"
+                                | "forge_update_project"
+                                | "forge_update_project_lifecycle_hooks"
+                                | "forge_memory_search"
+                        )
+                })
+                .map(|spec| spec.name)
+                .collect::<BTreeSet<_>>();
+            assert!(
+                id_taking.is_subset(&compared),
+                "untested id-taking tools: {:?}",
+                id_taking.difference(&compared).collect::<Vec<_>>()
+            );
+        }
+        let after: (i64, i64) = (
+            sqlx::query_scalar("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_dependency")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(before, after, "no refused reference had an effect");
     });
 }

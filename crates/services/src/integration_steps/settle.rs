@@ -67,9 +67,9 @@ pub trait HeadCheckSource: Send + Sync {
 }
 
 /// The default source: the same bundle review entry runs (`ci_steps` of the
-/// effective review configuration), built by the shared spec builder as the
-/// queue-head CI family. Existing commands are uncacheable, so this always
-/// runs once per rebased commit.
+/// effective review configuration), under the identity review entry asks
+/// under, so a result of either is a hit for the other on the same commit in
+/// the same worktree.
 pub struct ReviewCiHeadCheck {
     db: Arc<SqliteDb>,
 }
@@ -86,10 +86,6 @@ impl HeadCheckSource for ReviewCiHeadCheck {
         attempt: &IntegrationAttempt,
         queue: &IntegrationQueue,
     ) -> Result<Option<HeadCheck>> {
-        use api_types::{
-            CheckDigestInput, CheckEnvironmentIdentity, CheckEnvironmentValue,
-            CheckExecutionRevision,
-        };
         let commit_sha = attempt
             .candidate_sha
             .clone()
@@ -97,8 +93,6 @@ impl HeadCheckSource for ReviewCiHeadCheck {
         let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
@@ -127,56 +121,74 @@ impl HeadCheckSource for ReviewCiHeadCheck {
         {
             return Ok(None);
         }
-        let source = db::ReviewConformanceRepo::review_source(&*self.db, &task.id, None).await?;
         let owner_is_daemon = attempt.owner_kind == Some(db::IntegrationOwnerKind::Daemon);
+        let workspace = match attempt.workspace_id.as_deref() {
+            Some(id) => db::WorkspaceRepo::get_by_id(&*self.db, id).await?,
+            None => db::WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?,
+        };
+        // The identity review entry asks under (`request_entry_check`): the
+        // same source, the review state's effective configuration, the
+        // canonical policy, and the Task's workspace at its placement
+        // generation. The purpose is a property of who asks (the consumer),
+        // not of the result: a commit that already passed these commands in
+        // this worktree at review entry is a hit and runs nothing, and a
+        // commit the queue rebased is another commit and runs once. A
+        // daemon-owned checkout keeps its owner's frozen policy from the
+        // builder (it always runs), exactly as at review entry. The head is
+        // only asked for a check on a clean worktree (validation parks a
+        // dirty one first), which is the entry's dirty-tree rule.
+        let environment = ::review::contract::project_environment(&self.db, &task.id)
+            .await
+            .map_err(ServiceError::invalid_operation)?;
+        let source = match &workspace {
+            Some(workspace) => serde_json::json!({
+                "task_id": task.id, "project_id": task.project_id, "repo_id": workspace.repo_id,
+            }),
+            None => db::ReviewConformanceRepo::review_source(&*self.db, &task.id, None).await?,
+        };
+        let generation = attempt
+            .placement_generation
+            .and_then(|generation| u64::try_from(generation).ok());
+        let identity_workspace = match (&workspace, generation) {
+            (Some(workspace), Some(generation)) => {
+                Some(::review::check_spec::CheckWorkspaceIdentity {
+                    workspace_id: &workspace.id,
+                    generation,
+                })
+            }
+            _ => None,
+        };
         let spec = ::review::check_spec::build_check_spec(
-            CheckPurpose::QueueHeadCi,
+            CheckPurpose::EntryCi,
             &::review::check_spec::CheckSpecConfiguration {
                 source: &source,
                 entry_state_config: review_config.as_ref(),
-                environment: &settings.environment,
+                environment: &environment,
                 hooks: &[],
                 hook_test_index: None,
                 single_environment_check: None,
                 event: api_types::LifecycleEvent::BeforeWork,
-                role: crate::workflow::default_roles::REVIEWER,
+                role: "",
                 owner_is_daemon,
-                workspace: None,
-                canonical_policy: false,
-                queue_head_bundle: Some(::review::check_spec::QueueHeadCheckBundle::CiOnly),
+                canonical_policy: true,
+                workspace: identity_workspace,
+                queue_head_bundle: None,
             },
         )
         .map_err(ServiceError::invalid_operation)?;
         if spec.commands.is_empty() {
             return Ok(None);
         }
-        let workspace_id = match attempt.workspace_id.clone() {
-            Some(id) => Some(id),
-            None => db::WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
-                .await?
-                .map(|workspace| workspace.id),
-        };
+        let inputs =
+            crate::check_runner::policy::digest_input(&self.db, spec, &environment.env).await?;
         Ok(Some(HeadCheck {
             identity: CheckRunIdentity {
                 project_id: task.project_id.clone(),
                 repo_id: queue.repo_id.clone(),
                 commit_sha,
-                inputs: CheckDigestInput {
-                    environment: spec
-                        .commands
-                        .iter()
-                        .flat_map(|command| command.environment_keys.iter().cloned())
-                        .map(|key| (key, CheckEnvironmentValue::Volatile))
-                        .collect(),
-                    spec,
-                    environment_identity: CheckEnvironmentIdentity::NotAttested,
-                    execution_revision: CheckExecutionRevision {
-                        number: 0,
-                        audit_ref: None,
-                    },
-                },
+                inputs,
             },
-            workspace_id,
+            workspace_id: workspace.map(|workspace| workspace.id),
             machine_id: attempt.daemon_id.clone(),
             wall_timeout_seconds: u64::from(::review::contract::DEFAULT_CHECK_TIMEOUT_SECONDS),
         }))

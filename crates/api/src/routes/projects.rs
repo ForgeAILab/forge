@@ -475,6 +475,15 @@ pub async fn delete_project(
                 // leave the Project intact and are surfaced to the caller. Work
                 // admitted after this pass is handled by the next attempt or by
                 // the final in-use CAS below.
+                // A merge with an unknown result is what no force deletes:
+                // that refusal comes before anything is cancelled, not after
+                // the Project's work was stopped for a delete that then does
+                // not happen.
+                if let Err(error @ db::DbError::IntegrationUnresolved { .. }) =
+                    ProjectRepo::ensure_deletable(&*state.db, &id).await
+                {
+                    return Err(error.into());
+                }
                 state
                     .task_service
                     .prepare_project_deletion(&id, settle_until)

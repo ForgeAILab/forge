@@ -45,6 +45,37 @@ pub(crate) fn role_target(
     default_name: &str,
 ) -> String {
     use crate::workflow::default_states;
+    let target = |from: &str, trigger: api_types::WorkflowTrigger| {
+        workflow
+            .outgoing_trigger_targets(from)
+            .find(|(candidate, _)| *candidate == trigger)
+            .map(|(_, to)| to)
+    };
+    // A landed merge goes where THIS merge state's `accept` leads. A
+    // workflow with two merge states gives each its own target; the state
+    // named `done` is only the answer for a merge state that leads there (or
+    // names no `accept` target at all).
+    if default_name == default_states::DONE {
+        if let Some(own) = target(merge_state, api_types::WorkflowTrigger::Accept) {
+            return own;
+        }
+    }
+    // Likewise the repair state: this merge state's own `reject` target
+    // when that state carries the repair role's exit guard.
+    if default_name == default_states::MERGE_FAILED {
+        if let Some(own) = target(merge_state, api_types::WorkflowTrigger::Reject).filter(|own| {
+            workflow.states.iter().any(|state| {
+                state.name == *own
+                    && state
+                        .hooks
+                        .before_exit
+                        .iter()
+                        .any(|hook| hook.action == "require_conflict_markers_resolved")
+            })
+        }) {
+            return own;
+        }
+    }
     if workflow
         .states
         .iter()
@@ -52,12 +83,6 @@ pub(crate) fn role_target(
     {
         return default_name.to_owned();
     }
-    let target = |from: &str, trigger: api_types::WorkflowTrigger| {
-        workflow
-            .outgoing_trigger_targets(from)
-            .find(|(candidate, _)| *candidate == trigger)
-            .map(|(_, to)| to)
-    };
     // The repair state is the one that carries the conflict-marker exit
     // guard (the hook that belongs to that role), else the merge state's
     // `reject` target.
@@ -122,6 +147,37 @@ impl crate::TaskService {
         Ok(())
     }
 
+    /// The machine that owns the Task's checkout is back and the Task's
+    /// placement is `ready` again (`recovery::reconcile_workspace_placement`).
+    /// An attempt the worker parked for that machine (`owner_offline`, or a
+    /// counted retry it was still waiting out) is due now and the worker is
+    /// woken. A Task whose merge was waiting for the machine before the
+    /// queue existed (importer row P15: its attempt names no candidate, so
+    /// the worker cannot drive it) is admitted here, as the reconciler's
+    /// sweep would admit it at its next pass. No owner action is involved.
+    pub async fn integration_owner_ready(&self, task_id: &str) -> Result<()> {
+        let Some(current) = self.db.current_integration_attempt(task_id).await? else {
+            return Ok(());
+        };
+        if current.state.terminal() {
+            return Ok(());
+        }
+        if matches!(current.state, S::Parked | S::Queued) && admission::unbound(&current) {
+            if let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? {
+                self.reconcile_integration_admission(&task).await?;
+            }
+            return Ok(());
+        }
+        if self
+            .db
+            .expedite_parked_integration_attempt(task_id, &db::now_rfc3339(), false)
+            .await?
+        {
+            self.wake_integration_worker();
+        }
+        Ok(())
+    }
+
     /// A Project was resumed: its Tasks' waiting attempts are due now.
     pub async fn integration_project_resumed(&self, project_id: &str) -> Result<()> {
         if self
@@ -150,6 +206,27 @@ impl crate::TaskService {
                             | db::IntegrationOperationState::Uncertain
                     )
                 )
+        };
+        // An unknown result the importer took over (a merge that was in
+        // flight the old way at the upgrade): it has no fenced intent, so no
+        // owner receipt will ever settle it. The owner's Retry is the
+        // explicit settlement: the old operation is closed as failed, and
+        // Git decides from here (the commit is in the target: reported after
+        // the target owner's proof; it is not: queued again). Nothing is
+        // merged twice: validation and the fast-forward are of the exact
+        // commit.
+        let current = match current {
+            Some(attempt)
+                if unsettled(&attempt)
+                    && attempt.effect_intent_json.is_none()
+                    && attempt.import_source_json.is_some() =>
+            {
+                self.db
+                    .settle_imported_integration_operation(&attempt.id)
+                    .await?;
+                self.db.current_integration_attempt(&task.id).await?
+            }
+            other => other,
         };
         match current {
             Some(attempt) if unsettled(&attempt) => {
@@ -251,6 +328,16 @@ impl crate::TaskService {
         {
             Ok(attempt) => attempt,
             Err(error) if crate::worker_runtime::queue::retryable(&error) => return Err(error),
+            // The worktree would have to be recreated under the disk floor:
+            // the Task waits for disk (its typed capacity wait, with the
+            // recheck that asks again). Not a block, and nothing is charged.
+            Err(error)
+                if crate::placement::capacity_wait_of(&error)
+                    == Some(crate::placement::CapacityWait::Disk) =>
+            {
+                self.defer_placement_refusal(&task, &error).await?;
+                return Ok(false);
+            }
             // No candidate can be named (no workspace, no implementation
             // run, the repository is gone). The Task says so, typed, and its
             // owner's Retry asks again; nothing is declared reviewed.

@@ -8053,3 +8053,192 @@ async fn cross_owner_daemon_target_moved_between_rebase_and_fast_forward_starts_
         attempt_receipts(&attempt)
     );
 }
+
+/// Importer row P15 on a real daemon-placed Task: the old build was merging
+/// when the daemon that holds the Task's checkout dropped off. It left the
+/// Task in `merging` with its owner wait (`owner_wait`, an expired
+/// `deferred_dispatch`), the placement `disconnected`, and no attempt. The
+/// upgraded server starts with the daemon still away: the Task says, typed,
+/// which machine it waits for and nothing merges. When the daemon reconnects
+/// and its placement is `ready` again, the Task merges. No owner action is
+/// taken anywhere in this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_pre_queue_merge_waiting_for_its_disconnected_daemon_merges_on_reconnect() {
+    use db::{IntegrationQueueRepo, TaskStepRepo};
+    let mut fixture = Fixture::file_backed("forge-queue-p15-reconnect").await;
+    let candidate = fixture.candidate().await;
+    let database = fixture.harness.state.db.clone();
+    let service = fixture.harness.state.task_service.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let placement_id = fixture.resolved.placement.id.clone();
+
+    // The daemon goes away while the old build is in `merging`.
+    fixture.link.take();
+    common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
+    let now = db::now_rfc3339();
+    sqlx::query(
+        "UPDATE task SET status='merging',review_passed_at=?1,updated_at=?1,version=version+1,\
+           metadata_json=json_set(COALESCE(metadata_json,'{}'),\
+             '$.owner_wait',json(?2),'$.deferred_dispatch',json(?3)) WHERE id=?4",
+    )
+    .bind(&now)
+    .bind(json!({"daemon_id": fixture.daemon_id, "started_at": now}).to_string())
+    .bind(
+        json!({"target_state":"merging","reason":"daemon unavailable",
+               "not_before":"2026-01-01T00:00:00+00:00"})
+        .to_string(),
+    )
+    .bind(&task_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    // What the old build's heartbeat monitor did for the daemon it lost.
+    db::DaemonRepo::mark_offline(&*database, &fixture.daemon_id, &now)
+        .await
+        .unwrap();
+    let monitor =
+        services::HeartbeatMonitor::new(database.clone(), fixture.harness.state.event_bus.clone())
+            .with_daemon_connections(fixture.harness.state.daemon_connections.clone())
+            .with_task_service(service.clone());
+    monitor.check_once().await.unwrap();
+    let placement = WorkspacePlacementRepo::get_by_id(&*database, &placement_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement.state, PlacementState::Disconnected);
+    // The Task's stored condition follows its row, as every writer leaves it.
+    let mut tx = db::begin_immediate(database.pool()).await.unwrap();
+    database
+        .produce_condition_in_tx(&mut tx, &task_id, db::ConditionChange::Full)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(database
+        .current_integration_attempt(&task_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The upgraded server starts: the import, then the workers.
+    let report = services::integration_steps::import::import_at_start(&database)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.imported, report.continuations),
+        (1, 1),
+        "{report:?}"
+    );
+    let imported = database
+        .current_integration_attempt(&task_id)
+        .await
+        .unwrap()
+        .expect("imported");
+    assert_eq!(
+        imported.import_source_json.as_ref().unwrap()["priority"],
+        15,
+        "{:?}",
+        imported.import_source_json
+    );
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    let condition = |task: &db::Task| json!(task.condition.integration_reason());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let task = TaskRepo::get_by_id(&*database, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let stated = condition(&task);
+        if stated["kind"] == "deferred" {
+            assert_eq!(stated["cause"], "owner_offline", "{stated}");
+            assert_eq!(stated["owner_id"], fixture.daemon_id.as_str(), "{stated}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Task never stated its owner wait: {stated}, condition {}, steps {:#?}",
+            json!(task.condition)
+                .to_string()
+                .chars()
+                .take(600)
+                .collect::<String>(),
+            database
+                .task_steps(&task_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|s| (
+                    s.kind.clone(),
+                    s.causation_key.clone(),
+                    s.status.clone(),
+                    s.last_error.clone()
+                ))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // While the daemon is away nothing merges and the Task is not blocked.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let waiting = TaskRepo::get_by_id(&*database, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.status, "merging");
+    assert!(waiting.blocked_json.is_none(), "{:?}", waiting.blocked_json);
+    assert_ne!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        candidate
+    );
+
+    // The daemon is back; the runtime's owner reconciliation makes the
+    // placement `ready`, which wakes the merge.
+    fixture.link = Some(
+        DaemonLink::connect(
+            &fixture.server,
+            &fixture.daemon_id,
+            &fixture.token,
+            Arc::clone(&fixture.runtime),
+        )
+        .await,
+    );
+    fixture.reconcile_reconnected_placement(&placement_id).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let task = TaskRepo::get_by_id(&*database, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        if task.status == "done" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let attempt = database
+                .current_integration_attempt(&task_id)
+                .await
+                .unwrap();
+            panic!(
+                "the Task did not merge after the reconnect: status {}, condition {}, blocked {:?}, attempt {:?}, steps {:#?}",
+                task.status,
+                condition(&task),
+                task.blocked_json,
+                attempt.map(|a| (a.state, a.failure_message, a.available_at)),
+                database
+                    .task_steps(&task_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|s| (s.kind.clone(), s.causation_key.clone(), s.status.clone(), s.last_error.clone()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // The dispatcher's sweep is not run: the reconnect alone wakes it.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        candidate,
+        "the reviewed commit landed as it was"
+    );
+    let _ = service;
+}

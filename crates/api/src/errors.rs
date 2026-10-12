@@ -475,6 +475,11 @@ impl From<DbError> for ApiError {
                 error.code(), error.to_string()),
             DbError::TaskBusy {pending_steps,retry_after_ms} => ServiceError::TaskBusy {pending_steps,retry_after_ms}.into(),
             DbError::TaskConditionQuarantined { task_id } => ServiceError::TaskConditionQuarantined { task_id }.into(),
+            DbError::IntegrationUnresolved { task_id, machine } => Self::conflict_with_code_and_details(
+                api_types::INTEGRATION_UNRESOLVED,
+                format!("the merge of Task {task_id} on {machine} has an unknown result or an effect still outstanding; reconnect that machine or remove it, then retry"),
+                serde_json::json!({"task_id": task_id, "machine": machine}),
+            ),
             DbError::NotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "not_found",
@@ -659,6 +664,27 @@ impl From<std::io::Error> for ApiError {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+
+    #[test]
+    fn an_unresolved_merge_maps_to_a_typed_conflict_naming_the_task_and_the_machine() {
+        let error = ApiError::from(DbError::IntegrationUnresolved {
+            task_id: "t-1".into(),
+            machine: "builder-2".into(),
+        });
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, api_types::INTEGRATION_UNRESOLVED);
+        assert!(error.message.contains("t-1") && error.message.contains("builder-2"));
+        assert_eq!(
+            error.details.unwrap(),
+            serde_json::json!({"task_id": "t-1", "machine": "builder-2"})
+        );
+        // Through the service layer it is the same answer.
+        let through = ApiError::from(ServiceError::from(DbError::IntegrationUnresolved {
+            task_id: "t-1".into(),
+            machine: "builder-2".into(),
+        }));
+        assert_eq!(through.code, api_types::INTEGRATION_UNRESOLVED);
+    }
 
     #[test]
     fn daemon_upgrade_maps_to_human_action_and_readiness_stays_transient() {

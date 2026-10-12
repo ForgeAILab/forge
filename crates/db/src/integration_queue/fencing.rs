@@ -301,6 +301,15 @@ pub(crate) async fn settle_removed_integration_owner(
         sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,lease_owner=NULL,lease_until=NULL,revision=revision+1,updated_at=? WHERE head_attempt_id=? AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=integration_queue.head_attempt_id AND a.state='parked')")
             .bind(now_rfc3339()).bind(&receipt.request.fence.attempt_id).execute(&mut **tx).await?;
     }
+    // A merge the importer took over with an unknown result has no fenced
+    // intent: it records the old path's operation as `uncertain` on the
+    // machine that ran it. Nothing above settles it, and with that machine
+    // gone nothing ever answers for it: it would refuse every deletion of
+    // its repository (`integration_unresolved`) and its owner's Retry for
+    // good. The removal settles it as failed, as it settles an intent.
+    if let Some(daemon) = daemon {
+        settle_imported_operations(tx, "daemon_id=?1", daemon, message).await?;
+    }
     // Location deletion's existing queue update owns its single revision
     // increment and target-unconfigured projection in this transaction.
     if daemon.is_some() {
@@ -308,6 +317,59 @@ pub(crate) async fn settle_removed_integration_owner(
         .bind(message).bind(now_rfc3339()).bind(location).bind(location).bind(daemon).bind(daemon).execute(&mut **tx).await?;
     }
     Ok(())
+}
+
+/// Settle the unknown pre-queue operation of imported attempts matched by
+/// `filter` (bound once as `?1`): the operation is `failed`, the journal says
+/// who settled it, and a `reconciling` attempt becomes `quarantined` (the
+/// worker's next look reads Git and decides: landed, queued again, or
+/// parked for its owner). Attempts with a fenced intent are never touched
+/// here: those are settled by a receipt.
+async fn settle_imported_operations(
+    tx: &mut Transaction<'_, Sqlite>,
+    filter: &str,
+    bind: &str,
+    message: &str,
+) -> Result<u64> {
+    let now = now_rfc3339();
+    let entry = serde_json::json!({"kind":"imported_operation_settled","message":message,"at":now})
+        .to_string();
+    Ok(sqlx::query(&format!(
+        "UPDATE integration_attempt SET current_operation_state='failed',\
+           state=CASE WHEN state='reconciling' THEN 'quarantined' ELSE state END,\
+           failure_kind=CASE WHEN state IN ('reconciling','quarantined') THEN 'infrastructure' ELSE failure_kind END,\
+           failure_message=CASE WHEN state IN ('reconciling','quarantined') THEN ?2 ELSE failure_message END,\
+           operation_receipts_json=json_insert(CASE WHEN json_valid(operation_receipts_json) AND json_type(operation_receipts_json)='array' THEN operation_receipts_json ELSE '[]' END,'$[#]',json(?3)),\
+           revision=revision+1,updated_at=?4 \
+         WHERE {filter} AND import_source_json IS NOT NULL AND effect_intent_json IS NULL \
+           AND current_operation_state IN ('running','uncertain') \
+           AND state NOT IN ('completed','cancelled','superseded')"
+    ))
+    .bind(bind)
+    .bind(message)
+    .bind(entry)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected())
+}
+
+impl SqliteDb {
+    /// The owner settles, explicitly, the unknown pre-queue operation of an
+    /// imported attempt (their Retry of a merge whose old result nobody will
+    /// ever report). `Ok(false)`: the attempt has no such operation.
+    pub async fn settle_imported_integration_operation(&self, attempt_id: &str) -> Result<bool> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        let settled = settle_imported_operations(
+            &mut tx,
+            "id=?1",
+            attempt_id,
+            "settled by the owner's Retry",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(settled > 0)
+    }
 }
 
 async fn receipts_in_tx(
@@ -1377,8 +1439,15 @@ mod tests {
         );
         assert_eq!(refused.fence_generation, q.fence_generation);
     }
+    /// Deleting the target location while an effect is in flight is refused
+    /// (`integration_unresolved`): the effect, the attempt and the queue are
+    /// left as they are, and the owner's receipt still settles the effect.
+    /// (Before the guard the deletion settled the effect as a permanent
+    /// loss; a landed merge could be recorded as failed that way. Removing
+    /// the machine is the operation that settles an effect nobody can
+    /// answer for: `machine_removal_settles_attempt_and_preserves_quarantine`.)
     #[tokio::test]
-    async fn location_removal_settles_inflight_effect_and_preserves_quarantine() {
+    async fn location_removal_is_refused_while_an_effect_is_in_flight() {
         for quarantined in [false, true] {
             let (db, f) = claimed().await;
             let request = request(f.clone());
@@ -1395,45 +1464,35 @@ mod tests {
                     .await
                     .unwrap();
             }
-            crate::RepoLocationRepo::delete(&db, "l").await.unwrap();
-            let receipt = db
+            let refused = crate::RepoLocationRepo::delete(&db, "l").await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(crate::DbError::IntegrationUnresolved { task_id, .. }) if task_id == "a"
+                ),
+                "{refused:?}"
+            );
+            assert!(db
                 .integration_effect_receipt(&request)
                 .await
                 .unwrap()
-                .unwrap();
-            assert_eq!(receipt.result["kind"], "infrastructure");
-            assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
+                .is_none());
             let attempt = db
                 .integration_attempt(&f.attempt_id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(attempt.effect_intent_json.is_none());
-            assert_eq!(
-                attempt.failure_kind,
-                Some(IntegrationFailureKind::Infrastructure)
-            );
+            assert!(attempt.effect_intent_json.is_some(), "the intent stands");
             let queue = db.integration_queue(&f.queue_id).await.unwrap().unwrap();
-            assert_eq!(
-                queue.state,
-                if quarantined {
-                    IntegrationQueueState::Quarantined
-                } else {
-                    IntegrationQueueState::Suspended
-                }
-            );
-            assert_eq!(
-                queue.last_error_kind,
-                Some(IntegrationFailureKind::TargetUnconfigured)
-            );
-            // A late original owner cannot overwrite the permanent-loss receipt.
-            assert!(guard
+            assert!(queue.target_location_id.is_some(), "the target stands");
+            // The owner's receipt settles the effect; then the deletion works.
+            guard
                 .record(
                     serde_json::json!({"kind":"rebased"}),
-                    IntegrationOperationState::Succeeded
+                    IntegrationOperationState::Succeeded,
                 )
                 .await
-                .is_err());
+                .unwrap();
         }
     }
 

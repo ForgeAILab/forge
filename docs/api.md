@@ -33,7 +33,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
-| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution, a Workspace lease or a check run is live; `?force=true` refuses without cancelling anything when a check run is on an unreachable machine, and otherwise requests cancellation before retrying the guard |
+| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution, a Workspace lease or a check run is live, and `409 integration_unresolved` (never forced) while a merge into one of its repositories has an unknown result or an owner effect outstanding; `?force=true` refuses without cancelling anything when a check run is on an unreachable machine, and otherwise requests cancellation before retrying the guard |
 | GET    | `/api/v1/projects/{id}/analytics` | Read authorized Project analytics for a half-open window (CI steps, review summary, typed usage/cost breakdown, and released-milestone outcome economics) |
 | POST   | `/api/v1/projects/{id}/cost-estimation-previews` | Preview exact retrospective estimates for eligible legacy Project usage against one immutable catalog snapshot |
 | POST   | `/api/v1/projects/{id}/cost-estimation-runs` | Commit one preview's retrospective estimates idempotently |
@@ -107,7 +107,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
 | GET    | `/api/v1/repos/{id}` | Get repo |
 | PATCH  | `/api/v1/repos/{id}` | Update repo |
-| DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it |
+| DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it, and `409 integration_unresolved` while a merge into it has an unknown result or an owner effect outstanding |
 | GET    | `/api/v1/repos/{id}/integration-queues` | The repository's merge queues, one per target branch, with their members in queue order (see [Merge queue reads](#merge-queue-reads)) |
 | GET    | `/api/v1/repos/{id}/locations` | Owner/admin lists visible repository locations with opaque cursor pagination |
 | POST   | `/api/v1/repos/{id}/locations` | Owner/admin registers and verifies a machine-local checkout |
@@ -2680,6 +2680,28 @@ Workspace provenance. The delete is atomic and returns HTTP `409` with
 `code: "repo_in_use"` if a running Execution or active Workspace lease is still
 bound to that Repo; it never tears repository authority out from under a run.
 
+**`409 integration_unresolved`.** Deleting a Repo, a repo location or a
+Project, and changing a Repo's default location, is refused while a merge into
+that Repo has an unknown result or an owner effect still outstanding: the
+merge's attempt has an effect the owner machine has not answered for, or is
+being reconciled. `details` is `{"task_id", "machine"}`: the Task whose merge
+it is and the machine whose answer is missing (`the server` for the server's
+own checkout). `?force=true` does not override it. Reconnect that machine (its
+receipt settles the merge) or remove the machine (the effect is settled as
+failed and the Task goes back to review); then retry the request. A merge that
+was in flight before the merge queue existed and never reported is settled the
+same way by removing its machine, or by the Task owner's `retry` action on
+that Task (it closes the old operation and lets Git decide). A forced Project
+delete is refused before anything is cancelled.
+
+**Reporting a merge.** A Task is moved to `done` by the merge queue only after
+the owner of the repository's default checkout has confirmed that the target
+branch contains the merged commit. If it does not (the target was rewound),
+the Task stays in its merge state with condition reason `integration`, kind
+`deferred`, cause `unresolved_result`, and is queued again on the retry timer.
+In a merge state the owner's `approve` override is offered with the label
+"Mark done without merging".
+
 The response also includes `availability` for each dimension. `current` means
 the authoritative rows were read; `unavailable` (with a `refresh_and_retry`
 action) means that dimension must not be inferred from the other two. A
@@ -5185,9 +5207,8 @@ tool error the model can correct in the same turn, naming the operation, the
 field and the expected contract, for example ``skill.section: argument
 `section` is required; expected skill.section: {section: one of ...}``. The
 remaining read operations retain their current schemas and validation.
-Provider-wrapped `parameters` calls still normalize before validation. MCP
-Task/Project schemas remain unchanged; the account, identity and Chat MCP
-projection below derives schemas and strict typed decoding from the registry.
+Provider-wrapped `parameters` calls still normalize before validation. All MCP
+descriptors below derive schemas and strict typed decoding from the registry.
 
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
@@ -5369,33 +5390,32 @@ Project/Chat/handoff/Task references remain restricted to that same bound
 Project. The credential acts as the authenticated delegated user, not the
 bound Project Agent.
 
-The account, identity, Agent binding, Chat and handoff tools use typed contracts
-in `operation-registry::mcp`. Each description is one generated summary line
+All 43 MCP tools use typed contracts in `operation-registry::mcp`. Each description is one generated summary line
 with the admitted fields. Names and result shapes are unchanged. Unknown fields
-on these 18 tools map to one `-32602` contract error. The in-band result has
+on any tool map to one `-32602` contract error. The in-band result has
 `structuredContent.code = "validation_error"` and bounded `details` carrying
 `code = "mcp_contract_invalid"`, the operation name and the expected contract. A
 mistyped value is described by its JSON type and never quoted back. Arguments
-must be a JSON object. The
-registry checks delegated authority before reporting contract details. Required
+must be a JSON object. The registry checks delegated authority before reporting contract details. Required
 integer arguments retain MCP's strict JSON integer spelling; native integer
 coercions do not apply.
 
-The same evaluator determines the moved tools' connection-level advertisement
+The same evaluator determines every tool's connection-level advertisement
 and call admission. For a Project-constrained grant it loads the bound Project's
 current role on each list/call; a global administrator does not acquire a Project
 role through that status alone:
 
-| Grant / role | Moved tools offered |
+| Grant / role | Tools offered |
 |---|---|
-| Account grant | All 18 names; each referenced identity, Project, Chat and handoff is authorized on call |
-| Project owner or Project `owner` / `admin` member | All ten Project-classified moved tools |
-| Project ordinary member | Those ten except `forge_set_project_agent` |
-| Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
-| Project not visible to the user | No moved tools |
+| Account grant | 40 names; memory reads and escalation require a bound Project; references are authorized on call |
+| Exact Project owner | All 35 Project-classified names |
+| Project `owner` / `admin` member, without exact ownership | 34 names; escalation requires `project.owner_id` |
+| Project ordinary member | 33 names; no binding setter or escalation |
+| Visible Project without owner/member authority | 26 names: the 24 Task/Project visibility APIs (including memory and integration queue), `forge_list_projects`, and `forge_list_agent_chats`; no escalation or member-only identity/Chat/handoff tools |
+| Project not visible to the user | No tools |
 
-`forge_get_integration_queue` is a nineteenth registry-built tool, added with
-the merge-queue reads rather than moved: Project-classified, and offered to
+`forge_get_integration_queue` was added with the merge-queue reads rather
+than moved from a hand-written descriptor: Project-classified, and offered to
 every grant whose Project is visible to the user (the rule of `GET
 /api/v1/repos/{id}/integration-queues`), with or without owner/member
 authority. An account grant names the Project; a Project the user cannot see
@@ -5409,10 +5429,14 @@ account administrators and only the existing null no-op to other users.
 Its conditional field authority is also evaluated before
 contract decoding; a non-null value from a non-admin still returns `-32003`
 `admin_required`. A null or omitted daemon field retains its former meaning.
-The 24 unmoved Task/Project descriptors and their grant filtering retain the
-base behavior, including `forge_project_escalate`'s separate owner check.
+All 24 Task/Project tools now use the same projection. Memory tools and
+`forge_project_escalate` are omitted/refused for account grants. Escalation is
+also omitted/refused for any user other than the exact Project owner, even an
+`owner` or `admin` member. The service rechecks ownership in its transaction.
+Other Task/Project tools retain the existing Project-visibility admission rule;
+this change does not add a member-only write policy.
 
-A role denial on a moved tool is `-32001` with `data.code = "mcp_scope_denied"`
+A role denial on a catalog tool is `-32001` with `data.code = "mcp_scope_denied"`
 for both grant kinds. A reference the user may not use answers exactly like a
 missing one: an identity or session of another account is `-32004`
 (`agent_identity not found` / `agent_session not found`, naming only the id
@@ -5438,6 +5462,45 @@ refuse protected embedded registration and malformed permission documents.
 non-negative constraint. `forge_list_agent_chats` and
 `forge_list_agent_handoffs` retain their reserved, ignored `cursor` / `limit`
 fields and return all authorized records, with their existing result shapes.
+
+Task/Project contracts also refuse unknown root fields, unknown child fields,
+unknown execution override fields, and unknown lifecycle-hook fields. Optional
+nulls retain their existing omission meaning except `forge_create_task`'s
+`parent_task_id`, `priority`, and `type`, which still require non-null values if
+present. `forge_list_tasks.status` accepts a comma-separated string, an array
+of strings, or null; workflow state names are open strings on both Task listing
+and transition. `sort_by` includes the already accepted `board_position`.
+Memory `layer` advertises 1, 2, or 3; unsigned memory limits/budgets and positive
+follow-up deadlines advertise their decoder bounds. `settings` remains opaque
+JSON at the wire boundary; shared settings validation still requires a valid
+Project settings document.
+
+Task `action` and lifecycle-hook schemas advertise portable discriminator/field
+unions rather than conditional schemas. Exact variant fields are enforced by
+typed decoding: `send_back` requires `guidance`; only `retry` accepts
+`fresh_session`, `refresh_workspace`, and `reset_budget`, along with optional
+`guidance`; only
+`approve` accepts `override`. Optional action parameters accept null. Always
+copy a currently offered `available_actions` command and its meaningful
+parameters. Hook discriminators remain `script` and `plugin`, and lifecycle
+event names remain the five existing names.
+
+`forge_transition_task` keeps its MCP system attribution
+(`triggered_by="system"`) and the workflow policy that goes with it: only
+edges the workflow defines, with the dependency and conflict-marker gates
+enforced and no user override. `forge_task_action` keeps its delegated-user
+actor. Both Project settings tools pass the authenticated user to shared
+validation, so assigned agents must be usable by that user in the Project,
+just as on REST. Task reads retain their typed integration summaries and
+current `available_actions`; queue and offer eligibility are unchanged.
+
+A Task, parent, dependency, sub-task or Execution id outside what the
+credential may use answers `-32004` exactly like an id that does not exist,
+naming only the id that was sent: a Project-constrained credential cannot tell
+a Task of another Project from a missing one (even in a Project its user can
+see), and an Execution of such a Task is `execution not found`, never the Task
+behind it. A `project_id` other than the bound Project is refused the same way
+whether or not that Project exists.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and

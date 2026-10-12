@@ -8,6 +8,39 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Deleting a repository, a repo location or a Project, and changing a
+  repository's default location, is refused while a merge into it is
+  unresolved (`409 integration_unresolved`).** "Unresolved" is a merge whose
+  result is unknown or whose effect on an owner machine has not been answered
+  for. The error's `details` name the Task (`task_id`) and the machine
+  (`machine`); `?force=true` does not override it. Reconnect that machine, or
+  remove the machine (which settles the effect as failed), then retry.
+  Deleting a repo location used to settle an in-flight merge effect as a
+  permanent loss; it is now refused instead, so a merge that landed is never
+  recorded as failed by a deletion.
+- **A merge that waits for an offline machine says so and resumes by itself.**
+  A Task in the merge queue whose checkout's machine is unreachable (or whose
+  placement is not `ready` again after a reconnect) now reports
+  `integration` / `deferred` with cause `owner_offline` and the machine in
+  `owner_id`, instead of `infrastructure`. It no longer spends the three
+  counted infrastructure retries and then asks its owner to Retry: it waits,
+  is asked again on a back-off of at most ten minutes, and goes on at once
+  when the machine reconnects.
+- **Admission to the merge queue under the disk floor is a disk wait.** When a
+  Task's worktree is gone and the disk is under its floor, entering `merging`
+  no longer recreates the worktree anyway (and no longer fails the merge as a
+  `workspace_error`): the Task reports its disk capacity wait
+  (`machine_capacity` / `disk`), is not blocked and is asked again at the
+  30 second recheck. Nothing is charged to a retry budget.
+- **The merge-queue check and the review-entry check are one result.** The
+  check a queue head runs on a rebased commit is asked for under the same
+  identity as review entry's check (same commands, policy, workspace and
+  placement generation; the purpose is not part of it). `check_run` rows of a
+  queue head therefore carry the review-entry specification
+  (`purpose` `entry_ci` in the stored spec) rather than a separate
+  `queue_head_ci` specification, and a result of either is eligible for
+  reuse by the other for the same commit in the same worktree (a rebased
+  commit is another commit and still runs once).
 - **`merging` now means "in the merge queue" (3.2 stage D2b).** A Task
   entering `merging` is queued for its repository's target branch and stays
   in `merging` while Forge rebases it (only if the target moved), checks the
@@ -527,6 +560,69 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   revealed that it exists). `forge_get_agent_session` answers another
   account's session as `agent_session not found: <the id sent>` instead of
   naming that account's identity id.
+- **The MCP Task and Project tools refuse undeclared arguments (3.8 slice
+  H).** All 43 MCP tools are now generated from the operation registry and
+  closed. Of the 24 Task / Project tools, `forge_create_task`,
+  `forge_reorder_sub_tasks` and `forge_project_escalate` already refused
+  unknown fields; the other 21 ignored them and now answer `-32602` with
+  `data.code = "mcp_contract_invalid"`, the operation and the expected fields.
+  Fields a client may have been sending that are now refused:
+  - `project_id` on the tools keyed by a Task or Execution id
+    (`forge_get_task`, `forge_preview_prompt`, `forge_assign_agent`,
+    `forge_task_action`, `forge_get_task_diff`, `forge_list_executions`,
+    `forge_update_task`, `forge_transition_task`, the four dependency tools,
+    `forge_create_sub_tasks`, `forge_list_sub_tasks`,
+    `forge_follow_up_execution`) and on `forge_memory_get`. It was never read
+    there, also with a Project-constrained credential;
+  - `cursor` and `limit` on `forge_list_task_dependencies`,
+    `forge_list_task_dependents`, `forge_list_sub_tasks` and
+    `forge_get_task_diff`, which return everything;
+  - `reason` and `source` on `forge_transition_task`, and `status`,
+    `assignee_id`, `parent_task_id` or `depends_on_ids` on
+    `forge_update_task` (none of them was ever applied);
+  - any field beside `task_id`, `action` and `version` on
+    `forge_task_action`, and any field beside `verb` in a `start` action (for
+    example `reason`), which was ignored while every other verb already
+    refused unknown fields;
+  - unknown fields inside `subtasks[]`, `overrides` and a lifecycle hook
+    entry.
+  Every field the old schemas advertised is still accepted, `null` still
+  stands for an omitted optional (except `parent_task_id`, `priority` and
+  `type` on `forge_create_task`, which were already refused as `null`), and
+  integers keep their strict JSON spelling. Malformed input on
+  `forge_create_task` and `forge_follow_up_execution` now gets the same
+  `mcp_contract_invalid` correction instead of their hand-written field
+  messages.
+- **`tools/list` offers a Task / Project tool only where a call can succeed
+  (3.8 slice H).** An account credential no longer lists
+  `forge_memory_search`, `forge_memory_get` or `forge_project_escalate` (40
+  tools instead of 43): all three need a Project-constrained credential and
+  were refused on every call. `forge_project_escalate` is listed only for the
+  exact Project owner (`project.owner_id`), not for an `owner` / `admin`
+  member, who was likewise always refused. A credential constrained to a
+  Project its user cannot see lists no tools. Calling an omitted tool answers
+  `-32001` with `data.code = "mcp_scope_denied"` (in-band `policy_denied`)
+  before its arguments are read; these calls used to fail with `-32602` or
+  `-32004`. Nothing that worked is removed: every other Task / Project tool
+  keeps the rule it had, a Project visible to the user, with no new
+  member-only write rule.
+- **A Project-constrained MCP credential cannot tell a Task of another Project
+  from a missing one (3.8 slice H).** A `task_id`, `parent_task_id`,
+  `depends_on_id`, `depends_on_ids` or `ordered_ids` entry outside the bound
+  Project answers `-32004` `task not found: <the id sent>` (previously
+  `-32602` "task does not belong to scoped MCP project" with that Task's id
+  and the Project id, which confirmed that it exists). An `execution_id` the
+  credential may not use answers `execution not found: <the id sent>`
+  (previously an error that named the Task behind the Execution), for account
+  credentials as well.
+- **MCP Project settings updates check that assigned agents are usable by the
+  caller (3.8 slice H).** `forge_update_project` (with `settings`) and
+  `forge_update_project_lifecycle_hooks` pass the authenticated user to the
+  shared settings validation, as REST does. A settings document that assigns a
+  role to an agent this user cannot use in the Project is refused with
+  "agent not usable in this project" and nothing is written; this includes a
+  lifecycle-hook replacement on a Project whose stored settings already hold
+  such an assignment.
 
 - **Registered native Project calls refuse undeclared fields (3.8 slice E).**
   `project.current_state`, `project.observations`, `project.review_config`,
@@ -1200,6 +1296,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Every MCP tool is generated from the operation registry (3.8 slice H).**
+  `tools/list`, the input schemas, the grant and role admission, the
+  reference checks and the typed decode of all 43 tools come from one catalog;
+  the hand-written descriptors, the second dispatch table, the duplicated
+  parameter structs and the scope-name list are gone. Names, argument names
+  and result shapes are unchanged. Descriptions are one generated line plus
+  the field list, so `forge_create_task` and `forge_create_sub_tasks` no
+  longer carry the merge-friendly planning guidance in their descriptions.
+  The serialized catalog shrinks from 18,198 to 13,915 bytes for an account
+  credential and from 16,060 to 13,060 for a Project owner.
+  `forge_transition_task` is unchanged: it still runs as the MCP system
+  component, on defined workflow edges only and without the user override.
+- The owner's override on a Task in its merge state is labelled **Mark done
+  without merging** (it was "Advance Task"): it ends the Task as done, merges
+  nothing and cancels its place in the merge queue.
 
 - **Operator status shows where merges spend their time (3.2 stage D3a).**
   `GET /api/v1/operations/status` `integration_queues` adds `waiting`,
@@ -2720,6 +2832,90 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **MCP Task and Project schemas describe what the tools accept (3.8 slice
+  H).** Optional strings, integers and booleans advertise `null`;
+  `forge_list_tasks.status` advertises its comma-separated string, array and
+  `null` forms and `sort_by` the already accepted `board_position`;
+  `forge_transition_task.status` and status filters are open strings, so
+  custom workflow states are no longer hidden behind a fixed list;
+  `forge_update_project.settings` is opaque JSON; memory `layer` advertises 1
+  to 3 and the memory and deadline integers their bounds. With a
+  Project-constrained credential `forge_memory_search` no longer marks
+  `project_id` required, since the bound Project was always filled in.
+  A contract correction names the field and the accepted type and never
+  quotes the value that was sent.
+
+- **Changing a repository's default location is refused over the API while a
+  merge is unresolved.** The `409 integration_unresolved` guard for the
+  default change sat on a storage method the `PATCH` route does not use, so
+  the route moved the default (and with it every merge queue's target) while
+  a merge had an unknown result. The guard is now in the transaction of the
+  write the route makes.
+- **A forced Project delete that is refused for an unresolved merge no longer
+  cancels the Project's work first.** `DELETE /api/v1/projects/{id}?force=true`
+  checks `integration_unresolved` before it stops any execution, lease or
+  check.
+- **A merge with an unknown result from before the merge queue can be
+  settled.** Such a merge is recorded against the machine that ran it, with no
+  queue-era effect to settle. Removing that machine now settles it (it used to
+  stay unknown, refusing every deletion of its repository and its owner's
+  Retry for good), and the owner's **Retry Merge** on such a Task settles it
+  explicitly: the old operation is closed as failed and Git decides (the
+  commit is in the target: reported once the target's owner has proven it;
+  it is not: the Task is queued again). Nothing is merged twice.
+- **A workflow with two merge states** reports a landed merge to the `accept`
+  target of the merge state the Task was in (it went to the state named
+  `done` whenever the workflow still had one), and sends a repair to that
+  state's own repair state. **A workflow in which no state merges** is no
+  longer scanned by the upgrade import for Tasks in a state that happens to
+  be called `merging`.
+
+- **One writer per merge while an install is upgraded to the merge queue.**
+  The queue worker no longer takes an attempt that was recorded before the
+  queue was active (an imported row, or a `shadow:` row of the passive stage)
+  until that Task's import continuation step has settled, and never while the
+  old merge's own hooks step is still live (a pending, claimed or suspended
+  hooks step that recorded a `merge_intent`, `merge_outcome` or
+  `rebase_target`): it could start a rebase in a checkout that step was still
+  rebasing. The same rule holds a reserved imported head (an unknown result).
+  The old step now hands over through admission only: a merge it had finished
+  is no longer reported by that step beside the queue. The Task is admitted,
+  the head finds its commit in the target, and the `result` step reports it
+  after the target's owner has proven it (if the candidate can no longer be
+  named, the step reports it itself, after the same proof). The import
+  continuation waits for an earlier, suspended hooks step of the entry instead
+  of admitting beside it.
+
+- **A Task is reported merged only when the target's owner confirms it.**
+  Before the merge queue moves a Task to `done` (and before a merge that had
+  landed before an upgrade is reported), the owner of the repository's default
+  checkout is asked whether the target branch contains the merged commit: one
+  `git merge-base --is-ancestor` on the server, or the read-only
+  `integration.target_facts` of the daemon that holds the checkout. A recorded
+  merge receipt never replaces that read; a receipt of another attempt, of a
+  later claim, of another owner or naming another commit refuses the report
+  without reading Git. If the target does not contain the commit (it was
+  rewound after the fast-forward, or the row was wrong) the Task stays in its
+  merge state with the typed reason `integration` / `deferred` /
+  `unresolved_result`, its attempt leaves the queue slot
+  (`target_missing_commit`) and is validated again on the retry timer, so it
+  merges again against the target as it is. If the owner cannot be asked, the
+  Task says so and the question is repeated every 30 seconds; nothing is
+  reported meanwhile. The attempt graph gains `applied → parked`.
+
+- A Task that was merging on a daemon when the daemon dropped off, on an
+  install upgraded to the merge queue, merges when the daemon reconnects with
+  no owner action. Its stored retry time no longer puts a row the queue
+  cannot drive back in line.
+- A start no longer writes a history row for a cancelled Task whose merge
+  entry lies more than one status entry back (a Task cancelled out of
+  `merge_failed`).
+- Projects whose workflow renames the done, cancellation or review state: the
+  start-time import reads Tasks in those states by their role, and a merge the
+  old path had finished, a merge failure and the conflict-marker guard go to
+  the workflow's own states instead of `done` / `merge_failed` / `review`.
+- Draining a Task's steps no longer waits without limit for a stopped merge
+  head driver (30 seconds, then it is aborted).
 - **Cancel and Hold no longer strand a merge-queue step at transaction startup.**
   Preemption could drop SQLx's `BEGIN IMMEDIATE` after SQLite acknowledged it
   but before a rollback guard existed, returning a connection that held the
