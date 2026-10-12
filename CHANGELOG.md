@@ -56,7 +56,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   root **with** a lead, the lead runs a read-only `planner` execution on each
   finished subtask (prompt `planner.step_check.v1`) and ends it with a result
   block: `pass` moves the subtask to `done`; `fail` returns it to
-  `in_progress` and resumes the same worker thread with the findings. The
+  `in_progress` and resumes the same worker thread with the findings. The check's
+  prompt carries the step's diff (the shared workspace against the end of the
+  previous step, at most 32 KiB, the cut marked). The
   next subtask starts only after the step is accepted. Returns are limited by
   the gate's `max_rejections` (2): the entry after the second return parks
   the subtask as `retry_exhausted` with an Attention item, and the owner's

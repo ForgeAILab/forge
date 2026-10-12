@@ -6000,6 +6000,27 @@ the one Project slot it held during implementation (the check is that Task's
 run); a parked one holds none. The lead's Agent is admitted by the same Agent
 and machine limits as any run.
 
+The step-check prompt carries the step's diff as per-run input (the user
+part of `planner.step_check.v1`; the system part stays the stable doctrine and
+result contract). `workflow::dispatch::loader::load_step_diff` reads it where
+`AgentDispatchContext` is built, through the workspace backend's `diff`
+(embedded and daemon-owned workspaces alike; no protocol change): the shared
+root workspace, uncommitted leftovers included, against the commit the step
+started from. That commit is the head recorded when the last run of an
+earlier sibling ended (every step check records it, because the host runs it
+read-only; a native worker records it too) and the root workspace's branch
+point when none is recorded (the first step; or earlier steps run by a CLI
+worker under a root that had no lead then: the prompt says that changes of
+earlier steps are included). The diff is cut at 32 KiB (`STEP_DIFF_LIMIT`)
+with the cut marked; a diff that cannot be read is reported in the prompt in
+one line and never fails the dispatch.
+
+The step check is read-only by the host, not by its prompt: the runner marks
+every `planner` run read-only (`read_only_execution_role`), a native run gets
+the `TaskRead` scope (no write and no command tools), and for any executor the
+runner restores the worktree to the head it started from and fails the run
+(`read-only execution produced worktree changes`) when it wrote.
+
 The step-check role cannot be assigned on a subtask
 (`422 STEP_CHECK_ROLE_HELD_BY_ROOT`), and Project default role assignments
 do not copy it onto one (`TaskService::project_default_role_assignments`

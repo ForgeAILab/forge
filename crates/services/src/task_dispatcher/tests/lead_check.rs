@@ -1587,3 +1587,61 @@ async fn project_defaults_do_not_copy_the_step_check_role_onto_a_subtask() {
     assert_eq!(roles, vec!["coder".to_owned(), "planner".to_owned()]);
 }
 
+async fn check_prompt(db: &db::SqliteDb, task: &str) -> String {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT prompt FROM execution WHERE task_id=? AND role='planner' ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(task)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .unwrap_or_default()
+}
+
+/// The step-check prompt carries the step's own diff: the shared workspace
+/// against the end of the previous step (the root's branch point for the
+/// first step), bounded at 32 KiB with the cut marked.
+#[tokio::test]
+async fn the_step_check_prompt_carries_the_step_s_own_diff() {
+    let steps = steps(&[PASS], None).await;
+    steps
+        .commit_bytes
+        .store(64, std::sync::atomic::Ordering::SeqCst);
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the first step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    let prompt = check_prompt(&steps.db, &first.id).await;
+    assert!(
+        prompt.contains("+++ b/first.txt") && prompt.contains("+work of first"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("the root's branch point"), "{prompt}");
+    assert!(!prompt.contains("[diff truncated"), "{prompt}");
+    // The diff is per-run input, after the stable role contract.
+    let (contract, input) = prompt
+        .split_once("Execution request:")
+        .expect("the prompt has both parts");
+    assert!(!contract.contains("first.txt") && input.contains("first.txt"));
+
+    // The second step is large: its diff is cut at the bound, and it does not
+    // repeat the first step's changes.
+    steps
+        .commit_bytes
+        .store(48 * 1024, std::sync::atomic::Ordering::SeqCst);
+    until(&steps, "the second step check runs", async || {
+        running_check(&steps.db, &second.id).await
+    })
+    .await;
+    let prompt = check_prompt(&steps.db, &second.id).await;
+    assert!(prompt.contains("+++ b/second.txt"), "{prompt}");
+    assert!(
+        !prompt.contains("first.txt"),
+        "the previous step is not shown again"
+    );
+    assert!(prompt.contains("the end of the previous step"));
+    assert!(prompt.contains("[diff truncated at 32 KiB"));
+    assert!(prompt.len() < 32 * 1024 + 16 * 1024, "{}", prompt.len());
+}
+
