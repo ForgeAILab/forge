@@ -925,11 +925,13 @@ impl SqliteDb {
             // alias, but it must observe the same assignment CAS as `coder`.
             let assignment_role =
                 canonical_execution_role(Some(input.role.as_str())).unwrap_or(input.role.as_str());
+            let assignment_holder =
+                task::assignment_holder_in_tx(transaction, &input.task_id, assignment_role).await?;
             let role_assignment = sqlx::query(
                 "SELECT assignee_type, assignee_id
                  FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
             )
-            .bind(&input.task_id)
+            .bind(&assignment_holder)
             .bind(assignment_role)
             .fetch_optional(&mut **transaction)
             .await?;
@@ -1779,12 +1781,17 @@ fn default_workflow_role(status: &str) -> Option<&'static str> {
 }
 
 fn inherited_subtask_workflow_state(status: &str) -> bool {
-    matches!(status, "todo" | "in_progress" | "done" | "cancelled")
+    matches!(
+        status,
+        "todo" | "in_progress" | "lead_check" | "done" | "cancelled"
+    )
 }
 
 fn inherited_subtask_workflow_role(status: &str) -> Option<&'static str> {
     match status {
         "in_progress" => Some("coder"),
+        // The step check: the role is held by the root's lead.
+        "lead_check" => Some("planner"),
         _ => None,
     }
 }

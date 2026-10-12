@@ -186,7 +186,10 @@ impl SqliteDb {
             .bind(&ids).bind(&parent_ids).fetch_all(&mut *reader).await? {
             let a = super::workflow::map_task_role_assignment_row(row)?;
             for r in &mut reads {
-                if a.task_id==r.task.id || (a.role_name=="coder" && Some(&a.task_id)==r.task.parent_task_id.as_ref()) { r.assignments.push(a.clone()); }
+                // A subtask reads two roles from its root: the default worker
+                // and the lead that holds its step check. Each row keeps its
+                // own `task_id`, so a reader tells own from inherited.
+                if a.task_id==r.task.id || (matches!(a.role_name.as_str(),"coder"|"planner") && Some(&a.task_id)==r.task.parent_task_id.as_ref()) { r.assignments.push(a.clone()); }
             }
         }
         // Latest of each role, plus every running execution. Indexed by Task;

@@ -210,7 +210,11 @@ impl Terminals {
     /// The Task's own effective workflow: a subtask in a shared state uses the
     /// inherited subtask workflow, anything else the Project's.
     fn outcome(&self, state: &str, subtask: bool) -> Option<TerminalOutcome> {
-        let inherited = subtask && matches!(state, "todo" | "in_progress" | "done" | "cancelled");
+        let inherited = subtask
+            && matches!(
+                state,
+                "todo" | "in_progress" | "lead_check" | "done" | "cancelled"
+            );
         let terminal = if inherited {
             matches!(state, "done" | "cancelled")
         } else {
@@ -228,7 +232,11 @@ impl Terminals {
     /// inherited subtask workflow and the default Project workflow start in
     /// `todo`.
     fn initial(&self, state: &str, subtask: bool) -> bool {
-        let inherited = subtask && matches!(state, "todo" | "in_progress" | "done" | "cancelled");
+        let inherited = subtask
+            && matches!(
+                state,
+                "todo" | "in_progress" | "lead_check" | "done" | "cancelled"
+            );
         if inherited || !self.has_states {
             state == "todo"
         } else {
@@ -1009,7 +1017,7 @@ impl Snapshot {
         if self.parent.is_some()
             && matches!(
                 self.state.as_str(),
-                "todo" | "in_progress" | "done" | "cancelled"
+                "todo" | "in_progress" | "lead_check" | "done" | "cancelled"
             )
         {
             return Ok(false);

@@ -1167,6 +1167,30 @@ impl TaskDispatcher {
                 self.task_service.assign_project_default_roles(task).await?;
                 Ok(0)
             }
+            Step::SkipGate { target } => {
+                // The gate's own entry hook makes this skip; this is the same
+                // transition for a Task that rests in the gate.
+                self.task_service
+                    .transition(
+                        task.id.clone(),
+                        target.clone(),
+                        crate::task_service::TransitionOptions {
+                            bridge: api_types::TransitionBridge::new(
+                                api_types::TransitionBridgeKind::GateSkipped,
+                            ),
+                            version: task.version,
+                            reason: Some(format!(
+                                "Nobody holds the {} gate; optional gate skipped",
+                                task.status
+                            )),
+                            triggered_by: Actor::system(SystemComponent::TaskDispatcher),
+                            rejection: false,
+                            defer_dispatch_seconds: None,
+                        },
+                    )
+                    .await?;
+                Ok(1)
+            }
             Step::Initial {
                 target,
                 role,

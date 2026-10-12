@@ -1,6 +1,7 @@
 use api_types::{
-    CanonicalPhase, FailurePolicy, HookAudience, HookSpec, RoleDefinition, StateDefinition,
-    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
+    CanonicalPhase, FailurePolicy, GateConfig, HookAudience, HookSpec, RoleDefinition,
+    StateDefinition, StateHooks, StateKind, WorkflowDefinition, WorkflowDispatch,
+    WorkflowExecutionPolicy, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use serde_json::json;
 
@@ -38,6 +39,84 @@ fn state(
         triggers: std::collections::BTreeMap::new(),
         config: json!({}),
     }
+}
+
+/// The role of the step-check gate. It is never assigned on a subtask: it
+/// resolves to the root's lead (`task_hierarchy::effective_role_assignment`).
+pub const STEP_CHECK_ROLE: &str = default_roles::PLANNER;
+
+/// Whether `state` belongs to the inherited subtask workflow.
+pub fn is_inherited_state(state: &str) -> bool {
+    matches!(
+        state,
+        default_states::TODO
+            | default_states::IN_PROGRESS
+            | default_states::LEAD_CHECK
+            | default_states::DONE
+            | default_states::CANCELLED
+    )
+}
+
+/// The step check: an optional gate in the working phase between
+/// implementation and `done`. With no lead on the root it is skipped on entry
+/// (`auto_cascade_on_unassigned_role`); with one, the lead runs a read-only
+/// execution on the subtask and its result block accepts the step or returns
+/// it to the same worker thread. `max_rejections` bounds the returns: the
+/// entry after the last allowed return parks the subtask (`check_retry_budget`
+/// runs before the dispatch, so no check is started on a spent budget).
+fn lead_check() -> StateDefinition {
+    let mut lead_check = state(
+        default_states::LEAD_CHECK,
+        StateKind::Gate,
+        "In Progress",
+        "Lead Check",
+        Some(STEP_CHECK_ROLE),
+        CanonicalPhase::Working,
+        StateHooks {
+            on_enter: vec![hook("check_retry_budget"), hook("dispatch_role_agent")],
+            after_enter: vec![hook("auto_cascade_on_unassigned_role")],
+            ..StateHooks::default()
+        },
+    );
+    lead_check.dispatch = Some(WorkflowDispatch {
+        builder: Some(crate::workflow::dispatch::BUILDER_ID_PLANNER_STEP_CHECK_V1.to_owned()),
+        execution_policy: None,
+        prompt: None,
+    });
+    lead_check.gate_config = Some(GateConfig {
+        reject_target: Some(default_states::IN_PROGRESS.to_owned()),
+        max_rejections: Some(2),
+        approve_label: Some("Accept step".to_owned()),
+        reject_label: Some("Return step".to_owned()),
+        requires_user_approval: Some(false),
+        optional_when_unassigned: Some(true),
+    });
+    lead_check.triggers.insert(
+        WorkflowTrigger::Accept,
+        WorkflowTriggerDefinition {
+            to: default_states::DONE.to_owned(),
+            dispatch: None,
+        },
+    );
+    lead_check.triggers.insert(
+        WorkflowTrigger::Reject,
+        WorkflowTriggerDefinition {
+            to: default_states::IN_PROGRESS.to_owned(),
+            dispatch: Some(WorkflowDispatch {
+                builder: None,
+                execution_policy: Some(WorkflowExecutionPolicy::ResumeLatestTargetRoleThread),
+                prompt: None,
+            }),
+        },
+    );
+    lead_check.triggers.insert(
+        WorkflowTrigger::Fail,
+        WorkflowTriggerDefinition {
+            to: default_states::CANCELLED.to_owned(),
+            dispatch: None,
+        },
+    );
+    lead_check
 }
 
 pub fn inherited_subtask_workflow() -> WorkflowDefinition {
@@ -79,7 +158,7 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
     in_progress.triggers.insert(
         WorkflowTrigger::Accept,
         WorkflowTriggerDefinition {
-            to: default_states::DONE.to_owned(),
+            to: default_states::LEAD_CHECK.to_owned(),
             dispatch: None,
         },
     );
@@ -91,14 +170,22 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
         },
     );
     WorkflowDefinition {
-        roles: vec![RoleDefinition {
-            name: default_roles::CODER.to_owned(),
-            display_name: "Coder".to_owned(),
-            description: "Implements the work".to_owned(),
-        }],
+        roles: vec![
+            RoleDefinition {
+                name: default_roles::CODER.to_owned(),
+                display_name: "Coder".to_owned(),
+                description: "Implements the work".to_owned(),
+            },
+            RoleDefinition {
+                name: STEP_CHECK_ROLE.to_owned(),
+                display_name: "Lead".to_owned(),
+                description: "The root's lead checks each finished step".to_owned(),
+            },
+        ],
         states: vec![
             todo,
             in_progress,
+            lead_check(),
             state(
                 default_states::DONE,
                 StateKind::Terminal,
@@ -142,6 +229,54 @@ mod tests {
             .states
             .iter()
             .any(|state| state.name == "review"));
+    }
+
+    /// The step check is a working-phase gate, never a review: a review-phase
+    /// gate on a subtask would change subtask creation, the aggregate review
+    /// role and merge admission.
+    #[test]
+    fn the_step_check_is_an_optional_working_gate_between_implementation_and_done() {
+        let workflow = inherited_subtask_workflow();
+        let gate = workflow
+            .states
+            .iter()
+            .find(|state| state.name == default_states::LEAD_CHECK)
+            .expect("lead_check exists");
+        assert_eq!(gate.kind, api_types::StateKind::Gate);
+        assert_eq!(
+            gate.canonical_phase,
+            Some(api_types::CanonicalPhase::Working)
+        );
+        assert_eq!(gate.role.as_deref(), Some(super::STEP_CHECK_ROLE));
+        let config = gate.gate_config.as_ref().expect("gate config");
+        assert!(config.optional_when_unassigned());
+        assert!(!config.requires_user_approval());
+        assert_eq!(config.max_rejections, Some(2));
+        assert_eq!(
+            config.reject_target.as_deref(),
+            Some(default_states::IN_PROGRESS)
+        );
+        assert_eq!(
+            workflow.auto_transition_target(default_states::IN_PROGRESS),
+            Some(default_states::LEAD_CHECK)
+        );
+        assert_eq!(
+            workflow.auto_transition_target(default_states::LEAD_CHECK),
+            Some(default_states::DONE)
+        );
+        // The budget check runs before the dispatch.
+        let on_enter: Vec<&str> = gate
+            .hooks
+            .on_enter
+            .iter()
+            .map(|hook| hook.action.as_str())
+            .collect();
+        assert_eq!(on_enter, ["check_retry_budget", "dispatch_role_agent"]);
+        for state in &workflow.states {
+            assert!(super::is_inherited_state(&state.name), "{}", state.name);
+        }
+        assert!(!super::is_inherited_state(default_states::PLANNING));
+        assert!(!super::is_inherited_state(default_states::REVIEW));
     }
 
     #[test]

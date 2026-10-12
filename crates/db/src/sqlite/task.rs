@@ -8,7 +8,9 @@ use std::collections::HashSet;
 
 /// Load the assignment that authorizes an execution while holding the same
 /// writer transaction that will create it. Coder rows resolve child first,
-/// then direct parent; every other role remains Task-local.
+/// then direct parent. The step-check role of a subtask in an inherited
+/// workflow state (`planner`) is its root's row and never its own. Every
+/// other role remains Task-local.
 pub(super) async fn effective_execution_assignment_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     task_id: &str,
@@ -21,20 +23,51 @@ pub(super) async fn effective_execution_assignment_in_tx(
                 assignment.updated_at
          FROM task
          JOIN task_role_assignment AS assignment
-           ON assignment.role_name = ?
-          AND (assignment.task_id = task.id
-               OR (? = 'coder'
-                   AND task.parent_task_id IS NOT NULL
-                   AND assignment.task_id = task.parent_task_id))
-         WHERE task.id = ?
+           ON assignment.role_name = ?1
+          AND CASE
+                WHEN ?1 = 'planner'
+                     AND task.parent_task_id IS NOT NULL
+                     AND task.status IN ('todo','in_progress','lead_check','done','cancelled')
+                THEN assignment.task_id = task.parent_task_id
+                ELSE assignment.task_id = task.id
+                     OR (?1 = 'coder'
+                         AND task.parent_task_id IS NOT NULL
+                         AND assignment.task_id = task.parent_task_id)
+              END
+         WHERE task.id = ?2
          ORDER BY CASE WHEN assignment.task_id = task.id THEN 0 ELSE 1 END
          LIMIT 1",
     )
     .bind(role_name)
-    .bind(role_name)
     .bind(task_id)
     .fetch_optional(&mut **transaction)
     .await?)
+}
+
+/// The Task whose own row decides who holds `role_name` on `task_id`: the
+/// Task itself, except for the step-check role (`planner`) of a subtask in an
+/// inherited workflow state, which its root holds (the rule of
+/// [`effective_execution_assignment_in_tx`]).
+pub(super) async fn assignment_holder_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+) -> Result<String> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT CASE
+                  WHEN ?1 = 'planner'
+                       AND parent_task_id IS NOT NULL
+                       AND status IN ('todo','in_progress','lead_check','done','cancelled')
+                  THEN parent_task_id
+                  ELSE id
+                END
+         FROM task WHERE id = ?2",
+    )
+    .bind(role_name)
+    .bind(task_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .unwrap_or_else(|| task_id.to_owned()))
 }
 
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
@@ -129,12 +162,24 @@ async fn latest_execution_authority_matches_in_tx(
             "auditor" => "reviewer",
             role => role,
         };
+        // The step-check role of a subtask in an inherited workflow state is
+        // held by its root's row and never its own (the rule of
+        // `effective_execution_assignment_in_tx`).
+        let assignment_task_id = match task.parent_task_id.as_deref() {
+            Some(parent_task_id)
+                if assignment_role == "planner"
+                    && super::inherited_subtask_workflow_state(&task.status) =>
+            {
+                parent_task_id
+            }
+            _ => task.id.as_str(),
+        };
         let assignment = sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
             "SELECT assignee_type, assignee_id, updated_at
              FROM task_role_assignment
              WHERE task_id = ? AND role_name = ?",
         )
-        .bind(&task.id)
+        .bind(assignment_task_id)
         .bind(assignment_role)
         .fetch_optional(&mut **transaction)
         .await?;
@@ -728,11 +773,12 @@ async fn set_error_annotation_if_no_running_execution_inner(
     // execution's blocker. Interactive stops intentionally have no workflow
     // assignment dependency and pass `None` here.
     if let Some(role_name) = expected_assignment_role {
+        let holder = assignment_holder_in_tx(&mut transaction, id, role_name).await?;
         let actual_assignment = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
         )
-        .bind(id)
+        .bind(&holder)
         .bind(role_name)
         .fetch_optional(&mut *transaction)
         .await?

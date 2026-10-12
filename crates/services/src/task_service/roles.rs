@@ -530,6 +530,7 @@ impl TaskService {
     /// overrides and keep any parked disposition they own.
     async fn wake_role_dispatch(&self, task_id: &str, role_name: &str, reason: &str) -> Result<()> {
         crate::wake_task_dispatch(&self.db, task_id, reason).await?;
+        self.wake_step_checks_of(task_id, role_name).await?;
         if role_name != crate::workflow::default_roles::CODER {
             return Ok(());
         }
@@ -553,6 +554,23 @@ impl TaskService {
                     "root default worker assignment changed",
                 )
                 .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A change of a root's lead changes who holds the step check of its
+    /// subtasks: wake the ones that rest in that gate (a removed lead passes
+    /// them, a new one checks them).
+    async fn wake_step_checks_of(&self, root_id: &str, role_name: &str) -> Result<()> {
+        if role_name != crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE {
+            return Ok(());
+        }
+        for child in crate::task_hierarchy::ordered_children(&self.db, root_id).await? {
+            if crate::task_hierarchy::step_check_root(&child, role_name).is_some()
+                && child.status == crate::workflow::default_states::LEAD_CHECK
+            {
+                crate::wake_task_dispatch(&self.db, &child.id, "the root's lead changed").await?;
             }
         }
         Ok(())

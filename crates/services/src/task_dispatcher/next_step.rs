@@ -25,6 +25,11 @@ pub enum Step {
     ClearPlanningWait,
     AdvanceRoot,
     ApplyDefaults,
+    /// Leave an optional gate that nobody holds for the terminal state it
+    /// accepts into (a step check whose root has no lead any more).
+    SkipGate {
+        target: String,
+    },
     Initial {
         target: String,
         role: String,
@@ -166,6 +171,9 @@ pub struct Facts {
     pub reviewer_ready: bool,
     pub apply_defaults: bool,
     pub initial_target: Option<(String, String, String)>,
+    /// The terminal state an optional gate nobody holds is skipped to. Set
+    /// only where `initial_target` would otherwise be asked, never with it.
+    pub gate_skip: Option<String>,
     pub role_target: Option<(String, String)>,
     /// The state's role is assigned to a person.
     pub role_user: bool,
@@ -518,6 +526,13 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
             park(Reason::HumanWork, Owner::ProjectAgent, Action::AssignRole)
         }
         Some(StateKind::Active | StateKind::Gate) => {
+            // Before the stopped-run park: a run that nobody holds the role
+            // for any more is not waited on.
+            if let Some(target) = &f.gate_skip {
+                return Next::Step(Step::SkipGate {
+                    target: target.clone(),
+                });
+            }
             if f.stopped_execution {
                 return park(
                     Reason::ExecutionStopped,
@@ -684,6 +699,61 @@ mod tests {
             }
         }
     }
+    /// The gate-skip fact is not one of the enumerated bits: it is set only
+    /// for an optional gate nobody holds, in place of `initial_target`.
+    #[test]
+    fn an_optional_gate_nobody_holds_is_skipped_unless_something_owns_the_task() {
+        let workflow = WorkflowEngine::resolve_subtask_workflow();
+        let condition = TaskCondition::Clear {
+            evidence: ConditionEvidence::default(),
+        };
+        let skip = Facts {
+            gate_skip: Some("done".into()),
+            child_ready: true,
+            root_role_allowed: true,
+            reviewer_ready: true,
+            role_open: true,
+            stopped_execution: true,
+            ..Default::default()
+        };
+        let resolve = |facts: &Facts| {
+            next_step(&Snapshot {
+                state: "lead_check",
+                condition: &condition,
+                workflow: &workflow,
+                facts,
+            })
+        };
+        assert_eq!(
+            resolve(&skip),
+            Next::Step(Step::SkipGate {
+                target: "done".into()
+            })
+        );
+        // A paused Project, a running check, a hold on the root and a
+        // blocked subtask each come first.
+        for held in [
+            Facts {
+                paused: true,
+                ..skip.clone()
+            },
+            Facts {
+                in_flight: true,
+                ..skip.clone()
+            },
+            Facts {
+                blocking: true,
+                ..skip.clone()
+            },
+            Facts {
+                parent_wait: Some(("root".into(), "planning".into())),
+                ..skip.clone()
+            },
+        ] {
+            assert!(matches!(resolve(&held), Next::Park(_)), "{held:?}");
+        }
+    }
+
     #[test]
     fn handed_off_integration_lineage_allows_idle_role_dispatch() {
         let workflow = WorkflowEngine::resolve_workflow("{}");

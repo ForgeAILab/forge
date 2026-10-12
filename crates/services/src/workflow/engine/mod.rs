@@ -1982,7 +1982,15 @@ impl WorkflowEngine {
         if !current_in_subtask {
             return project_workflow;
         }
-        if actor.is_user() {
+        // A user acts under the Project workflow where it has the state. The
+        // step check exists only in the inherited workflow, so a subtask
+        // resting there is governed by it for every actor.
+        if actor.is_user()
+            && project_workflow
+                .states
+                .iter()
+                .any(|s| s.name.as_str() == task.status.as_str())
+        {
             return project_workflow;
         }
         subtask_wf

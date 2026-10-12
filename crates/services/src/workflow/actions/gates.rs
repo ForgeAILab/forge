@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use db::{TaskDependencyRepo, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo, WorkspaceRepo};
+use db::{TaskDependencyRepo, TaskRepo, TransitionLogRepo, WorkspaceRepo};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
@@ -40,6 +40,8 @@ impl HookAction for AutoCascadeOnUnassignedRole {
             Ok(assignment) => assignment,
             Err(reason) => return HookResult::Failed { reason },
         };
+        // The resolver decides who holds the role (a subtask's step check:
+        // its root's lead); an Agent or a person with an id holds it.
         if assignment
             .as_ref()
             .is_some_and(|assignment| assignment.assignee_id.is_some())
@@ -49,17 +51,10 @@ impl HookAction for AutoCascadeOnUnassignedRole {
             };
         }
 
-        let target = ctx
-            .workflow
-            .outgoing_trigger_targets(&ctx.to_state)
-            .filter(|(trigger, _)| !trigger.system_only())
-            .find_map(|(_, to)| {
-                ctx.workflow
-                    .states
-                    .iter()
-                    .find(|state| state.name == to && state.kind == api_types::StateKind::Active)
-                    .map(|state| state.name.clone())
-            });
+        // An implementation state, or the terminal state the gate accepts
+        // into (a step check in front of `done`); never cancellation.
+        let target = crate::workflow::optional_gate_skip_target(&ctx.workflow, &ctx.to_state)
+            .map(|state| state.name.clone());
 
         match target {
             Some(to) => HookResult::Cascade {
@@ -439,17 +434,14 @@ impl HookAction for RequireUpstreamRolesCompleted {
                 continue;
             };
 
-            let assignment =
-                match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
-                    .await
-                {
-                    Ok(assignment) => assignment,
-                    Err(error) => {
-                        return HookResult::Skipped {
-                            reason: format!("role assignment unavailable: {error}"),
-                        };
-                    }
-                };
+            let assignment = match get_role_assignment(ctx, role).await {
+                Ok(assignment) => assignment,
+                Err(error) => {
+                    return HookResult::Skipped {
+                        reason: format!("role assignment unavailable: {error}"),
+                    };
+                }
+            };
 
             if assignment.is_some() && !transition_logs.iter().any(|log| log.to_state == gate.name)
             {
