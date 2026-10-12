@@ -3117,6 +3117,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A merge taken over at the upgrade as already landed, whose commit the
+  target does not contain (or whose target cannot be asked), no longer asks
+  for its proof for ever. After five asks the attempt is parked for the
+  owner: the Task shows `deferred` / `owner_required` with an Attention item,
+  and Retry puts it back in line (Cancel ends it).
+
 - A queued check run whose last consumer is withdrawn (a Hold or Cancel
   during the entry check, a superseded step, a Project delete) is cancelled
   in the withdrawal itself. It used to stay `queued` until a machine slot

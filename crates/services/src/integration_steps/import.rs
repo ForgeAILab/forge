@@ -423,7 +423,7 @@ impl IntegrationSteps {
 
     /// State `reason` for the imported attempt and finish the step. An
     /// intervention raises its incident with the statement, as `park` does.
-    async fn import_state(
+    pub(super) async fn import_state(
         &self,
         step: &TaskStep,
         attempt: &IntegrationAttempt,

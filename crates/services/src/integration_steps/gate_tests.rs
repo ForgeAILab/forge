@@ -2341,3 +2341,143 @@ async fn a_stale_bound_head_is_left_to_its_driver_and_rebound_once_it_is_off_the
     assert_eq!(rebound.queue_seq, first.queue_seq);
     assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
 }
+
+/// A merge the importer took over as landed, whose commit the target's owner
+/// says the target does not contain. The continuation asks a bounded number
+/// of times, then parks the attempt for its owner: typed
+/// (`deferred/owner_required`), with an Attention item, and with a Retry
+/// that puts the Task back in line. It does not ask for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_imported_landed_row_whose_proof_fails_parks_for_its_owner_after_a_bounded_number_of_asks(
+) {
+    let world = World::new().await;
+    world.legacy_task("gone", "gone.txt", "merging").await;
+    world.seed_execution("gone", "executor", None).await;
+    // Startup classifies every row before any continuation may run.
+    world.db.import_integration_pass(100).await.unwrap();
+    let a = world
+        .db
+        .current_integration_attempt("gone")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(a.import_source_json.is_some());
+    // As the importer leaves a merge the old path recorded as landed, here
+    // of a commit the target never got.
+    let never_merged = "d".repeat(40);
+    world
+        .set(
+            &a.id,
+            &format!("state='applied',integrated_sha='{never_merged}',failure_kind=NULL,failure_message=NULL,available_at=NULL"),
+        )
+        .await;
+    let report = import::import_at_start(&world.db).await.unwrap();
+    assert_eq!(report.continuations, 1, "{report:?}");
+    let key = format!("integration-import:{}", a.id);
+    let continuation = || async {
+        world
+            .db
+            .task_steps("gone")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|step| step.causation_key == key)
+            .expect("the continuation step")
+    };
+    let interruptions = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id='gone'",
+        )
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap()
+    };
+    let mut asks = 0;
+    let mut told_while_asking = 0;
+    loop {
+        eventually("the continuation asked or ended", || async {
+            let step = continuation().await;
+            step.status == "done"
+                || (step.status == "pending"
+                    && step.attempts > asks
+                    && step.available_at > db::now_rfc3339())
+        })
+        .await;
+        let step = continuation().await;
+        if step.status == "done" {
+            break;
+        }
+        asks = step.attempts;
+        assert!(
+            asks <= IMPORT_PROOF_ASKS,
+            "asked {asks} times and still asks"
+        );
+        // While it asks, the Task says the result is unresolved.
+        let task = world.task("gone").await;
+        assert_eq!(task.status, "merging");
+        assert_eq!(integration(&task)["cause"], "unresolved_result");
+        told_while_asking = interruptions().await;
+        sqlx::query("UPDATE task_step SET available_at=? WHERE id=?")
+            .bind(db::now_rfc3339())
+            .bind(&step.id)
+            .execute(world.db.pool())
+            .await
+            .unwrap();
+        world.db.domain_event_notify().notify_waiters();
+    }
+    assert_eq!(continuation().await.attempts, IMPORT_PROOF_ASKS);
+    let parked = world.attempt(&a.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert_eq!(
+        parked.failure_kind,
+        Some(db::IntegrationFailureKind::OwnerRequired)
+    );
+    assert_eq!(parked.available_at, None, "no deadline: the owner decides");
+    assert_eq!(parked.integrated_sha, None, "the unproven claim is dropped");
+    let task = world.task("gone").await;
+    assert_eq!(task.status, "merging", "never done without the proof");
+    assert_eq!(integration(&task)["kind"], "deferred");
+    assert_eq!(integration(&task)["cause"], "owner_required");
+    assert!(
+        integration(&task)["message"]
+            .as_str()
+            .unwrap()
+            .contains(&never_merged),
+        "{}",
+        integration(&task)
+    );
+    assert!(db::material_blocker(&task.condition).requires_intervention);
+    // The park is a new interruption of the Task (what Attention projects),
+    // raised once.
+    assert_eq!(interruptions().await, told_while_asking + 1);
+    // The owner's Retry is offered, and it puts the Task back in line: the
+    // queue reads the target as it is and merges the Task's real commit.
+    assert!(world
+        .offers("gone")
+        .await
+        .contains(&("retry".into(), "integration_retry".into())));
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .act(
+            "gone",
+            TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+        )
+        .await;
+    world
+        .until(
+            "gone",
+            "the Task merges after the owner's Retry",
+            || async { world.task("gone").await.status == "done" },
+        )
+        .await;
+    assert_eq!(world.merges("gone").await, 1);
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}

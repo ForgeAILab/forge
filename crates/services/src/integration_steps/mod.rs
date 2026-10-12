@@ -160,6 +160,10 @@ pub struct IntegrationSteps {
     pub(crate) timers: IntegrationStepTimers,
 }
 
+/// How often the continuation of an imported, landed merge asks the target's
+/// owner for the proof before it parks the attempt for the Task's owner.
+pub(crate) const IMPORT_PROOF_ASKS: i64 = 5;
+
 impl IntegrationSteps {
     pub fn new(task_service: crate::TaskService) -> Self {
         let engine = task_service.workflow_engine();
@@ -969,7 +973,10 @@ impl IntegrationSteps {
     ///   and ends, so the worker takes the attempt off the slot and queues it
     ///   again; validation then reads the target as it is.
     /// - No answer, or an imported row: the step stays and asks again at
-    ///   `result_park`; the worker re-arms it on every sweep.
+    ///   `result_park`; the worker re-arms it on every sweep. An imported
+    ///   row has no worker: its continuation asks [`IMPORT_PROOF_ASKS`]
+    ///   times and then parks the attempt for the owner
+    ///   (`park_unproven_import`).
     async fn result_unproven(
         &self,
         step: &TaskStep,
@@ -983,6 +990,9 @@ impl IntegrationSteps {
             TargetProof::Unknown(why) => (false, why),
             TargetProof::Contains => unreachable!("a proven merge is reported"),
         };
+        if imported && step.attempts >= IMPORT_PROOF_ASKS {
+            return self.park_unproven_import(step, attempt, &why).await;
+        }
         let message = bounded(&format!(
             "the merge of this Task is not confirmed on its target: {why}"
         ));
@@ -1057,6 +1067,52 @@ impl IntegrationSteps {
             .await?;
         tx.commit().await?;
         Ok(StepOutcome::Settled)
+    }
+
+    /// An imported, landed merge is still not proven after
+    /// [`IMPORT_PROOF_ASKS`] asks. No worker holds a slot for such a row and
+    /// nothing else would end the asking, so the continuation ends it: the
+    /// attempt is parked for the Task's owner (`applied -> parked`,
+    /// `owner_required`, no deadline, its unproven commit claim dropped as
+    /// the worker's `not_landed` park does), the Task states
+    /// `deferred/owner_required` (an Attention item) and the step is done.
+    /// The owner's Retry puts the Task back in line, where validation reads
+    /// the target as it is; Cancel ends it.
+    async fn park_unproven_import(
+        &self,
+        step: &TaskStep,
+        attempt: &IntegrationAttempt,
+        why: &str,
+    ) -> Result<StepOutcome> {
+        let message = bounded(&format!(
+            "the merge of this Task from before the upgrade is not confirmed on its target ({why}); asked {IMPORT_PROOF_ASKS} times. Retry puts the Task back in line; Cancel ends it."
+        ));
+        tracing::warn!(target: "services::integration_steps", task_id = %attempt.task_ref, attempt_id = %attempt.id, %message, "imported merge parked for its owner");
+        let mut parked = attempt.clone();
+        parked.state = S::Parked;
+        parked.failure_kind = Some(db::IntegrationFailureKind::OwnerRequired);
+        parked.failure_message = Some(message.clone());
+        parked.available_at = None;
+        parked.integrated_sha = None;
+        parked.integrated_before_sha = None;
+        let parked = match self.db.transition_integration_attempt(parked).await {
+            Ok(parked) => parked,
+            Err(db::DbError::VersionConflict) => {
+                return Ok(StepOutcome::Retry("attempt moved while parking".into()))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.import_state(
+            step,
+            &parked,
+            Some(IntegrationReason::Deferred {
+                attempt_id: attempt_ref(&parked.id),
+                cause: IntegrationDeferralCause::OwnerRequired,
+                owner_id: None,
+                message,
+            }),
+        )
+        .await
     }
 
     /// The phase a `request_check` step states.
