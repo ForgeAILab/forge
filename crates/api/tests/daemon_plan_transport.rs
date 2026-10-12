@@ -500,13 +500,19 @@ impl Fixture {
         task.id
     }
     async fn dispatch(&self) -> Result<u64, services::ServiceError> {
-        let result = services::TaskDispatcher::new(
+        // The pass queues a `reconcile_role` step, and that step dispatches
+        // only through the dispatcher instance that queued it (the Task
+        // service holds it weakly). The step is run by the drain below, or by
+        // the step worker when that wins: the dispatcher has to live until
+        // both are over. As a temporary it was dropped when the pass
+        // returned, and a step that ran after that dispatched nothing and
+        // was marked done, with nothing left in this test to start the Task.
+        let dispatcher = services::TaskDispatcher::new(
             self.harness.state.db.clone(),
             self.harness.state.event_bus.clone(),
             self.harness.state.task_service.clone(),
-        )
-        .check_once()
-        .await;
+        );
+        let result = dispatcher.check_once().await;
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
         )
