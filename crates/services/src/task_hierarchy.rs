@@ -740,6 +740,487 @@ pub async fn is_subtask(db: &SqliteDb, task_id: &str) -> Result<bool> {
     Ok(!is_root_task(db, task_id).await?)
 }
 
+// ---------------------------------------------------------------------------
+// Re-plan (root lead, stage 2). A coordination root with a lead goes back to
+// its planning state when its aggregate review is rejected and when its
+// current subtask parks needing a decision. Everything here is a pure read of
+// rows the caller already loaded, so the scheduling fact and the command that
+// acts on it cannot disagree.
+// ---------------------------------------------------------------------------
+
+/// Database form of "this Task is a coordination root and has a lead":
+/// [`root_lead`], and only for a root that has subtasks.
+pub(crate) async fn coordination_root_lead(
+    db: &SqliteDb,
+    task: &Task,
+    workflow: &WorkflowDefinition,
+) -> Result<Option<TaskRoleAssignment>> {
+    let Some(lead) = root_lead(db, task, workflow).await? else {
+        return Ok(None);
+    };
+    Ok(coordination_root_has_subtasks(db, task)
+        .await?
+        .then_some(lead))
+}
+
+/// Where a rejected gate sends a Task. THE reader of a gate's
+/// `reject_target` for a rejection: the configured target (`in_progress`
+/// when the gate names none), except that a coordination root with a lead
+/// never goes back to its implementation state from a review-phase gate. No
+/// role runs for it there; its lead turns the findings into work, so it goes
+/// to its planning state. `lead_assigned` is false for every Task that is
+/// not a coordination root with a lead, and then nothing changes.
+pub(crate) fn effective_reject_target(
+    workflow: &WorkflowDefinition,
+    gate_state: &str,
+    lead_assigned: bool,
+) -> String {
+    let gate = workflow
+        .states
+        .iter()
+        .find(|state| state.name == gate_state);
+    let configured = gate
+        .and_then(|state| state.gate_config.as_ref())
+        .and_then(|gate| gate.reject_target.clone())
+        .unwrap_or_else(|| default_states::IN_PROGRESS.to_owned());
+    if !lead_assigned
+        || gate.is_none_or(|state| {
+            state.kind != StateKind::Gate || state.canonical_phase != Some(CanonicalPhase::Review)
+        })
+    {
+        return configured;
+    }
+    let to_implementation = workflow.states.iter().any(|state| {
+        state.name == configured
+            && state.kind == StateKind::Active
+            && state.canonical_phase != Some(CanonicalPhase::Review)
+    });
+    match RootRolePolicy::for_workflow(workflow).planning_state() {
+        Some(planning) if to_implementation => planning.to_owned(),
+        _ => configured,
+    }
+}
+
+/// Whether `bridge` is a re-plan entry into `target`: the one transition a
+/// workflow needs no trigger for. Only a system actor may make it, and only
+/// into the workflow's planning state.
+pub(crate) fn replan_edge(
+    workflow: &WorkflowDefinition,
+    bridge: &api_types::TransitionBridge,
+    target: &str,
+) -> bool {
+    bridge.bridge_kind == Some(api_types::TransitionBridgeKind::Replan)
+        && RootRolePolicy::for_workflow(workflow).planning_state() == Some(target)
+}
+
+/// The receipt of the re-plan for one park of one subtask. It is both the
+/// budget charge identity and the identity the planning entry carries.
+pub(crate) fn replan_receipt_for_subtask(child_id: &str, park: &str) -> String {
+    format!("replan:{child_id}:{park}")
+}
+
+/// The receipt of the re-plan for one rejected aggregate review.
+pub(crate) fn replan_receipt_for_review(review_id: &str) -> String {
+    format!("replan:review:{review_id}")
+}
+
+/// The bridge of a re-plan entry. `trigger` is `aggregate_review` or
+/// `subtask_parked`; `subject` is the Review or the subtask.
+pub(crate) fn replan_bridge(
+    trigger: &str,
+    subject: &str,
+    receipt: &str,
+    reason: &str,
+) -> api_types::TransitionBridge {
+    api_types::TransitionBridge {
+        bridge_kind: Some(api_types::TransitionBridgeKind::Replan),
+        bridge_payload: Some(serde_json::json!({
+            "trigger": trigger,
+            "subject_id": subject,
+            "receipt": receipt,
+            "reason": reason,
+        })),
+    }
+}
+
+/// Whether the root already entered its planning state for `receipt`.
+pub(crate) fn replan_entered(transitions: &[db::TransitionLog], receipt: &str) -> bool {
+    transitions.iter().any(|entry| {
+        entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::Replan)
+            && entry
+                .bridge
+                .bridge_payload
+                .as_ref()
+                .and_then(|payload| payload.get("receipt"))
+                .and_then(serde_json::Value::as_str)
+                == Some(receipt)
+    })
+}
+
+/// The condition a subtask's park is judged on. A stored copy that only
+/// shadows the legacy fields may lag them; the fields decide, as they do for
+/// the Task itself in the dispatcher's snapshot.
+fn decision_condition(child: &Task) -> db::TaskCondition {
+    if child.condition.evidence().stated {
+        child.condition.clone()
+    } else {
+        child
+            .condition
+            .restate_legacy(&db::LegacyConditionInput::from(child))
+    }
+}
+
+/// A subtask parked needing a decision, and the identity of that park:
+/// it failed or was interrupted, and nothing clears that by itself. Never a
+/// hold (the owner's), a queued owner action, or any wait that ends on its
+/// own (capacity, an Agent, a machine, the environment, a dependency, a
+/// human decision, checks, its parent, a retry deadline, a run in flight).
+///
+/// The identity is the time the park was recorded, which the stored blocker
+/// carries and no restatement changes; a later park of the same subtask has
+/// a later one.
+pub(crate) fn subtask_decision_park(child: &Task) -> Option<String> {
+    let condition = decision_condition(child);
+    let since = match &condition {
+        db::TaskCondition::Parked { primary, since, .. } => {
+            if matches!(
+                primary,
+                db::ParkReason::Held { .. } | db::ParkReason::HumanDecision { .. }
+            ) {
+                return None;
+            }
+            since.clone()
+        }
+        db::TaskCondition::Failed { since, .. } => since.clone(),
+        _ => return None,
+    };
+    let read = condition.read();
+    if !(read.hard_failure || read.interruption_present)
+        || read.failure_kind == Some(api_types::FailureKind::ManualStop)
+        || read.queued_command
+    {
+        return None;
+    }
+    Some(
+        since
+            .or_else(|| {
+                read.interruption
+                    .map(|interruption| interruption.created_at)
+            })
+            .or_else(|| read.diagnostic.and_then(|diagnostic| diagnostic.blocked_at))
+            .unwrap_or_else(|| "unrecorded".to_owned()),
+    )
+}
+
+impl RootRolePolicy<'_> {
+    /// The level-triggered re-plan fact (T3): the subtask that parked and
+    /// the identity of its park, when the root must go back to planning for
+    /// it. True only for an unblocked root with a lead, in its working
+    /// implementation state (never `merge_failed`), whose first incomplete
+    /// subtask is parked needing a decision, and that has not entered
+    /// planning for this park yet. One re-plan per park: after it, the same
+    /// park is the Project Agent's.
+    pub(crate) fn replan_due(
+        &self,
+        root: &Task,
+        children: &[Task],
+        assignments: &[TaskRoleAssignment],
+        transitions: &[db::TransitionLog],
+    ) -> Option<(String, String)> {
+        if root.parent_task_id.is_some() || root_blocked(root) {
+            return None;
+        }
+        let state = self
+            .workflow
+            .states
+            .iter()
+            .find(|state| state.name == root.status)?;
+        if state.kind != StateKind::Active || state.canonical_phase == Some(CanonicalPhase::Review)
+        {
+            return None;
+        }
+        self.planning_state()?;
+        self.lead(&root.id, assignments)?;
+        let child = next_incomplete_child(children, self.workflow)?;
+        let park = subtask_decision_park(child)?;
+        (!replan_entered(transitions, &replan_receipt_for_subtask(&child.id, &park)))
+            .then(|| (child.id.clone(), park))
+    }
+}
+
+/// Whether the lead of `task_id`'s coordination root handles that subtask's
+/// park, so the Project Agent is not woken for it: the root is about to
+/// re-plan for this park ([`RootRolePolicy::replan_due`]), or its lead is
+/// planning now. False for every other Task, and for a park the lead already
+/// re-planned for and left in place, a root that is held or blocked (its
+/// re-plan budget spent included), and a root that lost its lead: those are
+/// the Project Agent's.
+pub(crate) async fn lead_handles_subtask_park(db: &SqliteDb, task_id: &str) -> Result<bool> {
+    let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
+        return Ok(false);
+    };
+    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+        return Ok(false);
+    };
+    let (root, workflow) = coordination_root_context(db, parent_task_id).await?;
+    let policy = RootRolePolicy::for_workflow(&workflow);
+    let assignments = TaskRoleAssignmentRepo::list_by_task(db, parent_task_id).await?;
+    if policy.lead(&root.id, &assignments).is_none() || root_blocked(&root) {
+        return Ok(false);
+    }
+    if policy.planning_state() == Some(root.status.as_str()) {
+        return Ok(true);
+    }
+    let children = ordered_children(db, parent_task_id).await?;
+    let transitions = db::TransitionLogRepo::list_by_task(db, parent_task_id).await?;
+    Ok(policy
+        .replan_due(&root, &children, &assignments, &transitions)
+        .is_some_and(|(child_id, _)| child_id == task.id))
+}
+
+#[cfg(test)]
+mod replan_tests {
+    use super::*;
+
+    fn task(id: &str, status: &str, parent: Option<&str>) -> Task {
+        Task {
+            condition: Default::default(),
+            id: id.to_owned(),
+            project_id: "project".to_owned(),
+            parent_task_id: parent.map(str::to_owned),
+            assignee_type: None,
+            assignee_id: None,
+            title: id.to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: status.to_owned(),
+            is_automation: false,
+            priority: 0,
+            board_position: 0.0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            metadata_json: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            entry_barrier_json: None,
+            review_passed_at: None,
+            archived_at: None,
+            deleted_at: None,
+            version: 0,
+            created_at: "2026-10-12T00:00:00Z".to_owned(),
+            updated_at: "2026-10-12T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn parked(id: &str, at: &str, kind: &str) -> Task {
+        let mut child = task(id, default_states::IN_PROGRESS, Some("root"));
+        child.blocked_json = Some(
+            serde_json::json!({"reason": "retry budget exhausted", "created_at": at, "kind": kind})
+                .to_string(),
+        );
+        child.error_annotation = Some(
+            serde_json::json!({"type": kind, "blocking_reason": "retry budget exhausted", "message": "three attempts failed", "blocked_at": at})
+                .to_string(),
+        );
+        // The stored copy lags on purpose: the fields decide.
+        child
+    }
+
+    fn lead_row() -> Vec<TaskRoleAssignment> {
+        vec![TaskRoleAssignment {
+            id: "lead".to_owned(),
+            task_id: "root".to_owned(),
+            role_name: "planner".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some("lead".to_owned()),
+            created_at: "2026-10-12T00:00:00Z".to_owned(),
+            updated_at: "2026-10-12T00:00:00Z".to_owned(),
+        }]
+    }
+
+    fn replan_entry(receipt: &str) -> db::TransitionLog {
+        db::TransitionLog {
+            id: "entry".to_owned(),
+            task_id: "root".to_owned(),
+            from_state: default_states::IN_PROGRESS.to_owned(),
+            to_state: default_states::PLANNING.to_owned(),
+            trigger_name: None,
+            triggered_by: "system:task_dispatcher".to_owned(),
+            bridge: replan_bridge("subtask_parked", "child", receipt, "parked"),
+            trigger_reason: "parked".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: "2026-10-12T00:00:01Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_lead_root_rejects_from_review_into_planning_and_nothing_else_changes() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        assert_eq!(
+            effective_reject_target(&workflow, "review", false),
+            "in_progress"
+        );
+        assert_eq!(
+            effective_reject_target(&workflow, "review", true),
+            "planning"
+        );
+        // The merge gate rejects into a repair state, never into planning,
+        // and the planning gate keeps rejecting into itself.
+        assert_eq!(
+            effective_reject_target(&workflow, "merging", true),
+            "merge_failed"
+        );
+        assert_eq!(
+            effective_reject_target(&workflow, "planning", true),
+            "planning"
+        );
+        // A gate that names no target still defaults to `in_progress`.
+        let mut bare = workflow.clone();
+        for state in &mut bare.states {
+            if state.name == "review" {
+                state
+                    .gate_config
+                    .as_mut()
+                    .expect("review gate")
+                    .reject_target = None;
+            }
+        }
+        assert_eq!(
+            effective_reject_target(&bare, "review", false),
+            "in_progress"
+        );
+        assert_eq!(effective_reject_target(&bare, "review", true), "planning");
+        // A workflow without a planning state has no re-plan.
+        let mut flat = workflow.clone();
+        for state in &mut flat.states {
+            if state.name == "planning" {
+                state.role = Some("coder".to_owned());
+            }
+        }
+        assert_eq!(
+            effective_reject_target(&flat, "review", true),
+            "in_progress"
+        );
+
+        let replan = replan_bridge(
+            "aggregate_review",
+            "review-1",
+            "replan:review:review-1",
+            "x",
+        );
+        assert!(replan_edge(&workflow, &replan, "planning"));
+        assert!(!replan_edge(&workflow, &replan, "in_progress"));
+        assert!(!replan_edge(&workflow, &Default::default(), "planning"));
+        assert!(!replan_edge(&flat, &replan, "planning"));
+    }
+
+    #[test]
+    fn a_subtask_needs_a_decision_only_when_nothing_clears_its_park_by_itself() {
+        let at = "2026-10-12T01:00:00Z";
+        assert_eq!(
+            subtask_decision_park(&parked("child", at, "retry_exhausted")).as_deref(),
+            Some(at)
+        );
+        assert_eq!(
+            subtask_decision_park(&parked("child", at, "execution_failed")).as_deref(),
+            Some(at)
+        );
+        // The owner's hold is the owner's; a clear, running or waiting
+        // subtask needs nothing.
+        assert_eq!(
+            subtask_decision_park(&parked("child", at, "manual_stop")),
+            None
+        );
+        assert_eq!(
+            subtask_decision_park(&task("child", default_states::IN_PROGRESS, Some("root"))),
+            None
+        );
+        assert_eq!(
+            subtask_decision_park(&task("child", default_states::TODO, Some("root"))),
+            None
+        );
+        // The identity survives a restatement of the stored condition and
+        // changes with the next park.
+        let mut restated = parked("child", at, "retry_exhausted");
+        restated.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&restated));
+        assert_eq!(subtask_decision_park(&restated).as_deref(), Some(at));
+        assert_ne!(
+            subtask_decision_park(&parked("child", "2026-10-12T02:00:00Z", "retry_exhausted")),
+            subtask_decision_park(&restated)
+        );
+    }
+
+    #[test]
+    fn replan_is_due_once_per_park_for_a_working_lead_root() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        let policy = RootRolePolicy::for_workflow(&workflow);
+        let at = "2026-10-12T01:00:00Z";
+        let children = vec![
+            task("done", default_states::DONE, Some("root")),
+            parked("child", at, "retry_exhausted"),
+            task("later", default_states::TODO, Some("root")),
+        ];
+        let root = |status: &str| task("root", status, None);
+        let due = |status: &str, rows: &[TaskRoleAssignment], log: &[db::TransitionLog]| {
+            policy.replan_due(&root(status), &children, rows, log)
+        };
+        assert_eq!(
+            due("in_progress", &lead_row(), &[]),
+            Some(("child".to_owned(), at.to_owned()))
+        );
+        // No lead, no re-plan: the root waits on its subtasks as before.
+        assert_eq!(due("in_progress", &[], &[]), None);
+        // Only from the working implementation state.
+        for status in [
+            "todo",
+            "planning",
+            "review",
+            "merging",
+            "merge_failed",
+            "done",
+        ] {
+            assert_eq!(due(status, &lead_row(), &[]), None, "{status}");
+        }
+        // One re-plan per park; the next park of the same subtask is new.
+        let receipt = replan_receipt_for_subtask("child", at);
+        assert_eq!(
+            due("in_progress", &lead_row(), &[replan_entry(&receipt)]),
+            None
+        );
+        assert!(due(
+            "in_progress",
+            &lead_row(),
+            &[replan_entry(&replan_receipt_for_subtask(
+                "child",
+                "2026-10-11T00:00:00Z"
+            ))]
+        )
+        .is_some());
+        // A blocked or held root never re-plans.
+        let mut blocked = root("in_progress");
+        blocked.blocked_json = Some("{}".to_owned());
+        blocked.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&blocked));
+        assert_eq!(
+            policy.replan_due(&blocked, &children, &lead_row(), &[]),
+            None
+        );
+        // Only the first incomplete subtask counts: a parked later one waits
+        // its turn behind a running one.
+        let running_first = vec![
+            task("first", default_states::IN_PROGRESS, Some("root")),
+            parked("child", at, "retry_exhausted"),
+        ];
+        assert_eq!(
+            policy.replan_due(&root("in_progress"), &running_first, &lead_row(), &[]),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

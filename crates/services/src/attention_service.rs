@@ -362,6 +362,14 @@ impl AttentionService {
                 continue;
             };
             if attention.scope_type == "project" && blocker_category(&attention.attention_type) {
+                // The one lead filter: a subtask's blocker that the lead of
+                // its coordination root handles (the root is about to
+                // re-plan for it, or its lead is planning) wakes nobody.
+                // Level state: once the lead left the park in place, or the
+                // root itself parked, the next sweep admits the wake.
+                if self.lead_handles_blocker(&attention).await? {
+                    continue;
+                }
                 let digest = wake_attention_incident_digest(&attention);
                 let state = {
                     let mut conn = self.db.pool().acquire().await?;
@@ -431,6 +439,19 @@ impl AttentionService {
             }
         }
         Ok(admitted)
+    }
+
+    /// Whether an open blocker is a subtask's park that its root's lead
+    /// handles (`task_hierarchy::lead_handles_subtask_park`).
+    async fn lead_handles_blocker(&self, attention: &AttentionProjection) -> Result<bool> {
+        let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
+        if details.get("entity_type").and_then(Value::as_str) != Some("task") {
+            return Ok(false);
+        }
+        let Some(task_id) = details.get("entity_id").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        crate::task_hierarchy::lead_handles_subtask_park(&self.db, task_id).await
     }
 
     /// One wake per Project window for every eligible blocker, with one directive.

@@ -680,9 +680,10 @@ impl WorkflowExecution<'_> {
                             .await?
                         {
                             task = settled.task;
+                            let bridge = settled.bridge;
                             cascade = settled
                                 .cascade
-                                .map(|(target, _)| (target, error.clone(), Default::default()));
+                                .map(|(target, _)| (target, error.clone(), bridge));
                             before_enter_rejection_cascade = cascade.is_some();
                             skip_target_enter_hooks = true;
                             break;

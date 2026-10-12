@@ -363,6 +363,12 @@ impl TaskDispatcher {
                         .map(|e| e.role.as_str()),
                 ),
             );
+        // The re-plan fact of a root with a lead, from the same policy the
+        // command re-derives it with.
+        f.root_replan = f
+            .root
+            .then(|| root_policy.replan_due(t, &r.children, &r.assignments, &r.transitions))
+            .flatten();
         if let Some(parent) = &r.parent {
             let allowed =
                 crate::task_hierarchy::coordination_root_allows_child_dispatch(parent, &pw);
@@ -566,6 +572,8 @@ impl TaskDispatcher {
             && assignment(&r, "coder").is_none();
         let capability = if f.root_advance {
             super::initial_scheduling::COORDINATION_ROOT_CAPABILITY
+        } else if f.root_replan.is_some() {
+            super::replan::COORDINATION_ROOT_REPLAN_CAPABILITY
         } else if is_initial {
             f.initial_target
                 .as_ref()

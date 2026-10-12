@@ -23,6 +23,7 @@ mod environment_pause_sync;
 mod helpers;
 mod next_step;
 mod reconciliation;
+mod replan;
 mod snapshot;
 pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;

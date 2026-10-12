@@ -1286,7 +1286,8 @@ impl TaskStepWorker {
             let routing_exception = payload.skip_before_exit
                 && (target.is_some_and(|state| state.kind == api_types::StateKind::Initial)
                     || payload.to == step.expected_status)
-                || workflow.cancellation_state.as_deref() == Some(payload.to.as_str());
+                || workflow.cancellation_state.as_deref() == Some(payload.to.as_str())
+                || crate::task_hierarchy::replan_edge(&workflow, &payload.bridge, &payload.to);
             if source.is_none() || target.is_none() || (!edge && !routing_exception) {
                 return self
                     .settle(
@@ -1303,11 +1304,16 @@ impl TaskStepWorker {
             .iter()
             .find(|state| state.name == step.expected_status)
         {
+            // A lead root's rejection re-plans: its target is the planning
+            // state, over the re-plan edge (`effective_reject_target`).
             let rejection_to_target = payload.rejection
-                && source
-                    .gate_config
-                    .as_ref()
-                    .is_some_and(|gate| gate.reject_target.as_deref() == Some(payload.to.as_str()));
+                && (source.gate_config.as_ref().is_some_and(|gate| {
+                    gate.reject_target.as_deref() == Some(payload.to.as_str())
+                }) || crate::task_hierarchy::replan_edge(
+                    &workflow,
+                    &payload.bridge,
+                    &payload.to,
+                ));
             if !WorkflowEngine::cascade_allowed(source, &payload.bridge, rejection_to_target) {
                 return self
                     .settle(

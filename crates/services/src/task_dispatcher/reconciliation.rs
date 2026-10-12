@@ -1163,6 +1163,10 @@ impl TaskDispatcher {
                 Ok(0)
             }
             Step::AdvanceRoot => self.advance_coordination_root_once(task).await,
+            Step::ReplanRoot { child_id, park } => {
+                self.replan_coordination_root_once(task, child_id, park)
+                    .await
+            }
             Step::ApplyDefaults => {
                 self.task_service.assign_project_default_roles(task).await?;
                 Ok(0)
