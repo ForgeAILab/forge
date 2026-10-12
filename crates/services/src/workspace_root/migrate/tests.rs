@@ -807,9 +807,33 @@ async fn a_move_across_filesystems_copies_compares_and_only_then_removes() {
     install.assert_moved(&before).await;
 }
 
+/// The crash tests were two serial loops over every step (about 100 s and
+/// 150 s). Each is now this many cases; case `n` crashes at the steps whose
+/// index is `n` modulo this, each on its own install.
+const CRASH_CASES: usize = 6;
+
+fn crash_case_of(index: usize) -> usize {
+    index % CRASH_CASES
+}
+
+/// Every step index belongs to exactly one case, whatever the step count.
+#[test]
+fn the_crash_cases_partition_the_steps() {
+    for steps in 0..200 {
+        let mut owned = 0;
+        for case in 0..CRASH_CASES {
+            owned += (0..steps)
+                .filter(|index| crash_case_of(*index) == case)
+                .count();
+        }
+        assert_eq!(owned, steps);
+    }
+}
+
 /// A crash after any step: no server starts on the half-moved install, and
 /// running the command again finishes the move with nothing lost.
-async fn crash_at_every_step(copying: bool) {
+async fn crash_at_every_step(copying: bool, case: usize) {
+    assert!(case < CRASH_CASES);
     let request = |install: &Install| {
         if copying {
             install.request().copying()
@@ -817,13 +841,20 @@ async fn crash_at_every_step(copying: bool) {
             install.request()
         }
     };
-    let steps = {
-        let install = Install::new().await;
-        migrate(&install.db, &request(&install))
-            .await
-            .unwrap()
-            .steps
-    };
+    // The steps of an uninterrupted move, taken once for all cases of a kind.
+    static STEPS: [tokio::sync::OnceCell<Vec<String>>; 2] = [
+        tokio::sync::OnceCell::const_new(),
+        tokio::sync::OnceCell::const_new(),
+    ];
+    let steps = STEPS[usize::from(copying)]
+        .get_or_init(|| async {
+            let install = Install::new().await;
+            migrate(&install.db, &request(&install))
+                .await
+                .unwrap()
+                .steps
+        })
+        .await;
     assert!(steps.len() > 10, "{steps:?}");
     for prefix in [
         "plan",
@@ -839,7 +870,14 @@ async fn crash_at_every_step(copying: bool) {
             "{prefix}: {steps:?}"
         );
     }
-    for (index, step) in steps.iter().enumerate() {
+    let mut crashed_at = 0;
+    // More steps than cases, so no case is empty.
+    assert!(steps.len() >= CRASH_CASES, "{steps:?}");
+    for (index, step) in steps
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| crash_case_of(*index) == case)
+    {
         let install = Install::new().await;
         let before = install.snapshot().await;
         let crashed = migrate(&install.db, &request(&install).crashing_at(index))
@@ -882,17 +920,56 @@ async fn crash_at_every_step(copying: bool) {
         assert!(report.resumed, "{step}");
         assert_eq!(report.copied, copying, "{step}");
         install.assert_moved(&before).await;
+        crashed_at += 1;
     }
+    eprintln!(
+        "crash cases: copying={copying} case={case} crashed at {crashed_at} of {} steps",
+        steps.len()
+    );
 }
 
-#[tokio::test]
-async fn a_crash_at_any_step_of_a_rename_move_is_finished_by_a_rerun() {
-    crash_at_every_step(false).await;
+/// The old test names still select every case as a libtest filter.
+macro_rules! crash_cases {
+    ($group:ident, $copying:expr; $($name:ident => $case:expr,)+) => {
+        mod $group {
+            // The cases are exactly 0..CRASH_CASES, or this does not compile.
+            const _: () = {
+                let cases = [$($case),+];
+                assert!(cases.len() == super::CRASH_CASES);
+                let mut index = 0;
+                while index < cases.len() {
+                    assert!(cases[index] == index);
+                    index += 1;
+                }
+            };
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    super::crash_at_every_step($copying, $case).await;
+                }
+            )+
+        }
+    };
 }
 
-#[tokio::test]
-async fn a_crash_at_any_step_of_a_copy_move_is_finished_by_a_rerun() {
-    crash_at_every_step(true).await;
+crash_cases! {
+    a_crash_at_any_step_of_a_rename_move_is_finished_by_a_rerun, false;
+    steps_0_mod_6 => 0,
+    steps_1_mod_6 => 1,
+    steps_2_mod_6 => 2,
+    steps_3_mod_6 => 3,
+    steps_4_mod_6 => 4,
+    steps_5_mod_6 => 5,
+}
+
+crash_cases! {
+    a_crash_at_any_step_of_a_copy_move_is_finished_by_a_rerun, true;
+    steps_0_mod_6 => 0,
+    steps_1_mod_6 => 1,
+    steps_2_mod_6 => 2,
+    steps_3_mod_6 => 3,
+    steps_4_mod_6 => 4,
+    steps_5_mod_6 => 5,
 }
 
 #[tokio::test]

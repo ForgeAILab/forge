@@ -1172,6 +1172,17 @@ fn key(line: &str) -> &str {
 
 /// On the base commit this writes the recording; here it compares with it.
 fn settle(section: &str, lines: Vec<String>) {
+    settle_shapes(section, None, lines)
+}
+
+/// The shape a `steady`/`startup` line belongs to: its second word.
+fn shape_of(line: &str) -> &str {
+    line.split(' ').nth(1).unwrap_or("")
+}
+
+/// `settle` for the lines of some shapes of a section: only their recorded
+/// lines are expected, so each case of a split section reports what it ran.
+fn settle_shapes(section: &str, shapes: Option<&[&str]>, lines: Vec<String>) {
     if let Ok(dir) = std::env::var("SCHEDULER_EQUIVALENCE_RECORD") {
         std::fs::write(
             std::path::Path::new(&dir).join(format!("{section}.txt")),
@@ -1190,8 +1201,9 @@ fn settle(section: &str, lines: Vec<String>) {
             let (name, line) = rest.split_once(' ').expect("exception names a line");
             assert!(ALLOWED.contains(&name), "unknown exception {name}");
             allowed.insert(key(line), (name, line));
-        } else if line.starts_with(&format!("{section} "))
-            || line.starts_with(&format!("{section}/"))
+        } else if (line.starts_with(&format!("{section} "))
+            || line.starts_with(&format!("{section}/")))
+            && shapes.is_none_or(|shapes| shapes.contains(&shape_of(line)))
         {
             base.insert(key(line), line);
         }
@@ -1270,10 +1282,35 @@ fn settle(section: &str, lines: Vec<String>) {
     );
 }
 
-async fn shapes(mode: &'static str, prime: bool) {
+/// The two shape tests were serial loops over `SHAPES` (about 40 s each at
+/// four threads, 74 s in CI conditions). Each is now this many cases; case
+/// `n` runs the shapes whose index in `SHAPES` is `n` modulo this. Every
+/// shape already had its own database.
+const SHAPE_CASES: usize = 8;
+
+fn shapes_of_case(case: usize) -> Vec<&'static str> {
+    SHAPES
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % SHAPE_CASES == case)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+async fn shapes(mode: &'static str, prime: bool, case: usize) {
     let only = std::env::var("SCHEDULER_EQUIVALENCE_ONLY").ok();
+    // A recording is one file per section: the first case writes all of it.
+    let recording = std::env::var_os("SCHEDULER_EQUIVALENCE_RECORD").is_some();
+    if recording && case != 0 {
+        return;
+    }
+    let names = if recording {
+        SHAPES.to_vec()
+    } else {
+        shapes_of_case(case)
+    };
     let mut lines = Vec::new();
-    for name in SHAPES {
+    for name in &names {
         if only.as_deref().is_some_and(|o| !name.contains(o)) {
             continue;
         }
@@ -1286,17 +1323,89 @@ async fn shapes(mode: &'static str, prime: bool) {
         println!("{}", lines.join("\n"));
         return;
     }
-    settle(mode, lines);
+    settle_shapes(mode, Some(&names), lines);
 }
 
+/// The cases run every shape once, and together they expect every recorded
+/// line of the two sections: none is left to no case.
 #[test]
-fn scheduler_equivalence_shapes_steady() {
-    on_runtime(|| shapes("steady", true));
+fn scheduler_equivalence_shape_cases_cover_the_shapes_and_the_recording() {
+    let mut owned: Vec<&str> = (0..SHAPE_CASES).flat_map(shapes_of_case).collect();
+    assert_eq!(owned.len(), SHAPES.len());
+    for case in 0..SHAPE_CASES {
+        assert!(!shapes_of_case(case).is_empty(), "case {case} is empty");
+    }
+    owned.sort_unstable();
+    let mut all = SHAPES.to_vec();
+    all.sort_unstable();
+    assert_eq!(owned, all);
+    all.dedup();
+    assert_eq!(all.len(), SHAPES.len(), "a shape is listed twice");
+    for line in FIXTURE
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('@'))
+    {
+        for section in ["steady", "startup"] {
+            assert!(
+                !line.starts_with(&format!("{section}/")),
+                "{line} is expected by no shape case"
+            );
+            if line.starts_with(&format!("{section} ")) {
+                assert!(
+                    SHAPES.contains(&shape_of(line)),
+                    "{line} is expected by no shape case"
+                );
+            }
+        }
+    }
 }
 
-#[test]
-fn scheduler_equivalence_shapes_startup() {
-    on_runtime(|| shapes("startup", false));
+/// The old test names still select every case as a libtest filter.
+macro_rules! shape_cases {
+    ($group:ident, $mode:expr, $prime:expr; $($name:ident => $case:expr,)+) => {
+        mod $group {
+            // The cases are exactly 0..SHAPE_CASES, or this does not compile.
+            const _: () = {
+                let cases = [$($case),+];
+                assert!(cases.len() == super::SHAPE_CASES);
+                let mut index = 0;
+                while index < cases.len() {
+                    assert!(cases[index] == index);
+                    index += 1;
+                }
+            };
+            $(
+                #[test]
+                fn $name() {
+                    super::on_runtime(|| super::shapes($mode, $prime, $case));
+                }
+            )+
+        }
+    };
+}
+
+shape_cases! {
+    scheduler_equivalence_shapes_steady, "steady", true;
+    shapes_0_mod_8 => 0,
+    shapes_1_mod_8 => 1,
+    shapes_2_mod_8 => 2,
+    shapes_3_mod_8 => 3,
+    shapes_4_mod_8 => 4,
+    shapes_5_mod_8 => 5,
+    shapes_6_mod_8 => 6,
+    shapes_7_mod_8 => 7,
+}
+
+shape_cases! {
+    scheduler_equivalence_shapes_startup, "startup", false;
+    shapes_0_mod_8 => 0,
+    shapes_1_mod_8 => 1,
+    shapes_2_mod_8 => 2,
+    shapes_3_mod_8 => 3,
+    shapes_4_mod_8 => 4,
+    shapes_5_mod_8 => 5,
+    shapes_6_mod_8 => 6,
+    shapes_7_mod_8 => 7,
 }
 
 #[test]

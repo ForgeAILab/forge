@@ -225,41 +225,222 @@ fn condition_marker_present(task: &Task) -> bool {
         .is_some_and(|metadata| metadata.get("queued_recovery").is_some())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn condition_offer_apply_dispatch_matrix() {
+/// The snapshot count of the unsplit matrix (one test, one database) at
+/// `2e75beaf`: every (workflow, state, variant, failure kind) cell. The cases
+/// below partition those cells by failure kind.
+const CONDITION_MATRIX_SNAPSHOTS: usize = 745;
+
+fn condition_states(workflow: &str) -> Vec<&'static str> {
+    if workflow == "std" {
+        vec![
+            "backlog",
+            "todo",
+            "planning",
+            "in_progress",
+            "review",
+            "merging",
+            "merge_failed",
+        ]
+    } else {
+        vec![
+            "backlog",
+            "ready",
+            "working",
+            "review",
+            "merging",
+            "merge_failed",
+        ]
+    }
+}
+
+fn condition_variants(state: &str) -> Vec<&'static str> {
+    match state {
+        "review" => vec![
+            "bare",
+            "role_exec_done",
+            "review_failed",
+            "review_awaiting",
+            "review_running_orphan",
+            "review_passed",
+            "rejections_max",
+            "failed_json",
+            "barrier_blocked",
+            "blocked_retry_exhausted",
+        ],
+        "backlog" => vec!["bare", "failed_json"],
+        _ => vec![
+            "bare",
+            "role_exec_done",
+            "rejections_max",
+            "failed_json",
+            "barrier_blocked",
+            "blocked_retry_exhausted",
+        ],
+    }
+}
+
+fn condition_variant_kinds(variant: &str) -> Vec<Option<FailureKind>> {
+    match variant {
+        "bare" | "role_exec_done" => CONDITION_KINDS.to_vec(),
+        "review_failed" => vec![
+            None,
+            Some(FailureKind::ReviewBlocked),
+            Some(FailureKind::ReviewNeedsOwner),
+            Some(FailureKind::ReviewBudgetExhausted),
+            Some(FailureKind::ReviewGateFailed),
+            Some(FailureKind::ExecutorFailed),
+        ],
+        "barrier_blocked" => vec![None, Some(FailureKind::BeforeWorkHookFailed)],
+        "rejections_max" => vec![
+            None,
+            Some(FailureKind::ReviewBudgetExhausted),
+            Some(FailureKind::ExecutorFailed),
+        ],
+        _ => vec![None],
+    }
+}
+
+/// Workflow, state, variant, failure kind.
+type ConditionCell = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<FailureKind>,
+);
+
+/// Every cell of the unsplit matrix, in its order.
+fn condition_cells() -> Vec<ConditionCell> {
+    let mut cells = Vec::new();
+    for workflow in ["std", "auto"] {
+        for state in condition_states(workflow) {
+            for variant in condition_variants(state) {
+                for kind in condition_variant_kinds(variant) {
+                    cells.push((workflow, state, variant, kind));
+                }
+            }
+        }
+    }
+    cells
+}
+
+fn condition_kind_name(kind: Option<FailureKind>) -> String {
+    kind.map(|kind| kind.to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+#[derive(Clone, Copy, Default)]
+struct ConditionTotals {
+    snapshots: usize,
+    accepted: usize,
+    applied: usize,
+    restored: usize,
+    dead_ends: usize,
+    command_errors: usize,
+}
+
+impl ConditionTotals {
+    fn line(&self, head: &str) -> String {
+        format!(
+            "{head} snapshots={} accepted={} applied={} restored_with_error={} dead_ends={} command_errors={}",
+            self.snapshots,
+            self.accepted,
+            self.applied,
+            self.restored,
+            self.dead_ends,
+            self.command_errors
+        )
+    }
+}
+
+/// The parts this process has produced, by position in `CONDITION_KINDS`.
+static CONDITION_PARTS: std::sync::Mutex<
+    std::collections::BTreeMap<usize, (String, ConditionTotals)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Writes this case's part (`db-matrix.parts/<nn>-<kind>.txt`) and rebuilds
+/// the combined `db-matrix.txt` from the parts of this process, in the order
+/// of `CONDITION_KINDS`. The last case to finish leaves the whole matrix
+/// there; a filtered run leaves the cases it ran and says so on the last line.
+fn condition_write_evidence(only: Option<FailureKind>, out: String, totals: ConditionTotals) {
+    let index = CONDITION_KINDS
+        .iter()
+        .position(|kind| *kind == only)
+        .expect("a case of CONDITION_KINDS");
+    let dir = crate::task_actions::action_test_evidence_dir();
+    let parts_dir = dir.join("db-matrix.parts");
+    std::fs::create_dir_all(&parts_dir).unwrap();
+    std::fs::write(
+        parts_dir.join(format!("{index:02}-{}.txt", condition_kind_name(only))),
+        format!("{out}{}\n", totals.line("MATRIX_PART")),
+    )
+    .unwrap();
+    let mut parts = CONDITION_PARTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    parts.insert(index, (out, totals));
+    let mut combined = String::new();
+    let mut sum = ConditionTotals::default();
+    for (part, totals) in parts.values() {
+        combined.push_str(part);
+        sum.snapshots += totals.snapshots;
+        sum.accepted += totals.accepted;
+        sum.applied += totals.applied;
+        sum.restored += totals.restored;
+        sum.dead_ends += totals.dead_ends;
+        sum.command_errors += totals.command_errors;
+    }
+    let _ = writeln!(combined, "{}", sum.line("MATRIX_RESULT"));
+    let complete = parts.len() == CONDITION_KINDS.len();
+    if !complete {
+        let _ = writeln!(
+            combined,
+            "MATRIX_PARTIAL cases={}/{}",
+            parts.len(),
+            CONDITION_KINDS.len()
+        );
+    }
+    std::fs::write(dir.join("db-matrix.txt"), combined).unwrap();
+    drop(parts);
+    if complete {
+        assert_eq!(
+            sum.snapshots, CONDITION_MATRIX_SNAPSHOTS,
+            "the cases together must run the whole matrix"
+        );
+    }
+}
+
+/// The cases cover the unsplit matrix exactly: each cell belongs to the one
+/// case of its failure kind, and the cells add up to the old snapshot count.
+#[test]
+fn condition_matrix_cases_partition_the_matrix() {
+    let cells = condition_cells();
+    assert_eq!(cells.len(), CONDITION_MATRIX_SNAPSHOTS);
+    let mut distinct = std::collections::HashSet::new();
+    for cell in &cells {
+        assert!(
+            distinct.insert((cell.0, cell.1, cell.2, condition_kind_name(cell.3))),
+            "{cell:?} appears twice"
+        );
+    }
+    let mut covered = 0;
+    for (index, kind) in CONDITION_KINDS.iter().enumerate() {
+        assert!(
+            !CONDITION_KINDS[..index].contains(kind),
+            "{kind:?} has two cases"
+        );
+        let own = cells.iter().filter(|cell| cell.3 == *kind).count();
+        assert!(own > 0, "the case of {kind:?} is empty");
+        covered += own;
+    }
+    assert_eq!(covered, cells.len(), "a cell's kind has no case");
+}
+
+/// One failure kind's slice of the matrix, on its own database.
+async fn condition_matrix_case(only: Option<FailureKind>) {
     let db = Arc::new(sqlite_db().await);
     let (mut snapshots, mut accepted, mut applied, mut restored, mut dead_ends, mut command_errors) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut out = String::new();
-    let kinds: Vec<Option<FailureKind>> = vec![
-        None,
-        Some(FailureKind::MergeConflict),
-        Some(FailureKind::TargetRepoDirty),
-        Some(FailureKind::DirtyWorktree),
-        Some(FailureKind::CiFailed),
-        Some(FailureKind::ReviewGateFailed),
-        Some(FailureKind::ReviewBudgetExhausted),
-        Some(FailureKind::ReviewBlocked),
-        Some(FailureKind::ReviewNeedsOwner),
-        Some(FailureKind::EnvironmentNotReady),
-        Some(FailureKind::RetryExhausted),
-        Some(FailureKind::MergeFixBudgetExhausted),
-        Some(FailureKind::WorkflowGuardRejected),
-        Some(FailureKind::InternalCommandFailed),
-        Some(FailureKind::ExecutorFailed),
-        Some(FailureKind::WorkspaceFailed),
-        Some(FailureKind::WorkspaceResetRequired),
-        Some(FailureKind::WorkspaceError),
-        Some(FailureKind::BeforeWorkHookTimeout),
-        Some(FailureKind::BeforeWorkHookFailed),
-        Some(FailureKind::MaxTurnsExceeded),
-        Some(FailureKind::ManualStop),
-        Some(FailureKind::RecoveryRequired),
-        Some(FailureKind::ExecutorUnavailable),
-        Some(FailureKind::Unknown),
-        Some(FailureKind::DispatchFailed),
-        Some(FailureKind::DependencyCancelled),
-    ];
     let all_verbs = [
         TaskAction::Start,
         TaskAction::Hold { reason: None },
@@ -282,17 +463,8 @@ async fn condition_offer_apply_dispatch_matrix() {
         // are covered separately by the scenario tests.
         sqlx::query("UPDATE project SET settings = json_set(settings, '$.max_active_tasks', 0) WHERE id = ?")
             .bind(&project).execute(db.pool()).await.unwrap();
-        let states: Vec<&str> = if workflow == "std" {
-            vec![
-                "backlog",
-                "todo",
-                "planning",
-                "in_progress",
-                "review",
-                "merging",
-                "merge_failed",
-            ]
-        } else {
+        let states = condition_states(workflow);
+        if workflow != "std" {
             let definition =
                 crate::workflow::default_autonomous_workflow::default_autonomous_workflow();
             sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
@@ -301,15 +473,7 @@ async fn condition_offer_apply_dispatch_matrix() {
                 .execute(db.pool())
                 .await
                 .unwrap();
-            vec![
-                "backlog",
-                "ready",
-                "working",
-                "review",
-                "merging",
-                "merge_failed",
-            ]
-        };
+        }
         let agent = seed_agent(&db).await;
         let row = AgentRepo::get_by_id(&*db, &agent).await.unwrap().unwrap();
         AgentRepo::update(
@@ -342,48 +506,10 @@ async fn condition_offer_apply_dispatch_matrix() {
             .with_workspace_root(repo_dir.path().join("workspaces"))
             .with_task_executor(Arc::new(ConditionPendingExecutor));
         for state in states {
-            let variants: Vec<&str> = match state {
-                "review" => vec![
-                    "bare",
-                    "role_exec_done",
-                    "review_failed",
-                    "review_awaiting",
-                    "review_running_orphan",
-                    "review_passed",
-                    "rejections_max",
-                    "failed_json",
-                    "barrier_blocked",
-                    "blocked_retry_exhausted",
-                ],
-                "backlog" => vec!["bare", "failed_json"],
-                _ => vec![
-                    "bare",
-                    "role_exec_done",
-                    "rejections_max",
-                    "failed_json",
-                    "barrier_blocked",
-                    "blocked_retry_exhausted",
-                ],
-            };
-            for variant in variants {
-                let variant_kinds: Vec<Option<FailureKind>> = match variant {
-                    "bare" | "role_exec_done" => kinds.clone(),
-                    "review_failed" => vec![
-                        None,
-                        Some(FailureKind::ReviewBlocked),
-                        Some(FailureKind::ReviewNeedsOwner),
-                        Some(FailureKind::ReviewBudgetExhausted),
-                        Some(FailureKind::ReviewGateFailed),
-                        Some(FailureKind::ExecutorFailed),
-                    ],
-                    "barrier_blocked" => vec![None, Some(FailureKind::BeforeWorkHookFailed)],
-                    "rejections_max" => vec![
-                        None,
-                        Some(FailureKind::ReviewBudgetExhausted),
-                        Some(FailureKind::ExecutorFailed),
-                    ],
-                    _ => vec![None],
-                };
+            for variant in condition_variants(state) {
+                let variant_kinds = condition_variant_kinds(variant)
+                    .into_iter()
+                    .filter(|kind| *kind == only);
                 for kind in variant_kinds {
                     snapshots += 1;
                     let label = format!(
@@ -704,13 +830,23 @@ async fn condition_offer_apply_dispatch_matrix() {
             }
         }
     }
-    let _ = writeln!(out, "MATRIX_RESULT snapshots={snapshots} accepted={accepted} applied={applied} restored_with_error={restored} dead_ends={dead_ends} command_errors={command_errors}");
-    std::fs::create_dir_all(crate::task_actions::action_test_evidence_dir()).unwrap();
-    std::fs::write(
-        crate::task_actions::action_test_evidence_dir().join("db-matrix.txt"),
+    let expected = condition_cells()
+        .iter()
+        .filter(|cell| cell.3 == only)
+        .count();
+    assert_eq!(snapshots, expected, "the case must run each of its cells");
+    condition_write_evidence(
+        only,
         out,
-    )
-    .unwrap();
+        ConditionTotals {
+            snapshots,
+            accepted,
+            applied,
+            restored,
+            dead_ends,
+            command_errors,
+        },
+    );
     assert_eq!(
         command_errors, 0,
         "advertised parameter values must be accepted; see db-matrix.txt"
@@ -724,6 +860,55 @@ async fn condition_offer_apply_dispatch_matrix() {
         applied + restored,
         "each accepted action must settle; see db-matrix.txt"
     );
+}
+
+/// `condition_offer_apply_dispatch_matrix` was one test that ran the whole
+/// matrix serially on one database (about 300 s). Each failure kind is now a
+/// case with its own database, so the cases run in parallel; the old name
+/// still selects them all as a libtest filter.
+macro_rules! condition_matrix_cases {
+    ($($name:ident => $kind:expr,)+) => {
+        const CONDITION_KINDS: &[Option<FailureKind>] = &[$($kind),+];
+        mod condition_offer_apply_dispatch_matrix {
+            use super::*;
+            $(
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn $name() {
+                    condition_matrix_case($kind).await;
+                }
+            )+
+        }
+    };
+}
+
+condition_matrix_cases! {
+    none => None,
+    merge_conflict => Some(FailureKind::MergeConflict),
+    target_repo_dirty => Some(FailureKind::TargetRepoDirty),
+    dirty_worktree => Some(FailureKind::DirtyWorktree),
+    ci_failed => Some(FailureKind::CiFailed),
+    review_gate_failed => Some(FailureKind::ReviewGateFailed),
+    review_budget_exhausted => Some(FailureKind::ReviewBudgetExhausted),
+    review_blocked => Some(FailureKind::ReviewBlocked),
+    review_needs_owner => Some(FailureKind::ReviewNeedsOwner),
+    environment_not_ready => Some(FailureKind::EnvironmentNotReady),
+    retry_exhausted => Some(FailureKind::RetryExhausted),
+    merge_fix_budget_exhausted => Some(FailureKind::MergeFixBudgetExhausted),
+    workflow_guard_rejected => Some(FailureKind::WorkflowGuardRejected),
+    internal_command_failed => Some(FailureKind::InternalCommandFailed),
+    executor_failed => Some(FailureKind::ExecutorFailed),
+    workspace_failed => Some(FailureKind::WorkspaceFailed),
+    workspace_reset_required => Some(FailureKind::WorkspaceResetRequired),
+    workspace_error => Some(FailureKind::WorkspaceError),
+    before_work_hook_timeout => Some(FailureKind::BeforeWorkHookTimeout),
+    before_work_hook_failed => Some(FailureKind::BeforeWorkHookFailed),
+    max_turns_exceeded => Some(FailureKind::MaxTurnsExceeded),
+    manual_stop => Some(FailureKind::ManualStop),
+    recovery_required => Some(FailureKind::RecoveryRequired),
+    executor_unavailable => Some(FailureKind::ExecutorUnavailable),
+    unknown => Some(FailureKind::Unknown),
+    dispatch_failed => Some(FailureKind::DispatchFailed),
+    dependency_cancelled => Some(FailureKind::DependencyCancelled),
 }
 
 #[tokio::test]

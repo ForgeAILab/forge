@@ -22,8 +22,10 @@ async fn fixture(
         .unwrap()
 }
 
-#[tokio::test]
-async fn every_offer_applies_and_every_absent_verb_returns_current_offers() {
+/// One state's slice of what was a single serial test over every state and
+/// failure kind on one database.
+async fn every_offer_applies_in(state: &str) {
+    assert!(OFFER_STATES.contains(&state));
     let db = Arc::new(sqlite_db().await);
     let (project, _, repo_dir) = seed_project_repo(&db).await;
     initialize_primary_repository(&repo_dir);
@@ -44,17 +46,7 @@ async fn every_offer_applies_and_every_absent_verb_returns_current_offers() {
         TaskAction::Restart { reason: None },
         TaskAction::Cancel { reason: None },
     ];
-    for state in [
-        "backlog",
-        "todo",
-        "planning",
-        "in_progress",
-        "review",
-        "merging",
-        "merge_failed",
-        "done",
-        "cancelled",
-    ] {
+    {
         for kind in [
             None,
             Some(FailureKind::ExecutorFailed),
@@ -128,6 +120,52 @@ async fn every_offer_applies_and_every_absent_verb_returns_current_offers() {
             }
         }
     }
+}
+
+/// The states the unsplit test looped over, in its order.
+#[test]
+fn every_offer_cases_are_the_states_of_the_unsplit_test() {
+    assert_eq!(
+        OFFER_STATES,
+        [
+            "backlog",
+            "todo",
+            "planning",
+            "in_progress",
+            "review",
+            "merging",
+            "merge_failed",
+            "done",
+            "cancelled",
+        ]
+    );
+}
+
+/// The old test name still selects every case as a libtest filter.
+macro_rules! every_offer_cases {
+    ($($state:ident,)+) => {
+        const OFFER_STATES: &[&str] = &[$(stringify!($state)),+];
+        mod every_offer_applies_and_every_absent_verb_returns_current_offers {
+            $(
+                #[tokio::test]
+                async fn $state() {
+                    super::every_offer_applies_in(stringify!($state)).await;
+                }
+            )+
+        }
+    };
+}
+
+every_offer_cases! {
+    backlog,
+    todo,
+    planning,
+    in_progress,
+    review,
+    merging,
+    merge_failed,
+    done,
+    cancelled,
 }
 
 #[tokio::test]
