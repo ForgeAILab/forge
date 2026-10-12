@@ -1645,3 +1645,226 @@ async fn the_step_check_prompt_carries_the_step_s_own_diff() {
     assert!(prompt.len() < 32 * 1024 + 16 * 1024, "{}", prompt.len());
 }
 
+async fn seed_finished_check(steps: &Steps, task: &Task, reply: &str) -> String {
+    let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+        .bind(&steps.project)
+        .fetch_one(steps.db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let id = new_uuid_v4();
+    ExecutionRepo::create(
+        &*steps.db,
+        db::CreateExecution {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(steps.planner.clone()),
+            role: crate::workflow::default_roles::PLANNER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(reply.to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "project_version": project_version,
+                })
+                .to_string(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("the finished check is stored");
+    id
+}
+
+async fn verdict_comments(db: &db::SqliteDb, task: &str) -> i64 {
+    count(
+        db,
+        "SELECT COUNT(*) FROM task_comment WHERE task_id=? AND idempotency_key LIKE 'step-check:%'",
+        task,
+    )
+    .await
+}
+
+/// A crash between a check that completed and its settlement leaves a
+/// finished planner run on a subtask that still rests in the gate. The
+/// dispatcher settles it from what is stored: the verdict is applied once and
+/// no second check is started.
+#[tokio::test]
+async fn a_check_that_finished_before_a_crash_is_settled_from_stored_state() {
+    let steps = steps(&[], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    seed_finished_check(&steps, &child, FAIL).await;
+    until(&steps, "the step is returned", async || {
+        reload(&steps.db, &child.id).await.status != "lead_check"
+    })
+    .await;
+    passes(&steps, 3).await;
+    let hops = log(&steps.db, &child.id).await;
+    assert_eq!(
+        hops.first(),
+        Some(&hop(
+            "lead_check",
+            "in_progress",
+            Some("gate_rejected"),
+            true
+        )),
+        "{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(
+        hops.iter()
+            .filter(|hop| hop.0 == "lead_check" && hop.3)
+            .count(),
+        1,
+        "{hops:?}"
+    );
+    assert_eq!(gate_spent(&steps.db, &child.id).await, 1);
+    assert_eq!(verdict_comments(&steps.db, &child.id).await, 1);
+}
+
+/// Settling the same finished check twice (a replayed step, two passes that
+/// race) applies its verdict once: one transition, one comment, one charge.
+#[tokio::test]
+async fn settling_a_finished_check_twice_applies_its_verdict_once() {
+    let steps = steps(&[], Some("first")).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    seed_finished_check(&steps, &child, FAIL).await;
+    let version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+        .bind(&steps.project)
+        .fetch_one(steps.db.pool())
+        .await
+        .unwrap();
+    let stale = reload(&steps.db, &child.id).await;
+    let dispatcher = &steps.dispatcher;
+    for _ in 0..2 {
+        // Both calls hold the Task as it was before the first settlement.
+        dispatcher
+            .reconcile_terminal_role_execution(
+                &stale,
+                crate::workflow::default_roles::PLANNER,
+                version,
+            )
+            .await
+            .expect("settlement does not fail");
+    }
+    passes(&steps, 2).await;
+    let hops = log(&steps.db, &child.id).await;
+    assert_eq!(
+        hops.iter().filter(|hop| hop.0 == "lead_check").count(),
+        1,
+        "{hops:?}\n{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(gate_spent(&steps.db, &child.id).await, 1);
+    assert_eq!(verdict_comments(&steps.db, &child.id).await, 1);
+}
+
+/// A check that ends without a verdict while its session is still there is
+/// asked again in that session (not a new check, not a return), and the
+/// answer settles the step.
+#[tokio::test]
+async fn a_check_without_a_verdict_is_asked_again_in_its_live_session() {
+    let steps = steps(&["@session:Looks fine to me.", PASS], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    let runs: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, parent_execution_id, prompt FROM execution
+         WHERE task_id=? AND role='planner' ORDER BY created_at, id",
+    )
+    .bind(&first.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(runs.len(), 2, "{}", dump(&steps.db).await);
+    assert!(
+        runs[1].1.is_some(),
+        "the second run continues the first: {runs:?}"
+    );
+    assert!(
+        runs[1]
+            .2
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no usable result block"),
+        "{:?}",
+        runs[1].2
+    );
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0, "not a return");
+    assert_eq!(
+        log(&steps.db, &first.id).await.last(),
+        Some(&hop("lead_check", "done", None, false))
+    );
+    assert!(
+        !reload(&steps.db, &first.id)
+            .await
+            .condition
+            .read()
+            .interruption_present
+    );
+}
+
+/// The step check is a read-only run, enforced by the host and not by the
+/// prompt: what a lead writes to the shared workspace is discarded, the run
+/// fails loudly, and its verdict passes nothing.
+#[tokio::test]
+async fn a_step_check_that_writes_the_workspace_is_discarded_and_fails() {
+    let steps = steps(&[&format!("@write:{PASS}")], Some("second")).await;
+    steps
+        .commit_bytes
+        .store(64, std::sync::atomic::Ordering::SeqCst);
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check ended", async || {
+        executions(&steps.db, &first.id)
+            .await
+            .iter()
+            .any(|run| run.0 == "planner" && run.1 != "running")
+    })
+    .await;
+    let (status, error, worktree): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT e.status, e.error, w.worktree_path FROM execution e
+         JOIN workspace w ON w.id = e.workspace_id
+         WHERE e.task_id=? AND e.role='planner' ORDER BY e.created_at, e.id LIMIT 1",
+    )
+    .bind(&first.id)
+    .fetch_one(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "failed", "{}", dump(&steps.db).await);
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("read-only execution produced worktree changes"),
+        "{error:?}"
+    );
+    assert!(
+        !Path::new(&worktree).join("lead-was-here.txt").exists(),
+        "the lead's write is discarded"
+    );
+    assert!(
+        Path::new(&worktree).join("first.txt").exists(),
+        "the step's own work stays"
+    );
+    let moved = reload(&steps.db, &first.id).await;
+    assert_ne!(moved.status, "done", "a failed check passes nothing");
+    assert_eq!(executions(&steps.db, &second.id).await, Vec::new());
+}
