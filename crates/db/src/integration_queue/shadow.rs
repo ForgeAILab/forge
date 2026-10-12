@@ -130,3 +130,24 @@ pub(super) async fn record_observation_in_tx(
         Err(DbError::IdempotencyConflict)
     }
 }
+
+impl crate::SqliteDb {
+    /// Delete the passive-stage (`shadow:`) attempts of Tasks that no longer
+    /// exist. Such a row gets no continuation step (the Task is gone), holds
+    /// no slot and is never superseded: nothing else ends it. Kept: a row
+    /// that is its queue's head, and one with an unsettled or unknown effect
+    /// (its result is still evidence of a possible merge). Returns the rows
+    /// deleted.
+    pub async fn delete_orphan_shadow_attempts(&self) -> crate::Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM integration_attempt WHERE admission_key LIKE 'shadow:%' \
+               AND effect_intent_json IS NULL \
+               AND (current_operation_state IS NULL OR current_operation_state NOT IN ('running','uncertain')) \
+               AND NOT EXISTS(SELECT 1 FROM task t WHERE t.id=integration_attempt.task_ref AND t.deleted_at IS NULL) \
+               AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.head_attempt_id=integration_attempt.id)",
+        )
+        .execute(self.pool())
+        .await?
+        .rows_affected())
+    }
+}

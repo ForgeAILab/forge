@@ -3117,6 +3117,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A merge taken over at the upgrade that still waits in line and whose
+  continuation step was pruned is continued by the merge queue's next sweep
+  instead of at the next server start.
+- The recorded (`shadow:`) merge attempt of a Task deleted before the
+  upgrade finished is removed at start; it used to stay for good.
+
 - A merge taken over at the upgrade as already landed, whose commit the
   target does not contain (or whose target cannot be asked), no longer asks
   for its proof for ever. After five asks the attempt is parked for the

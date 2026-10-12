@@ -118,6 +118,17 @@ pub async fn import_at_start(db: &Arc<SqliteDb>) -> Result<ImportReport> {
             break;
         }
     }
+    // A shadow row of a Task deleted since gets no continuation and holds
+    // no slot: it is removed here, the one place that would list it.
+    match db.delete_orphan_shadow_attempts().await {
+        Ok(0) => {}
+        Ok(deleted) => {
+            tracing::info!(target: "services::integration_steps", deleted, "shadow attempts of deleted Tasks removed")
+        }
+        Err(error) => {
+            tracing::warn!(target: "services::integration_steps", %error, "shadow attempts of deleted Tasks were not removed; the next start retries")
+        }
+    }
     report.continuations = enqueue_missing_continuations(db, false).await?;
     Ok(report)
 }
