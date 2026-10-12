@@ -86,7 +86,8 @@ jobs:
       # One red shard must not cancel the others: a run reports every failure.
       fail-fast: false
       matrix:
-        # Package/target selections and the complementary services filters are
+        # Package/target selections, the test features of the services and db
+        # integration targets and the complementary services filters are
         # defined in scripts/ci_rust_shards.py;
         # its `check` (in the lint job) fails if this list differs from it.
         shard: [services-unit-a, services-unit-b, services-integration, api-a, api-b, db, rest]

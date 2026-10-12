@@ -23,13 +23,13 @@ The Rust gates run as eight parallel jobs, then one job that sums them up:
 
 | Job | Runs |
 | --- | --- |
-| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
-| `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service::` |
-| `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service::` |
-| `Rust test (services-integration)` | `cargo test -p services --test '*' --examples --no-fail-fast -- --test-threads=4` |
+| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
+| `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service:: task_dispatcher:: workspace_root::` |
+| `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service:: --skip task_dispatcher:: --skip workspace_root::` |
+| `Rust test (services-integration)` | `cargo test -p services --features test-support --test '*' --examples --no-fail-fast -- --test-threads=4` |
 | `Rust test (api-a)` | API binary selection from `scripts/ci_rust_shards.py`, with four libtest threads |
 | `Rust test (api-b)` | Remaining API binaries and all non-integration targets, with four libtest threads |
-| `Rust test (db)` | `cargo test -p db --all-targets --no-fail-fast` |
+| `Rust test (db)` | `cargo test -p db --features test-template --all-targets --no-fail-fast` |
 | `Rust test (rest)` | `cargo test --workspace --exclude services --exclude api --exclude db --all-targets --no-fail-fast` |
 | `Rust` | requires all eight Rust jobs; on same-repository `next/**` PRs, waits for the exact-head push workflow |
 
@@ -50,7 +50,12 @@ fails unless every workspace package is covered, every package a shard names
 exists (cargo only warns about an unknown `--exclude`), and the workflow matrix
 lists exactly the shards the script defines. Services lib filters must be
 exact complements and its integration shard
-uses `--test '*' --examples`, because `--tests` also runs lib tests. This
+uses `--features test-support --test '*' --examples`, because `--tests` also
+runs lib tests. Every target that declares `required-features` (the services
+and db integration targets, see [below](#test-features-and-required-features))
+must be selected with those features by each shard that builds it, and
+`scripts/ci-rust.sh` must name the same features for clippy and the
+whole-workspace run; a package that dev-depends on itself fails the check. This
 retains the example targets previously built by `--all-targets`; a new services
 bin or benchmark fails the check until it is assigned. API integration
 targets must each have exactly one explicit binary assignment; unknown, missing
@@ -59,14 +64,63 @@ to one API shard. Other packages remain in exactly one shard with `--all-targets
 the package-to-shard table and compiles nothing, so it also runs locally.
 
 Run locally, `./scripts/ci-rust.sh` without arguments still runs fmt, clippy
-and `cargo test --workspace --all-targets --no-fail-fast` in one pass. Like
+and `cargo test --workspace --all-targets --features
+db/test-template,services/test-support --no-fail-fast` in one pass. Like
 the shards, its test stage now explicitly uses `--test-threads=4`.
 
 A shard resolves Cargo features for its own packages, where the single
 workspace run unified them across all members. The workspace's own test
-features are unaffected: `services/test-support`, `cli-adapters/test-support`
-and `db/test-template` are requested by the dev-dependencies of each crate
-that needs them. Third-party crates can be built with fewer features in a shard
+features are unaffected for every crate that tests *another* crate:
+`services/test-support`, `cli-adapters/test-support` and `db/test-template`
+are requested by the dev-dependencies of each crate that needs them.
+
+### Test features and required-features
+
+`services` and `db` do not dev-depend on themselves. A
+`services = { path = ".", features = ["test-support"] }` dev-dependency made
+every `cargo test -p services --lib` build compile the services lib twice, one
+after the other: the plain lib with the feature, then the test lib, which
+waited for it. Locally (six jobs, at `3cd105cb`) that was 150.5 s + 221.5 s,
+6 m 12 s of wall time; without the self dev-dependency the same command
+compiles the test lib alone (252.8 s on the same loaded machine, 184.0 s in
+the earlier quiet measurement; 4 m 50 s of wall time including a `db`
+rebuild). In the cold CI timing report quoted
+[below](#cache-storage-and-remaining-builds) the two units were
+263.8 s and 331.3 s of a 766.4-second build, so each services unit shard
+should build about four minutes sooner. `db` had the same pattern with
+`test-template`: 29.7 s + 40.0 s (1 m 10 s) became 29.1 s (29 s) for
+`cargo test -p db --lib --no-run`.
+
+What replaced it:
+
+- Inside each crate, test-only items are gated
+  `#[cfg(any(test, feature = "..."))]`, so the unit tests see them without the
+  feature. `db` also lists `rusqlite` and `tempfile` as dev-dependencies for
+  that reason.
+- The integration targets (`services`: `main`, `main_project_create_command`,
+  `project_provisioning_characterization`; `db`: `main`) declare
+  `required-features` in `Cargo.toml` and are built with the feature:
+
+  ```bash
+  cargo test -p services --features test-support --test main attention_service::test_name
+  cargo test -p services --features test-support --test '*'   # all three targets
+  cargo test -p db --features test-template --test main file_backed_migration::test_name
+  ```
+
+- What Cargo does without the feature (checked at `3cd105cb`): a named target
+  or a glob (`--test main`, `--test '*'`) stops with ``error: target `main` in
+  package `db` requires the features: `test-template` ``. A plain
+  `cargo test -p services` or `cargo test -p db` runs the unit tests and
+  **skips the integration targets without a message**; add the feature. A
+  whole-workspace `cargo test` still builds and runs them, because `api` and
+  the other crates that dev-depend on `services` and `db` enable the features
+  for the workspace build; `make test` and `./scripts/ci-rust.sh` pass them
+  explicitly so that this does not rest on another crate's manifest.
+- The unit shards pass no feature. A new integration target in either crate
+  needs its own `[[test]]` entry with `required-features`; without one it
+  fails to compile under a plain `cargo test -p <crate>`, which is loud.
+
+Third-party crates can be built with fewer features in a shard
 (for example `tokio` without `test-util` outside `services`, and without `full`
 in `services` and `db`). A crate must therefore declare the features of each
 dependency it uses in its own `Cargo.toml`; a missing one fails that crate's
@@ -219,6 +273,9 @@ services-unit-a timing report above, the 766.4-second build included api-types
 393.7 seconds is not a wall-time saving. Plan for roughly **1–2 minutes saved**
 per services unit shard, with most of the roughly ten minutes of workspace
 building still present, plus the same 6.5–8 minutes of test execution.
+(That report predates the removal of the services self dev-dependency: the
+unit shards no longer build the 263.8-second services library unit. See
+[Test features and required-features](#test-features-and-required-features).)
 
 A build job that ships one services-lib test binary to both unit shards would
 compile the same workspace chain once **before** either shard can start. The
@@ -277,8 +334,9 @@ generator-owned files.
 ## Rust test database setup
 
 DB-backed tests keep calling `db::run_migrations(&pool)`. Test crates enable
-the `db/test-template` feature through their dev-dependencies; normal builds
-do not enable it. The first eligible call in each test process replays the
+the `db/test-template` feature through their dev-dependencies, `db`'s own unit
+tests get the same code through `cfg(test)`, and its integration target
+through `--features test-template`; normal builds do not enable it. The first eligible call in each test process replays the
 embedded migrations into an isolated memory pool, serializes the result, and
 closes that pool. Later fresh databases copy the cached byte image. The cache
 contains no pool or runtime handles, so it works across the separate Tokio
@@ -375,9 +433,27 @@ a CI responsibility.
 
 ## Services unit split and integration inventory
 
-The two services unit shards share one filter constant in
-`scripts/ci_rust_shards.py`: `task_service::` and its exact `--skip` twin.
-All test shards use four libtest threads. The green CI run
+The two services unit shards share one filter list in
+`scripts/ci_rust_shards.py`: `task_service::`, `task_dispatcher::` and
+`workspace_root::` for unit-a (libtest runs a test that matches any positional
+filter) and one `--skip` for each of them for unit-b (libtest skips a test
+that matches any). All test shards use four libtest threads.
+
+The split was `task_service::` alone until the self dev-dependency was removed.
+The last CI runs with it took about 390 s (408 tests) and 475 s (1813 tests).
+A local run of all 2169 unit tests with per-test times (six threads, 484.59 s,
+times summing to 2183 s, at `3cd105cb`) showed why counts mislead:
+`task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix`
+alone takes 345 s on one thread, so unit-a cannot finish sooner than that test
+and its other three threads were mostly idle, while unit-b carried 1555 s of
+the 2183 s. Moving `task_dispatcher::` (300 s, 183 tests) and
+`workspace_root::` (195 s, 36 tests) gives 1123 s (627 tests) / 1060 s
+(1542 tests). Scaled from the CI figures this predicts about 390 s / 325 s:
+the longest services unit shard is then bounded by that one test, which is
+also why a third unit shard would not lower it. Confirm with the first CI run
+and move another module if unit-b is still the longer one.
+
+The history of the earlier split follows. The green CI run
 [38219902459](https://github.com/ForgeAILab/forge/actions/runs/38219902459)
 recorded 508.55 seconds for services lib tests. Inferring start times from
 libtest's alphabetical queue and the timestamped completions on four workers,
@@ -392,11 +468,14 @@ artifacts remain enabled to compare cold and warm builds in CI.
 For focused integration work, use the original file stem as a module filter:
 
 ```bash
-cargo test -p db --test main file_backed_migration::test_name
-cargo test -p services --test main attention_service::test_name
+cargo test -p db --features test-template --test main file_backed_migration::test_name
+cargo test -p services --features test-support --test main attention_service::test_name
 cargo test -p api --test main happy_path::test_name
-cargo test -p services --test project_provisioning_characterization test_name
+cargo test -p services --features test-support --test project_provisioning_characterization test_name
 ```
+
+The `--features` argument is required for the `services` and `db` integration
+targets; see [Test features and required-features](#test-features-and-required-features).
 
 To prove a consolidation preserves tests, record combined stdout and stderr
 before moving files, repeat after the change, and compare the names. The
@@ -405,11 +484,11 @@ new module prefix; it compares multisets, rejects duplicate identities and
 incomplete target listings, and includes ignored tests.
 
 ```bash
-cargo test -p db --tests -- --list > db-before.log 2>&1
+cargo test -p db --features test-template --tests -- --list > db-before.log 2>&1
 # After moving files:
-cargo test -p db --tests -- --list > db-after.log 2>&1
+cargo test -p db --features test-template --tests -- --list > db-after.log 2>&1
 python3 scripts/check_integration_test_inventory.py db-before.log db-after.log
-# Repeat with -p services or -p api and their before/after logs.
+# Repeat with -p services --features test-support, or -p api, and their logs.
 ```
 
 For changes to the consolidated harness, run each integration binary in full

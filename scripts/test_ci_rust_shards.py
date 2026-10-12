@@ -20,11 +20,14 @@ class CoverageTests(unittest.TestCase):
     def setUp(self):
         self.workspace = {
             "services": {"targets": [{"name": "services", "kind": ["lib"]},
-                                     {"name": "main", "kind": ["test"]}]},
+                                     {"name": "main", "kind": ["test"],
+                                      "required-features": ["test-support"]}]},
             "api": {"targets": [{"name": "api", "kind": ["lib"]}] +
                                 [{"name": name, "kind": ["test"]}
                                  for names in shards.API_TARGETS.values() for name in names]},
-            "db": {"targets": []},
+            "db": {"targets": [{"name": "db", "kind": ["lib"]},
+                               {"name": "main", "kind": ["test"],
+                                "required-features": ["test-template"]}]},
             "new-crate": {"targets": []},
         }
 
@@ -39,6 +42,53 @@ class CoverageTests(unittest.TestCase):
         broken["services-unit-b"][-1] = "task_services::"
         with patch.object(shards, "SHARDS", broken):
             self.assertTrue(shards.coverage_errors(self.workspace))
+        for shard in ("services-unit-a", "services-unit-b"):
+            broken = copy.deepcopy(shards.SHARDS)
+            broken[shard].pop()
+            with self.subTest(shard=shard), patch.object(shards, "SHARDS", broken):
+                self.assertTrue(shards.coverage_errors(self.workspace))
+
+    def test_unit_filters_are_the_exact_filter_and_skip_twins(self):
+        filters = shards.SERVICES_UNIT_FILTERS
+        self.assertEqual(shards.cargo_args("services-unit-a"),
+                         ["-p", "services", "--lib", "--", *filters])
+        self.assertEqual(shards.cargo_args("services-unit-b")[4:],
+                         [arg for name in filters for arg in ("--skip", name)])
+        with patch.object(shards, "SERVICES_UNIT_FILTERS", filters + filters[:1]):
+            self.assertTrue(shards.coverage_errors(self.workspace))
+
+    def test_feature_gated_targets_are_selected_with_their_feature(self):
+        self.assertEqual(shards.required_features(self.workspace),
+                         ["db/test-template", "services/test-support"])
+        for shard, feature in (("services-integration", "services/test-support"),
+                               ("db", "db/test-template")):
+            broken = copy.deepcopy(shards.SHARDS)
+            index = broken[shard].index("--features")
+            del broken[shard][index:index + 2]
+            with self.subTest(shard=shard), patch.object(shards, "SHARDS", broken):
+                self.assertTrue(any(f"without --features {feature}" in error
+                                    for error in shards.coverage_errors(self.workspace)))
+        # The unit shards build the lib test alone and need no feature.
+        for shard in ("services-unit-a", "services-unit-b"):
+            self.assertEqual(shards.passed_features(shards.cargo_args(shard)), set())
+
+    def test_gated_target_in_the_catch_all_needs_a_qualified_feature(self):
+        self.workspace["new-crate"]["targets"].append(
+            {"name": "main", "kind": ["test"], "required-features": ["fixtures"]})
+        self.assertTrue(any("rest selects new-crate target 'main' without --features "
+                            "new-crate/fixtures" in error
+                            for error in shards.coverage_errors(self.workspace)))
+        self.assertTrue(shards.script_errors(self.workspace))
+
+    def test_self_dev_dependency_is_refused(self):
+        self.workspace["services"]["dependencies"] = [{"name": "services", "kind": "dev"}]
+        self.assertTrue(any("dev-depends on itself" in error
+                            for error in shards.coverage_errors(self.workspace)))
+
+    def test_ci_script_names_the_workspace_features(self):
+        self.assertEqual(shards.script_errors(self.workspace), [])
+        self.assertEqual(shards.workspace_feature_args(self.workspace),
+                         ["--features", "db/test-template,services/test-support"])
 
     def test_new_services_target_needs_explicit_coverage(self):
         self.workspace["services"]["targets"].append({"name": "new-bin", "kind": ["bin"]})
@@ -110,14 +160,31 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(commands, [
             ["test", "-p", "services", "--lib", "--no-run", "--timings"],
             ["test", "-p", "services", "--lib", "--no-fail-fast", "--",
-             "--test-threads=4", "--skip", "task_service::"],
+             "--test-threads=4", "--skip", "task_service::", "--skip", "task_dispatcher::",
+             "--skip", "workspace_root::"],
+        ])
+
+    def test_unit_a_sends_every_filter_to_libtest(self):
+        run, commands = self.commands("test", "services-unit-a")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(commands, [
+            ["test", "-p", "services", "--lib", "--no-fail-fast", "--", "--test-threads=4",
+             "task_service::", "task_dispatcher::", "workspace_root::"],
         ])
 
     def test_integration_glob_remains_literal_and_does_not_add_all_targets(self):
         run, commands = self.commands("test", "services-integration")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(commands, [["test", "-p", "services", "--test", "*", "--examples",
+        self.assertEqual(commands, [["test", "-p", "services", "--features", "test-support",
+                                     "--test", "*", "--examples",
                                      "--no-fail-fast", "--", "--test-threads=4"]])
+
+    def test_db_shard_passes_the_template_feature(self):
+        run, commands = self.commands("test", "db")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(commands, [["test", "-p", "db", "--features", "test-template",
+                                     "--all-targets", "--no-fail-fast", "--",
+                                     "--test-threads=4"]])
 
     def test_api_binary_selection_is_preserved_without_all_targets(self):
         for shard in shards.API_TARGETS:
@@ -135,7 +202,10 @@ class ShellTests(unittest.TestCase):
         run, commands = self.commands(failing="fmt")
         self.assertEqual(run.returncode, 1)
         self.assertEqual([cmd[0] for cmd in commands], ["fmt", "clippy", "test"])
-        self.assertEqual(commands[-1], ["test", "--workspace", "--all-targets",
+        features = ["--features", "db/test-template,services/test-support"]
+        self.assertEqual(commands[1], ["clippy", "--workspace", "--all-targets", *features,
+                                       "--", "-D", "warnings"])
+        self.assertEqual(commands[-1], ["test", "--workspace", "--all-targets", *features,
                                        "--no-fail-fast", "--", "--test-threads=4"])
 
 

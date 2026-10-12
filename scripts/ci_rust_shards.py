@@ -6,8 +6,10 @@ This file defines every shard's package, target and libtest selection:
     ci_rust_shards.py args <shard>   cargo and libtest selection, one argument per
                                      line (read by scripts/ci-rust.sh)
     ci_rust_shards.py check          fail unless every workspace package is
-                                     covered once (services lib and api targets are partitioned)
-                                     and the CI matrix runs exactly these shards
+                                     covered once (services lib and api targets are partitioned),
+                                     every target with `required-features` is
+                                     selected with those features, and the CI
+                                     matrix runs exactly these shards
 
 `check` only runs `cargo metadata --no-deps`; it compiles nothing.
 """
@@ -18,21 +20,40 @@ import re
 import subprocess
 import sys
 
-# Complementary filters stay adjacent and share one substring: every services
-# unit-test name contains it or does not, so no test is lost or run twice.
-# CI run 38219902459 completion timestamps predict 366.5s / 391.6s on four
-# workers (6.8% apart); local runs at 0adbb146 measured 239.92s / 277.75s
-# (15.8% apart). Test counts alone (408 / 1810 here) would mislead the split.
-SERVICES_UNIT_FILTER = "task_service::"
+# Complementary filters share one list of substrings: unit-a runs every
+# services unit test whose name contains any of them (libtest ORs positional
+# filters), unit-b skips every one of them (libtest ANDs --skip), so no test is
+# lost or run twice.
+# The last CI runs with `task_service::` alone took about 390s (408 tests) and
+# 475s (1813 tests). unit-a cannot go below one serial test,
+# task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix
+# (345s of a 484.59s six-thread local run of all 2169 tests at 3cd105cb, per-test
+# times summing to 2183s), which leaves three of its four threads mostly idle.
+# The two modules added here move 495s of that per-test sum (219 tests) into
+# the idle threads: 1123s (627 tests) / 1060s (1542 tests). Scaled from the CI
+# figures that predicts about 390s / 325s. Test counts alone would mislead the
+# split, and a third unit shard would not lower the longest one below that test.
+SERVICES_UNIT_FILTERS = ["task_service::", "task_dispatcher::", "workspace_root::"]
+SERVICES_UNIT_A = ["-p", "services", "--lib", "--", *SERVICES_UNIT_FILTERS]
+SERVICES_UNIT_B = ["-p", "services", "--lib", "--",
+                   *[arg for name in SERVICES_UNIT_FILTERS for arg in ("--skip", name)]]
+# Targets with `required-features` are skipped without a word when the feature
+# is absent and the target is not named (`--test '*'`, `--all-targets`), so
+# each shard that selects one passes the feature; `check` proves it against
+# `cargo metadata`. The unit shards must not: with no feature and no self
+# dev-dependency, `--lib` compiles the services lib once (the test lib) instead
+# of twice in series.
+SERVICES_INTEGRATION = ["-p", "services", "--features", "test-support",
+                        "--test", "*", "--examples"]
 SHARDS = {
-    "services-unit-a": ["-p", "services", "--lib", "--", SERVICES_UNIT_FILTER],
-    "services-unit-b": ["-p", "services", "--lib", "--", "--skip", SERVICES_UNIT_FILTER],
+    "services-unit-a": SERVICES_UNIT_A,
+    "services-unit-b": SERVICES_UNIT_B,
     # --tests includes the lib again; --test '*' selects integration bins only.
     # Retain the examples that --all-targets previously built (no lib rerun).
-    "services-integration": ["-p", "services", "--test", "*", "--examples"],
+    "services-integration": SERVICES_INTEGRATION,
     "api-a": ["-p", "api"],
     "api-b": ["-p", "api"],
-    "db": ["-p", "db", "--all-targets"],
+    "db": ["-p", "db", "--features", "test-template", "--all-targets"],
     # Catch-all by exclusion: a new workspace crate needs no edit here.
     "rest": None,
 }
@@ -56,6 +77,7 @@ API_OTHER_TARGETS_SHARD = "api-b"
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+CI_SCRIPT = ROOT / "scripts" / "ci-rust.sh"
 
 
 def named_packages():
@@ -79,6 +101,83 @@ def cargo_args(shard):
     return args
 
 
+def cargo_part(args):
+    """The arguments cargo reads: everything before the libtest separator."""
+    return args[:args.index("--")] if "--" in args else list(args)
+
+
+def passed_features(args, package=None):
+    """The `package/feature` names a cargo selection enables."""
+    args = cargo_part(args)
+    names = set()
+    for index, arg in enumerate(args):
+        if arg == "--features" and index + 1 < len(args):
+            value = args[index + 1]
+        elif arg.startswith("--features="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        for name in re.split(r"[ ,]+", value):
+            if name:
+                names.add(name if "/" in name or package is None else f"{package}/{name}")
+    return names
+
+
+def required_features(workspace):
+    """Every `package/feature` some workspace target cannot be built without."""
+    return sorted({f"{pkg}/{feature}" for pkg, data in workspace.items()
+                   for target in data["targets"]
+                   for feature in target.get("required-features", [])})
+
+
+def workspace_feature_args(workspace):
+    """Feature arguments of a whole-workspace build that skips no target."""
+    names = required_features(workspace)
+    return ["--features", ",".join(names)] if names else []
+
+
+def selects_only_lib(args):
+    args = cargo_part(args)
+    return "--lib" in args and not any(
+        arg in ("--test", "--tests", "--all-targets", "--examples", "--example",
+                "--bins", "--bin", "--benches", "--bench") for arg in args)
+
+
+def feature_errors(workspace):
+    """A gated target cargo would skip in silence: a shard without its feature."""
+    errors = []
+    for pkg, data in workspace.items():
+        for target in data["targets"]:
+            needed = {f"{pkg}/{feature}" for feature in target.get("required-features", [])}
+            if not needed:
+                continue
+            if target["kind"] == ["lib"]:
+                errors.append(f"{pkg} lib must not have required-features")
+                continue
+            for shard in SHARDS:
+                if pkg not in selected(shard, workspace):
+                    continue
+                args = cargo_args(shard)
+                if selects_only_lib(args):
+                    continue
+                named = None if SHARDS[shard] is None else pkg
+                missing = sorted(needed - passed_features(args, named))
+                if missing:
+                    errors.append(f"{shard} selects {pkg} target '{target['name']}' "
+                                  f"without --features {','.join(missing)}: "
+                                  "cargo would skip it without an error")
+    # The unit shards exist to compile the services lib once. A feature there
+    # is harmless to coverage but brings back nothing; a self dev-dependency
+    # brings the second, serial lib build back.
+    for pkg, data in workspace.items():
+        for dep in data.get("dependencies", []):
+            if dep.get("name") == pkg and dep.get("kind") == "dev":
+                errors.append(f"{pkg} dev-depends on itself: `cargo test -p {pkg} --lib` "
+                              "would compile the lib twice in series; use "
+                              "required-features on its targets instead")
+    return errors
+
+
 def selected(shard, workspace):
     """The packages cargo tests for this shard's arguments."""
     args = SHARDS[shard]
@@ -91,14 +190,23 @@ def coverage_errors(workspace):
     errors = []
     # The two selections must remain the exact filter/skip partition. The
     # integration selection must never grow --tests or --all-targets.
+    filters = SERVICES_UNIT_FILTERS
+    if not filters or len(set(filters)) != len(filters) or any(
+            not name or name.startswith("-") for name in filters):
+        errors.append(f"services unit filters must be distinct test-name substrings: {filters}")
+    skips = []
+    for name in filters:
+        skips += ["--skip", name]
     expected = {
-        "services-unit-a": ["-p", "services", "--lib", "--", SERVICES_UNIT_FILTER],
-        "services-unit-b": ["-p", "services", "--lib", "--", "--skip", SERVICES_UNIT_FILTER],
-        "services-integration": ["-p", "services", "--test", "*", "--examples"],
+        "services-unit-a": ["-p", "services", "--lib", "--", *filters],
+        "services-unit-b": ["-p", "services", "--lib", "--", *skips],
+        "services-integration": ["-p", "services", "--features", "test-support",
+                                 "--test", "*", "--examples"],
     }
     for shard, args in expected.items():
         if SHARDS.get(shard) != args:
             errors.append(f"{shard} must select {args}")
+    errors.extend(feature_errors(workspace))
     for pkg, data in workspace.items():
         owners = [s for s in SHARDS if pkg in selected(s, workspace)]
         if pkg == "services":
@@ -156,6 +264,16 @@ def workflow_shards():
     return [name.strip() for name in match.group(1).split(",") if name.strip()]
 
 
+def script_errors(workspace):
+    """scripts/ci-rust.sh lints and (with no shard) tests the whole workspace."""
+    wanted = " ".join(workspace_feature_args(workspace))
+    line = f"workspace_features=({wanted})"
+    if line not in CI_SCRIPT.read_text().splitlines():
+        return [f"{CI_SCRIPT.name} must contain the line `{line}` so that clippy and the "
+                "whole-workspace test run build every target with required-features"]
+    return []
+
+
 def check():
     errors = []
     workspace = workspace_packages()
@@ -171,6 +289,7 @@ def check():
             errors.append(f"shard package '{pkg}' is not a workspace package")
 
     errors.extend(coverage_errors(workspace))
+    errors.extend(script_errors(workspace))
     rows = []
     for pkg in sorted(workspace):
         owners = [s for s in SHARDS if pkg in selected(s, workspace)]
@@ -196,8 +315,12 @@ def check():
             print(f"error: {error}", file=sys.stderr)
             print(f"::error title=Rust test shards::{error}")
         return 1
+    gated = [f"{pkg}:{target['name']}" for pkg, data in sorted(workspace.items())
+             for target in data["targets"] if target.get("required-features")]
     print(f"ok: {len(rows)} workspace packages, covered without overlap across "
-          f"{len(SHARDS)} shards (services lib filter/skip; api target partition)")
+          f"{len(SHARDS)} shards (services lib filter/skip; api target partition); "
+          f"{len(gated)} feature-gated targets selected with their features "
+          f"({', '.join(gated)})")
     return 0
 
 

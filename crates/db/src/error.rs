@@ -13,7 +13,7 @@ pub enum DbError {
         owner: Option<String>,
         generation: i64,
     },
-    #[cfg(feature = "test-template")]
+    #[cfg(any(test, feature = "test-template"))]
     #[error("test database template failed: {0}")]
     TestTemplate(String),
 

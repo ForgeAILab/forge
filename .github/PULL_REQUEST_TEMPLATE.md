@@ -9,7 +9,7 @@
 ## Checklist
 
 - [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [ ] `cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings` passes
 - [ ] `cargo test --workspace --all-targets` passes
 - [ ] Frontend changes: `pnpm lint && pnpm typecheck && pnpm test && pnpm build` pass
 - [ ] Browser-facing changes: Playwright smoke test passes
