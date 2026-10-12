@@ -421,7 +421,9 @@ async fn a_hold_and_release_in_planning_stops_and_reruns_the_planner() {
     assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
     let runs = executions(&lead.db, &root.id).await;
     assert_eq!(
-        runs.iter().filter(|(_, status)| status == "running").count(),
+        runs.iter()
+            .filter(|(_, status)| status == "running")
+            .count(),
         1,
         "the release runs the planner again: {runs:?}"
     );

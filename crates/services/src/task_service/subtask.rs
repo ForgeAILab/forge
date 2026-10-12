@@ -90,39 +90,41 @@ impl TaskService {
         if db::task_writer::current_task_step().is_some() {
             return;
         }
-        let started: Result<()> = async {
-            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
-                return Ok(());
-            };
-            let Some(parent_task_id) = task.parent_task_id.as_deref() else {
-                return Ok(());
-            };
-            let (parent, workflow) =
-                crate::task_hierarchy::coordination_root_context(&self.db, parent_task_id).await?;
-            if crate::task_hierarchy::root_blocked(&parent)
-                || crate::task_hierarchy::coordination_root_allows_child_dispatch(
-                    &parent, &workflow,
-                )
-            {
-                return Ok(());
+        let started: Result<()> =
+            async {
+                let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
+                    return Ok(());
+                };
+                let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+                    return Ok(());
+                };
+                let (parent, workflow) =
+                    crate::task_hierarchy::coordination_root_context(&self.db, parent_task_id)
+                        .await?;
+                if crate::task_hierarchy::root_blocked(&parent)
+                    || crate::task_hierarchy::coordination_root_allows_child_dispatch(
+                        &parent, &workflow,
+                    )
+                {
+                    return Ok(());
+                }
+                let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id).await?;
+                if project.is_none_or(|project| project.paused_at.is_some()) {
+                    return Ok(());
+                }
+                let children =
+                    crate::task_hierarchy::ordered_children(&self.db, parent_task_id).await?;
+                let assignments =
+                    TaskRoleAssignmentRepo::list_by_task(&*self.db, parent_task_id).await?;
+                if crate::task_hierarchy::child_sequence_complete(&children, &workflow)
+                    || !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
+                        .root_advance_due(&parent, &children, &assignments, false)
+                {
+                    return Ok(());
+                }
+                self.advance_coordination_root(parent_task_id).await
             }
-            let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id).await?;
-            if project.is_none_or(|project| project.paused_at.is_some()) {
-                return Ok(());
-            }
-            let children =
-                crate::task_hierarchy::ordered_children(&self.db, parent_task_id).await?;
-            let assignments =
-                TaskRoleAssignmentRepo::list_by_task(&*self.db, parent_task_id).await?;
-            if crate::task_hierarchy::child_sequence_complete(&children, &workflow)
-                || !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
-                    .root_advance_due(&parent, &children, &assignments, false)
-            {
-                return Ok(());
-            }
-            self.advance_coordination_root(parent_task_id).await
-        }
-        .await;
+            .await;
         if let Err(error) = started {
             tracing::debug!(%task_id, %error, "coordination root was not started ahead of its subtask");
         }

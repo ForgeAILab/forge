@@ -372,27 +372,30 @@ impl TaskService {
                     let plans_through_subtasks =
                         crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task)
                             .await?;
-                    let rejected = plan.rejected_candidate(&execution.id).await.map_err(
-                        |error| error.into_service_error("execution plan candidate is unreadable"),
-                    )?;
+                    let rejected =
+                        plan.rejected_candidate(&execution.id)
+                            .await
+                            .map_err(|error| {
+                                error.into_service_error("execution plan candidate is unreadable")
+                            })?;
                     let candidate_required = rejected
                         || (!plans_through_subtasks
                             && (execution.role == crate::workflow::default_roles::PLANNER
-                            || task.plan.as_deref().is_some_and(|plan| {
-                                !crate::plan_artifact::parse_plan_markdown(plan)
-                                    .items
-                                    .is_empty()
-                            })
-                            || crate::plan_artifact::read_plan_text_for_resolved_workspace(
-                                &resolved,
-                            )
-                            .await
-                            .map_err(|error| {
-                                ServiceError::invalid_operation(format!(
-                                    "canonical plan artifact is unreadable: {error}"
-                                ))
-                            })?
-                            .is_some()));
+                                || task.plan.as_deref().is_some_and(|plan| {
+                                    !crate::plan_artifact::parse_plan_markdown(plan)
+                                        .items
+                                        .is_empty()
+                                })
+                                || crate::plan_artifact::read_plan_text_for_resolved_workspace(
+                                    &resolved,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    ServiceError::invalid_operation(format!(
+                                        "canonical plan artifact is unreadable: {error}"
+                                    ))
+                                })?
+                                .is_some()));
                     if candidate_required {
                         self.discard_brokered_execution_plan_stage(&execution)
                             .await?;

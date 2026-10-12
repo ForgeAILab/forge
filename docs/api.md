@@ -2765,6 +2765,26 @@ with source `inherited_from_root` (and therefore the assignment's `task_id`
 continues to name the root). `role_assignments` remains the Task's persisted
 rows only; inherited defaults are never copied into that array or into storage.
 
+`TaskResponse.effective_lead` is `{ assignment, source }` or `null`: the lead
+of the coordination root this Task is (`source: own`) or belongs to
+(`source: inherited_from_root`; `assignment.task_id` names the root). The lead
+is the Agent assigned to the workflow's planning role (`planner` in the
+built-in workflow) on a root Task that has subtasks. It is `null` for a root
+without a lead, for its subtasks, and for a Task without subtasks, whatever
+planner that Task has. The lead's work is ordinary executions on the root with
+role `planner`.
+
+Assigning the planning role on a root that has subtasks assigns its lead.
+`422 LEAD_REQUIRES_NATIVE_PROFILE` (`details.task_id`, `details.role`) refuses
+a CLI Agent or a person: a lead is a native Agent.
+`422 LEAD_ROLE_NOT_SUPPORTED` refuses a custom workflow whose planning gate
+names a role other than `planner`. Other roles on such a root are refused as
+before. A Task that already has a planner and then gets its first subtask
+keeps the planner only when it may lead; otherwise the row is removed with the
+other roles a coordination root does not accept. A root on a daemon-owned
+placement accepts a lead, but the planner cannot run there and the root parks
+on the placement refusal.
+
 `repo_id` is not a Task field. REST and MCP Task objects, Solo Task snapshots,
 and generated clients omit it. For work that has already run, repository
 identity is read from the execution's Workspace or Workspace lease; review,
@@ -2998,8 +3018,13 @@ coordinate it: creating a subtask under a parent that is terminal or in a
 review-phase gate (`review`, `merging`) answers
 `409 SUBTASK_PARENT_CLOSED` with `details.parent_task_id` and `details.state`;
 send the parent back to work first. A parent in `merge_failed` accepts one. A root with one or more children is a
-non-executing coordination container: the root's implementation prompt is not
-dispatched. Its `coder` assignment is retained as the default worker, while
+coordination container: the root's implementation prompt is not
+dispatched. The root moves from `todo` to `in_progress` when it has a subtask
+to run (through `planning` first when it has a lead), and its subtasks run
+only while it is in `in_progress` or `merge_failed`. Claiming, moving or
+transitioning its first subtask by hand before that starts the root first; a
+subtask of a root that is planning for its lead is refused until the planner
+finishes. Its `coder` assignment is retained as the default worker, while
 other non-review role assignments are removed. A child with its own `coder`
 uses that override; otherwise dispatch and claim resolve the root default
 without creating a child assignment row. Changing or removing the default
@@ -3300,7 +3325,9 @@ reason with its own `kind`; clients must render a kind they do not know as a
 plain wait. The reason `parent` (`parent_id`, `cause`) is shown by a subtask
 its parent does not let run: `cause` is `held` (the owner holds the parent;
 releasing the parent is the exit), `blocked` (the parent is parked on a failure
-or a blocked entry; recovering the parent is the exit) or `not_coordinating`
+or a blocked entry; recovering the parent is the exit), `planning` (the
+parent's lead is planning; the subtask starts when the planner finishes and no
+action is needed) or `not_coordinating`
 (the parent is in a state that runs no subtasks, such as `backlog`). It is a
 wait, not a failure: `details.failure_kind` stays empty, `start` is not offered
 on the subtask while it lasts, and it clears by itself when the parent lets its

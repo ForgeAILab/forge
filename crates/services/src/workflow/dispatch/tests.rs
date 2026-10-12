@@ -1202,7 +1202,9 @@ fn a_planner_on_a_coordination_root_gets_the_lead_prompt() {
     assert!(lead.system.contains(FAILURE_TAXONOMY_LINE));
     // Volatile state is user-role input, never part of the stable prefix.
     assert!(!lead.system.contains("Add the schema"));
-    assert!(lead.user.contains("Lead this feature: Add dispatch context"));
+    assert!(lead
+        .user
+        .contains("Lead this feature: Add dispatch context"));
     assert!(lead.user.contains("1. [todo] Add the schema"));
     assert!(lead.user.contains("   Migration and model."));
     assert!(lead.user.contains("2. [todo] Wire the endpoint"));

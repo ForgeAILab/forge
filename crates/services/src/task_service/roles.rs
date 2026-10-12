@@ -635,10 +635,7 @@ impl TaskService {
         crate::task_hierarchy::ensure_lead_assignable(
             &task.id,
             &input.role_name,
-            input
-                .assignee_id
-                .as_ref()
-                .and(input.assignee_type.as_ref()),
+            input.assignee_id.as_ref().and(input.assignee_type.as_ref()),
             backend_kind.as_deref(),
         )
     }

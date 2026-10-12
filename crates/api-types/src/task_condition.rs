@@ -314,8 +314,9 @@ pub enum ConditionReason {
         root_id: String,
         remaining: Vec<String>,
     },
-    /// A subtask waits for its parent Task. `cause` is `held`, `blocked` or
-    /// `not_coordinating`; the exit is on the parent.
+    /// A subtask waits for its parent Task. `cause` is `held`, `blocked`,
+    /// `planning` (the parent's lead is planning) or `not_coordinating`; the
+    /// exit is on the parent.
     Parent {
         parent_id: String,
         cause: String,

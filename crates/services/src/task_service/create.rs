@@ -319,14 +319,15 @@ impl TaskService {
                 crate::task_hierarchy::RootRolePolicy::for_workflow(&project_workflow);
             // The planning role stays only with an assignee that may lead
             // the root (a native Agent); any other planner is stripped.
-            let parent_roles = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
-                "SELECT a.role_name, a.assignee_type, a.assignee_id,
+            let parent_roles =
+                sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                    "SELECT a.role_name, a.assignee_type, a.assignee_id,
                         (SELECT backend_kind FROM agent_current WHERE id = a.assignee_id)
                  FROM task_role_assignment a WHERE a.task_id = ?",
-            )
-            .bind(parent_task_id)
-            .fetch_all(&mut *transaction)
-            .await?;
+                )
+                .bind(parent_task_id)
+                .fetch_all(&mut *transaction)
+                .await?;
             let mut removed_parent_role = false;
             for (role_name, assignee_type, assignee_id, backend_kind) in parent_roles {
                 let assignee_type = assignee_id

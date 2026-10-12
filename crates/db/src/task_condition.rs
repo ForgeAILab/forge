@@ -218,8 +218,10 @@ pub enum ParkReason {
     },
     /// A subtask its parent does not let run yet. `cause` is `held` (the
     /// owner holds the parent), `blocked` (the parent is parked on a
-    /// failure or a blocked entry) or `not_coordinating` (the parent is in
-    /// a state that runs no subtasks). The exit is on the parent.
+    /// failure or a blocked entry), `planning` (the parent is in its
+    /// planning state: its lead runs or is about to) or `not_coordinating`
+    /// (the parent is in another state that runs no subtasks). The exit is
+    /// on the parent.
     Parent {
         parent_id: String,
         cause: String,

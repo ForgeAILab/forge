@@ -40,7 +40,8 @@ pub(crate) fn planning_state(workflow: &WorkflowDefinition) -> Option<&StateDefi
             if next.kind == StateKind::Active {
                 break;
             }
-            if next.canonical_phase != Some(CanonicalPhase::Review) && effective_role(next).is_some()
+            if next.canonical_phase != Some(CanonicalPhase::Review)
+                && effective_role(next).is_some()
             {
                 return Some(next);
             }
@@ -994,9 +995,18 @@ mod tests {
         // A stale completion flag on a root with a subtask left is not work.
         assert!(!due("in_progress", &open, &[], true));
 
-        assert_eq!(policy.advance_target("todo", true).as_deref(), Some("planning"));
-        assert_eq!(policy.advance_target("todo", false).as_deref(), Some("in_progress"));
-        assert_eq!(policy.advance_target("planning", false).as_deref(), Some("in_progress"));
+        assert_eq!(
+            policy.advance_target("todo", true).as_deref(),
+            Some("planning")
+        );
+        assert_eq!(
+            policy.advance_target("todo", false).as_deref(),
+            Some("in_progress")
+        );
+        assert_eq!(
+            policy.advance_target("planning", false).as_deref(),
+            Some("in_progress")
+        );
     }
 
     #[test]

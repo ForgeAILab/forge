@@ -4615,6 +4615,12 @@ Task can return to `review` after repair or retry from `in_progress`; typed
 blocking annotations park a Task in its current state and are not states
 themselves.
 
+A root Task with subtasks (a coordination root) uses the same states with its
+own rules: it moves `todo → in_progress` when it has a subtask to run
+(`todo → planning → in_progress` when it has a lead), rests in `in_progress`
+while its subtasks run, and enters `review` when all of them are terminal.
+See [Root Tasks and ordered subtasks](#root-tasks-and-ordered-subtasks).
+
 ### `merging` is the integration queue (3.2 stage D2b)
 
 There is exactly one merge path. A Task entering `merging` is admitted to the
@@ -5785,22 +5791,24 @@ turn retry scope across REST, MCP, and native tools.
 A root Task is a Task with no `parent_task_id`. Setting `parent_task_id` makes a
 Task a direct child of that root and selects the root's shared workspace; it is
 the hierarchy/workspace relationship, not a prerequisite edge. A root Task
-with direct children is a non-executing coordination container, not a worker
+with direct children is a coordination container, not a worker
 execution. The bound Project Agent can create, sequence, assign, and observe
 those children, but Forge never sends the root's implementation prompt to one
 Agent as a proxy for all child work. A `coder` assignment on the root is the
 default worker for children that have no own `coder`; converting a Task into a
-coordination root keeps that assignment and removes other non-review roles.
-The root's aggregate review role also remains assignable and is the only role
-that may execute on the root, only while the root is in its review state. A
+coordination root keeps that assignment, keeps a planner that may lead the
+root (below) and removes other non-review roles.
+Two roles may execute on the root, each only in its own state: the lead in the
+planning state, and the aggregate review role while the root is in its review
+state. A
 subtask whose root does not let it run
 (`task_hierarchy::coordination_root_allows_child_dispatch` is false: the root
-is held, parked on a failure or a blocked entry, or in a state that runs no
-subtasks) says so: the dispatcher resolves `Reason::ParentWait` for it
+is held, parked on a failure or a blocked entry, or not in an implementation
+(`Active`) state) says so: the dispatcher resolves `Reason::ParentWait` for it
 (`task_dispatcher/next_step.rs`), which is one of the visible schedule parks
 (`db::task_condition::readers::owner_park`), so the subtask's stored condition
 is `parked` with the typed reason `parent { parent_id, cause }` (`held`,
-`blocked`, `not_coordinating`). It is a wait without a diagnostic or failure
+`blocked`, `planning`, `not_coordinating`). It is a wait without a diagnostic or failure
 kind, `start` is not offered on the subtask meanwhile, and the park is cleared
 on the pass that finds the root coordinating again (a change of the root's
 condition or status marks its children for the scheduler). A Task whose Agent cannot
@@ -5820,6 +5828,48 @@ root `coder` never executes there. The review role is whatever the workflow's
 review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution
 decisions.
+
+**Root lifecycle (kickoff and the lead).** One rule for every coordination
+root: its subtasks run only while it is in an implementation (`Active`) state
+(`in_progress`, or `merge_failed` for a corrective subtask). Kickoff is a
+level-triggered fact, not an event: `RootRolePolicy::root_advance_due` is true
+for an unblocked root that has not reached implementation and has a subtask
+left to run, `next_step` resolves `Step::AdvanceRoot` for it, and
+`TaskService::advance_coordination_root` walks it forward. The same walk
+serves completion (every subtask terminal: on to aggregate review).
+
+| Root state | Condition | Result | Mechanism |
+|---|---|---|---|
+| initial or a gate before implementation | a subtask is left to run; no lead | `in_progress` | `Step::AdvanceRoot`, kickoff |
+| initial | a subtask is left to run, or all are terminal; lead assigned | `planning` (the lead is dispatched by the state's entry) | `Step::AdvanceRoot`; the walk stops where the lead holds the state |
+| `planning` | the lead's execution succeeded | `in_progress` | the planning gate's Accept; then `Step::AdvanceRoot` goes on to review when every subtask is already terminal |
+| `planning`, lead assigned | planner assigned, nothing running | planner execution | `Step::Role` (never `AdvanceRoot`: the fact is false while the lead holds the state, whatever completion flag is left) |
+| `in_progress` | subtasks running | parked on `children` | unchanged |
+| `in_progress` | every subtask terminal | `review` | `Step::AdvanceRoot`, completion |
+
+The **lead** is the Agent assigned to the workflow's planning role on the
+root's own row. The planning state is found by position
+(`task_hierarchy::planning_state`: the first gate with a role, outside the
+review phase, on the path from an initial state to the first `Active` state),
+and `RootRolePolicy::lead` / `task_hierarchy::root_lead` is the one resolver
+for "does this root have a lead": the kickoff fact, the walk and the Task
+response read it. A lead must be a native Agent and, in this version, the
+planning role must be the built-in `planner` (the native host maps Task roles
+by name); assignment is refused otherwise (`LEAD_REQUIRES_NATIVE_PROFILE`,
+`LEAD_ROLE_NOT_SUPPORTED`), and conversion into a coordination root strips a
+planner that may not lead. A root on a daemon-owned placement accepts the
+assignment, but its planner cannot be placed there (daemon placement runs CLI
+Agents only): the dispatch parks on the placement refusal. While the root
+plans, its subtasks are parked `parent { cause: planning }` (owner: the
+running lead; no action is offered). The lead plans through the breakdown:
+its prompt is `planner.coordination.v1` (doctrine in the stable part, the
+breakdown with states as user-role input), and the checklist plan artifact a
+planner otherwise owes is not required of it. A root without a lead never
+enters `planning` to stay: nothing changes for it except that it moves to
+`in_progress` when it has a subtask to run instead of resting in `todo`.
+A subtask started by hand (claim, move, manual transition) while its root's
+kickoff is still due starts the root first
+(`TaskService::start_coordination_root_of`).
 
 A subtask can be created only while its parent can still coordinate it: in a
 backlog, initial or working state (`merge_failed` included). A parent that is
@@ -5845,13 +5895,16 @@ workers cannot bypass serialization. Reordering is transactional as well: the
 terminal prefix and current first incomplete child remain fixed, and only the
 untouched `todo` suffix may be permuted.
 
-The first runnable child creates the root workspace on demand. Completing a
+The first execution in the tree creates the root workspace on demand: the
+lead's kickoff run when the root has one, otherwise the first runnable child.
+Completing a
 child wakes the next ordered sibling. Once every child is `done` or
 `cancelled`, Forge advances the coordination root to its aggregate review
 gate; review and merge remain root-level operations, but they bind CI and
 integration to the latest relevant child implementation execution and the
-root-owned shared workspace. The root may receive a reviewer execution for
-that aggregate gate, but it never receives a root implementation execution.
+root-owned shared workspace. The root may receive a planner execution in its
+planning state and a reviewer execution for that aggregate gate, but it never
+receives a root implementation execution.
 If the integration target moves after aggregate review and Forge can rebase the
 shared worktree cleanly, a durable review-refresh transition returns the root
 directly to aggregate review without notifying or dispatching a merge-fix Worker

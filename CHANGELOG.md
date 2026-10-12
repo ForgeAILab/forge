@@ -8,6 +8,37 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A coordination root moves to `in_progress` when it has a subtask to run,
+  and its subtasks run only while it is there.** A root Task with subtasks
+  used to rest in `todo` while its subtasks ran. It now moves to its
+  implementation state (`in_progress`) on the dispatcher's first pass, lead
+  or not, and a subtask starts only while the root is in `in_progress` (or
+  `merge_failed`, for a corrective subtask). Roots already in `todo` move on
+  the first pass after upgrade; a subtask that is running is not interrupted.
+  Board columns and automation keyed on a root's status see the change.
+  Claiming, moving or transitioning the first subtask by hand starts the root
+  first. No migration.
+
+- **Coordination roots accept the planning role: the root's lead.** The
+  workflow's planning role (`planner` in the built-in workflow) can be
+  assigned on a root that has subtasks, and survives the conversion of a Task
+  into a coordination root. It runs on the root as ordinary `planner`
+  executions while the root is in `planning`: at kickoff the root goes
+  `todo -> planning`, the lead reviews the breakdown
+  (prompt `planner.coordination.v1`), and its success moves the root to
+  `in_progress`. A lead must be a native Agent under the role name `planner`;
+  other assignments are refused with `422 LEAD_REQUIRES_NATIVE_PROFILE` or
+  `422 LEAD_ROLE_NOT_SUPPORTED`. A Project whose default assignments give
+  Tasks a native planner therefore gets a lead on every Task that is later
+  split into subtasks. A root without a planner is unchanged apart from the
+  entry above. `TaskResponse.effective_lead` (`{ assignment, source }`) reports
+  the lead of a root and of its subtasks.
+
+- **New condition value `parent.cause = planning`.** A subtask whose root is
+  planning is `parked` on `parent { cause: planning }` until the planner
+  finishes. Clients that enumerate `cause` (`held`, `blocked`,
+  `not_coordinating`) must render it as a wait that needs no action.
+
 - **API integration-test target names are consolidated.** The 95 targets
   become eight binaries. For moved suites, use
   `cargo test -p api --test main <old-target>::<test-name>` (including
