@@ -26,13 +26,15 @@ import sys
 # lost or run twice.
 # The last CI runs with `task_service::` alone took about 390s (408 tests) and
 # 475s (1813 tests). unit-a cannot go below one serial test,
-# task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix
-# (345s of a 484.59s six-thread local run of all 2169 tests at 3cd105cb, per-test
-# times summing to 2183s), which leaves three of its four threads mostly idle.
-# The two modules added here move 495s of that per-test sum (219 tests) into
-# the idle threads: 1123s (627 tests) / 1060s (1542 tests). Scaled from the CI
-# figures that predicts about 390s / 325s. Test counts alone would mislead the
-# split, and a third unit shard would not lower the longest one below that test.
+# task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix:
+# locally at 3cd105cb with four threads it took 281.4s of the 284.1s that
+# `task_service::` alone needed, so three of unit-a's four threads were mostly
+# idle. The two modules added here fill them (per-test sums of a six-thread run
+# of all 2169 tests: 628s / 1555s before, 1123s / 1060s now). Measured locally
+# with four threads: 299.4s (627 tests) / 208.6s (1542 tests); with
+# `task_dispatcher::` alone added, 280.7s / 363.4s. Scaled from the CI figures
+# that predicts about 410s / 300s. Test counts alone would mislead the split,
+# and a third unit shard would not lower the longest one below that test.
 SERVICES_UNIT_FILTERS = ["task_service::", "task_dispatcher::", "workspace_root::"]
 SERVICES_UNIT_A = ["-p", "services", "--lib", "--", *SERVICES_UNIT_FILTERS]
 SERVICES_UNIT_B = ["-p", "services", "--lib", "--",

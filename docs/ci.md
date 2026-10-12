@@ -441,17 +441,26 @@ that matches any). All test shards use four libtest threads.
 
 The split was `task_service::` alone until the self dev-dependency was removed.
 The last CI runs with it took about 390 s (408 tests) and 475 s (1813 tests).
-A local run of all 2169 unit tests with per-test times (six threads, 484.59 s,
-times summing to 2183 s, at `3cd105cb`) showed why counts mislead:
+Local runs with per-test times at `3cd105cb` showed why counts mislead:
 `task_service::tests::condition_matrix::condition_offer_apply_dispatch_matrix`
-alone takes 345 s on one thread, so unit-a cannot finish sooner than that test
-and its other three threads were mostly idle, while unit-b carried 1555 s of
-the 2183 s. Moving `task_dispatcher::` (300 s, 183 tests) and
-`workspace_root::` (195 s, 36 tests) gives 1123 s (627 tests) / 1060 s
-(1542 tests). Scaled from the CI figures this predicts about 390 s / 325 s:
-the longest services unit shard is then bounded by that one test, which is
-also why a third unit shard would not lower it. Confirm with the first CI run
-and move another module if unit-b is still the longer one.
+is one serial test that took 281.4 s of the 284.1 s `task_service::` needed
+with four threads, so unit-a cannot finish sooner than that test and its
+other three threads were mostly idle, while unit-b carried 1555 s of the
+2183 s of summed per-test time (six-thread run of all 2169 tests, 484.59 s).
+Moving `task_dispatcher::` (300 s of that sum, 183 tests) and
+`workspace_root::` (195 s, 36 tests) gives 1123 s / 1060 s. Measured locally
+with four threads, one run each on a shared machine:
+
+| unit-a filters | unit-a | unit-b |
+| --- | --- | --- |
+| `task_service::` (before) | 284.1 s, 408 tests | not re-measured (239.92 / 277.75 s at `0adbb146`) |
+| + `task_dispatcher::` | 280.7 s, 591 tests | 363.4 s, 1578 tests |
+| + `task_dispatcher::`, `workspace_root::` (chosen) | 299.4 s, 627 tests | 208.6 s, 1542 tests |
+
+Scaled from the CI figures this predicts about 410 s / 300 s, against
+390 s / 475 s. The longest services unit shard is then bounded by that one
+test, which is also why a third unit shard would not lower it; splitting or
+speeding up that test is the next step. Confirm with the first CI run.
 
 The history of the earlier split follows. The green CI run
 [38219902459](https://github.com/ForgeAILab/forge/actions/runs/38219902459)
