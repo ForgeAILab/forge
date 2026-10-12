@@ -78,6 +78,56 @@ impl TaskService {
         self.advance_coordination_root(parent_task_id).await
     }
 
+    /// Start the coordination root of a subtask that a person or an Agent is
+    /// about to start by hand (claim, move, manual transition), when the
+    /// root's kickoff is due and the dispatcher has not run it yet. Without
+    /// this, a subtask created and claimed in quick succession is refused
+    /// only because its root is still one dispatcher pass from its
+    /// implementation state. Best effort: the caller's own order check
+    /// decides, and a root that plans for its lead still holds the subtask.
+    pub(crate) async fn start_coordination_root_of(&self, task_id: &str) {
+        // Inside a Task step nothing may wait on another Task's step.
+        if db::task_writer::current_task_step().is_some() {
+            return;
+        }
+        let started: Result<()> = async {
+            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
+                return Ok(());
+            };
+            let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+                return Ok(());
+            };
+            let (parent, workflow) =
+                crate::task_hierarchy::coordination_root_context(&self.db, parent_task_id).await?;
+            if crate::task_hierarchy::root_blocked(&parent)
+                || crate::task_hierarchy::coordination_root_allows_child_dispatch(
+                    &parent, &workflow,
+                )
+            {
+                return Ok(());
+            }
+            let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id).await?;
+            if project.is_none_or(|project| project.paused_at.is_some()) {
+                return Ok(());
+            }
+            let children =
+                crate::task_hierarchy::ordered_children(&self.db, parent_task_id).await?;
+            let assignments =
+                TaskRoleAssignmentRepo::list_by_task(&*self.db, parent_task_id).await?;
+            if crate::task_hierarchy::child_sequence_complete(&children, &workflow)
+                || !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
+                    .root_advance_due(&parent, &children, &assignments, false)
+            {
+                return Ok(());
+            }
+            self.advance_coordination_root(parent_task_id).await
+        }
+        .await;
+        if let Err(error) = started {
+            tracing::debug!(%task_id, %error, "coordination root was not started ahead of its subtask");
+        }
+    }
+
     pub(crate) async fn advance_coordination_root(&self, parent_task_id: &str) -> Result<()> {
         if db::task_writer::current_task_step().is_some_and(|step| step.task_id != parent_task_id) {
             // Identity-fenced (TaskCommand::fence): a root wake re-derives
@@ -220,11 +270,11 @@ impl TaskService {
 
         if !complete {
             // Kickoff ends in the implementation state: the first subtask
-            // may start now. A completion flag left from before a subtask
-            // was added no longer describes this root.
+            // may start now. The root's status change marks its subtasks for
+            // the dispatcher; a wake would bump the subtask's version under
+            // a caller that is starting it by hand. A completion flag left
+            // from before a subtask was added no longer describes this root.
             self.set_coordination_review_pending(parent_task_id, false)
-                .await?;
-            self.wake_next_ordered_subtask(parent_task_id, "coordination root started")
                 .await?;
             return Ok(());
         }

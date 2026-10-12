@@ -13,6 +13,9 @@ impl TaskService {
         let task_id: String = task_id.into();
         let options: TransitionOptions = options.into();
         if !db::task_writer::owns_task(&task_id) {
+            if options.triggered_by.is_user() {
+                self.start_coordination_root_of(&task_id).await;
+            }
             return self
                 .request_task_command(
                     &task_id,

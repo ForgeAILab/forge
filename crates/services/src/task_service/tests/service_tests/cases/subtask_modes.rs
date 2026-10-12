@@ -9,36 +9,8 @@ async fn batch_5_4_subtask_management_allows_manual_child_transition() {
     let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let child = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
-    // A subtask starts only while its root implements: before the root's
-    // kickoff the move is refused, by hand as for the dispatcher.
-    let early = service
-        .transition(
-            child.id.clone(),
-            "in_progress".to_owned(),
-            TransitionOptions {
-                bridge: Default::default(),
-                version: child.version,
-                reason: None,
-                triggered_by: api_types::Actor::user(api_types::UserActionSource::Api),
-                rejection: false,
-                defer_dispatch_seconds: None,
-            },
-        )
-        .await;
-    assert!(
-        matches!(&early, Err(ServiceError::InvalidOperation { message }) if message.contains("not in its implementation state")),
-        "{early:?}"
-    );
-    service
-        .advance_coordination_root(&root.id)
-        .await
-        .expect("the root starts");
-    service.drain(&root.id).await.expect("root steps settle");
-    let child = TaskRepo::get_by_id(&*db, &child.id, false)
-        .await
-        .expect("child reloads")
-        .expect("child exists");
-
+    // The root is still in `todo`: starting its first subtask by hand
+    // starts the root first, as the dispatcher's next pass would.
     let result = service
         .transition(
             child.id.clone(),

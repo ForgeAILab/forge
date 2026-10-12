@@ -36,6 +36,7 @@ impl TaskService {
     ) -> Result<ClaimedTask> {
         let task_id: String = task_id.into();
         if !db::task_writer::owns_task(&task_id) {
+            self.start_coordination_root_of(&task_id).await;
             return self
                 .request_task_command(
                     &task_id,
