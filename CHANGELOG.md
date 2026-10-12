@@ -3039,6 +3039,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Creating a Project from an approved Charter answers with the Project as
+  provisioning left it, and two overlapping submissions of the same command
+  get the same answer.** The response carried the Project row as it was
+  inside the create transaction, before provisioning linked its repository
+  (`primary_repo_id` empty, an older `version`), while a retry that
+  overlapped the original read the row after the link. One creation per
+  approval now runs at a time in the server process; the later submission
+  replays the receipt of the earlier one, and both read the Project after
+  provisioning.
+
 - **A slow login shell no longer loses a merge's check evidence or runs a
   check twice.** When the login-shell probe did not answer within its ten
   seconds (a loaded host), the identity built at the merge head differed from

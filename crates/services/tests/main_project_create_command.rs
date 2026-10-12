@@ -544,6 +544,14 @@ async fn concurrent_project_creation_service_replays_frozen_packet_ids() {
     let first = first.expect("first ProjectCreationService submission");
     let second = second.expect("second ProjectCreationService replay");
     assert_eq!(first, second);
+    // Both callers are told about the Project as provisioning left it, not
+    // the row as it was inside the create transaction.
+    let stored = db::ProjectRepo::get_by_id(&*fixture.db, &first.project.id)
+        .await
+        .expect("Project reads")
+        .expect("Project exists");
+    assert_eq!(first.project, stored);
+    assert!(first.project.primary_repo_id.is_some());
     assert_eq!(first.charter_id, CHARTER_ID);
     assert_eq!(first.charter_revision_id, CHARTER_REVISION_ID);
     for (query, label) in [
