@@ -5886,6 +5886,72 @@ serves completion (every subtask terminal: on to aggregate review).
 | `planning`, lead assigned | planner assigned, nothing running | planner execution | `Step::Role` (never `AdvanceRoot`: the fact is false while the lead holds the state, whatever completion flag is left) |
 | `in_progress` | subtasks running | parked on `children` | unchanged |
 | `in_progress` | every subtask terminal | `review` | `Step::AdvanceRoot`, completion |
+| `in_progress`, lead assigned | the first incomplete subtask is parked needing a decision, and the root has not re-planned for that park | `planning`, bridge `replan`; charges `replan` | `Step::ReplanRoot` → `TaskService::replan_coordination_root` |
+| `in_progress`, lead assigned | the same, with the `replan` budget spent | stays; parked `budget_exhausted { budget_kind: replan }` | the same command writes the block |
+| `review`, lead assigned | the aggregate review was rejected and the Review budget allows a retry | `planning`, bridge `replan`, `rejection`; charges `review` (as before) and `replan` | `review_failure_target` through `task_hierarchy::effective_reject_target` |
+| `review`, lead assigned | the same, with the `replan` budget spent | stays in `review`; parked `budget_exhausted { budget_kind: replan }` | `review_failure_target` |
+| `review`, no lead | the aggregate review was rejected | the gate's `reject_target`, as before | unchanged |
+
+**Re-plan.** A coordination root with a lead goes back to its planning state
+for two triggers, and its lead runs again there with the trigger's evidence in
+its input (`planner.coordination.v1`: the review findings and failed checks,
+or which subtask parked and why). Both are read from stored state on every
+pass; no wake is needed.
+
+- *Rejected aggregate review.* `task_hierarchy::effective_reject_target` is
+  the reader of a gate's `reject_target` for an automatic rejection: the
+  configured target, except that a coordination root with a lead never goes
+  from a review-phase gate back to its implementation state (no role runs for
+  it there) and goes to its planning state instead. The Review budget is
+  resolved first and is untouched: a spent Review budget blocks the root in
+  `review` with `review_budget_exhausted` exactly as without a lead. If the
+  lead adds no fix work the root goes `planning → in_progress → review` again
+  and the next rejection spends the Review budget, which bounds the loop.
+  Owner actions (`root_review_reopen`, an owner's own send-back or retry)
+  keep the workflow's configured target.
+- *Parked subtask.* `RootRolePolicy::replan_due` is the fact (`Facts::
+  root_replan`), evaluated beside `root_advance` in `next_step`, after the
+  Project pause, the integration wait, the root's own blocker and a human
+  wait: an unblocked root with a lead, in its working implementation state
+  (never `merge_failed`), whose first incomplete subtask is parked needing a
+  decision. "Needing a decision" (`task_hierarchy::subtask_decision_park`) is
+  a failure or interruption that nothing clears by itself; never the owner's
+  hold or manual stop, a queued owner action, a human decision, or any wait
+  that ends on its own (capacity, an Agent, a machine, the environment, a
+  dependency, checks, the parent, a retry deadline, a run in flight). The
+  subtasks are sequential, so nothing runs beside the parked one: no running
+  subtask is interrupted, and the subtasks that have not started are held by
+  the planning root (`parent { cause: planning }`).
+
+The transition into planning has no workflow trigger. The engine and the
+cascade step admit it only under the `replan` bridge, only for a system actor
+and only into the workflow's planning state (`task_hierarchy::replan_edge`);
+the source state's exit hooks do not run (they describe going forward).
+
+Bounds. One re-plan per trigger: the receipt (`replan:review:<review id>`,
+`replan:<subtask id>:<time the park was recorded>`) is the budget charge
+identity and is carried by the planning entry's bridge payload. The fact reads
+the entry, the charge reads the receipt, so a crash between the two re-issues
+the step, charges nothing and enters planning once. A park the lead left in
+place is never re-planned again: the root waits on its subtasks (`children`)
+and the Project Agent is woken for that subtask; a later park of the same
+subtask is a new trigger. Across all triggers the `replan` budget
+(`db::budget::Kind::Replan`, default 5 per budget window) is the machine
+bound. When it is spent the root parks where it is with
+`budget_exhausted { budget_kind: replan }` (blocked `retry_exhausted`, source
+`replan`), which raises Attention and wakes the Project Agent like any root
+blocker; the owner's Retry with a new budget clears the park and resets the
+window, and the root's own next step follows (re-plan, or the aggregate review
+again). A re-plan refused deterministically is recorded as a dispatch
+disposition (`coordination_root_replan`) and holds until the Task changes.
+
+Project Agent wakes. The blocker sweep has one lead filter
+(`task_hierarchy::lead_handles_subtask_park`): an open blocker of a subtask
+wakes nobody while its root's lead handles it, that is while the root is about
+to re-plan for that park or its lead is planning. It is level state, not a
+suppression record: once the lead left the park in place, the root itself
+parked (its `replan` budget included) or lost its lead, the next sweep admits
+the wake. Blockers of the root itself always wake the Project Agent.
 
 The **lead** is the Agent assigned to the workflow's planning role on the
 root's own row. The planning state is found by position

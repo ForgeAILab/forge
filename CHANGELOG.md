@@ -50,6 +50,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   finishes. Clients that enumerate `cause` (`held`, `blocked`,
   `not_coordinating`) must render it as a wait that needs no action.
 
+- **A rejected aggregate review of a root with a lead returns the root to
+  `planning`, and so does a parked subtask.** For a coordination root whose
+  planning role is assigned (its lead), an automatic rejection of the
+  aggregate review moves the root `review -> planning` instead of
+  `review -> in_progress`: the lead runs again with the review findings and
+  failed checks in its input, and the root goes on to `in_progress` and back
+  to review when it ends. The review rejection limit is unchanged and still
+  blocks the root in `review` when it is spent. The same root also goes
+  `in_progress -> planning` when its current subtask parks needing a decision
+  (a failure or interruption nothing clears by itself; never a hold), once
+  per park: the lead runs with that subtask's failure in its input, subtasks
+  that have not started wait (`parent { cause: planning }`), and a running
+  subtask is never interrupted. If the lead leaves the subtask parked, the
+  root waits on its subtasks again and the Project Agent is woken for it;
+  while the lead handles a subtask's park the Project Agent is not woken for
+  that subtask. Each such planning entry spends the new `replan` budget
+  (5 per budget window). When it is spent the root parks where it is with
+  `budget_exhausted` / `budget_kind: "replan"`, and Retry with a new budget
+  is the way on. Roots without a lead are unchanged: their rejection target,
+  their wait on a parked subtask and the Project Agent's wakes are as before,
+  and they never show a `replan` budget. Owner actions (send back, reopen for
+  a corrective subtask, retry) keep the workflow's configured target. No
+  migration.
+
+- **New values on existing fields: transition `bridge_kind = replan`,
+  `budget_exhausted.budget_kind = replan`, budget key `replan`.** Transition
+  history of a root with a lead can carry `bridge_kind: "replan"` with a
+  payload naming the trigger; the Task budget projection of such a root gains
+  `replan` once it has re-planned; its condition can be `budget_exhausted`
+  with `budget_kind: "replan"`. Clients that enumerate these must accept the
+  new values.
+
 - **REST no longer documents or maps `503 check_environment_unavailable`.**
   No REST handler could return it: the check environment is read only inside
   Task steps and the check worker, and the Task states the cause (review
