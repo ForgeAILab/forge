@@ -2053,3 +2053,94 @@ async fn a_parked_attempt_is_rebound_only_when_its_ready_placement_names_another
     assert_eq!(world.attempt(&first.id).await.state, S::Superseded);
     assert_eq!(rebound.queue_seq, first.queue_seq);
 }
+
+/// Two writers on one row state one cause. The reconciler's restatement
+/// (from the scheduler's snapshot) writes first on an imported row nothing
+/// has stated yet; the import continuation writes the same row afterwards;
+/// the reconciler looks again. All three decide with `deferral::deferral`:
+/// a quarantined imported row that names no operation is its owner's
+/// (`owner_required`, not a result that could still arrive), and a row that
+/// waited for a machine before the queue (P15) names that machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reconciler_and_the_import_continuation_state_one_cause_for_one_row() {
+    for (case, assignments, cause, owner) in [
+        (
+            "quarantined",
+            "state='quarantined',import_source_json='{\"priority\":20}',failure_kind='infrastructure',failure_message='contradictory evidence',available_at=NULL",
+            "owner_required",
+            Value::Null,
+        ),
+        (
+            "offline",
+            "state='parked',import_source_json='{\"priority\":15}',failure_kind='infrastructure',failure_message='waiting for the checkout owner',available_at='2099-01-01T00:00:00Z'",
+            "owner_offline",
+            json!("gone-machine"),
+        ),
+    ] {
+        let world = World::new().await;
+        world.legacy_task("two", "two.txt", "merging").await;
+        world.seed_execution("two", "executor", None).await;
+        if case == "offline" {
+            sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.owner_wait',json_object('daemon_id','gone-machine')) WHERE id='two'")
+                .execute(world.db.pool())
+                .await
+                .unwrap();
+        }
+        let current = world
+            .service
+            .admit_to_integration_queue("two")
+            .await
+            .unwrap();
+        world.set(&current.id, assignments).await;
+        let stated = || async {
+            let reason = integration(&world.task("two").await);
+            (reason["cause"].clone(), reason["owner_id"].clone())
+        };
+        let dispatcher = dispatcher(&world).await;
+        // Writer one: the reconciler, on a row whose deferral nobody stated.
+        world
+            .until("two", "the reconciler states the deferral", || async {
+                dispatcher.reconcile_all().await.unwrap();
+                integration(&world.task("two").await)["kind"] == "deferred"
+            })
+            .await;
+        assert_eq!(stated().await, (json!(cause), owner.clone()), "{case}: reconciler");
+        // Writer two: the import continuation of the same row.
+        let report = super::super::import::import_at_start(&world.db)
+            .await
+            .unwrap();
+        assert_eq!(report.continuations, 1, "{case}");
+        world
+            .until("two", "the import continuation settles", || async {
+                world
+                    .scalar::<i64>(
+                        "SELECT COUNT(*) FROM task_step WHERE task_id=? AND causation_key LIKE 'integration-import:%' AND status='done'",
+                        "two",
+                    )
+                    .await
+                    == 1
+            })
+            .await;
+        assert_eq!(
+            stated().await,
+            (json!(cause), owner.clone()),
+            "{case}: import continuation"
+        );
+        // And the reconciler finds nothing to restate.
+        let before = world.task("two").await.version;
+        dispatcher.reconcile_all().await.unwrap();
+        assert_eq!(stated().await, (json!(cause), owner), "{case}: second look");
+        assert_eq!(world.task("two").await.version, before, "{case}");
+        assert_eq!(
+            world.attempt(&current.id).await.revision,
+            world
+                .db
+                .current_integration_attempt("two")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            "{case}: the row was not replaced"
+        );
+    }
+}

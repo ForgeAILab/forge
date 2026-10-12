@@ -35,13 +35,16 @@ use api_types::{
     IntegrationAttemptId, IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
 };
 use db::{
-    ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S, IntegrationFailureKind,
+    ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S,
     IntegrationQueueRepo, IntegrationQueueState, IntegrationStepAckOutcome,
     IntegrationStepAckWrite, IntegrationStepPosition, SqliteDb, TaskRepo, TaskStep, TaskStepRepo,
 };
+#[cfg(test)]
+use db::IntegrationFailureKind;
 use std::sync::Arc;
 
 pub(crate) mod admission;
+pub(crate) mod deferral;
 pub(crate) mod gate;
 pub mod import;
 mod port;
@@ -373,6 +376,14 @@ impl IntegrationSteps {
         .bind(&attempt.task_ref)
         .fetch_one(self.db.pool())
         .await?;
+        // The machine a pre-queue owner wait named (importer row P15).
+        let waited_owner: Option<String> = sqlx::query_scalar(
+            "SELECT CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.owner_wait.daemon_id') END FROM task WHERE id=?",
+        )
+        .bind(&attempt.task_ref)
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let attempt = db::integration_attempt_in_tx(&mut tx, &request.attempt_id).await?;
         match db::integration_step_position(
@@ -438,30 +449,18 @@ impl IntegrationSteps {
                 (attempt.failure_kind, attempt.failure_message.clone())
             };
             let message = message.unwrap_or_else(|| "integration is waiting".into());
-            let cause = if attempt.state == S::Quarantined {
-                IntegrationDeferralCause::UnresolvedResult
-            } else if message.starts_with("target_dirty") {
-                IntegrationDeferralCause::TargetDirty
-            } else {
-                match kind {
-                    Some(
-                        IntegrationFailureKind::Infrastructure | IntegrationFailureKind::Timeout,
-                    ) => IntegrationDeferralCause::Infrastructure,
-                    Some(IntegrationFailureKind::TargetUnavailable) => {
-                        IntegrationDeferralCause::OwnerOffline
-                    }
-                    Some(IntegrationFailureKind::NeedsFact) => {
-                        IntegrationDeferralCause::UnresolvedResult
-                    }
-                    _ => IntegrationDeferralCause::OwnerRequired,
-                }
-            };
-            // A wait for the machine that holds the Task's checkout names
-            // that machine.
-            let owner_id = message
-                .starts_with("owner_offline")
-                .then(|| attempt.daemon_id.clone())
-                .flatten();
+            // One rule for every writer of this row (`deferral`). The
+            // suspended queue of a `queued` member is the queue's fact: the
+            // importer's classification of the row does not apply to it.
+            let (cause, owner_id) = deferral::deferral(&deferral::DeferralFacts {
+                quarantined: attempt.state == S::Quarantined,
+                kind,
+                message: &message,
+                daemon_id: attempt.daemon_id.as_deref(),
+                import: (attempt.state != S::Queued)
+                    .then(|| deferral::import_facts(&attempt, waited_owner.clone()))
+                    .flatten(),
+            });
             Some(IntegrationReason::Deferred {
                 attempt_id: attempt_ref(&attempt.id),
                 cause,

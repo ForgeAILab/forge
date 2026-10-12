@@ -5430,6 +5430,18 @@ binding changed makes a released attempt eligible for ordinary readmission;
 this also recovers a missed reconnect notification. Corrupt/newer condition
 formats retain the existing quarantine fence rather than being overwritten.
 
+Three writers can state `deferred` for one attempt row: the `park` step, the
+import continuation and the reconciler's restatement (from the scheduler's
+compact snapshot). `integration_steps::deferral::deferral` is the one rule for
+the cause and the machine waited for, from facts of the row: a quarantined
+attempt is `unresolved_result` unless the importer made it and it names no
+operation (`owner_required`: no result can still arrive); an imported row the
+worker has not parked itself reads the importer's classification (P15
+`owner_offline` with the machine the old wait named, a stored deadline
+`infrastructure`, otherwise `owner_required`); any other row reads its park
+reason code and failure kind. The reconciler restates a stated deferral only
+when cause or machine differ, never for its wording.
+
 ### Queues, attempts and the authoritative target
 
 A queue is unique by `(repo_id, target_branch)`, not by checkout location.

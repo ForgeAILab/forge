@@ -3039,6 +3039,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A merge that waits states one cause, whoever writes it.** The `park`
+  step, the import continuation and the reconciler's restatement each
+  mapped a parked or quarantined attempt to a deferral cause with their own
+  rule, so a quarantined imported row with no operation read
+  `unresolved_result` from the reconciler and `owner_required` from its
+  continuation, and a pre-queue owner wait lost the machine it names. One
+  function (`integration_steps::deferral`) now decides cause and machine
+  for all three from the attempt row; a stated deferral is restated only
+  when those differ.
+
 - **One writer per merge during an upgrade: an imported unknown result is
   not driven while its import continuation is still to run.** The queue
   worker could take a reserved imported head (a merge whose old operation

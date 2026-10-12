@@ -418,7 +418,7 @@ impl crate::TaskService {
 pub(crate) fn statement_reason(
     snapshot: &serde_json::Value,
 ) -> Option<api_types::IntegrationReason> {
-    use api_types::{IntegrationDeferralCause as C, IntegrationPhase as P, IntegrationReason as R};
+    use api_types::{IntegrationPhase as P, IntegrationReason as R};
     let id = snapshot["attempt_id"].as_str()?;
     let attempt_id = super::attempt_ref(id);
     let state = snapshot["state"].as_str()?;
@@ -458,27 +458,23 @@ pub(crate) fn statement_reason(
     if state == "parked" && crate::integration_worker::GateCause::parked_under(message) {
         return Some(R::Waiting { attempt_id });
     }
-    let cause = if state == "quarantined" {
-        C::UnresolvedResult
-    } else if message.starts_with("target_dirty") {
-        C::TargetDirty
-    } else if message.starts_with("owner_offline") {
-        C::OwnerOffline
-    } else {
-        match kind {
-            Some("infrastructure" | "timeout") => C::Infrastructure,
-            Some("target_unavailable") => C::OwnerOffline,
-            Some("needs_fact") => C::UnresolvedResult,
-            _ => C::OwnerRequired,
-        }
-    };
+    let kind = kind.and_then(|kind| kind.parse::<db::IntegrationFailureKind>().ok());
+    // One rule for every writer of this row (`deferral`); as in the `park`
+    // step, the importer's classification does not decide the wait of a
+    // `queued` member of a suspended queue.
+    let (cause, owner_id) = super::deferral::deferral(&super::deferral::DeferralFacts {
+        quarantined: state == "quarantined",
+        kind,
+        message,
+        daemon_id: snapshot["daemon_id"].as_str(),
+        import: (state != "queued")
+            .then(|| super::deferral::snapshot_import_facts(snapshot))
+            .flatten(),
+    });
     Some(R::Deferred {
         attempt_id,
         cause,
-        owner_id: message
-            .starts_with("owner_offline")
-            .then(|| snapshot["daemon_id"].as_str().map(str::to_owned))
-            .flatten(),
+        owner_id,
         message: super::bounded(message),
     })
 }
@@ -503,17 +499,24 @@ pub(crate) fn statement_stale(
     // extra writes for every phase. Released/suspended waits are exact.
     let waiting = matches!(snapshot["state"].as_str(), Some("parked" | "quarantined"))
         || (snapshot["state"] == "queued" && snapshot["queue_state"] != "open");
-    // A deferral already stated for this attempt stands: its writer (the
-    // park step, the import continuation, the result step) chose the typed
-    // cause and message with facts this snapshot does not carry, and each of
-    // them restates when the attempt parks again. Restating it from the
-    // snapshot would replace that cause and alternate with its writer.
+    // Every writer of a deferral (the `park` step, the import continuation,
+    // this restatement) decides the cause and the machine with one function
+    // (`deferral::deferral`), from facts this snapshot carries too. A stated
+    // deferral is stale only when those differ; its message is its writer's
+    // wording (the import continuation and the `result` step add detail the
+    // row does not hold) and is never a reason to restate.
     waiting
         && match (actual, &expected) {
             (
-                api_types::IntegrationReason::Deferred { .. },
-                api_types::IntegrationReason::Deferred { .. },
-            ) => false,
+                api_types::IntegrationReason::Deferred {
+                    cause, owner_id, ..
+                },
+                api_types::IntegrationReason::Deferred {
+                    cause: expected_cause,
+                    owner_id: expected_owner,
+                    ..
+                },
+            ) => cause != expected_cause || owner_id != expected_owner,
             _ => actual != &expected,
         }
 }
