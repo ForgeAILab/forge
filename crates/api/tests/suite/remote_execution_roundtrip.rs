@@ -368,6 +368,13 @@ async fn remote_execution_completes_and_transitions_task() {
     )
     .await;
 
+    // Started, and its daemon has not logged yet: the log exists and is
+    // empty. The path is recorded at launch; with no file behind it this
+    // read was a 404, which the polls below hit whenever they ran before
+    // the first log frame had been written.
+    let started = fetch_execution_logs(&fixture.harness.app, &execution_id).await;
+    assert_eq!(started["items"], json!([]), "{started}");
+
     send_execution_log(
         &mut fixture.daemon_socket,
         &execution_id,
