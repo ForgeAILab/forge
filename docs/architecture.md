@@ -50,7 +50,7 @@ forge-cli → api → services → db
           → api-types (shared request/response types, zero internal deps)
 
 forge-solo → services → db / events / agent-host / executors / workspace → git
-           → config / api-types / review / cli-adapters
+           → config / api-types / review / cli-adapters / operation-registry
 
 api / services → pricing → db / api-types
 
