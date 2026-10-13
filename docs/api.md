@@ -2852,8 +2852,8 @@ tool. What REST, MCP and event consumers see of them:
   for completeness and have no route that returns it today.
 - The budget rows `lead_subtasks`, `lead_subtasks_run:<execution>` and
   `lead_recover:<subtask>` on a root bound what its lead may repeat. They are
-  not projected in `budgets`; a Retry with a new budget on the root resets
-  them with the root's other budgets.
+  not projected in `remaining_retries` or `retry_limits`; a Retry with a new
+  budget on the root resets them with the root's other budgets.
 
 The `LEAD_OPERATION_REFUSED` reason codes are the values of
 `details.refusal` (HTTP 422):

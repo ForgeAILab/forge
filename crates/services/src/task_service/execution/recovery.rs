@@ -465,6 +465,38 @@ impl TaskService {
         result
     }
 
+    /// Record on an accepted action that the hierarchy refused its replay.
+    /// The Task's version does not move: a wait must not invalidate itself.
+    async fn mark_queued_action_awaits_hierarchy(&self, task: &Task) -> Result<()> {
+        let Some(expected) = TaskMetadata::parse(task.metadata_json.as_deref())
+            .ok()
+            .and_then(|metadata| {
+                metadata
+                    .extra
+                    .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+                    .cloned()
+            })
+            .filter(|raw| raw["awaits_hierarchy"] != true)
+        else {
+            return Ok(());
+        };
+        let mut value = expected.clone();
+        value["awaits_hierarchy"] = json!(true);
+        TaskRepo::mutate_metadata_with_change(
+            &*self.db,
+            &task.id,
+            None,
+            vec![TaskMetadataMutation::SetIf {
+                key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                expected,
+                value,
+            }],
+            &now_rfc3339(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// One failure boundary for replay: wait with its intent, or restore it.
     pub(crate) async fn settle_queued_task_action_refusal(
         &self,
@@ -479,7 +511,18 @@ impl TaskService {
             ServiceError::Db(
                 db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. }
             )
-        ) && current.version != task.version;
+        ) && (current.version != task.version
+            || crate::deferred_dispatch::queued_recovery(&current)
+                .is_some_and(|intent| intent.launches_role()));
+        // The root and child have separate writers. A root re-plan can win
+        // after this action's eligibility read; its admission refusal is a
+        // wait, even if the root has already finished when we settle it. The
+        // intent records the refusal, so the scheduler parks the subtask on
+        // its parent instead of replaying an action the hierarchy refuses.
+        if crate::task_hierarchy::is_subtask_wait_refusal(error) {
+            self.mark_queued_action_awaits_hierarchy(&current).await?;
+            return Ok(true);
+        }
         let waiting = claim_race
             || matches!(
                 error,
@@ -669,10 +712,7 @@ impl TaskService {
             &project.workflow_definition,
             &queued.request.actor,
         );
-        if matches!(
-            queued.request.offer.reason.as_str(),
-            "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
-        ) {
+        if queued.launches_role() {
             let role = crate::workflow::action_role(&workflow, &task.status).ok_or_else(|| {
                 ServiceError::invalid_operation("queued action lost its workflow role")
             })?;
@@ -729,6 +769,15 @@ impl TaskService {
                     }
                 }
             }
+        }
+        // An action that needs the hierarchy's admission is subject to the
+        // same wait as an ordinary dispatch. Do not claim it or restore its
+        // saved park while the root plans, is held, or an earlier sibling
+        // runs: `next_step` parks it on the parent until then.
+        if queued.needs_subtask_admission()
+            && !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await?
+        {
+            return Ok(false);
         }
         if let Some(agent_id) = queued.request.agent_id.as_deref() {
             let agent = AgentRepo::get_by_id(&*self.db, agent_id)
@@ -907,10 +956,7 @@ impl TaskService {
             .error_annotation
             .as_deref()
             .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok());
-        let role_launch = matches!(
-            request.offer.reason.as_str(),
-            "ready_to_start" | "initial_retry" | "manually_held" | "role_retry" | "merge_fix_retry"
-        );
+        let role_launch = queued.launches_role();
         let apply = async {
             match request.offer.reason.as_str() {
                 "hard_failure" | "interrupted_restart" => {
@@ -1541,6 +1587,15 @@ impl TaskService {
                 api_types::UserActionSource::Api,
             ));
             return Box::pin(self.rerun_review(id, requested_by)).await;
+        }
+        if updated.status == crate::workflow::default_states::LEAD_CHECK
+            && updated.parent_task_id.is_some()
+        {
+            // Validate the existing rework in a new entry, under the reset
+            // gate budget. Its role continuation waits for any root re-plan.
+            return self
+                .recover_retry_current_state_hooks(updated, Some(reason))
+                .await;
         }
         Ok(updated)
     }

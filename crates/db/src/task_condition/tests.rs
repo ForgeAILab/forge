@@ -2267,3 +2267,37 @@ fn measure_mapping_size_scaling() {
         );
     }
 }
+#[test]
+fn a_queued_command_keeps_its_continuation_under_a_planning_parent_wait() {
+    let mut input = super::LegacyConditionInput {
+        metadata_json: Some(serde_json::json!({
+            "deferred_dispatch": {"not_before":"2026-10-13T05:00:00Z", "target_state":"lead_check", "reason":"task action queued"},
+            "queued_recovery": {"id":"retry"},
+        }).to_string()),
+        ..Default::default()
+    };
+    let deferred = super::map_legacy_condition(&input);
+    assert!(matches!(&deferred, super::TaskCondition::Deferred { .. }));
+    let wait =
+        serde_json::json!({"reason":{"ParentWait":{"parent_id":"root", "cause":"planning"}}});
+    let parked = super::readers::apply_owner_park(deferred, Some(&wait));
+    assert!(matches!(parked,
+        super::TaskCondition::Parked {
+            primary: super::ParkReason::Parent { parent_id, cause },
+            resume: super::ConditionContinuation::ResumeQueuedCommand { intent_id: Some(intent) },
+            ..
+        } if parent_id == "root" && cause == "planning" && intent == "retry"));
+    input.metadata_json = Some(
+        serde_json::json!({
+            "deferred_dispatch": {"not_before":"2026-10-13T05:00:00Z", "target_state":"lead_check", "reason":"retry deadline"},
+        })
+        .to_string(),
+    );
+    assert!(
+        matches!(
+            super::readers::apply_owner_park(super::map_legacy_condition(&input), Some(&wait)),
+            super::TaskCondition::Deferred { .. }
+        ),
+        "a timer without an accepted command keeps its own continuation"
+    );
+}

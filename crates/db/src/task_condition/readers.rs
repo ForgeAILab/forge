@@ -613,6 +613,28 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
             _ => api_types::ConditionOwner::User,
         };
         return match condition {
+            TaskCondition::Deferred {
+                resume,
+                mut evidence,
+                ..
+            } if matches!(&reason, ParkReason::Parent { .. })
+                && matches!(&resume, ConditionContinuation::ResumeQueuedCommand { .. }) =>
+            {
+                // An accepted role action remains queued while the root
+                // plans or an earlier sibling runs. State that hierarchy
+                // wait without losing the accepted command's continuation.
+                evidence
+                    .presentation
+                    .get_or_insert_with(Default::default)
+                    .owner = Some(owner);
+                TaskCondition::Parked {
+                    primary: reason,
+                    additional: Vec::new(),
+                    resume,
+                    since: None,
+                    evidence,
+                }
+            }
             TaskCondition::Clear { mut evidence } => {
                 evidence
                     .presentation

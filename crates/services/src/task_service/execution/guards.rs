@@ -104,9 +104,11 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
         if crate::task_hierarchy::root_blocked(&parent) {
-            return Err(ServiceError::invalid_operation(format!(
-                "subtask {} cannot execute while coordination root {} is blocked or has an error",
-                task.id, parent.id
+            return Err(crate::task_hierarchy::subtask_wait_refusal(format!(
+                "subtask {} {ROOT_BLOCKED_REFUSAL} {} is blocked or has an error",
+                task.id,
+                parent.id,
+                ROOT_BLOCKED_REFUSAL = crate::task_hierarchy::ROOT_BLOCKED_REFUSAL,
             )));
         }
 

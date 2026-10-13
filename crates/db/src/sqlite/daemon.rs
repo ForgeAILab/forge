@@ -494,6 +494,49 @@ impl SqliteDb {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DaemonOperatorIssueRow {
+    pub id: String,
+    pub hostname: Option<String>,
+    pub status: String,
+    pub last_report_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl SqliteDb {
+    pub async fn daemon_operator_issue_rows(&self) -> crate::Result<Vec<DaemonOperatorIssueRow>> {
+        let rows = sqlx::query(
+            "SELECT id, hostname, status, last_report_at, updated_at
+             FROM daemon
+             WHERE removed_at IS NULL
+             ORDER BY updated_at DESC, id ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(DaemonOperatorIssueRow {
+                    id: row.try_get("id")?,
+                    hostname: row.try_get("hostname")?,
+                    status: row.try_get("status")?,
+                    last_report_at: row.try_get("last_report_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_error_count(&self) -> crate::Result<i64> {
+        let result =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM daemon WHERE status = 'error'")
+                .fetch_one(self.pool())
+                .await?;
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

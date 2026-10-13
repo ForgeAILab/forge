@@ -187,3 +187,248 @@ impl WorkspaceRepo for SqliteDb {
         Ok(())
     }
 }
+
+impl SqliteDb {
+    pub async fn workspace_cleanup_attempts_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT cleanup_attempts FROM workspace
+             WHERE task_id = ? AND status != 'cleaned'",
+        )
+        .bind(task_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug)]
+pub struct RecordWorkspaceCleanupFailureInput<'a> {
+    pub increment: i64,
+    pub last_error: &'a str,
+    pub cleanup_after: &'a str,
+    pub updated_at: &'a str,
+    pub task_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn record_workspace_cleanup_failure_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &RecordWorkspaceCleanupFailureInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET cleanup_attempts = cleanup_attempts + ?,
+                 last_cleanup_error = ?, cleanup_after = ?, updated_at = ?
+             WHERE task_id = ? AND status != 'cleaned'",
+        )
+        .bind(input.increment)
+        .bind(input.last_error)
+        .bind(input.cleanup_after)
+        .bind(input.updated_at)
+        .bind(input.task_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceCleanupAttentionRow {
+    pub id: String,
+    pub worktree_path: String,
+    pub cleanup_attempts: i64,
+    pub last_cleanup_error: Option<String>,
+    pub project_id: String,
+    pub title: String,
+}
+
+impl SqliteDb {
+    pub async fn workspace_cleanup_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<WorkspaceCleanupAttentionRow>> {
+        let row = sqlx::query(
+            "SELECT w.id, w.worktree_path, w.cleanup_attempts, w.last_cleanup_error,
+                    t.project_id, t.title
+             FROM workspace w JOIN task t ON t.id = w.task_id
+             WHERE w.task_id = ? AND w.status != 'cleaned'",
+        )
+        .bind(task_id)
+        .fetch_optional(connection)
+        .await?;
+        row.map(|row| {
+            Ok(WorkspaceCleanupAttentionRow {
+                id: row.try_get("id")?,
+                worktree_path: row.try_get("worktree_path")?,
+                cleanup_attempts: row.try_get("cleanup_attempts")?,
+                last_cleanup_error: row.try_get("last_cleanup_error")?,
+                project_id: row.try_get("project_id")?,
+                title: row.try_get("title")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_workspace_cleanup_retry(
+        &self,
+        updated_at: &str,
+        task_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET cleanup_after = NULL, cleanup_attempts = 0,
+                 last_cleanup_error = NULL, updated_at = ?
+             WHERE task_id = ?
+               AND (cleanup_after IS NOT NULL OR cleanup_attempts != 0
+                    OR last_cleanup_error IS NOT NULL)",
+        )
+        .bind(updated_at)
+        .bind(task_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn due_workspace_cleanup_task_ids(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        let result = sqlx::query_scalar::<_, String>("SELECT task_id FROM workspace
+             WHERE status != 'cleaned' AND (cleanup_after <= ? OR (status = 'cleaning' AND cleanup_after IS NULL))
+             ORDER BY cleanup_after, id LIMIT ?")
+            .bind(now)
+            .bind(limit)
+            .fetch_all(self.pool()).await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_cleanup_has_active_execution_or_lease(
+        &self,
+        task_id: &str,
+        workspace_id: Option<&str>,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM execution
+                WHERE (task_id = ? OR workspace_id = ?) AND status = 'running'
+             ) OR EXISTS (
+                SELECT 1 FROM workspace_lease wl
+                LEFT JOIN execution e ON e.id = wl.execution_id
+                WHERE (wl.task_id = ? OR e.workspace_id = ?) AND wl.status = 'active'
+             )",
+        )
+        .bind(task_id)
+        .bind(workspace_id)
+        .bind(task_id)
+        .bind(workspace_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_branch_is_shared(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        workspace_id: &str,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM workspace
+                            WHERE repo_id = ? AND branch = ? AND id != ? AND status != 'cleaned')",
+        )
+        .bind(repo_id)
+        .bind(branch)
+        .bind(workspace_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn mark_workspace_cleaning_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        workspace_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE workspace SET status = 'cleaning', cleanup_after = COALESCE(cleanup_after, ?), updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(workspace_id)
+            .execute(connection).await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn mark_workspace_cleaned_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        workspace_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE workspace
+                         SET status = 'cleaned', cleanup_after = NULL,
+                             cleanup_attempts = 0, last_cleanup_error = NULL,
+                             error = NULL, updated_at = ?
+                         WHERE id = ?",
+        )
+        .bind(now)
+        .bind(workspace_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OverdueWorkspaceCleanupRow {
+    pub id: String,
+    pub task_id: String,
+    pub cleanup_after: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn overdue_workspace_cleanup_rows(
+        &self,
+        now: &str,
+    ) -> crate::Result<Vec<OverdueWorkspaceCleanupRow>> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, cleanup_after
+             FROM workspace
+             WHERE status IN ('ready', 'cleaning')
+               AND cleanup_after IS NOT NULL
+               AND cleanup_after < ?
+             ORDER BY cleanup_after ASC, id ASC",
+        )
+        .bind(now)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(OverdueWorkspaceCleanupRow {
+                    id: row.try_get("id")?,
+                    task_id: row.try_get("task_id")?,
+                    cleanup_after: row.try_get("cleanup_after")?,
+                })
+            })
+            .collect()
+    }
+}

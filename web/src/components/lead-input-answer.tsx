@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { useResolveAttentionMutation } from '@/features/federation/hooks'
 import type { AttentionItem } from '@/features/federation/types'
+import { ApiError } from '@/api/client'
 import { getApiErrorMessage } from '@/lib/api-error'
 
 /** AttentionItem.category is the public projection of stored attention_type. */
@@ -16,13 +17,28 @@ export function leadQuestion(item: AttentionItem): string | null {
     : null
 }
 
+/**
+ * Why an answer was refused. A 409 is a stale item version (another tab, or
+ * the question was withdrawn with its root): the server's text for it names
+ * neither, so the form says what happened and that the draft is kept.
+ */
+function submitErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.status === 409) {
+    return 'This question changed while you were answering. Your answer is kept: check the question, then send it again.'
+  }
+  return getApiErrorMessage(error, 'Could not answer the lead')
+}
+
 /** Resolving a lead question requires the owner's answer at this item's version. */
 export function LeadInputAnswer({ item }: { item: AttentionItem }) {
   const [answer, setAnswer] = useState('')
   const submit = useResolveAttentionMutation()
+  // The pending flag reaches this component a render later than a second submit can.
+  const sending = useRef(false)
   const inputId = `lead-answer-${item.id}`
   const helpId = `${inputId}-help`
   const errorId = `${inputId}-error`
+  const submitErrorId = `${inputId}-submit-error`
   // The server trims the answer and counts Unicode scalar values, as Rust chars().
   const length = Array.from(answer.trim()).length
   const invalid = length === 0 || length > 4000
@@ -44,8 +60,18 @@ export function LeadInputAnswer({ item }: { item: AttentionItem }) {
           className="space-y-2"
           onSubmit={(event) => {
             event.preventDefault()
-            if (invalid || submit.isPending || submit.isSuccess || !question) return
-            submit.mutate({ id: item.id, expectedVersion: item.version, answer })
+            if (invalid || sending.current || submit.isPending || submit.isSuccess || !question) {
+              return
+            }
+            sending.current = true
+            submit.mutate(
+              { id: item.id, expectedVersion: item.version, answer },
+              {
+                onSettled: () => {
+                  sending.current = false
+                },
+              },
+            )
           }}
         >
           <label htmlFor={inputId} className="block text-xs font-medium text-foreground">
@@ -57,7 +83,7 @@ export function LeadInputAnswer({ item }: { item: AttentionItem }) {
             value={answer}
             disabled={submit.isPending || submit.isSuccess || !question}
             aria-invalid={Boolean(validation)}
-            aria-describedby={`${helpId}${validation ? ` ${errorId}` : ''}`}
+            aria-describedby={`${helpId}${validation ? ` ${errorId}` : ''}${submit.error ? ` ${submitErrorId}` : ''}`}
             onChange={(event) => setAnswer(event.target.value)}
           />
           <p id={helpId} className="text-xs text-muted-foreground">
@@ -77,8 +103,8 @@ export function LeadInputAnswer({ item }: { item: AttentionItem }) {
             {submit.isPending ? 'Resolving…' : submit.isSuccess ? 'Answered' : 'Resolve'}
           </Button>
           {submit.error ? (
-            <p className="text-xs text-destructive" role="alert">
-              {getApiErrorMessage(submit.error, 'Could not answer the lead')}
+            <p id={submitErrorId} className="text-xs text-destructive" role="alert">
+              {submitErrorMessage(submit.error)}
             </p>
           ) : null}
         </form>

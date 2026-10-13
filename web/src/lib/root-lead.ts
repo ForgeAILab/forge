@@ -148,3 +148,23 @@ export function roleAssignmentErrorMessage(error: unknown): string | undefined {
   const code = getApiErrorCode(error)
   return code ? ROLE_ASSIGNMENT_ERRORS[code] : undefined
 }
+
+/**
+ * Whether a root Task holds its runs for its subtasks, so no run can be
+ * launched on it by hand. A coordination root runs its lead in the planning
+ * state and its aggregate reviewer in review; the server refuses any other
+ * run (`ensure_ordered_execution_admission`). `hasSubtasks` is the subtask
+ * list when it is loaded; the root's own wait on its subtasks and its own
+ * lead say the same without it.
+ */
+export function rootHoldsRuns(
+  task: Pick<Task, 'parent_task_id' | 'status' | 'effective_lead' | 'condition'>,
+  hasSubtasks: boolean,
+): boolean {
+  if (task.parent_task_id != null || task.status === 'review') return false
+  const condition = task.condition
+  const waitsOnSubtasks =
+    condition?.kind === 'parked' &&
+    [condition.primary, ...condition.additional].some((reason) => reason.kind === 'children')
+  return hasSubtasks || waitsOnSubtasks || task.effective_lead?.source === 'own'
+}

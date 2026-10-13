@@ -352,11 +352,10 @@ describe('MissionControlPage', () => {
       )
       fireEvent.change(screen.getByLabelText('Answer the lead'), { target: { value: 'Parser A' } })
       fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
-      expect(resolveAttention).toHaveBeenCalledExactlyOnceWith({
-        id: 'lead-input-1',
-        expectedVersion: 8,
-        answer: 'Parser A',
-      })
+      expect(resolveAttention).toHaveBeenCalledExactlyOnceWith(
+        { id: 'lead-input-1', expectedVersion: 8, answer: 'Parser A' },
+        expect.anything(),
+      )
     } finally {
       data.needs_attention = previous
       resolveAttention.mockClear()

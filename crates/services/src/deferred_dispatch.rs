@@ -39,6 +39,29 @@ pub(crate) struct QueuedRecovery {
     /// is nothing left to launch and the intent is dropped, not failed.
     #[serde(default)]
     pub continuation: bool,
+    /// The hierarchy refused this action's replay (its root was not
+    /// implementing, or an earlier sibling was unfinished). The action stays
+    /// accepted and is replayed when the subtask is next in its root's order.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaits_hierarchy: bool,
+}
+
+impl QueuedRecovery {
+    pub(crate) fn launches_role(&self) -> bool {
+        matches!(
+            self.request.offer.reason.as_str(),
+            "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
+        )
+    }
+
+    /// Whether replaying this action on a subtask needs the hierarchy to
+    /// admit the subtask: a role launch always does, and any other action
+    /// does once the hierarchy has refused it (a move to a working state).
+    /// An action that needs no admission (a retry of entry checks, a
+    /// decision that ends the subtask) is replayed whatever the root does.
+    pub(crate) fn needs_subtask_admission(&self) -> bool {
+        self.launches_role() || self.awaits_hierarchy
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

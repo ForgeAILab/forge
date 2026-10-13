@@ -1107,3 +1107,82 @@ impl ProjectRepo for SqliteDb {
         })
     }
 }
+
+impl SqliteDb {
+    pub async fn lock_primary_milestone_project_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        expected_project_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project SET version = version
+             WHERE id = ? AND version = ?",
+        )
+        .bind(project_id)
+        .bind(expected_project_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn set_primary_milestone_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        primary_milestone_id: Option<&str>,
+        now: &str,
+        project_id: &str,
+        expected_project_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project SET primary_milestone_id = ?, version = version + 1,
+                 updated_at = ? WHERE id = ? AND version = ?",
+        )
+        .bind(primary_milestone_id)
+        .bind(now)
+        .bind(project_id)
+        .bind(expected_project_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn primary_milestone_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let result = sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_one(connection)
+            .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repair_primary_milestone_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        replacement: Option<String>,
+        now: &str,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project SET primary_milestone_id = ?, version = version + 1,
+             updated_at = ? WHERE id = ? AND primary_milestone_id = ?",
+        )
+        .bind(replacement)
+        .bind(now)
+        .bind(project_id)
+        .bind(milestone_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

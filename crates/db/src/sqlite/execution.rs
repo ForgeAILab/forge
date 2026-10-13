@@ -2221,3 +2221,106 @@ pub(super) async fn projection_executions(
     let rows = query.build().fetch_all(&mut *connection).await?;
     rows.into_iter().map(map_execution).collect()
 }
+
+#[derive(Debug, Clone)]
+pub struct ActiveExecutionOperatorRow {
+    pub execution_id: String,
+    pub task_id: String,
+    pub task_title: Option<String>,
+    pub role: String,
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub workspace_id: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub started_at: String,
+    pub logs_path: Option<String>,
+    pub executor_config_snapshot_json: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn active_execution_operator_rows(
+        &self,
+    ) -> crate::Result<Vec<ActiveExecutionOperatorRow>> {
+        let rows = sqlx::query(
+            "SELECT
+                e.id AS execution_id,
+                e.task_id,
+                t.title AS task_title,
+                e.role,
+                e.agent_id,
+                a.name AS agent_name,
+                e.workspace_id,
+                e.agent_session_id,
+                e.created_at AS started_at,
+                e.logs_path,
+                e.executor_config_snapshot_json
+             FROM execution e
+             JOIN task t ON t.id = e.task_id
+             LEFT JOIN agent_current a ON a.id = e.agent_id
+             WHERE e.status = 'running'
+             ORDER BY e.created_at ASC, e.id ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ActiveExecutionOperatorRow {
+                    execution_id: row.try_get("execution_id")?,
+                    task_id: row.try_get("task_id")?,
+                    task_title: row.try_get("task_title")?,
+                    role: row.try_get("role")?,
+                    agent_id: row.try_get("agent_id")?,
+                    agent_name: row.try_get("agent_name")?,
+                    workspace_id: row.try_get("workspace_id")?,
+                    agent_session_id: row.try_get("agent_session_id")?,
+                    started_at: row.try_get("started_at")?,
+                    logs_path: row.try_get("logs_path")?,
+                    executor_config_snapshot_json: row.try_get("executor_config_snapshot_json")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecentFailedExecutionOperatorRow {
+    pub execution_id: String,
+    pub task_id: String,
+    pub error: Option<String>,
+    pub occurred_at: String,
+}
+
+impl SqliteDb {
+    pub async fn recent_failed_execution_operator_rows(
+        &self,
+        cutoff: &str,
+    ) -> crate::Result<Vec<RecentFailedExecutionOperatorRow>> {
+        let rows = sqlx::query(
+            "SELECT
+                e.id AS execution_id,
+                e.task_id,
+                e.error,
+                COALESCE(e.stopped_at, e.updated_at) AS occurred_at
+             FROM execution e INDEXED BY idx_execution_usage_failed_recent
+             JOIN task t ON t.id = e.task_id
+             WHERE e.status = 'failed'
+               AND t.deleted_at IS NULL
+               AND t.status NOT IN ('done', 'cancelled')
+               AND COALESCE(e.stopped_at, e.updated_at) >= ?
+             ORDER BY occurred_at DESC, e.id ASC",
+        )
+        .bind(cutoff)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RecentFailedExecutionOperatorRow {
+                    execution_id: row.try_get("execution_id")?,
+                    task_id: row.try_get("task_id")?,
+                    error: row.try_get("error")?,
+                    occurred_at: row.try_get("occurred_at")?,
+                })
+            })
+            .collect()
+    }
+}

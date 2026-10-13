@@ -314,3 +314,65 @@ impl SqliteDb {
             .transpose()
     }
 }
+
+impl SqliteDb {
+    pub async fn cleanup_attention_is_open_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM attention_projection
+                            WHERE dedupe_key = ? AND status <> 'resolved')",
+        )
+        .bind(dedupe_key)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_task_workspace_cleanup_attention(
+        &self,
+        now: &str,
+        task_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE attention_projection
+             SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                 updated_at = ?, version = version + 1
+             WHERE status <> 'resolved'
+               AND dedupe_key IN (SELECT 'workspace-cleanup:' || id FROM workspace
+                                  WHERE task_id = ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(task_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_workspace_cleanup_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE attention_projection
+                 SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                     updated_at = ?, version = version + 1
+                 WHERE dedupe_key = ? AND status <> 'resolved'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(dedupe_key)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

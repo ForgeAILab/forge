@@ -35,6 +35,10 @@ const item: AttentionItem = {
 
 beforeEach(() => {
   state.mutate.mockReset()
+  // The request settles at once, as far as the form's own guard is concerned.
+  state.mutate.mockImplementation((_input: unknown, options?: { onSettled?: () => void }) =>
+    options?.onSettled?.(),
+  )
   state.isPending = false
   state.isSuccess = false
   state.error = null
@@ -51,11 +55,10 @@ describe('answering a lead question', () => {
       target: { value: 'Use the existing parser.' },
     })
     fireEvent.click(resolve)
-    expect(state.mutate).toHaveBeenCalledExactlyOnceWith({
-      id: item.id,
-      expectedVersion: 7,
-      answer: 'Use the existing parser.',
-    })
+    expect(state.mutate).toHaveBeenCalledExactlyOnceWith(
+      { id: item.id, expectedVersion: 7, answer: 'Use the existing parser.' },
+      expect.anything(),
+    )
   })
 
   it('rejects blank and overlong answers, allowing both length boundaries', () => {
@@ -83,13 +86,15 @@ describe('answering a lead question', () => {
     fireEvent.change(screen.getByLabelText('Answer the lead'), {
       target: { value: 'Use parser A.' },
     })
-    state.error = new ApiError('raw body', 409, undefined, {
-      code: 'version_conflict',
-      message: 'This question changed. Refresh it.',
+    state.error = new ApiError('raw body', 400, undefined, {
+      code: 'INVALID_OPERATION',
+      message: 'Attention item has no question to answer',
       request_id: 'request-1',
     })
     view.rerender(<LeadInputAnswer item={item} />)
-    expect(screen.getByRole('alert').textContent).toContain('This question changed. Refresh it.')
+    expect(screen.getByRole('alert').textContent).toContain(
+      'Attention item has no question to answer',
+    )
     expect((screen.getByLabelText('Answer the lead') as HTMLTextAreaElement).value).toBe(
       'Use parser A.',
     )
