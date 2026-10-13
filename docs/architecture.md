@@ -6167,9 +6167,10 @@ nothing. An item whose root was deleted is closed by resolving it.
 
 | Root | Condition | Result | Mechanism |
 |---|---|---|---|
-| `planning`, the lead's run asked | the run ends | stays in `planning`; the run is not the gate's Accept and is not settled again | `maybe_cascade_executor_completion` (`lead_asked_input`); the snapshot leaves that run out of `terminal_execution` |
+| `planning`, the lead's run asked | the run ends, successfully, failed or cancelled | stays in `planning`; the run is not the gate's Accept and is not settled again or treated as a manual stop after the answer | `maybe_cascade_executor_completion` (`lead_asked_input`); the snapshot leaves that run out of `terminal_execution` |
 | `planning`, waiting | every pass, a restart | parked `human_decision { lead_input }`, owner the user; no lead run; subtasks `parent { cause: planning }` | `next_step` `human_wait` |
 | `planning`, waiting | the owner resolves the item with an answer (`POST …/attention/{id}/resolve` with `answer`) | the answer is a user comment on the root, the wait is cleared, the item resolved, the root woken; the lead runs again with its questions and the owner's answers in its input | `AttentionService::resolve_with_answer` → `lead::answer_lead_input`, then `Step::Role` |
+| `planning`, waiting, asking run still live | the owner holds the root, then releases it | the asking run stops; release clears the hold and keeps the question wait. The lead runs once after the answer, not at release | the Release action uses `release_to_dispatch_queue` for a pending lead-input wait |
 | any | the root leaves `planning` another way (Approve, move, cancel) | the wait is cleared and the item resolved | `lead::clear_lead_input_wait` in the transition |
 
 An answer is no transition, so it charges no re-plan. The loop "ask, answer,

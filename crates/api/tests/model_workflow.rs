@@ -48,7 +48,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock, Weak,
     },
     time::Duration,
 };
@@ -66,6 +66,7 @@ use executors::{
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
     ExecutorKind, LogKind, LogStream, LogWriter,
 };
+use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -112,6 +113,8 @@ enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     Create,
+    /// Build the breakdown before the first dispatcher pass.
+    CreateLeadRoot,
     CreateChild(usize),
     /// The first Task waits for the second.
     Depend(usize, usize),
@@ -130,6 +133,7 @@ enum Action {
     EditProject,
     /// Make the scripted lead the planner of the Task (a coordination root).
     AssignLead(usize),
+    RemoveLead(usize),
     /// Pause and resume the coder Agent.
     PauseAgent,
     ResumeAgent,
@@ -164,8 +168,8 @@ fn crash_after(action: Action) -> Step {
 
 fn generate(seed: u64, steps: usize) -> Vec<Step> {
     let mut rng = Rng(seed);
-    let mut sequence = vec![step(Action::Create)];
-    let mut tasks = 1_u64;
+    let mut sequence = vec![step(Action::CreateLeadRoot), step(Action::AssignLead(0))];
+    let mut tasks = 3_u64;
     while sequence.len() < steps {
         // Half of the picks go to the newest Task: older ones settle.
         let task = if rng.below(2) == 0 {
@@ -178,10 +182,13 @@ fn generate(seed: u64, steps: usize) -> Vec<Step> {
                 tasks += 1;
                 Action::Create
             }
-            // `CreateChild` is not generated yet: a long run with it enabled
-            // reaches the open subtask findings pinned by the ignored tests
-            // at the end of this file within a few dozen seeds.
             14 => Action::EditProject,
+            15 if tasks < 6 => {
+                tasks += 1;
+                Action::CreateChild(0)
+            }
+            16 => Action::AssignLead(0),
+            17 => Action::RemoveLead(0),
             18..=22 => Action::Depend(task, rng.below(tasks) as usize),
             23..=26 => Action::Claim(task),
             0..=57 => Action::Finish(
@@ -224,6 +231,8 @@ struct Script {
     /// Task ID -> the coder execution waiting for a model action.
     waiting: Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<Outcome>)>>,
     shared: Arc<Shared>,
+    db: Arc<db::SqliteDb>,
+    service: OnceLock<Weak<services::TaskService>>,
 }
 
 /// Survives restarts: it is the model's memory, not the server's.
@@ -235,6 +244,8 @@ struct Shared {
     /// root's deliverable, which the root's aggregate review checks.
     parents: Mutex<HashMap<usize, usize>>,
     writes: AtomicU64,
+    lead_operations: Mutex<Vec<String>>,
+    lead_operation_errors: Mutex<Vec<String>>,
 }
 
 struct ScriptedAdapter(Arc<Script>);
@@ -345,6 +356,87 @@ const LEAD_PROMPT_MARK: &str = "You are the lead of this Forge coordination root
 const LEAD_AGENT_ID: &str = "model-lead";
 
 impl ScriptedAdapter {
+    async fn replan_operations(&self, ctx: &ExecutionContext) -> Result<(), ExecutorError> {
+        let db = &self.0.db;
+        let replanning: bool = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT bridge_kind='replan' FROM transition_log WHERE task_id=? AND to_state='planning' ORDER BY rowid DESC LIMIT 1), 0)"
+        ).bind(&ctx.task_id).fetch_one(db.pool()).await
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
+        if !replanning {
+            return Ok(());
+        }
+        let service = self
+            .0
+            .service
+            .get()
+            .and_then(Weak::upgrade)
+            .expect("live model service");
+        let read = lead_call(
+            db,
+            &service,
+            LEAD_AGENT_ID,
+            &ctx.task_id,
+            "lead.read",
+            json!({}),
+            &format!("{}:read", ctx.execution_id),
+        )
+        .await
+        .map_err(|e| ExecutorError::Other(e.to_string()))?;
+        let children = read["subtasks"].as_array().expect("lead reads subtasks");
+        let mut calls = vec![(
+            "lead.subtask",
+            json!({"action":"create", "title":"model lead fix", "description":"finish the root deliverable"}),
+        )];
+        if let Some(child) = children.iter().find(|c| c["lead_decides_park"] == true) {
+            calls.push(("lead.recover", json!({"task_id":child["task_id"], "version":child["version"], "action":{"verb":"retry"}})));
+        }
+        if let Some(child) = children
+            .iter()
+            .find(|c| c["started"] == false && c["status"] == "todo")
+        {
+            calls.push(("lead.subtask", json!({"action":"cancel", "task_id":child["task_id"], "version":child["version"], "reason":"replaced by the lead fix"})));
+        }
+        for (n, (operation, payload)) in calls.into_iter().enumerate() {
+            let result = lead_call(
+                db,
+                &service,
+                LEAD_AGENT_ID,
+                &ctx.task_id,
+                operation,
+                payload,
+                &format!("{}:op:{n}", ctx.execution_id),
+            )
+            .await;
+            let value = match result {
+                Ok(value) => value,
+                Err(error) if error.to_string().contains("lead_limit_reached") => continue,
+                Err(error) => {
+                    return Err(ExecutorError::Other(format!(
+                        "model lead operation: {error}"
+                    )))
+                }
+            };
+            self.0.shared.lead_operations.lock().unwrap().push(format!(
+                "{operation}:{}",
+                value["action"].as_str().unwrap_or("retry")
+            ));
+            if operation == "lead.subtask" && value["action"] == "create" {
+                let id = value["task_id"].as_str().expect("created id").to_owned();
+                let mut index = self.0.shared.index.lock().unwrap();
+                let next = index.len();
+                let root = index[&ctx.task_id];
+                let child_index = *index.entry(id).or_insert(next);
+                self.0
+                    .shared
+                    .parents
+                    .lock()
+                    .unwrap()
+                    .insert(child_index, root);
+            }
+        }
+        Ok(())
+    }
+
     /// The lead's step check of a subtask: a result block with the verdict
     /// the model scripted for that subtask (`Action::Verdict`; pass when
     /// nothing is scripted).
@@ -371,6 +463,108 @@ impl ScriptedAdapter {
             .await?;
         Ok(())
     }
+}
+
+/// The native Task session of `agent` on `task_id`, created once.
+async fn session(db: &db::SqliteDb, agent: &str, task_id: &str) -> String {
+    let runtime = format!("runtime:{agent}:{task_id}");
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session WHERE runtime_session_id=?)")
+            .bind(&runtime)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    if exists {
+        return runtime;
+    }
+    let (profile, project): (String, String) = sqlx::query_as(
+        "SELECT i.selected_profile_id, t.project_id FROM agent_identity i, task t WHERE i.id=? AND t.id=?",
+    )
+    .bind(agent)
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let now = db::now_rfc3339();
+    let scope = db::new_uuid_v4();
+    db::AgentContextScopeRepo::create_context_scope(
+        db,
+        db::CreateAgentContextScope {
+            id: scope.clone(),
+            identity_id: agent.to_owned(),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.to_owned(),
+            project_id: Some(project),
+            task_id: Some(task_id.to_owned()),
+            task_role: Some("planner".to_owned()),
+            workspace_access: "task_read".to_owned(),
+            authority_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            workspace_path: None,
+        },
+    )
+    .await
+    .expect("context scope creates");
+    db::AgentSessionRepo::create_agent_session(
+        db,
+        db::CreateAgentSession {
+            id: db::new_uuid_v4(),
+            identity_id: agent.to_owned(),
+            profile_id: profile,
+            context_scope_id: scope,
+            backend_kind: "native".to_owned(),
+            runtime_session_id: Some(runtime.clone()),
+            status: "running".to_owned(),
+            capabilities_json: "{}".to_owned(),
+            connection_status: "healthy".to_owned(),
+            predecessor_session_id: None,
+            last_activity_at: Some(now.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("agent session creates");
+    runtime
+}
+
+fn task_scope(task_id: &str) -> CanonicalScope {
+    CanonicalScope {
+        scope_type: CanonicalScopeType::Task,
+        scope_id: task_id.to_owned(),
+        workspace_access: WorkspaceAccess::TaskRead,
+    }
+}
+
+/// One lead operation, as the native host issues it for the run of `agent`
+/// on `task_id`.
+async fn lead_call(
+    db: &Arc<db::SqliteDb>,
+    service: &Arc<services::TaskService>,
+    agent: &str,
+    task_id: &str,
+    operation: &str,
+    payload: Value,
+    key: &str,
+) -> std::result::Result<Value, forge_agent_host::AgentHostError> {
+    let runtime = session(db, agent, task_id).await;
+    let provider = services::CoordinationToolProvider::new(Arc::clone(db));
+    provider.set_task_service(Arc::clone(service));
+    ForgeToolProvider::propose(
+        &provider,
+        agent,
+        &task_scope(task_id),
+        &runtime,
+        operation,
+        json!({"operation": operation, "payload": payload, "dedupe_key": key, "correlation_id": key}),
+    )
+    .await
+    // The host wraps a command's value in its outcome envelope.
+    .map(|value| match value.get("result") {
+        Some(result) if result.is_object() => result.clone(),
+        _ => value,
+    })
 }
 
 impl World {
@@ -408,7 +602,7 @@ impl World {
                 paused: false,
                 owner_id: None,
                 visibility: "global".to_owned(),
-                account_permission_ceiling: "{}".to_owned(),
+                account_permission_ceiling: r#"["read_task","read_memory","task_read"]"#.to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -423,7 +617,7 @@ impl World {
                 permission_policy: None,
                 prompt_template: None,
                 capabilities_json: "{}".to_owned(),
-                tool_policy_json: "{}".to_owned(),
+                tool_policy_json: r#"["read_task","read_memory","task_read"]"#.to_owned(),
                 config_json: "{}".to_owned(),
                 credential_ref: None,
                 daemon_id,
@@ -470,12 +664,21 @@ impl World {
     /// One model step outside `run`: the action, then every invariant of a
     /// committed and of a quiescent state.
     async fn lead_step(&mut self, action: Action) -> Result<String, String> {
-        let applied = self.apply(&action).await?;
-        self.check_committed().await?;
-        self.quiesce().await?;
-        let state = self.check_quiescent().await?;
-        self.trace.push(format!("{action:?} -> {applied}: {state}"));
-        Ok(applied)
+        let result: Result<String, String> = async {
+            let applied = self.apply(&action).await?;
+            self.check_committed().await?;
+            self.quiesce().await?;
+            let state = self.check_quiescent().await?;
+            self.trace.push(format!("{action:?} -> {applied}: {state}"));
+            Ok(applied)
+        }
+        .await;
+        result.map_err(|error| {
+            format!(
+                "{error}\nfailing action: {action:?}\ntrace: {:#?}",
+                self.trace
+            )
+        })
     }
 
     async fn lead_count(&self, sql: &str) -> Result<i64, String> {
@@ -629,6 +832,215 @@ async fn a_root_with_a_lead_plans_and_has_every_step_checked() {
     }
 }
 
+/// Exhaust the real step gate, then the replanning lead creates a fix,
+/// recovers the parked step and cancels the untouched suffix via native tools.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replanning_lead_uses_real_operations() {
+    let mut world = World::new().await;
+    world.create(None).await.unwrap();
+    world.create(Some(0)).await.unwrap();
+    world.create(Some(0)).await.unwrap();
+    for action in [
+        Action::AssignLead(0),
+        Action::Finish(0, Outcome::Success),
+        Action::Verdict(1, false),
+    ] {
+        world.lead_step(action).await.unwrap();
+    }
+    for _ in 0..3 {
+        world
+            .lead_step(Action::Finish(1, Outcome::Success))
+            .await
+            .unwrap();
+        if world.waiting(1) {
+            world
+                .lead_step(Action::Finish(1, Outcome::Success))
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        world.task(0).await.unwrap()["status"],
+        "planning",
+        "{:?}",
+        world.trace
+    );
+    assert_eq!(
+        world
+            .lead_count("SELECT SUM(spent) FROM task_budget WHERE kind='replan'")
+            .await
+            .unwrap(),
+        1
+    );
+    world
+        .lead_step(Action::Finish(0, Outcome::Success))
+        .await
+        .unwrap();
+    assert_eq!(
+        *world.shared.lead_operations.lock().unwrap(),
+        [
+            "lead.subtask:create",
+            "lead.recover:retry",
+            "lead.subtask:cancel"
+        ]
+    );
+    assert_eq!(world.tasks.len(), 4);
+    assert_eq!(world.task(2).await.unwrap()["status"], "cancelled");
+    assert_eq!(world.task(0).await.unwrap()["status"], "in_progress");
+    world.lead_step(Action::Verdict(1, true)).await.unwrap();
+    world.drive_to_settlement().await.unwrap();
+    assert_eq!(world.task(0).await.unwrap()["status"], "done");
+    assert_eq!(world.task(3).await.unwrap()["status"], "done");
+}
+
+/// Different submitted steps consume one root's full re-plan window. Each
+/// allowed re-plan performs native lead operations; the sixth trigger parks
+/// the root instead of admitting another planning run or another debit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replanning_lead_operations_stop_at_the_root_budget() {
+    let mut world = World::new().await;
+    world.create(None).await.unwrap();
+    world.create(Some(0)).await.unwrap();
+    world.create(Some(0)).await.unwrap();
+    world.lead_step(Action::AssignLead(0)).await.unwrap();
+    world
+        .lead_step(Action::Finish(0, Outcome::Success))
+        .await
+        .unwrap();
+    let mut child = 1;
+    for round in 1..=6 {
+        world
+            .lead_step(Action::Verdict(child, false))
+            .await
+            .unwrap();
+        // Five actions from a worker (or four from a recovered check)
+        // exhaust the gate. Stop before Finish's fallback could open the
+        // root's planning run instead of this child's run.
+        for _ in 0..6 {
+            let root = world.task(0).await.unwrap();
+            if root["status"] == "planning"
+                || root["condition"]["primary"]["budget_kind"] == "replan"
+            {
+                break;
+            }
+            assert!(world.waiting(child), "the submitted step owns the next run");
+            world
+                .lead_step(Action::Finish(child, Outcome::Success))
+                .await
+                .unwrap();
+        }
+        let root = world.task(0).await.unwrap();
+        if round == 6 {
+            assert_eq!(root["status"], "in_progress");
+            assert_eq!(
+                root["condition"]["primary"]["kind"], "budget_exhausted",
+                "{root}"
+            );
+            assert_eq!(
+                root["condition"]["primary"]["budget_kind"], "replan",
+                "{root}"
+            );
+            assert!(!world.waiting(0));
+            break;
+        }
+        assert_eq!(root["status"], "planning", "{root}");
+        world
+            .lead_step(Action::Finish(0, Outcome::Success))
+            .await
+            .unwrap();
+        assert_eq!(world.task(0).await.unwrap()["status"], "in_progress");
+        let next = world.tasks.len() - 1;
+        world.lead_step(Action::Verdict(child, true)).await.unwrap();
+        // Retry validates the existing work first. If the product instead
+        // needs an implementation run, finish that and its check too.
+        for _ in 0..2 {
+            if world.task(child).await.unwrap()["status"] == "done" {
+                break;
+            }
+            assert!(world.waiting(child));
+            world
+                .lead_step(Action::Finish(child, Outcome::Success))
+                .await
+                .unwrap();
+        }
+        assert_eq!(world.task(child).await.unwrap()["status"], "done");
+        child = next;
+    }
+    assert_eq!(
+        world
+            .lead_count("SELECT SUM(spent) FROM task_budget WHERE kind='replan'")
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        world
+            .lead_count("SELECT COUNT(*) FROM task_budget_charge WHERE kind='replan'")
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        world
+            .lead_count("SELECT COUNT(*) FROM transition_log WHERE bridge_kind='replan'")
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        world
+            .shared
+            .lead_operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.as_str() == "lead.subtask:create")
+            .count(),
+        5
+    );
+    world.check_quiescent().await.unwrap();
+}
+
+/// A lead retries the exhausted gate, which validates the existing work.
+/// Another failing verdict must stay within the gate's current window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_validation_after_lead_recovery_respects_the_step_budget() {
+    let mut world = World::new().await;
+    world.create(None).await.unwrap();
+    world.create(Some(0)).await.unwrap();
+    world.create(Some(0)).await.unwrap();
+    world.lead_step(Action::AssignLead(0)).await.unwrap();
+    world
+        .lead_step(Action::Finish(0, Outcome::Success))
+        .await
+        .unwrap();
+    world.lead_step(Action::Verdict(1, false)).await.unwrap();
+    for _ in 0..3 {
+        world
+            .lead_step(Action::Finish(1, Outcome::Success))
+            .await
+            .unwrap();
+        if world.waiting(1) {
+            world
+                .lead_step(Action::Finish(1, Outcome::Success))
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(world.task(0).await.unwrap()["status"], "planning");
+    world
+        .lead_step(Action::Finish(0, Outcome::Success))
+        .await
+        .unwrap();
+    assert!(world.waiting(1), "recovery starts the validation check");
+    // Keep the failed verdict instead of passing the recovered validation.
+    world
+        .lead_step(Action::Finish(1, Outcome::Success))
+        .await
+        .unwrap();
+    world.check_quiescent().await.unwrap();
+}
+
 fn result(status: ExecutionOutcome, error: Option<&str>) -> ExecutionResult {
     ExecutionResult {
         status,
@@ -693,11 +1105,21 @@ impl CodingExecutorAdapter for ScriptedAdapter {
                 retry_after: Some(Duration::from_millis(1)),
                 usage_reports: Vec::new(),
             }),
-            // The lead's runs are read-only: on its root it reports, on a
-            // subtask it ends with the scripted verdict; it writes nothing.
+            // The step check reports a verdict. On a re-plan the lead uses
+            // the native tool boundary to change the breakdown.
             Ok(_) if lead_run => {
                 if step_check {
                     self.step_check(&ctx).await?;
+                } else {
+                    if let Err(error) = self.replan_operations(&ctx).await {
+                        self.0
+                            .shared
+                            .lead_operation_errors
+                            .lock()
+                            .unwrap()
+                            .push(error.to_string());
+                        return Err(error);
+                    }
                 }
                 Ok(result(ExecutionOutcome::Completed, None))
             }
@@ -1064,6 +1486,8 @@ impl World {
             alive: AtomicBool::new(true),
             waiting: Mutex::default(),
             shared: Arc::clone(shared),
+            db: Arc::clone(&db),
+            service: OnceLock::new(),
         });
         let mut registry = executors::AdapterRegistry::new();
         registry.register(Box::new(ScriptedAdapter(Arc::clone(&script))));
@@ -1098,6 +1522,7 @@ impl World {
             .with_bcrypt_cost(api::state::test_bcrypt_cost())
             .build(),
         );
+        let _ = script.service.set(Arc::downgrade(&runtime.task_service));
         let state = AppState::from_runtime_arc(Arc::clone(&runtime), true);
         let app = build_router(state.clone(), dir.join("web"));
         let (stop, signal) = tokio::sync::watch::channel(false);
@@ -1577,6 +2002,13 @@ impl World {
         let count = self.tasks.len();
         let pick = |index: usize| (count > 0).then(|| index % count);
         match action {
+            Action::CreateLeadRoot => {
+                let root = self.tasks.len();
+                self.create(None).await?;
+                self.create(Some(root)).await?;
+                self.create(Some(root)).await?;
+                self.assign_lead(root).await
+            }
             Action::Create => self.create(None).await,
             Action::CreateChild(parent) => match pick(*parent) {
                 Some(parent) => self.create(Some(parent)).await,
@@ -1718,6 +2150,23 @@ impl World {
                 Some(task) => self.assign_lead(task).await,
                 None => Ok("skipped".to_owned()),
             },
+            Action::RemoveLead(task) => match pick(*task) {
+                Some(task) => {
+                    let (status, body) = self
+                        .request(
+                            Method::DELETE,
+                            &format!("/api/v1/tasks/{}/roles/planner", self.tasks[task]),
+                            None,
+                        )
+                        .await?;
+                    Ok(if status.is_success() {
+                        "lead removed".to_owned()
+                    } else {
+                        format!("refused {status} {}", body["code"])
+                    })
+                }
+                None => Ok("skipped".to_owned()),
+            },
             Action::AdvanceClock => Ok(format!(
                 "{} deadline(s) passed",
                 self.move_deadlines(true).await?
@@ -1842,7 +2291,7 @@ impl World {
 
     /// Invariant (d): run the step worker and the dispatcher until nothing
     /// changes. Not settling within the bound is a livelock.
-    async fn quiesce(&self) -> Result<(), String> {
+    async fn quiesce(&mut self) -> Result<(), String> {
         let mut last = String::new();
         let mut stable = 0;
         let mut unowned = Vec::new();
@@ -1853,6 +2302,7 @@ impl World {
             if round >= QUIESCENCE_BOUND && started.elapsed() >= QUIESCENCE_PATIENCE {
                 break;
             }
+            self.sync_lead_tasks();
             self.move_deadlines(false).await?;
             for (index, id) in self.tasks.iter().enumerate() {
                 self.drain(id).await.map_err(|error| {
@@ -1897,8 +2347,26 @@ impl World {
         ))
     }
 
+    fn sync_lead_tasks(&mut self) {
+        let mut indexed: Vec<_> = self
+            .shared
+            .index
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, index)| (*index, id.clone()))
+            .collect();
+        indexed.sort_by_key(|(index, _)| *index);
+        self.tasks = indexed.into_iter().map(|(_, id)| id).collect();
+    }
+
     /// The invariants that hold in every committed state.
     async fn check_committed(&mut self) -> Result<(), String> {
+        if let Some(error) = self.shared.lead_operation_errors.lock().unwrap().first() {
+            return Err(format!(
+                "scripted lead operation failed through the native entry: {error}"
+            ));
+        }
         // (e) the condition invariant the code already asserts.
         let violations = self
             .live()
@@ -1953,10 +2421,9 @@ impl World {
     /// (m) and (n) bind where a root has a lead: `Action::AssignLead` and
     /// the scripted lead exist, and `a_root_with_a_lead_plans_and_has_every_
     /// step_checked` runs every invariant on states with a live step check, a
-    /// returned step and a charged `gate:lead_check`. No random sequence
-    /// assigns a lead yet (as none creates a subtask), so in those they stay
-    /// vacuous; the lead cases are also proven at the dispatcher level, in
-    /// `services::task_dispatcher::tests::lead_check`.
+    /// returned step and a charged `gate:lead_check`. Random sequences also
+    /// create coordination roots, assign/remove leads and run their operations.
+    /// The operation corpus exhausts the check budget and recovers the step.
     async fn check_step_checks(&self, quiescent: bool) -> Result<(), String> {
         let pool = &self.live().pool;
         let rows = |sql: &'static str| async move {
@@ -2047,15 +2514,10 @@ impl World {
     /// state has no subtask left to run, so a re-plan can add work only
     /// before the root returns to implementation.
     ///
-    /// What is real and what is vacuous here. The "nobody without a lead"
-    /// half of (l) is real: every root in the model is such a root, and a
-    /// charge or a `replan` entry on any of them fails it. (o) is real for
-    /// the same roots. The accounting half of (l) (limit, receipts, charge
-    /// against entry) is VACUOUS until the harness has a lead
-    /// (`Action::AssignLead` and a scripted native planner): it is proven at
-    /// the dispatcher level in `services::task_dispatcher::tests::
-    /// root_replan` (one charge per trigger, the crash window, the sixth
-    /// re-plan, the Review budget untouched).
+    /// Both halves of (l), and (o), bind on the operation corpus: a real
+    /// re-plan charges its receipt, and the lead creates, recovers and cancels
+    /// subtasks before the root returns to implementation and aggregate review.
+    /// Random sequences additionally assign and remove the lead.
     async fn check_replans(&self, quiescent: bool) -> Result<(), String> {
         let pool = &self.live().pool;
         let rows = |sql: &'static str| async move {
@@ -2140,12 +2602,9 @@ impl World {
     /// the same roots. (i), (j) and the lead halves of (h) and (k) bind where
     /// a root has a lead: `a_root_with_a_lead_plans_and_has_every_step_
     /// checked` (`Action::AssignLead`, the scripted lead) checks them on a
-    /// root that rests in `planning` with its lead's run live. No random
-    /// sequence assigns a lead yet, so there they stay vacuous; the lead
-    /// cases are also proven at the dispatcher level, in
-    /// `services::task_dispatcher::tests::root_lead` (the upgrade matrix and
-    /// the lead-removed-while-planning case, which checks (g) and (h) with a
-    /// running planner).
+    /// root that rests in `planning` with its lead's run live. They also bind
+    /// during the operation corpus's re-plan and in random sequences, which
+    /// create coordination roots and assign/remove leads.
     async fn check_roots(&self, quiescent: bool) -> Result<(), String> {
         let pool = &self.live().pool;
         let rows = |sql: &'static str| async move {
@@ -2799,6 +3258,10 @@ async fn run(sequence: &[Step], avoid_open_findings: bool) -> Result<Vec<String>
     .await;
     if outcome.is_err() {
         world.record_history().await;
+    }
+    let operations = world.shared.lead_operations.lock().unwrap().clone();
+    if !operations.is_empty() {
+        world.trace.push(format!("lead operations: {operations:?}"));
     }
     // Leave nothing running behind the temporary directory.
     if let Some(live) = world.live.take() {

@@ -7990,3 +7990,129 @@ async fn a_parked_daemon_attempt_rebinds_after_runtime_or_placement_recovery() {
         let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     }
 }
+
+/// The real daemon owns an opaque workspace handle; prompt loading must
+/// request its diff and must keep working when that owner goes offline.
+#[tokio::test]
+async fn remote_step_check_prompt_carries_owner_diff_and_offline_fallback() {
+    use services::workflow::dispatch::{
+        build_effective_prompt,
+        loader::{load_agent_dispatch_context, DispatchContextParams},
+        StepDiff,
+    };
+    let mut fixture = Fixture::new("forge-remote-step-diff").await;
+    let db = Arc::clone(&fixture.harness.state.db);
+    let root = TaskRepo::get_by_id(&*db, &fixture.resolved.placement.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = db::now_rfc3339();
+    sqlx::query("UPDATE workspace SET before_sha=? WHERE id=?")
+        .bind(&fixture.base_sha)
+        .bind(&fixture.resolved.placement.workspace_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let step = TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: root.project_id.clone(),
+            parent_task_id: Some(root.id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "remote step".to_owned(),
+            description: Some("deliver the daemon-side change".to_owned()),
+            task_type: "task".to_owned(),
+            status: "lead_check".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let changed = fixture.run("printf 'only the daemon owns this change\n' > remote-step.txt; git add remote-step.txt; git commit -m step").await;
+    assert_eq!(changed.exit_code, 0);
+    let workflow = services::workflow::inherited_subtask_workflow::inherited_subtask_workflow();
+    let context = async || {
+        load_agent_dispatch_context(DispatchContextParams {
+            db: Arc::clone(&db),
+            router: &fixture.harness.state.workspace_backend_router,
+            task_id: &step.id,
+            role: "planner",
+            state_name: "lead_check",
+            state_config: json!({}),
+            execution_policy: None,
+            workflow: &workflow,
+        })
+        .await
+        .expect("diff availability never fails prompt loading")
+    };
+    let loaded = context().await;
+    assert!(
+        matches!(&loaded.step_diff,Some(StepDiff::Loaded { diff, .. }) if diff.contains("+only the daemon owns this change"))
+    );
+    let (prompt, selection) = build_effective_prompt(&loaded, None, None);
+    assert_eq!(
+        selection.builder_id,
+        services::workflow::dispatch::BUILDER_ID_PLANNER_STEP_CHECK_V1
+    );
+    assert!(
+        prompt.user.contains("+++ b/remote-step.txt")
+            && prompt.user.contains("+only the daemon owns this change"),
+        "{}",
+        prompt.user
+    );
+    assert!(prompt.user.contains("the root's branch point"));
+    assert!(
+        !prompt.system.contains("remote-step.txt"),
+        "the diff is run input, not the role contract"
+    );
+    let requests = fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .requests(METHOD_WORKSPACE_DIFF);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["placement_id"], fixture.resolved.placement.id);
+    fixture.assert_server_cannot_resolve_workspace();
+
+    // Drop the socket and wait for the server to see the offline owner.
+    fixture.link.take();
+    common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
+    let offline = load_agent_dispatch_context(DispatchContextParams {
+        db: Arc::clone(&db),
+        router: &fixture.harness.state.workspace_backend_router,
+        task_id: &step.id,
+        role: "planner",
+        state_name: "lead_check",
+        state_config: json!({}),
+        execution_policy: None,
+        workflow: &workflow,
+    })
+    .await
+    .expect("the missing owner is represented in the prompt");
+    assert!(matches!(
+        offline.step_diff,
+        Some(StepDiff::Unavailable { .. })
+    ));
+    let (prompt, _) = build_effective_prompt(&offline, None, None);
+    assert!(
+        prompt
+            .user
+            .contains("The step's diff could not be loaded (")
+            && prompt
+                .user
+                .contains("Read the step's changes in the workspace."),
+        "{}",
+        prompt.user
+    );
+    assert!(!prompt.user.contains("+++ b/remote-step.txt"));
+    assert!(!fixture.inaccessible_server_path.exists());
+}

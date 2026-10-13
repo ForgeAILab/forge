@@ -1091,3 +1091,302 @@ async fn upgrade_matrix_every_root_and_subtask_state_is_owned() {
     }
     eprintln!("REPORT upgrade matrix:\n{table}");
 }
+
+/// All-cancelled is a complete sequence. The aggregate gate is entered in
+/// both modes. With no candidate a configured reviewer is refused; an
+/// unassigned, check-less gate passes exactly as in the pre-feature product.
+#[tokio::test]
+async fn all_cancelled_subtasks_enter_aggregate_review_with_and_without_a_lead() {
+    for with_lead in [false, true] {
+        for with_reviewer in [false, true] {
+            let lead = lead_fixture(true).await;
+            let root = seed_task(&lead.db, &lead.project, "root", "todo", 1).await;
+            for order in 0..2 {
+                seed_subtask(&lead.db, &root, "cancelled step", "cancelled", order).await;
+            }
+            if with_lead {
+                assign_role(&lead.db, &root.id, "planner", &lead.planner).await;
+            }
+            if with_reviewer {
+                assign_role(&lead.db, &root.id, "reviewer", &lead.coder).await;
+            }
+            until(&lead, "the aggregate review gate is entered", async || {
+                super::root_replan::log(&lead, &root.id)
+                    .await
+                    .iter()
+                    .any(|(_, to, _)| to == "review")
+            })
+            .await;
+            if with_reviewer {
+                // No implementation ever ran: review is entered, but the
+                // configured reviewer has no candidate to review.
+                until(
+                    &lead,
+                    "the missing aggregate candidate is stated",
+                    async || {
+                        serde_json::to_value(reload(&lead.db, &root.id).await.condition.public())
+                            .unwrap()["primary"]["kind"]
+                            == "dispatch_refusal"
+                    },
+                )
+                .await;
+                let task = reload(&lead.db, &root.id).await;
+                assert_eq!(task.status, "review");
+                assert!(task
+                    .metadata_json
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no implementation execution to review"));
+                assert!(ReviewRepo::list_by_task(&*lead.db, &root.id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            } else {
+                until(&lead, "the unconfigured review passes", async || {
+                    super::root_replan::log(&lead, &root.id)
+                        .await
+                        .iter()
+                        .any(|(from, to, _)| from == "review" && to == "merging")
+                })
+                .await;
+                assert!(
+                    ReviewRepo::list_by_task(&*lead.db, &root.id)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "an ordinary empty gate creates no Review attempt"
+                );
+            }
+            passes(&lead, 4).await;
+            let hops = super::root_replan::log(&lead, &root.id).await;
+            assert_eq!(
+                hops.iter().filter(|(_, to, _)| to == "review").count(),
+                1,
+                "{hops:?}"
+            );
+            assert!(
+                hops.iter()
+                    .filter(|(_, to, _)| to == "merging")
+                    .all(|(from, _, _)| from == "review"),
+                "{hops:?}"
+            );
+            let runs = executions(&lead.db, &root.id).await;
+            assert_eq!(
+                runs.iter().filter(|(role, _)| role == "planner").count(),
+                usize::from(with_lead)
+            );
+            assert_eq!(
+                runs.iter().filter(|(role, _)| role == "reviewer").count(),
+                0,
+                "cancelled work supplied no candidate"
+            );
+            let child_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution e JOIN task t ON e.task_id=t.id WHERE t.parent_task_id=?")
+                .bind(&root.id).fetch_one(lead.db.pool()).await.unwrap();
+            assert_eq!(child_runs, 0);
+        }
+    }
+}
+
+struct PausedPlanningExecutor {
+    db: Arc<db::SqliteDb>,
+    sender: mpsc::UnboundedSender<ExecutionContext>,
+    finish: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl TaskExecutor for PausedPlanningExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        let role = ExecutionRepo::get_by_id(&*self.db, &ctx.execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .role;
+        let _ = self.sender.send(ctx);
+        if role == "planner" {
+            let finish = self.finish.lock().unwrap().take();
+            if let Some(finish) = finish {
+                finish.await.unwrap();
+                return Ok(ExecutionResult {
+                    status: executors::ExecutionOutcome::Failed,
+                    error: Some("planning interrupted by provider failure".to_owned()),
+                    ..Default::default()
+                });
+            }
+        }
+        pending::<()>().await;
+        unreachable!()
+    }
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_lead_paused_mid_planning_parks_typed_but_a_failed_run_needs_owner_retry() {
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let mut lead = fixture_with(|db, sender| {
+        Arc::new(PausedPlanningExecutor {
+            db,
+            sender,
+            finish: std::sync::Mutex::new(Some(wait)),
+        })
+    })
+    .await;
+    let (root, child) = root_with_child(&lead, true).await;
+    until(&lead, "the planner runs", async || {
+        executions(&lead.db, &root.id).await == [("planner".to_owned(), "running".to_owned())]
+    })
+    .await;
+    let ctx = tokio::time::timeout(Duration::from_secs(5), lead.rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ctx.task_id, root.id,
+        "pause happens inside the planning run, after launch"
+    );
+    db::AgentRepo::set_paused(&*lead.db, &lead.planner, true)
+        .await
+        .unwrap();
+    passes(&lead, 3).await;
+    assert_eq!(
+        executions(&lead.db, &root.id).await,
+        [("planner".to_owned(), "running".to_owned())],
+        "pause allows the admitted run to finish"
+    );
+    finish.send(()).unwrap();
+    until(&lead, "the failed run ends", async || {
+        executions(&lead.db, &root.id).await == [("planner".to_owned(), "failed".to_owned())]
+    })
+    .await;
+    let task = reload(&lead.db, &root.id).await;
+    if let Some(mut deferred) = task
+        .metadata_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .map(|m| m["deferred_dispatch"].clone())
+        .filter(serde_json::Value::is_object)
+    {
+        deferred["not_before"] = serde_json::json!("1970-01-01T00:00:00Z");
+        TaskRepo::mutate_metadata(
+            &*lead.db,
+            &root.id,
+            None,
+            vec![db::TaskMetadataMutation::Set {
+                key: "deferred_dispatch".to_owned(),
+                value: deferred,
+            }],
+            &now_rfc3339(),
+        )
+        .await
+        .unwrap();
+    }
+    until(&lead, "the root parks on its paused lead", async || {
+        serde_json::to_value(reload(&lead.db, &root.id).await.condition.public()).unwrap()
+            ["primary"]["kind"]
+            == "agent"
+    })
+    .await;
+    let condition =
+        serde_json::to_value(reload(&lead.db, &root.id).await.condition.public()).unwrap();
+    assert_eq!(condition["primary"]["agent_id"], lead.planner);
+    assert_eq!(condition["primary"]["status"], "paused");
+    assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
+    assert!(executions(&lead.db, &child.id).await.is_empty());
+    passes(&lead, 4).await;
+    assert_eq!(executions(&lead.db, &root.id).await.len(), 1);
+    db::AgentRepo::set_paused(&*lead.db, &lead.planner, false)
+        .await
+        .unwrap();
+    passes(&lead, 5).await;
+    assert_eq!(
+        executions(&lead.db, &root.id).await.len(),
+        1,
+        "resuming the Agent does not retry an ordinary failed planner"
+    );
+    let task = reload(&lead.db, &root.id).await;
+    assert!(
+        matches!(task.condition, db::TaskCondition::Clear { .. }),
+        "current product finding: the failed planner has no typed manual-retry park"
+    );
+    let offered = lead
+        .dispatcher
+        .task_service
+        .test_action_values(&root.id)
+        .await
+        .unwrap();
+    let retry = offered
+        .into_iter()
+        .find(|action| matches!(action, api_types::TaskAction::Retry { .. }))
+        .expect("owner has Retry Planning");
+    lead.dispatcher
+        .task_service
+        .perform_task_action(&root.id, retry, task.version)
+        .await
+        .unwrap();
+    until(&lead, "the owner's retry resumes planning", async || {
+        executions(&lead.db, &root.id).await.len() == 2
+    })
+    .await;
+    assert_eq!(
+        executions(&lead.db, &root.id).await.last().unwrap(),
+        &("planner".to_owned(), "running".to_owned())
+    );
+    assert!(executions(&lead.db, &child.id).await.is_empty());
+}
+
+/// Pause after planning entry admitted its run, before the provider launches.
+/// This pause is a typed Agent wait; resume alone starts exactly one run.
+#[tokio::test]
+async fn a_lead_paused_during_planning_admission_parks_typed_and_resumes_once() {
+    let lead = lead_fixture(false).await;
+    let (root, child) = root_with_child(&lead, true).await;
+    sqlx::query(&format!("CREATE TRIGGER pause_planning_lead AFTER INSERT ON workspace_lease WHEN NEW.task_id='{}' BEGIN UPDATE agent_identity SET paused=1,version=version+1 WHERE id='{}'; END",root.id,lead.planner))
+        .execute(lead.db.pool()).await.unwrap();
+    until(
+        &lead,
+        "the planning root parks on its paused Agent",
+        async || {
+            let condition =
+                serde_json::to_value(reload(&lead.db, &root.id).await.condition.public()).unwrap();
+            condition["primary"]["kind"] == "agent" && condition["primary"]["status"] == "paused"
+        },
+    )
+    .await;
+    let task = reload(&lead.db, &root.id).await;
+    assert_eq!(task.status, "planning");
+    let condition = serde_json::to_value(task.condition.public()).unwrap();
+    assert_eq!(condition["primary"]["agent_id"], lead.planner);
+    assert!(executions(&lead.db, &child.id).await.is_empty());
+    let before = executions(&lead.db, &root.id).await;
+    assert_eq!(
+        before,
+        [("planner".to_owned(), "failed".to_owned())],
+        "the admitted run failed before launch"
+    );
+    passes(&lead, 4).await;
+    assert_eq!(executions(&lead.db, &root.id).await, before);
+    sqlx::query("DROP TRIGGER pause_planning_lead")
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    db::AgentRepo::set_paused(&*lead.db, &lead.planner, false)
+        .await
+        .unwrap();
+    until(&lead, "the paused planning run resumes", async || {
+        executions(&lead.db, &root.id).await.len() == 2
+    })
+    .await;
+    passes(&lead, 4).await;
+    assert_eq!(
+        executions(&lead.db, &root.id).await,
+        [
+            ("planner".to_owned(), "failed".to_owned()),
+            ("planner".to_owned(), "running".to_owned())
+        ]
+    );
+    assert!(executions(&lead.db, &child.id).await.is_empty());
+}

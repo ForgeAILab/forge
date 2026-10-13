@@ -375,7 +375,18 @@ impl TaskService {
                             self.retry_integration(&task).await?
                         }
                         TaskAction::Release { reason }
-                            if offer.reason == "held_waiting" || review_entry_preempted =>
+                            if offer.reason == "held_waiting"
+                                || review_entry_preempted
+                                || snapshot
+                                    .task
+                                    .metadata_json
+                                    .as_deref()
+                                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                    .is_some_and(|metadata| {
+                                        metadata["awaiting_human"] == true
+                                            && metadata["awaiting_human_reason"]
+                                                == db::LEAD_INPUT_WAIT
+                                    }) =>
                         {
                             let released = self
                                 .release_to_dispatch_queue(&snapshot, reason.as_deref())

@@ -504,7 +504,11 @@ impl TaskDispatcher {
                         f.human_wait = true;
                     }
                 }
+                // Asking runs, including failed ones, are finished with
+                // the question. After the answer the next planning run owns
+                // the work; the asking run is not a manual-stop wait.
                 f.stopped_execution = !no_exact_review
+                    && metadata["lead_input_execution_id"] != e.id
                     && matches!(
                         e.status,
                         ExecutionStatus::Failed | ExecutionStatus::Cancelled
