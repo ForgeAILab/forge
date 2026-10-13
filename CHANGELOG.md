@@ -3283,8 +3283,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
-- A Task in review with an Agent reviewer or configured checks and nothing
-  delivered to review (every
+- A Task in review with an Agent reviewer, or with configured checks and a
+  Workspace, and nothing delivered to review (every
   subtask of a root was cancelled, or the owner moved a Task into review without
   a run) no longer rests with no next step. It parks as `review_blocked`
   (`blocking_reason: review_candidate_missing`, "nothing to review") and raises

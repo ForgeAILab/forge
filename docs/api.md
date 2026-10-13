@@ -3353,7 +3353,8 @@ Unavailable commands return HTTP 409, code `action_unavailable`, and current `de
 
 Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
-In review, an Agent reviewer and configured checks need a delivered candidate: an implementation
+In review, an Agent reviewer, and configured checks on a Task that has a
+Workspace and is not read-only, need a delivered candidate: an implementation
 run, or the owner's own commits on the Task branch (merges of the target alone
 do not count), which get the ordinary checks and reviewer; the delivery evidence
 records their exact base/head without an Agent implementation run. With no

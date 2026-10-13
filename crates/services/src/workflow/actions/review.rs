@@ -59,8 +59,18 @@ pub(super) async fn prepare_review_entry(
         None => false,
     };
     // A read-only Task runs no implementation checks, with or without a
-    // candidate: its skipped checks are not a missing validation.
+    // candidate: its skipped checks are not a missing validation. Nor are
+    // those of a Task with no Workspace: the owner moves such a Task across
+    // the board by hand and its checks have nowhere to run, as before.
     let checks = !review_ci_steps(&ctx.state_config)?.is_empty()
+        && (workspace_id(ctx).await.is_some()
+            || match task.parent_task_id.as_deref() {
+                Some(parent) => db::WorkspaceRepo::get_by_task_id(&*ctx.db, parent)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_some(),
+                None => false,
+            })
         && !task_execution_is_read_only(ctx, task).await?;
     if !(agent_reviewer || checks) || task.review_passed_at.is_some() {
         return Ok(None);

@@ -1253,6 +1253,14 @@ impl TaskDispatcher {
             .get("ci_steps")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|steps| !steps.is_empty())
+            // A Task with no Workspace is moved across the board by hand and
+            // its checks have nowhere to run, as before.
+            && db::WorkspaceRepo::get_by_task_id(
+                &*self.db,
+                task.parent_task_id.as_deref().unwrap_or(&task.id),
+            )
+            .await?
+            .is_some()
             // A read-only Task runs no implementation checks, with or
             // without a candidate: skipping them is not a missing validation.
             && !crate::workflow::actions::task_is_read_only(&self.db, task)
