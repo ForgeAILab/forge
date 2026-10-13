@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { useResolveAttentionMutation } from '@/features/federation/hooks'
@@ -30,8 +30,17 @@ function submitErrorMessage(error: unknown): string {
 }
 
 /** Resolving a lead question requires the owner's answer at this item's version. */
-export function LeadInputAnswer({ item }: { item: AttentionItem }) {
-  const [answer, setAnswer] = useState('')
+export function LeadInputAnswer({
+  item,
+  answer,
+  onAnswerChange,
+  onAnswered,
+}: {
+  item: AttentionItem
+  answer: string
+  onAnswerChange: (answer: string) => void
+  onAnswered: () => void
+}) {
   const submit = useResolveAttentionMutation()
   // The pending flag reaches this component a render later than a second submit can.
   const sending = useRef(false)
@@ -67,6 +76,7 @@ export function LeadInputAnswer({ item }: { item: AttentionItem }) {
             submit.mutate(
               { id: item.id, expectedVersion: item.version, answer },
               {
+                onSuccess: onAnswered,
                 onSettled: () => {
                   sending.current = false
                 },
@@ -84,7 +94,7 @@ export function LeadInputAnswer({ item }: { item: AttentionItem }) {
             disabled={submit.isPending || submit.isSuccess || !question}
             aria-invalid={Boolean(validation)}
             aria-describedby={`${helpId}${validation ? ` ${errorId}` : ''}${submit.error ? ` ${submitErrorId}` : ''}`}
-            onChange={(event) => setAnswer(event.target.value)}
+            onChange={(event) => onAnswerChange(event.target.value)}
           />
           <p id={helpId} className="text-xs text-muted-foreground">
             1–4000 characters · {length}/4000

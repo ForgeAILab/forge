@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { MissionControlPage } from '@/pages/MissionControlPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
@@ -192,6 +192,110 @@ const data: MissionControlResponse = {
 }
 
 describe('MissionControlPage', () => {
+  it('keeps a withdrawn lead draft at its card position until dismissed, and can copy it', async () => {
+    const previous = data.needs_attention
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } })
+    data.needs_attention = [
+      {
+        ...previous[0],
+        id: 'lead-draft',
+        category: 'human_input_required',
+        recommended_action: 'answer_lead_input',
+        details: { question: 'Which parser?' },
+      },
+      {
+        ...previous[0],
+        id: 'other-question',
+        category: 'human_input_required',
+        summary: 'Another question',
+      },
+    ]
+    try {
+      const view = render(<MissionControlPage />)
+      fireEvent.change(screen.getByLabelText('Answer the lead'), {
+        target: { value: '  Use parser A.\nKeep the tests.  ' },
+      })
+      data.needs_attention = [data.needs_attention[1]]
+      view.rerender(<MissionControlPage />)
+      const notice = screen
+        .getByText(/This question was withdrawn; your draft:/)
+        .closest('article')!
+      expect(notice.id).toBe('attention-lead-draft')
+      expect(notice.textContent).toContain('  Use parser A.\nKeep the tests.  ')
+      expect(notice.nextElementSibling?.textContent).toContain('Another question')
+      expect(screen.queryByLabelText('Answer the lead')).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Copy draft' }))
+      await waitFor(() =>
+        expect(writeText).toHaveBeenCalledExactlyOnceWith('  Use parser A.\nKeep the tests.  '),
+      )
+      expect(await screen.findByRole('button', { name: 'Copied' })).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss draft' }))
+      expect(screen.queryByText(/This question was withdrawn/)).toBeNull()
+      view.rerender(<MissionControlPage />)
+      expect(screen.queryByText(/This question was withdrawn/)).toBeNull()
+    } finally {
+      data.needs_attention = previous
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keys drafts by attention id across refetches and multiple withdrawn questions', () => {
+    const previous = data.needs_attention
+    data.needs_attention = ['first', 'second', 'empty'].map((id) => ({
+      ...previous[0],
+      id,
+      category: 'human_input_required',
+      recommended_action: 'answer_lead_input',
+      details: { question: `Question ${id}?` },
+    }))
+    try {
+      const view = render(<MissionControlPage />)
+      const inputs = screen.getAllByLabelText('Answer the lead')
+      fireEvent.change(inputs[0], { target: { value: 'First answer' } })
+      fireEvent.change(inputs[1], { target: { value: 'Second answer' } })
+      fireEvent.change(inputs[2], { target: { value: '  ' } })
+      data.needs_attention = data.needs_attention.map((item) => ({ ...item, version: 9 }))
+      view.rerender(<MissionControlPage />)
+      expect((screen.getAllByLabelText('Answer the lead')[0] as HTMLTextAreaElement).value).toBe(
+        'First answer',
+      )
+      data.needs_attention = []
+      view.rerender(<MissionControlPage />)
+      expect(screen.getAllByText(/This question was withdrawn/)).toHaveLength(2)
+      expect(screen.getByText('First answer')).toBeTruthy()
+      expect(screen.getByText('Second answer')).toBeTruthy()
+      expect(document.getElementById('attention-empty')).toBeNull()
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
+  it('does not call a successfully submitted answer a withdrawn draft', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        id: 'answered',
+        category: 'human_input_required',
+        recommended_action: 'answer_lead_input',
+        details: { question: 'Which parser?' },
+      },
+    ]
+    try {
+      const view = render(<MissionControlPage />)
+      fireEvent.change(screen.getByLabelText('Answer the lead'), { target: { value: 'Parser A' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+      const options = resolveAttention.mock.calls.at(-1)![1]
+      act(() => options.onSuccess?.())
+      data.needs_attention = []
+      view.rerender(<MissionControlPage />)
+      expect(screen.queryByText(/This question was withdrawn/)).toBeNull()
+    } finally {
+      data.needs_attention = previous
+      resolveAttention.mockClear()
+    }
+  })
   it('renders conflict hot spots with the existing attention warning treatment', () => {
     const previous = data.needs_attention
     data.needs_attention = [

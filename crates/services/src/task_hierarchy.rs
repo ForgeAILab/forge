@@ -691,6 +691,41 @@ pub(crate) async fn subtask_dispatch_ready(db: &SqliteDb, task: &Task) -> Result
     )
 }
 
+/// The three refusals a subtask meets while its hierarchy does not admit it
+/// (the root is blocked, the root is not implementing, an earlier sibling is
+/// unfinished). Each is a wait, not a rejection of the caller's input: the
+/// hierarchy's own progress ends it. They stay `InvalidOperation` so every
+/// public mapping of them is unchanged; the replay of an accepted action
+/// recognises them through [`is_subtask_wait_refusal`], which reads the same
+/// constants these messages are built from.
+pub(crate) const ROOT_BLOCKED_REFUSAL: &str = "cannot execute while coordination root";
+pub(crate) const ROOT_NOT_IMPLEMENTING_REFUSAL: &str = "cannot start while coordination root";
+pub(crate) const SIBLING_ORDER_REFUSAL: &str = "cannot start yet; ordered execution is waiting on";
+
+pub(crate) fn subtask_wait_refusal(message: String) -> ServiceError {
+    debug_assert!(is_subtask_wait_message(&message), "{message}");
+    ServiceError::invalid_operation(message)
+}
+
+fn is_subtask_wait_message(message: &str) -> bool {
+    message.strip_prefix("subtask ").is_some_and(|rest| {
+        rest.split_once(' ').is_some_and(|(_, refusal)| {
+            [
+                ROOT_BLOCKED_REFUSAL,
+                ROOT_NOT_IMPLEMENTING_REFUSAL,
+                SIBLING_ORDER_REFUSAL,
+            ]
+            .iter()
+            .any(|known| refusal.starts_with(known))
+        })
+    })
+}
+
+/// Whether an admission refusal is the hierarchy making a subtask wait.
+pub(crate) fn is_subtask_wait_refusal(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::InvalidOperation { message } if is_subtask_wait_message(message))
+}
+
 /// Enforce ordered dispatch for a child while preserving caller error text.
 pub(crate) async fn ensure_subtask_dispatch_order(db: &SqliteDb, task: &Task) -> Result<()> {
     let Some(parent_task_id) = task.parent_task_id.as_deref() else {
@@ -698,8 +733,8 @@ pub(crate) async fn ensure_subtask_dispatch_order(db: &SqliteDb, task: &Task) ->
     };
     let (parent, workflow) = coordination_root_context(db, parent_task_id).await?;
     if !coordination_root_allows_child_dispatch(&parent, &workflow) {
-        return Err(ServiceError::invalid_operation(format!(
-            "subtask {} cannot start while coordination root {} is blocked or not in its implementation state",
+        return Err(subtask_wait_refusal(format!(
+            "subtask {} {ROOT_NOT_IMPLEMENTING_REFUSAL} {} is blocked or not in its implementation state",
             task.id, parent_task_id
         )));
     }
@@ -711,8 +746,8 @@ pub(crate) async fn ensure_subtask_dispatch_order(db: &SqliteDb, task: &Task) ->
     let waiting_on = next
         .map(|candidate| candidate.id.as_str())
         .unwrap_or("the completed sequence");
-    Err(ServiceError::invalid_operation(format!(
-        "subtask {} cannot start yet; ordered execution is waiting on {}",
+    Err(subtask_wait_refusal(format!(
+        "subtask {} {SIBLING_ORDER_REFUSAL} {}",
         task.id, waiting_on
     )))
 }
@@ -1542,6 +1577,33 @@ mod replan_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hierarchy's three refusals are recognised as waits and are still
+    /// `InvalidOperation` for every caller; nothing else is taken for one.
+    #[test]
+    fn the_hierarchys_refusals_are_waits_and_stay_invalid_operations() {
+        for refusal in [
+            format!("subtask a {ROOT_BLOCKED_REFUSAL} b is blocked or has an error"),
+            format!(
+                "subtask a {ROOT_NOT_IMPLEMENTING_REFUSAL} b is blocked or not in its implementation state"
+            ),
+            format!("subtask a {SIBLING_ORDER_REFUSAL} b"),
+        ] {
+            let error = subtask_wait_refusal(refusal);
+            assert!(matches!(error, ServiceError::InvalidOperation { .. }));
+            assert!(is_subtask_wait_refusal(&error), "{error}");
+        }
+        for other in [
+            ServiceError::invalid_operation("stale queued Task action"),
+            ServiceError::invalid_operation("queued action's role ownership changed"),
+            ServiceError::invalid_operation(
+                "root tasks with subtasks are coordination containers; assign and run their subtasks",
+            ),
+            ServiceError::DependencyGate,
+        ] {
+            assert!(!is_subtask_wait_refusal(&other), "{other}");
+        }
+    }
 
     fn task(id: &str, status: &str, parent_task_id: Option<&str>) -> Task {
         Task {

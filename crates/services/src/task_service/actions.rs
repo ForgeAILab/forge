@@ -1319,6 +1319,7 @@ impl TaskService {
             blocked_json: task.blocked_json.clone(),
             failed_json: task.failed_json.clone(),
             continuation,
+            awaits_hierarchy: false,
         };
         if let Some(existing) = crate::deferred_dispatch::queued_recovery(&current) {
             if existing.target_state == queued.target_state

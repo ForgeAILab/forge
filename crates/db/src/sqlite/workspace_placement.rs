@@ -451,3 +451,37 @@ pub(super) fn map_workspace_placement(row: SqliteRow) -> Result<WorkspacePlaceme
         updated_at: row.try_get("updated_at")?,
     })
 }
+
+impl SqliteDb {
+    pub async fn ready_owner_retry_placement_ids(
+        &self,
+        retained_execution_ids_json: String,
+        reconciled_since: String,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT p.id FROM workspace_placement p WHERE p.state = 'ready' AND (
+                EXISTS (SELECT 1 FROM execution e JOIN json_each(?) report ON e.id = report.value WHERE e.workspace_id = p.workspace_id)
+                OR EXISTS (SELECT 1 FROM domain_event ev WHERE ev.entity_type = 'workspace_placement' AND ev.entity_id = p.id
+                    AND ev.event_type = 'workspace.owner_reconciled' AND ev.created_at >= ?))")
+.bind(retained_execution_ids_json)
+.bind(reconciled_since)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_bound_repo_location(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT p.repo_location_id FROM workspace_placement p
+                 JOIN workspace w ON w.id = p.workspace_id WHERE w.task_id = ?
+                 AND (p.state IN ('reserved', 'preparing', 'ready', 'disconnected', 'cleaning')
+                      OR (p.state = 'failed' AND p.workspace_handle IS NOT NULL))",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

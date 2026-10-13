@@ -4634,7 +4634,7 @@ See [Root Tasks and ordered subtasks](#root-tasks-and-ordered-subtasks).
 
 ### `merging` is the integration queue (3.2 stage D2b)
 
-There is exactly one merge path. A Task entering `merging` is admitted to the
+There is exactly one merge path. An eligible root Task entering `merging` is admitted to the
 integration queue of its repository's target branch and **stays in `merging`**
 while the queue worker brings it to the head, rebases it only if the target
 moved, has the head check run through the durable check runner, carries or
@@ -4654,13 +4654,15 @@ this and no other code merges.
 | Infrastructure, a dirty default checkout, a paused Project, a suspended queue | `integration/park` step | `merging` | `deferred` with its cause (retried by the worker's sweep, or the owner's) |
 | The machine that holds the Task's checkout is unreachable, or its placement is not `ready` again | `integration/park` step | `merging` | `deferred` / `owner_offline`, `owner_id` the machine; no retry is counted, the sweep asks again (back-off to `soon_retry_max`), and the reconnect makes the attempt due at once |
 | The Task's worktree would have to be recreated under the disk floor at admission | the entry's hooks step (suspended on the disk wait), or the reconciler | `merging` | the Task's disk capacity wait (`machine_capacity` / `disk`), 30 s recheck; no attempt exists yet |
-| The Task leaves `merging` by an owner command (Cancel, Hold, a board move) | that command; then `integration/clear` | the command's target | cleared |
+| The Task leaves `merging` by Cancel or a board move | that command; then `integration/clear` | the command's target | cleared |
+| The owner holds the Task in `merging` | the Hold command; the worker parks the attempt at its next gate | `merging` | Hold stays primary; integration is retained behind it |
 
 `merge_failed` therefore only means "a coder is repairing a conflict, a red
 check or a dirty worktree", or the one-step hop to `review` after a
-`review_required` send-back. A clean rebase never leaves `merging`: the
-`merging → merge_failed → review` bounce (bridge `target_moved_rebase`
-followed by `review_refresh`) is no longer produced. Rows of that shape written
+`review_required` send-back. A clean rebase no longer forces the old `merging → merge_failed → review`
+bounce (bridge `target_moved_rebase` followed by `review_refresh`) by itself.
+If review authority cannot carry to the rebased commit, a `needs_review`
+send-back still goes through repair to fresh review. Rows of that shape written
 before the upgrade are still read (history, budgets, the review-entry carry).
 
 What the entry hook still decides itself, before the queue: a subtask, a Task
@@ -4747,11 +4749,11 @@ its owner's Retry (`settle_imported_integration_operation`): the operation
 becomes `failed`, a `reconciling` attempt becomes `quarantined`, and Git
 decides from there. Until then it refuses the deletions below.
 
-**Importer continuation.** At every start the storage importer runs until
-nothing is left, then each *current* imported attempt (and each attempt the
-passive shadow recording left) without a continuation gets one
-identity-fenced `integration/import_continue` step, keyed
-`integration-import:<attempt id>`. The step applies the continuation of the
+**Importer continuation.** At every start the storage importer runs at most 100,000 passes of up to
+100 Tasks, stopping earlier when a pass has nothing left or examines no Task.
+Then each *current* imported attempt (and each attempt the passive shadow
+recording left) without a continuation gets one identity-fenced
+`integration/import_continue` step, keyed `integration-import:<attempt id>`. The step applies the continuation of the
 imported state under the Task's lease; running the start twice enqueues
 nothing new. A `queued` pre-queue attempt whose settled continuation step was
 pruned (Task-step retention, 7 days) would not be claimable: the queue
@@ -4772,7 +4774,7 @@ step and count one.
 | `parked` with a stored deadline | the worker's sweep re-queues it at the deadline; the step states `deferred` / `infrastructure` |
 | `parked` otherwise (blocked, failed, human wait, owner wait, sticky disposition, lost workspace), `quarantined` | nothing automatic; the step states `deferred` with its cause and raises the interruption for an intervention; the owner's existing action re-enters `merging`, which admits a successor |
 | `ejected`, `needs_review` | the repair or review already in progress continues; on its return to `merging` admission supersedes the row |
-| Task no longer in the imported entry | nothing is written; the row is history |
+| Task no longer in the imported entry | the continuation writes nothing; a queued row is cancelled by worker validation, while another current row is superseded by the Task's next admission rather than made historical by this step |
 
 A hooks step of a `merging` entry that was pending or running at the upgrade
 executes the admitting `run_merge`. It first reads the effects that step
@@ -4823,7 +4825,9 @@ no merge role and nothing of it is imported.
 inside the transaction that deletes a repository, a repo location or a
 Project, and before a location's `is_default` changes. It refuses with
 `DbError::IntegrationUnresolved` (HTTP `409 integration_unresolved`, naming
-the Task and the machine) while an attempt of a queue in that scope has an
+the Task and the machine that performs the outstanding effect: the owner of
+the Task's checkout for a rebase run on another machine than the queue
+target's, else the target's owner) while an attempt of a queue in that scope has an
 effect intent, a running or uncertain owner operation, or is `reconciling` /
 `ff_inflight`. Removing the machine is the operation that settles an effect
 nobody can answer for (`settle_removed_integration_owner`).
@@ -4860,10 +4864,10 @@ Task's `integration_lineage` witness name it by id; no reader of those ids was
 audited for a missing row, and deletion is not built without that audit. The
 table therefore grows by one row per merge attempt: one per entry of a merge
 state, plus one for each re-admission (a re-entry after a repair or a
-re-review, an owner's Retry that replaces the attempt, a rebind). With its
-receipts and observations emptied by the rule above a finished row keeps its
-scalar columns and the small JSON documents (paths, checks, timings), on the
-order of a few kilobytes. The only rows ever deleted are those of a deleted
+re-review, an owner's Retry that replaces the attempt, a rebind). An ordinary admitted row whose receipts and observations were emptied keeps
+its scalar columns and small path/check/timing JSON, typically a few kilobytes.
+An imported row also retains `import_source_json`; receipt pruning does not
+shrink that frozen bounded legacy snapshot, which can be much larger. The only rows ever deleted are those of a deleted
 queue (`ON DELETE CASCADE` from `integration_queue`), the rows of a deleted
 Project that have no queue, and the current, resting `shadow:` row of a
 deleted Task (above). What a Review quotes of a head
@@ -4987,10 +4991,10 @@ One function derives the summary for every surface. The attempt's state gives
 `state`, `phase` and `position`; the Task's condition (reason `integration`,
 same `attempt_id`) refines what only a Task step knows: which decision a head
 in `awaiting_task_step` waits for, a failed candidate check, and the cause of
-a deferral. A Task stopped by its owner or by a paused Project reads `waiting`
-with that cause, from the same `task_row_gate` the worker and the `settle`
-step apply, and the cause is the one that holds now (a member parked under a
-stop that was lifted names none). The member row carries whether its own
+a deferral. A queued member, or a member parked under a Task or Project gate, reads
+`waiting` with the current cause, from the same `task_row_gate` the worker
+and the `settle` step apply (a member parked under a stop that was lifted
+names none). An active head retains its owned phase until the worker parks it. The member row carries whether its own
 Project is paused, so no reader asks for the Project again. `action_hint` is
 never a second rule: `retry` is `task_actions::integration_retry_offered`,
 the function `available_actions` builds the `integration_retry` offer from,
@@ -4999,11 +5003,13 @@ nothing; `release` is the owner's Hold; `resume_project` is a Project action.
 
 Who is listed: admission refuses a Task whose Project is not the queue's
 repository's, so a queue's members are one Project's. The reads do not rest on
-that. A queue read lists the members of the reader's Project only (the
+that. A queue read fetches at most 100 current members per queue, head first
+then queue order, and lists only those of the reader's Project (the
 repository's Project on REST, the bound Project for an agent, whose
-`primary_repo_id` can name another Project's repository); any other member is
-counted, in `member_count` and in positions, and never listed, not even as the
-head. A deleted Task keeps its place and loses its title. An attempt is "in progress" while it is `current`;
+`primary_repo_id` can name another Project's repository). `member_count`
+and positions count all current members; another Project's member is never
+listed, not even as the head. `members_truncated` reports whether the queue
+has more current members than the fetch retained, before the visibility filter. A deleted Task keeps its place and loses its title. An attempt is "in progress" while it is `current`;
 the table's CHECK makes a finished attempt non-current, so no read filters on
 state.
 
@@ -5017,9 +5023,11 @@ read with the snapshot: count, revision sum, queue-sequence sum and newest
 write of the Project's members in progress (index
 `integration_attempt_project_live`, migration `V202610111630`) plus each of
 their queues' state and head, and the Project's pause (a wait cause of every
-member that writes no Task). The sums are over values that only grow, so a
-member that leaves and one that joins between two reads cannot cancel out. A
-lease renewal changes none of these.
+member that writes no Task). It also carries the exact set of those members,
+each with its own `revision` (which only grows): the sums alone cancel out
+when one member leaves and another joins with equal counters while the newest
+write does not move (a wall clock set back). A lease renewal changes none of
+these.
 
 `integration.updated {repo_id, queue_id, task_id, project_ids}` is published
 by `services::queue_invalidation::IntegrationUpdateProjector`, a periodic
@@ -5439,8 +5447,9 @@ cut at 4,096 bytes; 24 KiB is its tested ceiling for the same reason.
 
 ### Integration ownership and Task conditions
 
-Every root Task entering a state with the `run_merge` entry hook joins the
-integration queue. State names are not authority: custom workflows may rename
+The `run_merge` entry hook admits an eligible root Task to the integration
+queue; a Task without a worktree or a configured merge service is skipped,
+and an unavailable candidate requires facts or an owner action instead. State names are not authority: custom workflows may rename
 or define more than one merge state. Success follows that state's own `accept`
 target; repair and review follow its workflow roles. Subtasks deliver through
 their coordination root rather than creating an independent merge attempt.
@@ -5456,10 +5465,10 @@ are `waiting`, `owned` (phase), `repair`, `review_required`,
 `candidate_check_failed`, `deferred` (cause/owner/message), and `applied`.
 They contain an opaque attempt identity, never queue rank, lease tokens,
 clocks or physical paths. Full path sets and operational timestamps remain on
-the attempt; a condition samples at most 32 paths. A settled Task retains only
+the attempt; a condition samples at most 32 paths per path set. A settled Task retains only
 its integration lineage.
 
-A new attempt cannot overwrite another attempt's statement. Superseding a
+A new attempt cannot overwrite another attempt's still-owned statement; a handed-off integration reason no longer excludes a successor. Superseding a
 released predecessor preserves queue sequence; the Task-step writer clears
 that predecessor's statement and states its successor in one transaction.
 `IntegrationHandedOff` retains lineage while making coder/reviewer admission
@@ -5467,8 +5476,9 @@ ready. A real execution remains `running`; a real user Hold/block stays primary
 with integration behind it. Self-clearing capacity, placement and environment
 waits still reach their normal clearing action.
 
-Ordinary queue and head waits consume no execution capacity and retain an active
-Project slot. Owner-offline waits quietly park the slot. Dirty target, exhausted
+Ordinary queue and head ownership consumes no Agent execution concurrency
+and retains an active Project slot; a requested CI run participates in shared
+physical-machine capacity through the check runner. Owner-offline waits quietly park the slot. Dirty target, exhausted
 budget and owner-required conditions are intervention blockers. Their material
 identity uses cause, failure kind, owner and message; queue revisions, attempt
 IDs, paths and timer ticks do not create incidents. A Task step emits a changed
@@ -5515,8 +5525,10 @@ Admission pins the implementation execution's repository and workspace, even
 if the Project later selects another primary repository. It records the
 placement, owner kind, daemon, runtime, placement generation and reviewed commit.
 A reconnect/verified placement recovery or the owner's Retry compares that
-binding with the current ready placement. A released attempt with no unsettled
-effect is superseded with its queue sequence and reviewed commit retained.
+binding with the current ready placement. A released attempt with no unsettled effect is superseded with its queue
+sequence retained. Admission preserves the reviewed original when it matches
+the present HEAD or applies through recorded rebase lineage; otherwise it
+pins the present HEAD and `settle` assesses review authority for that candidate.
 Reserved heads and running/uncertain effects cannot be superseded; their frozen
 owner must settle them first.
 
@@ -5546,11 +5558,15 @@ implemented. `path_wait` is reserved storage, not a production path guard.
 
 ### Startup import and legacy continuations
 
-Startup runs the bounded importer before the Task-step and queue workers.
+Startup attempts the bounded import before the Task-step and queue workers.
+If import fails, the other workers still start; the queue worker retries import
+every 30 seconds before its first sweep, and the admission reconciler admits
+nothing while `integration_import_pending` remains set.
 `import_integration_pass` examines at most 100 Tasks per transaction, retaining
-at most 64 rows per history source plus a sentinel, and at most 65,536 source
-characters before materialization. Oversized sources keep their original length
-and a marked prefix and require complete evidence. A per-Task savepoint retains
+at most 64 rows per history source plus a sentinel and at most 65,536 characters
+per retained text column before materialization. A source whose UTF-8 byte length
+exceeds 65,536 is marked incomplete, with its original byte length and character
+prefix retained, and requires complete evidence. A per-Task savepoint retains
 an unreadable row as quarantine and lets the pass continue.
 
 Each `import:<task>:<epoch>` identity freezes the classification, missing facts
@@ -5568,7 +5584,7 @@ review-pass timestamp alone.
 | 5 | Rebase started without an outcome |
 | 6 | Clean rebase not yet checked/carried |
 | 7 | Conflict already handed to its coder |
-| 8 | Merge-fix follow-up continuation |
+| 8 | Review-refresh bridge, or a missing review-pass marker with a retained review contract, without clean-rebase proof |
 | 9 | Persisted review carry |
 | 10–12 | Current/resumed/obsolete paused-integration markers |
 | 13 | Hold, failure, human or entry blocker |
@@ -5649,8 +5665,11 @@ effect authority.
 
 Transfers are keyed by attempt/generation/direction, capped at 256 MiB, and
 bind exact requested objects. Missing/wrong objects refuse the effect. The
-Task's non-default target branch is not written. Claim refs and staging files
-are released after the slot; startup/reconnect sweep transfer leftovers.
+Task's non-default target branch is not written. Claim refs are released after the slot; staging files are removed when a
+transfer returns or is dropped. Startup sweeps server-checkout leftovers and
+retains up to 4,096 daemon-end releases from attempts updated within 30 days;
+connected-owner failures are tried at most three times, while disconnected
+owners remain on that release list until they return.
 The owner journals are acknowledged only after the server has retained their
 receipt. Retention never discards an unsettled intent/receipt or evidence
 pinning a quarantined queue.
@@ -5780,9 +5799,11 @@ outside the write transaction; the transaction rechecks attempt and Task entry.
 
 ### Deletion, recovery and operational limits
 
-Repository/location/Project deletion and default-location change return
-`409 integration_unresolved` while an effect is outstanding or its result is
-unknown. The guard names Task and machine and is checked in the mutation's
+The unresolved-integration guard refuses repository/location/Project deletion
+and default-location change with `409 integration_unresolved` while an effect
+is outstanding or its result is unknown. Other resource guards can refuse
+first: location deletion returns `409 version_conflict` while a placement still
+names it and is not `cleaned`, before it reaches the integration guard. The guard names Task and machine and is checked in the mutation's
 transaction. `force` cannot bypass it. Location deletion does not settle an
 in-flight effect as failed. Removal of a permanently lost machine is the
 explicit permanent-loss operation; it settles that owner's intents/imported
@@ -5796,8 +5817,10 @@ without merging**: it ends the Task and cancels its attempt without changing Git
 
 Public queue/member reads, Task integration summaries, operations status and
 `integration.updated` are live; see [api.md](api.md) and [cli.md](cli.md).
-`pending_steps` counts short queued Task steps, not a head waiting for CI or its
-slot. Queue position, phases, timing and actions come from the dedicated reads.
+`pending_steps` counts `pending` or `claimed` Task-step rows, excluding the
+caller's current step when read under that Task's lease. It does not count a
+`suspended` check wait or an integration head waiting for CI or its slot until
+that head enqueues a Task step. Queue position, phases, timing and actions come from the dedicated reads.
 
 Path guards, speculative/batched merging and an automatic decision that an
 unknown effect failed are not implemented. Transfer cleanup and bounded
@@ -6310,6 +6333,37 @@ checked once per entry (`check_retry_budget` on entry, before the dispatch; the
 auto-attached after-enter check is not added to a gate that already checks on
 entry). A subtask never enters a merge state (the inherited workflow has
 none), so merge-queue returns of the root never spend this budget.
+
+A subtask resting in `lead_check` with the gate's ledger spent is offered
+gate-budget recovery even though the gate's park is encoded as
+`retry_exhausted` (execution-budget recovery does not reset that ledger; no
+other gate's offer changes). Retry resets the budget and creates a new gate
+entry; the role launch that continues it is an accepted action like any
+other.
+
+One rule covers every accepted action on a subtask whose hierarchy does not
+admit it, whatever the cause (the root plans, is held, is blocked or has
+not started; an earlier sibling is unfinished) and whoever accepted it (the
+owner's Retry, the lead's `lead.recover`, the Project Agent's recovery, a
+start by hand). An action that needs the hierarchy's admission is not
+replayed while the subtask is not next in its root's order: `next_step`
+parks the subtask on its parent (`parent { cause }`, or the children park
+behind an earlier sibling) and the intent stays queued. A role launch
+always needs admission. Any other action needs it once the hierarchy has
+refused its replay (a move to a working state): the refusal is recorded on
+the intent (`queued_recovery.awaits_hierarchy`) instead of restoring the old
+park, so the next pass shows the parent wait. An action that needs no
+admission (a retry of entry checks, a decision that ends the subtask) is
+replayed whatever the root does. Because the root and child have separate
+writers, admission may lose after an eligibility read: the hierarchy's
+refusal, and a role launch's database authority conflict, keep the accepted
+intent. The hierarchy's refusals remain `invalid operation` to every
+caller. The root's status change marks its children for scheduling, so the
+action runs when the root releases them.
+
+An owner's manual move out of `lead_check`, a send-back to implementation
+included, charges no `gate:lead_check` return (`db::budget::transition`:
+an owner's move spends nothing).
 
 Removing the root's lead stops a step check that is still running
 (`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
@@ -6847,10 +6901,11 @@ lease-holding writer requires `Applied`, and no caller treats `Queued` as applie
 Callers that need a result enqueue a command and drive the same worker inline.
 A registered notification, checked before waiting, bounds the predecessor wait
 without polling: one deadline of five seconds, or fifteen for Cancel/Hold (five
-plus the ten-second remote acknowledgment). Once that command claims the lease,
-its result describes its own committed Task; running its own step is not counted
-as waiting (claim with environment checks is bounded only by its checks'
-timeouts; `rerun_review` only re-enters `review` and runs no check itself). A timeout returns HTTP 409 `task_busy` with
+plus the ten-second remote acknowledgment). A pending command also wakes when a
+predecessor's lease lapses, so it can reclaim work whose waiter and claimer both
+stopped. Once that command claims the lease, its result describes its own
+committed Task; its claimed wait has the separate ceiling described below
+(`rerun_review` only re-enters `review` and runs no check itself). A timeout returns HTTP 409 `task_busy` with
 `pending_steps`, `retry_after_ms` and a retry hint; the accepted command remains
 durable. Hooks and cascades remain asynchronous, and responses retain
 `pending_steps`. Claim and its execution startup share one command; dispatch
@@ -6865,15 +6920,32 @@ not cancelled by the five-second queue response ceiling; SQLite's busy timeout
 bounds database lock waits. A mutation still pending behind another Task step
 returns `task_busy` at the deadline and remains queued.
 
-A claimed mutation's wait is bounded too. A command waiter learns of a lost
-claimer from its reply channel; a mutation waiter has none, so the step lease
-is its bound. When the lease of a claimed mutation lapses without a
+A claimed command or mutation's wait is bounded too. Both waiters wake at
+the step lease's expiry even when no notification or reply arrives. When
+the lease of a claimed step lapses without a
 settlement (its claimer stopped between claim and release), the waiter takes
-the step over through the normal claim. A settled mutation whose release was
-lost answers when its lease lapses. A mutation that stays claimed under a live
+the step over through the normal claim, which excludes live local owners.
+A settled step whose release or reply was lost answers from its durable
+result when its lease lapses, without repeating the command's effect.
+A command or mutation that stays claimed under a live
 owner for 90 seconds (one 60-second lease plus SQLite's 30-second lock
 timeout) returns `task_busy` and remains queued: no caller waits without a
-bound.
+bound. The db handle carries that shared claimed-wait ceiling; tests shorten
+it through a test-only setter. Dropping a command waiter removes its reply
+registration while leaving its durable step and worker intact. The inline
+claim of a head, its liveness witness and its runner are one spawned job, never
+part of the waiter: a request dropped while the claim's commit is in flight
+cannot leave the step claimed with nothing running it. A command attempt that
+fails before it ran and is re-queued does not answer its caller: the command
+is still accepted, so the waiter drives the retry when its back-off is due and
+returns that answer, or `task_busy` at its deadline; only a settled failure
+answers with the error. A lost reply sender for a live step is re-registered
+for a later attempt. After the command ran, a busy database at its settlement
+is waited out and never re-queues it (the step is failed, and its caller still
+gets the command's own answer, if the lock never clears); a failed lease
+release is repeated and never replaces the committed answer. A waiter that
+reads a released step before its reply arrives waits up to 250 ms for the
+typed reply before it uses the stored result.
 
 Cancel/Hold preempts scripts, CI and startup at a safe point. Integration is
 protected from its start (`integration_started_at`) through its result and
@@ -7585,6 +7657,17 @@ unselected Repo rows retain their repository identities;
 removing Project repository setup no longer deletes Tasks through a Repo
 foreign-key cascade.
 
+Operator status, milestone readiness/release persistence, workspace cleanup,
+Attention/wake projections, Task workspace admission, and recovery persistence
+use typed `SqliteDb` functions in the corresponding DB aggregate modules.
+The services retain policy and transaction ownership; queries participating in
+those transactions accept the caller's `SqliteConnection`. Read projections
+return named row structs, while SQL execution and row decoding produce `DbError`
+for conversion to `ServiceError` at the service boundary. Projections whose
+callers conditionally decode fields or ignore decoding failures retain typed
+field results so the service handles those errors at the original point; nested
+wake-budget savepoints and fenced Task writes retain caller transaction ownership.
+
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.
 
@@ -8235,9 +8318,11 @@ semantics, including inherited environment, Git-variable removals and machine
 build policy. Keys describe explicit inputs passed to the command; inherited
 host inputs must additionally be controlled by the owner attestation before
 reuse is possible. The builder never copies Project environment values into a
-spec. Every existing configured command defaults to `uncacheable`; a future
-configuration declaration must explicitly establish controlled inputs before
-using `declared_controlled_inputs`.
+spec. The frozen policies mark configured commands `uncacheable`. The canonical
+server-worktree CI builder marks its commands `declared_controlled_inputs`,
+and the current review-entry and queue-head identity builder selects that
+policy; reusable receipt validation still requires the owner attestation,
+unchanged tracked candidate and confirmed process-tree settlement.
 
 | Execution family | Characterized bundle, cwd, environment and timeout |
 |---|---|
@@ -8250,14 +8335,16 @@ using `declared_controlled_inputs`.
 | Project/machine readiness | Already selected readiness probe set in order; repository or owner probe scratch; Project keys; 1–300 seconds; collect all checks. Selection and owner routing remain outside the builder. |
 | Exported environment helpers | Role-applicable selected checks; supplied directory; Project keys; 1–300 seconds; stop at failure. The single-check helper supplies `single_environment_check` and ignores role filtering, as today. |
 | Agent-selected commands | No configured authoritative bundle exists. The builder returns an empty `agent_selected` spec; it does not manufacture reusable CI from arbitrary agent tool calls. |
-| Future queue-head CI | `queue_head_ci` can describe CI-only or conformance bundles. The caller must explicitly supply `QueueHeadCheckBundle`; there is no default and no execution. This leaves the later gating decision open. |
+| Queue-head CI | The generic builder requires an explicit `QueueHeadCheckBundle` (CI-only or conformance), with no default. The active integration head uses the shared review-entry CI identity builder and requests the durable runner under the consumer purpose `queue_head_ci`. |
 
 **Run scope.** `CheckSpec.scope` says who may share one run of the bundle, and
-it is part of the digest. `check_family_scope` classifies every family:
+it is part of the digest. `check_family_scope` gives each family's default scope; `build_check_spec`
+overrides commit scope with the workspace ID/generation for canonical server CI:
 
 | Family | Scope | Why |
 |---|---|---|
-| Review-entry CI, manual review CI, queue-head CI (CI only), agent-selected | `commit` | The commands only read the commit. Every Task at that commit shares the run; no Task or workspace is in the identity. |
+| Frozen review-entry/manual review CI, frozen queue-head CI (CI only), agent-selected | `commit` | The builder's family default; Project/repo/commit/spec identity scopes a live run. Frozen CI is not reusable after completion. |
+| Canonical server review-entry CI and queue-head CI | workspace | The builder pins the Task's workspace ID and placement generation; another worktree or generation has another identity. |
 | Conformance and queue-head conformance **without** setup steps | `commit` | Same: checks only. |
 | Conformance and queue-head conformance **with** setup steps | worktree | Setup steps prepare the worktree the checks then run in. |
 | Blocking before-work, other lifecycle scripts / hook test | worktree | The script acts on the Task's worktree (or is owed to the Task's event). |
@@ -8361,8 +8448,9 @@ spec into a reusable check.
 legacy DML, and preserves existing data. `V202610082320__check_run_identity.sql`
 adds `check_run.applied_timeout_seconds` and `check_consumer.purpose`, and
 rebuilds `check_result` to change its certification CHECK (SQLite cannot alter
-one), carrying every row and every consumer-to-result link. Only fields read/written by the passive
-repositories, or required by constraints/indexes, are included. All JSON limits
+one), carrying every row and every consumer-to-result link. The base contract columns are listed here; the additive runner migration
+also persists the dispatch/owner intent, admission and capacity wait, runtime,
+deadline/cleanup, result and consumer-delivery fields used by stage C. All JSON limits
 are UTF-8 bytes, enforced in code and with SQLite BLOB-length CHECKs.
 
 | `check_run` column | Constraint / meaning |
@@ -8378,11 +8466,11 @@ are UTF-8 bytes, enforced in code and with SQLite BLOB-length CHECKs.
 | `state` | NOT NULL enum: queued, running, cancelling, cleaning, uncertain, succeeded, failed, cancelled. |
 | `operation_id` | NOT NULL UNIQUE application UUID, allocated before claim and preserved on takeover. |
 | `workspace_id` | Optional workspace FK, ON DELETE SET NULL. |
-| `machine_id` | Optional physical-owner daemon FK, ON DELETE SET NULL. No capacity admission occurs. |
+| `machine_id` | Optional physical-owner daemon FK, ON DELETE SET NULL. The durable runner performs physical-machine capacity admission before dispatch. |
 | `applied_timeout_seconds` | Optional positive integer: the whole-run wall limit this run executes under, taken from the request that scheduled it. Later requests that join or reuse never change it. The runner must apply this value, not the setting current at execution. |
 | `lease_owner`, `lease_until` | Optional text, both null or both populated; expiry comparisons use SQLite julianday. |
 | `lease_generation` | INTEGER NOT NULL DEFAULT 0, nonnegative; advances on every claim/takeover. |
-| `version` | INTEGER NOT NULL DEFAULT 1, positive; every mutation uses and increments CAS version. |
+| `version` | INTEGER NOT NULL DEFAULT 1, positive; individual claim/lease/state/settlement writes use and increment version CAS. Bulk withdrawal cancels unleased queued runs under state/consumer predicates and increments each affected run's version. |
 | `created_at`, `updated_at` | NOT NULL timestamps. |
 | `finished_at` | Optional timestamp; uncertainty never records terminal completion. |
 
@@ -8398,7 +8486,7 @@ cancelling, cleaning and uncertain; `check_run_state_lease(state, lease_until)`;
 | `outcome` | NOT NULL enum: pass, fail, timed_out, cancelled, infrastructure_failed. |
 | `cleanup` | NOT NULL enum: success, failed, uncertain, not_performed. |
 | `certified` | NOT NULL boolean. The repository sets it for a pass whose cleanup succeeded, or whose cleanup is `not_performed` when the spec declares no cleanup step; it requires all ordered commands to have passed. The SQL CHECK refuses it for any non-pass outcome and for failed or uncertain cleanup. |
-| `cacheable` | NOT NULL boolean copied from validated run eligibility. |
+| `cacheable` | NOT NULL boolean requiring validated run input eligibility, a certified pass and reusable owner evidence; it can be false even when the run's input flag was true. |
 | `steps_json` | NOT NULL ordered existing CheckCommandOutcome array, valid JSON, maximum 262,144 bytes. |
 | `output_truncated` | NOT NULL boolean; supplied capture truncation OR storage tail truncation. |
 | `created_at` | NOT NULL timestamp. |
@@ -8430,7 +8518,8 @@ command text that alone exceeds the cap is refused.
 | `created_at` | NOT NULL timestamp. |
 
 Consumer indexes: `(task_id, status_epoch)`, `run_id`, `result_id`, plus the
-unique request key. No application/delivery worker exists. Deleting Project or
+unique request key. The active runner enqueues consumer delivery as Task steps; result
+application and current-authority revalidation happen only in those steps. Deleting Project or
 repo cascades evidence; deleting Task, workspace or machine detaches optional
 references. Machine removal's existing tombstone behavior still works. There
 are no ON DELETE RESTRICT references. Tests cover each deletion and fresh and
@@ -8438,14 +8527,11 @@ upgrade migration replay without promoting old review rows.
 
 Relative to the inventory: the spec/environment/schema/execution revision and
 audit reference are stored once in the bounded input manifest; result identity
-joins the scoped run instead of duplicating repo/commit/spec data. Attempt
-counters, runtime/placement witnesses, start/deadline/cancel/cleanup timestamps,
-run result pointer, delivery/application/contract/review mappings,
-HEAD/tracked-change witnesses, drain flags and legacy provenance are deferred:
-no stage-A caller reads/writes them. Cleanup and outcome enums can represent
-success, failure and uncertainty without selecting later cleanup policy. Nullable
-columns can be added when the owner effect, durable runner and Task-step delivery
-actually use them. No legacy cache is seeded.
+joins the scoped run instead of duplicating repo/commit/spec data. Stage C persists the operational run and consumer-delivery fields it uses;
+owner receipts additionally carry HEAD/tracked-change and process-drain
+witnesses, which receipt validation checks before storing mechanical evidence. Cleanup and outcome enums can represent
+success, failure and uncertainty without selecting later cleanup policy. The runner and Task-step delivery use the additive stage-C columns described
+below. No legacy cache is seeded.
 
 **State machine and repository fencing.** `CHECK_RUN_TRANSITIONS` is data, with
 a totality test ensuring every nonterminal has an exit and terminals have none:
@@ -8500,30 +8586,34 @@ cleanup evidence never yields a hit, nor does a declared cleanup step that was
 not performed. The partial result index admits
 at most one certified reusable pass per exact identity. A forced rerun must
 advance the audited execution revision rather than duplicating that identity.
-Consumer authority and current attestation must be revalidated by the future
-Task-step consumer before applying any hit; these tables confer no authority.
+The active Task-step consumer revalidates current authority and input identity
+before applying a hit or joined result; these tables confer no authority.
 
 Operator status adds `checks.by_state` (all eight states, zeros included)
-and `checks.reusable_results`. These are read-only observations, separate
-from machine occupancy and severity; no worker or capacity behavior is enabled.
+and `checks.reusable_results`. These counters are read-only observations. The active worker separately
+performs admission, and status also reports admitted, capacity-waiting and
+borrowed runs from the same durable run/occupancy facts.
 
 Stage B implements the persistence-free owner execution/transport seam below.
 Stage C supplies admission/capacity, reconciliation and Task-step-only
 request/application. It consumes these identities/repositories, adds only the
 fields it actually needs, and rechecks current authority on every hit/join.
-It passes the run's recorded `applied_timeout_seconds` as an absolute owner
-wall deadline (default setting 1800 seconds); the two legacy policies retain
-unbounded CI until that runner's activation.
+The active runner passes the run's recorded `applied_timeout_seconds` as an
+absolute owner wall deadline for all policies. Producers choose the request's
+whole-run limit; the legacy policies retain no per-command limit. A direct
+primitive call without a whole-run deadline is unbounded under a legacy policy
+and refused under any other (`a canonical check requires a whole-run wall
+deadline`).
 
 ### Owner check execution (3.3 stage B)
 
 `check-executor` is a persistence-free owner primitive. It receives a `CheckSpec`,
 local checkout target, operation ID, owner identity, explicit owner input
 revisions, deadline, cancellation token and a borrowed `CheckPermit`. It acquires
-no capacity, writes no check/Task/Review rows and publishes no events. Stage C
-must admit the physical machine, retain the stable operation intent, certify the
-receipt against the frozen spec and owner inputs, and apply it through Task steps.
-There is no cache, single-flight by check digest, recovery loop or timing cutover.
+no capacity, writes no check/Task/Review rows and publishes no events. The active stage-C runner admits the physical machine, retains the stable
+operation intent, certifies the receipt against the frozen spec and owner inputs,
+and applies it through Task steps. The owner primitive itself owns no cache,
+digest single-flight or recovery loop.
 
 `CheckoutTarget::ExactCommit` verifies a full lowercase commit object ID and
 clones an exact detached checkout into a unique `check-*/repo` directory under
@@ -8532,8 +8622,9 @@ or cleans the source checkout or Task worktree. HEAD/tracked-change witnesses
 are captured before removal; a changed managed candidate cannot pass. The
 managed directory is removed even after failure, timeout, cancellation or failed
 preparation. Removal has a separate settlement bound; unconfirmed removal is
-`uncertain` cleanup. Existing CI continues to run in its Task worktree; stage D
-owns the managed-checkout cutover.
+`uncertain` cleanup. Review-entry and queue-head CI run in the Task worktree under the canonical
+or frozen policy. No managed-checkout cutover is enabled for those producers;
+the primitive still supports exact detached checkouts for commit-scoped callers.
 
 Each command runs through `process-supervisor`, the single process-group
 implementation shared with Git. It continuously drains both pipes, retains
@@ -8549,8 +8640,9 @@ most two more seconds and the receipt carries `stdout_drain_incomplete` /
 `stderr_drain_incomplete`; a finished command keeps its exit status even when
 its limit expires during that drain.
 
-What outlives a normal exit depends on the policy. Canonical policies stop the
-command's group after every command. The two frozen CI policies do not: neither
+What outlives a normal exit depends on the policy. New non-CI policies stop a command's group after each command. `canonical-ci/1`
+keeps groups alive for later steps, then stops every recorded step group at run
+end before its final candidate witness. The two frozen CI policies do not: neither
 the server nor the daemon ever stopped what a CI step left running, and a step
 may start a service that the next step uses. Those processes are not stopped at
 the end of the run either, exactly as before. Git retains its normal-exit
@@ -8572,8 +8664,9 @@ behavior during caller migration: the child inherits the owner process
 environment (PATH, HOME, toolchain variables), then the Project environment and
 secrets, then the run budget; no variable is removed except `GIT_DIR`,
 `GIT_WORK_TREE` and `GIT_INDEX_FILE` where the caller already removed them
-(daemon steps and server steps with a deadline). They also run no witness Git
-command beside a step and take no whole-run deadline. Project build overrides retain precedence.
+(daemon steps and server steps with a deadline). They add no witness Git command beside a workspace step and impose no implicit
+whole-run deadline; the active durable runner supplies a recorded absolute
+deadline, which the primitive applies to frozen CI too. Project build overrides retain precedence.
 Attestation is computed on the owner from `ServerCheckExecutionInputs` before
 preparation; revision metadata must bind tools, assets, secrets and any declared
 cleanup policy. Owners without that evidence, including today's daemon, return
@@ -8588,7 +8681,8 @@ overall pass. No declared cleanup plus `not_performed` cleanup may pass. Stage C
 must verify completeness, digest/scope, owner placement and attestation before
 certification; the receipt confers no semantic review authority.
 
-Daemon protocol **5** adds `check.run`, `check.lookup`, and `check.cancel`.
+The check methods `check.run`, `check.lookup`, and `check.cancel` were
+introduced at daemon protocol **5**; the current handshake requires protocol **7 or newer**.
 `check.run` takes a fence-free stable operation ID, owner-resolved workspace
 handle or repository-location/exact-commit target, purpose, spec, transient env,
 pinned cleanup plan and absolute RFC3339 deadline. Local purpose authorization,
@@ -8603,25 +8697,29 @@ handler after restart returns `interrupted`. Cancellation uses the existing
 persistent operation tombstones and waits for process/cleanup settlement.
 
 Every check state has an end. A `running` operation ends with a receipt when its
-commands and cleanup settle, at the latest at its deadline plus the cleanup
-bound and the kill grace; waiting for a busy checkout is bounded by the same
+commands and cleanup settle, after its deadline, cleanup/removal bounds and termination/drain phases;
+canonical CI additionally verifies every recorded step group at run end
+(each `stop_group` can take about three seconds); waiting for a busy checkout is bounded by the same
 deadline and by cancellation, and settles the key as `timed_out` / `cancelled`
 with nothing spawned. A key that was admitted but could not start (workspace
 gone) settles as `infrastructure`. An intent whose handler was dropped or whose
 daemon restarted is `interrupted` and holds no journal headroom. A check key
 outlives `journal.ack` only until its request deadline has passed: before it a
-duplicate must find the receipt, after it a duplicate settles as `timed_out`
-before any command starts, so the key is no longer needed. The deadline may be
+duplicate must find the receipt, after an expired acknowledged receipt has been pruned, a duplicate with the
+old deadline settles as `timed_out` before any command starts, so the key is no
+longer needed. A receipt still retained before that sweep is replayed. The deadline may be
 at most 24 hours ahead. Acknowledged receipts are deleted once their deadline
 has passed; unacknowledged receipts and interrupted intents 24 hours after it
 (at admission of a later check, at most once a minute, and at daemon start).
 The headroom reserved for a running check is sized from its own command count
-(about 51 KiB per declared command), not a fixed worst case. On the server, a
+(50 KiB per declared run or cleanup command, plus the request bytes and 8 KiB fixed overhead), not a fixed worst case. On the server, a
 `check.run` call returns `DaemonUnavailable` as soon as the connection goes
 stale and `DaemonTimeout` after the remaining deadline plus the cleanup bound
 plus the RPC timeout; the caller then asks `check.lookup`.
 Upgrade the server first, then every daemon from that release and restart using
-the same workspace root. Revision-4 and older daemons are refused before dispatch.
+the same workspace root. A daemon below the minimum protocol revision (7), or missing the required
+capabilities, is refused before command dispatch. Newer revisions remain
+compatible when they retain those capabilities.
 
 The inline `integration_effects::check::CheckRun` adapter is deleted with the
 review-entry cutover. Review-entry CI (now one check run per entry, which a
@@ -8663,8 +8761,9 @@ Daemon-local paths stay opaque to the server.
 
 Owner receipts are retained before result projection. Certification compares
 operation, pinned owner/runtime and execution-input identity, command order and
-completion, exit outcomes, timestamps, cleanup and (for reusable or canonical
-passes) exact HEAD/tracked-change witnesses. A malformed terminal receipt is
+completion, exit outcomes, timestamps, cleanup and the exact HEAD/tracked-change witnesses required for reuse.
+Canonical CI can still report its Task's verdict when a witness is dirty,
+missing or its attestation became unavailable; that result is not reusable. A malformed terminal receipt is
 infrastructure evidence, never a pass. Server receipts remain available in
 memory if their durable write has a transient failure. The worker records the
 immutable result before delivering it. Daemon `journal.ack` uses
@@ -8678,8 +8777,9 @@ An idle worker costs five indexed reads per second and no write: the sweep
 reads `check_run_state_lease` and the partial indexes
 `check_consumer_undelivered` and `check_run_unacknowledged`, which hold only
 rows that still need work, and it opens a write transaction only when one of
-them is non-empty. A run or consumer the sweep cannot process is logged and
-skipped; it never stops the sweep for the others. The worker touches only rows
+them is non-empty. Per-run admission and effect-job failures are logged and skipped. A batch
+selection/decoding, delivery enqueue or acknowledgement-batch failure can fail
+the sweep; framework supervision reports it and restarts the worker. The worker touches only rows
 of `check_run`, `check_result` and `check_consumer` created through
 `CheckRunner::request`, and enqueues Task steps.
 
@@ -8708,8 +8808,8 @@ This prevents a silent second execution of a certified key.
 | `running` | Receipt to `cleaning`; lost reply or lost lease to `uncertain`; no consumers left: `cancelling`. A run taken over before its intent was stored launched nothing and settles as an infrastructure failure | Recorded wall limit (1–86,400 seconds) plus 65 seconds of settlement grace. Lease 60 seconds, renewed every 15; takeover within 60 seconds plus sweep delay. |
 | `cancelling` | Cancel reply with a receipt to `cleaning`; any other reply, or a lost lease, to `uncertain` | One cancel exchange, at most 61 seconds. |
 | `cleaning` | Immutable result to a terminal state; a lost lease to `uncertain`, which resumes from the retained receipt | One fenced transaction; takeover within 60 seconds plus sweep delay. |
-| `uncertain` | Receipt settles the original run; owner reports unknown or interrupted after a cancel tombstone: infrastructure failure (retried); machine removed or owner past the disconnected-owner bound: infrastructure failure (retried); owner still "running" or refusing: infrastructure failure, **not** retried | Lookup at most 30 seconds, cancel at most 61, repeated every 15 seconds. Hard bound: the smaller of the configured disconnected-owner bound and the run's wall limit + 65 + 600 seconds. Never a second `check.run` for the operation. |
-| `succeeded`, `failed`, `cancelled` | One `apply_check_result` Task step per consumer; owner acknowledgement | Delivery marker and enqueue share a transaction, on the sweep after settlement. An infrastructure failure is retried at most twice per consumer, then delivered as "no verdict". |
+| `uncertain` | Receipt settles the original run; owner reports unknown or interrupted after a cancel tombstone: infrastructure failure (retried); machine removed or owner past the disconnected-owner bound: infrastructure failure (retried); owner still "running" or refusing: infrastructure failure, **not** retried | Lookup at most 30 seconds, cancel at most 61, repeated every 15 seconds. Hard bound: the run's wall limit + 65 + 600 seconds; while the owner is disconnected, its configured disconnected-owner bound can end the wait earlier. Never a second `check.run` for the operation. |
+| `succeeded`, `failed`, `cancelled` | One `apply_check_result` Task step per `(consumer, result)`; owner acknowledgement | Delivery marker and enqueue share a transaction, on the sweep after settlement. An infrastructure failure is retried at most twice per consumer, then delivered as "no verdict". |
 
 | Consumer delivery state | Automatic exit | Bound |
 | --- | --- | --- |
@@ -8837,9 +8937,9 @@ that level-triggered:
 - *Backstop.* Every wait for a machine carries a durable recheck deadline on
   that row: 60 s for a run slot (`SLOT_WAIT_RECHECK`), 30 s while the Task
   waits for disk or any machine is under its free-space floor
-  (`DISK_WAIT_RECHECK`; free disk comes back with no commit at all). The
-  deadline survives a restart and is due at once after one; a Task read again
-  before it fires keeps it. No ordering of a release and a wait, and no
+  (`DISK_WAIT_RECHECK`; free disk comes back with no commit at all). The deadline survives a restart; startup's immediate discovery/sweep
+  re-evaluates waits without requiring that stored timer to expire. A Task
+  read again before it fires keeps the armed deadline. No ordering of a release and a wait, and no
   release that marks nobody, parks a Task on an idle machine for longer than
   one period.
 
@@ -8871,8 +8971,9 @@ aged waiter and a check is their timestamps (a tie goes to the check).
 
 Result delivery enqueues an entry-fenced `apply_check_result` Task command with
 consumer/result/run identities, exact commit and spec digest. The consumer's
-`delivery_step_id` and enqueue share a transaction. Its marker survives Task-step
-retention, so restart and pruning cannot enqueue a second notification. Already
+`delivery_step_id` and enqueue share a transaction. Its marker survives Task-step retention, so restart and pruning cannot
+enqueue a second notification for that `(consumer, result)`. An owner rearm or
+revival may reset the marker and deliver the consumer's next result. Already
 stale epochs are enqueued as superseded and leave the Task untouched.
 
 #### Retention of check history
@@ -8892,8 +8993,8 @@ The predicate is deny-by-default (`crates/db/src/check_run/retention.rs`):
 
 | Row | Deleted only when |
 |---|---|
-| consumer | older than the cutoff; **and** finished (cancelled, applied, its Task gone, or its Task no longer in the status entry it asked from); **and** it holds no undelivered result; **and** no Task step that is `pending`, `claimed` or `suspended` awaits it (`task_step.awaited_consumer_id`); **and** its delivery step is not `pending`, `claimed` or `suspended`; **and** the Review attempt named in its request key is not `running` or `awaiting_human`; **and** its run is terminal |
-| run (its results go with it, `ON DELETE CASCADE`) | terminal (`succeeded`, `failed`, `cancelled`); finished before the cutoff and more than 26 hours ago (the owner acknowledgement window is 25); **and no consumer row at all** still names the run or one of its results |
+| consumer | older than the cutoff; **and** finished (cancelled, applied, its Task gone, or its Task no longer in the status entry it asked from); **and** it holds no undelivered result; **and** no Task step outside `done`/`superseded` awaits it (`task_step.awaited_consumer_id`) or names it through a hook checkpoint; **and** its delivery step is `done`/`superseded` or gone (failed and parked steps still pin it); **and** the Review attempt named in its request key is not `running` or `awaiting_human`; **and** its run is terminal; **and** no unfinished integration attempt still owns the integration consumer |
+| run (its results go with it, `ON DELETE CASCADE`) | terminal (`succeeded`, `failed`, `cancelled`); finished before the cutoff and more than 26 hours ago (the owner acknowledgement window is 25); **and no consumer row at all** still names the run or one of its results; **and** no unfinished integration attempt names its run/result/operation through stored check/effect/receipt/observation evidence |
 
 The last condition is what makes it deny-by-default: a consumer this job did
 not delete, for whatever reason, keeps its run and its result. A reusable
@@ -8917,8 +9018,8 @@ Every column that points at one of the three tables is listed in
 enumerates them from the migrated schema (`pragma_foreign_key_list` over
 every table, plus every column whose name says it holds a check run, result
 or consumer id, and every `run_id`/`result_id` column of an `integration_*`
-table). A reference added later, as the merge queue will add, fails that test
-until the predicate keeps the rows the new reader can still read.
+table). A reference added later fails that test until the predicate accounts for its
+reader; the current inventory already covers integration-attempt evidence.
 
 #### Task-step consumer contract
 
@@ -8929,16 +9030,21 @@ its Task, the status entry it runs under and its *authority*: the step or
 attempt that asks, as the family names it. The request is idempotent on
 (origin, Task, status entry, authority) and is refused when the Task has left
 that status entry or no family is registered. Its reply (`Hit`, `Joined`,
-`Scheduled`) is information only. Hit, joined or scheduled, the verdict always
-arrives as exactly one `apply_check_result` Task step, so there is one
-application path.
+`Scheduled`) is information only. A normal request delivers each `(consumer, result)` once through an
+`apply_check_result` Task step. The reuse-only `try_reuse` path applies a hit in
+the asking Task step and creates an already-applied consumer without a delivery
+step. Rearming a consumer for a new result can produce a new delivery. An integration head's
+`request_check` re-ask can also consume an already-recorded verdict in its
+requesting step to repair a missing earlier acknowledgement or failed delivery;
+it does not enqueue a second delivery for the existing result.
 
 `apply(step_id, delivery)` runs inside that step. It refuses (the step fails
 visibly) an envelope that is not carried by the consumer's recorded delivery
 step, or whose consumer, run, result, commit or spec digest differ from what
-is stored. It returns `stale` and leaves the Task untouched when the consumer
-was cancelled, the Task left the status entry, or the family's
-`current_authority` is no longer the one that asked. Otherwise it hands the
+is stored. It returns `stale` when the consumer was cancelled, the Task left its status
+entry, or the family's `current_authority` changed. A stale epoch leaves the
+Task untouched; cancellation or changed authority clears only that consumer's
+own wait when the delivery holds the Task lease. Otherwise it hands the
 family a `CheckVerdict`: `Result` (pass, fail, timed out or cancelled, for
 exactly the requested commit and spec) or `InfrastructureExhausted` (no
 verdict after the automatic retries: the family parks its Task with a

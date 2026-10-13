@@ -5,10 +5,637 @@ use api_types::{
 };
 use db::{EnqueueTaskStep, TaskStepRepo};
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum CommandPoint {
+    AfterClaim,
+    BeforeCommand,
+    BeforeSettle,
+    BeforeReply,
+    BeforeRelease,
+    BeforeSend,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CommandFault {
+    Pause,
+    Panic,
+    Retry,
+    /// The database is busy once at the point.
+    Busy,
+    /// The claimer is slow at the point.
+    Delay,
+}
+
+/// A real SQLITE_BUSY as the worker classifies it.
+pub(super) fn busy() -> ServiceError {
+    #[derive(Debug)]
+    struct Busy;
+    impl std::fmt::Display for Busy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("database is locked")
+        }
+    }
+    impl std::error::Error for Busy {}
+    impl sqlx::error::DatabaseError for Busy {
+        fn message(&self) -> &str {
+            "database is locked"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some("5".into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    ServiceError::Db(db::DbError::Sqlx(sqlx::Error::Database(Box::new(Busy))))
+}
+
+/// A per-worker barrier: no global timing or interference between tests.
+pub(super) struct CommandGate {
+    point: CommandPoint,
+    first: std::sync::atomic::AtomicBool,
+    arrived: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    fault: CommandFault,
+    job: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+impl CommandGate {
+    fn new(point: CommandPoint, fault: CommandFault) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            first: std::sync::atomic::AtomicBool::new(true),
+            arrived: Default::default(),
+            resume: Default::default(),
+            fault,
+            job: Default::default(),
+        })
+    }
+    pub(super) fn keep_job(&self, job: JoinHandle<()>) {
+        let mut kept = self.job.lock().unwrap();
+        if kept.is_none() {
+            *kept = Some(job);
+        }
+    }
+    pub(super) async fn pause(
+        &self,
+        db: &db::SqliteDb,
+        step: &TaskStep,
+        point: CommandPoint,
+    ) -> bool {
+        if step.kind != "command"
+            || step.attempts != 1
+            || point != self.point
+            || !self.first.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        // A short real lease exercises the wall-clock lease read without
+        // waiting on the production 60-second lease or simulating SQLite.
+        let until = (chrono::Utc::now() + chrono::Duration::milliseconds(500)).to_rfc3339();
+        sqlx::query("UPDATE task_step SET lease_until=? WHERE id=? AND claimed_by=?")
+            .bind(until)
+            .bind(&step.id)
+            .bind(&step.claimed_by)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.domain_event_notify().notify_waiters();
+        self.arrived.notify_one();
+        self.resume.notified().await;
+        assert!(
+            self.fault != CommandFault::Panic,
+            "injected claimer panic after claim"
+        );
+        self.fault == CommandFault::Retry
+    }
+    /// A fault that needs no test-side resume. True: fail busy here.
+    pub(super) async fn inject(&self, step: &TaskStep, point: CommandPoint) -> bool {
+        if step.kind != "command"
+            || point != self.point
+            || !self.first.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        if self.fault == CommandFault::Delay {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.fault == CommandFault::Busy
+    }
+    async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(3), self.arrived.notified())
+            .await
+            .expect("the claimer reached the barrier");
+    }
+    fn take_job(&self) -> JoinHandle<()> {
+        self.job.lock().unwrap().take().unwrap()
+    }
+}
+
+fn transition_command() -> crate::task_service::commands::TaskCommand {
+    crate::task_service::commands::TaskCommand {
+        operation: "engine_transition".into(),
+        preempt: false,
+        arguments: serde_json::json!({"task_id":"t","target_state":"done","version":1,"workflow":workflow(),"actor":cascade_actor(),"reason":"bounded command waiter","rejection":false,"skip_before_exit":false,"defer_dispatch_until":null,"board_move":null,"authority":null,"entry_retry":false}),
+    }
+}
+
+#[tokio::test]
+async fn command_waiter_reclaims_a_claimer_that_panics_after_claim() {
+    let (db, mut worker) = fixture().await;
+    let gate = CommandGate::new(CommandPoint::AfterClaim, CommandFault::Panic);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let mut waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<crate::workflow::engine::TransitionResult>(
+                    "t",
+                    transition_command(),
+                )
+                .await
+        }
+    });
+    gate.wait().await;
+    // The claimant is still alive here and its step is claimed. The
+    // channel sender remains registered across its panic.
+    gate.resume.notify_one();
+    assert!(gate.take_job().await.unwrap_err().is_panic());
+    let answer = tokio::time::timeout(Duration::from_secs(3), &mut waiter).await;
+    if answer.is_err() {
+        waiter.abort();
+        let _ = waiter.await;
+        panic!("command waiter hung after the claimer panicked and its lease lapsed");
+    }
+    assert_eq!(answer.unwrap().unwrap().unwrap().task.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!(command.status, "done");
+    assert_eq!(command.attempts, 2);
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn command_waiter_recovers_committed_reply_after_claimer_is_cancelled() {
+    let (db, mut worker) = fixture().await;
+    let gate = CommandGate::new(CommandPoint::BeforeReply, CommandFault::Pause);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<crate::workflow::engine::TransitionResult>(
+                    "t",
+                    transition_command(),
+                )
+                .await
+        }
+    });
+    gate.wait().await;
+    let job = gate.take_job();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    let answer = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .expect("a committed reply is recovered at lease expiry")
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.task.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!(command.status, "done");
+    assert_eq!(command.attempts, 1, "the effect is never repeated");
+    assert!(command.result_json.is_some());
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+async fn transition_under(
+    point: CommandPoint,
+    fault: CommandFault,
+    command: crate::task_service::commands::TaskCommand,
+) -> (
+    Arc<db::SqliteDb>,
+    Arc<TaskStepWorker>,
+    Result<crate::workflow::engine::TransitionResult>,
+) {
+    let (db, mut worker) = fixture().await;
+    worker.command_test_gate = Some(CommandGate::new(point, fault));
+    let worker = Arc::new(worker);
+    let answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        worker.request_command::<crate::workflow::engine::TransitionResult>("t", command),
+    )
+    .await
+    .expect("the command waiter is bounded");
+    // The inline job releases after it answers.
+    for _ in 0..200 {
+        if db.active_step_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (db, worker, answer)
+}
+
+/// The command ran and committed its effect; SQLite is busy when the step
+/// is settled. Re-queueing the step would run the command a second time.
+#[tokio::test]
+async fn command_that_ran_is_not_run_again_when_its_settlement_finds_the_database_busy() {
+    let (db, worker, answer) = transition_under(
+        CommandPoint::BeforeSettle,
+        CommandFault::Busy,
+        transition_command(),
+    )
+    .await;
+    assert_eq!(
+        answer.expect("the command's own answer").task.status,
+        "done"
+    );
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!(command.attempts, 1, "the effect is never repeated");
+    assert_eq!(command.status, "done");
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+/// The command is settled `done`; only the release of its lease finds the
+/// database busy. The caller gets the committed result, not that error.
+#[tokio::test]
+async fn committed_command_answers_its_result_when_the_release_finds_the_database_busy() {
+    let (db, _worker, answer) = transition_under(
+        CommandPoint::BeforeRelease,
+        CommandFault::Busy,
+        transition_command(),
+    )
+    .await;
+    assert_eq!(answer.expect("the committed result").task.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!((command.status.as_str(), command.attempts), ("done", 1));
+    assert_eq!(command.lease_until, None, "the release is repeated");
+}
+
+/// A waiter that reads the released step before the claimer has sent the
+/// reply must still return the command's typed error, not the stored
+/// summary of it.
+#[tokio::test]
+async fn released_command_error_keeps_its_type_when_the_waiter_reads_before_the_reply() {
+    let mut command = transition_command();
+    command.arguments["target_state"] = serde_json::json!("no_such_state");
+    let (_db, _worker, typed) = transition_under(
+        CommandPoint::BeforeSettle,
+        CommandFault::Delay,
+        command.clone(),
+    )
+    .await;
+    let typed = format!("{:?}", typed.err().expect("an unknown state is refused"));
+    let (_db, _worker, raced) =
+        transition_under(CommandPoint::BeforeSend, CommandFault::Delay, command).await;
+    assert_eq!(format!("{:?}", raced.err().expect("refused")), typed);
+}
+
+fn read_current_task_command() -> crate::task_service::commands::TaskCommand {
+    crate::task_service::commands::TaskCommand {
+        operation: "block_cancelled_dependencies".into(),
+        arguments: serde_json::json!(["t", []]),
+        preempt: false,
+    }
+}
+
+#[tokio::test]
+async fn command_waiter_dropped_while_claimed_does_not_wedge_the_next_command() {
+    let (db, mut worker) = fixture().await;
+    let gate = CommandGate::new(CommandPoint::AfterClaim, CommandFault::Pause);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<crate::workflow::engine::TransitionResult>(
+                    "t",
+                    transition_command(),
+                )
+                .await
+        }
+    });
+    gate.wait().await;
+    waiter.abort();
+    assert!(waiter
+        .await
+        .err()
+        .expect("waiter was aborted")
+        .is_cancelled());
+    assert!(
+        worker
+            .task_service
+            .task_step_replies
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "a dropped request removes its sender"
+    );
+    // Also lose the claimer: the next command's predecessor has no owner or
+    // waiter left to announce that the lease lapsed.
+    let job = gate.take_job();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    let next = tokio::time::timeout(
+        Duration::from_secs(3),
+        worker.request_command::<db::Task>("t", read_current_task_command()),
+    )
+    .await
+    .expect("the next command takes over its abandoned predecessor")
+    .unwrap();
+    assert_eq!(next.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    let commands: Vec<_> = rows.iter().filter(|step| step.kind == "command").collect();
+    assert_eq!(commands.len(), 2);
+    assert!(commands.iter().all(|step| step.status == "done"));
+    assert_eq!(commands[0].attempts, 2);
+    assert_eq!(commands[1].attempts, 1);
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+/// A request dropped while the commit of its inline claim is in flight (an
+/// aborted HTTP request) must not leave the step claimed for a whole lease
+/// with no runner: the next command of the Task would answer `task_busy`.
+/// The waiter is polled by hand and dropped after one more poll each round,
+/// so every point where it can be suspended is covered.
+#[tokio::test]
+async fn command_waiter_dropped_at_any_await_leaves_no_claim_without_a_runner() {
+    use std::{future::Future, task::Poll};
+    let (db, worker) = fixture().await;
+    let worker = Arc::new(worker);
+    for round in 1..400usize {
+        let mut waiter =
+            Box::pin(worker.request_command::<db::Task>("t", read_current_task_command()));
+        let mut finished = false;
+        for _ in 0..round {
+            finished =
+                std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx).is_ready())).await;
+            if finished {
+                break;
+            }
+            // Let SQLite finish what the waiter asked for before the waiter
+            // is polled again or dropped.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        drop(waiter);
+        let next = tokio::time::timeout(
+            Duration::from_secs(20),
+            worker.request_command::<db::Task>("t", read_current_task_command()),
+        )
+        .await
+        .expect("the next command is bounded");
+        if let Err(error) = next {
+            let queue: Vec<_> = db
+                .task_steps("t")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|step| step.status != "done")
+                .map(|step| {
+                    format!(
+                        "{} attempts={} lease={:?} runner={}",
+                        step.status,
+                        step.attempts,
+                        step.lease_until,
+                        db.step_is_active(step)
+                    )
+                })
+                .collect();
+            panic!("round {round}: {error:?}; queue: {queue:?}");
+        }
+        assert!(
+            worker
+                .task_service
+                .task_step_replies
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "round {round}: no reply registration is left"
+        );
+        if finished {
+            return;
+        }
+    }
+    panic!("the waiter never finished");
+}
+
+#[tokio::test]
+async fn command_waiter_returns_typed_busy_under_a_live_owner_that_completes_later() {
+    let (db, mut worker) = fixture().await;
+    db.set_claimed_task_step_wait(Duration::from_secs(1));
+    let gate = CommandGate::new(CommandPoint::AfterClaim, CommandFault::Pause);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<crate::workflow::engine::TransitionResult>(
+                    "t",
+                    transition_command(),
+                )
+                .await
+        }
+    });
+    gate.wait().await;
+    let answer = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .expect("a live claimer's waiter has a ceiling")
+        .unwrap();
+    assert!(
+        matches!(
+            answer,
+            Err(ServiceError::TaskBusy {
+                pending_steps: 1,
+                retry_after_ms: 250
+            })
+        ),
+        "expected typed busy, got {:?}",
+        answer.err()
+    );
+    let rows = db.task_steps("t").await.unwrap();
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(
+        rows[0].attempts, 1,
+        "a live owner is never stolen at lease expiry"
+    );
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+    gate.resume.notify_one();
+    gate.take_job().await.unwrap();
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "done"
+    );
+    assert_eq!(db.task_steps("t").await.unwrap()[0].status, "done");
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A command whose attempt failed before it ran and was re-queued is still
+/// accepted: it runs on its retry. Its caller is not answered with the
+/// attempt's transient error (a caller told "error" asks again, and both
+/// commands then run); it waits, within its bound, for the retry's answer.
+#[tokio::test]
+async fn command_waiter_gets_the_answer_of_its_requeued_command_not_the_attempt_error() {
+    let (db, mut worker) = fixture().await;
+    let gate = CommandGate::new(CommandPoint::BeforeCommand, CommandFault::Retry);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<db::Task>("t", read_current_task_command())
+                .await
+        }
+    });
+    gate.wait().await;
+    gate.resume.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(4), waiter)
+        .await
+        .expect("the retry is driven at its back-off, inside the waiter's bound")
+        .unwrap();
+    assert_eq!(
+        answer.expect("the re-queued command's own answer").status,
+        "todo"
+    );
+    let rows = db.task_steps("t").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].status.as_str(), rows[0].attempts), ("done", 2));
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn command_waiter_re_registers_a_lost_sender_for_its_live_step() {
+    let (db, mut worker) = fixture().await;
+    let gate = CommandGate::new(CommandPoint::AfterClaim, CommandFault::Pause);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<db::Task>("t", read_current_task_command())
+                .await
+        }
+    });
+    gate.wait().await;
+    let replies = &worker.task_service.task_step_replies;
+    let id = db.task_steps("t").await.unwrap()[0].id.clone();
+    // Lose the sender after removal, before sending the attempt's answer.
+    drop(replies.lock().unwrap().remove(&id).unwrap());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if replies.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a live step gets a replacement reply sender");
+    assert_eq!(replies.lock().unwrap().len(), 1);
+    gate.resume.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    gate.take_job().await.unwrap();
+    assert_eq!(answer.status, "todo");
+    let rows = db.task_steps("t").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "done");
+    assert_eq!(rows[0].attempts, 1);
+    assert!(replies.lock().unwrap().is_empty());
+}
+
 async fn fixture() -> (Arc<db::SqliteDb>, TaskStepWorker) {
     let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let db = Arc::new(db::SqliteDb::new(pool));
+    db.set_claimed_task_step_wait(Duration::from_secs(4));
     let now = db::now_rfc3339();
     sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
         .bind(&now)

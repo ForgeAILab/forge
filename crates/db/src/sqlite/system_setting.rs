@@ -44,3 +44,18 @@ impl SystemSettingRepo for SqliteDb {
         Ok(())
     }
 }
+
+impl SqliteDb {
+    pub async fn setting_value_with_updated_at(
+        &self,
+        key: &str,
+    ) -> crate::Result<Option<(String, String)>> {
+        let result = sqlx::query_as::<_, (String, String)>(
+            "SELECT value, updated_at FROM system_setting WHERE key = ?",
+        )
+        .bind(key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(result)
+    }
+}

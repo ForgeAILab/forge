@@ -18,7 +18,7 @@ use db::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Row, Sqlite, Transaction};
+use sqlx::{Acquire, Sqlite, Transaction};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -215,14 +215,11 @@ impl AttentionService {
             return;
         };
         // Only a stall with outstanding work is worth interrupting a user for.
-        let open_incidents: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM attention_projection
-             WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'",
-        )
-        .bind(scope_id)
-        .fetch_one(self.db.pool())
-        .await
-        .unwrap_or(0);
+        let open_incidents: i64 = self
+            .db
+            .open_project_autonomy_incident_count(scope_id)
+            .await
+            .unwrap_or(0);
         if open_incidents == 0 {
             return;
         }
@@ -295,37 +292,24 @@ impl AttentionService {
     /// Within a Project, blockers are batched first, then budget-suppressed
     /// decisions, then items waiting on setup.
     pub async fn sweep_once_at(&self, now: &str) -> Result<usize> {
-        let rows = sqlx::query(
-            "SELECT a.id, a.scope_type, a.scope_id, l.incident_digest AS latest_digest,
-                    l.disposition AS latest_disposition, l.reason AS latest_reason,
-                    l.identity_id AS latest_identity
-             FROM attention_projection a
-             LEFT JOIN agent_wake_attention_latest l ON l.attention_id = a.id
-             WHERE a.status = 'open'
-               AND a.recommended_action NOT IN ('answer_escalation', 'answer_lead_input')
-               AND (a.snoozed_until IS NULL OR a.snoozed_until <= ?)
-             ORDER BY a.scope_type, a.scope_id, a.occurred_at, a.id",
-        )
-        .bind(now)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.open_wake_sweep_candidates(now).await?;
         let mut scopes = std::collections::BTreeMap::<(String, String), Vec<SweepCandidate>>::new();
         for row in rows {
-            let disposition: Option<String> = row.try_get("latest_disposition")?;
+            let disposition: Option<String> = row.latest_disposition?;
             let latest = match disposition {
                 Some(disposition) => Some(LatestWakeDecision {
-                    digest: row.try_get("latest_digest")?,
+                    digest: row.latest_digest?,
                     disposition,
-                    reason: row.try_get("latest_reason")?,
-                    identity_id: row.try_get("latest_identity")?,
+                    reason: row.latest_reason?,
+                    identity_id: row.latest_identity?,
                 }),
                 None => None,
             };
             scopes
-                .entry((row.try_get("scope_type")?, row.try_get("scope_id")?))
+                .entry((row.scope_type?, row.scope_id?))
                 .or_default()
                 .push(SweepCandidate {
-                    id: row.try_get("id")?,
+                    id: row.id?,
                     latest,
                 });
         }
@@ -485,12 +469,7 @@ impl AttentionService {
         // earlier admission of the same digest: name the turns it replaces.
         let mut parts = Vec::with_capacity(batch.len());
         for attention in &batch {
-            let prior: Vec<String> = sqlx::query_scalar(
-                "SELECT turn_job_id FROM agent_wake_blocker WHERE attention_id = ? ORDER BY turn_job_id",
-            )
-            .bind(&attention.id)
-            .fetch_all(self.db.pool())
-            .await?;
+            let prior: Vec<String> = self.db.prior_blocker_turn_ids(&attention.id).await?;
             let digest = wake_attention_incident_digest(attention);
             parts.push(if prior.is_empty() {
                 digest
@@ -567,28 +546,20 @@ impl AttentionService {
         &self,
         request: &WakeAdmissionRequest,
     ) -> Result<WakeDecisionContext> {
-        let row = sqlx::query(
-            "SELECT id, attention_type, scope_type, scope_id, status,
-                    source_event_id, source_sequence, details_json,
-                    recommended_action, version
-             FROM attention_projection WHERE dedupe_key = ?",
-        )
-        .bind(&request.incident_key)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let row = self.db.wake_incident_context(&request.incident_key).await?;
         let Some(row) = row else {
             return Ok(WakeDecisionContext::default());
         };
-        let id: String = row.try_get("id")?;
-        let attention_type: String = row.try_get("attention_type")?;
-        let scope_type: String = row.try_get("scope_type")?;
-        let scope_id: String = row.try_get("scope_id")?;
-        let status: String = row.try_get("status")?;
-        let source_event_id: String = row.try_get("source_event_id")?;
-        let source_sequence: Option<i64> = row.try_get("source_sequence")?;
-        let details_json: String = row.try_get("details_json")?;
-        let recommended_action: String = row.try_get("recommended_action")?;
-        let version: i64 = row.try_get("version")?;
+        let id: String = row.id?;
+        let attention_type: String = row.attention_type?;
+        let scope_type: String = row.scope_type?;
+        let scope_id: String = row.scope_id?;
+        let status: String = row.status?;
+        let source_event_id: String = row.source_event_id?;
+        let source_sequence: Option<i64> = row.source_sequence?;
+        let details_json: String = row.details_json?;
+        let recommended_action: String = row.recommended_action?;
+        let version: i64 = row.version?;
         let details = serde_json::from_str::<Value>(&details_json).unwrap_or(Value::Null);
         let requires_current_task_intervention = attention_type == "execution_failed"
             && details.get("source_event_type").and_then(Value::as_str)
@@ -766,17 +737,13 @@ impl AttentionService {
         // that event receives a terminal suppression rather than waking a
         // stale responder.
         let attention_status = if let Some(attention_id) = context.attention_id.as_deref() {
-            sqlx::query_scalar::<_, String>("SELECT status FROM attention_projection WHERE id = ?")
-                .bind(attention_id)
-                .fetch_optional(&mut **transaction)
+            self.db
+                .wake_attention_status_in_tx(transaction, attention_id)
                 .await?
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT status FROM attention_projection WHERE dedupe_key = ?",
-            )
-            .bind(&request.incident_key)
-            .fetch_optional(&mut **transaction)
-            .await?
+            self.db
+                .wake_incident_status_in_tx(transaction, &request.incident_key)
+                .await?
         };
         if attention_status.as_deref() == Some("resolved") {
             self.append_wake_decision_in_tx(
@@ -803,9 +770,10 @@ impl AttentionService {
                 // Check again under the same writer lock as wake budgeting.
                 orphan_attempt_is_current(&self.db, transaction, execution_id).await?
             } else if let Some(task_id) = context.task_id.as_deref() {
-                let raw = sqlx::query_scalar::<_, String>(
-                    "SELECT condition_json FROM task WHERE id=? AND deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'",
-                ).bind(task_id).fetch_optional(&mut **transaction).await?;
+                let raw = self
+                    .db
+                    .wake_unsettled_task_condition_in_tx(transaction, task_id)
+                    .await?;
                 raw.and_then(|raw| db::task_condition::decode(&raw).ok())
                     .is_some_and(|condition| {
                         db::task_condition::material_blocker(&condition).requires_intervention
@@ -815,18 +783,15 @@ impl AttentionService {
             };
             if !active {
                 if let Some(attention_id) = context.attention_id.as_deref() {
-                    sqlx::query(
-                        "UPDATE attention_projection
-                         SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
-                             updated_at = ?, version = version + 1
-                         WHERE id = ? AND version = ? AND status <> 'resolved'",
-                    )
-                    .bind(&now)
-                    .bind(&now)
-                    .bind(attention_id)
-                    .bind(context.attention_version)
-                    .execute(&mut **transaction)
-                    .await?;
+                    self.db
+                        .resolve_stale_wake_attention_in_tx(
+                            transaction,
+                            &now,
+                            &now,
+                            attention_id,
+                            context.attention_version,
+                        )
+                        .await?;
                 }
                 self.append_wake_decision_in_tx(
                     transaction,
@@ -876,26 +841,23 @@ impl AttentionService {
                 "project" | "account" => {
                     Some((request.scope_type.clone(), request.scope_id.clone()))
                 }
-                "task" => sqlx::query_scalar::<_, String>(
-                    "SELECT project_id FROM task WHERE id=? AND deleted_at IS NULL",
-                )
-                .bind(&request.scope_id)
-                .fetch_optional(&mut **transaction)
-                .await?
-                .map(|id| ("project".to_owned(), id)),
+                "task" => self
+                    .db
+                    .wake_live_task_project_id_in_tx(transaction, &request.scope_id)
+                    .await?
+                    .map(|id| ("project".to_owned(), id)),
                 "agent_chat" => {
-                    let chat =
-                        sqlx::query("SELECT project_id,account_id FROM agent_chat WHERE id=?")
-                            .bind(&request.scope_id)
-                            .fetch_optional(&mut **transaction)
-                            .await?;
+                    let chat = self
+                        .db
+                        .wake_chat_canonical_scope_in_tx(transaction, &request.scope_id)
+                        .await?;
                     chat.and_then(|row| {
-                        row.try_get::<Option<String>, _>("project_id")
+                        row.project_id
                             .ok()
                             .flatten()
                             .map(|id| ("project".to_owned(), id))
                             .or_else(|| {
-                                row.try_get::<Option<String>, _>("account_id")
+                                row.account_id
                                     .ok()
                                     .flatten()
                                     .map(|id| ("account".to_owned(), id))
@@ -941,8 +903,14 @@ impl AttentionService {
             .map(wake_budget_category)
             .unwrap_or("delivery");
         if category == "delivery" {
-            let repeated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_disposition d JOIN agent_chat_turn_job j ON j.id=d.turn_job_id JOIN agent_identity i ON i.id=j.responder_identity_id JOIN agent_profile p ON p.id=i.selected_profile_id WHERE d.disposition='turn_admitted' AND d.incident_key=? AND d.incident_digest=? AND j.status='failed' AND j.profile_id=p.id AND j.profile_version=p.version)")
-                .bind(&request.incident_key).bind(context.incident_digest.as_deref()).fetch_one(&mut **transaction).await?;
+            let repeated: bool = self
+                .db
+                .failed_wake_matches_current_profile_in_tx(
+                    transaction,
+                    &request.incident_key,
+                    context.incident_digest.as_deref(),
+                )
+                .await?;
             if repeated {
                 self.append_wake_decision_in_tx(
                     transaction,
@@ -998,8 +966,10 @@ impl AttentionService {
                 .filter(|a| a.scope_type == "project")
                 .map(|a| &a.scope_id)
             {
-                let cooling: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_batch WHERE project_id = ? AND cooldown_until > ?)")
-                    .bind(project_id).bind(&now).fetch_one(&mut **transaction).await?;
+                let cooling: bool = self
+                    .db
+                    .wake_project_batch_is_cooling_in_tx(transaction, project_id, &now)
+                    .await?;
                 if cooling {
                     self.append_wake_decision_in_tx(
                         transaction,
@@ -1047,24 +1017,22 @@ impl AttentionService {
         // budget accounting.  This closes the binding-replacement race where
         // a new identity could otherwise analyse the same incident in
         // parallel with the old identity.
-        let existing_lease = sqlx::query(
-            "SELECT identity_id, leased_until, cooldown_until
-             FROM agent_wake_lease
-             WHERE scope_type = ? AND scope_id = ? AND incident_key = ?
-               AND (leased_until > ? OR cooldown_until > ?)
-             ORDER BY leased_until DESC, identity_id ASC
-             LIMIT 1",
-        )
-        .bind(&budget_scope_type)
-        .bind(&budget_scope_id)
-        .bind(&request.incident_key)
-        .bind(&now)
-        .bind(&now)
-        .fetch_optional(&mut **transaction)
-        .await?;
+        let existing_lease = self
+            .db
+            .active_incident_wake_lease_in_tx(
+                transaction,
+                db::ActiveIncidentWakeLeaseInTxInput {
+                    scope_type: &budget_scope_type,
+                    scope_id: &budget_scope_id,
+                    incident_key: &request.incident_key,
+                    leased_after: &now,
+                    cooldown_after: &now,
+                },
+            )
+            .await?;
         if let Some(row) = existing_lease {
-            let leased_until_existing: String = row.try_get("leased_until")?;
-            let cooldown_until_existing: Option<String> = row.try_get("cooldown_until")?;
+            let leased_until_existing: String = row.leased_until?;
+            let cooldown_until_existing: Option<String> = row.cooldown_until?;
             let reason = if leased_until_existing > now {
                 WakeSuppressionReason::DuplicateIncident
             } else if cooldown_until_existing
@@ -1095,12 +1063,10 @@ impl AttentionService {
         // incrementing the budget a second time before the domain-event
         // dedupe turns the append into a no-op.
         let dedupe_key = wake_admitted_dedupe_key(request, context);
-        let admitted_payload = sqlx::query_scalar::<_, String>(
-            "SELECT payload_json FROM domain_event WHERE dedupe_key = ?",
-        )
-        .bind(&dedupe_key)
-        .fetch_optional(&mut **transaction)
-        .await?;
+        let admitted_payload = self
+            .db
+            .admitted_wake_payload_in_tx(transaction, &dedupe_key)
+            .await?;
         if let Some(payload_json) = admitted_payload {
             let payload = serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::Null);
             let leased_until = payload
@@ -1124,9 +1090,10 @@ impl AttentionService {
         if budget == Some(0) {
             *stall_scope = Some((budget_scope_type.clone(), budget_scope_id.clone()));
             if budget_scope_type == "project" {
-                let open_incidents: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'"
-                ).bind(&budget_scope_id).fetch_one(&mut **transaction).await?;
+                let open_incidents: i64 = self
+                    .db
+                    .open_project_wake_incident_count_in_tx(transaction, &budget_scope_id)
+                    .await?;
                 if open_incidents > 0 {
                     DomainEventRepo::append_event_in_tx(&*self.db, transaction, &CreateDomainEvent {
                         id: new_uuid_v4(), event_type: "notification.requested".to_owned(),
@@ -1166,34 +1133,32 @@ impl AttentionService {
         let window_started =
             (parse_rfc3339(&now).unwrap_or_else(Utc::now) - Duration::hours(1)).to_rfc3339();
         let budget_remaining = if let Some(budget) = budget {
-            let current = sqlx::query(
-                "SELECT window_started_at, admitted_count
-                 FROM agent_wake_budget_window
-                 WHERE scope_type = ? AND scope_id = ? AND category = ?",
-            )
-            .bind(&budget_scope_type)
-            .bind(&budget_scope_id)
-            .bind(category)
-            .fetch_optional(&mut *budget_attempt)
-            .await?;
+            let current = self
+                .db
+                .wake_budget_window_in_tx(
+                    &mut budget_attempt,
+                    &budget_scope_type,
+                    &budget_scope_id,
+                    category,
+                )
+                .await?;
             let (admitted_count, in_window) = current
                 .map(|row| {
-                    let started: String = row.try_get("window_started_at")?;
-                    let count: i64 = row.try_get("admitted_count")?;
-                    Ok::<_, sqlx::Error>((count, started > window_started))
+                    let started: String = row.window_started_at?;
+                    let count: i64 = row.admitted_count?;
+                    Ok::<_, db::DbError>((count, started > window_started))
                 })
                 .transpose()?
                 .unwrap_or((0, false));
             let used = if shared_pool {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COALESCE(SUM(admitted_count), 0) FROM agent_wake_budget_window
-                     WHERE scope_type = ? AND scope_id = ? AND window_started_at > ?",
-                )
-                .bind(&budget_scope_type)
-                .bind(&budget_scope_id)
-                .bind(&window_started)
-                .fetch_one(&mut *budget_attempt)
-                .await?
+                self.db
+                    .shared_wake_budget_used_in_tx(
+                        &mut budget_attempt,
+                        &budget_scope_type,
+                        &budget_scope_id,
+                        &window_started,
+                    )
+                    .await?
             } else if in_window {
                 admitted_count
             } else {
@@ -1216,81 +1181,59 @@ impl AttentionService {
                 });
             }
             if in_window {
-                sqlx::query(
-                    "UPDATE agent_wake_budget_window
-                     SET admitted_count = admitted_count + 1, identity_id = ?,
-                         version = version + 1, updated_at = ?
-                     WHERE scope_type = ? AND scope_id = ? AND category = ?",
-                )
-                .bind(&request.identity_id)
-                .bind(&now)
-                .bind(&budget_scope_type)
-                .bind(&budget_scope_id)
-                .bind(category)
-                .execute(&mut *budget_attempt)
-                .await?;
+                self.db
+                    .increment_wake_budget_window_in_tx(
+                        &mut budget_attempt,
+                        db::IncrementWakeBudgetWindowInTxInput {
+                            identity_id: &request.identity_id,
+                            updated_at: &now,
+                            scope_type: &budget_scope_type,
+                            scope_id: &budget_scope_id,
+                            category,
+                        },
+                    )
+                    .await?;
             } else {
-                sqlx::query(
-                    "INSERT INTO agent_wake_budget_window (
-                        identity_id, scope_type, scope_id, category, window_started_at,
-                        window_seconds, admitted_count, version, updated_at
-                     ) VALUES (?, ?, ?, ?, ?, 3600, 1, 1, ?)
-                     ON CONFLICT(scope_type, scope_id, category) DO UPDATE SET
-                        window_started_at = excluded.window_started_at,
-                        identity_id = excluded.identity_id,
-                        admitted_count = 1,
-                        version = agent_wake_budget_window.version + 1,
-                        updated_at = excluded.updated_at",
-                )
-                .bind(&request.identity_id)
-                .bind(&budget_scope_type)
-                .bind(&budget_scope_id)
-                .bind(category)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *budget_attempt)
-                .await?;
+                self.db
+                    .start_wake_budget_window_in_tx(
+                        &mut budget_attempt,
+                        db::StartWakeBudgetWindowInTxInput {
+                            identity_id: &request.identity_id,
+                            scope_type: &budget_scope_type,
+                            scope_id: &budget_scope_id,
+                            category,
+                            window_started_at: &now,
+                            updated_at: &now,
+                        },
+                    )
+                    .await?;
             }
             Some((budget - used - 1).max(0))
         } else {
             None
         };
 
-        let lease_result = sqlx::query(
-            "INSERT INTO agent_wake_lease (
-                identity_id, scope_type, scope_id, incident_key, lease_owner,
-                leased_until, reaction_depth, updated_at, cooldown_until,
-                last_admitted_at, admission_count, correlation_id, causation_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-             ON CONFLICT(identity_id, scope_type, scope_id, incident_key) DO UPDATE SET
-                lease_owner = excluded.lease_owner,
-                leased_until = excluded.leased_until,
-                reaction_depth = excluded.reaction_depth,
-                updated_at = excluded.updated_at,
-                cooldown_until = excluded.cooldown_until,
-                last_admitted_at = excluded.last_admitted_at,
-                admission_count = agent_wake_lease.admission_count + 1,
-                correlation_id = excluded.correlation_id,
-                causation_id = excluded.causation_id
-             WHERE agent_wake_lease.leased_until <= excluded.updated_at
-               AND (agent_wake_lease.cooldown_until IS NULL
-                    OR agent_wake_lease.cooldown_until <= excluded.updated_at)",
-        )
-        .bind(&request.identity_id)
-        .bind(&budget_scope_type)
-        .bind(&budget_scope_id)
-        .bind(&request.incident_key)
-        .bind(&request.lease_owner)
-        .bind(&leased_until)
-        .bind(request.reaction_depth.clamp(0, 8))
-        .bind(&now)
-        .bind(&cooldown_until)
-        .bind(&now)
-        .bind(&request.correlation_id)
-        .bind(request.causation_id.as_deref())
-        .execute(&mut *budget_attempt)
-        .await?;
-        if lease_result.rows_affected() == 0 {
+        let lease_result = self
+            .db
+            .admit_incident_wake_lease_in_tx(
+                &mut budget_attempt,
+                db::AdmitIncidentWakeLeaseInTxInput {
+                    identity_id: &request.identity_id,
+                    scope_type: &budget_scope_type,
+                    scope_id: &budget_scope_id,
+                    incident_key: &request.incident_key,
+                    lease_owner: &request.lease_owner,
+                    leased_until: &leased_until,
+                    reaction_depth: request.reaction_depth.clamp(0, 8),
+                    updated_at: &now,
+                    cooldown_until: &cooldown_until,
+                    last_admitted_at: &now,
+                    correlation_id: &request.correlation_id,
+                    causation_id: request.causation_id.as_deref(),
+                },
+            )
+            .await?;
+        if lease_result == 0 {
             // This is normally covered by the global pre-check.  Keep the
             // compare-and-swap result authoritative for same-transaction
             // replays and classify an expired lease/cooldown conservatively.
@@ -1587,22 +1530,20 @@ impl AttentionService {
                 .collect()
         };
         for (id, digest) in members {
-            sqlx::query(
-                "INSERT INTO agent_wake_attention_latest(attention_id,incident_digest,disposition,reason,identity_id,updated_at)
-                 SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM attention_projection WHERE id=?)
-                 ON CONFLICT(attention_id) DO UPDATE SET incident_digest=excluded.incident_digest,
-                    disposition=excluded.disposition, reason=excluded.reason,
-                    identity_id=excluded.identity_id, updated_at=excluded.updated_at",
-            )
-            .bind(&id)
-            .bind(&digest)
-            .bind(&disposition_name)
-            .bind(reason_code)
-            .bind(identity_id.as_deref())
-            .bind(now)
-            .bind(&id)
-            .execute(&mut **transaction)
-            .await?;
+            self.db
+                .record_latest_attention_wake_in_tx(
+                    transaction,
+                    db::RecordLatestAttentionWakeInTxInput {
+                        attention_id: &id,
+                        incident_digest: &digest,
+                        disposition: &disposition_name,
+                        reason: reason_code,
+                        identity_id: identity_id.as_deref(),
+                        updated_at: now,
+                        existing_attention_id: &id,
+                    },
+                )
+                .await?;
         }
         // Audit-event dedupe is checked before persistence, making a replay a no-op.
         if self
@@ -1682,35 +1623,37 @@ impl AttentionService {
                         return Err(db::DbError::VersionConflict.into());
                     }
                     // A re-admission replaces a failed or imported row for the digest.
-                    sqlx::query(
-                        "INSERT INTO agent_wake_blocker(attention_id,incident_digest,turn_job_id,admitted_at) VALUES(?,?,?,?)
-                         ON CONFLICT(attention_id,incident_digest) DO UPDATE SET turn_job_id=excluded.turn_job_id,
-                            admitted_at=excluded.admitted_at, escalation_id=NULL, recorded_outcome=NULL,
-                            legacy_source_event_id=NULL",
-                    )
-                    .bind(&item.id)
-                    .bind(wake_attention_incident_digest(item))
-                    .bind(&turn_id)
-                    .bind(now)
-                    .execute(&mut **transaction)
-                    .await?;
+                    self.db
+                        .record_admitted_wake_blocker_in_tx(
+                            transaction,
+                            &item.id,
+                            wake_attention_incident_digest(item),
+                            &turn_id,
+                            now,
+                        )
+                        .await?;
                 }
-                sqlx::query("INSERT INTO agent_wake_batch(project_id,admitted_at,cooldown_until,turn_job_id) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET admitted_at=excluded.admitted_at,cooldown_until=excluded.cooldown_until,turn_job_id=excluded.turn_job_id")
-                    .bind(&context.batch[0].scope_id).bind(now).bind(cooldown_until).bind(&turn_id).execute(&mut **transaction).await?;
+                self.db
+                    .record_admitted_wake_batch_in_tx(
+                        transaction,
+                        &context.batch[0].scope_id,
+                        now,
+                        cooldown_until,
+                        &turn_id,
+                    )
+                    .await?;
             }
             // The owner's answer turn becomes the escalated blockers' turn, so
             // they are re-armed: if they persist after it, they escalate again.
             if let Some(escalation_id) = context.batch.first().and_then(answered_escalation_id) {
-                sqlx::query(
-                    "UPDATE agent_wake_blocker SET turn_job_id = ?, escalation_id = NULL,
-                        recorded_outcome = NULL, admitted_at = ?
-                     WHERE escalation_id = ?",
-                )
-                .bind(&turn_id)
-                .bind(now)
-                .bind(&escalation_id)
-                .execute(&mut **transaction)
-                .await?;
+                self.db
+                    .rearm_answered_escalation_blockers_in_tx(
+                        transaction,
+                        &turn_id,
+                        now,
+                        &escalation_id,
+                    )
+                    .await?;
             }
         }
         Ok(event)
@@ -1728,18 +1671,15 @@ impl AttentionService {
         let project_id = match scope_type {
             "project" => Some(scope_id.to_owned()),
             "task" => {
-                sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                    .bind(scope_id)
-                    .fetch_optional(&mut **transaction)
+                self.db
+                    .wake_budget_task_project_id_in_tx(transaction, scope_id)
                     .await?
             }
-            "agent_chat" => sqlx::query_scalar::<_, Option<String>>(
-                "SELECT project_id FROM agent_chat WHERE id = ?",
-            )
-            .bind(scope_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .flatten(),
+            "agent_chat" => self
+                .db
+                .wake_budget_chat_project_id_in_tx(transaction, scope_id)
+                .await?
+                .flatten(),
             "account" => None,
             _ => return Ok((Some(0), budget_scope_type, budget_scope_id)),
         };
@@ -1747,26 +1687,18 @@ impl AttentionService {
         if let Some(project_id) = project_id {
             budget_scope_type = "project".to_owned();
             budget_scope_id = project_id.clone();
-            let budget = sqlx::query_scalar::<_, i64>(
-                "SELECT wake_budget
-                 FROM project_agent_binding
-                 WHERE identity_id = ? AND project_id = ? AND state = 'active'",
-            )
-            .bind(identity_id)
-            .bind(&project_id)
-            .fetch_optional(&mut **transaction)
-            .await?;
+            let budget = self
+                .db
+                .active_project_identity_wake_budget_in_tx(transaction, identity_id, &project_id)
+                .await?;
             return Ok((budget.or(Some(0)), budget_scope_type, budget_scope_id));
         }
 
         if scope_type == "agent_chat" {
-            if let Some(account_id) = sqlx::query_scalar::<_, String>(
-                "SELECT account_id FROM agent_chat
-                 WHERE id = ? AND kind = 'account_main'",
-            )
-            .bind(scope_id)
-            .fetch_optional(&mut **transaction)
-            .await?
+            if let Some(account_id) = self
+                .db
+                .wake_budget_main_chat_account_id_in_tx(transaction, scope_id)
+                .await?
             {
                 return Ok((Some(10), "account".to_owned(), account_id));
             }
@@ -2081,88 +2013,60 @@ impl AttentionService {
         project_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MissionControlCoordinationActivity>> {
-        let (predicate, values) =
-            self.coordination_scope_visibility_predicate(user_id, project_id, "r");
-
-        let direct_sql = format!(
-            "SELECT r.id, r.principal_type, r.principal_id, r.scope_type, r.scope_id,
-                    r.operation, r.input_digest, r.policy_result, r.correlation_id,
-                    r.outcome_json, r.committed_at
-             FROM command_receipt r
-             WHERE r.agent_action_execution_id IS NULL
-               AND {predicate}
-             ORDER BY r.committed_at DESC, r.id DESC
-             LIMIT ?"
-        );
-        let mut direct_query = sqlx::query(&direct_sql);
-        for value in &values {
-            direct_query = direct_query.bind(value);
-        }
-        let direct_rows = direct_query.bind(limit).fetch_all(self.db.pool()).await?;
+        let direct_rows = self
+            .db
+            .attention_direct_coordination_receipts(user_id, project_id, limit)
+            .await?;
 
         let mut activities = direct_rows
             .into_iter()
             .map(|row| {
-                let outcome_json: Option<String> = row.try_get("outcome_json")?;
+                let outcome_json: Option<String> = row.outcome_json?;
                 Ok(MissionControlCoordinationActivity {
-                    id: row.try_get("id")?,
+                    id: row.id?,
                     activity_kind: "direct_command".to_owned(),
-                    actor_type: row.try_get("principal_type")?,
-                    actor_id: row.try_get("principal_id")?,
-                    scope_type: row.try_get("scope_type")?,
-                    scope_id: row.try_get("scope_id")?,
-                    operation: row.try_get("operation")?,
-                    input_digest: row.try_get("input_digest")?,
-                    policy_result: row.try_get("policy_result")?,
+                    actor_type: row.principal_type?,
+                    actor_id: row.principal_id?,
+                    scope_type: row.scope_type?,
+                    scope_id: row.scope_id?,
+                    operation: row.operation?,
+                    input_digest: row.input_digest?,
+                    policy_result: row.policy_result?,
                     status: "committed".to_owned(),
-                    correlation_id: row.try_get("correlation_id")?,
+                    correlation_id: row.correlation_id?,
                     outcome: outcome_json.and_then(|value| serde_json::from_str(&value).ok()),
-                    occurred_at: row.try_get("committed_at")?,
+                    occurred_at: row.committed_at?,
                 })
             })
-            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+            .collect::<std::result::Result<Vec<_>, db::DbError>>()
             .map_err(ServiceError::from)?;
 
-        let (action_predicate, action_values) =
-            self.coordination_scope_visibility_predicate(user_id, project_id, "a");
-        let action_sql = format!(
-            "SELECT a.id, a.actor_identity_id, a.scope_type, a.scope_id, a.operation,
-                    a.payload_hash, a.policy_result, a.status, a.correlation_id,
-                    a.outcome_json, a.updated_at
-             FROM agent_action a
-             WHERE a.policy_result = 'approval_required'
-               AND a.status IN ('pending_approval', 'approved')
-               AND {action_predicate}
-             ORDER BY a.updated_at DESC, a.id DESC
-             LIMIT ?"
-        );
-        let mut action_query = sqlx::query(&action_sql);
-        for value in &action_values {
-            action_query = action_query.bind(value);
-        }
-        let action_rows = action_query.bind(limit).fetch_all(self.db.pool()).await?;
+        let action_rows = self
+            .db
+            .attention_approval_coordination_actions(user_id, project_id, limit)
+            .await?;
         activities.extend(
             action_rows
                 .into_iter()
                 .map(|row| {
-                    let outcome_json: Option<String> = row.try_get("outcome_json")?;
+                    let outcome_json: Option<String> = row.outcome_json?;
                     Ok(MissionControlCoordinationActivity {
-                        id: row.try_get("id")?,
+                        id: row.id?,
                         activity_kind: "approval_action".to_owned(),
                         actor_type: "agent".to_owned(),
-                        actor_id: row.try_get("actor_identity_id")?,
-                        scope_type: row.try_get("scope_type")?,
-                        scope_id: row.try_get("scope_id")?,
-                        operation: row.try_get("operation")?,
-                        input_digest: row.try_get("payload_hash")?,
-                        policy_result: row.try_get("policy_result")?,
-                        status: row.try_get("status")?,
-                        correlation_id: row.try_get("correlation_id")?,
+                        actor_id: row.actor_identity_id?,
+                        scope_type: row.scope_type?,
+                        scope_id: row.scope_id?,
+                        operation: row.operation?,
+                        input_digest: row.payload_hash?,
+                        policy_result: row.policy_result?,
+                        status: row.status?,
+                        correlation_id: row.correlation_id?,
                         outcome: outcome_json.and_then(|value| serde_json::from_str(&value).ok()),
-                        occurred_at: row.try_get("updated_at")?,
+                        occurred_at: row.updated_at?,
                     })
                 })
-                .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?,
+                .collect::<std::result::Result<Vec<_>, db::DbError>>()?,
         );
 
         activities.sort_by(|left, right| {
@@ -2185,64 +2089,30 @@ impl AttentionService {
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", identity_id.to_owned()))?;
         self.require_agent_access(user_id, identity_id).await?;
-        let bindings = sqlx::query(
-            "SELECT binding_id, binding_type, project_id, chat_id, state,
-                    subscriptions_json, wake_budget
-             FROM (
-                 SELECT b.id AS binding_id,
-                        'main' AS binding_type,
-                        NULL AS project_id,
-                        c.id AS chat_id,
-                        b.state,
-                        '[]' AS subscriptions_json,
-                        0 AS wake_budget
-                 FROM account_main_agent_binding b
-                 JOIN agent_chat c
-                   ON c.kind = 'account_main' AND c.account_id = b.account_id
-                 WHERE b.identity_id = ? AND b.account_id = ?
-                   AND b.state <> 'revoked'
-                 UNION ALL
-                 SELECT b.id AS binding_id,
-                        'project' AS binding_type,
-                        b.project_id,
-                        c.id AS chat_id,
-                        b.state,
-                        b.subscriptions_json,
-                        b.wake_budget
-                 FROM project_agent_binding b
-                 JOIN agent_chat c
-                   ON c.kind = 'project' AND c.project_id = b.project_id
-                 JOIN project p ON p.id = b.project_id
-                 LEFT JOIN project_member pm
-                   ON pm.project_id = b.project_id AND pm.user_id = ?
-                 WHERE b.identity_id = ? AND b.state <> 'revoked'
-                   AND (p.owner_id IS NULL OR p.owner_id = ? OR pm.user_id IS NOT NULL)
-             )
-             ORDER BY project_id ASC, binding_type ASC, binding_id ASC LIMIT ?",
-        )
-        .bind(identity_id)
-        .bind(user_id)
-        .bind(user_id)
-        .bind(identity_id)
-        .bind(user_id)
-        .bind(limit.clamp(1, 50))
-        .fetch_all(self.db.pool())
-        .await?
-        .into_iter()
-        .map(|row| {
-            Ok(AgentBindingSummary {
-                binding_id: row.try_get("binding_id")?,
-                binding_type: row.try_get("binding_type")?,
-                project_id: row.try_get("project_id")?,
-                chat_id: row.try_get("chat_id")?,
-                state: row.try_get("state")?,
-                subscription_count: subscription_count(
-                    &row.try_get::<String, _>("subscriptions_json")?,
-                ),
-                wake_budget: row.try_get("wake_budget")?,
+        let bindings = self
+            .db
+            .visible_attention_agent_bindings(db::VisibleAttentionAgentBindingsInput {
+                identity_id,
+                account_id: user_id,
+                member_id: user_id,
+                project_identity_id: identity_id,
+                owner_id: user_id,
+                limit: limit.clamp(1, 50),
             })
-        })
-        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(AgentBindingSummary {
+                    binding_id: row.binding_id?,
+                    binding_type: row.binding_type?,
+                    project_id: row.project_id?,
+                    chat_id: row.chat_id?,
+                    state: row.state?,
+                    subscription_count: subscription_count(&row.subscriptions_json?),
+                    wake_budget: row.wake_budget?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, db::DbError>>()?;
 
         let mut scopes = Vec::new();
         for scope in AgentContextScopeRepo::list_context_scopes(&*self.db, identity_id).await? {
@@ -2267,32 +2137,24 @@ impl AttentionService {
             }
         }
 
-        let all_sessions = sqlx::query(
-            "SELECT s.id AS session_id, c.scope_type, c.scope_id,
-                    s.backend_kind, s.status, s.connection_status,
-                    s.last_activity_at, s.updated_at
-             FROM agent_session s
-             JOIN agent_context_scope c ON c.id = s.context_scope_id
-             WHERE s.identity_id = ?
-             ORDER BY s.updated_at DESC, s.id DESC",
-        )
-        .bind(identity_id)
-        .fetch_all(self.db.pool())
-        .await?
-        .into_iter()
-        .map(|row| {
-            Ok(AgentSessionSummary {
-                session_id: row.try_get("session_id")?,
-                scope_type: row.try_get("scope_type")?,
-                scope_id: row.try_get("scope_id")?,
-                backend_kind: row.try_get("backend_kind")?,
-                status: row.try_get("status")?,
-                connection_status: row.try_get("connection_status")?,
-                last_activity_at: row.try_get("last_activity_at")?,
-                updated_at: row.try_get("updated_at")?,
+        let all_sessions = self
+            .db
+            .attention_agent_sessions(identity_id)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(AgentSessionSummary {
+                    session_id: row.session_id?,
+                    scope_type: row.scope_type?,
+                    scope_id: row.scope_id?,
+                    backend_kind: row.backend_kind?,
+                    status: row.status?,
+                    connection_status: row.connection_status?,
+                    last_activity_at: row.last_activity_at?,
+                    updated_at: row.updated_at?,
+                })
             })
-        })
-        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+            .collect::<std::result::Result<Vec<_>, db::DbError>>()?;
         let mut sessions = Vec::new();
         for session in all_sessions {
             if let Err(error) = self
@@ -2323,13 +2185,10 @@ impl AttentionService {
         };
         let mut checkpoint_present = false;
         for session in &sessions {
-            let has_checkpoint = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM protected_agent_session_state
-                 WHERE session_id = ? AND checkpoint_turn_id IS NOT NULL",
-            )
-            .bind(&session.session_id)
-            .fetch_one(self.db.pool())
-            .await?
+            let has_checkpoint = self
+                .db
+                .attention_session_checkpoint_count(&session.session_id)
+                .await?
                 > 0;
             checkpoint_present |= has_checkpoint;
         }
@@ -2391,9 +2250,7 @@ impl AttentionService {
     }
 
     pub async fn consumer_health(&self) -> Result<Option<AttentionConsumerHealthResponse>> {
-        let row = sqlx::query("SELECT h.*, COALESCE(c.last_sequence, 0) AS last_sequence
-            FROM worker_health h LEFT JOIN event_consumer_cursor c ON c.consumer_name = h.worker_name WHERE h.worker_name = ?")
-            .bind(CONSUMER_NAME).fetch_optional(self.db.pool()).await?;
+        let row = self.db.attention_worker_health(CONSUMER_NAME).await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -2401,11 +2258,16 @@ impl AttentionService {
         let stale = lag
             .first()
             .is_some_and(|lag| lag.stalled(Utc::now(), CONSUMER_STALE_SECONDS));
-        let mut last_error_code: Option<String> = row.try_get("last_error_kind")?;
-        let mut last_error_message: Option<String> = row.try_get("last_error")?;
+        let mut last_error_code: Option<String> = row.last_error_kind?;
+        let mut last_error_message: Option<String> = row.last_error?;
         if last_error_message.is_none() {
-            let recent: Option<(String, String)> = sqlx::query_as("SELECT error_kind, last_error FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL AND dead_lettered_at >= ? ORDER BY dead_lettered_at DESC LIMIT 1")
-                .bind(CONSUMER_NAME).bind((Utc::now() - Duration::hours(1)).to_rfc3339()).fetch_optional(self.db.pool()).await?;
+            let recent: Option<(String, String)> = self
+                .db
+                .recent_attention_worker_error(
+                    CONSUMER_NAME,
+                    (Utc::now() - Duration::hours(1)).to_rfc3339(),
+                )
+                .await?;
             if let Some((kind, message)) = recent {
                 last_error_code = Some(kind);
                 last_error_message = Some(message);
@@ -2413,12 +2275,12 @@ impl AttentionService {
         }
         Ok(Some(AttentionConsumerHealthResponse {
             consumer_name: CONSUMER_NAME.to_owned(),
-            last_sequence: row.try_get("last_sequence")?,
-            last_success_at: row.try_get("last_success_at")?,
+            last_sequence: row.last_sequence?,
+            last_success_at: row.last_success_at?,
             last_error_code,
             last_error_message,
             stale,
-            updated_at: row.try_get("updated_at")?,
+            updated_at: row.updated_at?,
         }))
     }
 
@@ -2448,14 +2310,15 @@ impl AttentionService {
     }
 
     async fn resolve_superseded_turn_incidents(&self) -> Result<()> {
-        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT a.dedupe_key, e.entity_id, e.id, e.payload_json FROM attention_projection a
-             JOIN domain_event e ON e.id = a.source_event_id
-             WHERE a.status <> 'resolved' AND e.event_type = 'agent_chat.turn.failed'",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
-        for (key, turn_id, event_id, payload) in rows {
+        let rows: Vec<db::FailedTurnIncidentRow> =
+            self.db.unresolved_failed_turn_incidents().await?;
+        for db::FailedTurnIncidentRow {
+            dedupe_key: key,
+            entity_id: turn_id,
+            id: event_id,
+            payload_json: payload,
+        } in rows
+        {
             if let Some(turn) =
                 db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &turn_id).await?
             {
@@ -2563,15 +2426,14 @@ impl AttentionService {
                 recommended_action
             };
             let task_context = if event.entity_type == "task" {
-                sqlx::query("SELECT title, status, version FROM task WHERE id = ?")
-                    .bind(&event.entity_id)
-                    .fetch_optional(self.db.pool())
+                self.db
+                    .attention_task_context(&event.entity_id)
                     .await?
                     .map(|row| {
                         json!({
-                            "task_title": bounded_text(row.try_get::<String, _>("title").unwrap_or_default()),
-                            "task_status": row.try_get::<String, _>("status").unwrap_or_default(),
-                            "task_version": row.try_get::<i64, _>("version").unwrap_or_default(),
+                            "task_title": bounded_text(row.title.unwrap_or_default()),
+                            "task_status": row.status.unwrap_or_default(),
+                            "task_version": row.version.unwrap_or_default(),
                         })
                     })
             } else {
@@ -2843,8 +2705,10 @@ impl AttentionService {
     ) -> Result<Option<(String, String)>> {
         let mut stall = None;
         if let Some(p) = &prepared.incident {
-            let admitted: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE causation_id = ? AND event_type = 'agent.wake.admitted')")
-                .bind(&event.id).fetch_one(&mut **tx).await?;
+            let admitted: i64 = self
+                .db
+                .source_event_has_admitted_wake_in_tx(tx, &event.id)
+                .await?;
             if admitted != 0 {
                 return Ok(None);
             }
@@ -2931,10 +2795,18 @@ impl AttentionService {
         }
         if let Some((scope_type, scope_id)) = &prepared.followup_scope {
             let at = now_rfc3339();
-            sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
-                source_event_id = ?, updated_at = ?, version = version + 1
-                WHERE attention_type = 'delivery_followup' AND scope_type = ? AND scope_id = ? AND status <> 'resolved'")
-                .bind(&at).bind(&event.id).bind(&at).bind(scope_type).bind(scope_id).execute(&mut **tx).await?;
+            self.db
+                .resolve_scope_progress_attention_in_tx(
+                    tx,
+                    db::ResolveScopeProgressAttentionInTxInput {
+                        resolved_at: &at,
+                        source_event_id: &event.id,
+                        updated_at: &at,
+                        scope_type,
+                        scope_id,
+                    },
+                )
+                .await?;
         }
         Ok(stall)
     }
@@ -3016,25 +2888,20 @@ impl AttentionService {
         if scope_type != "agent_chat" {
             return Ok((scope_type.to_owned(), scope_id.to_owned()));
         }
-        let Some(row) =
-            sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
-                .bind(scope_id)
-                .fetch_optional(self.db.pool())
-                .await?
-        else {
+        let Some(row) = self.db.attention_chat_scope(scope_id).await? else {
             // Keep the raw scope for the existing projection error path when
             // an event references a chat that no longer exists.  Valid Chat
             // events always resolve to one of the accepted material scopes.
             return Ok((scope_type.to_owned(), scope_id.to_owned()));
         };
-        let kind: String = row.try_get("kind")?;
+        let kind: String = row.kind?;
         match kind.as_str() {
             "account_main" => row
-                .try_get::<Option<String>, _>("account_id")
+                .account_id
                 .map(|account_id| ("account".to_owned(), account_id.unwrap_or_default()))
                 .map_err(ServiceError::from),
             "project" => row
-                .try_get::<Option<String>, _>("project_id")
+                .project_id
                 .map(|project_id| ("project".to_owned(), project_id.unwrap_or_default()))
                 .map_err(ServiceError::from),
             _ => Ok((scope_type.to_owned(), scope_id.to_owned())),
@@ -3052,11 +2919,10 @@ impl AttentionService {
             }
         }
         if event.scope_type == "task" || event.entity_type == "task" {
-            if let Some(project_id) =
-                sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                    .bind(&event.entity_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
+            if let Some(project_id) = self
+                .db
+                .attention_event_task_project_id(&event.entity_id)
+                .await?
             {
                 return Ok(("project".to_owned(), project_id));
             }
@@ -3064,13 +2930,7 @@ impl AttentionService {
         let is_agent_chat_event = event.scope_type == "agent_chat"
             || event.entity_type == "agent_chat"
             || event.entity_type == "agent_chat_turn_job";
-        if is_agent_chat_event
-            && sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_chat WHERE id = ?")
-                .bind(&event.scope_id)
-                .fetch_one(self.db.pool())
-                .await?
-                > 0
-        {
+        if is_agent_chat_event && self.db.attention_scope_chat_count(&event.scope_id).await? > 0 {
             return Ok(("agent_chat".to_owned(), event.scope_id.clone()));
         }
         Ok((event.scope_type.clone(), event.scope_id.clone()))
@@ -3083,12 +2943,7 @@ impl AttentionService {
         let Some(actor_id) = event.actor_id.as_deref() else {
             return Ok(None);
         };
-        let exists =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_identity WHERE id = ?")
-                .bind(actor_id)
-                .fetch_one(self.db.pool())
-                .await?
-                > 0;
+        let exists = self.db.attention_actor_identity_count(actor_id).await? > 0;
         Ok(exists.then(|| actor_id.to_owned()))
     }
 
@@ -3100,60 +2955,35 @@ impl AttentionService {
         let (scope_type, scope_id) = self.event_scope(event).await?;
         match scope_type.as_str() {
             "project" => {
-                return Ok(sqlx::query_scalar::<_, String>(
-                    "SELECT identity_id FROM project_agent_binding
-                     WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
-                )
-                .bind(&scope_id)
-                .fetch_optional(self.db.pool())
-                .await?);
+                return Ok(self
+                    .db
+                    .attention_project_responder_identity(&scope_id)
+                    .await?);
             }
             "account" => {
-                return Ok(sqlx::query_scalar::<_, String>(
-                    "SELECT identity_id FROM account_main_agent_binding
-                     WHERE account_id = ? AND state = 'active'",
-                )
-                .bind(&scope_id)
-                .fetch_optional(self.db.pool())
-                .await?);
+                return Ok(self.db.attention_main_responder_identity(&scope_id).await?);
             }
             "agent_chat" => {
-                let chat =
-                    sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
-                        .bind(&scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                let chat = self.db.attention_responder_chat_scope(&scope_id).await?;
                 if let Some(chat) = chat {
-                    let kind: String = chat.try_get("kind")?;
+                    let kind: String = chat.kind?;
                     if kind == "account_main" {
-                        return Ok(sqlx::query_scalar::<_, String>(
-                            "SELECT identity_id FROM account_main_agent_binding
-                             WHERE account_id = ? AND state = 'active'",
-                        )
-                        .bind(chat.try_get::<Option<String>, _>("account_id")?)
-                        .fetch_optional(self.db.pool())
-                        .await?);
+                        return Ok(self
+                            .db
+                            .attention_chat_main_responder_identity(chat.account_id?)
+                            .await?);
                     }
                     if kind == "project" {
-                        return Ok(sqlx::query_scalar::<_, String>(
-                            "SELECT identity_id FROM project_agent_binding
-                             WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
-                        )
-                        .bind(chat.try_get::<Option<String>, _>("project_id")?)
-                        .fetch_optional(self.db.pool())
-                        .await?);
+                        return Ok(self
+                            .db
+                            .attention_chat_project_responder_identity(chat.project_id?)
+                            .await?);
                     }
                 }
                 return Ok(None);
             }
             "task" => {
-                return Ok(sqlx::query_scalar::<_, String>(
-                    "SELECT assignee_id FROM task
-                     WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
-                )
-                .bind(&scope_id)
-                .fetch_optional(self.db.pool())
-                .await?);
+                return Ok(self.db.attention_task_assignee_identity(&scope_id).await?);
             }
             _ => {}
         }
@@ -3175,12 +3005,11 @@ impl AttentionService {
             let Some(identity_id) = payload.get(key).and_then(Value::as_str) else {
                 continue;
             };
-            let exists =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_identity WHERE id = ?")
-                    .bind(identity_id)
-                    .fetch_one(self.db.pool())
-                    .await?
-                    > 0;
+            let exists = self
+                .db
+                .attention_requested_identity_count(identity_id)
+                .await?
+                > 0;
             if exists {
                 return Ok(Some(identity_id.to_owned()));
             }
@@ -3201,78 +3030,43 @@ impl AttentionService {
         let count = match scope_type {
             "account" => {
                 if let Some(identity_id) = identity_id {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM account_main_agent_binding
-                         WHERE account_id = ? AND identity_id = ? AND state = 'active'",
-                    )
-                    .bind(scope_id)
-                    .bind(identity_id)
-                    .fetch_one(self.db.pool())
-                    .await?
+                    self.db
+                        .attention_main_identity_binding_count(scope_id, identity_id)
+                        .await?
                 } else {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM account_main_agent_binding
-                         WHERE account_id = ? AND state = 'active'",
-                    )
-                    .bind(scope_id)
-                    .fetch_one(self.db.pool())
-                    .await?
+                    self.db.attention_main_binding_count(scope_id).await?
                 }
             }
             "project" => {
                 if let Some(identity_id) = identity_id {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM project_agent_binding
-                         WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-                    )
-                    .bind(scope_id)
-                    .bind(identity_id)
-                    .fetch_one(self.db.pool())
-                    .await?
+                    self.db
+                        .attention_project_identity_binding_count(scope_id, identity_id)
+                        .await?
                 } else {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM project_agent_binding
-                         WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
-                    )
-                    .bind(scope_id)
-                    .fetch_one(self.db.pool())
-                    .await?
+                    self.db.attention_project_binding_count(scope_id).await?
                 }
             }
             "agent_chat" => {
-                let chat =
-                    sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
-                        .bind(scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                let chat = self.db.attention_configured_chat_scope(scope_id).await?;
                 let Some(chat) = chat else {
                     return Ok(false);
                 };
-                let kind: String = chat.try_get("kind")?;
-                let account_id: Option<String> = chat.try_get("account_id")?;
-                let project_id: Option<String> = chat.try_get("project_id")?;
+                let kind: String = chat.kind?;
+                let account_id: Option<String> = chat.account_id?;
+                let project_id: Option<String> = chat.project_id?;
                 let configured = match kind.as_str() {
                     "account_main" => {
                         let Some(account_id) = account_id else {
                             return Ok(false);
                         };
                         if let Some(identity_id) = identity_id {
-                            sqlx::query_scalar::<_, i64>(
-                                "SELECT COUNT(*) FROM account_main_agent_binding
-                                 WHERE account_id = ? AND identity_id = ? AND state = 'active'",
-                            )
-                            .bind(account_id)
-                            .bind(identity_id)
-                            .fetch_one(self.db.pool())
-                            .await?
+                            self.db
+                                .attention_chat_main_identity_binding_count(account_id, identity_id)
+                                .await?
                         } else {
-                            sqlx::query_scalar::<_, i64>(
-                                "SELECT COUNT(*) FROM account_main_agent_binding
-                                 WHERE account_id = ? AND state = 'active'",
-                            )
-                            .bind(account_id)
-                            .fetch_one(self.db.pool())
-                            .await?
+                            self.db
+                                .attention_chat_main_binding_count(account_id)
+                                .await?
                         }
                     }
                     "project" => {
@@ -3280,23 +3074,16 @@ impl AttentionService {
                             return Ok(false);
                         };
                         if let Some(identity_id) = identity_id {
-                            sqlx::query_scalar::<_, i64>(
-                                "SELECT COUNT(*) FROM project_agent_binding
-                                 WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-                            )
-                            .bind(project_id)
-                            .bind(identity_id)
-                            .fetch_one(self.db.pool())
-                            .await?
+                            self.db
+                                .attention_chat_project_identity_binding_count(
+                                    project_id,
+                                    identity_id,
+                                )
+                                .await?
                         } else {
-                            sqlx::query_scalar::<_, i64>(
-                                "SELECT COUNT(*) FROM project_agent_binding
-                                 WHERE project_id = ? AND state = 'active'
-                                   AND identity_id IS NOT NULL",
-                            )
-                            .bind(project_id)
-                            .fetch_one(self.db.pool())
-                            .await?
+                            self.db
+                                .attention_chat_project_binding_count(project_id)
+                                .await?
                         }
                     }
                     _ => 0,
@@ -3305,22 +3092,13 @@ impl AttentionService {
             }
             "task" => {
                 if let Some(identity_id) = identity_id {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM task
-                         WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?",
-                    )
-                    .bind(scope_id)
-                    .bind(identity_id)
-                    .fetch_one(self.db.pool())
-                    .await?
+                    self.db
+                        .attention_task_identity_assignment_count(scope_id, identity_id)
+                        .await?
                 } else {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM task
-                         WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
-                    )
-                    .bind(scope_id)
-                    .fetch_one(self.db.pool())
-                    .await?
+                    self.db
+                        .attention_task_agent_assignment_count(scope_id)
+                        .await?
                 }
             }
             _ => 0,
@@ -3336,58 +3114,27 @@ impl AttentionService {
     ) -> Result<bool> {
         let eligible = match scope_type {
             "account" => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM agent_identity
-                 WHERE id = ? AND (owner_id IS NULL OR owner_id = ?)",
-                )
-                .bind(identity_id)
-                .bind(scope_id)
-                .fetch_one(self.db.pool())
-                .await?
+                self.db
+                    .attention_account_identity_access_count(identity_id, scope_id)
+                    .await?
                     > 0
             }
             "project" => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM project_agent_binding
-                 WHERE identity_id = ? AND project_id = ? AND state = 'active'",
-                )
-                .bind(identity_id)
-                .bind(scope_id)
-                .fetch_one(self.db.pool())
-                .await?
+                self.db
+                    .attention_project_identity_access_count(identity_id, scope_id)
+                    .await?
                     > 0
             }
             "agent_chat" => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM agent_chat c
-                 WHERE c.id = ? AND (
-                    (c.kind = 'account_main' AND EXISTS (
-                        SELECT 1 FROM account_main_agent_binding b
-                        WHERE b.account_id = c.account_id
-                          AND b.identity_id = ? AND b.state = 'active'
-                    )) OR (c.kind = 'project' AND EXISTS (
-                        SELECT 1 FROM project_agent_binding b
-                        WHERE b.project_id = c.project_id
-                          AND b.identity_id = ? AND b.state = 'active'
-                    ))
-                 )",
-                )
-                .bind(scope_id)
-                .bind(identity_id)
-                .bind(identity_id)
-                .fetch_one(self.db.pool())
-                .await?
+                self.db
+                    .attention_chat_identity_access_count(scope_id, identity_id, identity_id)
+                    .await?
                     > 0
             }
             "task" => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM task
-                 WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?",
-                )
-                .bind(scope_id)
-                .bind(identity_id)
-                .fetch_one(self.db.pool())
-                .await?
+                self.db
+                    .attention_task_identity_access_count(scope_id, identity_id)
+                    .await?
                     > 0
             }
             _ => false,
@@ -3422,13 +3169,11 @@ impl AttentionService {
             }
             "project" => self.require_project_access(user_id, scope_id).await?,
             "agent_chat" => {
-                let scope = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-                    "SELECT account_id, project_id FROM agent_chat WHERE id = ?",
-                )
-                .bind(scope_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| ServiceError::not_found("attention", scope_id.to_owned()))?;
+                let scope = self
+                    .db
+                    .attention_chat_account_project_scope(scope_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("attention", scope_id.to_owned()))?;
                 if let Some(project_id) = scope.1 {
                     self.require_project_access(user_id, &project_id).await?;
                 } else if scope.0.as_deref() != Some(user_id) {
@@ -3436,12 +3181,11 @@ impl AttentionService {
                 }
             }
             "task" => {
-                let project_id =
-                    sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                        .bind(scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", scope_id.to_owned()))?;
+                let project_id = self
+                    .db
+                    .attention_scope_task_project_id(scope_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", scope_id.to_owned()))?;
                 self.require_project_access(user_id, &project_id).await?;
             }
             "agent" => self.require_agent_access(user_id, scope_id).await?,
@@ -3464,29 +3208,19 @@ impl AttentionService {
     }
 
     async fn require_agent_access(&self, user_id: &str, identity_id: &str) -> Result<()> {
-        let row = sqlx::query("SELECT owner_id FROM agent_identity WHERE id = ?")
-            .bind(identity_id)
-            .fetch_optional(self.db.pool())
+        let row = self
+            .db
+            .attention_identity_owner(identity_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", identity_id.to_owned()))?;
-        let owner_id: Option<String> = row.try_get("owner_id")?;
+        let owner_id: Option<String> = row.owner_id?;
         if owner_id.is_none() || owner_id.as_deref() == Some(user_id) {
             return Ok(());
         }
-        let visible = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM project_agent_binding m
-             JOIN project p ON p.id = m.project_id
-             LEFT JOIN project_member pm ON pm.project_id = m.project_id AND pm.user_id = ?
-             WHERE m.identity_id = ?
-               AND m.state = 'active'
-               AND (p.owner_id IS NULL OR p.owner_id = ? OR pm.user_id IS NOT NULL)",
-        )
-        .bind(user_id)
-        .bind(identity_id)
-        .bind(user_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let visible = self
+            .db
+            .attention_identity_visible_project_count(user_id, identity_id, user_id)
+            .await?;
         if visible == 0 {
             return Err(ServiceError::not_found("agent", identity_id.to_owned()));
         }
@@ -3500,34 +3234,19 @@ impl AttentionService {
         statuses: &[&str],
         limit: i64,
     ) -> Result<Vec<MissionControlWorkItem>> {
-        let status_placeholders = vec!["?"; statuses.len()].join(", ");
-        let status_values = statuses.to_vec();
-        let (project_predicate, project_values) =
-            self.project_visibility_predicate(user_id, project_id);
-        let sql = format!(
-            "SELECT t.id, t.project_id, t.title, t.status, t.priority, t.updated_at
-             FROM task t JOIN project p ON p.id = t.project_id
-             WHERE t.deleted_at IS NULL AND t.status IN ({status_placeholders})
-               AND {project_predicate}
-             ORDER BY t.priority DESC, t.updated_at ASC, t.id ASC LIMIT ?"
-        );
-        let mut query = sqlx::query(&sql);
-        for status in status_values {
-            query = query.bind(status);
-        }
-        for value in project_values {
-            query = query.bind(value);
-        }
-        let rows = query.bind(limit).fetch_all(self.db.pool()).await?;
+        let rows = self
+            .db
+            .attention_visible_work_items(user_id, project_id, statuses, limit)
+            .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(MissionControlWorkItem {
-                    task_id: row.try_get("id")?,
-                    project_id: row.try_get("project_id")?,
-                    title: bounded_text(row.try_get::<String, _>("title")?),
-                    status: row.try_get("status")?,
-                    priority: row.try_get("priority")?,
-                    updated_at: row.try_get("updated_at")?,
+                    task_id: row.id?,
+                    project_id: row.project_id?,
+                    title: bounded_text(row.title?),
+                    status: row.status?,
+                    priority: row.priority?,
+                    updated_at: row.updated_at?,
                     primary_action: if statuses.contains(&"review") {
                         "review".to_owned()
                     } else {
@@ -3535,7 +3254,7 @@ impl AttentionService {
                     },
                 })
             })
-            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+            .collect::<std::result::Result<Vec<_>, db::DbError>>()
             .map_err(ServiceError::from)
     }
 
@@ -3545,77 +3264,27 @@ impl AttentionService {
         project_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MissionControlAgentHealth>> {
-        let (predicate, values) = self.agent_visibility_predicate(user_id, project_id);
-        let (project_count, count_values) = if let Some(project_id) = project_id {
-            (
-                "COUNT(DISTINCT CASE WHEN m.project_id = ? THEN m.project_id END)".to_owned(),
-                vec![project_id.to_owned()],
-            )
-        } else {
-            (
-                "COUNT(DISTINCT CASE
-                    WHEN p2.owner_id IS NULL OR p2.owner_id = ? OR pm2.user_id IS NOT NULL
-                    THEN m.project_id END)"
-                    .to_owned(),
-                vec![user_id.to_owned()],
-            )
-        };
-        let (active_session_count, session_count_values) = match project_id {
-            Some(project_id) => (
-                "COUNT(DISTINCT CASE WHEN session_scope.project_id = ? THEN s.id END)".to_owned(),
-                vec![project_id.to_owned()],
-            ),
-            None => ("COUNT(DISTINCT s.id)".to_owned(), Vec::new()),
-        };
-        let sql = format!(
-            "SELECT a.id, a.name, a.backend_kind, a.provider, a.model,
-                    a.status, a.paused, a.last_heartbeat_at,
-                    h.status AS connection_status,
-                    {active_session_count} AS active_session_count,
-                    {project_count} AS project_count
-             FROM agent_current a
-             LEFT JOIN agent_connection_health h ON h.profile_id = a.profile_id
-             LEFT JOIN agent_session s ON s.identity_id = a.id
-                 AND s.status IN ('starting', 'ready', 'running', 'degraded')
-             LEFT JOIN agent_context_scope session_scope
-                 ON session_scope.id = s.context_scope_id
-             LEFT JOIN project_agent_binding m ON m.identity_id = a.id AND m.state = 'active'
-             LEFT JOIN project p2 ON p2.id = m.project_id
-             LEFT JOIN project_member pm2 ON pm2.project_id = m.project_id AND pm2.user_id = ?
-             WHERE {predicate}
-             GROUP BY a.id, a.name, a.backend_kind, a.provider, a.model,
-                      a.status, a.paused, a.last_heartbeat_at, h.status
-             ORDER BY a.name ASC, a.id ASC LIMIT ?"
-        );
-        let mut query = sqlx::query(&sql);
-        for value in session_count_values {
-            query = query.bind(value);
-        }
-        for value in count_values {
-            query = query.bind(value);
-        }
-        query = query.bind(user_id);
-        for value in values {
-            query = query.bind(value);
-        }
-        let rows = query.bind(limit).fetch_all(self.db.pool()).await?;
+        let rows = self
+            .db
+            .attention_visible_agent_health(user_id, project_id, limit)
+            .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(MissionControlAgentHealth {
-                    identity_id: row.try_get("id")?,
-                    name: bounded_text(row.try_get::<String, _>("name")?),
-                    backend_kind: row.try_get("backend_kind")?,
-                    provider: row.try_get("provider")?,
-                    model: row.try_get("model")?,
-                    identity_status: row.try_get("status")?,
-                    paused: row.try_get::<i64, _>("paused")? != 0,
-                    connection_status: row.try_get("connection_status")?,
-                    last_activity_at: row.try_get("last_heartbeat_at")?,
-                    active_session_count: row.try_get("active_session_count")?,
-                    project_count: row.try_get("project_count")?,
+                    identity_id: row.id?,
+                    name: bounded_text(row.name?),
+                    backend_kind: row.backend_kind?,
+                    provider: row.provider?,
+                    model: row.model?,
+                    identity_status: row.status?,
+                    paused: row.paused? != 0,
+                    connection_status: row.connection_status?,
+                    last_activity_at: row.last_heartbeat_at?,
+                    active_session_count: row.active_session_count?,
+                    project_count: row.project_count?,
                 })
             })
-            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+            .collect::<std::result::Result<Vec<_>, db::DbError>>()
             .map_err(ServiceError::from)
     }
 
@@ -3625,30 +3294,21 @@ impl AttentionService {
         project_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MissionControlRecentOutcome>> {
-        let (predicate, values) = self.project_visibility_predicate(user_id, project_id);
-        let sql = format!(
-            "SELECT t.id, t.project_id, t.title, t.status, t.updated_at
-             FROM task t JOIN project p ON p.id = t.project_id
-             WHERE t.deleted_at IS NULL AND t.status IN ('done', 'cancelled', 'blocked')
-               AND {predicate}
-             ORDER BY t.updated_at DESC, t.id DESC LIMIT ?"
-        );
-        let mut query = sqlx::query(&sql);
-        for value in values {
-            query = query.bind(value);
-        }
-        let rows = query.bind(limit).fetch_all(self.db.pool()).await?;
+        let rows = self
+            .db
+            .attention_visible_recent_outcomes(user_id, project_id, limit)
+            .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(MissionControlRecentOutcome {
-                    task_id: row.try_get("id")?,
-                    project_id: row.try_get("project_id")?,
-                    title: bounded_text(row.try_get::<String, _>("title")?),
-                    outcome: row.try_get("status")?,
-                    occurred_at: row.try_get("updated_at")?,
+                    task_id: row.id?,
+                    project_id: row.project_id?,
+                    title: bounded_text(row.title?),
+                    outcome: row.status?,
+                    occurred_at: row.updated_at?,
                 })
             })
-            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+            .collect::<std::result::Result<Vec<_>, db::DbError>>()
             .map_err(ServiceError::from)
     }
 
@@ -3658,48 +3318,22 @@ impl AttentionService {
         project_id: Option<&str>,
         healthy: bool,
     ) -> Result<MissionControlCapacity> {
-        let (predicate, values) = self.project_visibility_predicate(user_id, project_id);
-        // Keep the query construction below explicit; it avoids interpolating
-        // authorization values while allowing account and project scopes.
-        let active_sql = format!(
-            "SELECT COUNT(*) AS count FROM execution e
-             JOIN task t ON t.id = e.task_id JOIN project p ON p.id = t.project_id
-             WHERE e.status = 'running' AND t.deleted_at IS NULL AND {predicate}"
-        );
-        let mut active_query = sqlx::query(&active_sql);
-        for value in &values {
-            active_query = active_query.bind(value);
-        }
-        let active = active_query
-            .fetch_optional(self.db.pool())
+        let active = self
+            .db
+            .attention_visible_active_execution_count(user_id, project_id)
             .await?
-            .and_then(|row| row.try_get::<i64, _>("count").ok())
+            .and_then(|row| row.count.ok())
             .unwrap_or(0);
 
-        let queued_sql = format!(
-            "SELECT COUNT(*) AS count FROM task t JOIN project p ON p.id = t.project_id
-             WHERE t.deleted_at IS NULL AND t.status IN ('todo', 'backlog') AND {predicate}"
-        );
-        let mut query = sqlx::query(&queued_sql);
-        for value in &values {
-            query = query.bind(value);
-        }
-        let queued = query
-            .fetch_one(self.db.pool())
+        let queued = self
+            .db
+            .attention_visible_queued_task_count(user_id, project_id)
             .await?
-            .try_get::<i64, _>("count")?;
-        let (agent_predicate, agent_values) = self.agent_visibility_predicate(user_id, project_id);
-        let session_sql = format!(
-            "SELECT COUNT(*) FROM agent_session s
-             JOIN agent_current a ON a.id = s.identity_id
-             WHERE s.status IN ('starting', 'ready', 'running', 'degraded')
-               AND {agent_predicate}"
-        );
-        let mut session_query = sqlx::query_scalar::<_, i64>(&session_sql);
-        for value in agent_values {
-            session_query = session_query.bind(value);
-        }
-        let active_sessions = session_query.fetch_one(self.db.pool()).await?;
+            .count?;
+        let active_sessions = self
+            .db
+            .attention_visible_active_session_count(user_id, project_id)
+            .await?;
         Ok(MissionControlCapacity {
             active_executions: active,
             queued_tasks: queued,
@@ -3715,29 +3349,10 @@ impl AttentionService {
         // commitment owned by this identity.  The identity predicate is
         // deliberately applied in both branches so replacing a binding never
         // leaks the previous owner's focus into the replacement detail.
-        let task_id = sqlx::query_scalar::<_, String>(
-            "SELECT task_id
-             FROM (
-                 SELECT t.id AS task_id, t.updated_at
-                 FROM task t
-                 WHERE t.assignee_id = ?
-                   AND t.status = 'in_progress'
-                   AND t.deleted_at IS NULL
-                 UNION
-                 SELECT t.id AS task_id, t.updated_at
-                 FROM task t
-                 JOIN agent_commitment c ON c.originating_task_id = t.id
-                 WHERE c.owner_identity_id = ?
-                   AND c.status IN ('proposed', 'open', 'accepted', 'in_progress', 'blocked')
-                   AND t.deleted_at IS NULL
-             )
-             ORDER BY updated_at DESC, task_id DESC
-             LIMIT 1",
-        )
-        .bind(identity_id)
-        .bind(identity_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let task_id = self
+            .db
+            .attention_agent_focus_task_id(identity_id, identity_id)
+            .await?;
         match task_id {
             Some(task_id) => Ok(db::TaskRepo::get_by_id(&*self.db, &task_id, false).await?),
             None => Ok(None),
@@ -3752,19 +3367,14 @@ impl AttentionService {
         user_id: &str,
         identity_id: &str,
     ) -> Result<i64> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT scope_type, scope_id
-             FROM forge_memory_source_binding
-             WHERE identity_id = ?
-             ORDER BY scope_type ASC, scope_id ASC",
-        )
-        .bind(identity_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .attention_identity_memory_scopes(identity_id)
+            .await?;
         let mut visible = BTreeSet::new();
         for row in rows {
-            let scope_type: String = row.try_get("scope_type")?;
-            let scope_id: String = row.try_get("scope_id")?;
+            let scope_type: String = row.scope_type?;
+            let scope_id: String = row.scope_id?;
             match self
                 .require_scope_access(user_id, &scope_type, &scope_id)
                 .await
@@ -3796,29 +3406,18 @@ impl AttentionService {
             ("agent_inbox_item", "recipient_identity_id") => (table, identity_column),
             _ => return Ok(0),
         };
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_one(self.db.pool())
-        .await?;
+        let exists = self.db.attention_coordination_table_count(table).await?;
         if exists == 0 {
             return Ok(0);
         }
-        let placeholders = vec!["?"; statuses.len()].join(", ");
-        let sql = format!(
-            "SELECT scope_type, scope_id FROM {table}
-             WHERE {identity_column} = ? AND status IN ({placeholders})"
-        );
-        let mut query = sqlx::query(&sql).bind(identity_id);
-        for status in statuses {
-            query = query.bind(status);
-        }
-        let rows = query.fetch_all(self.db.pool()).await?;
+        let rows = self
+            .db
+            .attention_coordination_scopes(table, identity_column, statuses, identity_id)
+            .await?;
         let mut visible = 0;
         for row in rows {
-            let scope_type: String = row.try_get("scope_type")?;
-            let scope_id: String = row.try_get("scope_id")?;
+            let scope_type: String = row.scope_type?;
+            let scope_id: String = row.scope_id?;
             match self
                 .require_scope_access(user_id, &scope_type, &scope_id)
                 .await
@@ -3829,150 +3428,6 @@ impl AttentionService {
             }
         }
         Ok(visible)
-    }
-
-    fn project_visibility_predicate(
-        &self,
-        user_id: &str,
-        project_id: Option<&str>,
-    ) -> (String, Vec<String>) {
-        match project_id {
-            Some(project_id) => ("t.project_id = ?".to_owned(), vec![project_id.to_owned()]),
-            None => (
-                "(p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                    SELECT 1 FROM project_member pm
-                    WHERE pm.project_id = p.id AND pm.user_id = ?
-                ))"
-                .to_owned(),
-                vec![user_id.to_owned(), user_id.to_owned()],
-            ),
-        }
-    }
-
-    fn coordination_scope_visibility_predicate(
-        &self,
-        user_id: &str,
-        project_id: Option<&str>,
-        scope_alias: &str,
-    ) -> (String, Vec<String>) {
-        match project_id {
-            Some(project_id) => (
-                format!(
-                    "(({scope_alias}.scope_type = 'project' AND {scope_alias}.scope_id = ?
-                       AND EXISTS (
-                           SELECT 1 FROM project p
-                           WHERE p.id = {scope_alias}.scope_id
-                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                                 SELECT 1 FROM project_member pm
-                                 WHERE pm.project_id = p.id AND pm.user_id = ?
-                             ))
-                       ))
-                      OR ({scope_alias}.scope_type = 'agent_chat' AND EXISTS (
-                           SELECT 1 FROM agent_chat c
-                           JOIN project p ON p.id = c.project_id
-                           WHERE c.id = {scope_alias}.scope_id
-                             AND c.kind = 'project'
-                             AND c.project_id = ?
-                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                                 SELECT 1 FROM project_member pm
-                                 WHERE pm.project_id = p.id AND pm.user_id = ?
-                             ))
-                       ))
-                      OR ({scope_alias}.scope_type = 'task' AND EXISTS (
-                           SELECT 1 FROM task t
-                           JOIN project p ON p.id = t.project_id
-                           WHERE t.id = {scope_alias}.scope_id
-                             AND t.project_id = ?
-                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                                 SELECT 1 FROM project_member pm
-                                 WHERE pm.project_id = p.id AND pm.user_id = ?
-                             ))
-                       )))"
-                ),
-                vec![
-                    project_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    project_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    project_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                ],
-            ),
-            None => (
-                format!(
-                    "(({scope_alias}.scope_type = 'account' AND {scope_alias}.scope_id = ?)
-                      OR ({scope_alias}.scope_type = 'project' AND EXISTS (
-                           SELECT 1 FROM project p
-                           WHERE p.id = {scope_alias}.scope_id
-                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                                 SELECT 1 FROM project_member pm
-                                 WHERE pm.project_id = p.id AND pm.user_id = ?
-                             ))
-                       ))
-                      OR ({scope_alias}.scope_type = 'agent_chat' AND EXISTS (
-                           SELECT 1 FROM agent_chat c
-                           LEFT JOIN project p ON p.id = c.project_id
-                           WHERE c.id = {scope_alias}.scope_id
-                             AND ((c.kind = 'account_main' AND c.account_id = ?)
-                               OR (c.kind = 'project' AND p.id IS NOT NULL AND
-                                   (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                                       SELECT 1 FROM project_member pm
-                                       WHERE pm.project_id = p.id AND pm.user_id = ?
-                                   ))))
-                       ))
-                      OR ({scope_alias}.scope_type = 'task' AND EXISTS (
-                           SELECT 1 FROM task t
-                           JOIN project p ON p.id = t.project_id
-                           WHERE t.id = {scope_alias}.scope_id
-                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
-                                 SELECT 1 FROM project_member pm
-                                 WHERE pm.project_id = p.id AND pm.user_id = ?
-                             ))
-                       )))"
-                ),
-                vec![
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                    user_id.to_owned(),
-                ],
-            ),
-        }
-    }
-
-    fn agent_visibility_predicate(
-        &self,
-        user_id: &str,
-        project_id: Option<&str>,
-    ) -> (String, Vec<String>) {
-        match project_id {
-            Some(project_id) => (
-                "EXISTS (
-                    SELECT 1 FROM project_agent_binding pm
-                    WHERE pm.identity_id = a.id AND pm.project_id = ? AND pm.state = 'active'
-                )"
-                .to_owned(),
-                vec![project_id.to_owned()],
-            ),
-            None => (
-                "(a.owner_id IS NULL OR a.owner_id = ? OR EXISTS (
-                    SELECT 1 FROM project_agent_binding pam
-                    JOIN project p ON p.id = pam.project_id
-                    LEFT JOIN project_member pm ON pm.project_id = p.id AND pm.user_id = ?
-                    WHERE pam.identity_id = a.id AND pam.state = 'active'
-                      AND (p.owner_id IS NULL OR p.owner_id = ? OR pm.user_id IS NOT NULL)
-                ))"
-                .to_owned(),
-                vec![user_id.to_owned(), user_id.to_owned(), user_id.to_owned()],
-            ),
-        }
     }
 }
 
@@ -4036,22 +3491,9 @@ async fn orphan_attempt_is_current(
     transaction: &mut Transaction<'_, Sqlite>,
     execution_id: &str,
 ) -> Result<bool> {
-    let task_id = sqlx::query_scalar::<_, String>(
-        "SELECT candidate.task_id FROM execution candidate
-            WHERE candidate.id = ? AND candidate.status IN ('failed', 'cancelled')
-              AND (candidate.resume_policy IS NULL OR candidate.resume_policy = 'manual')
-              AND (candidate.stop_reason IS NULL OR candidate.stop_reason NOT IN ('user_cancelled', 'role_reassigned'))
-              AND NOT EXISTS (
-                  SELECT 1 FROM execution successor
-                  WHERE successor.task_id = candidate.task_id AND successor.id <> candidate.id
-                    AND (successor.status = 'running'
-                         OR successor.parent_execution_id = candidate.id
-                         OR successor.created_at > candidate.created_at)
-              )",
-    )
-    .bind(execution_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
+    let task_id = db
+        .current_orphan_attempt_task_id_in_tx(transaction, execution_id)
+        .await?;
     let Some(task_id) = task_id else {
         return Ok(false);
     };
@@ -4068,11 +3510,9 @@ async fn orphan_attempt_is_current(
     {
         return Ok(false);
     }
-    let workflow_json =
-        sqlx::query_scalar::<_, String>("SELECT workflow_definition FROM project WHERE id = ?")
-            .bind(&task.project_id)
-            .fetch_optional(&mut **transaction)
-            .await?;
+    let workflow_json = db
+        .orphan_attempt_workflow_definition_in_tx(transaction, &task.project_id)
+        .await?;
     let Some(workflow_json) = workflow_json else {
         return Ok(false);
     };

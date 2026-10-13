@@ -266,3 +266,183 @@ impl CommandReceiptRepo for SqliteDb {
         insert_command_receipt_in_tx(transaction, &input).await
     }
 }
+
+impl SqliteDb {
+    pub async fn retained_owner_workspace_reset_outcome(
+        &self,
+        placement_id: &str,
+        generation: i64,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM command_receipt WHERE operation = 'daemon.workspace.reset'
+         AND principal_id = 'workspace-backend'
+         AND json_extract(outcome_json, '$.metadata.placement_id') = ?
+         AND json_extract(outcome_json, '$.metadata.generation') = ?
+         AND json_extract(outcome_json, '$.metadata.status') = 'result'
+         ORDER BY committed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(placement_id)
+        .bind(generation)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub(crate) fn attention_coordination_scope_visibility_predicate(
+        user_id: &str,
+        project_id: Option<&str>,
+        scope_alias: &str,
+    ) -> (String, Vec<String>) {
+        match project_id {
+            Some(project_id) => (
+                format!(
+                    "(({scope_alias}.scope_type = 'project' AND {scope_alias}.scope_id = ?
+                       AND EXISTS (
+                           SELECT 1 FROM project p
+                           WHERE p.id = {scope_alias}.scope_id
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       ))
+                      OR ({scope_alias}.scope_type = 'agent_chat' AND EXISTS (
+                           SELECT 1 FROM agent_chat c
+                           JOIN project p ON p.id = c.project_id
+                           WHERE c.id = {scope_alias}.scope_id
+                             AND c.kind = 'project'
+                             AND c.project_id = ?
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       ))
+                      OR ({scope_alias}.scope_type = 'task' AND EXISTS (
+                           SELECT 1 FROM task t
+                           JOIN project p ON p.id = t.project_id
+                           WHERE t.id = {scope_alias}.scope_id
+                             AND t.project_id = ?
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       )))"
+                ),
+                vec![
+                    project_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    project_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    project_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                ],
+            ),
+            None => (
+                format!(
+                    "(({scope_alias}.scope_type = 'account' AND {scope_alias}.scope_id = ?)
+                      OR ({scope_alias}.scope_type = 'project' AND EXISTS (
+                           SELECT 1 FROM project p
+                           WHERE p.id = {scope_alias}.scope_id
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       ))
+                      OR ({scope_alias}.scope_type = 'agent_chat' AND EXISTS (
+                           SELECT 1 FROM agent_chat c
+                           LEFT JOIN project p ON p.id = c.project_id
+                           WHERE c.id = {scope_alias}.scope_id
+                             AND ((c.kind = 'account_main' AND c.account_id = ?)
+                               OR (c.kind = 'project' AND p.id IS NOT NULL AND
+                                   (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                       SELECT 1 FROM project_member pm
+                                       WHERE pm.project_id = p.id AND pm.user_id = ?
+                                   ))))
+                       ))
+                      OR ({scope_alias}.scope_type = 'task' AND EXISTS (
+                           SELECT 1 FROM task t
+                           JOIN project p ON p.id = t.project_id
+                           WHERE t.id = {scope_alias}.scope_id
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       )))"
+                ),
+                vec![
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                ],
+            ),
+        }
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionDirectCoordinationReceiptsRow {
+    pub id: crate::Result<String>,
+    pub principal_type: crate::Result<String>,
+    pub principal_id: crate::Result<String>,
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+    pub operation: crate::Result<String>,
+    pub input_digest: crate::Result<String>,
+    pub policy_result: crate::Result<String>,
+    pub correlation_id: crate::Result<String>,
+    pub outcome_json: crate::Result<Option<String>>,
+    pub committed_at: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_direct_coordination_receipts(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<AttentionDirectCoordinationReceiptsRow>> {
+        let (predicate, values) =
+            Self::attention_coordination_scope_visibility_predicate(user_id, project_id, "r");
+
+        let direct_sql = format!(
+            "SELECT r.id, r.principal_type, r.principal_id, r.scope_type, r.scope_id,
+                    r.operation, r.input_digest, r.policy_result, r.correlation_id,
+                    r.outcome_json, r.committed_at
+             FROM command_receipt r
+             WHERE r.agent_action_execution_id IS NULL
+               AND {predicate}
+             ORDER BY r.committed_at DESC, r.id DESC
+             LIMIT ?"
+        );
+        let mut direct_query = sqlx::query(&direct_sql);
+        for value in &values {
+            direct_query = direct_query.bind(value);
+        }
+        let direct_rows = direct_query.bind(limit).fetch_all(self.pool()).await?;
+        Ok(direct_rows
+            .into_iter()
+            .map(|row| AttentionDirectCoordinationReceiptsRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                principal_type: row.try_get("principal_type").map_err(crate::DbError::from),
+                principal_id: row.try_get("principal_id").map_err(crate::DbError::from),
+                scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+                operation: row.try_get("operation").map_err(crate::DbError::from),
+                input_digest: row.try_get("input_digest").map_err(crate::DbError::from),
+                policy_result: row.try_get("policy_result").map_err(crate::DbError::from),
+                correlation_id: row.try_get("correlation_id").map_err(crate::DbError::from),
+                outcome_json: row.try_get("outcome_json").map_err(crate::DbError::from),
+                committed_at: row.try_get("committed_at").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}

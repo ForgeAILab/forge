@@ -3244,6 +3244,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Web coordination roots no longer offer refused interactive launches, withdrawn lead questions preserve typed drafts with copy and dismiss controls, board subtask exits use the server's effective workflow, and out-of-order Task events cannot overwrite newer cached state.
+- `409 integration_unresolved` names the machine that performs the outstanding effect. For a rebase run on another machine than the merge target's it used to name the target's machine, so its "reconnect or remove that machine" hint pointed at the wrong one.
+- The Task list's ETag can no longer stay equal when one merge-queue member leaves and another joins with equal counters while the newest member timestamp does not move (a wall clock set back): the validator now carries the exact set of current members.
+- A Task command whose attempt failed before it ran and was re-queued no longer answers its caller with that attempt's transient error while the command stays queued and runs later (a caller that asked again got the command applied twice). The caller now waits, within its 5-second (Cancel/Hold: 15-second) bound, for the retry's own answer, or gets `409 task_busy` with the command still accepted.
+- A request aborted while it claimed its Task's queued step no longer leaves that step claimed for a whole 60-second lease with nothing running it; the next write or command of the Task used to answer `409 task_busy` (`pending_steps: 2`) until the lease lapsed. The claim, its liveness witness and its runner now belong to one background job that survives the request.
+- A Task command that ran is no longer run a second time when SQLite is busy as its step is settled, and its caller no longer gets that busy error (or the error of a failed lease release) in place of the committed result. A command's typed error is no longer flattened to a generic check error when its waiter reads the settled step just before the reply.
+- A claimed Task command no longer hangs after its claimer panics or is cancelled: waiters recover at lease expiry, return `task_busy` after 90 seconds under a live owner, and remove dropped requests' reply registrations.
+- Retry on a subtask's spent `lead_check` gate resets the gate budget and
+  validates the existing rework. If its root is still re-planning, the
+  accepted Retry waits for the root and resumes afterward instead of losing
+  its intent and restoring the spent-budget park with `recovery_required`.
+  The same holds for every accepted action on a subtask (the owner's Retry,
+  a lead's or the Project Agent's recovery, a start by hand) while its root
+  is planning, held, blocked or not started, or an earlier sibling is
+  unfinished: the subtask shows the parent wait and the action runs when the
+  hierarchy admits it. No error code or status changes.
 - Prevent normal WAL contention from timing out an accepted Task mutation, and restart an unlaunched lead check after its Agent resumes.
 - A Task write whose queued step was claimed and then abandoned no longer waits for ever: the waiter takes the step over when its lease lapses, and answers `task_busy` after 90 seconds under a live owner.
 - A run whose Agent is paused between admission and launch no longer spends an execution retry or shows a retry delay: the Task parks on the paused Agent at once and runs when the Agent is resumed.

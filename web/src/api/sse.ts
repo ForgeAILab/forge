@@ -297,6 +297,9 @@ function patchTaskList(payload: SsePayload, queryClient: QueryClient): boolean {
   if (
     !payload.project_id ||
     !payload.new_status ||
+    // Ordinary status envelopes carry no version. Refetch them rather than
+    // painting a potentially older cascade over a newer cached Task.
+    typeof payload.task_version !== 'number' ||
     !['task.status_changed', 'task.moved'].includes(payload.event_type)
   )
     return false
@@ -347,7 +350,7 @@ function patchTaskList(payload: SsePayload, queryClient: QueryClient): boolean {
     // for fields the event does not carry. Same-status moves need no refetch
     // only at the next revision and without an older list request in flight.
     if (item.status !== payload.new_status) needsRefetch = true
-    if (typeof payload.task_version === 'number' && payload.task_version < item.version) continue
+    if (payload.task_version < item.version) continue
     if (payload.new_status === 'cancelled' && !search.include_cancelled) {
       needsRefetch = true
     }

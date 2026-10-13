@@ -6,6 +6,9 @@ import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
 import type { AgentChatTurn } from '@/features/agent-chat/types'
 import { qk } from '@/api/query-keys'
+import { taskListItem } from '@/test-utils/task-list-item'
+import type { TasksResponse } from '@/types/generated'
+import type { InfiniteData } from '@tanstack/react-query'
 
 function createMocks() {
   const invalidateQueries = vi.fn()
@@ -15,6 +18,112 @@ function createMocks() {
 }
 
 describe('routeSsePayload', () => {
+  it.each([
+    ['done', 'in_progress', 'lead_check'],
+    ['lead_check', 'done', 'in_progress'],
+  ])('keeps the newest no-lead subtask version when events arrive %s → %s → %s', (...statuses) => {
+    vi.useFakeTimers()
+    const client = new QueryClient()
+    const key = [...qk.projectTasks('proj-1'), JSON.stringify({ limit: 200 })]
+    const subtask = taskListItem({
+      id: 'subtask',
+      project_id: 'proj-1',
+      parent_task_id: 'root',
+      status: 'todo',
+      version: 1,
+    })
+    const unrelated = taskListItem({ id: 'other', project_id: 'proj-1', version: 12 })
+    client.setQueryData<InfiniteData<TasksResponse>>(key, {
+      pages: [
+        { items: [subtask, unrelated], board_revision: 1, has_more: false, next_cursor: null },
+      ],
+      pageParams: [undefined],
+    })
+    const newest = { ...subtask, status: 'done', version: 4 }
+    client.setQueryData(qk.task('subtask'), newest)
+    client.setQueryData(qk.taskDetail('subtask'), { task: newest })
+    const versions: Record<string, number> = { in_progress: 2, lead_check: 3, done: 4 }
+    let highestVersion = 1
+    try {
+      for (const status of statuses) {
+        const version = versions[status]
+        highestVersion = Math.max(highestVersion, version)
+        routeSsePayload(
+          {
+            event_type: 'task.moved',
+            entity_id: subtask.id,
+            task_id: subtask.id,
+            project_id: 'proj-1',
+            new_status: status,
+            new_board_position: 0,
+            task_version: version,
+            board_revision: version,
+            timestamp: `2026-10-13T00:00:0${version}Z`,
+          },
+          client,
+          { dispatch: vi.fn() },
+        )
+        const cached = client.getQueryData<InfiniteData<TasksResponse>>(key)!.pages[0].items
+        expect(cached.find((task) => task.id === subtask.id)).toMatchObject({
+          status: highestVersion === 4 ? 'done' : 'lead_check',
+          version: highestVersion,
+        })
+        expect(cached.find((task) => task.id === unrelated.id)).toEqual(unrelated)
+        expect(client.getQueryData(qk.task('subtask'))).toEqual(newest)
+        expect(client.getQueryData(qk.taskDetail('subtask'))).toEqual({ task: newest })
+      }
+      vi.advanceTimersByTime(1500)
+      expect(
+        client
+          .getQueryData<InfiniteData<TasksResponse>>(key)!
+          .pages[0].items.find((task) => task.id === subtask.id)?.status,
+      ).toBe('done')
+    } finally {
+      client.clear()
+      vi.useRealTimers()
+    }
+  })
+  it('refetches unversioned status events instead of overwriting a newer cached no-lead subtask', () => {
+    vi.useFakeTimers()
+    const client = new QueryClient()
+    const key = [...qk.projectTasks('proj-1'), JSON.stringify({ limit: 200 })]
+    const newest = taskListItem({
+      id: 'subtask',
+      project_id: 'proj-1',
+      parent_task_id: 'root',
+      status: 'done',
+      version: 4,
+    })
+    client.setQueryData<InfiniteData<TasksResponse>>(key, {
+      pages: [{ items: [newest], board_revision: 4, has_more: false, next_cursor: null }],
+      pageParams: [undefined],
+    })
+    try {
+      // The ordinary status envelope has no Task version. Its timestamp is
+      // insufficient to order the cascaded events against an authoritative read.
+      for (const status of ['lead_check', 'in_progress', 'done']) {
+        routeSsePayload(
+          {
+            event_type: 'task.status_changed',
+            entity_id: newest.id,
+            project_id: 'proj-1',
+            new_status: status,
+            timestamp: '2026-10-13T00:00:00Z',
+          },
+          client,
+          { dispatch: vi.fn() },
+        )
+        expect(client.getQueryData<InfiniteData<TasksResponse>>(key)!.pages[0].items[0]).toEqual(
+          newest,
+        )
+      }
+      vi.advanceTimersByTime(1500)
+      expect(client.getQueryState(key)?.isInvalidated).toBe(true)
+    } finally {
+      client.clear()
+      vi.useRealTimers()
+    }
+  })
   it.each(['task.status_changed', 'task.blocked', 'task.recovered'])(
     'refreshes slot usage for %s in the affected project',
     (eventType) => {

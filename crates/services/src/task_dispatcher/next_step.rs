@@ -160,6 +160,9 @@ pub struct Facts {
     pub retry_pending: bool,
     pub review_ci_retry: bool,
     pub queued_recovery: bool,
+    /// The accepted action needs the hierarchy to admit this subtask: it
+    /// launches a role, or the hierarchy already refused its replay.
+    pub queued_needs_admission: bool,
     pub review_refresh: Option<String>,
     pub terminal_execution: Option<String>,
     pub failed_review: bool,
@@ -214,6 +217,21 @@ fn park(reason: Reason, owner: Owner, recovery: Action) -> Next {
         owner,
         recovery,
     })
+}
+fn parent_park(parent_id: &str, cause: &str) -> Next {
+    let (owner, recovery) = match cause {
+        "held" => (Owner::User, Action::ReleaseHold),
+        "planning" => (Owner::Worker, Action::WaitForOwner),
+        _ => (Owner::ProjectAgent, Action::SettleChildren),
+    };
+    park(
+        Reason::ParentWait {
+            parent_id: parent_id.to_owned(),
+            cause: cause.to_owned(),
+        },
+        owner,
+        recovery,
+    )
 }
 fn condition_park(condition: &TaskCondition) -> Next {
     let reason = match condition {
@@ -393,24 +411,24 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         if f.dependency_wait {
             return condition_park(s.condition);
         }
-        // Behind a root whose lead is planning, the accepted action waits
-        // like the subtask itself: replaying it would only be refused by the
-        // order check and park the subtask again. The root's return to its
+        // An accepted action that needs the hierarchy's admission waits like
+        // the subtask itself while the hierarchy does not admit it, whatever
+        // the cause (the root plans, is held, is blocked or has not started;
+        // an earlier sibling is unfinished) and whoever accepted it (the
+        // owner's Retry, the lead's `lead.recover`, the Project Agent's
+        // recovery, a start by hand). Replaying it would only be refused by
+        // the order check. The intent is kept; the root's return to its
         // implementation state marks its subtasks, and the action runs then.
-        // (The lead's own `lead.recover` is such an action.)
-        if let Some((parent_id, cause)) = f
-            .parent_wait
-            .as_ref()
-            .filter(|(_, cause)| cause == "planning")
-        {
-            return park(
-                Reason::ParentWait {
-                    parent_id: parent_id.clone(),
-                    cause: cause.clone(),
-                },
-                Owner::Worker,
-                Action::WaitForOwner,
-            );
+        // An action that needs no admission is replayed as usual.
+        if f.queued_needs_admission && !f.child_ready {
+            return match &f.parent_wait {
+                Some((parent_id, cause)) => parent_park(parent_id, cause),
+                None => park(
+                    Reason::Children,
+                    Owner::ProjectAgent,
+                    Action::SettleChildren,
+                ),
+            };
         }
         return Next::Step(Step::QueuedRecovery);
     }
@@ -500,20 +518,7 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // admission attempt meets the dependency gate, which writes the visible
     // refusal (and blocks on a cancelled dependency) exactly as before.
     if let Some((parent_id, cause)) = &f.parent_wait {
-        let (owner, recovery) = match cause.as_str() {
-            "held" => (Owner::User, Action::ReleaseHold),
-            // The root's lead is planning; its success releases the subtask.
-            "planning" => (Owner::Worker, Action::WaitForOwner),
-            _ => (Owner::ProjectAgent, Action::SettleChildren),
-        };
-        return park(
-            Reason::ParentWait {
-                parent_id: parent_id.clone(),
-                cause: cause.clone(),
-            },
-            owner,
-            recovery,
-        );
+        return parent_park(parent_id, cause);
     }
     if !f.child_ready || (f.root && !f.root_role_allowed) {
         return park(
@@ -1261,6 +1266,66 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn queued_role_actions_wait_for_the_parent_without_blocking_other_commands() {
+        let workflow = crate::workflow::inherited_subtask_workflow::inherited_subtask_workflow();
+        let condition = TaskCondition::Clear {
+            evidence: ConditionEvidence::default(),
+        };
+        for (cause, owner, recovery) in [
+            ("planning", Owner::Worker, Action::WaitForOwner),
+            ("held", Owner::User, Action::ReleaseHold),
+            ("blocked", Owner::ProjectAgent, Action::SettleChildren),
+            (
+                "not_coordinating",
+                Owner::ProjectAgent,
+                Action::SettleChildren,
+            ),
+        ] {
+            let mut facts = Facts {
+                queued_recovery: true,
+                queued_needs_admission: true,
+                parent_wait: Some(("root".to_owned(), cause.to_owned())),
+                ..Default::default()
+            };
+            let resolve = |facts: &Facts| {
+                next_step(&Snapshot {
+                    state: "lead_check",
+                    condition: &condition,
+                    workflow: &workflow,
+                    facts,
+                })
+            };
+            assert_eq!(
+                resolve(&facts),
+                park(
+                    Reason::ParentWait {
+                        parent_id: "root".to_owned(),
+                        cause: cause.to_owned(),
+                    },
+                    owner,
+                    recovery
+                )
+            );
+            facts.queued_needs_admission = false;
+            assert_eq!(resolve(&facts), Next::Step(Step::QueuedRecovery));
+            facts.queued_needs_admission = true;
+            facts.child_ready = true;
+            facts.parent_wait = None;
+            assert_eq!(resolve(&facts), Next::Step(Step::QueuedRecovery));
+            // The root implements and an earlier sibling is unfinished.
+            facts.child_ready = false;
+            assert_eq!(
+                resolve(&facts),
+                park(
+                    Reason::Children,
+                    Owner::ProjectAgent,
+                    Action::SettleChildren
+                )
+            );
+        }
+    }
+
     #[test]
     fn backlog_root_stays_parked_after_a_manual_move() {
         let workflow = WorkflowEngine::resolve_workflow("{}");

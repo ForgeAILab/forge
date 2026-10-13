@@ -314,3 +314,442 @@ impl SqliteDb {
             .transpose()
     }
 }
+
+impl SqliteDb {
+    pub async fn cleanup_attention_is_open_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM attention_projection
+                            WHERE dedupe_key = ? AND status <> 'resolved')",
+        )
+        .bind(dedupe_key)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_task_workspace_cleanup_attention(
+        &self,
+        now: &str,
+        task_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE attention_projection
+             SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                 updated_at = ?, version = version + 1
+             WHERE status <> 'resolved'
+               AND dedupe_key IN (SELECT 'workspace-cleanup:' || id FROM workspace
+                                  WHERE task_id = ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(task_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_workspace_cleanup_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE attention_projection
+                 SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                     updated_at = ?, version = version + 1
+                 WHERE dedupe_key = ? AND status <> 'resolved'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(dedupe_key)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_disconnect_incident_is_current(
+        &self,
+        attention_key: String,
+        event_key: String,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attention_projection a JOIN domain_event e ON e.id = a.source_event_id
+         WHERE a.dedupe_key = ? AND e.dedupe_key = ? AND a.status != 'resolved')")
+.bind(attention_key)
+.bind(event_key)
+.fetch_one(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_reconciled_owner_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        resolved_at: String,
+        source_event_id: &str,
+        updated_at: String,
+        dedupe_key: String,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE attention_projection SET status = 'resolved', resolved_at = ?,
+        snoozed_until = NULL, source_event_id = ?, updated_at = ?, version = version + 1
+        WHERE dedupe_key = ? AND status <> 'resolved'",
+        )
+        .bind(resolved_at)
+        .bind(source_event_id)
+        .bind(updated_at)
+        .bind(dedupe_key)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_owner_reconnect_review_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        resolved_at: String,
+        updated_at: String,
+        review_key: String,
+        owner_wait_key: String,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
+        WHERE status <> 'resolved' AND dedupe_key IN (?, ?)")
+.bind(resolved_at)
+.bind(updated_at)
+.bind(review_key)
+.bind(owner_wait_key)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_expired_placement_wait_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        resolved_at: String,
+        updated_at: String,
+        owner_wait_key: String,
+        environment_wait_key: String,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
+.bind(resolved_at)
+.bind(updated_at)
+.bind(owner_wait_key)
+.bind(environment_wait_key)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_claim_placement_wait_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        resolved_at: String,
+        updated_at: String,
+        owner_wait_key: String,
+        environment_wait_key: String,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
+            WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
+.bind(resolved_at)
+.bind(updated_at)
+.bind(owner_wait_key)
+.bind(environment_wait_key)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn open_project_autonomy_incident_count(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attention_projection
+             WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct WakeSweepCandidateRow {
+    pub id: crate::Result<String>,
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+    pub latest_digest: crate::Result<Option<String>>,
+    pub latest_disposition: crate::Result<Option<String>>,
+    pub latest_reason: crate::Result<String>,
+    pub latest_identity: crate::Result<Option<String>>,
+}
+
+impl SqliteDb {
+    pub async fn open_wake_sweep_candidates(
+        &self,
+        now: &str,
+    ) -> crate::Result<Vec<WakeSweepCandidateRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.scope_type, a.scope_id, l.incident_digest AS latest_digest,
+                    l.disposition AS latest_disposition, l.reason AS latest_reason,
+                    l.identity_id AS latest_identity
+             FROM attention_projection a
+             LEFT JOIN agent_wake_attention_latest l ON l.attention_id = a.id
+             WHERE a.status = 'open'
+               AND a.recommended_action NOT IN ('answer_escalation', 'answer_lead_input')
+               AND (a.snoozed_until IS NULL OR a.snoozed_until <= ?)
+             ORDER BY a.scope_type, a.scope_id, a.occurred_at, a.id",
+        )
+        .bind(now)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(WakeSweepCandidateRow {
+                    id: row.try_get("id").map_err(crate::DbError::from),
+                    scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                    scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+                    latest_digest: row.try_get("latest_digest").map_err(crate::DbError::from),
+                    latest_disposition: row
+                        .try_get("latest_disposition")
+                        .map_err(crate::DbError::from),
+                    latest_reason: row.try_get("latest_reason").map_err(crate::DbError::from),
+                    latest_identity: row.try_get("latest_identity").map_err(crate::DbError::from),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct WakeIncidentContextRow {
+    pub id: crate::Result<String>,
+    pub attention_type: crate::Result<String>,
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+    pub status: crate::Result<String>,
+    pub source_event_id: crate::Result<String>,
+    pub source_sequence: crate::Result<Option<i64>>,
+    pub details_json: crate::Result<String>,
+    pub recommended_action: crate::Result<String>,
+    pub version: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn wake_incident_context(
+        &self,
+        incident_key: &str,
+    ) -> crate::Result<Option<WakeIncidentContextRow>> {
+        let rows = sqlx::query(
+            "SELECT id, attention_type, scope_type, scope_id, status,
+                    source_event_id, source_sequence, details_json,
+                    recommended_action, version
+             FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(incident_key)
+        .fetch_optional(self.pool())
+        .await?;
+        rows.map(|row| {
+            Ok(WakeIncidentContextRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                attention_type: row.try_get("attention_type").map_err(crate::DbError::from),
+                scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+                status: row.try_get("status").map_err(crate::DbError::from),
+                source_event_id: row.try_get("source_event_id").map_err(crate::DbError::from),
+                source_sequence: row.try_get("source_sequence").map_err(crate::DbError::from),
+                details_json: row.try_get("details_json").map_err(crate::DbError::from),
+                recommended_action: row
+                    .try_get("recommended_action")
+                    .map_err(crate::DbError::from),
+                version: row.try_get("version").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_attention_status_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT status FROM attention_projection WHERE id = ?")
+                .bind(attention_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_incident_status_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        incident_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT status FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(incident_key)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_stale_wake_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        resolved_at: &str,
+        updated_at: &str,
+        attention_id: &str,
+        expected_version: Option<i64>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE attention_projection
+                         SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                             updated_at = ?, version = version + 1
+                         WHERE id = ? AND version = ? AND status <> 'resolved'",
+        )
+        .bind(resolved_at)
+        .bind(updated_at)
+        .bind(attention_id)
+        .bind(expected_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn open_project_wake_incident_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'")
+.bind(project_id)
+.fetch_one(connection)
+.await?)
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionWorkerHealthRow {
+    pub last_error_kind: crate::Result<Option<String>>,
+    pub last_error: crate::Result<Option<String>>,
+    pub last_sequence: crate::Result<i64>,
+    pub last_success_at: crate::Result<Option<String>>,
+    pub updated_at: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_worker_health(
+        &self,
+        consumer_name: &str,
+    ) -> crate::Result<Option<AttentionWorkerHealthRow>> {
+        let rows = sqlx::query("SELECT h.*, COALESCE(c.last_sequence, 0) AS last_sequence
+            FROM worker_health h LEFT JOIN event_consumer_cursor c ON c.consumer_name = h.worker_name WHERE h.worker_name = ?")
+.bind(consumer_name)
+.fetch_optional(self.pool())
+.await?;
+        rows.map(|row| {
+            Ok(AttentionWorkerHealthRow {
+                last_error_kind: row.try_get("last_error_kind").map_err(crate::DbError::from),
+                last_error: row.try_get("last_error").map_err(crate::DbError::from),
+                last_sequence: row.try_get("last_sequence").map_err(crate::DbError::from),
+                last_success_at: row.try_get("last_success_at").map_err(crate::DbError::from),
+                updated_at: row.try_get("updated_at").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+// Preserve the original tuple query's positional decoding and error indices.
+impl<'r> sqlx::FromRow<'r, SqliteRow> for FailedTurnIncidentRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            dedupe_key: row.try_get(0)?,
+            entity_id: row.try_get(1)?,
+            id: row.try_get(2)?,
+            payload_json: row.try_get(3)?,
+        })
+    }
+}
+#[derive(Debug)]
+pub struct FailedTurnIncidentRow {
+    pub dedupe_key: String,
+    pub entity_id: String,
+    pub id: String,
+    pub payload_json: String,
+}
+
+impl SqliteDb {
+    pub async fn unresolved_failed_turn_incidents(
+        &self,
+    ) -> crate::Result<Vec<FailedTurnIncidentRow>> {
+        Ok(sqlx::query_as::<_, FailedTurnIncidentRow>(
+            "SELECT a.dedupe_key, e.entity_id, e.id, e.payload_json FROM attention_projection a
+             JOIN domain_event e ON e.id = a.source_event_id
+             WHERE a.status <> 'resolved' AND e.event_type = 'agent_chat.turn.failed'",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct ResolveScopeProgressAttentionInTxInput<'a> {
+    pub resolved_at: &'a str,
+    pub source_event_id: &'a str,
+    pub updated_at: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn resolve_scope_progress_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ResolveScopeProgressAttentionInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                source_event_id = ?, updated_at = ?, version = version + 1
+                WHERE attention_type = 'delivery_followup' AND scope_type = ? AND scope_id = ? AND status <> 'resolved'")
+.bind(input.resolved_at)
+.bind(input.source_event_id)
+.bind(input.updated_at)
+.bind(input.scope_type)
+.bind(input.scope_id)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}

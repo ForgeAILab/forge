@@ -16,7 +16,6 @@ use api_types::{
 use chrono::{DateTime, Duration, Utc};
 use db::{CheckRunRepo, IntegrationQueueRepo, SqliteDb, WorkspaceRepo};
 use serde_json::Value;
-use sqlx::Row;
 
 use crate::{
     plan_artifact::{read_plan_for_resolved_workspace, PlanArtifactError},
@@ -207,10 +206,7 @@ impl OperatorStatusService {
         let event_consumers = self.event_consumers(now).await?;
         let periodic_workers = self.periodic_workers.status().await?;
         let task_steps = self.task_step_status(now).await?;
-        let pending_remote_cancels: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM pending_remote_cancel")
-                .fetch_one(self.db.pool())
-                .await?;
+        let pending_remote_cancels: i64 = self.db.pending_remote_cancel_count().await?;
         let storage = db::sqlite_storage_status(self.db.pool()).await?;
         let database = DatabaseStorageStatus {
             incremental_vacuum: storage.incremental_vacuum,
@@ -300,18 +296,8 @@ impl OperatorStatusService {
         // A Task parked because its checks produced no verdict is an
         // infrastructure problem the operator must see: it is not a failure
         // of the change, and only `retry` or `cancel` ends it.
-        for row in sqlx::query(
-            "SELECT id, title, condition_json, updated_at FROM task
-             WHERE condition_json LIKE '%infrastructure_exhausted%'
-               AND deleted_at IS NULL AND archived_at IS NULL
-               AND status NOT IN ('done', 'cancelled')
-             ORDER BY updated_at DESC, id ASC LIMIT 50",
-        )
-        .fetch_all(self.db.pool())
-        .await?
-        {
-            let condition =
-                db::task_condition::decode_or_unknown(&row.try_get::<String, _>("condition_json")?);
+        for row in self.db.tasks_with_exhausted_infrastructure_checks().await? {
+            let condition = db::task_condition::decode_or_unknown(&row.condition_json.clone());
             if !condition
                 .check_wait()
                 .is_some_and(|wait| wait.requires_intervention())
@@ -320,12 +306,12 @@ impl OperatorStatusService {
             }
             recent_errors.push(RecentErrorSummary {
                 entity_type: "task_check_exhausted".to_owned(),
-                entity_id: row.try_get("id")?,
+                entity_id: row.id.clone(),
                 error: format!(
                     "Checks for Task \"{}\" produced no result after the automatic retries. Retry the Task's checks or cancel it",
-                    row.try_get::<String, _>("title")?
+                    row.title.clone()
                 ),
-                occurred_at: row.try_get("updated_at")?,
+                occurred_at: row.updated_at.clone(),
                 severity: OperatorSeverity::Attention,
             });
         }
@@ -402,12 +388,10 @@ impl OperatorStatusService {
         // A workspace root this database does not own is never garbage
         // collected: say so for as long as it lasts, the disk fills silently
         // otherwise.
-        let gc_status = sqlx::query_as::<_, (String, String)>(
-            "SELECT value, updated_at FROM system_setting WHERE key = ?",
-        )
-        .bind(crate::workspace_cleanup::GC_STATUS_KEY)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let gc_status = self
+            .db
+            .setting_value_with_updated_at(crate::workspace_cleanup::GC_STATUS_KEY)
+            .await?;
         if let Some((value, since)) = gc_status {
             let status: Value = serde_json::from_str(&value).unwrap_or_default();
             let state = status["state"].as_str().unwrap_or("unknown");
@@ -431,11 +415,7 @@ impl OperatorStatusService {
         // (`review.auditor_agent_id`). Nothing runs an auditor pass any more
         // and new configurations that name one are refused: say which Tasks
         // still carry it, for as long as they do.
-        let auditor_tasks: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM task WHERE deleted_at IS NULL AND status NOT IN ('done','cancelled') AND task_state_config IS NOT NULL AND json_valid(task_state_config) AND COALESCE(json_extract(task_state_config,'$.review.auditor_agent_id'), json_extract(task_state_config,'$.auditor_agent_id')) IS NOT NULL ORDER BY id LIMIT 11",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let auditor_tasks: Vec<String> = self.db.open_tasks_with_retired_auditor().await?;
         if !auditor_tasks.is_empty() {
             recent_errors.push(RecentErrorSummary {
                 severity: api_types::OperatorSeverity::Attention,
@@ -476,12 +456,10 @@ impl OperatorStatusService {
         }
         // A root in the system temp directory loses worktrees to the
         // operating system's cleaner: say so until the operator moves it.
-        let root_status = sqlx::query_as::<_, (String, String)>(
-            "SELECT value, updated_at FROM system_setting WHERE key = ?",
-        )
-        .bind(crate::workspace_root::STATUS_KEY)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let root_status = self
+            .db
+            .setting_value_with_updated_at(crate::workspace_root::STATUS_KEY)
+            .await?;
         if let Some((value, since)) = root_status {
             let status: Value = serde_json::from_str(&value).unwrap_or_default();
             let root = status["root"].as_str().unwrap_or_default().to_owned();
@@ -606,12 +584,12 @@ impl OperatorStatusService {
     ) -> Result<api_types::TaskStepQueueStatus, ServiceError> {
         // Failed and parked count only while the Task's annotation still
         // points at that step: resolved rows are history, not queue health.
-        let (pending,claimed,oldest): (i64,i64,Option<String>) = sqlx::query_as("SELECT COALESCE(SUM(status='pending'),0),COALESCE(SUM(status='claimed'),0),MIN(CASE WHEN status='pending' THEN created_at END) FROM task_step WHERE status IN ('pending','claimed')")
-            .fetch_one(self.db.pool()).await?;
-        let (failed,parked): (i64,i64) = sqlx::query_as("SELECT COALESCE(SUM(s.status='failed'),0),COALESCE(SUM(s.status='parked'),0) FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.status IN ('failed','parked') AND t.deleted_at IS NULL AND json_extract(t.condition_json,'$.evidence.presentation.failed_step_id')=s.id")
-            .fetch_one(self.db.pool()).await?;
-        let (last_error,last_error_at,restart_count): (Option<String>,Option<String>,i64) = sqlx::query_as("SELECT last_error,last_error_at,restart_count FROM worker_health WHERE worker_name='task_steps'")
-            .fetch_optional(self.db.pool()).await?.unwrap_or_default();
+        let (pending, claimed, oldest): (i64, i64, Option<String>) =
+            self.db.pending_and_claimed_task_step_counts().await?;
+        let (failed, parked): (i64, i64) =
+            self.db.current_failed_and_parked_task_step_counts().await?;
+        let (last_error, last_error_at, restart_count): (Option<String>, Option<String>, i64) =
+            self.db.task_step_worker_error().await?.unwrap_or_default();
         Ok(api_types::TaskStepQueueStatus {
             worker_name: "task_steps".into(),
             pending,
@@ -669,32 +647,12 @@ impl OperatorStatusService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<ActiveExecutionSummary>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT
-                e.id AS execution_id,
-                e.task_id,
-                t.title AS task_title,
-                e.role,
-                e.agent_id,
-                a.name AS agent_name,
-                e.workspace_id,
-                e.agent_session_id,
-                e.created_at AS started_at,
-                e.logs_path,
-                e.executor_config_snapshot_json
-             FROM execution e
-             JOIN task t ON t.id = e.task_id
-             LEFT JOIN agent_current a ON a.id = e.agent_id
-             WHERE e.status = 'running'
-             ORDER BY e.created_at ASC, e.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.active_execution_operator_rows().await?;
 
         let mut active_executions = Vec::with_capacity(rows.len());
         for row in rows {
-            let started_at: String = row.try_get("started_at")?;
-            let workspace_id: Option<String> = row.try_get("workspace_id")?;
+            let started_at: String = row.started_at.clone();
+            let workspace_id: Option<String> = row.workspace_id.clone();
             let resolved = match workspace_id.as_deref() {
                 Some(id) => match WorkspaceRepo::get_by_id(&*self.db, id).await? {
                     Some(workspace) => Some(
@@ -718,7 +676,7 @@ impl OperatorStatusService {
                     .or_else(|| workspace.placement.daemon_id.clone())
             });
             let runtime_seconds = seconds_since(&started_at, now);
-            let snapshot_json: Option<String> = row.try_get("executor_config_snapshot_json")?;
+            let snapshot_json: Option<String> = row.executor_config_snapshot_json.clone();
             let effective_policy =
                 effective_policy(snapshot_json.as_deref(), workspace_path.as_deref());
             let rate_limit_snapshot = rate_limit_snapshot(snapshot_json.as_deref());
@@ -726,11 +684,8 @@ impl OperatorStatusService {
                 Some(workspace) => plan_progress(workspace).await?,
                 None => None,
             };
-            let log_snapshot = self
-                .log_snapshots
-                .read(row.try_get::<Option<String>, _>("logs_path")?)
-                .await;
-            let execution_id: String = row.try_get("execution_id")?;
+            let log_snapshot = self.log_snapshots.read(row.logs_path.clone()).await;
+            let execution_id: String = row.execution_id.clone();
             let usage = usage_aggregate_for_source_state(&self.db, &execution_id, true).await?;
             let token_totals = Some(TokenTotalsSummary {
                 tokens: usage.tokens.clone(),
@@ -739,15 +694,15 @@ impl OperatorStatusService {
 
             active_executions.push(ActiveExecutionSummary {
                 execution_id,
-                task_id: row.try_get("task_id")?,
-                task_title: row.try_get("task_title")?,
-                role: row.try_get("role")?,
-                agent_id: row.try_get("agent_id")?,
-                agent_name: row.try_get("agent_name")?,
+                task_id: row.task_id.clone(),
+                task_title: row.task_title.clone(),
+                role: row.role.clone(),
+                agent_id: row.agent_id.clone(),
+                agent_name: row.agent_name.clone(),
                 daemon_id,
                 workspace_id,
                 workspace_path,
-                session_id: row.try_get("agent_session_id")?,
+                session_id: row.agent_session_id.clone(),
                 started_at,
                 runtime_seconds,
                 elapsed_seconds: runtime_seconds,
@@ -766,28 +721,16 @@ impl OperatorStatusService {
     }
 
     async fn blocked_tasks(&self) -> Result<Vec<BlockedTaskSummary>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT id, title, condition_json, updated_at
-             FROM task
-             WHERE (status = 'blocked' OR json_extract(condition_json,'$.evidence.presentation.interruption_present') = 1)
-               AND deleted_at IS NULL
-               AND archived_at IS NULL
-               AND status NOT IN ('done', 'cancelled')
-             ORDER BY updated_at DESC, id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.blocked_task_operator_rows().await?;
 
         rows.into_iter()
             .map(|row| {
-                let condition = db::task_condition::decode_or_unknown(
-                    &row.try_get::<String, _>("condition_json")?,
-                );
+                let condition = db::task_condition::decode_or_unknown(&row.condition_json.clone());
                 Ok(BlockedTaskSummary {
-                    task_id: row.try_get("id")?,
-                    title: row.try_get("title")?,
+                    task_id: row.id.clone(),
+                    title: row.title.clone(),
                     blocked_reason: condition.read().operator_reason,
-                    blocked_since: Some(row.try_get("updated_at")?),
+                    blocked_since: Some(row.updated_at.clone()),
                 })
             })
             .collect()
@@ -798,20 +741,13 @@ impl OperatorStatusService {
         now: DateTime<Utc>,
     ) -> Result<Vec<DaemonIssueSummary>, ServiceError> {
         let stale_before = now - Duration::minutes(5);
-        let rows = sqlx::query(
-            "SELECT id, hostname, status, last_report_at, updated_at
-             FROM daemon
-             WHERE removed_at IS NULL
-             ORDER BY updated_at DESC, id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.daemon_operator_issue_rows().await?;
 
         rows.into_iter()
             .filter(|row| {
-                let id: String = row.get("id");
-                let status: String = row.get("status");
-                let last: Option<String> = row.get("last_report_at");
+                let id: String = row.id.clone();
+                let status: String = row.status.clone();
+                let last: Option<String> = row.last_report_at.clone();
                 matches!(status.as_str(), "offline" | "error")
                     || last.is_some_and(|last| last < stale_before.to_rfc3339())
                     || self
@@ -821,14 +757,14 @@ impl OperatorStatusService {
                         .is_some_and(|connection| connection.needs_upgrade())
             })
             .map(|row| {
-                let status: String = row.try_get("status")?;
-                let last_report_at: Option<String> = row.try_get("last_report_at")?;
+                let status: String = row.status.clone();
+                let last_report_at: Option<String> = row.last_report_at.clone();
                 let (issue, severity) = match status.as_str() {
                     "error" => ("error".to_owned(), OperatorSeverity::Error),
                     "offline" => ("offline".to_owned(), OperatorSeverity::Attention),
                     _ => ("stale".to_owned(), OperatorSeverity::Attention),
                 };
-                let id: String = row.try_get("id")?;
+                let id: String = row.id.clone();
                 let issue = if self
                     .daemon_connections
                     .as_ref()
@@ -844,21 +780,17 @@ impl OperatorStatusService {
                 };
                 Ok(DaemonIssueSummary {
                     daemon_id: id,
-                    hostname: row.try_get("hostname")?,
+                    hostname: row.hostname.clone(),
                     issue,
                     severity,
-                    detected_at: last_report_at.or_else(|| row.try_get("updated_at").ok()),
+                    detected_at: last_report_at.or_else(|| Some(row.updated_at.clone())),
                 })
             })
             .collect()
     }
 
     async fn daemon_error_count(&self) -> Result<i64, ServiceError> {
-        Ok(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM daemon WHERE status = 'error'")
-                .fetch_one(self.db.pool())
-                .await?,
-        )
+        Ok(self.db.daemon_error_count().await?)
     }
 
     async fn daemon_pressure(&self) -> Result<Vec<DaemonPressureSummary>, ServiceError> {
@@ -895,41 +827,20 @@ impl OperatorStatusService {
     }
 
     async fn agent_pressure(&self) -> Result<Vec<AgentPressureSummary>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT
-                a.id AS agent_id,
-                a.name AS agent_name,
-                a.daemon_id,
-                a.max_concurrent_tasks,
-                (
-                    SELECT COUNT(*)
-                    FROM execution e
-                    WHERE e.agent_id = a.id AND e.status = 'running'
-                ) + (
-                    SELECT COUNT(*) FROM workspace_placement p
-                    WHERE p.agent_id = a.id AND p.state IN ('reserved', 'preparing')
-                       AND julianday(COALESCE(p.reserved_until, datetime(p.updated_at, '+10 minutes'))) > julianday('now')
-                      AND NOT EXISTS (SELECT 1 FROM execution e
-                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
-                ) AS running_executions
-             FROM agent_current a
-             ORDER BY a.name ASC, a.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.agent_operator_pressure_rows().await?;
 
         let mut pressure = Vec::new();
         for row in rows {
-            let active_tasks = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
-            let max_concurrent_tasks = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
+            let active_tasks = row.running_executions.max(0) as u32;
+            let max_concurrent_tasks = row.max_concurrent_tasks.max(0) as u32;
             let at_capacity = max_concurrent_tasks > 0 && active_tasks >= max_concurrent_tasks;
             if active_tasks == 0 && !at_capacity {
                 continue;
             }
             pressure.push(AgentPressureSummary {
-                agent_id: row.try_get("agent_id")?,
-                agent_name: row.try_get("agent_name")?,
-                daemon_id: row.try_get("daemon_id")?,
+                agent_id: row.agent_id.clone(),
+                agent_name: row.agent_name.clone(),
+                daemon_id: row.daemon_id.clone(),
                 active_tasks,
                 max_concurrent_tasks,
                 at_capacity,
@@ -948,21 +859,14 @@ impl OperatorStatusService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<WorkspaceCleanupSummary>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT id, task_id, cleanup_after
-             FROM workspace
-             WHERE status IN ('ready', 'cleaning')
-               AND cleanup_after IS NOT NULL
-               AND cleanup_after < ?
-             ORDER BY cleanup_after ASC, id ASC",
-        )
-        .bind(now.to_rfc3339())
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .overdue_workspace_cleanup_rows(&(now.to_rfc3339()))
+            .await?;
 
         let mut backlog = Vec::with_capacity(rows.len());
         for row in rows {
-            let workspace_id: String = row.try_get("id")?;
+            let workspace_id: String = row.id.clone();
             let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.clone()))?;
@@ -972,9 +876,9 @@ impl OperatorStatusService {
                 .await?;
             backlog.push(WorkspaceCleanupSummary {
                 workspace_id,
-                task_id: row.try_get("task_id")?,
+                task_id: row.task_id.clone(),
                 worktree_path: Some(resolved.handle()?.to_owned()),
-                cleanup_after: row.try_get("cleanup_after")?,
+                cleanup_after: row.cleanup_after.clone(),
             });
         }
         Ok(backlog)
@@ -983,40 +887,13 @@ impl OperatorStatusService {
     async fn retry_pressure(&self) -> Result<Vec<RetryPressureSummary>, ServiceError> {
         // `attempt_count` counts transition rejections, as it always has; the
         // Execution spend comes from the budget ledger. Both are page queries.
-        let rows = sqlx::query(
-            "SELECT
-                t.id AS task_id,
-                t.title,
-                t.status,
-                t.condition_json,
-                COUNT(tl.id) AS attempt_count,
-                COALESCE((
-                    SELECT b.spent FROM task_budget b
-                    WHERE b.task_id = t.id AND b.kind = 'execution'
-                ), 0) AS execution_spent,
-                (
-                    SELECT e.error
-                    FROM execution e
-                    WHERE e.task_id = t.id AND e.status = 'failed'
-                    ORDER BY COALESCE(e.stopped_at, e.updated_at) DESC, e.id DESC
-                    LIMIT 1
-                ) AS last_error
-             FROM task t
-             LEFT JOIN transition_log tl ON tl.task_id = t.id AND tl.rejection = 1
-             WHERE t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'cancelled')
-             GROUP BY t.id, t.title, t.status, t.condition_json
-             HAVING COUNT(tl.id) >= 1 OR json_extract(t.condition_json,'$.evidence.presentation.retry_display.reason') IS NOT NULL OR execution_spent > 0
-             ORDER BY attempt_count DESC, t.updated_at DESC, t.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.task_operator_retry_rows().await?;
 
         let retried = rows
             .iter()
-            .filter(|row| row.try_get::<i64, _>("execution_spent").unwrap_or(0) > 0)
-            .map(|row| row.try_get::<String, _>("task_id"))
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter(|row| row.execution_spent > 0)
+            .map(|row| row.task_id.clone())
+            .collect::<Vec<_>>();
         let retried = self
             .db
             .get_tasks_by_ids(&retried.iter().map(String::as_str).collect::<Vec<_>>())
@@ -1049,11 +926,10 @@ impl OperatorStatusService {
 
         let mut pressure = Vec::new();
         for row in rows {
-            let attempt_count: i64 = row.try_get("attempt_count")?;
-            let condition =
-                db::task_condition::decode_or_unknown(&row.try_get::<String, _>("condition_json")?);
-            let task_id: String = row.try_get("task_id")?;
-            let execution_retry_count = row.try_get::<i64, _>("execution_spent")?.max(0) as u32;
+            let attempt_count: i64 = row.attempt_count;
+            let condition = db::task_condition::decode_or_unknown(&row.condition_json.clone());
+            let task_id: String = row.task_id.clone();
+            let execution_retry_count = row.execution_spent.max(0) as u32;
             let deferred = condition.read().retry_display;
             let retry_reason = deferred
                 .as_ref()
@@ -1072,12 +948,12 @@ impl OperatorStatusService {
                     .get(&task_id)
                     .map(|limit| (*limit).max(0) as u32),
                 task_id,
-                title: row.try_get("title")?,
+                title: row.title.clone(),
                 attempt_count,
-                current_state: row.try_get("status")?,
+                current_state: row.status.clone(),
                 retry_reason,
                 due_time,
-                last_error: row.try_get("last_error")?,
+                last_error: row.last_error.clone(),
             });
         }
         Ok(pressure)
@@ -1101,32 +977,19 @@ impl OperatorStatusService {
         now: DateTime<Utc>,
     ) -> Result<Vec<RecentErrorSummary>, ServiceError> {
         let cutoff = now - Duration::hours(1);
-        let rows = sqlx::query(
-            "SELECT
-                e.id AS execution_id,
-                e.task_id,
-                e.error,
-                COALESCE(e.stopped_at, e.updated_at) AS occurred_at
-             FROM execution e INDEXED BY idx_execution_usage_failed_recent
-             JOIN task t ON t.id = e.task_id
-             WHERE e.status = 'failed'
-               AND t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'cancelled')
-               AND COALESCE(e.stopped_at, e.updated_at) >= ?
-             ORDER BY occurred_at DESC, e.id ASC",
-        )
-        .bind(cutoff.to_rfc3339())
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .recent_failed_execution_operator_rows(&(cutoff.to_rfc3339()))
+            .await?;
 
         rows.into_iter()
             .map(|row| {
-                let error: Option<String> = row.try_get("error")?;
+                let error: Option<String> = row.error.clone();
                 Ok(RecentErrorSummary {
                     entity_type: "task".to_owned(),
-                    entity_id: row.try_get("task_id")?,
+                    entity_id: row.task_id.clone(),
                     error: error.unwrap_or_else(|| "execution failed".to_owned()),
-                    occurred_at: row.try_get("occurred_at")?,
+                    occurred_at: row.occurred_at.clone(),
                     severity: OperatorSeverity::Error,
                 })
             })

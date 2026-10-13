@@ -3046,3 +3046,183 @@ impl SqliteDb {
             .transpose()
     }
 }
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct WakeChatCanonicalScopeRow {
+    pub project_id: crate::Result<Option<String>>,
+    pub account_id: crate::Result<Option<String>>,
+}
+
+impl SqliteDb {
+    pub async fn wake_chat_canonical_scope_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        chat_id: &str,
+    ) -> crate::Result<Option<WakeChatCanonicalScopeRow>> {
+        let rows = sqlx::query("SELECT project_id,account_id FROM agent_chat WHERE id=?")
+            .bind(chat_id)
+            .fetch_optional(connection)
+            .await?;
+        rows.map(|row| {
+            Ok(WakeChatCanonicalScopeRow {
+                project_id: row.try_get("project_id").map_err(crate::DbError::from),
+                account_id: row.try_get("account_id").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_budget_chat_project_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT project_id FROM agent_chat WHERE id = ?",
+        )
+        .bind(chat_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_budget_main_chat_account_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        chat_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT account_id FROM agent_chat
+                 WHERE id = ? AND kind = 'account_main'",
+        )
+        .bind(chat_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionChatScopeRow {
+    pub kind: crate::Result<String>,
+    pub account_id: crate::Result<Option<String>>,
+    pub project_id: crate::Result<Option<String>>,
+}
+
+impl SqliteDb {
+    pub async fn attention_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<AttentionChatScopeRow>> {
+        let rows = sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(self.pool())
+            .await?;
+        rows.map(|row| {
+            Ok(AttentionChatScopeRow {
+                kind: row.try_get("kind").map_err(crate::DbError::from),
+                account_id: row.try_get("account_id").map_err(crate::DbError::from),
+                project_id: row.try_get("project_id").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_scope_chat_count(&self, chat_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_chat WHERE id = ?")
+                .bind(chat_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_responder_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<AttentionChatScopeRow>> {
+        let rows = sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(self.pool())
+            .await?;
+        rows.map(|row| {
+            Ok(AttentionChatScopeRow {
+                kind: row.try_get("kind").map_err(crate::DbError::from),
+                account_id: row.try_get("account_id").map_err(crate::DbError::from),
+                project_id: row.try_get("project_id").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_configured_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<AttentionChatScopeRow>> {
+        let rows = sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(self.pool())
+            .await?;
+        rows.map(|row| {
+            Ok(AttentionChatScopeRow {
+                kind: row.try_get("kind").map_err(crate::DbError::from),
+                account_id: row.try_get("account_id").map_err(crate::DbError::from),
+                project_id: row.try_get("project_id").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_chat_identity_access_count(
+        &self,
+        chat_id: &str,
+        main_identity_id: &str,
+        project_identity_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_chat c
+                 WHERE c.id = ? AND (
+                    (c.kind = 'account_main' AND EXISTS (
+                        SELECT 1 FROM account_main_agent_binding b
+                        WHERE b.account_id = c.account_id
+                          AND b.identity_id = ? AND b.state = 'active'
+                    )) OR (c.kind = 'project' AND EXISTS (
+                        SELECT 1 FROM project_agent_binding b
+                        WHERE b.project_id = c.project_id
+                          AND b.identity_id = ? AND b.state = 'active'
+                    ))
+                 )",
+        )
+        .bind(chat_id)
+        .bind(main_identity_id)
+        .bind(project_identity_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_chat_account_project_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<(Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT account_id, project_id FROM agent_chat WHERE id = ?",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

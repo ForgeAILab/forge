@@ -1,8 +1,14 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
+import { useState } from 'react'
 import type { AttentionItem } from '@/features/federation/types'
-import { LeadInputAnswer } from './lead-input-answer'
+import { LeadInputAnswer as AnswerForm } from './lead-input-answer'
+
+function LeadInputAnswer({ item }: { item: AttentionItem }) {
+  const [answer, setAnswer] = useState('')
+  return <AnswerForm item={item} answer={answer} onAnswerChange={setAnswer} onAnswered={() => {}} />
+}
 
 const state = vi.hoisted(() => ({
   mutate: vi.fn(),

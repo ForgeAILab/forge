@@ -551,3 +551,94 @@ fn map_event_consumer_cutover(
         created_at: row.try_get("created_at")?,
     })
 }
+
+impl SqliteDb {
+    pub async fn milestone_source_event_watermark_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let result = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE scope_type = 'project' AND scope_id = ?
+               AND event_type NOT IN (
+                   'milestone.readiness.evaluated',
+                   'project_release.candidate_requested'
+               )
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn terminal_execution_previous_owner(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN (
+                   'execution.completed', 'execution.failed',
+                   'execution.cancelled', 'execution.terminal_report.received'
+               )
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(execution_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_recovery_event_exists_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)")
+                .bind(dedupe_key)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn admitted_wake_payload_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM domain_event WHERE dedupe_key = ?",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn source_event_has_admitted_wake_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        causation_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE causation_id = ? AND event_type = 'agent.wake.admitted')")
+.bind(causation_id)
+.fetch_one(connection)
+.await?)
+    }
+}

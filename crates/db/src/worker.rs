@@ -504,3 +504,5 @@ fn bounded_error(value: &str) -> String {
         .take(1024)
         .collect()
 }
+
+mod operator_reads;

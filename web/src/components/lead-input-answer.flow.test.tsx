@@ -1,10 +1,15 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import type { ReactElement } from 'react'
+import { useState, type ReactElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
 import type { AttentionItem } from '@/features/federation/types'
-import { LeadInputAnswer } from './lead-input-answer'
+import { LeadInputAnswer as AnswerForm } from './lead-input-answer'
+
+function LeadInputAnswer({ item }: { item: AttentionItem }) {
+  const [answer, setAnswer] = useState('')
+  return <AnswerForm item={item} answer={answer} onAnswerChange={setAnswer} onAnswered={() => {}} />
+}
 
 // The real mutation hook over a mocked transport: what the form does with the
 // server's actual answers (`crates/services/src/attention_service.rs`,

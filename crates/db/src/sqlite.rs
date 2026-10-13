@@ -77,6 +77,7 @@ use tokio::sync::Notify;
 
 mod action;
 mod agent;
+pub use agent::AgentOperatorPressureRow;
 mod agent_chat;
 mod chat_ledger;
 mod chat_read_events;
@@ -90,6 +91,7 @@ mod command_finalization;
 mod command_receipt;
 mod commitment;
 mod daemon;
+pub use daemon::DaemonOperatorIssueRow;
 mod dead_letter;
 pub use dead_letter::{DeadLetter, DeadLetterAction, DeadLetterPage};
 mod domain_event;
@@ -97,6 +99,7 @@ pub use domain_event::EventSubscription;
 mod embedded_agent;
 pub(crate) mod environment_readiness;
 mod execution;
+pub use execution::{ActiveExecutionOperatorRow, RecentFailedExecutionOperatorRow};
 mod external_link;
 mod inbox;
 mod integration;
@@ -107,6 +110,17 @@ mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
+pub use orchestration::{
+    ActiveCheckWaiverSourceRow, CharterReadinessSourceRow, InsertMilestoneReadinessInput,
+    InsertMilestoneReadinessSourceInput, InsertMilestoneReleaseInput,
+    InsertReleaseDecisionReferenceInput, InsertReleaseDocumentReferenceInput,
+    InsertReleaseGitReferenceInput, InsertReleaseReviewReferenceInput,
+    InsertReleaseTaskReferenceInput, InsertReleaseValidationReferenceInput,
+    MilestoneCharterAuthorityRow, MilestoneCheckResultRow, MilestoneDecisionRow,
+    MilestoneDefinitionReadinessSourceRow, MilestoneDocumentSourceRow, MilestoneReadinessSourceRow,
+    MilestoneWaiverAffectedRow, ProjectAgentIdentityRow, ReleaseCharterRevisionSourceRow,
+    ReleaseReferenceRow, UpdateMilestoneReadinessProjectionInput,
+};
 mod outbox;
 pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
@@ -119,17 +133,24 @@ mod project_provisioning;
 mod project_review_config;
 mod provider_authorization;
 mod repo;
+pub use repo::MilestoneRepositoryContextRow;
 mod repo_location;
 mod review;
 pub use review::AttemptCarryBase;
 mod runtime;
 mod schedule;
 mod shared_media;
+pub use shared_media::{
+    InsertReleaseEvidencePinInput, MilestoneEvidenceRow, MilestoneReleasePinMetadataRow,
+    ReleaseEvidencePinRow,
+};
 mod skill;
 mod system_setting;
 mod task;
 pub use schedule::integration_statement_in_tx;
 pub use schedule::{ScheduleRead, INTEGRATION_OWNED_SQL};
+pub use task::MilestoneTaskSourceRow;
+pub use task::{BlockedTaskOperatorRow, TaskOperatorConditionRow, TaskOperatorRetryRow};
 mod task_adaptive;
 mod task_comment;
 mod task_dependency;
@@ -141,6 +162,8 @@ mod task_terminal_session;
 mod user_auth;
 mod workflow;
 mod workspace;
+pub use workspace::OverdueWorkspaceCleanupRow;
+pub use workspace::{RecordWorkspaceCleanupFailureInput, WorkspaceCleanupAttentionRow};
 mod workspace_lease;
 mod workspace_placement;
 
@@ -154,6 +177,7 @@ pub struct SqliteDb {
     >,
     pub(crate) task_step_executor:
         Arc<std::sync::Mutex<Option<std::sync::Weak<dyn crate::task_writer::TaskStepExecutor>>>>,
+    pub(crate) claimed_task_step_wait: Arc<std::sync::Mutex<std::time::Duration>>,
     pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
     /// Disk-pressure admission: off until the running server configures it.
     pub disk_admission: Arc<crate::machine_disk::DiskAdmission>,
@@ -177,6 +201,9 @@ impl SqliteDb {
             condition_checks: Default::default(),
             task_step_controls: Default::default(),
             task_step_executor: Default::default(),
+            claimed_task_step_wait: Arc::new(std::sync::Mutex::new(
+                std::time::Duration::from_secs(90),
+            )),
             task_step_activity: Default::default(),
             readiness_decode_warnings: Default::default(),
             domain_event_hooks,
@@ -1787,3 +1814,46 @@ fn inherited_subtask_workflow_state(status: &str) -> bool {
 fn inherited_subtask_workflow_role(status: &str) -> Option<&'static str> {
     crate::inherited_subtask::role(status)
 }
+
+pub use action::{AttentionApprovalCoordinationActionsRow, AttentionCoordinationScopesRow};
+
+pub use agent::{
+    AttentionAgentBindingRow, AttentionAgentSessionRow, AttentionIdentityOwnerRow,
+    AttentionVisibleAgentHealthRow, VisibleAttentionAgentBindingsInput,
+};
+
+pub use agent_chat::{AttentionChatScopeRow, WakeChatCanonicalScopeRow};
+
+pub use agent_wake::{
+    ActiveIncidentWakeLeaseInTxInput, ActiveIncidentWakeLeaseRow, AdmitIncidentWakeLeaseInTxInput,
+    IncrementWakeBudgetWindowInTxInput, RecordLatestAttentionWakeInTxInput,
+    StartWakeBudgetWindowInTxInput, WakeBudgetWindowRow,
+};
+
+pub use attention::{
+    AttentionWorkerHealthRow, FailedTurnIncidentRow, ResolveScopeProgressAttentionInTxInput,
+    WakeIncidentContextRow, WakeSweepCandidateRow,
+};
+
+pub use command_receipt::AttentionDirectCoordinationReceiptsRow;
+
+pub use execution::AttentionVisibleActiveExecutionCountRow;
+
+pub use memory::AttentionMemoryScopeRow;
+
+pub use repo_location::{
+    CloneVerificationLocationRow, InsertPreparedServerRepoLocationInTxInput,
+    PreparedServerRepoLocationRow, ReadyServerLocationRow,
+};
+
+pub use task::{
+    AnnotateOwnerRecoveryInTxInput, AnnotateRemovedMachineTaskInput, AttentionTaskContextRow,
+    AttentionVisibleQueuedTaskCountRow, AttentionVisibleRecentOutcomesRow,
+    AttentionVisibleWorkItemsRow, ClearRemovedMachineCancelAnnotationInput,
+    RecordPlacementRefusalInTxInput,
+};
+
+pub use workspace::{
+    InsertCreatingAdmissionWorkspaceInTxInput, InsertPreparedServerWorkspaceInTxInput,
+    MarkPreparedAdmissionWorkspaceReadyInTxInput, RecordedOwnerWorkspaceHeadInput,
+};

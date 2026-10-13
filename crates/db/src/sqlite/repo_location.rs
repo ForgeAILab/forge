@@ -203,3 +203,181 @@ fn map_repo_location(row: SqliteRow) -> Result<RepoLocation> {
         updated_at: row.try_get("updated_at")?,
     })
 }
+
+// Preserve the original tuple query's positional decoding and error indices.
+impl<'r> sqlx::FromRow<'r, SqliteRow> for CloneVerificationLocationRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            path: row.try_get(1)?,
+            version: row.try_get(2)?,
+            last_error: row.try_get(3)?,
+        })
+    }
+}
+#[derive(Debug)]
+pub struct CloneVerificationLocationRow {
+    pub id: String,
+    pub path: String,
+    pub version: i64,
+    pub last_error: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_clone_verification_locations(
+        &self,
+        repo_id: &str,
+        bound_location: &Option<String>,
+        matching_location: &Option<String>,
+    ) -> crate::Result<Vec<CloneVerificationLocationRow>> {
+        Ok(sqlx::query_as::<_, CloneVerificationLocationRow>("SELECT id, path, version, last_error FROM repo_location WHERE repo_id = ?
+                 AND owner_kind = 'server' AND daemon_id IS NULL AND runtime_id IS NULL
+                 AND kind = 'managed_clone' AND (status = 'unverified' OR (status = 'unavailable' AND last_error LIKE '{%')
+                      OR (status = 'invalid' AND last_error = 'managed_clone_is_worktree'))
+                 AND (? IS NULL OR id = ?)")
+.bind(repo_id)
+.bind(bound_location)
+.bind(matching_location)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_server_location_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repo_location WHERE repo_id = ? AND owner_kind = 'server' AND daemon_id IS NULL")
+.bind(repo_id)
+.fetch_one(connection)
+.await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct ReadyServerLocationRow {
+    id: std::result::Result<String, sqlx::Error>,
+}
+
+impl ReadyServerLocationRow {
+    /// Preserve the original `Row::get` panic only when this fallback is used.
+    pub fn id(self) -> String {
+        self.id.unwrap()
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_ready_server_location_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+    ) -> crate::Result<Option<ReadyServerLocationRow>> {
+        let rows = sqlx::query("SELECT id FROM repo_location WHERE repo_id = ? AND owner_kind = 'server' AND status = 'ready'
+                AND daemon_id IS NULL ORDER BY is_default DESC, created_at, id LIMIT 1")
+.bind(repo_id)
+.fetch_optional(connection)
+.await?;
+        Ok(rows.map(|row| ReadyServerLocationRow {
+            id: row.try_get("id"),
+        }))
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct PreparedServerRepoLocationRow {
+    pub id: crate::Result<String>,
+    pub status: crate::Result<String>,
+    pub version: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn prepared_server_repo_location_in_tx(
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        kind: String,
+        source: &str,
+    ) -> crate::Result<Option<PreparedServerRepoLocationRow>> {
+        let rows = sqlx::query(
+            "SELECT id, status, version FROM repo_location
+         WHERE repo_id = ? AND owner_kind = 'server' AND daemon_id IS NULL
+           AND runtime_id IS NULL AND kind = ? AND path = ?
+         ORDER BY created_at ASC, id ASC LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(source)
+        .fetch_optional(connection)
+        .await?;
+        rows.map(|row| {
+            Ok(PreparedServerRepoLocationRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                status: row.try_get("status").map_err(crate::DbError::from),
+                version: row.try_get("version").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn mark_prepared_server_repo_location_ready_in_tx(
+        connection: &mut sqlx::SqliteConnection,
+        last_verified_at: &str,
+        updated_at: &str,
+        id: &str,
+        expected_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE repo_location SET status = 'ready', last_verified_at = ?,
+                 last_error = NULL, version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = ?",
+        )
+        .bind(last_verified_at)
+        .bind(updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertPreparedServerRepoLocationInTxInput<'a> {
+    pub id: &'a str,
+    pub repo_id: &'a str,
+    pub source: &'a str,
+    pub kind: String,
+    pub is_default: bool,
+    pub last_verified_at: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_prepared_server_repo_location_in_tx(
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertPreparedServerRepoLocationInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO repo_location (
+            id, repo_id, owner_kind, path, kind, is_default, status,
+            last_verified_at, created_at, updated_at
+         ) VALUES (?, ?, 'server', ?, ?, ?, 'ready', ?, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.repo_id)
+        .bind(input.source)
+        .bind(input.kind)
+        .bind(input.is_default)
+        .bind(input.last_verified_at)
+        .bind(input.created_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

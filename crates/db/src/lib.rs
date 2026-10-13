@@ -65,10 +65,25 @@ pub use orchestration::*;
 pub use pagination::*;
 pub use repository::*;
 pub use review_conformance::*;
+
 pub use sqlite::{
-    supported_main_baseline_revision, AttemptCarryBase, DeadLetter, DeadLetterAction,
-    DeadLetterPage, EventSubscription, ScheduleRead, SqliteDb, TaskListRead, WorkerDeadLetterIssue,
-    WorkerDiagnostic, INTEGRATION_OWNED_SQL,
+    integration_statement_in_tx, supported_main_baseline_revision, ActiveCheckWaiverSourceRow,
+    ActiveExecutionOperatorRow, AgentOperatorPressureRow, AttemptCarryBase, BlockedTaskOperatorRow,
+    CharterReadinessSourceRow, DaemonOperatorIssueRow, DeadLetter, DeadLetterAction,
+    DeadLetterPage, EventSubscription, InsertMilestoneReadinessInput,
+    InsertMilestoneReadinessSourceInput, InsertMilestoneReleaseInput,
+    InsertReleaseDecisionReferenceInput, InsertReleaseDocumentReferenceInput,
+    InsertReleaseEvidencePinInput, InsertReleaseGitReferenceInput,
+    InsertReleaseReviewReferenceInput, InsertReleaseTaskReferenceInput,
+    InsertReleaseValidationReferenceInput, MilestoneCharterAuthorityRow, MilestoneCheckResultRow,
+    MilestoneDecisionRow, MilestoneDefinitionReadinessSourceRow, MilestoneDocumentSourceRow,
+    MilestoneEvidenceRow, MilestoneReadinessSourceRow, MilestoneReleasePinMetadataRow,
+    MilestoneRepositoryContextRow, MilestoneTaskSourceRow, MilestoneWaiverAffectedRow,
+    OverdueWorkspaceCleanupRow, ProjectAgentIdentityRow, RecentFailedExecutionOperatorRow,
+    RecordWorkspaceCleanupFailureInput, ReleaseCharterRevisionSourceRow, ReleaseEvidencePinRow,
+    ReleaseReferenceRow, ScheduleRead, SqliteDb, TaskListRead, TaskOperatorConditionRow,
+    TaskOperatorRetryRow, UpdateMilestoneReadinessProjectionInput, WorkerDeadLetterIssue,
+    WorkerDiagnostic, WorkspaceCleanupAttentionRow, INTEGRATION_OWNED_SQL,
 };
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
@@ -93,4 +108,21 @@ pub use repository::{
 pub mod check_run;
 pub use check_run::*;
 
-pub use sqlite::integration_statement_in_tx;
+pub use sqlite::{
+    ActiveIncidentWakeLeaseInTxInput, ActiveIncidentWakeLeaseRow, AdmitIncidentWakeLeaseInTxInput,
+    AnnotateOwnerRecoveryInTxInput, AnnotateRemovedMachineTaskInput, AttentionAgentBindingRow,
+    AttentionAgentSessionRow, AttentionApprovalCoordinationActionsRow, AttentionChatScopeRow,
+    AttentionCoordinationScopesRow, AttentionDirectCoordinationReceiptsRow,
+    AttentionIdentityOwnerRow, AttentionMemoryScopeRow, AttentionTaskContextRow,
+    AttentionVisibleActiveExecutionCountRow, AttentionVisibleAgentHealthRow,
+    AttentionVisibleQueuedTaskCountRow, AttentionVisibleRecentOutcomesRow,
+    AttentionVisibleWorkItemsRow, AttentionWorkerHealthRow,
+    ClearRemovedMachineCancelAnnotationInput, CloneVerificationLocationRow, FailedTurnIncidentRow,
+    IncrementWakeBudgetWindowInTxInput, InsertCreatingAdmissionWorkspaceInTxInput,
+    InsertPreparedServerRepoLocationInTxInput, InsertPreparedServerWorkspaceInTxInput,
+    MarkPreparedAdmissionWorkspaceReadyInTxInput, PreparedServerRepoLocationRow,
+    ReadyServerLocationRow, RecordLatestAttentionWakeInTxInput, RecordPlacementRefusalInTxInput,
+    RecordedOwnerWorkspaceHeadInput, ResolveScopeProgressAttentionInTxInput,
+    StartWakeBudgetWindowInTxInput, VisibleAttentionAgentBindingsInput, WakeBudgetWindowRow,
+    WakeChatCanonicalScopeRow, WakeIncidentContextRow, WakeSweepCandidateRow,
+};
