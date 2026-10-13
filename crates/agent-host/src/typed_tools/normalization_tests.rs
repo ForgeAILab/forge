@@ -143,7 +143,7 @@ fn serialized_tool_definitions() {
 /// union of role surfaces must reach the entire native catalog.
 #[test]
 fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
-    let permissions = operation_registry::READ_CATALOG
+    let permissions: BTreeSet<String> = operation_registry::READ_CATALOG
         .iter()
         .chain(operation_registry::PROPOSAL_CATALOG.iter())
         .flat_map(|spec| {
@@ -155,11 +155,59 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
         .collect();
     let workspace = tempfile::tempdir().unwrap();
     let mut reached = BTreeSet::new();
-    for (scope_type, access, role, project, setup) in [
+    // The lead operations are composed only for a session whose admitted
+    // principal leads a coordination root.
+    #[derive(Debug)]
+    struct LeadProvider(operation_registry::authority::EffectiveAuthority);
+    #[async_trait]
+    impl ForgeToolProvider for LeadProvider {
+        fn admitted_authority(&self) -> Option<&operation_registry::authority::EffectiveAuthority> {
+            Some(&self.0)
+        }
+        async fn read(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, AgentHostError> {
+            Ok(Value::Null)
+        }
+        async fn propose(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            _: &str,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, AgentHostError> {
+            Ok(Value::Null)
+        }
+    }
+    let lead_authority = operation_registry::authority::EffectiveAuthority::resolve(
+        operation_registry::authority::AuthorityFacts {
+            principal: operation_registry::authority::Principal::TaskAgent {
+                identity_id: "identity".into(),
+                execution_id: "execution".into(),
+                role: operation_registry::authority::TaskRole::Planner,
+                runtime_session_id: None,
+                lead_root_id: Some("root".into()),
+            },
+            scope_type: "task".into(),
+            scope_id: scope(CanonicalScopeType::Task, WorkspaceAccess::TaskRead).scope_id,
+            profile_id: "profile".into(),
+            layers: vec![permissions.clone()],
+            binding_id: None,
+            setup_required: false,
+            active: true,
+        },
+    );
+    for (scope_type, access, role, project, setup, lead) in [
         (
             CanonicalScopeType::AgentChat,
             WorkspaceAccess::AccountScratch,
             None,
+            false,
             false,
             false,
         ),
@@ -169,12 +217,14 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
             None,
             false,
             false,
+            false,
         ),
         (
             CanonicalScopeType::AgentChat,
             WorkspaceAccess::Deny,
             None,
             true,
+            false,
             false,
         ),
         (
@@ -183,6 +233,7 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
             None,
             true,
             true,
+            false,
         ),
         (
             CanonicalScopeType::Project,
@@ -190,11 +241,13 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
             None,
             true,
             false,
+            false,
         ),
         (
             CanonicalScopeType::Task,
             WorkspaceAccess::TaskWrite,
             Some("worker"),
+            false,
             false,
             false,
         ),
@@ -204,6 +257,7 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
             Some("reviewer"),
             false,
             false,
+            false,
         ),
         (
             CanonicalScopeType::Task,
@@ -211,6 +265,15 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
             Some("planner"),
             false,
             false,
+            false,
+        ),
+        (
+            CanonicalScopeType::Task,
+            WorkspaceAccess::TaskRead,
+            Some("planner"),
+            false,
+            false,
+            true,
         ),
     ] {
         let composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
@@ -223,7 +286,11 @@ fn composed_native_surfaces_cover_the_catalog_without_duplicates() {
                 is_project_agent_chat: project,
                 charter_setup_required: setup,
             },
-            Some(Arc::new(ConfiguredSearchProvider)),
+            Some(if lead {
+                Arc::new(LeadProvider(lead_authority.clone())) as Arc<dyn ForgeToolProvider>
+            } else {
+                Arc::new(ConfiguredSearchProvider)
+            }),
             ScopeToolRuntime::default(),
         )
         .unwrap();

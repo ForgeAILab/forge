@@ -51,6 +51,15 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("task.propose", "PC", true),
         ("task.adaptive", "PC", true),
         ("task.dependency", "PC", true),
+        // `L`: a Task session whose running execution leads a coordination
+        // root. It is a Task principal (every `T` cell holds for it too), and
+        // these five cells are the widening the lead operations add: no
+        // other principal or surface holds them.
+        ("lead.read", "L", false),
+        ("lead.subtask", "L", true),
+        ("lead.recover", "L", true),
+        ("lead.handoff", "L", false),
+        ("lead.request_input", "L", false),
         ("work.read", "PCT", false),
         ("events.read", "MPCT", false),
         ("inbox.read", "AMPCT", false),
@@ -113,6 +122,7 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
             ('P', CanonicalScopeType::Project, false),
             ('C', CanonicalScopeType::AgentChat, true),
             ('T', CanonicalScopeType::Task, false),
+            ('L', CanonicalScopeType::Task, false),
         ] {
             for granted in [false, true] {
                 for setup in [false, true] {
@@ -150,7 +160,7 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                                 execution_id: "exec".into(),
                                 role: operation_registry::authority::TaskRole::Planner,
                                 runtime_session_id: None,
-                                lead_root_id: None,
+                                lead_root_id: (key == 'L').then(|| "root".into()),
                             },
                             _ => Principal::SystemComponent {
                                 name: "system".into(),
@@ -168,13 +178,14 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                         });
                         let native_principal = if matches!(key, 'P' | 'C') {
                             kind == 1
-                        } else if key == 'T' {
+                        } else if matches!(key, 'T' | 'L') {
                             kind == 4
                         } else {
                             kind == 0
                         };
                         let expected = native_principal
-                            && admitted_scopes.contains(key)
+                            && (admitted_scopes.contains(key)
+                                || (key == 'L' && admitted_scopes.contains('T')))
                             && granted
                             && (!ready_only || !setup);
                         assert_eq!(
@@ -184,12 +195,15 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                             spec.id
                         );
                         if native_principal {
+                            // Leading a root is a fact of the admitted
+                            // principal: the projection used when nothing
+                            // was admitted never has it.
                             let advertised = !filter_operations(
                                 scope_type,
                                 &[spec.id.into()],
                                 &permissions,
                                 context,
-                                None,
+                                (key == 'L').then_some(&authority),
                             )
                             .is_empty();
                             assert_eq!(advertised, expected, "advertisement {} {key}", spec.id);
@@ -607,7 +621,8 @@ fn each_registered_proposal_projects_only_its_own_fields() {
         let one = BTreeSet::from([spec.id.to_owned()]);
         let aliases = coordination_payload_properties(&one);
         let task = operation_registry::task_proposals::IDS.contains(&spec.id)
-            || operation_registry::task_records::IDS.contains(&spec.id);
+            || operation_registry::task_records::IDS.contains(&spec.id)
+            || operation_registry::task_lead::IDS.contains(&spec.id);
         if task {
             assert_eq!(
                 aliases

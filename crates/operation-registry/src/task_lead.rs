@@ -106,7 +106,12 @@ const CONSTRAINTS: &[StructuralConstraint] = &[
 ];
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
     vec![
-        OperationSpec::typed("lead.read", AUTHORITY, EffectClass::Query, AvailabilityRule::Always, SURFACES,
+        // A read, issued through the command envelope like every lead
+        // operation: it is answered for the running execution that leads the
+        // root, which only that envelope's session identifies. It writes
+        // nothing. The host classifies the propose aggregate's operations as
+        // direct commands, so it is declared as one.
+        OperationSpec::typed("lead.read", AUTHORITY, EffectClass::DirectCommand, AvailabilityRule::Always, SURFACES,
             "Read this root's subtasks: id, version, state, park, whether started, hand-off notes.",
             "Bounded. Ids and versions for the other lead operations come from here.",
             CONSTRAINTS, |c, i| Box::pin(c.lead_read(i))),
