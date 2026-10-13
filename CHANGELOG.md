@@ -38,8 +38,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   "Project paused". A Task whose run is live stays `running`, and a Task that
   is held, failed, blocked, waiting for a person, for its checks or in the
   merge queue keeps its own primary reason. Resuming the Project removes the
-  reason on the scheduler's next pass and every Task shows what it showed
-  before. The reason is never shown for a Project that is not paused. Existing
+  reason from every Task in the resume itself, and after the scheduler's next
+  pass every Task shows what it showed before. The reason is never shown for a
+  Project that is not paused. Existing
   databases are refreshed once in the background after the upgrade (condition
   mapping revision 7), in slices, without blocking startup.
 - Hold and Cancel are offered while a root waits for the owner's answer to

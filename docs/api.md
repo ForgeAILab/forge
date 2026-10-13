@@ -3442,7 +3442,8 @@ reason of its own: a Task that is `clear` or waits for a retry deadline, its
 parent or its Agent. It is the same kind of wait (no failure kind, no
 diagnostic); the exit is
 resuming the Project (`POST /api/v1/projects/{id}/resume`), and the reason is removed
-by the scheduler's next pass over the Task after the resume. A Task that is
+in the resume's own commit (the Task then reads `clear` or its own reason
+until the scheduler's next pass gives it its step or park). A Task that is
 held, failed, blocked, waiting for a person, waiting for its checks or in the
 merge queue keeps that reason as `primary` (the pause is at most an entry of
 `additional`), and a Task whose run is live stays `running`. `project_paused`

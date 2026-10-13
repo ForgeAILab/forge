@@ -5926,7 +5926,11 @@ Every non-terminal child retains a typed park through either change. A
 only while that Project is actually paused: the condition reader ignores a
 pause record whose Project has no `paused_at` (`Families::sql`,
 `set_condition`), so a record a resumed Project left behind states nothing
-and the invariant check repairs a condition that still shows it. A Task whose
+and the invariant check repairs a condition that still shows it. A resume
+removes the pause records of the Project's Tasks and restates their
+conditions in its own commit (`wake_dispatch_for_project_in_tx`), one
+condition write per Task that showed the pause, so the stored condition never
+disagrees with the Project row. A Task whose
 run or state entry is live keeps `running` / `entering` under a pause
 (`ConditionFacts::apply`); the pause becomes its park when the run ends. It is restated from the scheduler
 record, never carried by a check or integration statement. The condition write

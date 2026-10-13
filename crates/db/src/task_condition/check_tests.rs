@@ -402,16 +402,19 @@ async fn a_pause_record_is_no_park_unless_the_project_is_paused() {
     assert!(paused_on(&paused), "{:?}", paused.condition);
     db.check_task_condition_invariant(&paused).await.unwrap();
 
-    // Resumed, and the scheduler has not passed over the Task yet.
-    sqlx::query("UPDATE project SET paused_at=NULL WHERE id='p'")
-        .execute(db.pool())
+    // The resume restates the condition in its own commit: nothing shows
+    // the pause before the scheduler has passed over the Task.
+    crate::ProjectRepo::set_paused_at(&db, "p", None)
         .await
         .unwrap();
-    assert!(db.check_task_condition_invariant(&paused).await.is_err());
-    assert_eq!(
-        db.check_task_conditions_of(&[id.to_owned()]).await.unwrap(),
-        1
-    );
     let resumed = read(&db, id).await;
     assert!(!paused_on(&resumed), "{:?}", resumed.condition);
+    db.check_task_condition_invariant(&resumed).await.unwrap();
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
+    let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_schedule_park WHERE task_id=?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(records, 0);
 }
