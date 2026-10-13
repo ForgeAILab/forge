@@ -4825,7 +4825,9 @@ no merge role and nothing of it is imported.
 inside the transaction that deletes a repository, a repo location or a
 Project, and before a location's `is_default` changes. It refuses with
 `DbError::IntegrationUnresolved` (HTTP `409 integration_unresolved`, naming
-the Task and the machine) while an attempt of a queue in that scope has an
+the Task and the machine that performs the outstanding effect: the owner of
+the Task's checkout for a rebase run on another machine than the queue
+target's, else the target's owner) while an attempt of a queue in that scope has an
 effect intent, a running or uncertain owner operation, or is `reconciling` /
 `ff_inflight`. Removing the machine is the operation that settles an effect
 nobody can answer for (`settle_removed_integration_owner`).
@@ -5021,9 +5023,11 @@ read with the snapshot: count, revision sum, queue-sequence sum and newest
 write of the Project's members in progress (index
 `integration_attempt_project_live`, migration `V202610111630`) plus each of
 their queues' state and head, and the Project's pause (a wait cause of every
-member that writes no Task). The sums are over values that only grow, so a
-member that leaves and one that joins between two reads cannot cancel out. A
-lease renewal changes none of these.
+member that writes no Task). It also carries the exact set of those members,
+each with its own `revision` (which only grows): the sums alone cancel out
+when one member leaves and another joins with equal counters while the newest
+write does not move (a wall clock set back). A lease renewal changes none of
+these.
 
 `integration.updated {repo_id, queue_id, task_id, project_ids}` is published
 by `services::queue_invalidation::IntegrationUpdateProjector`, a periodic
@@ -8542,8 +8546,10 @@ request/application. It consumes these identities/repositories, adds only the
 fields it actually needs, and rechecks current authority on every hit/join.
 The active runner passes the run's recorded `applied_timeout_seconds` as an
 absolute owner wall deadline for all policies. Producers choose the request's
-whole-run limit; the legacy policies retain no per-command limit, and a direct
-primitive call without a supplied whole-run deadline remains unbounded.
+whole-run limit; the legacy policies retain no per-command limit. A direct
+primitive call without a whole-run deadline is unbounded under a legacy policy
+and refused under any other (`a canonical check requires a whole-run wall
+deadline`).
 
 ### Owner check execution (3.3 stage B)
 

@@ -949,8 +949,10 @@ pub(crate) enum IntegrationGuardScope<'a> {
 /// `ff_inflight`. Deleting the repository, the location or the Project, or
 /// moving the repository's default location, would drop the only record
 /// that can still say whether the commit landed. The error names the Task
-/// and the machine whose answer is missing; the way out is that machine's
-/// reconnect, or removing the machine (which settles the effect as failed).
+/// and the machine whose answer is missing: the owner that performs the
+/// outstanding effect (`witness.effect_owner`, a rebase on another machine
+/// than the target's), else the queue target's. The way out is that
+/// machine's reconnect, or removing it (which settles the effect as failed).
 /// Called inside the transaction of the write it guards.
 pub(crate) async fn refuse_unresolved_integration(
     tx: &mut Transaction<'_, Sqlite>,
@@ -970,7 +972,7 @@ pub(crate) async fn refuse_unresolved_integration(
         }
     };
     let unresolved: Option<(String, String)> = sqlx::query_as(&format!(
-        "SELECT a.task_ref,COALESCE((SELECT d.hostname FROM daemon d WHERE d.id=COALESCE(json_extract(q.target_owner_json,'$.daemon_id'),a.daemon_id)),'the server') \
+        "SELECT a.task_ref,COALESCE((SELECT d.hostname FROM daemon d WHERE d.id=CASE WHEN json_type(a.effect_intent_json,'$.request.witness.effect_owner')='object' THEN json_extract(a.effect_intent_json,'$.request.witness.effect_owner.daemon_id') ELSE COALESCE(json_extract(q.target_owner_json,'$.daemon_id'),a.daemon_id) END),'the server') \
          FROM integration_attempt a JOIN integration_queue q ON q.id=a.queue_id \
          WHERE a.state NOT IN ('completed','cancelled','superseded') \
            AND (a.effect_intent_json IS NOT NULL OR COALESCE(a.current_operation_state,'') IN ('running','uncertain') OR a.state IN ('reconciling','ff_inflight')) \
