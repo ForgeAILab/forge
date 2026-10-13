@@ -1114,24 +1114,11 @@ impl TaskDispatcher {
                     .await
                     .map(u64::from)
             }
-            Step::AdmitIntegration => {
-                if self.task_service.merge_service.is_none()
-                    && !crate::integration_steps::reconcile::statement_stale(
-                        p.read.integration_statement.as_ref(),
-                        &p.read.condition,
-                    )
-                {
-                    // Admission otherwise answers false without a refusal,
-                    // leaving the sweep to enqueue the same no-op command.
-                    return Err(ServiceError::invalid_operation(
-                        "merge service not configured",
-                    ));
-                }
-                self.task_service
-                    .reconcile_integration_admission(task)
-                    .await
-                    .map(u64::from)
-            }
+            Step::AdmitIntegration => self
+                .task_service
+                .reconcile_integration_admission(task)
+                .await
+                .map(u64::from),
             Step::ExpireOwnerWait => {
                 self.task_service.expire_owner_wait(task).await?;
                 Ok(0)
@@ -1183,6 +1170,24 @@ impl TaskDispatcher {
                     }
                     _ => unreachable!("matched a recovery hop"),
                 };
+                // One hop per entry and per ended attempt. While an attempt
+                // is queued the identity is unchanged, so a second round or
+                // pass adds nothing. An attempt that failed parked the Task
+                // (`CascadeFailed`), and nothing is issued under that park.
+                // Once its owner lifts the park without leaving the state,
+                // the next attempt has its own identity: the ended one must
+                // not swallow it and leave the Task with neither a step nor
+                // a park that says why.
+                let ended: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM task_step WHERE task_id=? AND expected_epoch=? AND status IN ('failed','parked','superseded') AND substr(causation_key,1,length(?))=?",
+                )
+                .bind(&task.id)
+                .bind(p.read.epoch)
+                .bind(format!("{key}:"))
+                .bind(format!("{key}:"))
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db::DbError::from)?;
                 let cascade = self
                     .task_service
                     .workflow_execution()
@@ -1200,7 +1205,7 @@ impl TaskDispatcher {
                             clear_review_passed_at_on_commit: false,
                         }),
                         None,
-                        format!("{key}:{}:{}:{target}", task.id, p.read.epoch),
+                        format!("{key}:{}:{}:{target}:{ended}", task.id, p.read.epoch),
                         Some(p.read.epoch),
                     )
                     .await?;

@@ -1145,7 +1145,6 @@ const ALLOWED: &[&str] = &[
     "MissedWakeRepair",
     "IdleTickQuiescence",
     "IntegrationQueueOwned",
-    "MergeServiceUnavailable",
     // The base counted a Task's own running execution against that Task: on
     // a full machine every running Task was given a `machine_capacity` wait
     // (or the `project_capacity` wait it was converted to). A Task that
@@ -1183,14 +1182,6 @@ fn own_slot_exception_is_sound(recorded: &str, expected: &str) -> bool {
         && expected == format!("{head}meta=[-] disp=[-] {tail}")
 }
 
-fn merge_service_unavailable_exception_is_sound(before: &str, after: &str) -> bool {
-    before.contains(" status=merging ")
-        && before != after
-        && after == before
-            .replace("meta=[-] disp=[-]", "meta=[dispatch_disposition] disp=[merging:invalid operation: merge service not configured]")
-            .replace("meta=[paused_integration] disp=[-]", "meta=[dispatch_disposition,paused_integration] disp=[merging:invalid operation: merge service not configured]")
-}
-
 fn key(line: &str) -> &str {
     line.split_once(": ").map_or(line, |(key, _)| key)
 }
@@ -1218,7 +1209,6 @@ fn settle_shapes(section: &str, shapes: Option<&[&str]>, lines: Vec<String>) {
     }
     let mut base: HashMap<&str, &str> = HashMap::new();
     let mut allowed: HashMap<&str, (&str, &str)> = HashMap::new();
-    let mut admission_baselines: HashMap<&str, &str> = HashMap::new();
     for line in FIXTURE
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -1226,16 +1216,6 @@ fn settle_shapes(section: &str, shapes: Option<&[&str]>, lines: Vec<String>) {
         if let Some(rest) = line.strip_prefix('@') {
             let (name, line) = rest.split_once(' ').expect("exception names a line");
             assert!(ALLOWED.contains(&name), "unknown exception {name}");
-            // The base contains only this partition's keys; other sections'
-            // exception rows are parsed too, but need no baseline here.
-            if name == "MergeServiceUnavailable" && base.contains_key(key(line)) {
-                let before = match allowed.get(key(line)) {
-                    Some((old_name, _)) if *old_name == "ExplicitOwnerPark" => base[key(line)],
-                    Some((_, expected)) => *expected,
-                    None => base[key(line)],
-                };
-                admission_baselines.insert(key(line), before);
-            }
             allowed.insert(key(line), (name, line));
         } else if (line.starts_with(&format!("{section} "))
             || line.starts_with(&format!("{section}/")))
@@ -1269,15 +1249,6 @@ fn settle_shapes(section: &str, shapes: Option<&[&str]>, lines: Vec<String>) {
                     assert!(
                         own_slot_exception_is_sound(recorded, expected),
                         "{name} may only clear a running Task's own capacity wait: {recorded}"
-                    );
-                }
-                if name == &"MergeServiceUnavailable" {
-                    assert!(
-                        merge_service_unavailable_exception_is_sound(
-                            admission_baselines[key(line)],
-                            expected
-                        ),
-                        "{name} may only add the unavailable merge service refusal: {line}"
                     );
                 }
                 if name == &"ExplicitOwnerPark" {
@@ -1370,7 +1341,7 @@ async fn unchanged_shapes(case: usize) {
                 baseline = after;
             } else if pass > 2 && after != baseline {
                 findings.push(format!("{name}: pass {pass}: {baseline:?} -> {after:?}"));
-                // Retain the first finding per fixture, but still run every pass.
+                // Report each further write once, against the pass before it.
                 baseline = after;
             }
         }

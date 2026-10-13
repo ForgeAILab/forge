@@ -3402,11 +3402,20 @@ async fn retry_with_an_unpinned_legacy_execution_never_merges_without_review() {
     let production = Production::new(&world);
     let running = production.run();
     world.act("orphan", retry_action()).await;
+    // The send-back commits `merge_failed` first; the hop on to review is
+    // the next step of the same chain, and only its refusal states the
+    // failure Restart is offered for. Reading the offers between the two
+    // sees a Task that is still moving (Cancel, and no Restart).
     world
         .until(
             "orphan",
-            "the unreviewable candidate is sent back",
-            || async { world.task("orphan").await.status == "merge_failed" },
+            "the unreviewable candidate is sent back and parked",
+            || async {
+                let task = world.task("orphan").await;
+                task.status == "merge_failed"
+                    && task.condition.read().failure_kind
+                        == Some(api_types::FailureKind::CascadeFailed)
+            },
         )
         .await;
     assert_eq!(world.main_tip().await, tip);

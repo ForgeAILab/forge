@@ -655,8 +655,17 @@ impl TaskDispatcher {
             .integration_statement
             .as_ref()
             .is_some_and(|statement| statement["current"] == false);
+        // A server composed without a merge service (no production runtime
+        // is) admits nothing: asking would enqueue a command that answers
+        // "no" at every pass. A stale statement is still restated, which
+        // needs no merge service.
         f.missing_merge_entry = t.parent_task_id.is_none()
             && merge_state
+            && (self.task_service.merge_service.is_some()
+                || crate::integration_steps::reconcile::statement_stale(
+                    r.integration_statement.as_ref(),
+                    &r.condition,
+                ))
             && (!f.disposition_current
                 || crate::integration_steps::reconcile::statement_stale(
                     r.integration_statement.as_ref(),

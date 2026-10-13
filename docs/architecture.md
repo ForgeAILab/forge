@@ -4673,12 +4673,19 @@ honors that park (and any other owner blocker or current dispatch refusal)
 before asking for a refresh again. Unchanged passes append no commands or
 scheduler generations. Restart begins again from the coder with fresh
 execution provenance; Cancel ends the Task. A missing historical Review row
-alone does not prevent the normal fresh-review hop.
+alone does not prevent the normal fresh-review hop. While the Task's machine
+is away the dispatcher issues nothing and the Task waits for the machine,
+with no failure recorded. The cascade's identity also counts the attempts of
+that entry that ended without moving the Task: if the park is lifted while the
+Task stays in the state, exactly one new attempt is issued, which advances to
+review when the cause is gone and parks again when it is not.
 
 The paused-integration resume hop uses the same entry-keyed cascade and honors
 a current refusal. Merge admission also honors an unchanged admission refusal,
-and records one when no merge service is configured, while still repairing a
-missing or stale integration statement. An accepted
+while still repairing a missing or stale integration statement. A server
+composed without a merge service (no production runtime is; some test
+harnesses are) admits nothing, so the sweep does not ask for admission there
+and writes nothing on the Task. An accepted
 role Retry probes machine capacity before issuing its replay command: while
 the slot is full it keeps the accepted intent and its existing capacity park.
 The machine's release or capacity change lets the normal replay proceed.

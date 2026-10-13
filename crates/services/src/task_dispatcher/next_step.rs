@@ -1445,4 +1445,74 @@ mod tests {
             Next::Park(_)
         ));
     }
+    /// An interrupted review refresh is the Task's step only while nothing
+    /// holds it: a blocker or a recorded refusal parks it instead, and a
+    /// recorded refusal also holds the paused-integration resume.
+    #[test]
+    fn a_held_review_refresh_or_resume_parks_instead_of_being_issued_again() {
+        let workflow = WorkflowEngine::resolve_workflow("{}");
+        let condition = TaskCondition::Clear {
+            evidence: ConditionEvidence::default(),
+        };
+        let step = |f: &Facts| {
+            next_step(&Snapshot {
+                state: "merge_failed",
+                condition: &condition,
+                workflow: &workflow,
+                facts: f,
+            })
+        };
+        let base = Facts {
+            child_ready: true,
+            root_role_allowed: true,
+            reviewer_ready: true,
+            ..Default::default()
+        };
+        let refresh = Facts {
+            review_refresh: Some("review".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            step(&refresh),
+            Next::Step(Step::ReviewRefresh {
+                target: "review".into()
+            })
+        );
+        let resume = Facts {
+            integrate: true,
+            ..base.clone()
+        };
+        assert_eq!(step(&resume), Next::Step(Step::Integrate));
+        for held in [
+            Facts {
+                blocking: true,
+                ..refresh.clone()
+            },
+            Facts {
+                disposition_current: true,
+                ..refresh.clone()
+            },
+            Facts {
+                blocking: true,
+                ..resume.clone()
+            },
+            Facts {
+                disposition_current: true,
+                ..resume.clone()
+            },
+        ] {
+            assert!(matches!(step(&held), Next::Park(_)), "{held:?}");
+        }
+        // The machine being away comes first: a wait, not a recovery.
+        assert!(matches!(
+            step(&Facts {
+                placement_unavailable: true,
+                ..refresh.clone()
+            }),
+            Next::Park(Park {
+                owner: Owner::Machine,
+                ..
+            })
+        ));
+    }
 }
