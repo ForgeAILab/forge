@@ -20,6 +20,26 @@ impl SqliteDb {
     }
 }
 
+/// The Task's present merge entry was imported as a missing-source
+/// quarantine and its owner has retried it since: an attempt of the same
+/// entry names that quarantine as its predecessor (only the admission of an
+/// unowned quarantine writes that link). `?1` is the Task id.
+///
+/// Every admission of that entry, not only the first Retry's, may use the
+/// Task's present workspace, and every attempt of it owes the head check:
+/// the legacy execution that would prove the candidate does not exist.
+const RETRIED_QUARANTINED_IMPORT: &str = "SELECT EXISTS(SELECT 1 FROM task t JOIN integration_attempt q ON q.task_ref=t.id AND q.expected_status=t.status AND q.expected_epoch=t.status_epoch WHERE t.id=?1 AND t.deleted_at IS NULL AND q.current=0 AND q.state='quarantined' AND q.failure_kind='corrupt_import' AND json_extract(q.import_source_json,'$.decision.reason')='missing execution or pinned workspace' AND EXISTS(SELECT 1 FROM integration_attempt s WHERE s.task_ref=q.task_ref AND s.predecessor_attempt_id=q.id AND s.expected_status=q.expected_status AND s.expected_epoch=q.expected_epoch))";
+
+impl SqliteDb {
+    /// See [`RETRIED_QUARANTINED_IMPORT`].
+    pub async fn retried_quarantined_import(&self, task_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(RETRIED_QUARANTINED_IMPORT)
+            .bind(task_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}
+
 /// One acknowledgment, written with the Task write it answers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntegrationStepAckWrite {

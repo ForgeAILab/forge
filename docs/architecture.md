@@ -5631,6 +5631,11 @@ target, and must pass normal review authority before fast-forwarding. If no
 current workspace can be recovered, Retry reports the missing source and
 keeps the park; Cancel ends the Task.
 
+Once the owner has retried the entry, every later admission of that same
+entry (a placement verified again, an attempt sent back or parked unbound)
+uses the same source, and every attempt of it owes the head check, not only
+the one the Retry admitted.
+
 The park is level-triggered and idempotent. The dispatcher's sweep asks for
 its statement only while the Task's condition does not carry it (never
 stated, or lost); a stated park is not a missing merge entry, so later passes

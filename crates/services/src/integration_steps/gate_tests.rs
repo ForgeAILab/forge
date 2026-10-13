@@ -3458,3 +3458,56 @@ async fn a_quarantined_import_of_a_paused_project_hints_the_resume_and_then_retr
     assert!(world.offers("orphan").await.contains(&retry));
     assert_eq!(hint().await, Some(api_types::IntegrationActionHint::Retry));
 }
+
+/// The head check a retried quarantined import owes is owed by every
+/// successor of that Retry in the same entry: an attempt that replaces the
+/// retried one (its placement was verified again) must not fast-forward an
+/// unchanged target unchecked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successor_of_a_retried_quarantined_import_still_owes_the_head_check() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    let quarantine = world.parked_quarantine("orphan").await;
+    review_ci(&world, "orphan", &["test -f orphan.txt"]).await;
+    world.act("orphan", retry_action()).await;
+    let first = world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.predecessor_attempt_id.as_deref(), Some(&*quarantine));
+    // Recovery verified the placement again: the binding is stale and the
+    // sweep replaces the attempt through admission.
+    sqlx::query("UPDATE workspace_placement SET generation=generation+1 WHERE task_id='orphan'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let row = world.task("orphan").await;
+    assert!(world
+        .service
+        .reconcile_integration_admission(&row)
+        .await
+        .unwrap());
+    let second = world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.predecessor_attempt_id.as_deref(), Some(&*first.id));
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .until("orphan", "the successor merges", || async {
+            world.task("orphan").await.status == "done"
+        })
+        .await;
+    let checks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE id IN (SELECT run_id FROM check_consumer WHERE origin='integration' AND task_id='orphan')")
+        .fetch_one(world.db.pool()).await.unwrap();
+    assert_eq!(checks, 1, "the successor merged without the head check");
+    assert_eq!(world.merges("orphan").await, 1);
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}

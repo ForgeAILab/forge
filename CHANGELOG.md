@@ -3245,6 +3245,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Fixed
 
 - Legacy merge imports missing their execution or pinned workspace now park their Tasks as `deferred/owner_required`, with the retained cause, Attention, an integration summary, Retry and Cancel. This also repairs quarantines from an earlier start. Retry admits the Task's present branch through normal admission and performs a full head check; it never merges the import's old candidate blindly.
+- After the owner's Retry of a quarantined import, a later admission of the same merge entry (its placement was verified again) no longer blocks the Task with `integration_admission_failed` for the execution it never had, and the attempt that replaces the retried one still runs the head check.
 - A Task parked for a quarantined import adds no Task-step row and no scheduler generation on later dispatcher passes or starts (the sweep used to ask for its admission at every pass).
 - The merge summary's `action_hint` of a stopped merge is `resume_project`, not `retry`, while the Task's Project is paused: `retry` is withheld during a pause, so the hint named an action that answered `409 action_unavailable`.
 - Startup recovery no longer creates no-op command history and scheduler generations for active Tasks with no running execution to recover.

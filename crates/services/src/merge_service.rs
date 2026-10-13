@@ -386,7 +386,12 @@ impl MergeService {
                 .await?
                 .is_some_and(|import| import.id == attempt_id.as_str()),
             _ => false,
-        };
+        }
+        // A later admission of the entry the owner already retried (its
+        // placement was verified again, its attempt was sent back or parked
+        // unbound): the same source, or the Task would be blocked for an
+        // execution it never had.
+            || self.db.retried_quarantined_import(&task.id).await?;
         let (workspace, resolved) = if incomplete_import {
             // The owner retries the Task's present branch, never the import's
             // old candidate. Its successor requires the full head check.
