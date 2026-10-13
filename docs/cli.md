@@ -897,7 +897,8 @@ stored as `gate:lead_check`). `--reset-budget true` opens a new budget window
 for the Task, including `replan` on a root or `lead_check` on a subtask. It
 does not select an individual budget kind. The lead's operation ledger rows
 (`lead_subtasks`, `lead_subtasks_run:<execution>`, `lead_recover:<subtask>`)
-are not projected in `budgets`; only resetting the root's window resets them.
+are not projected in `remaining_retries` or `retry_limits`; only resetting the
+root's window resets them.
 
 `--output json` prints the offer/version object or the resulting Task. An HTTP 409 `action_unavailable` prints the current available actions (the structured error object in JSON mode) and exits with code **3**; other failures use the normal nonzero error exit. A stale version remains a version conflict. There is no `execution` command group in forge-ctl; individual execution stop is available through `POST /api/v1/executions/{id}/stop` and the web Stop control.
 
