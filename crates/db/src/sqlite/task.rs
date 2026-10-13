@@ -3268,3 +3268,680 @@ impl SqliteDb {
         .transpose()
     }
 }
+
+impl SqliteDb {
+    pub async fn pending_recovery_command_exists(
+        &self,
+        task_id: &str,
+        prefix: &str,
+        matching_prefix: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND substr(causation_key,1,length(?))=?)")
+.bind(task_id)
+.bind(prefix)
+.bind(matching_prefix)
+.fetch_one(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn pending_retired_review_settlement_exists(
+        &self,
+        task_id: &str,
+        prefix: &str,
+        matching_prefix: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND substr(causation_key,1,length(?))=?)")
+.bind(task_id)
+.bind(prefix)
+.bind(matching_prefix)
+.fetch_one(self.pool())
+.await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct AnnotateOwnerRecoveryInTxInput<'a> {
+    pub annotation: String,
+    pub updated_at: String,
+    pub task_id: &'a str,
+    pub expected_version: i64,
+    pub terminal_states_json: String,
+}
+
+impl SqliteDb {
+    pub async fn annotate_owner_recovery_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        target_id: &str,
+        input: AnnotateOwnerRecoveryInTxInput<'_>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?
+            AND deleted_at IS NULL AND failed_json IS NULL AND status NOT IN (SELECT value FROM json_each(?))
+            AND (error_annotation IS NULL OR (json_valid(error_annotation) AND json_extract(error_annotation, '$.blocking_reason') IN ('owner_disconnected_timeout', 'owner_lost_execution')))")
+.bind(input.annotation)
+.bind(input.updated_at)
+.bind(input.task_id)
+.bind(input.expected_version)
+.bind(input.terminal_states_json)
+.identity_fenced()
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_reconciled_owner_waits_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        updated_at: String,
+        task_id: &str,
+        parent_task_id: &str,
+    ) -> crate::Result<crate::task_writer::BulkTaskQueryResult> {
+        crate::task_writer::BulkTaskQuery::new(self, "UPDATE task SET metadata_json = json_remove(COALESCE(metadata_json, '{}'),
+        '$.dispatch_disposition', '$.deferred_dispatch', '$.owner_wait'), version = version + 1, updated_at = ?
+        WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
+        AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+             OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
+             OR json_type(metadata_json, '$.owner_wait') IS NOT NULL)")
+.bind(updated_at)
+.bind(task_id)
+.bind(parent_task_id)
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_reconnect_exhausted_review_task_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        parent_task_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT id FROM task WHERE (id=? OR parent_task_id=?) AND deleted_at IS NULL AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation,'$.blocking_reason')='review_ci_infrastructure_exhausted'")
+.bind(task_id)
+.bind(parent_task_id)
+.fetch_all(connection)
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn restart_owner_reconnect_review_barrier_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        window: &str,
+        task_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE task SET entry_barrier_json=json_set(entry_barrier_json,'$.started_at',?) WHERE id=?")
+.bind(window)
+.bind(task_id)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn restore_owner_reconnect_review_retry_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        updated_at: String,
+        task_id: &str,
+        parent_task_id: &str,
+    ) -> crate::Result<crate::task_writer::BulkTaskQueryResult> {
+        crate::task_writer::BulkTaskQuery::new(self, "UPDATE task SET blocked_json = NULL,
+        entry_barrier_json = entry_barrier_json,
+        error_annotation = json_set(error_annotation, '$.blocking_reason', 'review_ci_infrastructure'),
+        version = version + 1, updated_at = ? WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
+        AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'")
+.bind(updated_at)
+.bind(task_id)
+.bind(parent_task_id)
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+#[derive(Debug)]
+pub struct ClearRemovedMachineCancelAnnotationInput<'a> {
+    pub updated_at: String,
+    pub task_id: &'a str,
+    pub workspace_task_id: &'a str,
+    pub step_task_id: &'a str,
+    pub execution_task_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn clear_removed_machine_cancel_annotation(
+        &self,
+        target_id: &str,
+        input: ClearRemovedMachineCancelAnnotationInput<'_>,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=NULL, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END, version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE w.task_id=? OR s.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=c.workspace_id))")
+.bind(input.updated_at)
+.bind(input.task_id)
+.bind(input.workspace_task_id)
+.bind(input.step_task_id)
+.bind(input.execution_task_id)
+.identity_fenced()
+.execute(self.pool())
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn refresh_remaining_machine_cancel_annotation(
+        &self,
+        target_id: &str,
+        annotation: String,
+        updated_at: String,
+        task_id: &str,
+        previous_annotation: &str,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=?,version=version+1,updated_at=? WHERE id=? AND error_annotation=?")
+.bind(annotation)
+.bind(updated_at)
+.bind(task_id)
+.bind(previous_annotation)
+.identity_fenced()
+.execute(self.pool())
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_removed_machine_metadata_wait(
+        &self,
+        target_id: &str,
+        key: &str,
+        owner: &str,
+        task_id: &str,
+        daemon_id: &str,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, target_id, format!("UPDATE task SET metadata_json=json_remove(metadata_json,'$.{key}','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.{owner}')=?"))
+.bind(task_id)
+.bind(daemon_id)
+.identity_fenced()
+.execute(self.pool())
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_removed_machine_queued_recovery(
+        &self,
+        target_id: &str,
+        metadata_path: String,
+        updated_at: String,
+        task_id: &str,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json=json_remove(metadata_json,?,'$.deferred_dispatch','$.dispatch_disposition'),version=version+1,updated_at=? WHERE id=? AND json_valid(metadata_json)")
+.bind(metadata_path)
+.bind(updated_at)
+.bind(task_id)
+.identity_fenced()
+.execute(self.pool())
+.await
+    }
+}
+
+#[derive(Debug)]
+pub struct AnnotateRemovedMachineTaskInput<'a> {
+    pub annotation: String,
+    pub updated_at: String,
+    pub task_id: &'a str,
+    pub terminal_states_json: String,
+    pub owner_loss_reasons_json: String,
+}
+
+impl SqliteDb {
+    pub async fn annotate_removed_machine_task(
+        &self,
+        target_id: &str,
+        input: AnnotateRemovedMachineTaskInput<'_>,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=?,
+            blocked_json=CASE WHEN json_valid(error_annotation) AND json_extract(error_annotation,'$.blocked_by')='system:workflow' THEN NULL ELSE blocked_json END,
+            updated_at=?, version=version+1
+         WHERE id=? AND deleted_at IS NULL AND failed_json IS NULL
+           AND status NOT IN (SELECT value FROM json_each(?))
+           AND (error_annotation IS NULL OR (json_valid(error_annotation)
+                AND json_extract(error_annotation,'$.blocking_reason') IN (SELECT value FROM json_each(?))))")
+.bind(input.annotation)
+.bind(input.updated_at)
+.bind(input.task_id)
+.bind(input.terminal_states_json)
+.bind(input.owner_loss_reasons_json)
+.identity_fenced()
+.execute(self.pool())
+.await
+    }
+}
+
+#[derive(Debug)]
+pub struct RecordPlacementRefusalInTxInput<'a> {
+    pub deferral: &'a Option<String>,
+    pub deferral_value: &'a Option<String>,
+    pub annotation: &'a Option<String>,
+    pub blocked: &'a Option<String>,
+    pub updated_at: String,
+    pub version_increment: i64,
+    pub task_id: &'a str,
+    pub expected_version: i64,
+    pub expected_status: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn record_placement_refusal_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        target_id: &str,
+        input: RecordPlacementRefusalInTxInput<'_>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
+            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
+            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
+            error_annotation = COALESCE(?, error_annotation),
+            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ? AND status = ?")
+.bind(input.deferral)
+.bind(input.deferral_value)
+.bind(input.annotation)
+.bind(input.blocked)
+.bind(input.updated_at)
+.bind(input.version_increment)
+.bind(input.task_id)
+.bind(input.expected_version)
+.bind(input.expected_status)
+.identity_fenced()
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_placement_owner_wait_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        target_id: &str,
+        owner_wait: String,
+        task_id: &str,
+        expected_status: &str,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ? AND status = ?")
+.bind(owner_wait)
+.bind(task_id)
+.bind(expected_status)
+.identity_fenced()
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_expired_placement_wait_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        target_id: &str,
+        task_id: &str,
+        expected_version: i64,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
+.bind(task_id)
+.bind(expected_version)
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_claim_placement_waits_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        target_id: &str,
+        task_id: &str,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.environment_wait', '$.deferred_dispatch')
+            WHERE id = ? AND (json_type(metadata_json, '$.owner_wait') IS NOT NULL
+            OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)")
+.bind(task_id)
+.execute_in_tx(transaction)
+.await
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_unsettled_task_condition_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=? AND deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'")
+.bind(task_id)
+.fetch_optional(connection)
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_live_task_project_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT project_id FROM task WHERE id=? AND deleted_at IS NULL",
+        )
+        .bind(task_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_budget_task_project_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionTaskContextRow {
+    pub title: crate::Result<String>,
+    pub status: crate::Result<String>,
+    pub version: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn attention_task_context(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<AttentionTaskContextRow>> {
+        let rows = sqlx::query("SELECT title, status, version FROM task WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(self.pool())
+            .await?;
+        rows.map(|row| {
+            Ok(AttentionTaskContextRow {
+                title: row.try_get("title").map_err(crate::DbError::from),
+                status: row.try_get("status").map_err(crate::DbError::from),
+                version: row.try_get("version").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_event_task_project_id(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_task_assignee_identity(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT assignee_id FROM task
+                     WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_task_identity_assignment_count(
+        &self,
+        task_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task
+                         WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?",
+        )
+        .bind(task_id)
+        .bind(identity_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_task_agent_assignment_count(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task
+                         WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_task_identity_access_count(
+        &self,
+        task_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task
+                 WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?",
+        )
+        .bind(task_id)
+        .bind(identity_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_scope_task_project_id(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn attention_agent_focus_task_id(
+        &self,
+        assignee_id: &str,
+        commitment_owner_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT task_id
+             FROM (
+                 SELECT t.id AS task_id, t.updated_at
+                 FROM task t
+                 WHERE t.assignee_id = ?
+                   AND t.status = 'in_progress'
+                   AND t.deleted_at IS NULL
+                 UNION
+                 SELECT t.id AS task_id, t.updated_at
+                 FROM task t
+                 JOIN agent_commitment c ON c.originating_task_id = t.id
+                 WHERE c.owner_identity_id = ?
+                   AND c.status IN ('proposed', 'open', 'accepted', 'in_progress', 'blocked')
+                   AND t.deleted_at IS NULL
+             )
+             ORDER BY updated_at DESC, task_id DESC
+             LIMIT 1",
+        )
+        .bind(assignee_id)
+        .bind(commitment_owner_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub(crate) fn attention_project_visibility_predicate(
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> (String, Vec<String>) {
+        match project_id {
+            Some(project_id) => ("t.project_id = ?".to_owned(), vec![project_id.to_owned()]),
+            None => (
+                "(p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                    SELECT 1 FROM project_member pm
+                    WHERE pm.project_id = p.id AND pm.user_id = ?
+                ))"
+                .to_owned(),
+                vec![user_id.to_owned(), user_id.to_owned()],
+            ),
+        }
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionVisibleWorkItemsRow {
+    pub id: crate::Result<String>,
+    pub project_id: crate::Result<String>,
+    pub title: crate::Result<String>,
+    pub status: crate::Result<String>,
+    pub priority: crate::Result<i64>,
+    pub updated_at: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_visible_work_items(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+        statuses: &[&str],
+        limit: i64,
+    ) -> crate::Result<Vec<AttentionVisibleWorkItemsRow>> {
+        let status_placeholders = vec!["?"; statuses.len()].join(", ");
+        let status_values = statuses.to_vec();
+        let (project_predicate, project_values) =
+            Self::attention_project_visibility_predicate(user_id, project_id);
+        let sql = format!(
+            "SELECT t.id, t.project_id, t.title, t.status, t.priority, t.updated_at
+             FROM task t JOIN project p ON p.id = t.project_id
+             WHERE t.deleted_at IS NULL AND t.status IN ({status_placeholders})
+               AND {project_predicate}
+             ORDER BY t.priority DESC, t.updated_at ASC, t.id ASC LIMIT ?"
+        );
+        let mut query = sqlx::query(&sql);
+        for status in status_values {
+            query = query.bind(status);
+        }
+        for value in project_values {
+            query = query.bind(value);
+        }
+        let rows = query.bind(limit).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AttentionVisibleWorkItemsRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                project_id: row.try_get("project_id").map_err(crate::DbError::from),
+                title: row.try_get("title").map_err(crate::DbError::from),
+                status: row.try_get("status").map_err(crate::DbError::from),
+                priority: row.try_get("priority").map_err(crate::DbError::from),
+                updated_at: row.try_get("updated_at").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionVisibleRecentOutcomesRow {
+    pub id: crate::Result<String>,
+    pub project_id: crate::Result<String>,
+    pub title: crate::Result<String>,
+    pub status: crate::Result<String>,
+    pub updated_at: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_visible_recent_outcomes(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<AttentionVisibleRecentOutcomesRow>> {
+        let (predicate, values) = Self::attention_project_visibility_predicate(user_id, project_id);
+        let sql = format!(
+            "SELECT t.id, t.project_id, t.title, t.status, t.updated_at
+             FROM task t JOIN project p ON p.id = t.project_id
+             WHERE t.deleted_at IS NULL AND t.status IN ('done', 'cancelled', 'blocked')
+               AND {predicate}
+             ORDER BY t.updated_at DESC, t.id DESC LIMIT ?"
+        );
+        let mut query = sqlx::query(&sql);
+        for value in values {
+            query = query.bind(value);
+        }
+        let rows = query.bind(limit).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AttentionVisibleRecentOutcomesRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                project_id: row.try_get("project_id").map_err(crate::DbError::from),
+                title: row.try_get("title").map_err(crate::DbError::from),
+                status: row.try_get("status").map_err(crate::DbError::from),
+                updated_at: row.try_get("updated_at").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionVisibleQueuedTaskCountRow {
+    pub count: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn attention_visible_queued_task_count(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> crate::Result<AttentionVisibleQueuedTaskCountRow> {
+        let (predicate, values) = Self::attention_project_visibility_predicate(user_id, project_id);
+        let queued_sql = format!(
+            "SELECT COUNT(*) AS count FROM task t JOIN project p ON p.id = t.project_id
+             WHERE t.deleted_at IS NULL AND t.status IN ('todo', 'backlog') AND {predicate}"
+        );
+        let mut query = sqlx::query(&queued_sql);
+        for value in &values {
+            query = query.bind(value);
+        }
+        let queued = query.fetch_one(self.pool()).await?;
+        Ok(AttentionVisibleQueuedTaskCountRow {
+            count: queued.try_get("count").map_err(crate::DbError::from),
+        })
+    }
+}

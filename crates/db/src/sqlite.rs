@@ -1814,3 +1814,46 @@ fn inherited_subtask_workflow_state(status: &str) -> bool {
 fn inherited_subtask_workflow_role(status: &str) -> Option<&'static str> {
     crate::inherited_subtask::role(status)
 }
+
+pub use action::{AttentionApprovalCoordinationActionsRow, AttentionCoordinationScopesRow};
+
+pub use agent::{
+    AttentionAgentBindingRow, AttentionAgentSessionRow, AttentionIdentityOwnerRow,
+    AttentionVisibleAgentHealthRow, VisibleAttentionAgentBindingsInput,
+};
+
+pub use agent_chat::{AttentionChatScopeRow, WakeChatCanonicalScopeRow};
+
+pub use agent_wake::{
+    ActiveIncidentWakeLeaseInTxInput, ActiveIncidentWakeLeaseRow, AdmitIncidentWakeLeaseInTxInput,
+    IncrementWakeBudgetWindowInTxInput, RecordLatestAttentionWakeInTxInput,
+    StartWakeBudgetWindowInTxInput, WakeBudgetWindowRow,
+};
+
+pub use attention::{
+    AttentionWorkerHealthRow, FailedTurnIncidentRow, ResolveScopeProgressAttentionInTxInput,
+    WakeIncidentContextRow, WakeSweepCandidateRow,
+};
+
+pub use command_receipt::AttentionDirectCoordinationReceiptsRow;
+
+pub use execution::AttentionVisibleActiveExecutionCountRow;
+
+pub use memory::AttentionMemoryScopeRow;
+
+pub use repo_location::{
+    CloneVerificationLocationRow, InsertPreparedServerRepoLocationInTxInput,
+    PreparedServerRepoLocationRow, ReadyServerLocationRow,
+};
+
+pub use task::{
+    AnnotateOwnerRecoveryInTxInput, AnnotateRemovedMachineTaskInput, AttentionTaskContextRow,
+    AttentionVisibleQueuedTaskCountRow, AttentionVisibleRecentOutcomesRow,
+    AttentionVisibleWorkItemsRow, ClearRemovedMachineCancelAnnotationInput,
+    RecordPlacementRefusalInTxInput,
+};
+
+pub use workspace::{
+    InsertCreatingAdmissionWorkspaceInTxInput, InsertPreparedServerWorkspaceInTxInput,
+    MarkPreparedAdmissionWorkspaceReadyInTxInput, RecordedOwnerWorkspaceHeadInput,
+};

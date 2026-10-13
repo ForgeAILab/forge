@@ -107,3 +107,22 @@ pub use repository::{
 
 pub mod check_run;
 pub use check_run::*;
+
+pub use sqlite::{
+    ActiveIncidentWakeLeaseInTxInput, ActiveIncidentWakeLeaseRow, AdmitIncidentWakeLeaseInTxInput,
+    AnnotateOwnerRecoveryInTxInput, AnnotateRemovedMachineTaskInput, AttentionAgentBindingRow,
+    AttentionAgentSessionRow, AttentionApprovalCoordinationActionsRow, AttentionChatScopeRow,
+    AttentionCoordinationScopesRow, AttentionDirectCoordinationReceiptsRow,
+    AttentionIdentityOwnerRow, AttentionMemoryScopeRow, AttentionTaskContextRow,
+    AttentionVisibleActiveExecutionCountRow, AttentionVisibleAgentHealthRow,
+    AttentionVisibleQueuedTaskCountRow, AttentionVisibleRecentOutcomesRow,
+    AttentionVisibleWorkItemsRow, AttentionWorkerHealthRow,
+    ClearRemovedMachineCancelAnnotationInput, CloneVerificationLocationRow, FailedTurnIncidentRow,
+    IncrementWakeBudgetWindowInTxInput, InsertCreatingAdmissionWorkspaceInTxInput,
+    InsertPreparedServerRepoLocationInTxInput, InsertPreparedServerWorkspaceInTxInput,
+    MarkPreparedAdmissionWorkspaceReadyInTxInput, PreparedServerRepoLocationRow,
+    ReadyServerLocationRow, RecordLatestAttentionWakeInTxInput, RecordPlacementRefusalInTxInput,
+    RecordedOwnerWorkspaceHeadInput, ResolveScopeProgressAttentionInTxInput,
+    StartWakeBudgetWindowInTxInput, VisibleAttentionAgentBindingsInput, WakeBudgetWindowRow,
+    WakeChatCanonicalScopeRow, WakeIncidentContextRow, WakeSweepCandidateRow,
+};

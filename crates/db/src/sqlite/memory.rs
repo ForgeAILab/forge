@@ -726,3 +726,35 @@ fn map_context_manifest_source(
         fragment_fingerprint: row.try_get("fragment_fingerprint")?,
     })
 }
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionMemoryScopeRow {
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_identity_memory_scopes(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Vec<AttentionMemoryScopeRow>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT scope_type, scope_id
+             FROM forge_memory_source_binding
+             WHERE identity_id = ?
+             ORDER BY scope_type ASC, scope_id ASC",
+        )
+        .bind(identity_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AttentionMemoryScopeRow {
+                    scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                    scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+                })
+            })
+            .collect()
+    }
+}

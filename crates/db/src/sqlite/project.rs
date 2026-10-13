@@ -1186,3 +1186,47 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+impl SqliteDb {
+    pub async fn workspace_admission_project_settings(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_project_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn orphan_attempt_workflow_definition_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT workflow_definition FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
