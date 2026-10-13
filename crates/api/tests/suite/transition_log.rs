@@ -27,6 +27,17 @@ async fn transition_log_records_review_retry_and_completion_history() {
     )
     .await;
     task = set_task_status(&harness, &task.id, "in_progress").await;
+    let now = db::now_rfc3339();
+    db::ExecutionRepo::create(
+        &*harness.db,
+        serde_json::from_value(json!({
+                "id":db::new_uuid_v4(), "task_id":task.id, "role":"coder", "status":db::ExecutionStatus::Completed,
+            "summary":"fixture implementation delivered", "created_at":now, "updated_at":now
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     assign_human_reviewer(&harness.app, &task).await;
 
     task = transition(&harness, &task, "review", "ready for review").await;
@@ -50,7 +61,10 @@ async fn transition_log_records_review_retry_and_completion_history() {
             (
                 entry["from_state"].as_str().unwrap().to_owned(),
                 entry["to_state"].as_str().unwrap().to_owned(),
-                entry["trigger_reason"].as_str().unwrap().to_owned(),
+                entry["trigger_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
             )
         })
         .collect::<Vec<_>>();
@@ -72,11 +86,7 @@ async fn transition_log_records_review_retry_and_completion_history() {
                 "review".to_owned(),
                 "retry ready".to_owned()
             ),
-            (
-                "review".to_owned(),
-                "merging".to_owned(),
-                "gate approved".to_owned()
-            ),
+            ("review".to_owned(), "merging".to_owned(), String::new()),
             (
                 "merging".to_owned(),
                 "done".to_owned(),
@@ -86,10 +96,21 @@ async fn transition_log_records_review_retry_and_completion_history() {
     );
     let approval = entries
         .iter()
-        .find(|entry| entry["trigger_reason"] == "gate approved")
+        .find(|entry| entry["from_state"] == "review" && entry["to_state"] == "merging")
         .unwrap();
-    assert_eq!(approval["bridge_kind"], "gate_approved");
+    assert!(approval["bridge_kind"].is_null());
     assert!(approval["bridge_payload"].is_null());
+    let reviews = db::ReviewRepo::list_by_task(&*harness.db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        reviews
+            .iter()
+            .max_by_key(|review| review.attempt_number)
+            .unwrap()
+            .status,
+        db::ReviewStatus::Passed
+    );
     // A send-back with guidance is an ordinary rejection, as base read it.
     let rejection = entries
         .iter()

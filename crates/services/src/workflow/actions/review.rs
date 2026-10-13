@@ -26,6 +26,67 @@ pub(super) async fn resolve_workspace(
 
 pub struct RunCiSteps;
 
+/// Both transition entry and recovered dispatch resolve the same candidate.
+/// An empty configured gate must not silently skip its required validation.
+pub(super) async fn prepare_review_entry(
+    ctx: &HookContext,
+    task: &db::Task,
+) -> Result<Option<HookResult>, String> {
+    let Some(state) = ctx
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == ctx.to_state)
+    else {
+        return Ok(None);
+    };
+    if state.kind != api_types::StateKind::Gate
+        || state.canonical_phase != Some(api_types::CanonicalPhase::Review)
+    {
+        return Ok(None);
+    }
+    let assigned = match effective_role(state) {
+        Some(role) => get_role_assignment(ctx, role)
+            .await?
+            .is_some_and(|assignment| assignment.assignee_id.is_some()),
+        None => false,
+    };
+    if !assigned
+        && review_ci_steps(&ctx.state_config)?.is_empty()
+        && !gate_requires_user_approval(ctx)
+    {
+        return Ok(None);
+    }
+    let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "review Project is missing".to_owned())?;
+    if ctx
+        .task_service
+        .prepare_review_candidate(task, &project)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let missing = ctx
+        .task_service
+        .missing_review_candidate(task)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Some(match missing.target {
+        Some(to) => HookResult::Cascade {
+            to,
+            reason: missing.reason,
+            bridge: missing.bridge,
+        },
+        None => HookResult::Skipped {
+            reason: missing.reason,
+        },
+    }))
+}
+
 #[async_trait]
 impl HookAction for RunCiSteps {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
@@ -33,6 +94,11 @@ impl HookAction for RunCiSteps {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
+        match prepare_review_entry(ctx, &task).await {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(reason) => return HookResult::Failed { reason },
+        }
         let read_only = match task_execution_is_read_only(ctx, &task).await {
             Ok(read_only) => read_only,
             Err(reason) => return HookResult::Failed { reason },

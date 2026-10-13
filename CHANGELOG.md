@@ -8,6 +8,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- A configured review with no delivered candidate no longer offers Approve.
+  It requires new work or cancellation; lead-managed empty roots re-plan within
+  their existing budget instead of waiting in review without validation.
 - Removing or replacing a coordination root's lead now cancels its live
   planning execution. Removal advances through the no-lead path; replacement
   starts the new lead once. Operations from the old execution are refused.
@@ -3283,6 +3286,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Reviews accept human-authored commits on the Task branch without an Agent
+  implementation run. Empty configured reviews state an actionable
+  `review_blocked` park and raise the existing recovery Attention item.
+- An unconfigured review still skips into merging; an all-cancelled root with
+  no commits now completes as a no-op instead of waiting for an implementation
+  execution that does not exist. Changed or dirty branches are preserved.
 - A planner failure while its Agent is paused no longer leaves the Task clear
   without a run after resume; it retries within the Execution budget.
 - A queued lead recovery opens a fresh step-check budget window before

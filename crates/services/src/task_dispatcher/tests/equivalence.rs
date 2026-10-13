@@ -1156,6 +1156,8 @@ const ALLOWED: &[&str] = &[
     // `todo`. A completion flag on a root that still has a subtask left is
     // no longer attempted (and refused) as an aggregate-review advance.
     "RootKickoff",
+    // Configured reviews without delivered work require the owner's action.
+    "MissingReviewCandidate",
 ];
 
 /// `RootKickoff` may only change a coordination root's own row, or the
@@ -1235,6 +1237,13 @@ fn settle_shapes(section: &str, shapes: Option<&[&str]>, lines: Vec<String>) {
         };
         match allowed.get(key(line)) {
             Some((name, expected)) => {
+                if name == &"MissingReviewCandidate" {
+                    assert!(matches!(
+                        shape_of(line),
+                        "review_reviewer" | "review_user_reviewer" | "review_ci_no_review"
+                    ));
+                    assert!(key(line).ends_with(" T") || key(line).ends_with("(pass)"));
+                }
                 assert_ne!(
                     expected, recorded,
                     "exception {name} changes nothing: {line}"

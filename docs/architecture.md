@@ -5875,6 +5875,35 @@ replace validation of that install's retained owner evidence.
 
 ### Task condition actions
 
+**Review without an Agent delivery.** A Task branch with a head different from
+its recorded base is a human submission and runs the ordinary configured
+review checks and reviewer. Its completed delivery-evidence row records the
+exact base/head and a human-submission summary, with no Agent, process, lease,
+session or logs. It grants no review authority by itself. Review attempts retain
+their execution foreign key and the ordinary candidate/admission fences.
+
+A configured review with no delivery candidate instead parks as
+`failure { failure_kind: review_blocked }`, with “nothing to review” and the
+existing `execution_failed` Attention category. It offers Cancel and Send Back
+to add work, and refuses Approve (including an override) and candidate retries.
+Sending a coordination root back holds it in implementation so the owner can
+add corrective subtasks before Release; it cannot immediately advance to the
+same empty review. An ordinary Task takes its configured rejection transition.
+The park is stated once; unchanged dispatcher passes add no Task write, event,
+step, execution or Attention incident.
+
+For a root whose children were all cancelled, cancelled children supply no
+aggregate candidate. With a lead, missing work triggers planning once per
+review entry and charges only the existing `replan` budget. Exhaustion leaves
+the root in the existing `budget_exhausted { replan }` park. Without a lead it
+uses the owner park above, naming “every subtask was cancelled.” An unassigned,
+check-less gate that requires no human approval still skips into `merging` by
+configuration; no delivery or required validation is claimed by that skip.
+The merge entry completes an all-cancelled sequence as a no-op when there is
+no Workspace or its branch is proven unchanged and clean. A changed, dirty or
+unavailable branch keeps the ordinary integration handling and is never
+discarded by that no-op.
+
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
 
 The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only. A role-launching offer (`start`, role `retry`, `release`) is made for one role, resolved in one place (`workflow::action_role`): the role of the Task's state, else the role of the state a claim would enter (the first outgoing Active state, else the first Gate). The Agent the offer needs, the role stored with the queued action, its replay and the claim all use that role, so `start` on a `todo` Task runs its coder, waits for capacity when the coder is busy, and is not offered while that Agent is paused or offline.

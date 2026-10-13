@@ -198,6 +198,11 @@ impl HookAction for DispatchRoleAgent {
                     && assignment.assignee_id.is_some()
             })
         {
+            match super::review::prepare_review_entry(ctx, &current_task).await {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(reason) => return HookResult::Failed { reason },
+            }
             // A CI hook that just failed is still in the same transition and
             // must not immediately mint a replacement reviewer attempt. On
             // the next review cycle the implementation candidate differs (or

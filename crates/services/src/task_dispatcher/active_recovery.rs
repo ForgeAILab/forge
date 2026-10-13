@@ -905,9 +905,12 @@ impl TaskDispatcher {
         // logs as a lost race and retries forever: a Task parked in review
         // with no Review row -- a read-only Task whose CI hook skipped, or
         // any Task whose reviewer never launched -- could never be recovered.
-        if role_name == crate::workflow::default_roles::REVIEWER {
-            self.ensure_review_attempt_for_recovery(project, task, &state.name)
-                .await?;
+        if role_name == crate::workflow::default_roles::REVIEWER
+            && !self
+                .ensure_review_attempt_for_recovery(project, task, &state.name)
+                .await?
+        {
+            return Ok(false);
         }
         let dispatch_ctx =
             load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
@@ -1108,9 +1111,12 @@ impl TaskDispatcher {
         // logs as a lost race and retries forever: a Task parked in review
         // with no Review row -- a read-only Task whose CI hook skipped, or
         // any Task whose reviewer never launched -- could never be recovered.
-        if role_name == crate::workflow::default_roles::REVIEWER {
-            self.ensure_review_attempt_for_recovery(project, task, &state.name)
-                .await?;
+        if role_name == crate::workflow::default_roles::REVIEWER
+            && !self
+                .ensure_review_attempt_for_recovery(project, task, &state.name)
+                .await?
+        {
+            return Ok(false);
         }
         let dispatch_ctx =
             load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
@@ -1213,32 +1219,84 @@ impl TaskDispatcher {
         Ok(true)
     }
 
-    /// Establish the Review attempt a recovered reviewer dispatch binds to.
-    ///
-    /// Mirrors the transition-time helper: an attempt already Running or
-    /// AwaitingHuman for the current candidate is left alone, and a Task with
-    /// no implementation candidate gets no attempt, because a Review has no
-    /// authority without the execution it reviews.
+    /// Recover a configured entry that has neither a Review nor delivery
+    /// evidence, before a cached refusal or CI readiness can hide it.
+    pub(super) async fn reconcile_missing_review_candidate(
+        &self,
+        project: &Project,
+        workflow: &WorkflowDefinition,
+        task: &Task,
+    ) -> Result<bool> {
+        let Some(state) = workflow.states.iter().find(|state| {
+            state.name == task.status
+                && state.kind == api_types::StateKind::Gate
+                && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+        }) else {
+            return Ok(false);
+        };
+        let assigned = match crate::workflow::effective_role(state) {
+            Some(role) => crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
+                .await?
+                .is_some_and(|resolved| resolved.assignment.assignee_id.is_some()),
+            None => false,
+        };
+        let config =
+            helpers::merged_state_config(state, project, task.task_state_config.as_deref());
+        let checks = config
+            .get("ci_steps")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| !steps.is_empty());
+        if (!assigned
+            && !checks
+            && !state
+                .gate_config
+                .as_ref()
+                .is_some_and(|gate| gate.requires_user_approval()))
+            || crate::task_service::latest_executor_execution_for_task(&self.db, task)
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        self.task_service.reconcile_review_candidate(task).await?;
+        Ok(true)
+    }
+
+    /// Establish the exact attempt used by a recovered reviewer admission.
     async fn ensure_review_attempt_for_recovery(
         &self,
         project: &Project,
         task: &Task,
         to_state: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if task.review_passed_at.is_some() {
-            return Ok(());
+            return Ok(true);
         }
-        let Some(candidate) =
-            crate::task_service::latest_executor_execution_for_task(&self.db, task).await?
+        let Some(candidate) = self
+            .task_service
+            .prepare_review_candidate(task, project)
+            .await?
         else {
-            // Reviewing nothing is not a transient condition: a Task in
-            // review with no implementation attempt has nothing to bind a
-            // Review to, and retrying every scan only hides that. Refuse
-            // deterministically so the Task parks with the actual reason.
-            return Err(ServiceError::conflict(format!(
-                "task {} is in review with no implementation execution to review",
-                task.id
-            )));
+            let missing = self.task_service.missing_review_candidate(task).await?;
+            if let Some(target) = missing.target {
+                self.task_service
+                    .transition(
+                        task.id.clone(),
+                        target,
+                        crate::task_service::TransitionOptions {
+                            bridge: missing.bridge,
+                            version: missing.task.version,
+                            reason: Some(missing.reason),
+                            triggered_by: api_types::Actor::system(
+                                api_types::SystemComponent::Workflow,
+                            ),
+                            rejection: false,
+                            defer_dispatch_seconds: None,
+                        },
+                    )
+                    .await?;
+            }
+            return Ok(false);
         };
         let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
         let current = reviews
@@ -1251,7 +1309,7 @@ impl TaskDispatcher {
                     db::ReviewStatus::Running | db::ReviewStatus::AwaitingHuman
                 )
         }) {
-            return Ok(());
+            return Ok(true);
         }
         let now = db::now_rfc3339();
         ReviewRepo::create_with_task_authority(
@@ -1274,7 +1332,7 @@ impl TaskDispatcher {
             Some(candidate.id.as_str()),
         )
         .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Settle a reviewer execution whose terminal event was lost before it

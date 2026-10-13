@@ -188,6 +188,18 @@ impl TaskService {
             }
             .into());
         }
+        // Persisted corruption remains a server error for review decisions,
+        // even when the candidate guard correctly withholds their offer.
+        if snapshot.task.status == "review"
+            && matches!(
+                &action,
+                TaskAction::Approve { .. } | TaskAction::SendBack { .. }
+            )
+        {
+            if let Some(review) = snapshot.latest_review.as_ref() {
+                super::strict_review_details(review)?;
+            }
+        }
         let offers = available_actions(&snapshot);
         let selected = offers.iter().find(|offer| {
             offer.action.verb() == action.verb()
@@ -265,16 +277,6 @@ impl TaskService {
             validate_required("reason", reason.unwrap_or_default())?;
         } else if let Some(reason) = reason {
             validate_required("reason", reason)?;
-        }
-        if snapshot.task.status == "review"
-            && matches!(
-                action,
-                TaskAction::Approve { .. } | TaskAction::SendBack { .. }
-            )
-        {
-            if let Some(review) = snapshot.latest_review.as_ref() {
-                super::strict_review_details(review)?;
-            }
         }
         let actor = match actor {
             Actor::User {

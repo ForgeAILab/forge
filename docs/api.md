@@ -3353,6 +3353,15 @@ Unavailable commands return HTTP 409, code `action_unavailable`, and current `de
 
 Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
+In review, a configured validation needs a delivered candidate. Human commits
+on the Task branch run the ordinary checks and reviewer; the delivery evidence
+records their exact base/head without an Agent implementation run. With no
+candidate, the Task states `review_blocked` and raises the existing
+`execution_failed` Attention category. Its offers are Send Back to add work and
+Cancel; Approve is unavailable even with an override. A lead-managed empty
+root re-plans within its existing `replan` budget. Sending a root back holds it
+in implementation until corrective subtasks are added and the root is released.
+
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
 MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Native action reasons/guidance live inside that object; the retired generic envelope `reason`/`decision` properties are removed. Single-Task reads include caller-filtered offers; REST and MCP Task lists omit offers and MCP Task pages use `items`. The Project Agent's admitted native `work.read` projection carries live per-Task offers and versions. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.

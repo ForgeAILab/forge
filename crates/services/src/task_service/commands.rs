@@ -599,6 +599,20 @@ impl TaskService {
                     }
                     encode(Box::pin(self.review_failure_target(&task, execution.as_deref())).await?)
                 }
+                "missing_review_candidate" | "reconcile_review_candidate" => {
+                    let (id, version, status): (String, i64, String) =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let task = self.command_task(&id).await?;
+                    if task.version != version || task.status != status {
+                        return Err(db::DbError::VersionConflict.into());
+                    }
+                    if command.operation == "reconcile_review_candidate" {
+                        encode(Box::pin(self.reconcile_review_candidate(&task)).await?)
+                    } else {
+                        encode(Box::pin(self.missing_review_candidate(&task)).await?)
+                    }
+                }
                 "transition" => {
                     let (task_id, new_status, mut options): (
                         String,

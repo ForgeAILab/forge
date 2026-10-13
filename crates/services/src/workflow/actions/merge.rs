@@ -21,6 +21,42 @@ pub struct RunMerge;
 #[async_trait]
 impl HookAction for RunMerge {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        let current = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        match ctx
+            .task_service
+            .empty_cancelled_root_has_no_commits(&current)
+            .await
+        {
+            Ok(true)
+                if unconfigured_review_source(ctx, &current)
+                    .await
+                    .unwrap_or(false) =>
+            {
+                if let Some(to) = ctx
+                    .workflow
+                    .outgoing_trigger_targets(&ctx.to_state)
+                    .find_map(|(trigger, target)| {
+                        (trigger == api_types::WorkflowTrigger::Accept
+                            && ctx.workflow.state_kind(&target)
+                                == Some(api_types::StateKind::Terminal))
+                        .then_some(target)
+                    })
+                {
+                    return HookResult::Cascade {
+                        to: to.to_owned(),
+                        reason:
+                            "nothing delivered: every subtask was cancelled; no commits to merge"
+                                .into(),
+                        bridge: Default::default(),
+                    };
+                }
+            }
+            Ok(_) => {}
+            Err(error) => return failed(ctx, error),
+        }
         let Some(merge_service) = ctx.merge_service.as_ref() else {
             return HookResult::Skipped {
                 reason: "merge service not configured".to_string(),
@@ -199,6 +235,40 @@ impl HookAction for RunMerge {
         }
         HookResult::Ok
     }
+}
+
+/// Only a gate configured to skip validation may finish an empty sequence.
+/// A direct move into merging cannot turn missing configured review into a pass.
+async fn unconfigured_review_source(ctx: &HookContext, task: &db::Task) -> Result<bool, String> {
+    let Some(state) = ctx.workflow.states.iter().find(|state| {
+        state.name == ctx.from_state
+            && state.kind == api_types::StateKind::Gate
+            && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+    }) else {
+        return Ok(false);
+    };
+    let Some(role) = crate::workflow::effective_role(state) else {
+        return Ok(false);
+    };
+    if super::common::get_role_assignment(ctx, role)
+        .await?
+        .is_some_and(|assignment| assignment.assignee_id.is_some())
+        || state
+            .gate_config
+            .as_ref()
+            .is_some_and(|gate| gate.requires_user_approval())
+    {
+        return Ok(false);
+    }
+    let project = db::ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let config = crate::workflow::engine::effective_state_config(
+        state,
+        project.as_ref(),
+        task.task_state_config.as_deref(),
+    );
+    Ok(super::common::review_ci_steps(&config)?.is_empty())
 }
 
 /// Whether the running hooks step is one the old merge path left: it
