@@ -1367,38 +1367,57 @@ impl TaskDispatcher {
         gate: bool,
     ) -> bool {
         let mut failed = false;
-        // An unavailable Agent asks for no run slot. In particular, startup
-        // can recover the last holder while its Agent is paused: the initial
-        // dispatch below will then be skipped, so it cannot retire the old wait.
-        let target = p
-            .facts
-            .initial_target
-            .as_ref()
-            .map(|(_, _, id)| id)
-            .or_else(|| p.facts.role_target.as_ref().map(|(_, id)| id));
-        if target.is_some_and(|id| {
-            !matches!(
+        // A Task that has not started is not dispatched while its Agent is
+        // unavailable, so the dispatch that records and retires its capacity
+        // wait never runs: a wait recorded before a restart would stand after
+        // recovery ended the run that held the slot. Ask the same question
+        // the dispatch asks. A wait that is still real is kept, one that is
+        // not is retired (never past the Project limit) and the Task parks on
+        // its Agent. A started Task is asked by the role check below.
+        let stale_initial_wait = p.facts.initial_target.as_ref().and_then(|(_, role, id)| {
+            let unavailable = !matches!(
                 agents.statuses.get(id),
                 Some(
                     crate::agent_service::EffectiveStatus::Active
                         | crate::agent_service::EffectiveStatus::Busy
                 )
-            )
-        }) && deferred_dispatch::current_dispatch_disposition(&p.read.task).is_some_and(|wait| {
-            matches!(
-                wait.capability.as_str(),
-                "machine_capacity" | "project_capacity"
-            )
-        }) {
-            let retired: Result<()> = async {
-                deferred_dispatch::clear_capacity_wait(&self.db, &p.read.task).await?;
-                self.reread(p, project).await?;
-                Ok(())
+            );
+            let waits = deferred_dispatch::current_dispatch_disposition(&p.read.task).is_some_and(
+                |wait| {
+                    matches!(
+                        wait.capability.as_str(),
+                        "machine_capacity" | "project_capacity"
+                    )
+                },
+            );
+            (unavailable && waits)
+                .then(|| agents.agents.iter().find(|agent| &agent.id == id))
+                .flatten()
+                .map(|agent| (role.clone(), agent))
+        });
+        if let Some((role, agent)) = stale_initial_wait {
+            let retired: Result<bool> = async {
+                if crate::placement::machine_precheck::wait_before_dispatch(
+                    &self.db,
+                    &self.task_service,
+                    &p.read.task,
+                    agent,
+                    Some(&role),
+                )
+                .await?
+                {
+                    return Ok(true);
+                }
+                self.reread(p, project).await
             }
             .await;
-            if let Err(error) = retired {
-                tracing::warn!(task_id = %p.read.task.id, %error, "obsolete capacity wait could not be retired");
-                return true;
+            match retired {
+                Ok(true) => {}
+                Ok(false) => return true,
+                Err(error) => {
+                    tracing::warn!(task_id = %p.read.task.id, %error, "obsolete capacity wait could not be retired");
+                    return true;
+                }
             }
         }
         let probe = next_step::next_step(&Snapshot {

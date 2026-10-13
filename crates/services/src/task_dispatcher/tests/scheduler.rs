@@ -246,6 +246,68 @@ async fn startup_replaces_a_stale_slot_wait_with_the_paused_agent_that_owns_it()
     );
 }
 
+/// A paused Agent asks for no run slot, so its waiters give up their slot
+/// wait once (started or not) and park on the Agent. Idle ticks after that
+/// write nothing: the wait is not retired and recorded again on every pass.
+#[tokio::test]
+async fn slot_waiters_of_a_paused_agent_park_on_it_once_and_write_nothing() {
+    let (db, project, agent, _repo, ws) = fixture().await;
+    db.server_run_cap.set(
+        Some(1),
+        config::resolved_run_cap(Some(1)),
+        &config::embedded_machine_id(),
+    );
+    let running = seed_task(&db, &project, "running", "in_progress", 0).await;
+    assign_role(&db, &running.id, "coder", &agent).await;
+    seed_running_execution(&db, &running.id, &agent, "coder").await;
+    let active = seed_task(&db, &project, "active", "in_progress", 0).await;
+    assign_role(&db, &active.id, "coder", &agent).await;
+    let waiting = seed_task(&db, &project, "waiting", "todo", 0).await;
+    assign_role(&db, &waiting.id, "coder", &agent).await;
+    let (dispatcher, _rx) = build_dispatcher_runtime(db.clone(), ws.path(), true).await;
+    for _ in 0..6 {
+        dispatcher.check_once_and_drain().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    for id in [&active.id, &waiting.id] {
+        assert_eq!(
+            deferred_dispatch::current_dispatch_disposition(&reload(&db, id).await)
+                .map(|d| d.capability),
+            Some("machine_capacity".to_owned())
+        );
+    }
+    AgentRepo::set_paused(&*db, &agent, true).await.unwrap();
+    for _ in 0..6 {
+        dispatcher.check_once_and_drain().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let observe = || async {
+        (
+            count(&db, "SELECT COUNT(*) FROM task_step").await,
+            count(&db, "SELECT COUNT(*) FROM domain_event").await,
+            count(&db, "SELECT COALESCE(SUM(version),0) FROM task").await,
+            count(&db, "SELECT COUNT(*) FROM execution").await,
+            reload(&db, &active.id).await.metadata_json,
+            reload(&db, &waiting.id).await.metadata_json,
+        )
+    };
+    let before = observe().await;
+    for _ in 0..30 {
+        dispatcher.check_once_and_drain().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(12)).await;
+    }
+    assert_eq!(observe().await, before, "idle ticks wrote nothing");
+    for id in [&active.id, &waiting.id] {
+        let parked = reload(&db, id).await;
+        assert!(deferred_dispatch::current_dispatch_disposition(&parked).is_none());
+        assert!(
+            matches!(&parked.condition, db::TaskCondition::Parked { primary: db::ParkReason::Agent { agent_id, .. }, .. } if agent_id == &agent),
+            "{:?}",
+            parked.condition
+        );
+    }
+}
+
 /// Freed capacity kicks the waiters it can admit: the Task that waited on the
 /// Project limit is admitted on the pass after the slot frees.
 #[tokio::test]
