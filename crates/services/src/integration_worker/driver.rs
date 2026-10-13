@@ -21,7 +21,7 @@ use db::{
     IntegrationCheckTiming, IntegrationCiSkipReason, IntegrationEffectReceipt,
     IntegrationEffectRequest, IntegrationFailureKind, IntegrationLostRace, IntegrationLostRaceKind,
     IntegrationOperationKind, IntegrationOperationState, IntegrationOwnerFence,
-    IntegrationPhaseTimings, IntegrationQueue, IntegrationQueueState,
+    IntegrationPhaseTimings, IntegrationQueue, IntegrationQueueRepo, IntegrationQueueState,
 };
 use serde_json::json;
 use std::{collections::HashSet, sync::Arc, time::Duration};
@@ -1176,7 +1176,22 @@ impl HeadDriver {
             .is_some_and(|original| original != facts.candidate_head);
         let checked = a.checks_commit_sha.as_deref() == Some(&facts.candidate_head);
         let elapsed = millis(started, self.w.clock.now());
-        let skip_check = facts.target_in_candidate && (!rebased_by_queue || checked);
+        let retried_incomplete_import = match a.predecessor_attempt_id.as_deref() {
+            Some(id) => self
+                .w
+                .db
+                .integration_attempt(id)
+                .await?
+                .is_some_and(|predecessor| {
+                    predecessor.state == S::Quarantined
+                        && predecessor.failure_kind == Some(IntegrationFailureKind::CorruptImport)
+                        && predecessor.import_source_json.is_some()
+                }),
+            None => false,
+        };
+        let skip_check = facts.target_in_candidate
+            && (!rebased_by_queue || checked)
+            && (!retried_incomplete_import || checked);
         let lost = !facts.target_in_candidate;
         let now = self.w.clock.now();
         self.timings(&a.id, |timings| {

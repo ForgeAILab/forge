@@ -291,9 +291,6 @@ impl crate::TaskService {
         let Some(task) = TaskRepo::get_by_id(&*self.db, &task.id, false).await? else {
             return Ok(false);
         };
-        let Some(merge_service) = self.merge_service.as_ref() else {
-            return Ok(false);
-        };
         if task.parent_task_id.is_some() || task.archived_at.is_some() {
             return Ok(false);
         }
@@ -315,9 +312,22 @@ impl crate::TaskService {
             .map_err(db::DbError::from)?;
         // Rebind stale released owners through admission first. Healthy
         // attempts can repair their condition behind a real hold/block.
-        if owned && self.restate_integration_condition(&task).await? {
+        let incomplete_import = self
+            .db
+            .unowned_quarantined_import(&task.id)
+            .await?
+            .is_some();
+        if (owned || incomplete_import) && self.restate_integration_condition(&task).await? {
             return Ok(true);
         }
+        if incomplete_import {
+            // No automatic readmission, even after its source is repaired.
+            // The owner must explicitly retry the incomplete import.
+            return Ok(false);
+        }
+        let Some(merge_service) = self.merge_service.as_ref() else {
+            return Ok(false);
+        };
         // The same guards as the transition into the state: a Task its owner
         // stopped is not admitted, and an entry whose hooks are still to run
         // admits itself.

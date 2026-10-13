@@ -42,6 +42,45 @@ async fn sweep_now(dispatcher: &TaskDispatcher) {
     dispatcher.drain_steps().await.unwrap();
 }
 
+#[tokio::test]
+async fn sweep_parks_a_quarantined_import_from_a_previous_start_without_reimporting() {
+    let (db, project, _, _repo, workspace) = fixture().await;
+    let task = seed_task(&db, &project, "incomplete imported merge", "merging", 0).await;
+    let imported = db.import_integration_pass(100).await.unwrap();
+    assert_eq!(imported.quarantined, 1);
+    let (dispatcher, _) = build_dispatcher(db.clone(), workspace.path()).await;
+    sweep_now(&dispatcher).await;
+    let parked = reload(&db, &task.id).await;
+    assert!(
+        matches!(
+            parked.condition.integration_wait(),
+            Some(api_types::IntegrationReason::Deferred {
+                cause: api_types::IntegrationDeferralCause::OwnerRequired,
+                ..
+            })
+        ),
+        "{:?}",
+        parked.condition
+    );
+    assert!(dispatcher
+        .task_service
+        .task_action_offers(&task.id, &Actor::user(api_types::UserActionSource::Api))
+        .await
+        .unwrap()
+        .available_actions
+        .iter()
+        .any(|offer| offer.reason == "integration_retry"));
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(attempts, 1);
+    sweep_now(&dispatcher).await;
+    assert_eq!(reload(&db, &task.id).await.condition, parked.condition);
+}
+
 /// One Task whose stored condition cannot be decoded neither fails the pass
 /// nor leaves it marked idle: every other Project still dispatches. A corrupt
 /// value is recomputed from the Task's legacy fields and the repair is

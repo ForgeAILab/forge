@@ -118,8 +118,61 @@ async fn file_backed_migrations_apply_cleanly() {
         })
         .count() as i64;
     assert_eq!(applied, bundled);
+    assert_eq!(
+        fs::metadata(format!("{}-wal", db_path.display()))
+            .unwrap()
+            .len(),
+        0
+    );
     pool.close().await;
     let _ = fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn comment_rebuild_bundle_truncates_wal_and_preserves_comment_content() {
+    let migration_dir = unique_temp_path("comment-checkpoint-migrations");
+    fs::create_dir_all(&migration_dir).unwrap();
+    copy_migrations_up_to(202610122352, &migration_dir);
+    let db_path = unique_temp_path("comment-checkpoint-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .unwrap();
+    run_migrations_from(&pool, &migration_dir).await.unwrap();
+    sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','now','now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t','p','t','done','now','now')").execute(&pool).await.unwrap();
+    let content = "preserved Unicode: 数据\n".repeat(65_536);
+    sqlx::query("INSERT INTO task_comment(id,task_id,author_type,author_name,content,created_at,updated_at,worklog_kind,idempotency_key) VALUES('c','t','system','Forge',?,'now','now','progress','retained')")
+        .bind(&content).execute(&pool).await.unwrap();
+    run_migrations_from(
+        &pool,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::metadata(format!("{}-wal", db_path.display()))
+            .unwrap()
+            .len(),
+        0
+    );
+    let retained: (String, String, String) = sqlx::query_as(
+        "SELECT content,worklog_kind,idempotency_key FROM task_comment WHERE id='c'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, (content, "progress".into(), "retained".into()));
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
 }
 
 #[tokio::test]

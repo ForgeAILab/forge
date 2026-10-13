@@ -5612,6 +5612,25 @@ live legacy merge hook owns it. A suspended older hook completes its recorded
 rebase/read-only outcome and hands over through the same admission function.
 There are no shadow observation writers in the active merge path.
 
+An import missing its execution or pinned workspace (`corrupt_import`,
+"missing execution or pinned workspace") is non-current because it has no
+resolvable queue. Wholly unreadable or contradictory legacy evidence keeps
+its existing continuation policy.
+While it is the Task's only attempt and the Task still occupies that merge
+entry, startup continuation and the dispatcher's sweep state
+`deferred/owner_required` with its cause and raise the normal Attention
+interruption. This includes quarantines committed by a previous start.
+The Task integration summary exposes the quarantine, and operations status
+counts it in `integration_queues.quarantined_imports`. Nothing readmits it
+automatically. Retry uses normal admission to bind the Task's current branch,
+workspace and ready placement; if the legacy execution or its workspace pin
+is absent, only this explicit retry may use the Task's present workspace.
+No execution or review evidence is fabricated. The new attempt retains the
+quarantine as predecessor, requires the full head check even on an unchanged
+target, and must pass normal review authority before fast-forwarding. If no
+current workspace can be recovered, Retry reports the missing source and
+keeps the park; Cancel ends the Task.
+
 The continuation binds a runnable candidate, states a wait/owner action, or
 reports a landed result after the target-owner proof. A held/offline/lost-owner
 row is not readmitted merely because its candidate was unnamed. Offline P15
@@ -7393,6 +7412,10 @@ the terminal CAS for embedded owner-lease expiry or a reached hard deadline.
 A separate semantic-progress scan emits warnings without terminalizing a live
 owner. Hard deadlines are recovered distinctly from ordinary owner-lease expiry.
 
+Startup enqueues a Task recovery command only when that Task has a running
+execution to recover. An unchanged restart with no interrupted execution adds
+no recovery steps or Task scheduler dirty generations.
+
 Startup crash recovery marks every interrupted implementation execution whose
 terminal CAS it wins with `resume_policy = auto`, regardless of its active
 workflow state or whether the attempt has a reusable runtime session. It leaves
@@ -7558,6 +7581,14 @@ start, before applying anything, in two cases:
 Without that check, the second migration would be skipped without an error and
 its schema would never exist. The one known reconciled exception is a V053
 `integration_credentials` row from early hosts, which V054 repairs.
+
+After the whole bundle and its reconciliation finish, outside every migration
+transaction and before workers start, the runner requests
+`PRAGMA wal_checkpoint(TRUNCATE)`. A successful checkpoint syncs committed
+pages and truncates the WAL to zero bytes. An external reader can keep the
+checkpoint busy; SQLite then retains the WAL safely. This does not compact
+the main database: pages freed by a table rebuild remain on its freelist for
+reuse. No automatic VACUUM is performed.
 
 To recover a refused host, compare `SELECT version, name FROM _migration` with
 `crates/db/migrations/`. Apply the build's migration by hand if its schema is

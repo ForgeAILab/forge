@@ -85,7 +85,7 @@ pub(crate) struct MergeIntent {
 
 /// See [`MergeService::integration_admission_facts`].
 pub(crate) struct IntegrationAdmissionFacts {
-    pub execution_id: String,
+    pub execution_id: Option<String>,
     pub workspace: db::Workspace,
     pub placement: db::WorkspacePlacement,
     pub target_branch: String,
@@ -318,6 +318,14 @@ impl MergeService {
         execution: &db::Execution,
     ) -> Result<(db::Workspace, crate::workspace_backend::ResolvedWorkspace)> {
         let expected = resolve_delivery_workspace(&self.db, execution).await?;
+        self.ensure_integration_workspace(task, expected).await
+    }
+
+    async fn ensure_integration_workspace(
+        &self,
+        task: &db::Task,
+        expected: db::Workspace,
+    ) -> Result<(db::Workspace, crate::workspace_backend::ResolvedWorkspace)> {
         let router = self.workspace_backend_router()?;
         let daemon_owned = WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &expected.id)
             .await?
@@ -365,15 +373,35 @@ impl MergeService {
                 "subtasks do not merge; only root tasks merge to the default branch",
             ));
         }
-        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, task)
-            .await?
-            .ok_or_else(|| {
+        let execution =
+            crate::task_service::latest_executor_execution_for_task(&self.db, task).await?;
+        let incomplete_import = match task.condition.integration_wait() {
+            Some(api_types::IntegrationReason::Deferred {
+                attempt_id,
+                cause: api_types::IntegrationDeferralCause::OwnerRequired,
+                ..
+            }) => self
+                .db
+                .unowned_quarantined_import(&task.id)
+                .await?
+                .is_some_and(|import| import.id == attempt_id.as_str()),
+            _ => false,
+        };
+        let (workspace, resolved) = if incomplete_import {
+            // The owner retries the Task's present branch, never the import's
+            // old candidate. Its successor requires the full head check.
+            let workspace = WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?
+                .ok_or_else(|| ServiceError::invalid_operation("the quarantined Task has no current workspace; restore its branch before Retry"))?;
+            self.ensure_integration_workspace(task, workspace).await?
+        } else {
+            let execution = execution.as_ref().ok_or_else(|| {
                 ServiceError::invalid_operation(format!(
                     "task {} has no executor execution",
                     task.id
                 ))
             })?;
-        let (workspace, resolved) = self.ensure_delivery_workspace(task, &execution).await?;
+            self.ensure_delivery_workspace(task, execution).await?
+        };
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
             .filter(|repo| repo.project_id == task.project_id)
@@ -385,7 +413,7 @@ impl MergeService {
             .trim()
             .to_owned();
         Ok(IntegrationAdmissionFacts {
-            execution_id: execution.id,
+            execution_id: execution.map(|execution| execution.id),
             target_branch: target_branch(&task.merge_config, &repo.default_branch)?,
             placement: resolved.placement.clone(),
             workspace,

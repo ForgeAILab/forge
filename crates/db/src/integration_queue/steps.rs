@@ -3,6 +3,23 @@
 //! The queue worker only reads these fields.
 use super::*;
 
+/// A missing-execution/workspace import that owns no queue/effect and has no
+/// successor. Wholly unreadable or contradictory evidence keeps its own
+/// continuation policy; it is not a candidate-availability owner park.
+/// `a` is the attempt alias. Match the Task entry as well: history must never
+/// park a later entry, or compete with any admitted successor.
+pub const UNOWNED_QUARANTINED_IMPORT: &str = "a.current=0 AND a.state='quarantined' AND a.failure_kind='corrupt_import' AND json_extract(a.import_source_json,'$.decision.reason')='missing execution or pinned workspace' AND a.effect_intent_json IS NULL AND a.operation_id IS NULL AND a.current_operation_state IS NULL AND NOT EXISTS(SELECT 1 FROM integration_attempt successor WHERE successor.task_ref=a.task_ref AND successor.id<>a.id) AND EXISTS(SELECT 1 FROM task entry WHERE entry.id=a.task_ref AND entry.status=a.expected_status AND entry.status_epoch=a.expected_epoch AND entry.deleted_at IS NULL)";
+
+impl SqliteDb {
+    pub async fn unowned_quarantined_import(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<IntegrationAttempt>> {
+        sqlx::query(&format!("SELECT a.* FROM integration_attempt a WHERE a.task_ref=? AND ({UNOWNED_QUARANTINED_IMPORT})"))
+            .bind(task_id).fetch_optional(self.pool()).await?.map(map_attempt).transpose()
+    }
+}
+
 /// One acknowledgment, written with the Task write it answers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntegrationStepAckWrite {

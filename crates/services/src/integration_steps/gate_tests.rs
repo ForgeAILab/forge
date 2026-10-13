@@ -6,6 +6,152 @@ use super::*;
 use crate::integration_worker::{HeadDriver, Pass};
 use api_types::TaskAction;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quarantined_imports_without_execution_or_pinned_workspace_park_and_retry_current_head() {
+    for missing_execution in [true, false] {
+        let world = World::new().await;
+        let old_head = world.legacy_task("orphan", "orphan.txt", "merging").await;
+        if !missing_execution {
+            let execution = world.seed_execution("orphan", "executor", None).await;
+            sqlx::query("UPDATE execution SET workspace_id=NULL WHERE id=?")
+                .bind(execution)
+                .execute(world.db.pool())
+                .await
+                .unwrap();
+        }
+        // Reproduce a previous build's start: it committed the import but
+        // never enqueued a continuation for its non-current quarantine.
+        let imported = world.db.import_integration_pass(100).await.unwrap();
+        assert_eq!(imported.quarantined, 1);
+        let id: String =
+            sqlx::query_scalar("SELECT id FROM integration_attempt WHERE task_ref='orphan'")
+                .fetch_one(world.db.pool())
+                .await
+                .unwrap();
+        let orphan = world.attempt(&id).await;
+        assert!(!orphan.current);
+        assert_eq!(orphan.state, S::Quarantined);
+        assert_eq!(
+            orphan.failure_kind,
+            Some(db::IntegrationFailureKind::CorruptImport)
+        );
+        assert_eq!(
+            orphan.failure_message.as_deref(),
+            Some("missing execution or pinned workspace")
+        );
+        let report = import::import_at_start(&world.db).await.unwrap();
+        assert_eq!(report.imported, 0);
+        assert_eq!(
+            report.continuations, 1,
+            "a previous start's quarantine needs its park step"
+        );
+        world
+            .until("orphan", "the quarantine is an owner park", || async {
+                integration(&world.task("orphan").await)["cause"] == "owner_required"
+            })
+            .await;
+        let parked = world.task("orphan").await;
+        assert_eq!(parked.status, "merging");
+        assert!(matches!(parked.condition, db::TaskCondition::Parked { .. }));
+        assert_eq!(
+            integration(&parked)["message"],
+            "missing execution or pinned workspace"
+        );
+        let summary = crate::integration_reads::task_integration(&world.db, &parked)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.state, api_types::IntegrationMemberState::Deferred);
+        assert_eq!(
+            summary.wait.unwrap().code,
+            api_types::IntegrationWaitCode::OwnerRequired
+        );
+        assert_eq!(
+            summary.action_hint,
+            Some(api_types::IntegrationActionHint::Retry)
+        );
+        let offers = world.offers("orphan").await;
+        assert!(
+            offers.contains(&("retry".into(), "integration_retry".into())),
+            "{offers:?}"
+        );
+        assert!(offers.iter().any(|(verb, _)| verb == "cancel"));
+        crate::AttentionService::new(world.db.clone())
+            .project_once(100)
+            .await
+            .unwrap();
+        let attention: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE status='open' AND json_extract(details_json,'$.entity_id')='orphan'")
+            .fetch_one(world.db.pool()).await.unwrap();
+        assert_eq!(attention, 1);
+        let operations = crate::OperatorStatusService::new_for_test(world.db.clone())
+            .compute_status()
+            .await
+            .unwrap();
+        assert_eq!(operations.integration_queues.quarantined_imports, 1);
+        let unchanged = import::import_at_start(&world.db).await.unwrap();
+        assert_eq!((unchanged.imported, unchanged.continuations), (0, 0));
+
+        // An unpinned historical execution cannot prove review provenance.
+        // Supply a present implementation run rather than rewriting history.
+        // The no-execution case also proves Retry can use the current branch
+        // without inventing a historical run.
+        if !missing_execution {
+            world.seed_execution("orphan", "executor", None).await;
+        }
+        // Retry must bind and check the present HEAD, not the import's candidate.
+        std::fs::write(world.tree("orphan").join("current.txt"), "current\n").unwrap();
+        git::commit_all(&world.tree("orphan"), "current candidate")
+            .await
+            .unwrap();
+        let current_head = git::get_current_sha(&world.tree("orphan")).await.unwrap();
+        assert_ne!(old_head, current_head);
+        review_ci(&world, "orphan", &["test -f current.txt"]).await;
+        let production = Production::new(&world);
+        world
+            .act(
+                "orphan",
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+            )
+            .await;
+        let admitted = world
+            .db
+            .current_integration_attempt("orphan")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.state, S::Queued);
+        assert_ne!(admitted.id, orphan.id);
+        assert_eq!(
+            admitted.original_candidate_sha.as_deref(),
+            Some(current_head.as_str())
+        );
+        let running = production.run();
+        world
+            .until(
+                "orphan",
+                "Retry validates and merges the present branch",
+                || async { world.task("orphan").await.status == "done" },
+            )
+            .await;
+        assert!(world.on_main("current.txt").await);
+        assert_eq!(world.merges("orphan").await, 1);
+        let checks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE id IN (SELECT run_id FROM check_consumer WHERE origin='integration' AND task_id='orphan')")
+            .fetch_one(world.db.pool()).await.unwrap();
+        assert_eq!(
+            checks, 1,
+            "the quarantined import cannot skip the head check"
+        );
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    }
+}
+
 impl World {
     /// A Task in `merging` that nothing has admitted (no attempt, no entry
     /// step), with its implementation run, then admitted by the reconciler's
