@@ -1742,26 +1742,68 @@ mod tests {
     const T1: &str = "2025-01-01T00:00:01+00:00";
     const T20: &str = "2025-01-01T00:00:20+00:00";
 
+    /// The one set of roles that never get worktree write access: the runner
+    /// (launch config, discarded-changes message) and the native Task session
+    /// both call `is_read_only_task_role`, so this table is the contract.
     #[test]
-    fn runner_and_native_task_roles_share_read_only_policy() {
+    fn read_only_roles_are_the_reviewer_and_the_planner() {
         for (role, read_only) in [
-            ("planner", true),
-            ("reviewer", true),
+            (crate::workflow::default_roles::PLANNER, true),
+            (crate::workflow::default_roles::REVIEWER, true),
+            (crate::workflow::default_roles::CODER, false),
             ("worker", false),
-            ("coder", false),
             ("executor", false),
             ("auditor", false),
             ("interactive", false),
             ("system", false),
             ("custom", false),
+            ("Planner", false),
+            ("", false),
         ] {
-            assert_eq!(is_read_only_task_role(role), read_only, "runner: {role}");
-            assert_eq!(
-                is_read_only_task_role(role),
-                crate::embedded_task_executor::is_read_only_task_role(role),
-                "runner and native Task session disagree for {role}"
-            );
+            assert_eq!(is_read_only_task_role(role), read_only, "{role:?}");
         }
+    }
+
+    /// No second definition of the set: every use in the services crate goes
+    /// through the one function, and the role names appear as a read-only
+    /// pair nowhere else.
+    #[test]
+    fn read_only_role_set_has_one_definition() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path, text));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let definitions: Vec<_> = files
+            .iter()
+            .filter(|(_, text)| {
+                text.lines().any(|line| {
+                    let line = line.trim_start();
+                    (line.starts_with("fn ") || line.contains(" fn "))
+                        && line.contains("read_only")
+                        && line.contains("role")
+                        && line.contains("-> bool")
+                })
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "one read-only role predicate, found in {definitions:?}"
+        );
+        assert!(definitions[0].ends_with("embedded_task_executor.rs"));
     }
 
     #[test]

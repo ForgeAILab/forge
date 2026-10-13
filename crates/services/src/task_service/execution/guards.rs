@@ -3,6 +3,19 @@ use super::*;
 /// The error an execution carries when its launch was deferred for free
 /// disk ([`TaskService::defer_launch_for_disk`]).
 pub(crate) const DISK_PRE_DISPATCH_ERROR_PREFIX: &str = "waiting for free disk before launch: ";
+/// Error prefix of a run that was admitted and then not launched because its
+/// Agent was paused in between. The Task's Agent wait is its recovery.
+pub(crate) const AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX: &str = "Agent paused before launch: ";
+
+/// A run ended by [`TaskService::defer_launch_for_paused_agent`]. It is not
+/// an execution failure of the Task: it takes no retry and no block.
+pub(crate) fn is_agent_paused_pre_dispatch_failure(execution: &db::Execution) -> bool {
+    execution.status == ExecutionStatus::Failed
+        && execution
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX))
+}
 
 impl TaskService {
     /// Refuse paused Projects before placement or launch side effects. The
@@ -330,7 +343,10 @@ impl TaskService {
     }
 
     /// A paused assigned Agent can revoke launch eligibility after admission.
-    /// The Agent wait owns recovery; no Task retry or setup refusal is needed.
+    /// The Agent wait owns recovery: the run ends auto-resumable under
+    /// [`AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX`], which keeps it out of the
+    /// Task's execution-failure handling (no retry spent, no block), and the
+    /// dispatcher parks the Task on the Agent until it is resumed.
     pub(super) async fn defer_launch_for_paused_agent(
         &self,
         execution: &db::Execution,
@@ -354,9 +370,14 @@ impl TaskService {
         {
             return Ok(None);
         }
-        self.fail_execution_before_dispatch_inner(&execution.id, error.to_string(), false, true)
-            .await
-            .map(Some)
+        self.fail_execution_before_dispatch_inner(
+            &execution.id,
+            format!("{AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX}{error}"),
+            false,
+            true,
+        )
+        .await
+        .map(Some)
     }
 
     /// Terminalize a pre-dispatch execution while leaving its Task projection

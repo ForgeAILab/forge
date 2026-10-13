@@ -10,6 +10,7 @@ mod cascade;
 mod environment;
 mod follow_up;
 mod guards;
+pub(crate) use guards::is_agent_paused_pre_dispatch_failure;
 #[cfg(test)]
 pub(crate) use guards::DISK_PRE_DISPATCH_ERROR_PREFIX;
 mod hooks;

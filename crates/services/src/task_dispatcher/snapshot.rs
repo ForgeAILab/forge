@@ -490,6 +490,7 @@ impl TaskDispatcher {
                         && !f.retry_pending
                         && metadata["last_execution_failure_execution_id"] != e.id
                         && !crate::project_environment::is_environment_pre_dispatch_failure(e)
+                        && !crate::task_service::execution::is_agent_paused_pre_dispatch_failure(e)
                         && crate::task_service::execution::should_block_task_for_failed_execution(e)
                     {
                         f.terminal_execution = Some(e.id.clone());

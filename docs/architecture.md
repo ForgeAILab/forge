@@ -6119,8 +6119,18 @@ role from its own rows, and no row is copied onto it.
 | `lead_check`, nothing running | the root has a lead (a restart between the entry and the run) | the step check | `Step::Role` | — |
 | `lead_check`, a check running | the lead is removed, or the Agent that is the lead is archived | the run is stopped; then `done`, bridge `gate_skipped`, in the next dispatcher pass | `TaskService::wake_step_checks_of` (from role removal and, for an archived Agent, `TaskService::lead_removed_from` after the archive sweep), then `Step::SkipGate` | — |
 | `lead_check`, nothing running | the lead's Agent is paused (or cannot be reached) | stays; `parked` with `agent { agent_id, status }` naming the lead's Agent; the check starts when the Agent is resumed | `next_step` (`Reason::AgentWait`), as for a planning root whose planner is paused | — |
-| `lead_check`, admitted check has not launched | the lead's Agent is paused between admission and launch | the unlaunched attempt ends auto-resumable; the subtask parks on the Agent and resume starts a fresh check | `TaskService::defer_launch_for_paused_agent`; no persistent setup refusal | — |
+| `lead_check`, admitted check has not launched | the lead's Agent is paused between admission and launch | the unlaunched attempt ends auto-resumable; the subtask parks on the Agent and resume starts a fresh check; while the Agent stays paused nothing is launched again | `TaskService::defer_launch_for_paused_agent`; no persistent setup refusal | — |
 | `lead_check`, a check running | the lead's Agent is paused | the run goes on and its verdict settles the step (a pause starts nothing and stops nothing) | — | — |
+
+The admission-to-launch pause is handled the same way for every role of
+every Task (a coder on a plain Task as well): the run ends `failed` with
+`resume_policy = auto` and an error that starts with `Agent paused before
+launch: `. That prefix keeps it out of execution-failure handling: no retry is
+spent, no retry delay is taken and the Task is not blocked. The dispatcher's
+next pass parks the Task on the Agent (`parked`, `agent { agent_id, status:
+paused }`), and the resume starts a fresh run. An Agent that was archived
+instead is not deferred: the run fails as a setup refusal and the archive
+sweep settles its roles.
 
 "No dispatcher decision" in the no-lead row means the skip does not depend on
 one, not that the dispatcher never looks: the subtask is in `lead_check` for
@@ -6710,6 +6720,16 @@ write-lock acquisition and a claimed mutation's persistence and release are
 not cancelled by the five-second queue response ceiling; SQLite's busy timeout
 bounds database lock waits. A mutation still pending behind another Task step
 returns `task_busy` at the deadline and remains queued.
+
+A claimed mutation's wait is bounded too. A command waiter learns of a lost
+claimer from its reply channel; a mutation waiter has none, so the step lease
+is its bound. When the lease of a claimed mutation lapses without a
+settlement (its claimer stopped between claim and release), the waiter takes
+the step over through the normal claim. A settled mutation whose release was
+lost answers when its lease lapses. A mutation that stays claimed under a live
+owner for 90 seconds (one 60-second lease plus SQLite's 30-second lock
+timeout) returns `task_busy` and remains queued: no caller waits without a
+bound.
 
 Cancel/Hold preempts scripts, CI and startup at a safe point. Integration is
 protected from its start (`integration_started_at`) through its result and
