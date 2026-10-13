@@ -125,24 +125,4 @@ describe('answering a lead question against the server', () => {
     // (the answer is a comment on the root; the root's wait is cleared).
     expect(view.invalidate).toHaveBeenCalledWith({ queryKey: ['tasks', 'root-1'] })
   })
-
-  it('says the question was withdrawn when the item comes back resolved', async () => {
-    // The root was cancelled or its lead removed: `clear_lead_input_wait`
-    // resolved the item and raised its version, so the answer is refused.
-    apiFetch.mockRejectedValueOnce(
-      new ApiError('resource version conflict', 409, undefined, {
-        code: 'version_conflict',
-        message: 'resource version conflict',
-      } as never),
-    )
-    const view = mount(<LeadInputAnswer item={item} />)
-    type('Use parser A.')
-    fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
-    await screen.findByRole('alert')
-    view.rerender(<LeadInputAnswer item={{ ...item, lifecycle: 'resolved', version: 8 }} />)
-    expect(screen.queryByRole('textbox')).toBeNull()
-    expect(screen.getByRole('status').textContent).toContain('no longer waiting')
-    // The answer the owner typed is not thrown away with the form.
-    expect(screen.getByText('Use parser A.')).toBeTruthy()
-  })
 })

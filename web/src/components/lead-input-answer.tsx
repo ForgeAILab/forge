@@ -108,12 +108,6 @@ export function LeadInputAnswer({ item }: { item: AttentionItem }) {
             </p>
           ) : null}
         </form>
-      ) : !submit.isSuccess && answer.trim() ? (
-        // Closed under a draft: the root was cancelled or its lead removed.
-        <div role="status" className="space-y-1 text-xs text-muted-foreground">
-          <p>The lead is no longer waiting for this answer, so it was not sent. Your draft:</p>
-          <p className="whitespace-pre-wrap break-words text-foreground">{answer}</p>
-        </div>
       ) : null}
     </div>
   )
