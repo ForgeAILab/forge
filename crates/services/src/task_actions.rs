@@ -783,9 +783,19 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             retry(None, None, Some(true)),
             &["reset_budget", "guidance"],
             &[Owner, ProjectAgent],
+            // A coordination root parked on its spent re-plan budget has no
+            // run to retry: the fresh budget is the whole recovery, and the
+            // root's own next step (re-plan, or its aggregate review) follows.
             if condition == Some(FailureKind::RetryExhausted)
                 && role.is_some()
                 && (snapshot.has_agent && !snapshot.project_paused)
+                && !condition_read
+                    .interruption
+                    .as_ref()
+                    .is_some_and(|interruption| {
+                        interruption.source.as_deref()
+                            == Some(crate::task_service::replan::REPLAN_BLOCK_SOURCE)
+                    })
             {
                 "execution_retry_exhausted"
             } else {

@@ -14,6 +14,10 @@ pub enum TransitionBridgeKind {
     GateRejected,
     CiOnlyReviewPassed,
     ReviewCarry,
+    /// A coordination root with a lead goes back to its planning state: its
+    /// aggregate review was rejected, or its current subtask parked needing
+    /// a decision. The payload names the trigger.
+    Replan,
 }
 
 impl TransitionBridgeKind {
@@ -29,6 +33,7 @@ impl TransitionBridgeKind {
             Self::GateRejected => "gate_rejected",
             Self::CiOnlyReviewPassed => "ci_only_review_passed",
             Self::ReviewCarry => "review_carry",
+            Self::Replan => "replan",
         }
     }
     pub const fn is_review_refresh(self) -> bool {
@@ -56,6 +61,7 @@ impl std::str::FromStr for TransitionBridgeKind {
             "gate_rejected" => Ok(Self::GateRejected),
             "ci_only_review_passed" => Ok(Self::CiOnlyReviewPassed),
             "review_carry" => Ok(Self::ReviewCarry),
+            "replan" => Ok(Self::Replan),
             _ => Err(format!("unknown transition bridge kind: {value}")),
         }
     }

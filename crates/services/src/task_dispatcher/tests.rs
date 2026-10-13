@@ -10500,5 +10500,7 @@ mod equivalence;
 mod lead_check;
 #[path = "tests/root_lead.rs"]
 mod root_lead;
+#[path = "tests/root_replan.rs"]
+mod root_replan;
 #[path = "tests/scheduler.rs"]
 mod scheduler;

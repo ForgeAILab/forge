@@ -680,6 +680,11 @@ fn interruption_reasons(
                     match kind {
                         Some("review_budget_exhausted") => Some(crate::budget::Kind::Review),
                         Some("merge_fix_budget_exhausted") => Some(crate::budget::Kind::MergeFix),
+                        // A coordination root whose re-plan budget is spent
+                        // (`replan_coordination_root`).
+                        Some("retry_exhausted") if is(fields, "source", "replan") => {
+                            Some(crate::budget::Kind::Replan)
+                        }
                         _ => None,
                     }
                 },

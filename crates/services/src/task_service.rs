@@ -76,6 +76,7 @@ pub(crate) use update::state_retired_auditor_notices;
 pub(crate) use update::RETIRED_AUDITOR_CONFIG;
 mod roles;
 pub(crate) use roles::RoleSweepEvent;
+pub(crate) mod replan;
 mod subtask;
 mod transition;
 pub(crate) use transition::next_workflow_state;
