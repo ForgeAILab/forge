@@ -150,7 +150,7 @@ impl SqliteDb {
         }
         let metadata_json = metadata.to_json();
         let condition = crate::task_condition::metadata_condition(
-            &mut **transaction,
+            transaction,
             root_id,
             metadata_json.as_deref(),
         )

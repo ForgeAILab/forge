@@ -229,11 +229,12 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
         shape_before,
         "columns, foreign keys, indexes and triggers are what they were"
     );
-    let ddl: String =
-        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_comment'")
-            .fetch_one(&pool)
-            .await
-            .expect("table reads");
+    let ddl: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_comment'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("table reads");
     assert!(ddl.contains("'handoff', 'request_input'"), "{ddl}");
 
     let indexes: Vec<String> = sqlx::query_scalar(

@@ -922,10 +922,7 @@ impl TaskService {
                     execution_id: Some(run.execution_id.clone()),
                     role: Some(binding.role.clone()),
                     worklog_kind: Some(db::COMMENT_KIND_REQUEST_INPUT.to_owned()),
-                    idempotency_key: Some(format!(
-                        "lead:{}:{key}",
-                        db::COMMENT_KIND_REQUEST_INPUT
-                    )),
+                    idempotency_key: Some(format!("lead:{}:{key}", db::COMMENT_KIND_REQUEST_INPUT)),
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 },

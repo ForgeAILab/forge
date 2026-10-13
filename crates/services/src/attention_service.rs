@@ -1912,13 +1912,21 @@ impl AttentionService {
             if current.version != expected_version {
                 return Err(ServiceError::from(db::DbError::VersionConflict));
             }
-            let answer = answer.filter(|answer| answer.chars().count() <= 4000).ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "this item is a question from a Task's lead: resolve it with `answer` (1 to 4000 characters)",
-                )
-            })?;
             let details =
                 serde_json::from_str::<Value>(&current.details_json).unwrap_or(Value::Null);
+            // Read by a person (a client without an answer box shows it as
+            // is): what the item is, the question, and what to send.
+            let answer = answer.filter(|answer| answer.chars().count() <= 4000).ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "This item is a question from a Task's lead and is resolved by answering it. Question: \"{}\". Send the answer as `answer` (1 to 4000 characters) with `expected_version` to POST /api/v1/mission-control/attention/{id}/resolve; the Task waits until then.",
+                    details["question"]
+                        .as_str()
+                        .unwrap_or(current.summary.as_str())
+                        .chars()
+                        .take(500)
+                        .collect::<String>()
+                ))
+            })?;
             let (Some(task_id), Some(comment_id)) =
                 (details["task_id"].as_str(), details["comment_id"].as_str())
             else {

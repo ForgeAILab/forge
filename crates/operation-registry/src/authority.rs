@@ -566,37 +566,63 @@ mod tests {
     /// was before the lead existed.
     #[test]
     fn narrowing_revokes_on_any_other_caller_for_every_principal_kind() {
-        let task = |identity: &str, execution: &str, role, session: Option<&str>, lead: Option<&str>| {
-            Principal::TaskAgent {
-                identity_id: identity.into(),
-                execution_id: execution.into(),
-                role,
-                runtime_session_id: session.map(str::to_owned),
-                lead_root_id: lead.map(str::to_owned),
-            }
-        };
+        let task =
+            |identity: &str, execution: &str, role, session: Option<&str>, lead: Option<&str>| {
+                Principal::TaskAgent {
+                    identity_id: identity.into(),
+                    execution_id: execution.into(),
+                    role,
+                    runtime_session_id: session.map(str::to_owned),
+                    lead_root_id: lead.map(str::to_owned),
+                }
+            };
         let kinds = [
             (
-                Principal::InteractiveUser { user_id: "u".into() },
-                vec![Principal::InteractiveUser { user_id: "v".into() }],
+                Principal::InteractiveUser {
+                    user_id: "u".into(),
+                },
+                vec![Principal::InteractiveUser {
+                    user_id: "v".into(),
+                }],
             ),
             (
-                Principal::DelegatedUser { user_id: "u".into() },
+                Principal::DelegatedUser {
+                    user_id: "u".into(),
+                },
                 vec![
-                    Principal::DelegatedUser { user_id: "v".into() },
-                    Principal::InteractiveUser { user_id: "u".into() },
+                    Principal::DelegatedUser {
+                        user_id: "v".into(),
+                    },
+                    Principal::InteractiveUser {
+                        user_id: "u".into(),
+                    },
                 ],
             ),
             (
-                Principal::MainAgent { identity_id: "a".into() },
-                vec![Principal::MainAgent { identity_id: "b".into() }],
+                Principal::MainAgent {
+                    identity_id: "a".into(),
+                },
+                vec![Principal::MainAgent {
+                    identity_id: "b".into(),
+                }],
             ),
             (
-                Principal::ProjectAgent { identity_id: "a".into(), project_id: "p".into() },
+                Principal::ProjectAgent {
+                    identity_id: "a".into(),
+                    project_id: "p".into(),
+                },
                 vec![
-                    Principal::ProjectAgent { identity_id: "b".into(), project_id: "p".into() },
-                    Principal::ProjectAgent { identity_id: "a".into(), project_id: "q".into() },
-                    Principal::MainAgent { identity_id: "a".into() },
+                    Principal::ProjectAgent {
+                        identity_id: "b".into(),
+                        project_id: "p".into(),
+                    },
+                    Principal::ProjectAgent {
+                        identity_id: "a".into(),
+                        project_id: "q".into(),
+                    },
+                    Principal::MainAgent {
+                        identity_id: "a".into(),
+                    },
                 ],
             ),
             (
@@ -611,7 +637,10 @@ mod tests {
                     task("a", "run", TaskRole::Worker, Some("s"), Some("root")),
                     task("a", "run", TaskRole::Planner, Some("t"), Some("root")),
                     task("a", "run", TaskRole::Planner, None, Some("root")),
-                    Principal::ProjectAgent { identity_id: "a".into(), project_id: "p".into() },
+                    Principal::ProjectAgent {
+                        identity_id: "a".into(),
+                        project_id: "p".into(),
+                    },
                 ],
             ),
         ];

@@ -1324,7 +1324,12 @@ async fn a_step_check_run_has_no_lead_operation() {
         ),
     ] {
         let denied = ops
-            .call(&checked.id, operation, payload.clone(), &format!("{operation}:{payload}"))
+            .call(
+                &checked.id,
+                operation,
+                payload.clone(),
+                &format!("{operation}:{payload}"),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1426,7 +1431,10 @@ async fn two_questions_at_once_ask_one() {
     );
     let waiting = reload(&lead.db, &root.id).await;
     let metadata: Value = serde_json::from_str(waiting.metadata_json.as_deref().unwrap()).unwrap();
-    assert_eq!(metadata["awaiting_human_marker_id"], questions[0].id.as_str());
+    assert_eq!(
+        metadata["awaiting_human_marker_id"],
+        questions[0].id.as_str()
+    );
 }
 
 /// A lead cannot make itself a worker (its runs read the repository; a
@@ -1693,7 +1701,7 @@ async fn question_items(lead: &Lead, status: &str) -> i64 {
 /// waits, and its question is not left open for the owner to find later.
 #[tokio::test]
 async fn cancelling_a_root_that_waits_for_an_answer_closes_the_question() {
-    let mut ops = ops_fixture(true).await;
+    let ops = ops_fixture(true).await;
     let (root, child) = root_with_child(&ops.lead, true).await;
     ops.script(vec![vec![Call::Raw(
         "lead.request_input",
@@ -1736,7 +1744,7 @@ async fn cancelling_a_root_that_waits_for_an_answer_closes_the_question() {
 /// answer releases the root, which goes on without a lead.
 #[tokio::test]
 async fn a_lead_removed_during_the_wait_leaves_an_answerable_question() {
-    let mut ops = ops_fixture(true).await;
+    let ops = ops_fixture(true).await;
     let (root, child) = root_with_child(&ops.lead, true).await;
     ops.script(vec![vec![Call::Raw(
         "lead.request_input",

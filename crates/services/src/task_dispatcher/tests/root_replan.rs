@@ -542,7 +542,10 @@ async fn a_spent_replan_budget_parks_the_root_with_a_typed_park_and_an_exit() {
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(spent(&lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await, 1);
+    assert_eq!(
+        spent(&lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await,
+        1
+    );
 
     // The exit: the owner's retry with a fresh budget lets the lead plan.
     let service = &lead.dispatcher.task_service;
