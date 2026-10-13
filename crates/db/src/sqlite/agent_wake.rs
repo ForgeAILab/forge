@@ -884,3 +884,377 @@ impl SqliteDb {
         Ok(disposition)
     }
 }
+
+impl SqliteDb {
+    pub async fn prior_blocker_turn_ids(&self, attention_id: &str) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT turn_job_id FROM agent_wake_blocker WHERE attention_id = ? ORDER BY turn_job_id")
+.bind(attention_id)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn failed_wake_matches_current_profile_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        incident_key: &str,
+        incident_digest: Option<&str>,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_disposition d JOIN agent_chat_turn_job j ON j.id=d.turn_job_id JOIN agent_identity i ON i.id=j.responder_identity_id JOIN agent_profile p ON p.id=i.selected_profile_id WHERE d.disposition='turn_admitted' AND d.incident_key=? AND d.incident_digest=? AND j.status='failed' AND j.profile_id=p.id AND j.profile_version=p.version)")
+.bind(incident_key)
+.bind(incident_digest)
+.fetch_one(connection)
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_project_batch_is_cooling_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        now: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_batch WHERE project_id = ? AND cooldown_until > ?)")
+.bind(project_id)
+.bind(now)
+.fetch_one(connection)
+.await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct ActiveIncidentWakeLeaseInTxInput<'a> {
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub incident_key: &'a str,
+    pub leased_after: &'a str,
+    pub cooldown_after: &'a str,
+}
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct ActiveIncidentWakeLeaseRow {
+    pub leased_until: crate::Result<String>,
+    pub cooldown_until: crate::Result<Option<String>>,
+}
+
+impl SqliteDb {
+    pub async fn active_incident_wake_lease_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ActiveIncidentWakeLeaseInTxInput<'_>,
+    ) -> crate::Result<Option<ActiveIncidentWakeLeaseRow>> {
+        let rows = sqlx::query(
+            "SELECT identity_id, leased_until, cooldown_until
+             FROM agent_wake_lease
+             WHERE scope_type = ? AND scope_id = ? AND incident_key = ?
+               AND (leased_until > ? OR cooldown_until > ?)
+             ORDER BY leased_until DESC, identity_id ASC
+             LIMIT 1",
+        )
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.incident_key)
+        .bind(input.leased_after)
+        .bind(input.cooldown_after)
+        .fetch_optional(connection)
+        .await?;
+        rows.map(|row| {
+            Ok(ActiveIncidentWakeLeaseRow {
+                leased_until: row.try_get("leased_until").map_err(crate::DbError::from),
+                cooldown_until: row.try_get("cooldown_until").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct WakeBudgetWindowRow {
+    pub window_started_at: crate::Result<String>,
+    pub admitted_count: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn wake_budget_window_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        scope_type: &str,
+        scope_id: &str,
+        category: &str,
+    ) -> crate::Result<Option<WakeBudgetWindowRow>> {
+        let rows = sqlx::query(
+            "SELECT window_started_at, admitted_count
+                 FROM agent_wake_budget_window
+                 WHERE scope_type = ? AND scope_id = ? AND category = ?",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(category)
+        .fetch_optional(connection)
+        .await?;
+        rows.map(|row| {
+            Ok(WakeBudgetWindowRow {
+                window_started_at: row
+                    .try_get("window_started_at")
+                    .map_err(crate::DbError::from),
+                admitted_count: row.try_get("admitted_count").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn shared_wake_budget_used_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        scope_type: &str,
+        scope_id: &str,
+        window_started: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(admitted_count), 0) FROM agent_wake_budget_window
+                     WHERE scope_type = ? AND scope_id = ? AND window_started_at > ?",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(window_started)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct IncrementWakeBudgetWindowInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub updated_at: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub category: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn increment_wake_budget_window_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: IncrementWakeBudgetWindowInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_wake_budget_window
+                     SET admitted_count = admitted_count + 1, identity_id = ?,
+                         version = version + 1, updated_at = ?
+                     WHERE scope_type = ? AND scope_id = ? AND category = ?",
+        )
+        .bind(input.identity_id)
+        .bind(input.updated_at)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.category)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct StartWakeBudgetWindowInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub category: &'a str,
+    pub window_started_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn start_wake_budget_window_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: StartWakeBudgetWindowInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_wake_budget_window (
+                        identity_id, scope_type, scope_id, category, window_started_at,
+                        window_seconds, admitted_count, version, updated_at
+                     ) VALUES (?, ?, ?, ?, ?, 3600, 1, 1, ?)
+                     ON CONFLICT(scope_type, scope_id, category) DO UPDATE SET
+                        window_started_at = excluded.window_started_at,
+                        identity_id = excluded.identity_id,
+                        admitted_count = 1,
+                        version = agent_wake_budget_window.version + 1,
+                        updated_at = excluded.updated_at",
+        )
+        .bind(input.identity_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.category)
+        .bind(input.window_started_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct AdmitIncidentWakeLeaseInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub incident_key: &'a str,
+    pub lease_owner: &'a str,
+    pub leased_until: &'a str,
+    pub reaction_depth: i64,
+    pub updated_at: &'a str,
+    pub cooldown_until: &'a str,
+    pub last_admitted_at: &'a str,
+    pub correlation_id: &'a str,
+    pub causation_id: Option<&'a str>,
+}
+
+impl SqliteDb {
+    pub async fn admit_incident_wake_lease_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: AdmitIncidentWakeLeaseInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_wake_lease (
+                identity_id, scope_type, scope_id, incident_key, lease_owner,
+                leased_until, reaction_depth, updated_at, cooldown_until,
+                last_admitted_at, admission_count, correlation_id, causation_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(identity_id, scope_type, scope_id, incident_key) DO UPDATE SET
+                lease_owner = excluded.lease_owner,
+                leased_until = excluded.leased_until,
+                reaction_depth = excluded.reaction_depth,
+                updated_at = excluded.updated_at,
+                cooldown_until = excluded.cooldown_until,
+                last_admitted_at = excluded.last_admitted_at,
+                admission_count = agent_wake_lease.admission_count + 1,
+                correlation_id = excluded.correlation_id,
+                causation_id = excluded.causation_id
+             WHERE agent_wake_lease.leased_until <= excluded.updated_at
+               AND (agent_wake_lease.cooldown_until IS NULL
+                    OR agent_wake_lease.cooldown_until <= excluded.updated_at)",
+        )
+        .bind(input.identity_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.incident_key)
+        .bind(input.lease_owner)
+        .bind(input.leased_until)
+        .bind(input.reaction_depth)
+        .bind(input.updated_at)
+        .bind(input.cooldown_until)
+        .bind(input.last_admitted_at)
+        .bind(input.correlation_id)
+        .bind(input.causation_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct RecordLatestAttentionWakeInTxInput<'a> {
+    pub attention_id: &'a str,
+    pub incident_digest: &'a str,
+    pub disposition: &'a str,
+    pub reason: &'a str,
+    pub identity_id: Option<&'a str>,
+    pub updated_at: &'a str,
+    pub existing_attention_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn record_latest_attention_wake_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: RecordLatestAttentionWakeInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_attention_latest(attention_id,incident_digest,disposition,reason,identity_id,updated_at)
+                 SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM attention_projection WHERE id=?)
+                 ON CONFLICT(attention_id) DO UPDATE SET incident_digest=excluded.incident_digest,
+                    disposition=excluded.disposition, reason=excluded.reason,
+                    identity_id=excluded.identity_id, updated_at=excluded.updated_at")
+.bind(input.attention_id)
+.bind(input.incident_digest)
+.bind(input.disposition)
+.bind(input.reason)
+.bind(input.identity_id)
+.bind(input.updated_at)
+.bind(input.existing_attention_id)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_admitted_wake_blocker_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+        incident_digest: String,
+        turn_job_id: &str,
+        admitted_at: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_blocker(attention_id,incident_digest,turn_job_id,admitted_at) VALUES(?,?,?,?)
+                         ON CONFLICT(attention_id,incident_digest) DO UPDATE SET turn_job_id=excluded.turn_job_id,
+                            admitted_at=excluded.admitted_at, escalation_id=NULL, recorded_outcome=NULL,
+                            legacy_source_event_id=NULL")
+.bind(attention_id)
+.bind(incident_digest)
+.bind(turn_job_id)
+.bind(admitted_at)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_admitted_wake_batch_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        admitted_at: &str,
+        cooldown_until: Option<String>,
+        turn_job_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_batch(project_id,admitted_at,cooldown_until,turn_job_id) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET admitted_at=excluded.admitted_at,cooldown_until=excluded.cooldown_until,turn_job_id=excluded.turn_job_id")
+.bind(project_id)
+.bind(admitted_at)
+.bind(cooldown_until)
+.bind(turn_job_id)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn rearm_answered_escalation_blockers_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        turn_job_id: &str,
+        admitted_at: &str,
+        escalation_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_wake_blocker SET turn_job_id = ?, escalation_id = NULL,
+                        recorded_outcome = NULL, admitted_at = ?
+                     WHERE escalation_id = ?",
+        )
+        .bind(turn_job_id)
+        .bind(admitted_at)
+        .bind(escalation_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

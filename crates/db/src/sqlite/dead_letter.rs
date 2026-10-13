@@ -293,6 +293,20 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    pub async fn recent_attention_worker_error(
+        &self,
+        consumer_name: &str,
+        dead_lettered_since: String,
+    ) -> crate::Result<Option<(String, String)>> {
+        Ok(sqlx::query_as("SELECT error_kind, last_error FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL AND dead_lettered_at >= ? ORDER BY dead_lettered_at DESC LIMIT 1")
+.bind(consumer_name)
+.bind(dead_lettered_since)
+.fetch_optional(self.pool())
+.await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,9 +67,9 @@ impl TaskService {
         agent: &Agent,
         role: &str,
     ) -> Result<bool> {
-        let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
-            .bind(&task.project_id)
-            .fetch_optional(self.db.pool())
+        let raw: String = self
+            .db
+            .workspace_admission_project_settings(&task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
         let settings = serde_json::from_str::<ProjectSettings>(&raw).map_err(|error| {
@@ -128,11 +128,13 @@ impl TaskService {
         let empty = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
         let registry = self.daemon_connections.as_deref().unwrap_or(&empty);
         let mut tx = self.db.pool().begin().await?;
-        let workspace_id: Option<String> =
-            sqlx::query_scalar("SELECT id FROM workspace WHERE task_id = ?")
-                .bind(task.parent_task_id.as_deref().unwrap_or(&task.id))
-                .fetch_optional(&mut *tx)
-                .await?;
+        let workspace_id: Option<String> = self
+            .db
+            .workspace_admission_task_workspace_id_in_tx(
+                &mut tx,
+                task.parent_task_id.as_deref().unwrap_or(&task.id),
+            )
+            .await?;
         let path = prepared
             .repo
             .local_path
@@ -286,13 +288,24 @@ impl TaskService {
             .to_string()
         });
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let result = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
-            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
-            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
-            error_annotation = COALESCE(?, error_annotation),
-            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ? AND status = ?")
-            .bind(&deferral).bind(&deferral).bind(&annotation).bind(&blocked).bind(now.to_rfc3339()).bind(i64::from(!unchanged_reason))
-            .bind(&task.id).bind(task.version).bind(&task.status).identity_fenced().execute_in_tx(&mut tx).await?;
+        let result = self
+            .db
+            .record_placement_refusal_in_tx(
+                &mut tx,
+                &task.id,
+                db::RecordPlacementRefusalInTxInput {
+                    deferral: &deferral,
+                    deferral_value: &deferral,
+                    annotation: &annotation,
+                    blocked: &blocked,
+                    updated_at: now.to_rfc3339(),
+                    version_increment: i64::from(!unchanged_reason),
+                    task_id: &task.id,
+                    expected_version: task.version,
+                    expected_status: &task.status,
+                },
+            )
+            .await?;
         // The dispatcher records refusals outside the Task lease, where this
         // blocking deferral is queued. It is identity-fenced to the status it
         // was computed for: it lands unless the Task moved on (then moot), so
@@ -301,8 +314,16 @@ impl TaskService {
             return Err(DbError::VersionConflict.into());
         }
         if let Some(owner_wait) = owner_wait.filter(|_| !unchanged_reason) {
-            let _queued_or_applied = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ? AND status = ?")
-                .bind(owner_wait).bind(&task.id).bind(&task.status).identity_fenced().execute_in_tx(&mut tx).await?;
+            let _queued_or_applied = self
+                .db
+                .record_placement_owner_wait_in_tx(
+                    &mut tx,
+                    &task.id,
+                    owner_wait,
+                    &task.id,
+                    &task.status,
+                )
+                .await?;
         }
         if daemon_id.is_some() && !unchanged_reason {
             crate::placement::admission::record_wait_attention_in_tx(
@@ -369,11 +390,19 @@ impl TaskService {
             return Ok(true);
         }
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
-            .bind(&task.id).bind(current.version).execute_in_tx(&mut tx).await?.require_applied()?;
-        sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
-            .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
-            .bind(format!("task-environment-wait:{}", task.id)).execute(&mut *tx).await?;
+        self.db
+            .clear_expired_placement_wait_in_tx(&mut tx, &task.id, &task.id, current.version)
+            .await?
+            .require_applied()?;
+        self.db
+            .resolve_expired_placement_wait_attention_in_tx(
+                &mut tx,
+                now_rfc3339(),
+                now_rfc3339(),
+                format!("task-owner-wait:{}", task.id),
+                format!("task-environment-wait:{}", task.id),
+            )
+            .await?;
         tx.commit().await?;
         Ok(false)
     }
@@ -460,15 +489,10 @@ impl TaskService {
                     || role.agent.daemon_id == server_facts.execution_daemon_id
             })
         {
-            let bound_location = sqlx::query_scalar::<_, String>(
-                "SELECT p.repo_location_id FROM workspace_placement p
-                 JOIN workspace w ON w.id = p.workspace_id WHERE w.task_id = ?
-                 AND (p.state IN ('reserved', 'preparing', 'ready', 'disconnected', 'cleaning')
-                      OR (p.state = 'failed' AND p.workspace_handle IS NOT NULL))",
-            )
-            .bind(workspace_task_id)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let bound_location = self
+                .db
+                .workspace_admission_bound_repo_location(workspace_task_id)
+                .await?;
             let lock_key = repo
                 .local_path
                 .as_deref()
@@ -484,14 +508,21 @@ impl TaskService {
                 });
             let locks = self.repo_cache_locks.clone().unwrap_or_default();
             // Use the same physical-source key as every clone/worktree writer.
-            let locations: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
-                "SELECT id, path, version, last_error FROM repo_location WHERE repo_id = ?
-                 AND owner_kind = 'server' AND daemon_id IS NULL AND runtime_id IS NULL
-                 AND kind = 'managed_clone' AND (status = 'unverified' OR (status = 'unavailable' AND last_error LIKE '{%')
-                      OR (status = 'invalid' AND last_error = 'managed_clone_is_worktree'))
-                 AND (? IS NULL OR id = ?)")
-                .bind(&repo.id).bind(&bound_location).bind(&bound_location).fetch_all(self.db.pool()).await?;
-            for (id, path, version, last_error) in locations {
+            let locations: Vec<db::CloneVerificationLocationRow> = self
+                .db
+                .workspace_admission_clone_verification_locations(
+                    &repo.id,
+                    &bound_location,
+                    &bound_location,
+                )
+                .await?;
+            for db::CloneVerificationLocationRow {
+                id,
+                path,
+                version,
+                last_error,
+            } in locations
+            {
                 let original_path = path.clone();
                 let retry: Value = last_error
                     .as_deref()
@@ -587,29 +618,26 @@ impl TaskService {
         if current_authority.repo_id != repo.id {
             return Err(DbError::VersionConflict.into());
         }
-        let project_version =
-            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
-                .bind(&task.project_id)
-                .fetch_one(&mut *transaction)
-                .await?;
+        let project_version = self
+            .db
+            .workspace_admission_project_version_in_tx(&mut transaction, &task.project_id)
+            .await?;
         if project_version != authority.project.version {
             return Err(DbError::VersionConflict.into());
         }
         for role in claiming_agent.iter().chain(worktree_agents.iter()) {
-            let current_version =
-                sqlx::query_scalar::<_, i64>("SELECT version FROM agent_current WHERE id = ?")
-                    .bind(&role.agent.id)
-                    .fetch_optional(&mut *transaction)
-                    .await?;
+            let current_version = self
+                .db
+                .workspace_admission_agent_version_in_tx(&mut transaction, &role.agent.id)
+                .await?;
             if current_version != Some(role.agent.version) {
                 return Err(DbError::VersionConflict.into());
             }
         }
-        let workspace_id =
-            sqlx::query_scalar::<_, String>("SELECT id FROM workspace WHERE task_id = ?")
-                .bind(workspace_task_id)
-                .fetch_optional(&mut *transaction)
-                .await?;
+        let workspace_id = self
+            .db
+            .workspace_admission_workspace_id_in_tx(&mut transaction, workspace_task_id)
+            .await?;
         let existing = match workspace_id.as_deref() {
             Some(id) => {
                 WorkspacePlacementRepo::get_by_workspace_id_in_tx(&*self.db, &mut transaction, id)
@@ -618,12 +646,10 @@ impl TaskService {
             None => None,
         };
         if let Some(workspace_id) = workspace_id.as_deref() {
-            if let Some(execution_id) = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM execution WHERE workspace_id = ? AND status = 'running' LIMIT 1",
-            )
-            .bind(workspace_id)
-            .fetch_optional(&mut *transaction)
-            .await?
+            if let Some(execution_id) = self
+                .db
+                .workspace_admission_running_execution_id_in_tx(&mut transaction, workspace_id)
+                .await?
             {
                 return Err(ServiceError::execution_already_running(
                     "repository",
@@ -654,11 +680,10 @@ impl TaskService {
                 ),
             });
         }
-        let location_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repo_location WHERE repo_id = ? AND owner_kind = 'server' AND daemon_id IS NULL")
-                .bind(&repo.id)
-                .fetch_one(&mut *transaction)
-                .await?;
+        let location_count = self
+            .db
+            .workspace_admission_server_location_count_in_tx(&mut transaction, &repo.id)
+            .await?;
         if location_count == 0 {
             let source = repo
                 .local_path
@@ -758,14 +783,15 @@ impl TaskService {
                     .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
             )
         } else {
-            let row = sqlx::query("SELECT id FROM repo_location WHERE repo_id = ? AND owner_kind = 'server' AND status = 'ready'
-                AND daemon_id IS NULL ORDER BY is_default DESC, created_at, id LIMIT 1")
-                .bind(&repo.id).fetch_optional(&mut *transaction).await?;
+            let row = self
+                .db
+                .workspace_admission_ready_server_location_in_tx(&mut transaction, &repo.id)
+                .await?;
             let location_id = existing
                 .as_ref()
                 .filter(|placement| placement.owner_kind == PlacementOwnerKind::Server)
                 .map(|placement| placement.repo_location_id.clone())
-                .or_else(|| row.map(|row| row.get("id")))
+                .or_else(|| row.map(|row| row.id()))
                 .ok_or_else(|| {
                     ServiceError::PlacementUnavailable(crate::placement::PlacementUnavailable {
                         task_id: task.id.clone(),
@@ -796,17 +822,25 @@ impl TaskService {
             } else {
                 String::new()
             };
-            sqlx::query("INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'creating', ?, ?)")
-                .bind(&workspace_id).bind(workspace_task_id).bind(&repo.id).bind(server_path)
-                .bind(::workspace::task_branch_name(workspace_task_id)).bind(&now).bind(&now)
-                .execute(&mut *transaction).await?;
+            self.db
+                .insert_creating_admission_workspace_in_tx(
+                    &mut transaction,
+                    db::InsertCreatingAdmissionWorkspaceInTxInput {
+                        id: &workspace_id,
+                        task_id: workspace_task_id,
+                        repo_id: &repo.id,
+                        worktree_path: server_path,
+                        branch: ::workspace::task_branch_name(workspace_task_id),
+                        created_at: &now,
+                        updated_at: &now,
+                    },
+                )
+                .await?;
         } else {
-            let workspace_repo =
-                sqlx::query_scalar::<_, String>("SELECT repo_id FROM workspace WHERE id = ?")
-                    .bind(&workspace_id)
-                    .fetch_one(&mut *transaction)
-                    .await?;
+            let workspace_repo = self
+                .db
+                .workspace_admission_repo_id_in_tx(&mut transaction, &workspace_id)
+                .await?;
             if workspace_repo != repo.id {
                 return Err(ServiceError::WorkspaceResetRequired {
                     task_id: workspace_task_id.to_owned(),
@@ -909,8 +943,14 @@ impl TaskService {
             } else {
                 String::new()
             };
-            sqlx::query("UPDATE workspace SET status = 'creating', worktree_path = ?, error = NULL, updated_at = ? WHERE id = ?")
-                .bind(path).bind(&placement.updated_at).bind(&workspace_id).execute(&mut *transaction).await?;
+            self.db
+                .mark_reserved_workspace_creating_in_tx(
+                    &mut transaction,
+                    path,
+                    &placement.updated_at,
+                    &workspace_id,
+                )
+                .await?;
         }
         if let Some(context) = context.as_mut() {
             context.existing_placement = Some(placement.clone());
@@ -1255,12 +1295,22 @@ impl TaskService {
         update.reserved_until = Some(None);
         admission.placement =
             WorkspacePlacementRepo::update_in_tx(&*self.db, &mut transaction, update).await?;
-        sqlx::query("UPDATE workspace SET status = 'ready', branch = ?, before_sha = COALESCE(before_sha, ?),
-                worktree_path = ?, error = NULL, cleanup_after = NULL, cleanup_attempts = 0,
-                last_cleanup_error = NULL, updated_at = ? WHERE id = ?")
-            .bind(prepared.branch).bind(prepared.base_sha)
-            .bind(if admission.placement.owner_kind == PlacementOwnerKind::Server { prepared.handle } else { String::new() })
-            .bind(now).bind(&admission.workspace.id).execute(&mut *transaction).await?;
+        self.db
+            .mark_prepared_admission_workspace_ready_in_tx(
+                &mut transaction,
+                db::MarkPreparedAdmissionWorkspaceReadyInTxInput {
+                    branch: prepared.branch,
+                    before_sha: prepared.base_sha,
+                    worktree_path: if admission.placement.owner_kind == PlacementOwnerKind::Server {
+                        prepared.handle
+                    } else {
+                        String::new()
+                    },
+                    updated_at: now,
+                    workspace_id: &admission.workspace.id,
+                },
+            )
+            .await?;
         transaction.commit().await?;
         admission.workspace = WorkspaceRepo::get_by_id(&*self.db, &admission.workspace.id)
             .await?
@@ -1289,11 +1339,10 @@ impl TaskService {
             for role in
                 std::iter::once(&previous.claiming_agent).chain(previous.worktree_agents.iter())
             {
-                let current_version =
-                    sqlx::query_scalar::<_, i64>("SELECT version FROM agent_current WHERE id = ?")
-                        .bind(&role.agent.id)
-                        .fetch_optional(&mut **transaction)
-                        .await?;
+                let current_version = self
+                    .db
+                    .workspace_claim_agent_version_in_tx(transaction, &role.agent.id)
+                    .await?;
                 if current_version != Some(role.agent.version) {
                     return Err(DbError::VersionConflict.into());
                 }
@@ -1328,20 +1377,19 @@ impl TaskService {
             context.environment_admission = admission.environment_admission;
             crate::placement::select_placement(&context).into_result()?;
         }
-        db::task_writer::TaskQuery::new(&self.db,&task.id,
-            "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.environment_wait', '$.deferred_dispatch')
-            WHERE id = ? AND (json_type(metadata_json, '$.owner_wait') IS NOT NULL
-            OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)",
-        )
-        .bind(&task.id)
-        .execute_in_tx(transaction)
-        .await?
-        .require_applied()?;
-        sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
-            WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
-            .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
-            .bind(format!("task-environment-wait:{}", task.id))
-            .execute(&mut **transaction).await?;
+        self.db
+            .clear_claim_placement_waits_in_tx(transaction, &task.id, &task.id)
+            .await?
+            .require_applied()?;
+        self.db
+            .resolve_claim_placement_wait_attention_in_tx(
+                transaction,
+                now_rfc3339(),
+                now_rfc3339(),
+                format!("task-owner-wait:{}", task.id),
+                format!("task-environment-wait:{}", task.id),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -2249,34 +2297,27 @@ async fn server_repo_location_in_tx(
     } else {
         RepoLocationKind::ManagedClone
     };
-    let existing = sqlx::query(
-        "SELECT id, status, version FROM repo_location
-         WHERE repo_id = ? AND owner_kind = 'server' AND daemon_id IS NULL
-           AND runtime_id IS NULL AND kind = ? AND path = ?
-         ORDER BY created_at ASC, id ASC LIMIT 1",
+    let existing = db::SqliteDb::prepared_server_repo_location_in_tx(
+        transaction,
+        &repo.id,
+        kind.to_string(),
+        source,
     )
-    .bind(&repo.id)
-    .bind(kind.to_string())
-    .bind(source)
-    .fetch_optional(&mut **transaction)
     .await?;
     if let Some(row) = existing {
-        let id: String = row.try_get("id")?;
-        let status: String = row.try_get("status")?;
+        let id: String = row.id?;
+        let status: String = row.status?;
         if status != "ready" {
-            let version: i64 = row.try_get("version")?;
-            let result = sqlx::query(
-                "UPDATE repo_location SET status = 'ready', last_verified_at = ?,
-                 last_error = NULL, version = version + 1, updated_at = ?
-                 WHERE id = ? AND version = ?",
+            let version: i64 = row.version?;
+            let result = db::SqliteDb::mark_prepared_server_repo_location_ready_in_tx(
+                transaction,
+                now,
+                now,
+                &id,
+                version,
             )
-            .bind(now)
-            .bind(now)
-            .bind(&id)
-            .bind(version)
-            .execute(&mut **transaction)
             .await?;
-            if result.rows_affected() == 0 {
+            if result == 0 {
                 return Err(DbError::VersionConflict);
             }
         }
@@ -2284,21 +2325,19 @@ async fn server_repo_location_in_tx(
     }
 
     let id = new_uuid_v4();
-    sqlx::query(
-        "INSERT INTO repo_location (
-            id, repo_id, owner_kind, path, kind, is_default, status,
-            last_verified_at, created_at, updated_at
-         ) VALUES (?, ?, 'server', ?, ?, ?, 'ready', ?, ?, ?)",
+    db::SqliteDb::insert_prepared_server_repo_location_in_tx(
+        transaction,
+        db::InsertPreparedServerRepoLocationInTxInput {
+            id: &id,
+            repo_id: &repo.id,
+            source,
+            kind: kind.to_string(),
+            is_default: kind == RepoLocationKind::PrimaryCheckout,
+            last_verified_at: now,
+            created_at: now,
+            updated_at: now,
+        },
     )
-    .bind(&id)
-    .bind(&repo.id)
-    .bind(source)
-    .bind(kind.to_string())
-    .bind(kind == RepoLocationKind::PrimaryCheckout)
-    .bind(now)
-    .bind(now)
-    .bind(now)
-    .execute(&mut **transaction)
     .await?;
     Ok(id)
 }
@@ -2345,21 +2384,20 @@ async fn persist_prepared_workspace(
     input: CreateWorkspace,
 ) -> Result<Workspace> {
     let mut transaction = db::begin_immediate(db.pool()).await?;
-    sqlx::query(
-        "INSERT INTO workspace (
-            id, task_id, repo_id, worktree_path, branch, status, before_sha, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    db.insert_prepared_server_workspace_in_tx(
+        &mut transaction,
+        db::InsertPreparedServerWorkspaceInTxInput {
+            id: &input.id,
+            task_id: &input.task_id,
+            repo_id: &input.repo_id,
+            worktree_path: &input.worktree_path,
+            branch: &input.branch,
+            status: input.status.to_string(),
+            before_sha: input.before_sha.as_deref(),
+            created_at: &input.created_at,
+            updated_at: &input.updated_at,
+        },
     )
-    .bind(&input.id)
-    .bind(&input.task_id)
-    .bind(&input.repo_id)
-    .bind(&input.worktree_path)
-    .bind(&input.branch)
-    .bind(input.status.to_string())
-    .bind(input.before_sha.as_deref())
-    .bind(&input.created_at)
-    .bind(&input.updated_at)
-    .execute(&mut *transaction)
     .await?;
     let location_id =
         server_repo_location_in_tx(&mut transaction, repo, source, &input.updated_at).await?;
@@ -2442,16 +2480,15 @@ async fn persist_recovered_workspace(
         )
         .await?;
     }
-    let result = sqlx::query(
-        "UPDATE workspace SET status = 'ready', worktree_path = ?, error = NULL, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(worktree_path.to_string_lossy().as_ref())
-    .bind(now)
-    .bind(&workspace.id)
-    .execute(&mut *transaction)
-    .await?;
-    if result.rows_affected() == 0 {
+    let result = db
+        .mark_server_workspace_ready_in_tx(
+            &mut transaction,
+            worktree_path.to_string_lossy().as_ref(),
+            now,
+            &workspace.id,
+        )
+        .await?;
+    if result == 0 {
         return Err(DbError::NotFound.into());
     }
     transaction.commit().await?;
@@ -2478,12 +2515,9 @@ pub(super) async fn reset_daemon_workspace(
 ) -> Result<Workspace> {
     use crate::workspace_backend::{PreparedWorkspace, ResetSpec, WorkspaceBackendError};
     let placement = &resolved.placement;
-    let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
-    )
-    .bind(&workspace.id)
-    .fetch_one(db.pool())
-    .await?;
+    let running: bool = db
+        .owner_workspace_has_running_execution(&workspace.id)
+        .await?;
     if running {
         return Err(ServiceError::invalid_operation(
             "cannot reset an owner workspace with a running execution",
@@ -2499,18 +2533,9 @@ pub(super) async fn reset_daemon_workspace(
         .ok_or_else(|| ServiceError::invalid_operation("placement generation exhausted"))?;
     // A receipt can survive the owner reset while the placement CAS did
     // not. Apply that result before issuing any read with the old fence.
-    let retained = sqlx::query_scalar::<_, String>(
-        "SELECT outcome_json FROM command_receipt WHERE operation = 'daemon.workspace.reset'
-         AND principal_id = 'workspace-backend'
-         AND json_extract(outcome_json, '$.metadata.placement_id') = ?
-         AND json_extract(outcome_json, '$.metadata.generation') = ?
-         AND json_extract(outcome_json, '$.metadata.status') = 'result'
-         ORDER BY committed_at DESC, id DESC LIMIT 1",
-    )
-    .bind(&placement.id)
-    .bind(generation)
-    .fetch_optional(db.pool())
-    .await?;
+    let retained = db
+        .retained_owner_workspace_reset_outcome(&placement.id, generation)
+        .await?;
     let prepared = if let Some(retained) = retained {
         let retained: serde_json::Value = serde_json::from_str(&retained).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid reset receipt: {error}"))
@@ -2561,12 +2586,9 @@ pub(super) async fn reset_daemon_workspace(
         ));
     }
     let mut transaction = db::begin_immediate(db.pool()).await?;
-    let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
-    )
-    .bind(&workspace.id)
-    .fetch_one(&mut *transaction)
-    .await?;
+    let running: bool = db
+        .owner_workspace_has_running_execution_in_tx(&mut transaction, &workspace.id)
+        .await?;
     if running {
         return Err(db::DbError::VersionConflict.into());
     }
@@ -2577,10 +2599,14 @@ pub(super) async fn reset_daemon_workspace(
     update.disconnected_at = Some(None);
     update.failure_cause = Some(None);
     db::WorkspacePlacementRepo::update_in_tx(db, &mut transaction, update).await?;
-    sqlx::query("UPDATE workspace SET status = 'ready', before_sha = ?, branch = ?, cleanup_after = NULL,
-            cleanup_attempts = 0, last_cleanup_error = NULL, error = NULL, updated_at = ? WHERE id = ?")
-        .bind(prepared.base_sha).bind(prepared.branch).bind(now_rfc3339()).bind(&workspace.id)
-        .execute(&mut *transaction).await?;
+    db.record_owner_workspace_reset_in_tx(
+        &mut transaction,
+        prepared.base_sha,
+        prepared.branch,
+        now_rfc3339(),
+        &workspace.id,
+    )
+    .await?;
     crate::placement::admission::resolve_workspace_attention_in_tx(
         db,
         &mut transaction,

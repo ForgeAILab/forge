@@ -2324,3 +2324,178 @@ impl SqliteDb {
             .collect()
     }
 }
+
+impl SqliteDb {
+    pub async fn running_execution_ids_for_temp_sweep(&self) -> crate::Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT id FROM execution WHERE status = 'running'")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn running_retired_review_task_ids(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT DISTINCT task_id FROM execution WHERE status = 'running' AND role IN ('reviewer','auditor')")
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn latest_owner_failed_execution_ids(
+        &self,
+        workspace_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT e.id FROM execution e WHERE e.workspace_id = ? AND e.status = 'failed'
+         AND e.stop_reason = 'daemon_disconnected' AND json_valid(e.error)
+         AND json_extract(e.error, '$.cause')
+             IN ('owner_disconnected_timeout', 'owner_lost_execution')
+         AND NOT EXISTS (SELECT 1 FROM execution newer WHERE newer.task_id = e.task_id
+             AND CASE newer.role WHEN 'executor' THEN 'coder' ELSE newer.role END
+                 = CASE e.role WHEN 'executor' THEN 'coder' ELSE e.role END
+             AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id)))")
+.bind(workspace_id)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn latest_terminal_workspace_execution_ids(
+        &self,
+        workspace_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT e.id FROM execution e WHERE e.workspace_id = ? AND e.status != 'running'
+         AND NOT EXISTS (SELECT 1 FROM execution newer WHERE newer.task_id = e.task_id
+             AND CASE newer.role WHEN 'executor' THEN 'coder' ELSE newer.role END
+                 = CASE e.role WHEN 'executor' THEN 'coder' ELSE e.role END
+             AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id)))
+         ORDER BY e.created_at DESC, e.id DESC")
+.bind(workspace_id)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn unplaced_daemon_running_execution_ids(
+        &self,
+        created_before: &str,
+        daemon_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT e.id FROM execution e
+         LEFT JOIN workspace_placement p ON p.workspace_id = e.workspace_id
+         LEFT JOIN agent_current a ON a.id = e.agent_id
+         WHERE e.status = 'running' AND e.created_at < ?
+           AND (p.owner_kind IS NULL OR p.owner_kind != 'daemon')
+           AND CASE WHEN e.workspace_id IS NOT NULL
+               THEN CASE p.owner_kind WHEN 'daemon' THEN p.daemon_id ELSE p.execution_daemon_id END
+               ELSE COALESCE(NULLIF(TRIM(json_extract(e.executor_config_snapshot_json, '$.daemon_id')), ''), a.daemon_id)
+               END = ?
+         ORDER BY e.created_at, e.id")
+.bind(created_before)
+.bind(daemon_id)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_running_execution_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        workspace_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM execution WHERE workspace_id = ? AND status = 'running' LIMIT 1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_workspace_has_running_execution(
+        &self,
+        workspace_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
+        )
+        .bind(workspace_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_workspace_has_running_execution_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        workspace_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
+        )
+        .bind(workspace_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn current_orphan_attempt_task_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        execution_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT candidate.task_id FROM execution candidate
+            WHERE candidate.id = ? AND candidate.status IN ('failed', 'cancelled')
+              AND (candidate.resume_policy IS NULL OR candidate.resume_policy = 'manual')
+              AND (candidate.stop_reason IS NULL OR candidate.stop_reason NOT IN ('user_cancelled', 'role_reassigned'))
+              AND NOT EXISTS (
+                  SELECT 1 FROM execution successor
+                  WHERE successor.task_id = candidate.task_id AND successor.id <> candidate.id
+                    AND (successor.status = 'running'
+                         OR successor.parent_execution_id = candidate.id
+                         OR successor.created_at > candidate.created_at)
+              )")
+.bind(execution_id)
+.fetch_optional(connection)
+.await?)
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionVisibleActiveExecutionCountRow {
+    pub count: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn attention_visible_active_execution_count(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> crate::Result<Option<AttentionVisibleActiveExecutionCountRow>> {
+        let (predicate, values) = Self::attention_project_visibility_predicate(user_id, project_id);
+        // Keep the query construction below explicit; it avoids interpolating
+        // authorization values while allowing account and project scopes.
+        let active_sql = format!(
+            "SELECT COUNT(*) AS count FROM execution e
+             JOIN task t ON t.id = e.task_id JOIN project p ON p.id = t.project_id
+             WHERE e.status = 'running' AND t.deleted_at IS NULL AND {predicate}"
+        );
+        let mut active_query = sqlx::query(&active_sql);
+        for value in &values {
+            active_query = active_query.bind(value);
+        }
+        let active = active_query.fetch_optional(self.pool()).await?;
+        Ok(active.map(|row| AttentionVisibleActiveExecutionCountRow {
+            count: row.try_get("count").map_err(crate::DbError::from),
+        }))
+    }
+}

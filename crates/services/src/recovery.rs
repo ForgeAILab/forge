@@ -96,10 +96,7 @@ impl CrashRecovery {
     /// older than the longest run. An execution still recorded as running
     /// keeps its directory and loses it when it settles.
     async fn sweep_dead_run_temp_dirs(&self) -> Result<()> {
-        let live: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM execution WHERE status = 'running'")
-                .fetch_all(self.db.pool())
-                .await?;
+        let live: Vec<String> = self.db.running_execution_ids_for_temp_sweep().await?;
         let mut task_root_dirs = HashSet::new();
         for placement in
             WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Ready).await?
@@ -223,11 +220,9 @@ impl CrashRecovery {
             running.sort();
             let key = format!("recover_task_after_restart:{}", running.join(","));
             let prefix = format!("{key}:");
-            let queued: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND substr(causation_key,1,length(?))=?)")
-                .bind(&task.id)
-                .bind(&prefix)
-                .bind(&prefix)
-                .fetch_one(self.db.pool())
+            let queued: bool = self
+                .db
+                .pending_recovery_command_exists(&task.id, &prefix, &prefix)
                 .await?;
             if queued {
                 continue;
@@ -263,12 +258,7 @@ impl CrashRecovery {
         // auditor executions `running` under leases only that pipeline
         // renewed. Nothing runs them now: stop them at start, whatever their
         // lease says, and let each Task's review entry run again.
-        let leftover_tasks: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT task_id FROM execution WHERE status = 'running' AND role IN ('reviewer','auditor')",
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let leftover_tasks: Vec<String> = self.db.running_retired_review_task_ids().await?;
         for task_id in leftover_tasks {
             let mut leftovers = ExecutionRepo::list_running_by_task(&*self.db, &task_id)
                 .await?
@@ -285,11 +275,9 @@ impl CrashRecovery {
             };
             let key = format!("settle_retired_review_rerun:{}", leftovers.join(","));
             let prefix = format!("{key}:");
-            let queued: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND substr(causation_key,1,length(?))=?)")
-                .bind(&task.id)
-                .bind(&prefix)
-                .bind(&prefix)
-                .fetch_one(self.db.pool())
+            let queued: bool = self
+                .db
+                .pending_retired_review_settlement_exists(&task.id, &prefix, &prefix)
                 .await?;
             if queued {
                 continue;
@@ -352,24 +340,10 @@ async fn reconcile_unreplayable_local_usage_invocations(db: &SqliteDb) -> Result
         if execution.status == ExecutionStatus::Running {
             continue;
         }
-        let previous_owner = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT json_extract(payload_json, '$.previous_lease_owner')
-             FROM domain_event
-             WHERE entity_type = 'task'
-               AND entity_id = ?
-               AND event_type IN (
-                   'execution.completed', 'execution.failed',
-                   'execution.cancelled', 'execution.terminal_report.received'
-               )
-               AND json_extract(payload_json, '$.execution_id') = ?
-             ORDER BY sequence DESC
-             LIMIT 1",
-        )
-        .bind(&execution.task_id)
-        .bind(&execution.id)
-        .fetch_optional(db.pool())
-        .await?
-        .flatten();
+        let previous_owner = db
+            .terminal_execution_previous_owner(&execution.task_id, &execution.id)
+            .await?
+            .flatten();
         if previous_owner
             .as_deref()
             .is_some_and(|owner| owner.starts_with("daemon:"))
@@ -2140,12 +2114,19 @@ async fn record_disconnected_attention(
     placement: &WorkspacePlacement,
 ) -> Result<()> {
     let daemon_id = placement_execution_daemon_id(placement);
-    let incident_current: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM attention_projection a JOIN domain_event e ON e.id = a.source_event_id
-         WHERE a.dedupe_key = ? AND e.dedupe_key = ? AND a.status != 'resolved')")
-        .bind(format!("workspace-owner:{}", placement.id))
-        .bind(format!("workspace-disconnect:{}:{}", placement.id, placement.disconnected_at.as_deref().unwrap_or(&placement.updated_at)))
-        .fetch_one(db.pool()).await?;
+    let incident_current: bool = db
+        .workspace_disconnect_incident_is_current(
+            format!("workspace-owner:{}", placement.id),
+            format!(
+                "workspace-disconnect:{}:{}",
+                placement.id,
+                placement
+                    .disconnected_at
+                    .as_deref()
+                    .unwrap_or(&placement.updated_at)
+            ),
+        )
+        .await?;
     if incident_current {
         return Ok(());
     }
@@ -2361,12 +2342,12 @@ impl HeartbeatMonitor {
         let retained = serde_json::to_string(&registry.retained_terminal_execution_ids())
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let recent = (Utc::now() - ChronoDuration::seconds(60)).to_rfc3339();
-        let ready_to_retry: HashSet<String> = sqlx::query_scalar(
-            "SELECT p.id FROM workspace_placement p WHERE p.state = 'ready' AND (
-                EXISTS (SELECT 1 FROM execution e JOIN json_each(?) report ON e.id = report.value WHERE e.workspace_id = p.workspace_id)
-                OR EXISTS (SELECT 1 FROM domain_event ev WHERE ev.entity_type = 'workspace_placement' AND ev.entity_id = p.id
-                    AND ev.event_type = 'workspace.owner_reconciled' AND ev.created_at >= ?))")
-            .bind(retained).bind(recent).fetch_all(self.db.pool()).await?.into_iter().collect();
+        let ready_to_retry: HashSet<String> = self
+            .db
+            .ready_owner_retry_placement_ids(retained, recent)
+            .await?
+            .into_iter()
+            .collect();
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         for state in [PlacementState::Disconnected, PlacementState::Ready] {
             for placement in WorkspacePlacementRepo::list_by_state(&*self.db, state).await? {
@@ -2610,11 +2591,9 @@ async fn annotate_owner_recovery(
         .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
     let mut transaction = db::begin_immediate(db.pool()).await?;
     let dedupe_key = format!("workspace-execution-recovery:{}", execution.id);
-    let recorded: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)")
-            .bind(&dedupe_key)
-            .fetch_one(&mut *transaction)
-            .await?;
+    let recorded: bool = db
+        .owner_recovery_event_exists_in_tx(&mut transaction, &dedupe_key)
+        .await?;
     if recorded {
         transaction.rollback().await?;
         return Ok(());
@@ -2651,13 +2630,20 @@ async fn annotate_owner_recovery(
             .filter(|state| state.kind == api_types::StateKind::Terminal)
             .map(|state| state.name.clone())
             .collect::<Vec<_>>();
-        let updated = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?
-            AND deleted_at IS NULL AND failed_json IS NULL AND status NOT IN (SELECT value FROM json_each(?))
-            AND (error_annotation IS NULL OR (json_valid(error_annotation) AND json_extract(error_annotation, '$.blocking_reason') IN ('owner_disconnected_timeout', 'owner_lost_execution')))")
-            .bind(annotation.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version)
-            .bind(serde_json::to_string(&terminal).expect("terminal states serialize"))
-            .identity_fenced()
-            .execute_in_tx(&mut transaction).await?;
+        let updated = db
+            .annotate_owner_recovery_in_tx(
+                &mut transaction,
+                &task.id,
+                db::AnnotateOwnerRecoveryInTxInput {
+                    annotation: annotation.to_string(),
+                    updated_at: now_rfc3339(),
+                    task_id: &task.id,
+                    expected_version: task.version,
+                    terminal_states_json: serde_json::to_string(&terminal)
+                        .expect("terminal states serialize"),
+                },
+            )
+            .await?;
         if updated.applied().is_some_and(|rows| rows != 1) {
             return Err(db::DbError::VersionConflict.into());
         }
@@ -2708,16 +2694,9 @@ pub(crate) fn owner_execution_failure_cause(
 }
 
 async fn repair_owner_recovery(db: &SqliteDb, placement: &WorkspacePlacement) -> Result<bool> {
-    let execution_ids = sqlx::query_scalar::<_, String>(
-        "SELECT e.id FROM execution e WHERE e.workspace_id = ? AND e.status = 'failed'
-         AND e.stop_reason = 'daemon_disconnected' AND json_valid(e.error)
-         AND json_extract(e.error, '$.cause')
-             IN ('owner_disconnected_timeout', 'owner_lost_execution')
-         AND NOT EXISTS (SELECT 1 FROM execution newer WHERE newer.task_id = e.task_id
-             AND CASE newer.role WHEN 'executor' THEN 'coder' ELSE newer.role END
-                 = CASE e.role WHEN 'executor' THEN 'coder' ELSE e.role END
-             AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id)))")
-        .bind(&placement.workspace_id).fetch_all(db.pool()).await?;
+    let execution_ids = db
+        .latest_owner_failed_execution_ids(&placement.workspace_id)
+        .await?;
     let mut lost_execution = false;
     for execution_id in execution_ids {
         let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? else {
@@ -2810,8 +2789,12 @@ pub(crate) async fn apply_owner_cleanup(
                 placement_update(&placement, PlacementState::Cleaned, None),
             )
             .await?;
-            sqlx::query("UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, cleanup_attempts = 0, last_cleanup_error = NULL, error = NULL, updated_at = ? WHERE id = ?")
-                .bind(now_rfc3339()).bind(&placement.workspace_id).execute(&mut *transaction).await?;
+            db.mark_owner_workspace_cleaned_in_tx(
+                &mut transaction,
+                now_rfc3339(),
+                &placement.workspace_id,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(DaemonTerminalDisposition::Acknowledge);
         }
@@ -3199,28 +3182,16 @@ async fn complete_workspace_reconciliation(
     let Some(daemon_id) = placement_execution_daemon_id(placement) else {
         return Ok(false);
     };
-    let recorded_head = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT head_sha FROM (
-         SELECT head_sha, recorded_at AS evidence_at, placement_id AS evidence_id FROM workspace_expected_head
-         WHERE placement_id = ? AND generation = ?
-         UNION ALL
-         SELECT e.after_sha AS head_sha, (COALESCE(e.stopped_at, (SELECT MIN(receipt.created_at) FROM execution_terminal_receipt receipt WHERE receipt.execution_id = e.id), e.created_at)) AS evidence_at, e.id AS evidence_id FROM execution e WHERE e.workspace_id = ? AND e.after_sha IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM command_receipt reset
-             WHERE reset.operation = 'daemon.workspace.reset'
-               AND json_extract(reset.outcome_json, '$.metadata.placement_id') = ?
-               AND json_extract(reset.outcome_json, '$.metadata.generation') = ?
-               AND json_extract(reset.outcome_json, '$.metadata.status') = 'result'
-               AND julianday(reset.committed_at) > julianday(e.created_at))
-         ) ORDER BY julianday(evidence_at) DESC, evidence_id DESC LIMIT 1",
-    )
-    .bind(&placement.id)
-    .bind(placement.generation)
-    .bind(&placement.workspace_id)
-    .bind(&placement.id)
-    .bind(placement.generation)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let recorded_head = db
+        .recorded_owner_workspace_head(db::RecordedOwnerWorkspaceHeadInput {
+            placement_id: &placement.id,
+            generation: placement.generation,
+            workspace_id: &placement.workspace_id,
+            reset_placement_id: &placement.id,
+            reset_generation: placement.generation,
+        })
+        .await?
+        .flatten();
     let recorded_head = match recorded_head {
         Some(head) => Some(head),
         None => db::WorkspaceRepo::get_by_id(db, &placement.workspace_id)
@@ -3262,31 +3233,28 @@ async fn complete_workspace_reconciliation(
         payload_json: json!({"task_id": ready.task_id, "placement_id": ready.id, "head_sha": state.head_sha}).to_string(),
         created_at: now_rfc3339(),
     }).await?;
-    sqlx::query(
-        "UPDATE attention_projection SET status = 'resolved', resolved_at = ?,
-        snoozed_until = NULL, source_event_id = ?, updated_at = ?, version = version + 1
-        WHERE dedupe_key = ? AND status <> 'resolved'",
+    db.resolve_reconciled_owner_attention_in_tx(
+        &mut transaction,
+        now_rfc3339(),
+        &event.id,
+        now_rfc3339(),
+        format!("workspace-owner:{}", ready.id),
     )
-    .bind(now_rfc3339())
-    .bind(&event.id)
-    .bind(now_rfc3339())
-    .bind(format!("workspace-owner:{}", ready.id))
-    .execute(&mut *transaction)
     .await?;
-    db::task_writer::BulkTaskQuery::new(db,
-        "UPDATE task SET metadata_json = json_remove(COALESCE(metadata_json, '{}'),
-        '$.dispatch_disposition', '$.deferred_dispatch', '$.owner_wait'), version = version + 1, updated_at = ?
-        WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
-        AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-             OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
-             OR json_type(metadata_json, '$.owner_wait') IS NOT NULL)",
+    db.clear_reconciled_owner_waits_in_tx(
+        &mut transaction,
+        now_rfc3339(),
+        &ready.task_id,
+        &ready.task_id,
     )
-    .bind(now_rfc3339())
-    .bind(&ready.task_id)
-    .bind(&ready.task_id)
-    .execute_in_tx(&mut transaction)
     .await?;
-    let exhausted_tasks:Vec<String>=sqlx::query_scalar("SELECT id FROM task WHERE (id=? OR parent_task_id=?) AND deleted_at IS NULL AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation,'$.blocking_reason')='review_ci_infrastructure_exhausted'").bind(&ready.task_id).bind(&ready.task_id).fetch_all(&mut *transaction).await?;
+    let exhausted_tasks: Vec<String> = db
+        .owner_reconnect_exhausted_review_task_ids_in_tx(
+            &mut transaction,
+            &ready.task_id,
+            &ready.task_id,
+        )
+        .await?;
     for task in exhausted_tasks {
         let window = format!("reconnect:{}:{}", ready.id, ready.version);
         db::budget::reset(
@@ -3296,20 +3264,26 @@ async fn complete_workspace_reconciliation(
             &window,
         )
         .await?;
-        sqlx::query("UPDATE task SET entry_barrier_json=json_set(entry_barrier_json,'$.started_at',?) WHERE id=?").bind(&window).bind(&task).execute(&mut *transaction).await?;
+        db.restart_owner_reconnect_review_barrier_in_tx(&mut transaction, &window, &task)
+            .await?;
         db.produce_condition_in_tx(&mut transaction, &task, db::ConditionChange::Legacy)
             .await?;
     }
-    db::task_writer::BulkTaskQuery::new(db,"UPDATE task SET blocked_json = NULL,
-        entry_barrier_json = entry_barrier_json,
-        error_annotation = json_set(error_annotation, '$.blocking_reason', 'review_ci_infrastructure'),
-        version = version + 1, updated_at = ? WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
-        AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'")
-        .bind(now_rfc3339()).bind(&ready.task_id).bind(&ready.task_id).execute_in_tx(&mut transaction).await?;
-    sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
-        WHERE status <> 'resolved' AND dedupe_key IN (?, ?)")
-        .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("review-ci:{}", ready.task_id))
-        .bind(format!("task-owner-wait:{}", ready.task_id)).execute(&mut *transaction).await?;
+    db.restore_owner_reconnect_review_retry_in_tx(
+        &mut transaction,
+        now_rfc3339(),
+        &ready.task_id,
+        &ready.task_id,
+    )
+    .await?;
+    db.resolve_owner_reconnect_review_attention_in_tx(
+        &mut transaction,
+        now_rfc3339(),
+        now_rfc3339(),
+        format!("review-ci:{}", ready.task_id),
+        format!("task-owner-wait:{}", ready.task_id),
+    )
+    .await?;
     transaction.commit().await?;
     if let Some(task_service) = task_service {
         // A merge that waited for this machine goes on now, not at the
@@ -3363,17 +3337,17 @@ async fn finish_reconciled_cascades(
     let Some(task_service) = task_service else {
         return Ok(());
     };
-    for execution_id in sqlx::query_scalar::<_, String>(
-        "SELECT e.id FROM execution e WHERE e.workspace_id = ? AND e.status != 'running'
-         AND NOT EXISTS (SELECT 1 FROM execution newer WHERE newer.task_id = e.task_id
-             AND CASE newer.role WHEN 'executor' THEN 'coder' ELSE newer.role END
-                 = CASE e.role WHEN 'executor' THEN 'coder' ELSE e.role END
-             AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id)))
-         ORDER BY e.created_at DESC, e.id DESC")
-        .bind(&placement.workspace_id).fetch_all(db.pool()).await? {
-        let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? else { continue; };
+    for execution_id in db
+        .latest_terminal_workspace_execution_ids(&placement.workspace_id)
+        .await?
+    {
+        let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? else {
+            continue;
+        };
         if owner_execution_failure_cause(&execution).is_none() {
-            task_service.try_cascade_executor_completion(&execution_id).await?;
+            task_service
+                .try_cascade_executor_completion(&execution_id)
+                .await?;
         }
     }
     if let Some(daemon_id) = placement_execution_daemon_id(placement) {
@@ -3404,22 +3378,9 @@ pub(crate) async fn reconcile_daemon_report_executions(
     let created_before = (Utc::now()
         - ChronoDuration::seconds(DAEMON_REPORT_RECONCILE_MIN_AGE.as_secs() as i64))
     .to_rfc3339();
-    let execution_ids = sqlx::query_scalar::<_, String>(
-        "SELECT e.id FROM execution e
-         LEFT JOIN workspace_placement p ON p.workspace_id = e.workspace_id
-         LEFT JOIN agent_current a ON a.id = e.agent_id
-         WHERE e.status = 'running' AND e.created_at < ?
-           AND (p.owner_kind IS NULL OR p.owner_kind != 'daemon')
-           AND CASE WHEN e.workspace_id IS NOT NULL
-               THEN CASE p.owner_kind WHEN 'daemon' THEN p.daemon_id ELSE p.execution_daemon_id END
-               ELSE COALESCE(NULLIF(TRIM(json_extract(e.executor_config_snapshot_json, '$.daemon_id')), ''), a.daemon_id)
-               END = ?
-         ORDER BY e.created_at, e.id",
-    )
-    .bind(&created_before)
-    .bind(&daemon.id)
-    .fetch_all(db.pool())
-    .await?;
+    let execution_ids = db
+        .unplaced_daemon_running_execution_ids(&created_before, &daemon.id)
+        .await?;
 
     let mut interrupted = 0_u64;
     for execution_id in execution_ids {
@@ -9327,10 +9288,17 @@ pub(crate) async fn settle_removed_machine_task(
     if !db.daemon_removed(daemon_id).await? {
         return Ok(settlement);
     }
-    db::task_writer::TaskQuery::new(db,task_id,
-        "UPDATE task SET error_annotation=NULL, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END, version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE w.task_id=? OR s.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=c.workspace_id))")
-        .bind(now_rfc3339()).bind(task_id).bind(task_id).bind(task_id).bind(task_id)
-        .identity_fenced().execute(db.pool()).await?;
+    db.clear_removed_machine_cancel_annotation(
+        task_id,
+        db::ClearRemovedMachineCancelAnnotationInput {
+            updated_at: now_rfc3339(),
+            task_id,
+            workspace_task_id: task_id,
+            step_task_id: task_id,
+            execution_task_id: task_id,
+        },
+    )
+    .await?;
     let remaining = db.task_pending_remote_cancel_machines(task_id).await?;
     if !remaining.is_empty() {
         if let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? {
@@ -9340,10 +9308,14 @@ pub(crate) async fn settle_removed_machine_task(
                         let machines = remaining.join(", ");
                         annotation["blocked_by"] = json!(format!("machine:{machines}"));
                         annotation["message"] = json!(format!("Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup."));
-                        db::task_writer::TaskQuery::new(db, task_id,
-                            "UPDATE task SET error_annotation=?,version=version+1,updated_at=? WHERE id=? AND error_annotation=?")
-                            .bind(annotation.to_string()).bind(now_rfc3339()).bind(task_id).bind(raw)
-                            .identity_fenced().execute(db.pool()).await?;
+                        db.refresh_remaining_machine_cancel_annotation(
+                            task_id,
+                            annotation.to_string(),
+                            now_rfc3339(),
+                            task_id,
+                            raw,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -9356,9 +9328,8 @@ pub(crate) async fn settle_removed_machine_task(
         ("environment_wait", "environment_wait.machine.daemon_id"),
         ("owner_wait", "owner_wait.daemon_id"),
     ] {
-        db::task_writer::TaskQuery::new(db,task_id,
-            format!("UPDATE task SET metadata_json=json_remove(metadata_json,'$.{key}','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.{owner}')=?"))
-            .bind(task_id).bind(daemon_id).identity_fenced().execute(db.pool()).await?;
+        db.clear_removed_machine_metadata_wait(task_id, key, owner, task_id, daemon_id)
+            .await?;
     }
     let actor = facts.actor();
     for execution_id in &facts.executions {
@@ -9441,10 +9412,13 @@ pub(crate) async fn settle_removed_machine_task(
         .as_ref()
         .is_some_and(|queued| queued.request.offer.reason == "owner_reconcile");
     if stale_owner_retry {
-        db::task_writer::TaskQuery::new(db, task_id,
-            "UPDATE task SET metadata_json=json_remove(metadata_json,?,'$.deferred_dispatch','$.dispatch_disposition'),version=version+1,updated_at=? WHERE id=? AND json_valid(metadata_json)")
-            .bind(format!("$.{}", crate::deferred_dispatch::QUEUED_RECOVERY_KEY))
-            .bind(now_rfc3339()).bind(task_id).identity_fenced().execute(db.pool()).await?;
+        db.clear_removed_machine_queued_recovery(
+            task_id,
+            format!("$.{}", crate::deferred_dispatch::QUEUED_RECOVERY_KEY),
+            now_rfc3339(),
+            task_id,
+        )
+        .await?;
     }
     settlement.lost_work |= stale_owner_retry
         || (facts.placed
@@ -9456,17 +9430,9 @@ pub(crate) async fn settle_removed_machine_task(
     }
     // Retired Agents leave their Tasks through the archive sweep, so each Task
     // follows the same unassigned path as any other archived Agent's.
-    let retired: Vec<String> = sqlx::query_scalar(
-        "SELECT i.id FROM agent_identity i WHERE i.archived_at IS NOT NULL
-         AND i.selected_profile_id IN (SELECT id FROM agent_profile WHERE daemon_id=?)
-         AND (EXISTS(SELECT 1 FROM task t WHERE t.id=? AND t.assignee_type='agent' AND t.assignee_id=i.id)
-           OR EXISTS(SELECT 1 FROM task_role_assignment r WHERE r.task_id=? AND r.assignee_type='agent' AND r.assignee_id=i.id))",
-    )
-    .bind(daemon_id)
-    .bind(task_id)
-    .bind(task_id)
-    .fetch_all(db.pool())
-    .await?;
+    let retired: Vec<String> = db
+        .retired_machine_task_agent_ids(daemon_id, task_id, task_id)
+        .await?;
     for agent_id in retired {
         let mut transaction = db::begin_immediate(db.pool()).await?;
         settlement
@@ -9506,22 +9472,22 @@ async fn annotate_machine_removed(
         },
     });
     // An expired owner wait also blocked the Task; that blocker goes with it.
-    db::task_writer::TaskQuery::new(db, &task.id,
-        "UPDATE task SET error_annotation=?,
-            blocked_json=CASE WHEN json_valid(error_annotation) AND json_extract(error_annotation,'$.blocked_by')='system:workflow' THEN NULL ELSE blocked_json END,
-            updated_at=?, version=version+1
-         WHERE id=? AND deleted_at IS NULL AND failed_json IS NULL
-           AND status NOT IN (SELECT value FROM json_each(?))
-           AND (error_annotation IS NULL OR (json_valid(error_annotation)
-                AND json_extract(error_annotation,'$.blocking_reason') IN (SELECT value FROM json_each(?))))")
-        .bind(annotation.to_string())
-        .bind(now_rfc3339())
-        .bind(&task.id)
-        .bind(json!(terminal).to_string())
-        .bind(json!([OWNER_LOSS_REASONS.as_slice(), &[MACHINE_REMOVED_REASON]].concat()).to_string())
-        .identity_fenced()
-        .execute(db.pool())
-        .await?;
+    db.annotate_removed_machine_task(
+        &task.id,
+        db::AnnotateRemovedMachineTaskInput {
+            annotation: annotation.to_string(),
+            updated_at: now_rfc3339(),
+            task_id: &task.id,
+            terminal_states_json: json!(terminal).to_string(),
+            owner_loss_reasons_json: json!([
+                OWNER_LOSS_REASONS.as_slice(),
+                &[MACHINE_REMOVED_REASON]
+            ]
+            .concat())
+            .to_string(),
+        },
+    )
+    .await?;
     Ok(())
 }
 
