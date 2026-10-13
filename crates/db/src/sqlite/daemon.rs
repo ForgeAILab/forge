@@ -602,6 +602,284 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    pub async fn placement_eligibility_machines(
+        &self,
+    ) -> crate::Result<Vec<(String, String, String)>> {
+        Ok(
+            sqlx::query_as("SELECT id, status, detected_clis_json FROM daemon ORDER BY id")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_eligibility_cli_policies(
+        &self,
+    ) -> crate::Result<Vec<(String, String, bool)>> {
+        Ok(sqlx::query_as("SELECT daemon_id,executor_type,enabled FROM cli_runtime_policy ORDER BY daemon_id,executor_type").fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_refusal_machine_name(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT hostname FROM daemon WHERE id=?")
+            .bind(daemon_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_delete_check_machine(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Option<(Option<String>, String)>> {
+        Ok(
+            sqlx::query_as("SELECT removed_at, hostname FROM daemon WHERE id = ?")
+                .bind(daemon_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_delete_execution_machine_name(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT hostname FROM daemon WHERE id = ?")
+                .bind(daemon_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_receipt_daemon_removed_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        daemon_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL)",
+        )
+        .bind(daemon_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+pub struct AgentRunnableMachineSourceRow {
+    row: SqliteRow,
+}
+impl AgentRunnableMachineSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn hostname(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("hostname")?)
+    }
+    pub fn machine_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("machine_id")?)
+    }
+    pub fn detected_clis_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("detected_clis_json")?)
+    }
+    pub fn runtime_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("runtime_id")?)
+    }
+    pub fn owner_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("owner_id")?)
+    }
+    pub fn visibility(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("visibility")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn agent_runnable_machine_sources(
+        &self,
+        embedded_machine_id: String,
+    ) -> crate::Result<Vec<AgentRunnableMachineSourceRow>> {
+        let rows = sqlx::query("SELECT d.id,d.hostname,d.machine_id,d.owner_id,d.visibility,d.detected_clis_json,r.id AS runtime_id FROM daemon AS d LEFT JOIN runtime r ON r.daemon_id=d.id AND r.status='ready' WHERE d.status <> 'offline' AND (r.id IS NOT NULL OR d.machine_id=?) ORDER BY d.id,r.id").bind(embedded_machine_id).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AgentRunnableMachineSourceRow { row })
+            .collect())
+    }
+}
+
+pub struct AgentRunnableCliPolicyRow {
+    row: SqliteRow,
+}
+impl AgentRunnableCliPolicyRow {
+    pub fn owner_user_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("owner_user_id")?)
+    }
+    pub fn daemon_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("daemon_id")?)
+    }
+    pub fn executor_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("executor_type")?)
+    }
+    pub fn enabled(&self) -> crate::Result<bool> {
+        Ok(self.row.try_get("enabled")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn agent_runnable_cli_policy_sources(
+        &self,
+        daemon_ids_json: String,
+        cli_types_json: String,
+    ) -> crate::Result<Vec<AgentRunnableCliPolicyRow>> {
+        let rows = sqlx::query("SELECT owner_user_id,daemon_id,executor_type,enabled FROM cli_runtime_policy WHERE daemon_id IN (SELECT value FROM json_each(?)) AND executor_type IN (SELECT value FROM json_each(?))").bind(daemon_ids_json).bind(cli_types_json).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AgentRunnableCliPolicyRow { row })
+            .collect())
+    }
+}
+
+pub struct PlacementExecutionDaemonSourceRow {
+    row: SqliteRow,
+}
+impl PlacementExecutionDaemonSourceRow {
+    pub fn machine_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("machine_id")?)
+    }
+    pub fn owner_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("owner_id")?)
+    }
+    pub fn visibility(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("visibility")?)
+    }
+    pub fn max_concurrent_runs(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("max_concurrent_runs")?)
+    }
+    pub fn run_limit(&self) -> crate::Result<Option<u32>> {
+        Ok(self.row.try_get("run_limit")?)
+    }
+    pub fn detected_clis_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("detected_clis_json")?)
+    }
+    pub fn disk_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("disk_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_execution_daemon_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        daemon_id: &str,
+    ) -> crate::Result<Option<PlacementExecutionDaemonSourceRow>> {
+        let rows = sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json, disk_json FROM daemon WHERE id = ? AND removed_at IS NULL").bind(daemon_id).fetch_optional(connection).await?;
+        Ok(rows.map(|row| PlacementExecutionDaemonSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_owned_cli_enabled_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        owner_id: &str,
+        daemon_id: &str,
+        executor_type: &str,
+    ) -> crate::Result<Option<bool>> {
+        Ok(sqlx::query_scalar::<_, bool>(
+                            "SELECT enabled FROM cli_runtime_policy WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?",
+                        ).bind(owner_id).bind(daemon_id).bind(executor_type).fetch_optional(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_unowned_cli_enabled_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        daemon_id: &str,
+        executor_type: &str,
+    ) -> crate::Result<Option<bool>> {
+        Ok(sqlx::query_scalar::<_, Option<bool>>(
+            "SELECT MIN(enabled) FROM cli_runtime_policy WHERE daemon_id = ? AND executor_type = ?",
+        )
+        .bind(daemon_id)
+        .bind(executor_type)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn external_online_daemon_ids(
+        &self,
+        retained_machine_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id
+             FROM daemon
+             WHERE status = 'online'
+               AND machine_id != ?",
+        )
+        .bind(retained_machine_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn mark_external_online_daemons_offline(
+        &self,
+        updated_at: &str,
+        retained_machine_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE daemon
+             SET status = 'offline',
+                 updated_at = ?,
+                 version = version + 1
+             WHERE status = 'online'
+               AND machine_id != ?",
+        )
+        .bind(updated_at)
+        .bind(retained_machine_id)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn check_owner_disconnect_facts(
+        &self,
+        placement_id: &str,
+        daemon_id: &str,
+    ) -> crate::Result<Option<(Option<String>, Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as("SELECT d.removed_at,p.disconnected_at,d.last_report_at FROM daemon d LEFT JOIN workspace_placement p ON p.id=? WHERE d.id=?").bind(placement_id).bind(daemon_id).fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_server_execution_daemon_id(
+        &self,
+        embedded_machine_id: String,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'",
+        )
+        .bind(embedded_machine_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,7 +18,6 @@ use db::{
 use executors::ExecutorKind;
 use executors::{UsageCounters, UsageReport, UsageTelemetryState as ExecutorTelemetryState};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{Result, ServiceError};
 
@@ -85,12 +84,11 @@ async fn scope_snapshot(
                 .project_id
                 .clone()
                 .ok_or_else(|| ServiceError::invalid_operation("Project Chat has no project"))?;
-            let row = sqlx::query("SELECT owner_id, name FROM project WHERE id = ?")
-                .bind(&project_id)
-                .fetch_optional(db.pool())
+            let row = db
+                .chat_usage_project_scope(&project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-            let owner_user_id: Option<String> = row.try_get("owner_id")?;
+            let owner_user_id: Option<String> = row.owner_id()?;
             let owner_user_id = owner_user_id
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
@@ -99,7 +97,7 @@ async fn scope_snapshot(
             Ok(ScopeSnapshot {
                 owner_user_id,
                 project_id: Some(project_id),
-                project_name: row.try_get("name")?,
+                project_name: row.name()?,
                 surface: UsageSurface::ProjectChat,
             })
         }
@@ -125,64 +123,19 @@ async fn scope_snapshot(
             // An active Genesis session identifies the Main turn as Genesis
             // work.  A project is attached only after the immutable handoff
             // boundary proves the exact source turn/message belongs to it.
-            let active = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(
-                   SELECT 1 FROM product_genesis_session
-                   WHERE main_chat_id = ?
-                     AND account_id = ?
-                     AND lifecycle IN ('discovering', 'ready_for_project')
-                )",
-            )
-            .bind(&chat.id)
-            .bind(&owner_user_id)
-            .fetch_one(db.pool())
-            .await?
+            let active = db
+                .chat_usage_active_genesis_exists(&chat.id, &owner_user_id)
+                .await?
                 != 0;
-            let handed_off_project: Option<String> = sqlx::query_scalar(
-                "SELECT g.project_id
-                 FROM product_genesis_session g
-                 JOIN agent_handoff h ON h.id = g.handoff_id
-                 JOIN project p
-                   ON p.id = g.project_id
-                  AND p.owner_id = g.account_id
-                 JOIN project_admission_receipt receipt
-                   ON receipt.project_id = g.project_id
-                  AND receipt.source_kind = 'genesis_handoff'
-                  AND receipt.handoff_id = g.handoff_id
-                 JOIN agent_chat target ON target.id = h.target_chat_id
-                 JOIN agent_handoff_delivery delivery
-                   ON delivery.handoff_id = h.id
-                  AND delivery.delivery_sequence = 1
-                  AND delivery.status = 'delivered'
-                  AND delivery.target_message_id IS h.target_message_id
-                  AND delivery.target_turn_job_id IS h.target_turn_job_id
-                 WHERE g.main_chat_id = ? AND g.lifecycle = 'handed_off'
-                   AND g.project_id IS NOT NULL AND h.target_chat_id = target.id
-                   AND g.account_id = ? AND h.source_chat_id = g.main_chat_id
-                   AND h.status = 'delivered'
-                   AND target.kind = 'project' AND target.project_id = g.project_id
-                   AND json_valid(h.source_revisions_json)
-                   AND json_extract(
-                       h.source_revisions_json,
-                       '$.request.source_revisions_digest'
-                   ) = receipt.payload_digest
-                   AND (h.source_turn_job_id = ? OR h.source_message_id = ?
-                        OR EXISTS (
-                            SELECT 1
-                            FROM json_each(
-                                json_extract(h.source_revisions_json, '$.source.message_ids')
-                            )
-                            WHERE json_each.value = ?
-                        ))
-                 ORDER BY h.created_at DESC, h.id DESC LIMIT 1",
-            )
-            .bind(&chat.id)
-            .bind(&owner_user_id)
-            .bind(&job.id)
-            .bind(trigger_id)
-            .bind(trigger_id)
-            .fetch_optional(db.pool())
-            .await?;
+            let handed_off_project: Option<String> = db
+                .chat_usage_handed_off_project_id(db::ChatUsageHandedOffProjectIdInput {
+                    chat_id: &chat.id,
+                    account_id: &owner_user_id,
+                    turn_id: &job.id,
+                    source_message_id: trigger_id,
+                    cited_message_id: trigger_id,
+                })
+                .await?;
             if !active && handed_off_project.is_none() {
                 return Ok(ScopeSnapshot {
                     owner_user_id,
@@ -364,17 +317,15 @@ async fn create_chat_invocation(
             expected_version,
             lease_owner,
         } => {
-            let valid = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM agent_chat_turn_job
-                 WHERE id = ? AND version = ? AND status = 'leased'
-                   AND lease_owner = ?",
-            )
-            .bind(id)
-            .bind(expected_version)
-            .bind(lease_owner)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .is_some();
+            let valid = db
+                .chat_usage_admitted_turn_guard_in_tx(
+                    &mut transaction,
+                    id,
+                    expected_version,
+                    lease_owner,
+                )
+                .await?
+                .is_some();
             if !valid {
                 return Err(db::DbError::VersionConflict.into());
             }
@@ -383,27 +334,19 @@ async fn create_chat_invocation(
             id,
             expected_version,
         } => {
-            let valid = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM agent_inquiry
-                 WHERE id = ? AND version = ? AND status = 'running'",
-            )
-            .bind(id)
-            .bind(expected_version)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .is_some();
+            let valid = db
+                .chat_usage_admitted_inquiry_guard_in_tx(&mut transaction, id, expected_version)
+                .await?
+                .is_some();
             if !valid {
                 return Err(db::DbError::VersionConflict.into());
             }
         }
         AdmissionGuard::TopicSummary { id } => {
-            let valid = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM agent_topic_summary_usage WHERE id = ? AND settled_at IS NULL",
-            )
-            .bind(id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .is_some();
+            let valid = db
+                .chat_usage_unsettled_topic_summary_guard_in_tx(&mut transaction, id)
+                .await?
+                .is_some();
             if !valid {
                 return Err(db::DbError::VersionConflict.into());
             }
@@ -919,33 +862,18 @@ pub(crate) async fn settle_late_chat_usage(
 /// ids are stable, settlement skips an already settled invocation, and the
 /// row is marked settled last. `false` when there was nothing to settle.
 pub(crate) async fn settle_topic_summary_usage(db: &SqliteDb, row_id: &str) -> Result<bool> {
-    let Some(row) = sqlx::query(
-        "SELECT runtime_session_id, provider, model, input_tokens, output_tokens, failed,
-                chat_id, settled_at
-         FROM agent_topic_summary_usage WHERE id = ?",
-    )
-    .bind(row_id)
-    .fetch_optional(db.pool())
-    .await?
-    else {
+    let Some(row) = db.chat_topic_summary_usage_source(row_id).await? else {
         return Ok(false);
     };
-    if row.try_get::<Option<String>, _>("settled_at")?.is_some() {
+    if row.settled_at()?.is_some() {
         return Ok(false);
     }
-    let runtime_session_id: String = row.try_get("runtime_session_id")?;
-    let session: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT session.identity_id, session.profile_id, scope.scope_id
-         FROM agent_session AS session
-         JOIN agent_context_scope AS scope ON scope.id = session.context_scope_id
-         WHERE session.runtime_session_id = ? AND scope.scope_type = 'agent_chat'
-         LIMIT 1",
-    )
-    .bind(&runtime_session_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let runtime_session_id: String = row.runtime_session_id()?;
+    let session: Option<(String, String, String)> = db
+        .chat_topic_summary_session_scope(&runtime_session_id)
+        .await?;
     let chat_id = row
-        .try_get::<Option<String>, _>("chat_id")?
+        .chat_id()?
         .or_else(|| session.as_ref().map(|session| session.2.clone()));
     let chat = match chat_id {
         Some(chat_id) => AgentChatRepo::get_agent_chat(db, &chat_id).await?,
@@ -958,10 +886,7 @@ pub(crate) async fn settle_topic_summary_usage(db: &SqliteDb, row_id: &str) -> R
             row_id,
             "topic summary usage has no chat or session left to attribute; dropping it"
         );
-        sqlx::query("UPDATE agent_topic_summary_usage SET settled_at = ? WHERE id = ?")
-            .bind(now_rfc3339())
-            .bind(row_id)
-            .execute(db.pool())
+        db.settle_unattributed_chat_topic_summary_usage(now_rfc3339(), row_id)
             .await?;
         return Ok(false);
     };
@@ -979,16 +904,16 @@ pub(crate) async fn settle_topic_summary_usage(db: &SqliteDb, row_id: &str) -> R
         AdmissionGuard::TopicSummary { id: row_id },
     )
     .await?;
-    let input = u64::try_from(row.try_get::<i64, _>("input_tokens")?).unwrap_or(0);
-    let output = u64::try_from(row.try_get::<i64, _>("output_tokens")?).unwrap_or(0);
+    let input = u64::try_from(row.input_tokens()?).unwrap_or(0);
+    let output = u64::try_from(row.output_tokens()?).unwrap_or(0);
     let report = UsageReport {
         report_id: row_id.to_owned(),
         request_id: Some(row_id.to_owned()),
         report_sequence: 0,
         candidate_key: Some(TOPIC_SUMMARY_CANDIDATE.to_owned()),
         attempt_ordinal: 0,
-        provider_id: row.try_get("provider")?,
-        model_id: row.try_get("model")?,
+        provider_id: row.provider()?,
+        model_id: row.model()?,
         counters: UsageCounters {
             input_tokens: Some(input),
             output_tokens: Some(output),
@@ -1000,28 +925,19 @@ pub(crate) async fn settle_topic_summary_usage(db: &SqliteDb, row_id: &str) -> R
         selected_tier: None,
         reported_cost_usd: None,
         outcome: None,
-        partial: row.try_get::<bool, _>("failed")?,
+        partial: row.failed()?,
     };
     let now = now_rfc3339();
     settle_late_chat_usage(db, row_id, &[report], &now).await?;
-    sqlx::query(
-        "UPDATE agent_topic_summary_usage SET settled_at = ? WHERE id = ? AND settled_at IS NULL",
-    )
-    .bind(&now)
-    .bind(row_id)
-    .execute(db.pool())
-    .await?;
+    db.settle_pending_chat_topic_summary_usage(&now, row_id)
+        .await?;
     Ok(true)
 }
 
 /// Drains rotation-summary usage the rotation itself could not settle (a
 /// crash between the summary and its settlement). Bounded per pass.
 pub(crate) async fn settle_unsettled_topic_summary_usage(db: &SqliteDb) -> Result<usize> {
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM agent_topic_summary_usage WHERE settled_at IS NULL ORDER BY id LIMIT 16",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let ids: Vec<String> = db.unsettled_chat_topic_summary_usage_ids().await?;
     let mut settled = 0;
     for id in ids {
         match settle_topic_summary_usage(db, &id).await {

@@ -158,3 +158,39 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+impl SqliteDb {
+    pub async fn task_proposal_project_member(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT 1 FROM project_member
+                     WHERE project_id = ? AND user_id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_setup_project_admin_member(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project_member
+                 WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+             )",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}

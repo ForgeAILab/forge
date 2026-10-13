@@ -43,15 +43,9 @@ impl TaskService {
     pub(crate) async fn settle_retired_review_rerun(&self, execution: &Execution) -> Result<()> {
         const REASON: &str = "this execution belonged to the inline review re-run, \
              which this Forge version no longer has; it was stopped at upgrade";
-        sqlx::query(
-            "UPDATE execution SET error = ?, updated_at = ? WHERE id = ? AND status <> 'running'",
-        )
-        .bind(REASON)
-        .bind(now_rfc3339())
-        .bind(&execution.id)
-        .execute(self.db.pool())
-        .await
-        .map_err(DbError::from)?;
+        self.db
+            .record_retired_review_rerun_error(REASON, now_rfc3339(), &execution.id)
+            .await?;
         let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? else {
             return Ok(());
         };
@@ -75,15 +69,13 @@ impl TaskService {
             .reasons()
             .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
         {
-            sqlx::query(
-                "UPDATE execution SET error = ?, updated_at = ? WHERE id = ? AND status <> 'running'",
-            )
-            .bind(RETIRED_REVIEW_RERUN_HELD)
-            .bind(now_rfc3339())
-            .bind(&execution.id)
-            .execute(self.db.pool())
-            .await
-            .map_err(DbError::from)?;
+            self.db
+                .record_retired_review_rerun_error(
+                    RETIRED_REVIEW_RERUN_HELD,
+                    now_rfc3339(),
+                    &execution.id,
+                )
+                .await?;
             return Ok(());
         }
         let id = Uuid::parse_str(&task.id)
@@ -143,9 +135,15 @@ impl TaskService {
             .is_some_and(|placement| placement.state == db::PlacementState::Disconnected);
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         if let Some(version) = ctx.project_version {
-            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
-                .bind(&task.project_id).bind(version).bind(ctx.project_workflow_definition.as_deref())
-                .fetch_one(&mut *tx).await?;
+            let valid: bool = self
+                .db
+                .review_ci_project_authority_valid_in_tx(
+                    &mut tx,
+                    &task.project_id,
+                    version,
+                    ctx.project_workflow_definition.as_deref(),
+                )
+                .await?;
             if !valid {
                 return Err(DbError::VersionConflict.into());
             }
@@ -166,12 +164,9 @@ impl TaskService {
             .await?
             .spent
         } else {
-            sqlx::query_scalar(
-                "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure'),0)",
-            )
-            .bind(&task.id)
-            .fetch_one(&mut *tx)
-            .await?
+            self.db
+                .review_ci_infrastructure_budget_spent_in_tx(&mut tx, &task.id)
+                .await?
         };
         let exhausted = retry
             && !disconnected

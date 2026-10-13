@@ -19,7 +19,6 @@ use forge_agent_host::{
     AgentHostError, AgentTurnRequest, CanonicalScope, CanonicalScopeType, NativeProviderConfig,
     WorkspaceAccess,
 };
-use sqlx::Row;
 use std::sync::Arc;
 
 /// Attempts one rotation intent gets before it is abandoned.
@@ -30,25 +29,8 @@ const ROTATION_LEASE_SECONDS: i64 = 30;
 /// Intents examined per worker pass.
 const ROTATION_PASS_LIMIT: i64 = 8;
 
-/// SQL predicate: the chat's responder (account Main binding or Project
-/// binding -> the identity's selected Profile) runs on the native backend.
-/// The same rule gates the automatic rotation triggers in
-/// `V202610050233__topic_working_sets.sql`.
-pub(crate) const NATIVE_RESPONDER_SQL: &str = "SELECT EXISTS (
-    SELECT 1 FROM agent_chat c
-    JOIN agent_identity i ON i.id = COALESCE(
-        (SELECT b.identity_id FROM account_main_agent_binding b
-         WHERE b.account_id = c.account_id AND b.state = 'active'),
-        (SELECT b.identity_id FROM project_agent_binding b
-         WHERE b.project_id = c.project_id AND b.state = 'active'))
-    JOIN agent_profile p ON p.id = i.selected_profile_id
-    WHERE c.id = ? AND p.backend_kind = 'native')";
-
 pub(crate) async fn responder_is_native(db: &SqliteDb, chat_id: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar(NATIVE_RESPONDER_SQL)
-        .bind(chat_id)
-        .fetch_one(db.pool())
-        .await?)
+    Ok(db.topic_rotation_responder_is_native(chat_id).await?)
 }
 
 #[async_trait]
@@ -82,22 +64,9 @@ impl TopicRotationCoordinator {
 /// Chats with a due, unleased intent that no live turn blocks, fresh
 /// intents first so a repeatedly failing one cannot starve newer ones.
 pub(crate) async fn due_topic_rotations(db: &SqliteDb, now: DateTime<Utc>) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar(
-        "SELECT r.chat_id FROM agent_chat_topic_rotation r
-         WHERE (r.owner_token IS NULL OR julianday(r.lease_until) <= julianday(?1))
-           AND (r.next_attempt_at IS NULL OR julianday(r.next_attempt_at) <= julianday(?1))
-           AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job j
-                           WHERE j.chat_id = r.chat_id AND j.status = 'leased')
-           AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job j
-                           WHERE j.id = r.origin_turn_id
-                             AND j.status IN ('queued', 'leased', 'retry_wait', 'awaiting_input'))
-         ORDER BY r.attempt_count ASC, r.created_at ASC
-         LIMIT ?2",
-    )
-    .bind(now.to_rfc3339())
-    .bind(ROTATION_PASS_LIMIT)
-    .fetch_all(db.pool())
-    .await?)
+    Ok(db
+        .due_chat_topic_rotations(now.to_rfc3339(), ROTATION_PASS_LIMIT)
+        .await?)
 }
 
 /// One bounded worker pass, off the turn-claim path: attempt every due
@@ -191,30 +160,15 @@ impl TopicRotator for TopicRotationCoordinator {
         let owner = db::new_uuid_v4();
         let lease_until = (now + chrono::Duration::seconds(ROTATION_LEASE_SECONDS)).to_rfc3339();
         // Leasing an attempt counts it; a crash mid-attempt still counts.
-        let row = sqlx::query(
-            "UPDATE agent_chat_topic_rotation
-             SET owner_token = ?1, lease_until = ?2, attempt_count = attempt_count + 1
-             WHERE chat_id = ?3
-               AND (owner_token IS NULL OR julianday(lease_until) <= julianday(?4))
-               AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?4))
-               AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job
-                               WHERE chat_id = ?3 AND status = 'leased')
-               AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job
-                               WHERE id = origin_turn_id
-                                 AND status IN ('queued', 'leased', 'retry_wait', 'awaiting_input'))
-             RETURNING *",
-        )
-        .bind(&owner)
-        .bind(lease_until)
-        .bind(chat_id)
-        .bind(now.to_rfc3339())
-        .fetch_optional(self.db.pool())
-        .await?;
+        let row = self
+            .db
+            .lease_due_chat_topic_rotation(&owner, lease_until, chat_id, now.to_rfc3339())
+            .await?;
         let Some(row) = row else {
             return Ok(false);
         };
-        let intent: String = row.try_get("id")?;
-        let attempts: i64 = row.try_get("attempt_count")?;
+        let intent: String = row.id()?;
+        let attempts: i64 = row.attempt_count()?;
         let stop = tokio_util::sync::CancellationToken::new();
         let _guard = stop.clone().drop_guard();
         let renew_db = self.db.clone();
@@ -226,8 +180,7 @@ impl TopicRotator for TopicRotationCoordinator {
                     _ = renew_stop.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                         let until = (Utc::now() + chrono::Duration::seconds(ROTATION_LEASE_SECONDS)).to_rfc3339();
-                        if let Err(error) = sqlx::query("UPDATE agent_chat_topic_rotation SET lease_until = ? WHERE owner_token = ?")
-                            .bind(until).bind(&renew_owner).execute(renew_db.pool()).await {
+                        if let Err(error) = renew_db.renew_chat_topic_rotation_lease(until, &renew_owner).await {
                             tracing::warn!(%error, "topic rotation lease renewal failed");
                             break;
                         }
@@ -253,16 +206,9 @@ impl TopicRotator for TopicRotationCoordinator {
             }
             // Nothing was attempted (a turn was admitted meanwhile): refund.
             Ok(false) => {
-                sqlx::query(
-                    "UPDATE agent_chat_topic_rotation
-                     SET owner_token = NULL, lease_until = NULL,
-                         attempt_count = MAX(attempt_count - 1, 0)
-                     WHERE chat_id = ? AND owner_token = ?",
-                )
-                .bind(chat_id)
-                .bind(&owner)
-                .execute(self.db.pool())
-                .await?;
+                self.db
+                    .refund_unattempted_chat_topic_rotation(chat_id, &owner)
+                    .await?;
                 Ok(false)
             }
             Err(failure) if attempts >= MAX_TOPIC_ROTATION_ATTEMPTS => {
@@ -277,18 +223,14 @@ impl TopicRotator for TopicRotationCoordinator {
                     .min(ROTATION_BACKOFF_SECONDS.len() - 1);
                 let next = now + chrono::Duration::seconds(ROTATION_BACKOFF_SECONDS[index]);
                 tracing::warn!(%chat_id, intent_id = %intent, kind = failure.kind, error = %failure.error, attempts, "topic rotation attempt failed; backing off");
-                sqlx::query(
-                    "UPDATE agent_chat_topic_rotation
-                     SET owner_token = NULL, lease_until = NULL,
-                         next_attempt_at = ?, last_error_kind = ?
-                     WHERE chat_id = ? AND owner_token = ?",
-                )
-                .bind(next.to_rfc3339())
-                .bind(failure.kind)
-                .bind(chat_id)
-                .bind(&owner)
-                .execute(self.db.pool())
-                .await?;
+                self.db
+                    .backoff_failed_chat_topic_rotation(
+                        next.to_rfc3339(),
+                        failure.kind,
+                        chat_id,
+                        &owner,
+                    )
+                    .await?;
                 Err(failure.error)
             }
         }
@@ -300,13 +242,13 @@ impl TopicRotationCoordinator {
         &self,
         chat_id: &str,
         owner: &str,
-        row: sqlx::sqlite::SqliteRow,
+        row: db::TopicRotationIntentRow,
     ) -> std::result::Result<bool, RotationFailure> {
-        let intent: String = row.try_get("id")?;
-        let label: String = row.try_get("label")?;
-        let summary: Option<String> = row.try_get("requested_summary")?;
-        let cause: String = row.try_get("cause")?;
-        let now: String = row.try_get("created_at")?;
+        let intent: String = row.id()?;
+        let label: String = row.label()?;
+        let summary: Option<String> = row.requested_summary()?;
+        let cause: String = row.cause()?;
+        let now: String = row.created_at()?;
         let chat = self
             .db
             .get_agent_chat(chat_id)
@@ -316,16 +258,12 @@ impl TopicRotationCoordinator {
         if !native && cause != "rest" {
             // Automatic rotations exist only for native chats; a CLI chat
             // keeps its conversation exactly as before.
-            sqlx::query(
-                "DELETE FROM agent_chat_topic_rotation WHERE chat_id = ? AND owner_token = ?",
-            )
-            .bind(chat_id)
-            .bind(owner)
-            .execute(self.db.pool())
-            .await?;
+            self.db
+                .delete_non_native_chat_topic_rotation(chat_id, owner)
+                .await?;
             return Ok(false);
         }
-        let successor_runtime: String = row.try_get("successor_runtime_id")?;
+        let successor_runtime: String = row.successor_runtime_id()?;
         if native {
             self.fork_native_topic(chat_id, owner, &chat, &row, &intent)
                 .await?;
@@ -364,11 +302,11 @@ impl TopicRotationCoordinator {
         chat_id: &str,
         owner: &str,
         chat: &db::AgentChat,
-        row: &sqlx::sqlite::SqliteRow,
+        row: &db::TopicRotationIntentRow,
         intent: &str,
     ) -> std::result::Result<(), RotationFailure> {
         let request = self.fork_request(chat_id, owner, chat, row, intent).await?;
-        let successor_runtime: String = row.try_get("successor_runtime_id")?;
+        let successor_runtime: String = row.successor_runtime_id()?;
         self.embedded
             .native_backend()
             .fork_topic(request, intent, &successor_runtime)
@@ -383,25 +321,25 @@ impl TopicRotationCoordinator {
         chat_id: &str,
         owner: &str,
         chat: &db::AgentChat,
-        row: &sqlx::sqlite::SqliteRow,
+        row: &db::TopicRotationIntentRow,
         intent: &str,
     ) -> std::result::Result<AgentTurnRequest, RotationFailure> {
-        let now: String = row.try_get("created_at")?;
-        let source_id: Option<String> = row.try_get("source_session_id")?;
+        let now: String = row.created_at()?;
+        let source_id: Option<String> = row.source_session_id()?;
         let source_id = if let Some(id) = source_id {
             id
         } else {
-            let existing: Option<String> = sqlx::query_scalar("SELECT s.id FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id WHERE c.scope_type = 'agent_chat' AND c.scope_id = ? AND s.status IN ('starting','ready','running','degraded') ORDER BY s.created_at DESC LIMIT 1")
-                .bind(chat_id).fetch_optional(self.db.pool()).await?;
+            let existing: Option<String> =
+                self.db.topic_rotation_source_session_id(chat_id).await?;
             if let Some(id) = existing {
                 id
             } else {
                 let binding: Option<(String, String)> = if let Some(account) = &chat.account_id {
-                    sqlx::query_as("SELECT identity_id, profile_id FROM account_main_agent_binding WHERE account_id = ? AND state = 'active'")
-                        .bind(account).fetch_optional(self.db.pool()).await?
+                    self.db.topic_rotation_main_binding(account).await?
                 } else {
-                    sqlx::query_as("SELECT identity_id, profile_id FROM project_agent_binding WHERE project_id = ? AND state = 'active'")
-                        .bind(&chat.project_id).fetch_optional(self.db.pool()).await?
+                    self.db
+                        .topic_rotation_project_binding(&chat.project_id)
+                        .await?
                 };
                 let (identity_id, profile_id) = binding.ok_or_else(|| {
                     ServiceError::invalid_operation("topic rotation requires an Agent binding")
@@ -434,13 +372,24 @@ impl TopicRotationCoordinator {
             .get_profile(&source.profile_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent_profile", &source.profile_id))?;
-        let successor_forge: String = row.try_get("successor_session_id")?;
-        let successor_runtime: String = row.try_get("successor_runtime_id")?;
+        let successor_forge: String = row.successor_session_id()?;
+        let successor_runtime: String = row.successor_runtime_id()?;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        sqlx::query("UPDATE agent_chat_topic_rotation SET source_session_id = ? WHERE id = ? AND owner_token = ?")
-            .bind(&source_id).bind(intent).bind(owner).execute(&mut *tx).await?;
-        sqlx::query("INSERT OR IGNORE INTO agent_session (id, identity_id, profile_id, context_scope_id, backend_kind, runtime_session_id, status, capabilities_json, connection_status, predecessor_session_id, created_at, updated_at) SELECT ?, identity_id, profile_id, context_scope_id, backend_kind, ?, 'suspended', capabilities_json, connection_status, id, ?, ? FROM agent_session WHERE id = ?")
-            .bind(&successor_forge).bind(&successor_runtime).bind(&now).bind(&now).bind(&source_id).execute(&mut *tx).await?;
+        self.db
+            .record_topic_rotation_source_session_in_tx(&mut tx, &source_id, intent, owner)
+            .await?;
+        self.db
+            .reserve_topic_rotation_successor_session_in_tx(
+                &mut tx,
+                db::ReserveTopicRotationSuccessorSessionInTxInput {
+                    successor_id: &successor_forge,
+                    runtime_id: &successor_runtime,
+                    created_at: &now,
+                    updated_at: &now,
+                    source_id: &source_id,
+                },
+            )
+            .await?;
         tx.commit().await?;
         let config: crate::agent_chat_turn_worker::NativeProfileConfig =
             serde_json::from_str(&profile.config_json).map_err(|_| {
@@ -459,28 +408,37 @@ impl TopicRotationCoordinator {
                 config.max_input_tokens,
                 config.max_output_tokens,
             );
-        let scope_row = sqlx::query(
-            "SELECT workspace_access, workspace_path FROM agent_context_scope WHERE id = ?",
-        )
-        .bind(&source.context_scope_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        let workspace_path: Option<String> = scope_row.try_get("workspace_path")?;
-        let access: String = scope_row.try_get("workspace_access")?;
+        let scope_row = self
+            .db
+            .topic_rotation_scope_workspace(&source.context_scope_id)
+            .await?;
+        let workspace_path: Option<String> = scope_row.workspace_path()?;
+        let access: String = scope_row.workspace_access()?;
         let workspace_access = match access.as_str() {
             "account_scratch" => WorkspaceAccess::AccountScratch,
             "project_verify" => WorkspaceAccess::ProjectVerify,
             _ => WorkspaceAccess::Deny,
         };
-        let history = sqlx::query("SELECT author_type, content FROM agent_chat_message WHERE chat_id = ? AND status = 'complete' AND sequence >= COALESCE((SELECT MAX(starting_message_sequence) FROM agent_chat_topic WHERE chat_id = ?), 0) ORDER BY sequence ASC")
-            .bind(chat_id).bind(chat_id).fetch_all(self.db.pool()).await?.into_iter().filter_map(|r| {
-                let role: String = r.get("author_type");
+        let history = self
+            .db
+            .topic_rotation_history_messages(chat_id, chat_id)
+            .await?
+            .into_iter()
+            .filter_map(|r| {
+                let role: String = r.author_type_value();
                 match role.as_str() {
-                    "user" => Some(forge_agent_host::Message::text(forge_agent_host::Role::User, r.get::<String, _>("content"))),
-                    "agent" => Some(forge_agent_host::Message::text(forge_agent_host::Role::Assistant, r.get::<String, _>("content"))),
+                    "user" => Some(forge_agent_host::Message::text(
+                        forge_agent_host::Role::User,
+                        r.content_value(),
+                    )),
+                    "agent" => Some(forge_agent_host::Message::text(
+                        forge_agent_host::Role::Assistant,
+                        r.content_value(),
+                    )),
                     _ => None,
                 }
-            }).collect();
+            })
+            .collect();
         let provider_account_id = match profile.credential_ref.as_deref() {
             Some(id) => db::CredentialHandleRepo::get_credential_handle(&*self.db, id)
                 .await?
@@ -548,26 +506,19 @@ impl TopicRotationCoordinator {
         attempts: i64,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let row =
-            sqlx::query("SELECT * FROM agent_chat_topic_rotation WHERE id = ? AND owner_token = ?")
-                .bind(intent)
-                .bind(owner)
-                .fetch_optional(self.db.pool())
-                .await?;
+        let row = self
+            .db
+            .owned_chat_topic_rotation_intent(intent, owner)
+            .await?;
         let Some(row) = row else {
             return Ok(());
         };
-        let label: String = row.try_get("label")?;
-        let successor_forge: String = row.try_get("successor_session_id")?;
-        let hand_over: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM protected_agent_session_state
-                           WHERE session_id = ?
-                             AND (snapshot_ciphertext IS NOT NULL
-                                  OR checkpoint_ciphertext IS NOT NULL))",
-        )
-        .bind(&successor_forge)
-        .fetch_one(self.db.pool())
-        .await?;
+        let label: String = row.label()?;
+        let successor_forge: String = row.successor_session_id()?;
+        let hand_over: bool = self
+            .db
+            .topic_rotation_successor_has_protected_state(&successor_forge)
+            .await?;
         if !hand_over && responder_is_native(&self.db, chat_id).await? {
             let aborted = match self.db.get_agent_chat(chat_id).await? {
                 Some(chat) => match self.fork_request(chat_id, owner, &chat, &row, intent).await {

@@ -758,3 +758,206 @@ impl SqliteDb {
             .collect()
     }
 }
+
+pub struct MemoryBackfillExecutionRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillExecutionRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn agent_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("agent_id")?)
+    }
+    pub fn role(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("role")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn summary(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("summary")?)
+    }
+    pub fn error(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("error")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_execution_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillExecutionRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, e.id, e.task_id, e.agent_id, e.role, e.status, e.summary, e.error \
+         FROM execution e JOIN task t ON t.id = e.task_id \
+         WHERE e.status IN ('completed', 'failed') \
+           AND (TRIM(COALESCE(e.summary, '')) <> '' OR TRIM(COALESCE(e.error, '')) <> '') \
+         ORDER BY e.created_at ASC, e.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillExecutionRow { row })
+            .collect())
+    }
+}
+
+pub struct MemoryBackfillReviewRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillReviewRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn execution_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("execution_id")?)
+    }
+    pub fn attempt_number(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("attempt_number")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn step_results_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("step_results_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_review_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillReviewRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, r.id, r.task_id, r.execution_id, r.attempt_number, r.status, r.step_results_json \
+         FROM review r JOIN task t ON t.id = r.task_id \
+         WHERE r.status != 'running' \
+         ORDER BY r.created_at ASC, r.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillReviewRow { row })
+            .collect())
+    }
+}
+
+pub struct MemoryBackfillCommentRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillCommentRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn author_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("author_type")?)
+    }
+    pub fn author_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("author_id")?)
+    }
+    pub fn author_name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("author_name")?)
+    }
+    pub fn content(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_comment_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillCommentRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, c.id, c.task_id, c.author_type, c.author_id, c.author_name, c.content \
+         FROM task_comment c JOIN task t ON t.id = c.task_id \
+         ORDER BY c.created_at ASC, c.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillCommentRow { row })
+            .collect())
+    }
+}
+
+pub struct MemoryBackfillTransitionRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillTransitionRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn from_state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("from_state")?)
+    }
+    pub fn to_state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("to_state")?)
+    }
+    pub fn trigger_name(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("trigger_name")?)
+    }
+    pub fn triggered_by(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("triggered_by")?)
+    }
+    pub fn bridge_kind(&self) -> crate::Result<Option<&str>> {
+        Ok(self.row.try_get("bridge_kind")?)
+    }
+    pub fn bridge_payload(&self) -> crate::Result<Option<&str>> {
+        Ok(self.row.try_get("bridge_payload")?)
+    }
+    pub fn trigger_reason(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("trigger_reason")?)
+    }
+    pub fn hook_results_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("hook_results_json")?)
+    }
+    pub fn rejection(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("rejection")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_transition_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillTransitionRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, tl.id, tl.task_id, tl.from_state, tl.to_state, tl.trigger_name, tl.triggered_by, \
+                tl.bridge_kind, tl.bridge_payload, tl.trigger_reason, tl.hook_results_json, tl.rejection, tl.created_at \
+         FROM transition_log tl JOIN task t ON t.id = tl.task_id \
+         ORDER BY tl.created_at ASC, tl.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillTransitionRow { row })
+            .collect())
+    }
+}
+
+impl MemoryBackfillTransitionRow {
+    pub fn id_ref(&self) -> crate::Result<&str> {
+        Ok(self.row.try_get("id")?)
+    }
+}

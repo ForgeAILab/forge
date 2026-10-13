@@ -1575,3 +1575,61 @@ impl SqliteDb {
             .await?)
     }
 }
+
+pub struct WakeBlockerTurnSourceRow {
+    row: SqliteRow,
+}
+impl WakeBlockerTurnSourceRow {
+    pub fn incident_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("incident_digest")?)
+    }
+    pub fn legacy_source_event_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("legacy_source_event_id")?)
+    }
+    pub fn escalation_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("escalation_id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn error_code(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("error_code")?)
+    }
+    pub fn failure_class_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("failure_class_json")?)
+    }
+    pub fn responder_identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("responder_identity_id")?)
+    }
+    pub fn profile_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("profile_id")?)
+    }
+    pub fn profile_version(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("profile_version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_blocker_turn_sources(
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+    ) -> crate::Result<Vec<WakeBlockerTurnSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT b.incident_digest, b.legacy_source_event_id, b.escalation_id,
+                j.status, j.error_code, j.failure_class_json, j.responder_identity_id,
+                j.profile_id, j.profile_version, j.updated_at
+         FROM agent_wake_blocker b JOIN agent_chat_turn_job j ON j.id = b.turn_job_id
+         WHERE b.attention_id = ?",
+        )
+        .bind(attention_id)
+        .fetch_all(connection)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| WakeBlockerTurnSourceRow { row })
+            .collect())
+    }
+}

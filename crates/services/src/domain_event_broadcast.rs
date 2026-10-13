@@ -95,12 +95,8 @@ impl DomainEventBroadcastConsumer {
         }
     }
     pub async fn status(&self) -> Result<api_types::EventRelayStatus> {
-        let error: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT last_error, last_error_at FROM worker_health WHERE worker_name = ?",
-        )
-        .bind(RELAY_NAME)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let error: Option<(Option<String>, Option<String>)> =
+            self.db.domain_event_relay_error_status(RELAY_NAME).await?;
         let (last_error, last_error_at) = error.unwrap_or_default();
         Ok(api_types::EventRelayStatus {
             running: self.running.load(Ordering::SeqCst),

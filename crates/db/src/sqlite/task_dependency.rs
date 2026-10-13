@@ -124,3 +124,39 @@ fn task_columns_with_alias(alias: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeTaskDependencyRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeTaskDependencyRow {
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn depends_on_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("depends_on_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_work_task_dependencies(
+        &self,
+        ids: &[String],
+    ) -> crate::Result<Vec<NativeTaskDependencyRow>> {
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!(
+            "SELECT task_id, depends_on_id FROM task_dependency
+                 WHERE task_id IN ({placeholders}) ORDER BY task_id, depends_on_id"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+
+        let rows = query.fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeTaskDependencyRow { row })
+            .collect())
+    }
+}

@@ -1,6 +1,6 @@
 use super::*;
 use events::RoleAssignmentSnapshot;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 use std::collections::HashSet;
 
 impl TaskService {
@@ -51,18 +51,10 @@ impl TaskService {
     pub async fn lead_removed_from(&self, root_ids: &[String], agent_id: &str) -> Result<()> {
         let role = crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE;
         for root_id in root_ids {
-            let cleared = db::task_writer::TaskQuery::new(
-                &self.db,
-                root_id,
-                "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND role_name=? AND assignee_type='agent' AND assignee_id=?",
-            )
-            .bind(now_rfc3339())
-            .bind(root_id)
-            .bind(role)
-            .bind(agent_id)
-            .identity_fenced()
-            .execute(self.db.pool())
-            .await;
+            let cleared = self
+                .db
+                .clear_removed_lead_role_assignment(root_id, now_rfc3339(), role, agent_id)
+                .await;
             if let Err(error) = cleared {
                 // The queued clear still applies; the dispatcher then passes
                 // the gate from stored state once the run has ended.
@@ -79,23 +71,20 @@ impl TaskService {
         agent_id: &str,
     ) -> Result<Vec<RoleSweepEvent>> {
         validate_required("agent_id", agent_id)?;
-        let rows = sqlx::query(
-            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id = ? ORDER BY task_id, role_name",
-        )
-        .bind(agent_id)
-        .fetch_all(&mut **transaction)
-        .await?;
+        let rows = db
+            .agent_role_sweep_assignments_in_tx(transaction, agent_id)
+            .await?;
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             let previous_assignment = TaskRoleAssignment {
-                id: row.try_get("id")?,
-                task_id: row.try_get("task_id")?,
-                role_name: row.try_get("role_name")?,
+                id: row.id?,
+                task_id: row.task_id?,
+                role_name: row.role_name?,
                 assignee_type: Some(AssigneeKind::Agent),
-                assignee_id: row.try_get("assignee_id")?,
-                created_at: row.try_get("created_at")?,
-                updated_at: row.try_get("updated_at")?,
+                assignee_id: row.assignee_id?,
+                created_at: row.created_at?,
+                updated_at: row.updated_at?,
             };
             let mut new_assignment = previous_assignment.clone();
             new_assignment.assignee_id = None;
@@ -107,15 +96,28 @@ impl TaskService {
             });
         }
 
-        let task_ids:Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (assignee_id=? OR id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?))")
-            .bind(agent_id).bind(agent_id).fetch_all(&mut **transaction).await?;
+        let task_ids: Vec<String> = db
+            .agent_role_sweep_task_ids_in_tx(transaction, agent_id)
+            .await?;
         for task_id in task_ids {
             // Role clears for a deleted Agent must never be lost: each is
             // identity-fenced by its own predicate when queued.
-            let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?")
-                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).identity_fenced().execute_in_tx(transaction).await?;
-            let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?")
-                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).identity_fenced().execute_in_tx(transaction).await?;
+            let _queued_or_applied = db
+                .clear_deleted_agent_role_assignments_in_tx(
+                    transaction,
+                    &task_id,
+                    now_rfc3339(),
+                    agent_id,
+                )
+                .await?;
+            let _queued_or_applied = db
+                .clear_deleted_agent_task_assignee_in_tx(
+                    transaction,
+                    &task_id,
+                    now_rfc3339(),
+                    agent_id,
+                )
+                .await?;
         }
 
         // Agent archival changes the effective authority of every affected
@@ -125,32 +127,9 @@ impl TaskService {
         let affected_task_ids: HashSet<&str> =
             events.iter().map(|event| event.task_id.as_str()).collect();
         for task_id in affected_task_ids {
-            let _queued_or_applied = db::task_writer::TaskQuery::new(db,task_id,
-                "UPDATE task
-                 SET review_passed_at = NULL,
-                     version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
-                     metadata_json = CASE
-                         WHEN json_valid(COALESCE(metadata_json, '{}'))
-                         THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
-                         ELSE metadata_json
-                     END,
-                     updated_at = CASE
-                         WHEN review_passed_at IS NOT NULL
-                              OR (json_valid(COALESCE(metadata_json, '{}'))
-                                  AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                       OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
-                         THEN ? ELSE updated_at END
-                 WHERE id = ? AND deleted_at IS NULL
-                   AND (review_passed_at IS NOT NULL
-                        OR (json_valid(COALESCE(metadata_json, '{}'))
-                            AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                 OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))",
-            )
-            .bind(now_rfc3339())
-            .bind(task_id)
-            .identity_fenced()
-            .execute_in_tx(transaction)
-            .await?;
+            let _queued_or_applied = db
+                .invalidate_deleted_agent_task_authority_in_tx(transaction, task_id, now_rfc3339())
+                .await?;
         }
 
         Ok(events)
@@ -810,18 +789,14 @@ impl TaskService {
         if is_coordination_root && !root_role_allowed {
             return Err(crate::task_hierarchy::root_assignment_denied());
         }
-        let previous_row = sqlx::query(
-            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
-             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-        )
-        .bind(&input.task_id)
-        .bind(&input.role_name)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let previous_row = self
+            .db
+            .previous_task_role_assignment_in_tx(&mut transaction, &input.task_id, &input.role_name)
+            .await?;
         let previous = previous_row
             .map(|row| {
                 let assignee_type = row
-                    .try_get::<Option<String>, _>("assignee_type")?
+                    .assignee_type?
                     .map(|value| {
                         value.parse::<AssigneeKind>().map_err(|_| {
                             ServiceError::invalid_operation(format!(
@@ -831,13 +806,13 @@ impl TaskService {
                     })
                     .transpose()?;
                 Ok::<_, ServiceError>(TaskRoleAssignment {
-                    id: row.try_get("id")?,
-                    task_id: row.try_get("task_id")?,
-                    role_name: row.try_get("role_name")?,
+                    id: row.id?,
+                    task_id: row.task_id?,
+                    role_name: row.role_name?,
                     assignee_type,
-                    assignee_id: row.try_get("assignee_id")?,
-                    created_at: row.try_get("created_at")?,
-                    updated_at: row.try_get("updated_at")?,
+                    assignee_id: row.assignee_id?,
+                    created_at: row.created_at?,
+                    updated_at: row.updated_at?,
                 })
             })
             .transpose()?;
@@ -868,28 +843,23 @@ impl TaskService {
             let mut assignment = previous
                 .clone()
                 .expect("same assignment requires an existing assignment");
-            sqlx::query(
-                "UPDATE task_role_assignment SET updated_at = ? WHERE task_id = ? AND role_name = ?",
-            )
-            .bind(&input.updated_at)
-            .bind(&input.task_id)
-            .bind(&input.role_name)
-            .execute(&mut *transaction)
-            .await?;
+            self.db
+                .refresh_task_role_assignment_in_tx(
+                    &mut transaction,
+                    &input.updated_at,
+                    &input.task_id,
+                    &input.role_name,
+                )
+                .await?;
             assignment.updated_at = input.updated_at;
             transaction.commit().await?;
             return Ok((previous, assignment, false));
         }
 
-        let running_execution_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM execution
-             WHERE task_id = ? AND status = 'running' AND (role = ? OR role = 'executor')
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&input.task_id)
-        .bind(&input.role_name)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let running_execution_id = self
+            .db
+            .running_task_role_execution_in_tx(&mut transaction, &input.task_id, &input.role_name)
+            .await?;
         if running_execution_id.is_some() {
             return Err(ServiceError::invalid_operation(format!(
                 "task {} has a running {} execution; stop it before changing its assignment",
@@ -897,35 +867,19 @@ impl TaskService {
             )));
         }
 
-        sqlx::query(
-            "INSERT INTO task_role_assignment
-                (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(task_id, role_name) DO UPDATE SET
-                assignee_type = excluded.assignee_type,
-                assignee_id = excluded.assignee_id,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&input.id)
-        .bind(&input.task_id)
-        .bind(&input.role_name)
-        .bind(input.assignee_type.as_ref().map(ToString::to_string))
-        .bind(input.assignee_id.as_deref())
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&mut *transaction)
-        .await?;
+        self.db
+            .upsert_idle_task_role_assignment_in_tx(&mut transaction, &input)
+            .await?;
 
-        let result = sqlx::query(
-            "UPDATE task
-             SET review_passed_at = NULL, updated_at = ?, version = version + 1
-             WHERE id = ? AND deleted_at IS NULL AND version = ?",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.task_id)
-        .bind(expected_task_version)
-        .execute(&mut *transaction)
-        .await?;
+        let result = self
+            .db
+            .invalidate_idle_task_assignment_review_in_tx(
+                &mut transaction,
+                &input.updated_at,
+                &input.task_id,
+                expected_task_version,
+            )
+            .await?;
         if result.rows_affected() == 0 {
             return Err(db::DbError::VersionConflict.into());
         }

@@ -15,7 +15,7 @@ use db::{
     DomainEventRepo, SqliteDb, Task, TaskRepo,
 };
 use serde_json::{json, Value};
-use sqlx::{Acquire, Row, Sqlite, Transaction};
+use sqlx::{Acquire, Sqlite, Transaction};
 
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -96,13 +96,7 @@ impl CoordinationOutcomeConsumer {
             return Ok(None);
         };
 
-        let commitment_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM agent_commitment
-             WHERE originating_task_id = ? ORDER BY id ASC",
-        )
-        .bind(&task.id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let commitment_ids = self.db.task_outcome_commitment_ids(&task.id).await?;
         let action_origins = self.task_action_origins(&task.id).await?;
 
         let mut recipients = BTreeMap::<RecipientKey, RecipientSource>::new();
@@ -165,35 +159,24 @@ impl CoordinationOutcomeConsumer {
     }
 
     async fn task_action_origins(&self, task_id: &str) -> Result<Vec<ActionOrigin>> {
-        let rows = sqlx::query(
-            "SELECT a.id, a.actor_identity_id, a.scope_type, a.scope_id,
-                    e.result_json
-             FROM agent_action AS a
-             JOIN agent_action_execution AS e ON e.action_id = a.id
-             WHERE a.operation = 'task.propose'
-               AND e.status = 'succeeded'
-               AND e.result_json IS NOT NULL
-             ORDER BY a.id ASC, e.created_at ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.task_outcome_action_origin_sources().await?;
         let mut origins = Vec::new();
         let mut seen = BTreeSet::new();
         for row in rows {
-            let result_json: String = row.try_get("result_json")?;
+            let result_json: String = row.result_json?;
             let result = serde_json::from_str::<Value>(&result_json).unwrap_or(Value::Null);
             if result.get("task_id").and_then(Value::as_str) != Some(task_id) {
                 continue;
             }
-            let action_id: String = row.try_get("id")?;
+            let action_id: String = row.id?;
             if !seen.insert(action_id.clone()) {
                 continue;
             }
             origins.push(ActionOrigin {
                 action_id,
-                actor_identity_id: row.try_get("actor_identity_id")?,
-                scope_type: row.try_get("scope_type")?,
-                scope_id: row.try_get("scope_id")?,
+                actor_identity_id: row.actor_identity_id?,
+                scope_type: row.scope_type?,
+                scope_id: row.scope_id?,
             });
         }
         Ok(origins)
@@ -210,29 +193,14 @@ impl CoordinationOutcomeConsumer {
         source_ids.extend(actions.iter().map(|action| action.action_id.clone()));
         let now = now_rfc3339();
         for source_id in source_ids {
-            let ids = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM agent_inbox_item
-                 WHERE source_id = ? AND COALESCE(source_type, '') <> 'task_outcome'",
-            )
-            .bind(&source_id)
-            .fetch_all(&mut **tx)
-            .await?;
-            for id in ids {
-                sqlx::query(
-                    "UPDATE agent_inbox_item SET
-                        status = 'acknowledged',
-                        read_at = COALESCE(read_at, ?),
-                        acknowledged_at = COALESCE(acknowledged_at, ?),
-                        version = version + 1,
-                        updated_at = ?
-                     WHERE id = ? AND status IN ('unread', 'read')",
-                )
-                .bind(&now)
-                .bind(&now)
-                .bind(&now)
-                .bind(id)
-                .execute(&mut **tx)
+            let ids = self
+                .db
+                .task_outcome_originating_inbox_ids_in_tx(tx, &source_id)
                 .await?;
+            for id in ids {
+                self.db
+                    .acknowledge_task_outcome_originating_inbox_in_tx(tx, &now, id)
+                    .await?;
             }
         }
         Ok(())
@@ -247,24 +215,19 @@ impl CoordinationOutcomeConsumer {
         match scope_type {
             "task" => Ok(scope_id == task.id),
             "project" => Ok(scope_id == task.project_id),
-            "account" => Ok(sqlx::query_scalar::<_, Option<String>>(
-                "SELECT owner_id FROM project WHERE id = ?",
-            )
-            .bind(&task.project_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .flatten()
-            .as_deref()
+            "account" => Ok(self
+                .db
+                .task_outcome_project_owner(&task.project_id)
+                .await?
+                .flatten()
+                .as_deref()
                 == Some(scope_id)),
-            "agent_chat" => Ok(sqlx::query_scalar::<_, Option<String>>(
-                "SELECT project_id FROM agent_chat
-                 WHERE id = ? AND kind = 'project'",
-            )
-            .bind(scope_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .flatten()
-            .as_deref()
+            "agent_chat" => Ok(self
+                .db
+                .task_outcome_project_chat_scope(scope_id)
+                .await?
+                .flatten()
+                .as_deref()
                 == Some(task.project_id.as_str())),
             // An Agent-scoped commitment does not carry a canonical Task
             // authority relation, so fail closed rather than cross-deliver.
@@ -351,8 +314,10 @@ impl CoordinationOutcomeConsumer {
                 match result {
                     Ok(_) => Ok(()),
                     Err(db::DbError::VersionConflict) => {
-                        let evidence: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_evidence WHERE commitment_id = ? AND evidence_type = 'task_delivery' AND evidence_id = ?")
-                            .bind(&commitment.id).bind(&task.id).fetch_one(&mut **tx).await?;
+                        let evidence: i64 = self
+                            .db
+                            .task_delivery_evidence_count_in_tx(tx, &commitment.id, &task.id)
+                            .await?;
                         if current.status == AgentCommitmentStatus::Completed && evidence > 0 {
                             Ok(())
                         } else {
@@ -363,8 +328,10 @@ impl CoordinationOutcomeConsumer {
                 }
             }
             TaskOutcome::Blocked { reason } | TaskOutcome::Cancelled { reason } => {
-                let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_lifecycle WHERE commitment_id = ? AND dedupe_key = ?")
-                    .bind(&commitment.id).bind(&dedupe_key).fetch_one(&mut **tx).await?;
+                let exists: i64 = self
+                    .db
+                    .task_outcome_commitment_lifecycle_count_in_tx(tx, &commitment.id, &dedupe_key)
+                    .await?;
                 if exists > 0 {
                     return Ok(());
                 }
@@ -423,15 +390,12 @@ impl CoordinationOutcomeConsumer {
         Ok(match scope_type {
             "project" => scope_id == task.project_id,
             "task" => scope_id == task.id,
-            "agent_chat" => sqlx::query_scalar::<_, Option<String>>(
-                "SELECT project_id FROM agent_chat
-                 WHERE id = ? AND kind = 'project'",
-            )
-            .bind(scope_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .flatten()
-            .is_some_and(|project_id| project_id == task.project_id),
+            "agent_chat" => self
+                .db
+                .task_outcome_project_chat_scope(scope_id)
+                .await?
+                .flatten()
+                .is_some_and(|project_id| project_id == task.project_id),
             _ => false,
         })
     }
@@ -546,9 +510,9 @@ impl Worker for CoordinationOutcomeConsumer {
                 .await?;
             let health =
                 crate::worker_runtime::WorkerHealth::new(Arc::clone(&self.db), &self.consumer_name);
-            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id = ?)")
-                .bind(&p.task.id)
-                .fetch_one(&mut **tx)
+            let exists: bool = self
+                .db
+                .task_outcome_task_exists_in_tx(tx, &p.task.id)
                 .await?;
             if !exists {
                 return Err(db::DbError::NotFound.into());

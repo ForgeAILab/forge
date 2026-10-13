@@ -906,3 +906,101 @@ fn map_provider_entry_health(row: sqlx::sqlite::SqliteRow) -> Result<ProviderEnt
         updated_at: row.try_get("updated_at")?,
     })
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct TopicRotationScopeWorkspaceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl TopicRotationScopeWorkspaceRow {
+    pub fn workspace_path(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("workspace_path")?)
+    }
+    pub fn workspace_access(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("workspace_access")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn topic_rotation_source_session_id(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT s.id FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id WHERE c.scope_type = 'agent_chat' AND c.scope_id = ? AND s.status IN ('starting','ready','running','degraded') ORDER BY s.created_at DESC LIMIT 1",)
+.bind(chat_id)
+.fetch_optional(self.pool()).await?)
+    }
+}
+
+pub struct ReserveTopicRotationSuccessorSessionInTxInput<'a> {
+    pub successor_id: &'a str,
+    pub runtime_id: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+    pub source_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn reserve_topic_rotation_successor_session_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ReserveTopicRotationSuccessorSessionInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT OR IGNORE INTO agent_session (id, identity_id, profile_id, context_scope_id, backend_kind, runtime_session_id, status, capabilities_json, connection_status, predecessor_session_id, created_at, updated_at) SELECT ?, identity_id, profile_id, context_scope_id, backend_kind, ?, 'suspended', capabilities_json, connection_status, id, ?, ? FROM agent_session WHERE id = ?",)
+.bind(input.successor_id)
+.bind(input.runtime_id)
+.bind(input.created_at)
+.bind(input.updated_at)
+.bind(input.source_id)
+.execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn topic_rotation_scope_workspace(
+        &self,
+        scope_id: &str,
+    ) -> crate::Result<TopicRotationScopeWorkspaceRow> {
+        let rows = sqlx::query(
+            "SELECT workspace_access, workspace_path FROM agent_context_scope WHERE id = ?",
+        )
+        .bind(scope_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(TopicRotationScopeWorkspaceRow { row: rows })
+    }
+}
+
+impl SqliteDb {
+    pub async fn topic_rotation_successor_has_protected_state(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM protected_agent_session_state
+                           WHERE session_id = ?
+                             AND (snapshot_ciphertext IS NOT NULL
+                                  OR checkpoint_ciphertext IS NOT NULL))",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_topic_summary_session_scope(
+        &self,
+        runtime_session_id: &str,
+    ) -> crate::Result<Option<(String, String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "SELECT session.identity_id, session.profile_id, scope.scope_id
+         FROM agent_session AS session
+         JOIN agent_context_scope AS scope ON scope.id = session.context_scope_id
+         WHERE session.runtime_session_id = ? AND scope.scope_type = 'agent_chat'
+         LIMIT 1",
+        )
+        .bind(runtime_session_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

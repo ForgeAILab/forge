@@ -14,8 +14,8 @@
 //! finished move does not have.
 
 use super::{
-    is_under, real_dir, record_root, recorded_root, same_path, spellings, status_value,
-    stored_roots, under_sql, WorkspaceRootError, JOURNAL_FILE, MIGRATE_COMMAND, STATUS_KEY,
+    is_under, real_dir, record_root, recorded_root, root_record_error, same_path, spellings,
+    status_value, stored_roots, WorkspaceRootError, JOURNAL_FILE, MIGRATE_COMMAND, STATUS_KEY,
 };
 use db::{now_rfc3339, SqliteDb};
 use executors::gc;
@@ -32,148 +32,6 @@ use std::{
 /// Left in the old root: where its contents went.
 pub const MOVED_MARKER: &str = "MOVED";
 
-/// Every column that stores an absolute path under the server's workspace
-/// root, and whether a rewrite bumps the row's optimistic-lock version.
-const STORED_PATHS: [StoredPath; 13] = [
-    StoredPath::plain("workspace", "worktree_path"),
-    StoredPath::versioned("repo_location", "path").only("owner_kind = 'server'"),
-    // A server-owned placement's handle is its worktree path; a daemon's
-    // handle is the daemon's own name for a directory under its own root.
-    StoredPath::versioned("workspace_placement", "workspace_handle").only("owner_kind = 'server'"),
-    StoredPath::touched("repo", "local_path"),
-    StoredPath::touched("repo", "remote_url"),
-    StoredPath::plain("execution", "logs_path"),
-    StoredPath::plain("agent_context_scope", "workspace_path"),
-    StoredPath::plain("agent_inquiry", "workspace_path"),
-    StoredPath::plain("agent_inquiry", "findings_path"),
-    // A runtime row is a daemon's statement about its own root. Only the
-    // daemon inside the server process runs on the server's root; any other
-    // daemon keeps what it reported (one sharing the root keeps its Task
-    // roots in the old one) and reports again when it connects.
-    StoredPath::plain("runtime", "workspace_root")
-        .only("daemon_id IN (SELECT id FROM daemon WHERE machine_id LIKE 'embedded:%')"),
-    StoredPath::plain("integration_attempt", "repo_location_ref"),
-    // Durable steps carry the paths they act on inside their JSON; a step
-    // that has not run yet must act on the new root. The value is replaced
-    // as text, not parsed: the old root is matched only where a `/` or the
-    // closing `"` of a JSON string follows it, and both needle and
-    // replacement are JSON-escaped, so a root that is a prefix of another
-    // path (`/data/wt` and `/data/wt2`) is never touched, the document
-    // stays valid JSON, and keys, numbers and other strings are unchanged
-    // (proved by the `/data/wt2` rows of the fixture).
-    StoredPath::embedded("task_step", "payload_json"),
-    StoredPath::embedded("task_step", "result_json"),
-];
-
-struct StoredPath {
-    table: &'static str,
-    column: &'static str,
-    /// `version = version + 1`: a holder of the old row must re-read.
-    bump_version: bool,
-    touch_updated_at: bool,
-    /// The path is inside a JSON document, not the whole value.
-    embedded: bool,
-    /// Rows the rewrite is limited to.
-    only: Option<&'static str>,
-}
-
-impl StoredPath {
-    const fn plain(table: &'static str, column: &'static str) -> Self {
-        Self {
-            table,
-            column,
-            bump_version: false,
-            touch_updated_at: false,
-            embedded: false,
-            only: None,
-        }
-    }
-
-    const fn touched(table: &'static str, column: &'static str) -> Self {
-        Self {
-            touch_updated_at: true,
-            ..Self::plain(table, column)
-        }
-    }
-
-    const fn versioned(table: &'static str, column: &'static str) -> Self {
-        Self {
-            bump_version: true,
-            ..Self::touched(table, column)
-        }
-    }
-
-    const fn embedded(table: &'static str, column: &'static str) -> Self {
-        Self {
-            embedded: true,
-            ..Self::plain(table, column)
-        }
-    }
-
-    const fn only(mut self, rows: &'static str) -> Self {
-        self.only = Some(rows);
-        self
-    }
-
-    /// The `UPDATE` for one spelling of the old root. `?1` is the old root,
-    /// `?2` the new one (both JSON-escaped for an embedded path) and `?3`
-    /// the time, when the row's `updated_at` is touched.
-    fn update_sql(&self) -> String {
-        let column = self.column;
-        let (mut set, mut rows) = if self.embedded {
-            (
-                format!(
-                    "{column} = replace(replace({column}, ?1 || '/', ?2 || '/'), ?1 || '\"', ?2 || '\"')"
-                ),
-                format!("(instr({column}, ?1 || '/') > 0 OR instr({column}, ?1 || '\"') > 0)"),
-            )
-        } else {
-            (
-                format!("{column} = ?2 || substr({column}, length(?1) + 1)"),
-                moved_sql(column),
-            )
-        };
-        if self.bump_version {
-            set.push_str(", version = version + 1");
-        }
-        if self.touch_updated_at {
-            set.push_str(", updated_at = ?3");
-        }
-        if let Some(only) = self.only {
-            rows = format!("{rows} AND {only}");
-        }
-        format!("UPDATE {} SET {set} WHERE {rows}", self.table)
-    }
-}
-
-impl StoredPath {
-    /// Counts the rows of this column that still name the root bound as
-    /// `?1` (JSON-escaped for an embedded path), within the rows the
-    /// rewrite is limited to.
-    fn remaining_sql(&self) -> String {
-        let column = self.column;
-        let mut rows = if self.embedded {
-            format!("(instr({column}, ?1 || '/') > 0 OR instr({column}, ?1 || '\"') > 0)")
-        } else {
-            moved_sql(column)
-        };
-        if let Some(only) = self.only {
-            rows = format!("{rows} AND {only}");
-        }
-        format!("SELECT COUNT(*) FROM {} WHERE {rows}", self.table)
-    }
-}
-
-/// SQL: `column` is the root bound as `?1` or a path inside it, and not a
-/// path inside `<root>/.forge/workspaces`: what a daemon sharing the root
-/// keeps there stays in the old root, so a path into it stays as it is.
-fn moved_sql(column: &str) -> String {
-    format!(
-        "({} AND NOT ({column} = ?1 || '/.forge/{DAEMON_WORKSPACES}' OR substr({column}, 1, length(?1 || '/.forge/{DAEMON_WORKSPACES}/')) = ?1 || '/.forge/{DAEMON_WORKSPACES}/'))",
-        under_sql(column)
-    )
-}
-
 /// `text` as it appears inside a JSON string.
 fn json_escaped(text: &str) -> String {
     let quoted = serde_json::Value::String(text.to_owned()).to_string();
@@ -183,7 +41,7 @@ fn json_escaped(text: &str) -> String {
 /// The stored paths a move rewrites, as `table.column`.
 #[must_use]
 pub fn stored_path_columns() -> Vec<String> {
-    let mut all: Vec<String> = STORED_PATHS
+    let mut all: Vec<String> = db::WORKSPACE_ROOT_STORED_PATHS
         .iter()
         .map(|stored| format!("{}.{}", stored.table, stored.column))
         .collect();
@@ -878,7 +736,7 @@ async fn named_by_database(
         let path = format!("{spelling}/{unit}");
         let found = sweep(
             db,
-            "({column} = ?1 OR instr({column}, ?1 || '/') > 0 OR instr({column}, ?2 || '/') > 0 OR instr({column}, ?2 || '\"') > 0)",
+            db::WorkspaceRootTextPredicate::NamedUnit,
             &[path.clone(), json_escaped(&path)],
         )
         .await?;
@@ -946,47 +804,35 @@ struct Running {
     leases: i64,
 }
 
-/// The integration attempts a move must wait for.
-///
-/// An attempt is at rest when its state is final (`completed`, `cancelled`,
-/// `superseded`) or hands the Task back with nothing in flight (`parked`:
-/// waiting for an operator; `needs_review`, `ejected`: the Task is back
-/// with a reviewer or coder), AND it has no outstanding owner effect
-/// (`effect_intent_json`) and no operation other than a settled one
-/// (`succeeded`, `failed`, `acknowledged`, or none). That second half is
-/// the queue's own definition of an unsettled attempt. Every other state
-/// names a repository location or owner state that the queue is still
-/// acting on, or (`quarantined`) that nobody has established.
-///
-/// Both halves name what is at rest, never what is not: a state or an
-/// operation state this code does not know (a later queue revision adds
-/// some) blocks the move until somebody decides it is at rest.
-const UNSETTLED_ATTEMPTS: &str = "SELECT task_ref, state, effect_intent_json IS NOT NULL,
-            COALESCE(current_operation_state, '')
-     FROM integration_attempt
-     WHERE state NOT IN ('completed', 'cancelled', 'superseded', 'parked', 'needs_review', 'ejected')
-        OR effect_intent_json IS NOT NULL
-        OR COALESCE(current_operation_state, '') NOT IN ('', 'succeeded', 'failed', 'acknowledged')
-     ORDER BY updated_at, id";
-
 impl Running {
     async fn read(db: &SqliteDb) -> Result<Self, sqlx::Error> {
-        let count = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql).fetch_one(db.pool());
         Ok(Self {
-            executions: count("SELECT COUNT(*) FROM execution WHERE status = 'running'").await?,
-            checks: count(
-                "SELECT COUNT(*) FROM check_run WHERE state IN ('running', 'cancelling', 'cleaning')",
-            )
-            .await?,
+            executions: db
+                .workspace_root_running_execution_total()
+                .await
+                .map_err(root_record_error)?,
+            checks: db
+                .workspace_root_running_check_total()
+                .await
+                .map_err(root_record_error)?,
             // A claimed step is being run; a suspended one waits for a
             // check it started in a worktree.
-            steps: count("SELECT COUNT(*) FROM task_step WHERE status IN ('claimed', 'suspended')")
-                .await?,
-            integrations: sqlx::query_as::<_, (String, String, bool, String)>(UNSETTLED_ATTEMPTS)
-                .fetch_all(db.pool())
-                .await?
+            steps: db
+                .workspace_root_claimed_step_total()
+                .await
+                .map_err(root_record_error)?,
+            integrations: db
+                .workspace_root_unsettled_attempts()
+                .await
+                .map_err(root_record_error)?
                 .into_iter()
-                .map(|(task, state, intent, operation)| {
+                .map(|row| {
+                    let (task, state, intent, operation) = (
+                        row.task_ref,
+                        row.state,
+                        row.effect_outstanding,
+                        row.operation_state,
+                    );
                     let mut why = format!("Task {task}: {state}");
                     if intent {
                         why.push_str(", owner effect outstanding");
@@ -1003,12 +849,10 @@ impl Running {
                     why
                 })
                 .collect(),
-            leases: sqlx::query_scalar(
-                "SELECT COUNT(*) FROM workspace_lease WHERE status = 'active' AND expires_at > ?",
-            )
-            .bind(now_rfc3339())
-            .fetch_one(db.pool())
-            .await?,
+            leases: db
+                .workspace_root_active_lease_count(now_rfc3339())
+                .await
+                .map_err(root_record_error)?,
         })
     }
 
@@ -1166,19 +1010,18 @@ async fn is_this_databases(
 ) -> Result<bool, sqlx::Error> {
     let (inside, name) = unit.rsplit_once('/').unwrap_or(("", unit));
     let table = match inside {
-        "" if is_uuid(name) => Some("task"),
-        ".repos" => Some("repo"),
-        ".forge/logs" => Some("project"),
+        "" if is_uuid(name) => Some(db::WorkspaceRootEntity::Task),
+        ".repos" => Some(db::WorkspaceRootEntity::Repo),
+        ".forge/logs" => Some(db::WorkspaceRootEntity::Project),
         ".forge" | ".forge/gc" => return Ok(!adopted_by_another),
         "" if name == ".forge-tmp" => return Ok(!adopted_by_another),
         _ => None,
     };
     if let Some(table) = table {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE id = ?");
-        let rows: i64 = sqlx::query_scalar(&sql)
-            .bind(name)
-            .fetch_one(db.pool())
-            .await?;
+        let rows = db
+            .workspace_root_entity_count(table, name)
+            .await
+            .map_err(root_record_error)?;
         if rows > 0 {
             return Ok(true);
         }
@@ -1586,12 +1429,10 @@ async fn repair_worktrees(
     if let Ok(entries) = fs::read_dir(target.join(".repos")) {
         repositories.extend(entries.flatten().map(|entry| entry.path()));
     }
-    let known: Vec<String> = sqlx::query_scalar(
-        "SELECT local_path FROM repo WHERE local_path IS NOT NULL AND local_path != ''
-         UNION SELECT path FROM repo_location WHERE owner_kind = 'server'",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let known: Vec<String> = db
+        .workspace_root_repair_repository_paths()
+        .await
+        .map_err(root_record_error)?;
     for path in known {
         let path = PathBuf::from(rehome(&path, journal).unwrap_or(path));
         if !repositories.contains(&path) {
@@ -1779,9 +1620,9 @@ async fn rewrite_database(
     let new_root = run.journal.target.clone();
     let mut rows = Vec::new();
     let mut tx = db.pool().begin().await?;
-    for stored in &STORED_PATHS {
+    for stored in &db::WORKSPACE_ROOT_STORED_PATHS {
         let mut changed = 0;
-        let sql = stored.update_sql();
+        let rewrite = stored.rewrite();
         #[cfg(test)]
         if run.request.skip_column == Some(stored.column) {
             continue;
@@ -1792,50 +1633,47 @@ async fn rewrite_database(
             } else {
                 (old.clone(), new_root.clone())
             };
-            let mut query = sqlx::query(&sql).bind(old).bind(new);
-            if stored.touch_updated_at {
-                query = query.bind(&now);
-            }
-            changed += query.execute(&mut *tx).await?.rows_affected();
+            changed += rewrite
+                .execute_in_tx(&mut tx, old, new, &now)
+                .await
+                .map_err(root_record_error)?;
         }
         rows.push((format!("{}.{}", stored.table, stored.column), changed));
     }
     record_root(&mut *tx, target).await?;
-    sqlx::query(
-        "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    db::record_workspace_root_setting(
+        &mut *tx,
+        STATUS_KEY,
+        &status_value(
+            target,
+            is_under(target, &run.request.system_temp),
+            &run.request.command,
+            &[],
+        ),
+        now.clone(),
     )
-    .bind(STATUS_KEY)
-    .bind(status_value(
-        target,
-        is_under(target, &run.request.system_temp),
-        &run.request.command,
-        &[],
-    ))
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(root_record_error)?;
     // What the last ownership check found is about the old root; the check
     // after the move writes it again.
-    sqlx::query("DELETE FROM system_setting WHERE key = ?")
-        .bind(crate::workspace_cleanup::GC_STATUS_KEY)
-        .execute(&mut *tx)
-        .await?;
+    db.delete_workspace_root_setting_in_tx(&mut tx, crate::workspace_cleanup::GC_STATUS_KEY)
+        .await
+        .map_err(root_record_error)?;
     // The post-condition, inside the transaction: no column that stores a
     // path still names the old root. If one does, nothing is committed.
     let mut pending = Vec::new();
-    for stored in &STORED_PATHS {
-        let sql = stored.remaining_sql();
+    for stored in &db::WORKSPACE_ROOT_STORED_PATHS {
+        let remaining = stored.remaining();
         for old in &run.journal.source_spellings {
             let old = if stored.embedded {
                 json_escaped(old)
             } else {
                 old.clone()
             };
-            let left: i64 = sqlx::query_scalar(&sql)
-                .bind(old)
-                .fetch_one(&mut *tx)
-                .await?;
+            let left: i64 = remaining
+                .count_in_tx(&mut tx, old)
+                .await
+                .map_err(root_record_error)?;
             if left > 0 {
                 pending.push(format!(
                     "{}.{} ({left} row(s))",
@@ -1865,7 +1703,12 @@ pub(crate) async fn mentions(
     db: &SqliteDb,
     needle: &str,
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-    sweep(db, "instr({column}, ?1) > 0", &[needle.to_owned()]).await
+    sweep(
+        db,
+        db::WorkspaceRootTextPredicate::Mentions,
+        &[needle.to_owned()],
+    )
+    .await
 }
 
 /// Every text column of every table with rows matching `predicate`
@@ -1873,39 +1716,28 @@ pub(crate) async fn mentions(
 /// `table.column` and a row count.
 async fn sweep(
     db: &SqliteDb,
-    predicate: &str,
+    predicate: db::WorkspaceRootTextPredicate,
     binds: &[String],
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-         AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let tables: Vec<String> = db
+        .workspace_root_text_tables()
+        .await
+        .map_err(root_record_error)?;
     let mut found = Vec::new();
     for table in tables {
-        let columns: Vec<(String, String)> = sqlx::query_as(&format!(
-            "SELECT name, type FROM pragma_table_info('{}')",
-            table.replace('\'', "''")
-        ))
-        .fetch_all(db.pool())
-        .await?;
+        let columns: Vec<(String, String)> = db
+            .workspace_root_table_columns(&table)
+            .await
+            .map_err(root_record_error)?;
         for (column, kind) in columns {
             let kind = kind.to_ascii_uppercase();
             if !(kind.is_empty() || kind.contains("TEXT") || kind.contains("JSON")) {
                 continue;
             }
-            let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-            let sql = format!(
-                "SELECT COUNT(*) FROM {} WHERE {}",
-                quoted(&table),
-                predicate.replace("{column}", &quoted(&column))
-            );
-            let mut query = sqlx::query_scalar::<_, i64>(&sql);
-            for bind in binds {
-                query = query.bind(bind);
-            }
-            let Ok(count) = query.fetch_one(db.pool()).await else {
+            let Ok(count) = db
+                .workspace_root_column_match_count(&table, &column, predicate, binds)
+                .await
+            else {
                 continue;
             };
             if count > 0 {

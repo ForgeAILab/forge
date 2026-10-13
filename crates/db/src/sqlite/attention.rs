@@ -786,3 +786,213 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+pub struct UpsertPlacementRefusalAttentionInTxInput<'a> {
+    pub id: String,
+    pub project_id: &'a str,
+    pub event_id: String,
+    pub summary: &'a str,
+    pub details_json: String,
+    pub dedupe_key: String,
+    pub occurred_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn upsert_placement_refusal_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: UpsertPlacementRefusalAttentionInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'human_input_required', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'configure_environment') ON CONFLICT(dedupe_key) DO UPDATE SET status='open', summary=excluded.summary, details_json=excluded.details_json, updated_at=excluded.updated_at, resolved_at=NULL, version=attention_projection.version+1").bind(input.id).bind(input.project_id).bind(input.event_id).bind(input.summary).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_placement_refusal_attention(
+        &self,
+        resolved_at: String,
+        updated_at: String,
+        environment_dedupe_key: String,
+        provision_dedupe_key: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE dedupe_key IN (?,?) AND status<>'resolved'").bind(resolved_at).bind(updated_at).bind(environment_dedupe_key).bind(provision_dedupe_key).execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_execution_plan_wait_attention(
+        &self,
+        resolved_at: String,
+        updated_at: String,
+        dedupe_key: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=? WHERE dedupe_key=? AND status<>'resolved'").bind(resolved_at).bind(updated_at).bind(dedupe_key).execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_lead_input_attention(
+        &self,
+        now: &str,
+        dedupe_key: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+        "UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1
+         WHERE dedupe_key=? AND status!='resolved'",
+    ).bind(now).bind(now).bind(dedupe_key).execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn lead_input_attention_status_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key=?")
+                .bind(dedupe_key)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+pub struct ResolveWorkspaceAdmissionAttentionInTxInput<'a> {
+    pub resolved_at: &'a str,
+    pub updated_at: &'a str,
+    pub review_dedupe_key: String,
+    pub owner_dedupe_key: String,
+    pub environment_dedupe_key: String,
+    pub task_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn resolve_workspace_admission_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ResolveWorkspaceAdmissionAttentionInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
+        WHERE status <> 'resolved' AND (dedupe_key IN (?, ?, ?) OR (dedupe_key LIKE 'workspace-fence:%' AND json_extract(details_json, '$.task.id') = ?))").bind(input.resolved_at).bind(input.updated_at).bind(input.review_dedupe_key).bind(input.owner_dedupe_key).bind(input.environment_dedupe_key).bind(input.task_id).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_workspace_review_ci_attention(
+        &self,
+        now: &str,
+        dedupe_key: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key = ?").bind(now).bind(now).bind(dedupe_key).execute(self.pool()).await?)
+    }
+}
+
+pub struct RecordWorkspaceWaitAttentionInTxInput<'a> {
+    pub id: String,
+    pub kind: &'a str,
+    pub project_id: &'a str,
+    pub event_id: &'a str,
+    pub reason: &'a str,
+    pub details_json: String,
+    pub dedupe_key: &'a str,
+    pub occurred_at: &'a str,
+    pub updated_at: &'a str,
+    pub sequence: i64,
+}
+
+impl SqliteDb {
+    pub async fn record_workspace_wait_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: RecordWorkspaceWaitAttentionInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id,
+        source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at,
+        updated_at, recommended_action, source_sequence)
+        VALUES (?, ?, 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'recover_task', ?)
+        ON CONFLICT(dedupe_key) DO UPDATE SET summary = excluded.summary, details_json = excluded.details_json,
+        source_event_id = excluded.source_event_id, status = 'open', resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL,
+        updated_at = excluded.updated_at, version = attention_projection.version + 1").bind(input.id).bind(input.kind).bind(input.project_id).bind(input.event_id).bind(input.reason).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).bind(input.sequence).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn away_repository_cleanup_raised_at(
+        &self,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT occurred_at FROM attention_projection
+             WHERE dedupe_key = ? AND status <> 'resolved'
+             ORDER BY occurred_at LIMIT 1",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn settle_away_repository_cleanup_attention(
+        &self,
+        evidence: &str,
+        updated_at: String,
+        dedupe_key: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE attention_projection
+             SET details_json = json_set(details_json, '$.settled', ?), updated_at = ?,
+                 version = version + 1
+             WHERE dedupe_key = ? AND status <> 'resolved'",
+        )
+        .bind(evidence)
+        .bind(updated_at)
+        .bind(dedupe_key)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn open_retired_auditor_notice_keys(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+        "SELECT dedupe_key FROM attention_projection WHERE status <> 'resolved' AND dedupe_key LIKE 'retired-auditor:%'",
+    ).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn acknowledge_retired_auditor_notice_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE attention_projection SET status = 'acknowledged', acknowledged_at = updated_at WHERE dedupe_key = ? AND status = 'open'").bind(dedupe_key).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn resolve_retired_auditor_notice(
+        &self,
+        now: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key = ?").bind(now).bind(now).bind(dedupe_key).execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn domain_event_relay_error_status(
+        &self,
+        worker_name: &str,
+    ) -> crate::Result<Option<(Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as(
+            "SELECT last_error, last_error_at FROM worker_health WHERE worker_name = ?",
+        )
+        .bind(worker_name)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

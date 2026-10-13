@@ -14,7 +14,7 @@ use db::{
     SqliteDb,
 };
 use serde_json::{json, Value};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 use std::sync::Arc;
 use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
@@ -280,37 +280,22 @@ impl WakeTurnConsumer {
     ) -> Result<DeliveryFollowupState> {
         let governed_milestone_ids: Vec<String> = match task_id {
             Some(task_id) => {
-                sqlx::query_scalar(
-                    "SELECT DISTINCT g.milestone_id FROM project_task_governance g
-                 WHERE g.task_id = ? AND g.project_id = ? AND g.milestone_id IS NOT NULL",
-                )
-                .bind(task_id)
-                .bind(project_id)
-                .fetch_all(self.db.pool())
-                .await?
+                self.db
+                    .delivery_followup_governed_milestone_ids(task_id, project_id)
+                    .await?
             }
             None => Vec::new(),
         };
 
-        let candidates = sqlx::query(
-            "SELECT m.id, m.milestone_key, m.version,
-                    m.current_definition_revision_id AS definition_revision_id,
-                    r.task_selection_json
-             FROM project_milestone m
-             JOIN project_milestone_revision r
-               ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
-             WHERE m.project_id = ?
-               AND m.lifecycle IN ('planned', 'active', 'ready_for_release')
-             ORDER BY m.milestone_sequence ASC, m.id ASC",
-        )
-        .bind(project_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let candidates = self
+            .db
+            .delivery_followup_milestone_sources(project_id)
+            .await?;
 
         let mut milestones = Vec::new();
         let mut skipped_milestones = 0usize;
         for row in candidates {
-            let milestone_id: String = row.try_get("id")?;
+            let milestone_id: String = row.id()?;
             if !governed_milestone_ids.is_empty() && !governed_milestone_ids.contains(&milestone_id)
             {
                 continue;
@@ -319,53 +304,31 @@ impl WakeTurnConsumer {
                 skipped_milestones += 1;
                 continue;
             }
-            let definition_revision_id: String = row.try_get("definition_revision_id")?;
-            let task_selection_json: String = row.try_get("task_selection_json")?;
+            let definition_revision_id: String = row.definition_revision_id()?;
+            let task_selection_json: String = row.task_selection_json()?;
             // Mirror readiness: a milestone gates on every governed Task plus
             // every Task its definition selected, so the wake never claims the
             // work is finished while readiness still sees an open Task.
-            let open_task_count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM task t
-                 WHERE t.project_id = ?
-                   AND t.deleted_at IS NULL AND t.archived_at IS NULL
-                   AND t.status NOT IN ('done', 'cancelled')
-                   AND (
-                        t.id IN (SELECT g.task_id FROM project_task_governance g
-                                 WHERE g.milestone_id = ? AND g.project_id = ?)
-                     OR t.id IN (SELECT value FROM json_each(?))
-                   )",
-            )
-            .bind(project_id)
-            .bind(&milestone_id)
-            .bind(project_id)
-            .bind(&task_selection_json)
-            .fetch_optional(self.db.pool())
-            .await?
-            .unwrap_or_default();
+            let open_task_count = self
+                .db
+                .delivery_followup_open_task_count(project_id, &milestone_id, &task_selection_json)
+                .await?
+                .unwrap_or_default();
 
-            let check_rows = sqlx::query(
-                "SELECT c.id, c.source_kind, COALESCE(r.outcome, 'missing') AS outcome
-                 FROM project_milestone_check c
-                 LEFT JOIN project_milestone_check_result r
-                   ON r.id = c.current_result_id
-                  AND r.definition_revision_id = c.definition_revision_id
-                 WHERE c.project_id = ? AND c.milestone_id = ?
-                   AND c.definition_revision_id = ? AND c.required = 1
-                   AND COALESCE(r.outcome, 'missing') NOT IN ('passed', 'waived')
-                 ORDER BY c.check_key ASC
-                 LIMIT 64",
-            )
-            .bind(project_id)
-            .bind(&milestone_id)
-            .bind(&definition_revision_id)
-            .fetch_all(self.db.pool())
-            .await?;
+            let check_rows = self
+                .db
+                .delivery_followup_outstanding_check_sources(
+                    project_id,
+                    &milestone_id,
+                    &definition_revision_id,
+                )
+                .await?;
             let mut agent_check_ids = Vec::new();
             let mut manual_check_ids = Vec::new();
             for check in check_rows {
-                let check_id: String = check.try_get("id")?;
-                let source_kind: String = check.try_get("source_kind")?;
-                let outcome: String = check.try_get("outcome")?;
+                let check_id: String = check.id()?;
+                let source_kind: String = check.source_kind()?;
+                let outcome: String = check.outcome()?;
                 // A check that already failed or went stale is still
                 // outstanding, but it is not unobserved: say which it is so the
                 // Agent re-runs it rather than reporting it as never attempted.
@@ -382,8 +345,8 @@ impl WakeTurnConsumer {
             }
             milestones.push(DeliveryFollowupMilestone {
                 milestone_id,
-                milestone_key: row.try_get("milestone_key")?,
-                version: row.try_get("version")?,
+                milestone_key: row.milestone_key()?,
+                version: row.version()?,
                 definition_revision_id,
                 open_task_count,
                 agent_check_ids,

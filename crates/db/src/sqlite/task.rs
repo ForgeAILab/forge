@@ -4272,3 +4272,996 @@ impl SqliteDb {
         Ok(rows.map(|row| WorkspaceLeaseRoleAssignmentRow { row }))
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeWorkTaskRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeWorkTaskRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn condition_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("condition_json")?)
+    }
+    pub fn parent_task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("parent_task_id")?)
+    }
+    pub fn subtask_order(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("subtask_order")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn title(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("title")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn priority(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("priority")?)
+    }
+    pub fn assignee_type(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("assignee_type")?)
+    }
+    pub fn assignee_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("assignee_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_work_tasks(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<NativeWorkTaskRow>> {
+        let rows = sqlx::query(
+            "SELECT id, parent_task_id, subtask_order, version,
+                            title, status, priority, assignee_type, assignee_id,
+                            condition_json
+                     FROM task WHERE project_id = ? AND deleted_at IS NULL
+                     ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeWorkTaskRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_scope_work_task(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Vec<NativeWorkTaskRow>> {
+        let rows = sqlx::query(
+            "SELECT id, parent_task_id, subtask_order, version,
+                        title, status, priority, assignee_type, assignee_id,
+                        condition_json
+                     FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeWorkTaskRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_task_project_id(&self, task_id: &str) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_task_scope_summary(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<NativeScopeSummaryRow>> {
+        let rows =
+            sqlx::query("SELECT id, project_id, title, status, priority FROM task WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(rows.map(|row| NativeScopeSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_task_log_references(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM review
+                WHERE task_id = ?1 AND status IN ('running', 'awaiting_human')
+             ) OR EXISTS (
+                SELECT 1 FROM attention_projection
+                WHERE status <> 'resolved'
+                  AND ((scope_type = 'task' AND scope_id = ?1)
+                       OR json_extract(details_json, '$.task_id') = ?1
+                       OR json_extract(details_json, '$.task.id') = ?1)
+             )",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_legacy_log_task_exists(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
+                .bind(task_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_root_task_exists(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
+                .bind(task_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_task_active_uses(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS (
+                SELECT 1 FROM execution
+                WHERE (task_id = ?1 OR workspace_id IN (SELECT id FROM workspace WHERE task_id = ?1))
+                  AND status = 'running'
+             ) OR EXISTS (
+                SELECT 1 FROM workspace_lease wl
+                LEFT JOIN execution e ON e.id = wl.execution_id
+                WHERE (wl.task_id = ?1
+                       OR e.workspace_id IN (SELECT id FROM workspace WHERE task_id = ?1))
+                  AND wl.status = 'active'
+             ) OR EXISTS (
+                SELECT 1 FROM task child JOIN execution e ON e.task_id = child.id
+                WHERE child.parent_task_id = ?1 AND e.status = 'running'
+             )",)
+.bind(task_id)
+.fetch_one(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_environment_wait_tasks(
+        &self,
+        project_id: &str,
+        machine_json: &str,
+    ) -> crate::Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as::<_, (String, i64)>("SELECT id,version FROM task WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?)",)
+.bind(project_id)
+.bind(machine_json)
+.fetch_all(self.pool()).await?)
+    }
+}
+
+pub struct RepositoryProvisionTaskWaitInput<'a> {
+    pub task_id: &'a str,
+    pub reason: &'a str,
+    pub version: i64,
+    pub machine_json: &'a str,
+    pub project_id: &'a str,
+    pub daemon_id: &'a Option<String>,
+    pub runtime_id: &'a Option<String>,
+    pub readiness_version: i64,
+}
+impl SqliteDb {
+    pub async fn record_repository_provision_task_wait_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: RepositoryProvisionTaskWaitInput<'_>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
+.bind(input.reason).bind(input.task_id).bind(input.version).bind(input.machine_json).bind(input.project_id).bind(input.daemon_id).bind(input.runtime_id).bind(input.readiness_version).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_observed_task_status(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT status FROM task
+                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_definition_task_reference(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_governed_task_reference(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1
+                 FROM task AS t
+                 JOIN project_task_governance AS g ON g.task_id = t.id
+                 WHERE t.id = ? AND t.project_id = ?
+                 LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_task_reference(
+        &self,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1",
+        )
+        .bind(id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct PlacementEligibilityAssignmentRow {
+    pub role_name: String,
+    pub assignee_type: Option<String>,
+    pub assignee_id: Option<String>,
+    pub updated_at: String,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for PlacementEligibilityAssignmentRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            role_name: row.try_get(0)?,
+            assignee_type: row.try_get(1)?,
+            assignee_id: row.try_get(2)?,
+            updated_at: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_eligibility_assignments(
+        &self,
+        task_id: &str,
+        parent_task_id: &str,
+    ) -> crate::Result<Vec<PlacementEligibilityAssignmentRow>> {
+        Ok(sqlx::query_as("SELECT role_name,assignee_type,assignee_id,updated_at FROM task_role_assignment WHERE task_id=? OR task_id=? ORDER BY task_id,role_name").bind(task_id).bind(parent_task_id).fetch_all(self.pool()).await?)
+    }
+}
+
+pub struct ClearPlacementDispatchRefusalInput<'a> {
+    pub annotation: String,
+    pub updated_at: String,
+    pub task_id: &'a str,
+    pub version: i64,
+    pub metadata_json: &'a Option<String>,
+}
+impl SqliteDb {
+    pub async fn clear_placement_dispatch_refusal(
+        &self,
+        input: ClearPlacementDispatchRefusalInput<'_>,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET error_annotation=CASE WHEN error_annotation=? THEN NULL ELSE error_annotation END,
+            metadata_json=CASE WHEN json_extract(metadata_json,'$.environment_wait.kind') IN ('environment_unverified','provision_failed') THEN json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition','$.environment_wait') ELSE json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition') END,version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?").bind(input.annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).bind(input.metadata_json).execute(self.pool()).await
+    }
+}
+
+pub struct RecordPlacementDispatchRefusalInput<'a> {
+    pub annotation: String,
+    pub environment_wait: bool,
+    pub marker: String,
+    pub wait_json: String,
+    pub marker_copy: String,
+    pub updated_at: String,
+    pub task_id: &'a str,
+    pub version: i64,
+}
+impl SqliteDb {
+    pub async fn record_placement_dispatch_refusal(
+        &self,
+        input: RecordPlacementDispatchRefusalInput<'_>,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
+            metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?").bind(input.annotation).bind(input.environment_wait).bind(input.marker).bind(input.wait_json).bind(input.marker_copy).bind(input.updated_at).bind(input.task_id).bind(input.version).execute(self.pool()).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_plan_wait_task_version(
+        &self,
+        execution_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar("SELECT version FROM task WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=?").bind(execution_id).fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_execution_plan_task_wait(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+        updated_at: String,
+        version: Option<i64>,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET error_annotation=CASE WHEN json_extract(error_annotation, '$.type')='plan_settlement_wait' AND json_extract(error_annotation, '$.execution_id')=? THEN NULL ELSE error_annotation END,
+        metadata_json=CASE WHEN json_extract(metadata_json, '$.owner_wait.plan_execution_id')=?
+          THEN json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch', '$.owner_wait')
+          ELSE json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch') END,
+        version=version+1,updated_at=? WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=? AND version=?").bind(execution_id).bind(execution_id).bind(updated_at).bind(execution_id).bind(version).execute(self.pool()).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_execution_plan_owner_wait_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+        owner_wait_json: String,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?").bind(owner_wait_json).bind(task_id).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+pub struct RecordExecutionPlanTaskWaitInTxInput<'a> {
+    pub task_id: &'a str,
+    pub marker: String,
+    pub disposition: String,
+    pub annotation: String,
+    pub updated_at: String,
+    pub version: i64,
+}
+
+impl SqliteDb {
+    pub async fn record_execution_plan_task_wait_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: RecordExecutionPlanTaskWaitInTxInput<'_>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json, '{}'), '$.plan_settlement_wait', json(?), '$.deferred_dispatch', json(?)),
+        error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation, '$.type')='plan_settlement_wait' THEN ? ELSE error_annotation END,
+        version=version+1, updated_at=? WHERE id=? AND version=?").bind(input.marker).bind(input.disposition).bind(input.annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_task_exists_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id = ?)")
+                .bind(task_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn link_task_hook_execution_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        execution_id: &str,
+        step_id: &str,
+        hook_index: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task_hook_checkpoint SET execution_id=? WHERE step_id=? AND hook_index=? AND execution_id IS NULL").bind(execution_id).bind(step_id).bind(hook_index).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn lead_budget_charge_recorded_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        budget: &str,
+        key: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM task_budget_charge c JOIN task_budget b USING(task_id,kind) WHERE c.task_id=? AND c.kind=? AND c.window_id=b.window_id AND c.step_id=?)",
+            ).bind(task_id).bind(budget).bind(key).fetch_one(connection).await?)
+    }
+}
+
+pub struct TaskRoleAssignmentSourceRow {
+    pub id: crate::Result<String>,
+    pub task_id: crate::Result<String>,
+    pub role_name: crate::Result<String>,
+    pub assignee_type: crate::Result<Option<String>>,
+    pub assignee_id: crate::Result<Option<String>>,
+    pub created_at: crate::Result<String>,
+    pub updated_at: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn agent_role_sweep_assignments_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        agent_id: &str,
+    ) -> crate::Result<Vec<TaskRoleAssignmentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id = ? ORDER BY task_id, role_name",
+        ).bind(agent_id).fetch_all(connection).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TaskRoleAssignmentSourceRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                task_id: row.try_get("task_id").map_err(crate::DbError::from),
+                role_name: row.try_get("role_name").map_err(crate::DbError::from),
+                assignee_type: row.try_get("assignee_type").map_err(crate::DbError::from),
+                assignee_id: row.try_get("assignee_id").map_err(crate::DbError::from),
+                created_at: row.try_get("created_at").map_err(crate::DbError::from),
+                updated_at: row.try_get("updated_at").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn previous_task_role_assignment_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        role_name: &str,
+    ) -> crate::Result<Option<TaskRoleAssignmentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(task_id)
+        .bind(role_name)
+        .fetch_optional(connection)
+        .await?;
+        Ok(rows.map(|row| TaskRoleAssignmentSourceRow {
+            id: row.try_get("id").map_err(crate::DbError::from),
+            task_id: row.try_get("task_id").map_err(crate::DbError::from),
+            role_name: row.try_get("role_name").map_err(crate::DbError::from),
+            assignee_type: row.try_get("assignee_type").map_err(crate::DbError::from),
+            assignee_id: row.try_get("assignee_id").map_err(crate::DbError::from),
+            created_at: row.try_get("created_at").map_err(crate::DbError::from),
+            updated_at: row.try_get("updated_at").map_err(crate::DbError::from),
+        }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn agent_role_sweep_task_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        agent_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (assignee_id=? OR id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?))").bind(agent_id).bind(agent_id).fetch_all(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn refresh_task_role_assignment_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: &str,
+        task_id: &str,
+        role_name: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE task_role_assignment SET updated_at = ? WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(updated_at)
+        .bind(task_id)
+        .bind(role_name)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn upsert_idle_task_role_assignment_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &crate::CreateTaskRoleAssignment,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO task_role_assignment
+                (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(task_id, role_name) DO UPDATE SET
+                assignee_type = excluded.assignee_type,
+                assignee_id = excluded.assignee_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .bind(input.assignee_type.as_ref().map(ToString::to_string))
+        .bind(input.assignee_id.as_deref())
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn invalidate_idle_task_assignment_review_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: &str,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE task
+             SET review_passed_at = NULL, updated_at = ?, version = version + 1
+             WHERE id = ? AND deleted_at IS NULL AND version = ?",
+        )
+        .bind(updated_at)
+        .bind(task_id)
+        .bind(version)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn invalidate_deleted_agent_task_authority_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+        updated_at: String,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task
+                 SET review_passed_at = NULL,
+                     version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
+                     metadata_json = CASE
+                         WHEN json_valid(COALESCE(metadata_json, '{}'))
+                         THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
+                         ELSE metadata_json
+                     END,
+                     updated_at = CASE
+                         WHEN review_passed_at IS NOT NULL
+                              OR (json_valid(COALESCE(metadata_json, '{}'))
+                                  AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                       OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
+                         THEN ? ELSE updated_at END
+                 WHERE id = ? AND deleted_at IS NULL
+                   AND (review_passed_at IS NOT NULL
+                        OR (json_valid(COALESCE(metadata_json, '{}'))
+                            AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                 OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))").bind(updated_at).bind(task_id).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_deleted_agent_task_assignee_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+        updated_at: String,
+        agent_id: &str,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?").bind(updated_at).bind(task_id).bind(agent_id).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_deleted_agent_role_assignments_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+        updated_at: String,
+        agent_id: &str,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?").bind(updated_at).bind(task_id).bind(agent_id).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_removed_lead_role_assignment(
+        &self,
+        task_id: &str,
+        updated_at: String,
+        role_name: &str,
+        agent_id: &str,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND role_name=? AND assignee_type='agent' AND assignee_id=?").bind(updated_at).bind(task_id).bind(role_name).bind(agent_id).identity_fenced().execute(self.pool()).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_task_waited_owner(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar(
+            "SELECT CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.owner_wait.daemon_id') END FROM task WHERE id=?",
+        ).bind(task_id).fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn consume_applied_task_integration_pause_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: String,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET metadata_json=json_set(json_remove(COALESCE(metadata_json,'{}'),'$.paused_integration'),'$.paused_integration_generation',COALESCE(json_extract(metadata_json,'$.paused_integration_generation'),0)+1),updated_at=? WHERE id=? AND version=?").bind(updated_at).bind(task_id).bind(version).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_workspace_admission_environment_wait_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL").bind(task_id).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+#[derive(Debug)]
+pub struct TaskCreationParentRoleRow {
+    pub role_name: String,
+    pub assignee_type: Option<String>,
+    pub assignee_id: Option<String>,
+    pub backend_kind: Option<String>,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for TaskCreationParentRoleRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            role_name: row.try_get(0)?,
+            assignee_type: row.try_get(1)?,
+            assignee_id: row.try_get(2)?,
+            backend_kind: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_creation_parent_roles_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        parent_task_id: &str,
+    ) -> crate::Result<Vec<TaskCreationParentRoleRow>> {
+        Ok(sqlx::query_as::<_, TaskCreationParentRoleRow>(
+            "SELECT a.role_name, a.assignee_type, a.assignee_id,
+                        (SELECT backend_kind FROM agent_current WHERE id = a.assignee_id)
+                 FROM task_role_assignment a WHERE a.task_id = ?",
+        )
+        .bind(parent_task_id)
+        .fetch_all(connection)
+        .await?)
+    }
+}
+
+pub struct InsertInitialExplicitTaskRoleInTxInput<'a> {
+    pub id: String,
+    pub task_id: &'a str,
+    pub role_name: String,
+    pub assignee_type: String,
+    pub assignee_id: String,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_initial_explicit_task_role_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertInitialExplicitTaskRoleInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").bind(input.id).bind(input.task_id).bind(input.role_name).bind(input.assignee_type).bind(input.assignee_id).bind(input.created_at).bind(input.updated_at).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_initial_default_task_role_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        assignment: crate::CreateTaskRoleAssignment,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").bind(assignment.id).bind(task_id).bind(assignment.role_name).bind(assignment.assignee_type.map(|kind|kind.to_string())).bind(assignment.assignee_id).bind(assignment.created_at).bind(assignment.updated_at).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_project_hook_task_role_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        assignment: &crate::CreateTaskRoleAssignment,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(&assignment.id).bind(task_id).bind(&assignment.role_name).bind(assignment.assignee_type.as_ref().map(|kind|kind.to_string())).bind(&assignment.assignee_id).bind(&assignment.created_at).bind(&assignment.updated_at).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn advance_project_hook_task_role_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: String,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET version = version + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND version = ?").bind(updated_at).bind(task_id).bind(version).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn tasks_naming_retired_auditor(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+        "SELECT id FROM task WHERE deleted_at IS NULL AND status NOT IN ('done','cancelled') AND task_state_config IS NOT NULL AND json_valid(task_state_config) AND COALESCE(json_extract(task_state_config,'$.review.auditor_agent_id'), json_extract(task_state_config,'$.auditor_agent_id')) IS NOT NULL ORDER BY id",
+    ).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn review_ci_infrastructure_budget_spent_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+                "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure'),0)",
+            ).bind(task_id).fetch_one(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_step_live_task_version(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT version FROM task WHERE id=? AND deleted_at IS NULL")
+                .bind(task_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_setup_task_capability_class(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT capability_class FROM project_task_governance
+         WHERE task_id = ? AND project_id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_admission_task_status_epoch(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+                .bind(task_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+pub struct ProjectWorkCompletionSourceRow {
+    row: SqliteRow,
+}
+impl ProjectWorkCompletionSourceRow {
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn parent_task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("parent_task_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_work_completion_sources(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<ProjectWorkCompletionSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, status, parent_task_id \
+             FROM task \
+             WHERE project_id = ? \
+               AND is_automation = 0 \
+               AND archived_at IS NULL \
+               AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectWorkCompletionSourceRow { row })
+            .collect())
+    }
+}
+
+pub async fn project_work_completion_sources_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> crate::Result<Vec<ProjectWorkCompletionSourceRow>> {
+    let rows = sqlx::query("SELECT id, status, parent_task_id FROM task WHERE project_id = ? AND is_automation = 0 AND archived_at IS NULL AND deleted_at IS NULL").bind(project_id).fetch_all(connection).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ProjectWorkCompletionSourceRow { row })
+        .collect())
+}
+
+pub struct ShutdownTaskSourceRow {
+    row: SqliteRow,
+}
+impl ShutdownTaskSourceRow {
+    pub fn id(&self) -> String {
+        self.row.get("id")
+    }
+    pub fn project_id(&self) -> String {
+        self.row.get("project_id")
+    }
+}
+
+impl SqliteDb {
+    pub async fn shutdown_in_progress_task_sources(
+        &self,
+    ) -> crate::Result<Vec<ShutdownTaskSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id FROM task WHERE status = 'in_progress' AND deleted_at IS NULL",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ShutdownTaskSourceRow { row })
+            .collect())
+    }
+}
+
+pub async fn coordination_root_visible_children_in_connection(
+    connection: &mut sqlx::SqliteConnection,
+    task_id: &str,
+) -> crate::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM task AS root
+             JOIN task AS child ON child.parent_task_id = root.id
+             WHERE root.id = ?
+               AND root.parent_task_id IS NULL
+               AND root.deleted_at IS NULL
+               AND child.deleted_at IS NULL
+         )",
+    )
+    .bind(task_id)
+    .fetch_one(connection)
+    .await?)
+}
+
+pub struct TaskRepositoryAuthoritySourceRow {
+    row: SqliteRow,
+}
+impl TaskRepositoryAuthoritySourceRow {
+    pub fn project_id(&self) -> String {
+        self.row.get("project_id")
+    }
+    pub fn task_version(&self) -> i64 {
+        self.row.get("task_version")
+    }
+    pub fn primary_repo_id(&self) -> Option<String> {
+        self.row.get("primary_repo_id")
+    }
+    pub fn resolved_repo_id(&self) -> Option<String> {
+        self.row.get("resolved_repo_id")
+    }
+    pub fn repo_project_id(&self) -> String {
+        self.row.get("repo_project_id")
+    }
+    pub fn default_branch(&self) -> String {
+        self.row.get("default_branch")
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_repository_authority_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<TaskRepositoryAuthoritySourceRow>> {
+        Ok(sqlx::query(
+            "SELECT t.project_id, t.version AS task_version,
+                    p.primary_repo_id,
+                    r.id AS resolved_repo_id,
+                    r.project_id AS repo_project_id,
+                    r.default_branch
+             FROM task t
+             JOIN project p ON p.id = t.project_id
+             LEFT JOIN repo r ON r.id = p.primary_repo_id
+             WHERE t.id = ? AND t.deleted_at IS NULL",
+        )
+        .bind(task_id)
+        .fetch_optional(connection)
+        .await?
+        .map(|row| TaskRepositoryAuthoritySourceRow { row }))
+    }
+}
+
+pub struct LatestTaskStateEntrySourceRow {
+    row: SqliteRow,
+}
+impl LatestTaskStateEntrySourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn latest_task_state_entry_source(
+        &self,
+        task_id: &str,
+        to_state: &str,
+    ) -> crate::Result<Option<LatestTaskStateEntrySourceRow>> {
+        let rows = sqlx::query(
+        "SELECT id, created_at FROM transition_log WHERE task_id = ? AND to_state = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    ).bind(task_id).bind(to_state).fetch_optional(self.pool()).await?;
+        Ok(rows.map(|row| LatestTaskStateEntrySourceRow { row }))
+    }
+}

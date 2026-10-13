@@ -37,21 +37,16 @@ impl ResolvedWorkspace {
         db: &db::SqliteDb,
         facts: crate::integration_effects::rebase::RebaseHeadFacts,
     ) -> Result<()> {
-        let changed = sqlx::query(
-            "INSERT INTO workspace_expected_head (placement_id, generation, head_sha, recorded_at)
-             SELECT id, generation, ?, ? FROM workspace_placement
-             WHERE id = ? AND generation = ? AND version = ?
-             ON CONFLICT(placement_id) DO UPDATE SET generation = excluded.generation,
-                 head_sha = excluded.head_sha, recorded_at = excluded.recorded_at",
-        )
-        .bind(facts.head_sha)
-        .bind(db::now_rfc3339())
-        .bind(&self.placement.id)
-        .bind(self.placement.generation)
-        .bind(self.placement.version)
-        .execute(db.pool())
-        .await
-        .map_err(ServiceError::from)?;
+        let changed = db
+            .record_review_rebase_expected_head(
+                facts.head_sha,
+                db::now_rfc3339(),
+                &self.placement.id,
+                self.placement.generation,
+                self.placement.version,
+            )
+            .await
+            .map_err(ServiceError::from)?;
         if changed.rows_affected() != 1 {
             return Err(db::DbError::VersionConflict.into());
         }

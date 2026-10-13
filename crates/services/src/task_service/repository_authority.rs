@@ -62,24 +62,14 @@ impl TaskService {
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         task: &Task,
     ) -> Result<TransactionalTaskRepositoryAuthority> {
-        let row = sqlx::query(
-            "SELECT t.project_id, t.version AS task_version,
-                    p.primary_repo_id,
-                    r.id AS resolved_repo_id,
-                    r.project_id AS repo_project_id,
-                    r.default_branch
-             FROM task t
-             JOIN project p ON p.id = t.project_id
-             LEFT JOIN repo r ON r.id = p.primary_repo_id
-             WHERE t.id = ? AND t.deleted_at IS NULL",
-        )
-        .bind(&task.id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        let row = self
+            .db
+            .task_repository_authority_source_in_tx(transaction, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
 
-        let project_id: String = row.get("project_id");
-        let task_version: i64 = row.get("task_version");
+        let project_id: String = row.project_id();
+        let task_version: i64 = row.task_version();
         if project_id != task.project_id {
             return Err(ServiceError::RepoMismatch {
                 project_id: task.project_id.clone(),
@@ -89,18 +79,18 @@ impl TaskService {
             return Err(ServiceError::Db(DbError::VersionConflict));
         }
 
-        let primary_repo_id = row
-            .get::<Option<String>, _>("primary_repo_id")
-            .ok_or_else(|| ServiceError::MissingPrimaryRepo {
-                project_id: project_id.clone(),
-            })?;
-        let resolved_repo_id = row
-            .get::<Option<String>, _>("resolved_repo_id")
-            .ok_or_else(|| ServiceError::PrimaryRepoNotFound {
-                project_id: project_id.clone(),
-                repo_id: primary_repo_id.clone(),
-            })?;
-        let repo_project_id: String = row.get("repo_project_id");
+        let primary_repo_id =
+            row.primary_repo_id()
+                .ok_or_else(|| ServiceError::MissingPrimaryRepo {
+                    project_id: project_id.clone(),
+                })?;
+        let resolved_repo_id =
+            row.resolved_repo_id()
+                .ok_or_else(|| ServiceError::PrimaryRepoNotFound {
+                    project_id: project_id.clone(),
+                    repo_id: primary_repo_id.clone(),
+                })?;
+        let repo_project_id: String = row.repo_project_id();
         if resolved_repo_id != primary_repo_id || repo_project_id != project_id {
             return Err(ServiceError::RepoMismatch { project_id });
         }
@@ -108,7 +98,7 @@ impl TaskService {
         Ok(TransactionalTaskRepositoryAuthority {
             project_id,
             repo_id: resolved_repo_id,
-            default_branch: row.get("default_branch"),
+            default_branch: row.default_branch(),
             task_version,
         })
     }

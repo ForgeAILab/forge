@@ -263,13 +263,13 @@ impl ServerIntegrationOwner {
                 }
                 IntegrationOperationKind::FastForward | IntegrationOperationKind::Merge => {
                     let branch = text("target_branch")?;
-                    let path: String = sqlx::query_scalar(
-                        "SELECT path FROM repo_location WHERE id=? AND owner_kind='server'",
-                    )
-                    .bind(request.fence.target_owner["location_id"].as_str())
-                    .fetch_optional(self.db.pool())
-                    .await
-                    .ok()??;
+                    let path: String = self
+                        .db
+                        .integration_owner_server_checkout_path(
+                            request.fence.target_owner["location_id"].as_str(),
+                        )
+                        .await
+                        .ok()??;
                     let tip = integration_effects::merge::target_tip(Path::new(&path), branch)
                         .await
                         .ok()?;
@@ -332,12 +332,12 @@ impl ServerIntegrationOwner {
                 Err(_) => Ok(None),
             };
         }
-        let path: Option<String> =
-            sqlx::query_scalar("SELECT path FROM repo_location WHERE id=? AND owner_kind='server'")
-                .bind(request.fence.target_owner["location_id"].as_str())
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db::DbError::from)?;
+        let path: Option<String> = self
+            .db
+            .integration_owner_server_checkout_path(
+                request.fence.target_owner["location_id"].as_str(),
+            )
+            .await?;
         let Some(path) = path else {
             return Ok(None);
         };
@@ -930,13 +930,10 @@ impl ServerIntegrationOwner {
         if self.db.integration_owner_fence(&fence.attempt_id).await? != Some(fence.clone()) {
             return Ok(Err(api_types::ObjectTransferRefusal::StaleFence));
         }
-        let path: Option<String> = sqlx::query_scalar(
-            "SELECT path FROM repo_location WHERE id=? AND owner_kind='server' AND status='ready'",
-        )
-        .bind(repo_location_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let path: Option<String> = self
+            .db
+            .integration_transfer_ready_server_location(repo_location_id)
+            .await?;
         Ok(path.map(std::path::PathBuf::from).ok_or_else(|| {
             api_types::ObjectTransferRefusal::Invalid {
                 reason: "checkout is not a ready server-owned repo location".into(),

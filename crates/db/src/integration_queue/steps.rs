@@ -346,3 +346,91 @@ pub async fn request_task_integration_cancel_in_tx(
         Err(error) => Err(error),
     }
 }
+
+impl SqliteDb {
+    pub async fn integration_passed_review_ids(&self, task_id: &str) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM review WHERE task_id=? AND status='passed' ORDER BY attempt_number DESC,id DESC LIMIT 16",
+        ).bind(task_id).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_passed_review_entry_consumer(
+        &self,
+        task_id: &str,
+        identity_key: &str,
+        review_id: &str,
+    ) -> crate::Result<Option<(String, i64)>> {
+        Ok(sqlx::query_as(
+                "SELECT c.id,c.status_epoch FROM check_consumer c JOIN check_result r ON r.id=c.result_id JOIN check_run run ON run.id=c.run_id WHERE c.task_id=?1 AND c.origin='entry' AND c.identity_key=?2 AND c.cancelled_at IS NULL AND r.outcome='pass' AND r.identity_key=?2 AND run.identity_key=?2 AND run.state='succeeded' AND substr(c.request_key,length(c.request_key)-length(?3))='|'||?3 ORDER BY c.created_at DESC,c.id DESC LIMIT 1",
+            ).bind(task_id).bind(identity_key).bind(review_id).fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_latest_review_details_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Option<(String, String)>> {
+        Ok(sqlx::query_as("SELECT id,step_results_json FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1").bind(task_id).fetch_optional(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_check_consumer_origin_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        consumer_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT origin FROM check_consumer WHERE id=?")
+                .bind(consumer_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_first_check_consumer_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        run_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM check_consumer WHERE run_id=? ORDER BY created_at,rowid LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn annotate_integration_review_details_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        details_json: String,
+        updated_at: String,
+        review_id: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(
+            sqlx::query("UPDATE review SET step_results_json=?,updated_at=? WHERE id=?")
+                .bind(details_json)
+                .bind(updated_at)
+                .bind(review_id)
+                .execute(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_step_task_left_entry(&self, attempt_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+                    "SELECT NOT EXISTS(SELECT 1 FROM integration_attempt a JOIN task t ON t.id=a.task_ref WHERE a.id=? AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch AND t.deleted_at IS NULL)",
+                ).bind(attempt_id).fetch_one(self.pool()).await?)
+    }
+}

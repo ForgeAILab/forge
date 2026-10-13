@@ -20,7 +20,6 @@ use db::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::{
     AgentActionProvenance, AuthorizationProvenance, CommandContext, CommandPrincipal, CommandScope,
@@ -123,28 +122,21 @@ impl ProjectDecisionCommandService {
         // The approved Charter governs an Agent decision. Its revision, and
         // the Documents approved under it, are the artifact set a decision may
         // name; anything outside that is reconciliation_required.
-        let charter = sqlx::query(
-            "SELECT c.id AS artifact_id, p.current_charter_revision_id,
-                    r.content_digest, r.render_version, r.rendered_digest,
-                    r.lifecycle
-             FROM project AS p
-             JOIN project_charter AS c ON c.project_id = p.id
-             JOIN project_charter_revision AS r
-               ON r.id = p.current_charter_revision_id AND r.charter_id = c.id
-             WHERE p.id = ? LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::conflict("Project decision requires the current approved Project Charter")
-        })?;
-        let charter_artifact_id: String = charter.try_get("artifact_id")?;
-        let charter_revision_id: String = charter.try_get("current_charter_revision_id")?;
-        let charter_content_digest: String = charter.try_get("content_digest")?;
-        let charter_render_version: String = charter.try_get("render_version")?;
-        let charter_render_digest: String = charter.try_get("rendered_digest")?;
-        let charter_lifecycle: String = charter.try_get("lifecycle")?;
+        let charter = self
+            .db
+            .decision_governing_charter_source(project_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::conflict(
+                    "Project decision requires the current approved Project Charter",
+                )
+            })?;
+        let charter_artifact_id: String = charter.artifact_id()?;
+        let charter_revision_id: String = charter.current_charter_revision_id()?;
+        let charter_content_digest: String = charter.content_digest()?;
+        let charter_render_version: String = charter.render_version()?;
+        let charter_render_digest: String = charter.rendered_digest()?;
+        let charter_lifecycle: String = charter.lifecycle()?;
         if charter_content_digest.trim().is_empty()
             || charter_render_version.trim().is_empty()
             || charter_render_digest.trim().is_empty()
@@ -172,17 +164,10 @@ impl ProjectDecisionCommandService {
         )?;
 
         for task_id in &affected_task_ids {
-            let governed: Option<i64> = sqlx::query_scalar(
-                "SELECT 1
-                 FROM task AS t
-                 JOIN project_task_governance AS g ON g.task_id = t.id
-                 WHERE t.id = ? AND t.project_id = ?
-                 LIMIT 1",
-            )
-            .bind(task_id)
-            .bind(project_id)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let governed: Option<i64> = self
+                .db
+                .decision_governed_task_reference(task_id, project_id)
+                .await?;
             if governed.is_none() {
                 return Err(ServiceError::invalid_operation(
                     "decision affected Task crosses Project scope",
@@ -190,28 +175,21 @@ impl ProjectDecisionCommandService {
             }
         }
 
-        let mut governing_artifacts = sqlx::query(
-            "SELECT d.id AS artifact_id, r.id AS revision_id, r.content_digest,
-                    r.render_version, r.rendered_digest
-             FROM project_document AS d
-             JOIN project_document_revision AS r
-               ON r.id = d.current_approved_revision_id AND r.document_id = d.id
-             WHERE d.project_id = ? AND r.lifecycle = 'approved'",
-        )
-        .bind(project_id)
-        .fetch_all(self.db.pool())
-        .await?
-        .into_iter()
-        .map(|row| {
-            Ok::<_, sqlx::Error>(ArtifactRef {
-                artifact_id: row.try_get("artifact_id")?,
-                revision_id: row.try_get("revision_id")?,
-                content_digest: row.try_get("content_digest")?,
-                render_version: Some(row.try_get("render_version")?),
-                render_digest: Some(row.try_get("rendered_digest")?),
+        let mut governing_artifacts = self
+            .db
+            .decision_governing_document_sources(project_id)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok::<_, db::DbError>(ArtifactRef {
+                    artifact_id: row.artifact_id()?,
+                    revision_id: row.revision_id()?,
+                    content_digest: row.content_digest()?,
+                    render_version: Some(row.render_version()?),
+                    render_digest: Some(row.rendered_digest()?),
+                })
             })
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         governing_artifacts.push(ArtifactRef {
             artifact_id: charter_artifact_id,
             revision_id: charter_revision_id.clone(),
@@ -1175,14 +1153,9 @@ async fn authorize_project_principal(
             }
         }
         "agent" => {
-            let bound: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(&authorization.principal_id)
-            .fetch_optional(db.pool())
-            .await?;
+            let bound: Option<i64> = db
+                .decision_authorized_project_identity(project_id, &authorization.principal_id)
+                .await?;
             if bound.is_some() {
                 Ok(())
             } else {
@@ -1203,36 +1176,25 @@ async fn validate_decision_context(
     context: &DecisionCandidateContext,
 ) -> Result<()> {
     for artifact in &context.affected_artifact_refs {
-        let row = sqlx::query(
-            "SELECT render_version, rendered_digest
-             FROM project_document_revision r JOIN project_document d ON d.id = r.document_id
-             WHERE d.project_id = ? AND d.id = ? AND r.id = ? AND r.content_digest = ?
-             UNION ALL
-             SELECT r.render_version, r.rendered_digest
-             FROM project_charter_revision r JOIN project_charter c ON c.id = r.charter_id
-             WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND r.content_digest = ?
-             UNION ALL
-             SELECT r.render_version, r.rendered_digest
-             FROM project_milestone_revision r JOIN project_milestone m ON m.id = r.milestone_id
-             WHERE m.project_id = ? AND m.id = ? AND r.id = ? AND r.content_digest = ? LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .fetch_optional(db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("decision_reference", &artifact.revision_id))?;
-        let render_version: String = row.try_get("render_version")?;
-        let render_digest: String = row.try_get("rendered_digest")?;
+        let row = db
+            .decision_artifact_render_source(db::DecisionArtifactRenderSourceInput {
+                document_project_id: project_id,
+                document_id: &artifact.artifact_id,
+                document_revision_id: &artifact.revision_id,
+                document_digest: &artifact.content_digest,
+                charter_project_id: project_id,
+                charter_id: &artifact.artifact_id,
+                charter_revision_id: &artifact.revision_id,
+                charter_digest: &artifact.content_digest,
+                milestone_project_id: project_id,
+                milestone_id: &artifact.artifact_id,
+                milestone_revision_id: &artifact.revision_id,
+                milestone_digest: &artifact.content_digest,
+            })
+            .await?
+            .ok_or_else(|| ServiceError::not_found("decision_reference", &artifact.revision_id))?;
+        let render_version: String = row.render_version()?;
+        let render_digest: String = row.rendered_digest()?;
         if artifact
             .render_version
             .as_deref()
@@ -1254,15 +1216,9 @@ async fn validate_decision_context(
         require_reference(db, "project_milestone", project_id, milestone_id).await?;
     }
     if let Some(charter_revision_id) = context.governing_charter_revision_id.as_deref() {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_charter_revision r
-             JOIN project_charter c ON c.id = r.charter_id
-             WHERE r.id = ? AND c.project_id = ? LIMIT 1",
-        )
-        .bind(charter_revision_id)
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?;
+        let exists: Option<i64> = db
+            .decision_governing_charter_reference(charter_revision_id, project_id)
+            .await?;
         if exists.is_none() {
             return Err(ServiceError::not_found(
                 "decision_reference",
@@ -1274,22 +1230,15 @@ async fn validate_decision_context(
 }
 
 async fn require_reference(db: &SqliteDb, table: &str, project_id: &str, id: &str) -> Result<()> {
-    let statement = match table {
-        "task" => "SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1",
-        "project_milestone" => {
-            "SELECT 1 FROM project_milestone WHERE id = ? AND project_id = ? LIMIT 1"
-        }
+    let exists: Option<i64> = match table {
+        "task" => db.decision_task_reference(id, project_id).await?,
+        "project_milestone" => db.decision_milestone_reference(id, project_id).await?,
         _ => {
             return Err(ServiceError::invalid_operation(
                 "invalid Decision reference table",
             ));
         }
     };
-    let exists: Option<i64> = sqlx::query_scalar(statement)
-        .bind(id)
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?;
     if exists.is_none() {
         return Err(ServiceError::not_found("decision_reference", id));
     }
@@ -1395,33 +1344,31 @@ async fn load_decision(
     project_id: &str,
     decision_id: &str,
 ) -> Result<Option<ProjectDecisionRecord>> {
-    let row = sqlx::query("SELECT * FROM project_decision WHERE id = ? AND project_id = ? LIMIT 1")
-        .bind(decision_id)
-        .bind(project_id)
-        .fetch_optional(db.pool())
+    let row = db
+        .project_decision_command_source(decision_id, project_id)
         .await?;
     row.map(|row| {
-        Ok::<ProjectDecisionRecord, sqlx::Error>(ProjectDecisionRecord {
-            id: row.try_get("id")?,
-            project_id: row.try_get("project_id")?,
-            state: row.try_get("state")?,
-            decision_class: row.try_get("decision_class")?,
-            question: row.try_get("question")?,
-            context_json: row.try_get("context_json")?,
-            options_json: row.try_get("options_json")?,
-            selected_outcome: row.try_get("selected_outcome")?,
-            rationale: row.try_get("rationale")?,
-            principal_type: row.try_get("principal_type")?,
-            principal_id: row.try_get("principal_id")?,
-            authority_basis: row.try_get("authority_basis")?,
-            authorization_action: row.try_get("authorization_action")?,
-            explicit_event: row.try_get("explicit_event")?,
-            authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-            charter_revision_id: row.try_get("charter_revision_id")?,
-            source_refs_json: row.try_get("source_refs_json")?,
-            affected_records_json: row.try_get("affected_records_json")?,
-            supersedes_decision_id: row.try_get("supersedes_decision_id")?,
-            created_at: row.try_get("created_at")?,
+        Ok::<ProjectDecisionRecord, db::DbError>(ProjectDecisionRecord {
+            id: row.id()?,
+            project_id: row.project_id()?,
+            state: row.state()?,
+            decision_class: row.decision_class()?,
+            question: row.question()?,
+            context_json: row.context_json()?,
+            options_json: row.options_json()?,
+            selected_outcome: row.selected_outcome()?,
+            rationale: row.rationale()?,
+            principal_type: row.principal_type()?,
+            principal_id: row.principal_id()?,
+            authority_basis: row.authority_basis()?,
+            authorization_action: row.authorization_action()?,
+            explicit_event: row.explicit_event()?,
+            authorization_occurred_at: row.authorization_occurred_at()?,
+            charter_revision_id: row.charter_revision_id()?,
+            source_refs_json: row.source_refs_json()?,
+            affected_records_json: row.affected_records_json()?,
+            supersedes_decision_id: row.supersedes_decision_id()?,
+            created_at: row.created_at()?,
         })
     })
     .transpose()

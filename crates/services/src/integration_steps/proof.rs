@@ -49,6 +49,13 @@ pub struct TargetOwnerProof {
     daemons: Option<Arc<DaemonConnectionRegistry>>,
 }
 
+fn target_query_error(error: db::DbError) -> sqlx::Error {
+    match error {
+        db::DbError::Sqlx(error) => error,
+        error => sqlx::Error::Protocol(error.to_string()),
+    }
+}
+
 impl TargetOwnerProof {
     pub fn new(db: Arc<SqliteDb>, daemons: Option<Arc<DaemonConnectionRegistry>>) -> Self {
         Self { db, daemons }
@@ -70,12 +77,12 @@ impl TargetProofSource for TargetOwnerProof {
         let Some(location_id) = queue.target_location_id.as_deref() else {
             return TargetProof::Unknown("the queue has no default checkout".into());
         };
-        let row: Option<(String, String, Option<String>, Option<String>)> = match sqlx::query_as(
-            "SELECT path,owner_kind,daemon_id,runtime_id FROM repo_location WHERE id=?",
-        )
-        .bind(location_id)
-        .fetch_optional(self.db.pool())
-        .await
+        let row: Option<(String, String, Option<String>, Option<String>)> = match self
+            .db
+            .integration_target_location(location_id)
+            .await
+            .map(|row| row.map(|row| (row.path, row.owner_kind, row.daemon_id, row.runtime_id)))
+            .map_err(target_query_error)
         {
             Ok(row) => row,
             Err(error) => return TargetProof::Unknown(error.to_string()),
@@ -147,15 +154,10 @@ pub(crate) async fn target_owner_away(
     let Some(location_id) = queue.target_location_id.as_deref() else {
         return Ok(None);
     };
-    let daemon_id: Option<String> = sqlx::query_scalar(
-        "SELECT l.daemon_id FROM repo_location l JOIN daemon d ON d.id=l.daemon_id \
-         WHERE l.id=? AND l.owner_kind='daemon' AND d.removed_at IS NULL",
-    )
-    .bind(location_id)
-    .fetch_optional(db.pool())
-    .await
-    .map_err(db::DbError::from)?
-    .flatten();
+    let daemon_id: Option<String> = db
+        .integration_target_disconnected_daemon_id(location_id)
+        .await?
+        .flatten();
     Ok(daemon_id.filter(|id| !daemons.is_some_and(|registry| registry.get(id).is_some())))
 }
 

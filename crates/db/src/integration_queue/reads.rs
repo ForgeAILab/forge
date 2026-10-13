@@ -583,3 +583,119 @@ mod tests {
         assert_eq!(db.integration_watch_rows().await.unwrap().len(), 1);
     }
 }
+
+/// The integration attempts a move must wait for.
+///
+/// An attempt is at rest when its state is final (`completed`, `cancelled`,
+/// `superseded`) or hands the Task back with nothing in flight (`parked`:
+/// waiting for an operator; `needs_review`, `ejected`: the Task is back
+/// with a reviewer or coder), AND it has no outstanding owner effect
+/// (`effect_intent_json`) and no operation other than a settled one
+/// (`succeeded`, `failed`, `acknowledged`, or none). That second half is
+/// the queue's own definition of an unsettled attempt. Every other state
+/// names a repository location or owner state that the queue is still
+/// acting on, or (`quarantined`) that nobody has established.
+///
+/// Both halves name what is at rest, never what is not: a state or an
+/// operation state this code does not know (a later queue revision adds
+/// some) blocks the move until somebody decides it is at rest.
+const UNSETTLED_ATTEMPTS: &str = "SELECT task_ref, state, effect_intent_json IS NOT NULL,
+            COALESCE(current_operation_state, '')
+     FROM integration_attempt
+     WHERE state NOT IN ('completed', 'cancelled', 'superseded', 'parked', 'needs_review', 'ejected')
+        OR effect_intent_json IS NOT NULL
+        OR COALESCE(current_operation_state, '') NOT IN ('', 'succeeded', 'failed', 'acknowledged')
+     ORDER BY updated_at, id";
+#[derive(Debug)]
+pub struct WorkspaceRootUnsettledAttemptRow {
+    pub task_ref: String,
+    pub state: String,
+    pub effect_outstanding: bool,
+    pub operation_state: String,
+}
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for WorkspaceRootUnsettledAttemptRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            task_ref: row.try_get(0)?,
+            state: row.try_get(1)?,
+            effect_outstanding: row.try_get(2)?,
+            operation_state: row.try_get(3)?,
+        })
+    }
+}
+impl SqliteDb {
+    pub async fn workspace_root_unsettled_attempts(
+        &self,
+    ) -> Result<Vec<WorkspaceRootUnsettledAttemptRow>> {
+        Ok(
+            sqlx::query_as::<_, WorkspaceRootUnsettledAttemptRow>(UNSETTLED_ATTEMPTS)
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_transfer_attempt_holds_slot(
+        &self,
+        attempt_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM integration_queue WHERE head_attempt_id=?)",
+        )
+        .bind(attempt_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_owned_live_integration_queue_ids(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM integration_queue WHERE state!='closed' AND json_extract(target_owner_json,'$.daemon_id')=?",
+        ).bind(daemon_id).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_task_head_integration_queue_ids(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT q.id FROM integration_queue q JOIN integration_attempt a ON a.id=q.head_attempt_id WHERE q.state!='closed' AND a.daemon_id=?",
+        ).bind(daemon_id).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_queue_rebased_original_candidate(
+        &self,
+        task_id: &str,
+        candidate_sha: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT original_candidate_sha FROM integration_attempt \
+         WHERE task_ref=? AND candidate_sha=? AND original_candidate_sha IS NOT NULL \
+           AND original_candidate_sha<>? AND integrated_sha IS NULL \
+         ORDER BY created_at DESC,id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(candidate_sha)
+        .bind(candidate_sha)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_reconcile_task_owned(&self, task_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(crate::INTEGRATION_OWNED_SQL)
+            .bind(task_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}

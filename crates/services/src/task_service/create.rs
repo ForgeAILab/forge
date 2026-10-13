@@ -275,9 +275,9 @@ impl TaskService {
             Vec::new()
         };
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
-            .bind(&project_id)
-            .fetch_one(&mut *transaction)
+        let project_version: i64 = self
+            .db
+            .task_creation_project_version_in_tx(&mut transaction, &project_id)
             .await?;
         if project_version != project.version {
             return Err(db::DbError::VersionConflict.into());
@@ -319,17 +319,18 @@ impl TaskService {
                 crate::task_hierarchy::RootRolePolicy::for_workflow(&project_workflow);
             // The planning role stays only with an assignee that may lead
             // the root (a native Agent); any other planner is stripped.
-            let parent_roles =
-                sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
-                    "SELECT a.role_name, a.assignee_type, a.assignee_id,
-                        (SELECT backend_kind FROM agent_current WHERE id = a.assignee_id)
-                 FROM task_role_assignment a WHERE a.task_id = ?",
-                )
-                .bind(parent_task_id)
-                .fetch_all(&mut *transaction)
+            let parent_roles = self
+                .db
+                .task_creation_parent_roles_in_tx(&mut transaction, parent_task_id)
                 .await?;
             let mut removed_parent_role = false;
-            for (role_name, assignee_type, assignee_id, backend_kind) in parent_roles {
+            for row in parent_roles {
+                let (role_name, assignee_type, assignee_id, backend_kind) = (
+                    row.role_name,
+                    row.assignee_type,
+                    row.assignee_id,
+                    row.backend_kind,
+                );
                 let assignee_type = assignee_id
                     .as_ref()
                     .and(assignee_type.as_deref())
@@ -402,16 +403,26 @@ impl TaskService {
             for (role_name, assignee_type, assignee_id) in assignments {
                 // Initial assignment is part of the unpublished Task's
                 // birth transaction, before another writer can see it.
-                sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-                    .bind(new_uuid_v4()).bind(&task.id).bind(role_name).bind(assignee_type.to_string())
-                    .bind(assignee_id).bind(&now).bind(&now).execute(&mut *transaction).await?;
+                self.db
+                    .insert_initial_explicit_task_role_in_tx(
+                        &mut transaction,
+                        db::InsertInitialExplicitTaskRoleInTxInput {
+                            id: new_uuid_v4(),
+                            task_id: &task.id,
+                            role_name,
+                            assignee_type: assignee_type.to_string(),
+                            assignee_id,
+                            created_at: &now,
+                            updated_at: &now,
+                        },
+                    )
+                    .await?;
             }
         }
         for assignment in initial_defaults {
-            sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-                .bind(assignment.id).bind(&task.id).bind(assignment.role_name)
-                .bind(assignment.assignee_type.map(|kind|kind.to_string())).bind(assignment.assignee_id)
-                .bind(assignment.created_at).bind(assignment.updated_at).execute(&mut *transaction).await?;
+            self.db
+                .insert_initial_default_task_role_in_tx(&mut transaction, &task.id, assignment)
+                .await?;
         }
         transaction.commit().await?;
 
@@ -819,16 +830,18 @@ impl TaskService {
             )
             .await?;
         for (expected_version, assignment) in (task.version..).zip(&prepared.assignments) {
-            sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-                .bind(&assignment.id).bind(&task.id).bind(&assignment.role_name)
-                .bind(assignment.assignee_type.as_ref().map(|kind| kind.to_string())).bind(&assignment.assignee_id)
-                .bind(&assignment.created_at).bind(&assignment.updated_at).execute(&mut **transaction).await?;
-            let updated =
-                sqlx::query("UPDATE task SET version = version + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND version = ?")
-                    .bind(now_rfc3339()).bind(&task.id)
-                    .bind(expected_version)
-                    .execute(&mut **transaction)
-                    .await?;
+            self.db
+                .insert_project_hook_task_role_in_tx(transaction, &task.id, assignment)
+                .await?;
+            let updated = self
+                .db
+                .advance_project_hook_task_role_version_in_tx(
+                    transaction,
+                    now_rfc3339(),
+                    &task.id,
+                    expected_version,
+                )
+                .await?;
             if updated.rows_affected() != 1 {
                 return Err(DbError::VersionConflict.into());
             }

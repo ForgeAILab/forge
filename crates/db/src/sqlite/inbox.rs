@@ -437,3 +437,44 @@ impl SqliteDb {
             .collect())
     }
 }
+
+impl SqliteDb {
+    pub async fn task_outcome_originating_inbox_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        source_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_inbox_item
+                 WHERE source_id = ? AND COALESCE(source_type, '') <> 'task_outcome'",
+        )
+        .bind(source_id)
+        .fetch_all(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn acknowledge_task_outcome_originating_inbox_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        id: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE agent_inbox_item SET
+                        status = 'acknowledged',
+                        read_at = COALESCE(read_at, ?),
+                        acknowledged_at = COALESCE(acknowledged_at, ?),
+                        version = version + 1,
+                        updated_at = ?
+                     WHERE id = ? AND status IN ('unread', 'read')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(connection)
+        .await?)
+    }
+}

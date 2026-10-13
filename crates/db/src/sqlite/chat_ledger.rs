@@ -990,3 +990,102 @@ pub(super) async fn cancel_agent_inquiry_with_usage(
     transaction.commit().await?;
     Ok(record)
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ChatTopicSummaryUsageRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ChatTopicSummaryUsageRow {
+    pub fn settled_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("settled_at")?)
+    }
+    pub fn runtime_session_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("runtime_session_id")?)
+    }
+    pub fn chat_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("chat_id")?)
+    }
+    pub fn input_tokens(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("input_tokens")?)
+    }
+    pub fn output_tokens(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("output_tokens")?)
+    }
+    pub fn provider(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("provider")?)
+    }
+    pub fn model(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("model")?)
+    }
+    pub fn failed(&self) -> crate::Result<bool> {
+        Ok(self.row.try_get("failed")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_usage_unsettled_topic_summary_guard_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        summary_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM agent_topic_summary_usage WHERE id = ? AND settled_at IS NULL",
+        )
+        .bind(summary_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_topic_summary_usage_source(
+        &self,
+        summary_id: &str,
+    ) -> crate::Result<Option<ChatTopicSummaryUsageRow>> {
+        let rows = sqlx::query(
+            "SELECT runtime_session_id, provider, model, input_tokens, output_tokens, failed,
+                chat_id, settled_at
+         FROM agent_topic_summary_usage WHERE id = ?",
+        )
+        .bind(summary_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ChatTopicSummaryUsageRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn settle_unattributed_chat_topic_summary_usage(
+        &self,
+        settled_at: String,
+        summary_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(
+            sqlx::query("UPDATE agent_topic_summary_usage SET settled_at = ? WHERE id = ?")
+                .bind(settled_at)
+                .bind(summary_id)
+                .execute(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn settle_pending_chat_topic_summary_usage(
+        &self,
+        settled_at: &str,
+        summary_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE agent_topic_summary_usage SET settled_at = ? WHERE id = ? AND settled_at IS NULL",)
+.bind(settled_at)
+.bind(summary_id)
+.execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn unsettled_chat_topic_summary_usage_ids(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT id FROM agent_topic_summary_usage WHERE settled_at IS NULL ORDER BY id LIMIT 16",)
+.fetch_all(self.pool()).await?)
+    }
+}

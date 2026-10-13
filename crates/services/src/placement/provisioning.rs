@@ -108,9 +108,9 @@ pub(crate) async fn start(job: Job) -> Result<()> {
         })?
         .id();
     let mut tx = db::begin_immediate(job.db.pool()).await?;
-    let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
-        .bind(&job.project.id)
-        .fetch_one(&mut *tx)
+    let raw: String = job
+        .db
+        .provisioning_current_project_settings_in_tx(&mut tx, &job.project.id)
         .await?;
     let latest: ProjectSettings = serde_json::from_str(&raw)
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
@@ -120,19 +120,33 @@ pub(crate) async fn start(job: Job) -> Result<()> {
     let next = environment_retry_at(1);
     // Claim a due attempt and schedule its successor before starting I/O. A
     // response loss or process death can only delay work to a bounded deadline.
-    let attempts: Option<i64> = sqlx::query_scalar("INSERT INTO repo_provision_retry (repo_id, runtime_id, attempts, next_attempt_at, checks_digest, connection_id, started_at) VALUES (?, ?, 1, ?, ?, ?, ?) ON CONFLICT(repo_id, runtime_id) DO UPDATE SET attempts = CASE WHEN checks_digest <> excluded.checks_digest OR connection_id <> excluded.connection_id THEN 1 ELSE attempts + 1 END, next_attempt_at = excluded.next_attempt_at, checks_digest = excluded.checks_digest, connection_id = excluded.connection_id, started_at = excluded.started_at, last_error = CASE WHEN checks_digest <> excluded.checks_digest THEN NULL ELSE last_error END WHERE (checks_digest <> excluded.checks_digest OR connection_id <> excluded.connection_id OR (attempts < ? AND julianday(next_attempt_at) <= julianday(?))) RETURNING attempts")
-        .bind(&job.repo.id).bind(runtime).bind(next).bind(&digest).bind(connection as i64).bind(db::now_rfc3339()).bind(MAX_PROVISION_ATTEMPTS).bind(db::now_rfc3339()).fetch_optional(&mut *tx).await?;
+    let attempts: Option<i64> = job
+        .db
+        .claim_repository_provision_attempt_in_tx(
+            &mut tx,
+            db::ClaimRepositoryProvisionAttemptInTxInput {
+                repo_id: &job.repo.id,
+                runtime_id: runtime,
+                next_attempt_at: next,
+                checks_digest: &digest,
+                connection_id: connection as i64,
+                started_at: db::now_rfc3339(),
+                max_attempts: MAX_PROVISION_ATTEMPTS,
+                now: db::now_rfc3339(),
+            },
+        )
+        .await?;
     let Some(attempts) = attempts else {
         return Ok(());
     };
-    sqlx::query(
-        "UPDATE repo_provision_retry SET next_attempt_at = ? WHERE repo_id = ? AND runtime_id = ?",
-    )
-    .bind(environment_retry_at(attempts))
-    .bind(&job.repo.id)
-    .bind(runtime)
-    .execute(&mut *tx)
-    .await?;
+    job.db
+        .schedule_repository_provision_successor_in_tx(
+            &mut tx,
+            environment_retry_at(attempts),
+            &job.repo.id,
+            runtime,
+        )
+        .await?;
     tx.commit().await?;
     tokio::spawn(async move {
         let mut location_witness = None;
@@ -177,7 +191,19 @@ pub(crate) async fn start(job: Job) -> Result<()> {
             {
                 // A new digest/version owns the next attempt. No old error or
                 // location result is applied to that epoch.
-                let _ = sqlx::query("UPDATE repo_provision_retry SET next_attempt_at=? WHERE repo_id=? AND runtime_id=? AND attempts=? AND checks_digest=? AND connection_id=?").bind(db::now_rfc3339()).bind(&job.repo.id).bind(&job.candidate.location.runtime_id).bind(attempts).bind(&digest).bind(connection as i64).execute(job.db.pool()).await;
+                let _ = job
+                    .db
+                    .release_stale_repository_provision_attempt(
+                        db::ReleaseStaleRepositoryProvisionAttemptInput {
+                            next_attempt_at: db::now_rfc3339(),
+                            repo_id: &job.repo.id,
+                            runtime_id: &job.candidate.location.runtime_id,
+                            attempts,
+                            checks_digest: &digest,
+                            connection_id: connection as i64,
+                        },
+                    )
+                    .await;
                 drop(guard);
                 job.kick.notify_one();
                 return;
@@ -204,29 +230,92 @@ pub(crate) async fn start(job: Job) -> Result<()> {
                     .await
                     .is_ok()
                 {
-                    let _ = sqlx::query("UPDATE repo_provision_retry SET last_error = ?, next_attempt_at = ? WHERE repo_id = ? AND runtime_id = ? AND attempts = ? AND checks_digest = ? AND connection_id = ? AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
-                .bind(crate::project_environment::bounded_output_tail(&error.to_string())).bind(environment_retry_at(attempts))
-                .bind(&job.repo.id).bind(&job.candidate.location.runtime_id).bind(attempts).bind(&digest).bind(connection as i64).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).execute(&mut *tx).await;
+                    let _ = job
+                        .db
+                        .record_repository_provision_failure_in_tx(
+                            &mut tx,
+                            db::RecordRepositoryProvisionFailureInTxInput {
+                                last_error: crate::project_environment::bounded_output_tail(
+                                    &error.to_string(),
+                                ),
+                                next_attempt_at: environment_retry_at(attempts),
+                                repo_id: &job.repo.id,
+                                runtime_id: &job.candidate.location.runtime_id,
+                                attempts,
+                                checks_digest: &digest,
+                                connection_id: connection as i64,
+                                project_id: &job.project.id,
+                                daemon_id: &job.candidate.location.daemon_id,
+                                readiness_runtime_id: &job.candidate.location.runtime_id,
+                                readiness_version: readiness_witness
+                                    .as_ref()
+                                    .map(|row| row.version)
+                                    .unwrap_or(-1),
+                            },
+                        )
+                        .await;
                     let _ = tx.commit().await;
                 }
             }
         }
         // Existing waiters receive the terminal failure/progress reason without
         // spending a Task version or relying on a later scan to display it.
-        if let Ok(Some((started, Some(error)))) = sqlx::query_as::<_, (Option<String>, Option<String>)>("SELECT started_at, last_error FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND attempts=? AND checks_digest=? AND connection_id=?")
-            .bind(&job.repo.id).bind(&job.candidate.location.runtime_id).bind(attempts).bind(&digest).bind(connection as i64).fetch_optional(job.db.pool()).await {
+        if let Ok(Some((started, Some(error)))) = job
+            .db
+            .repository_provision_attempt_failure(db::RepositoryProvisionAttemptFailureInput {
+                repo_id: &job.repo.id,
+                runtime_id: &job.candidate.location.runtime_id,
+                attempts,
+                checks_digest: &digest,
+                connection_id: connection as i64,
+            })
+            .await
+        {
             let machine = db::EnvironmentMachine::from_location(&job.candidate.location);
             if let Ok(name) = environment::machine_name(&job.db, &machine).await {
                 let machine_json = serde_json::to_value(&machine).expect("machine").to_string();
-                let tasks: Vec<(String,i64)> = sqlx::query_as("SELECT id,version FROM task WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?)")
-                    .bind(&job.project.id).bind(&machine_json).fetch_all(job.db.pool()).await.unwrap_or_default();
-                let elapsed = started.as_deref().and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()).map(|time| (chrono::Utc::now()-time.with_timezone(&chrono::Utc)).num_seconds().max(0)).unwrap_or(0);
+                let tasks: Vec<(String, i64)> = job
+                    .db
+                    .repository_provision_environment_wait_tasks(&job.project.id, &machine_json)
+                    .await
+                    .unwrap_or_default();
+                let elapsed = started
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|time| {
+                        (chrono::Utc::now() - time.with_timezone(&chrono::Utc))
+                            .num_seconds()
+                            .max(0)
+                    })
+                    .unwrap_or(0);
                 let reason = format!("environment_probe_pending: {name}; provisioning elapsed {elapsed}s; last failure: {error}{}", if attempts >= MAX_PROVISION_ATTEMPTS { "; provisioning retry limit reached" } else { "" });
-                if let Ok(mut tx)=db::begin_immediate(job.db.pool()).await {
-                    if fence_job_inputs(&mut tx,&job.project.id,&digest).await.is_ok() {
-                for (id,version) in tasks { let _ = db::task_writer::TaskQuery::new(&job.db,&id,"UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
-                    .bind(&reason).bind(&id).bind(version).bind(&machine_json).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).identity_fenced().execute_in_tx(&mut tx).await; }
-                        let _=tx.commit().await;
+                if let Ok(mut tx) = db::begin_immediate(job.db.pool()).await {
+                    if fence_job_inputs(&mut tx, &job.project.id, &digest)
+                        .await
+                        .is_ok()
+                    {
+                        for (id, version) in tasks {
+                            let _ = job
+                                .db
+                                .record_repository_provision_task_wait_in_tx(
+                                    &mut tx,
+                                    db::RepositoryProvisionTaskWaitInput {
+                                        task_id: &id,
+                                        reason: &reason,
+                                        version,
+                                        machine_json: &machine_json,
+                                        project_id: &job.project.id,
+                                        daemon_id: &job.candidate.location.daemon_id,
+                                        runtime_id: &job.candidate.location.runtime_id,
+                                        readiness_version: readiness_witness
+                                            .as_ref()
+                                            .map(|row| row.version)
+                                            .unwrap_or(-1),
+                                    },
+                                )
+                                .await;
+                        }
+                        let _ = tx.commit().await;
                     }
                 }
             }
@@ -251,9 +340,7 @@ async fn fence_job_inputs(
     project_id: &str,
     digest: &str,
 ) -> Result<()> {
-    let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
+    let raw: String = db::provisioning_project_settings_on_connection(tx, project_id)
         .await?
         .ok_or(db::DbError::NotFound)?;
     let settings: ProjectSettings = serde_json::from_str(&raw)
@@ -289,8 +376,16 @@ impl Job {
     }
 
     async fn ensure_attempt(&self, attempt: i64, digest: &str, connection: i64) -> Result<()> {
-        let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND attempts=? AND checks_digest=? AND connection_id=?)")
-            .bind(&self.repo.id).bind(&self.candidate.location.runtime_id).bind(attempt).bind(digest).bind(connection).fetch_one(self.db.pool()).await?;
+        let current: bool = self
+            .db
+            .repository_provision_attempt_is_current(db::RepositoryProvisionAttemptIsCurrentInput {
+                repo_id: &self.repo.id,
+                runtime_id: &self.candidate.location.runtime_id,
+                attempts: attempt,
+                checks_digest: digest,
+                connection_id: connection,
+            })
+            .await?;
         if !current
             || self
                 .registry
@@ -341,8 +436,20 @@ impl Job {
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         fence_job_inputs(tx, &self.project.id, &job_inputs_digest(&snapshot)).await?;
         let (owner, daemon, runtime) = row.machine.columns();
-        let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_machine_readiness r JOIN project p ON p.id=r.project_id WHERE r.project_id=? AND r.owner_kind=? AND r.daemon_id=? AND r.runtime_id=? AND r.version=? AND r.checks_digest=?)")
-            .bind(&self.project.id).bind(owner).bind(daemon).bind(runtime).bind(row.version).bind(&row.checks_digest).fetch_one(&mut **tx).await?;
+        let current: bool = self
+            .db
+            .repository_provision_readiness_is_current_in_tx(
+                tx,
+                db::RepositoryProvisionReadinessIsCurrentInTxInput {
+                    project_id: &self.project.id,
+                    owner_kind: owner,
+                    daemon_id: daemon,
+                    runtime_id: runtime,
+                    version: row.version,
+                    checks_digest: &row.checks_digest,
+                },
+            )
+            .await?;
         if !current {
             return Err(db::DbError::VersionConflict.into());
         }
@@ -361,14 +468,37 @@ impl Job {
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         self.fence_in_transaction(&mut tx, row).await?;
         let now = db::now_rfc3339();
-        let changed=sqlx::query("UPDATE repo_location SET path=COALESCE(?,path),status=?,last_error=?,last_verified_at=CASE WHEN ? THEN ? ELSE last_verified_at END,updated_at=?,version=version+1 WHERE id=? AND version=?")
-            .bind(&path).bind(status.to_string()).bind(&error).bind(verified).bind(&now).bind(&now).bind(&location.id).bind(location.version).execute(&mut *tx).await?;
+        let changed = self
+            .db
+            .apply_repository_provision_location_in_tx(
+                &mut tx,
+                db::ApplyRepositoryProvisionLocationInTxInput {
+                    path: &path,
+                    status: status.to_string(),
+                    last_error: &error,
+                    verified,
+                    verified_at: &now,
+                    updated_at: &now,
+                    location_id: &location.id,
+                    version: location.version,
+                },
+            )
+            .await?;
         if changed.rows_affected() != 1 {
             return Err(db::DbError::VersionConflict.into());
         }
         if verified {
-            sqlx::query("DELETE FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND checks_digest=?")
-                .bind(&self.repo.id).bind(&location.runtime_id).bind(job_inputs_digest(&serde_json::from_str::<ProjectSettings>(&self.project.settings).map_err(|error|ServiceError::invalid_operation(error.to_string()))?)).execute(&mut *tx).await?;
+            self.db
+                .delete_verified_repository_provision_retry_in_tx(
+                    &mut tx,
+                    &self.repo.id,
+                    &location.runtime_id,
+                    job_inputs_digest(
+                        &serde_json::from_str::<ProjectSettings>(&self.project.settings)
+                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                    ),
+                )
+                .await?;
         }
         tx.commit().await?;
         let mut saved = location.clone();
@@ -460,33 +590,40 @@ impl Job {
         let now = db::now_rfc3339();
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         self.fence_in_transaction(&mut tx, &saved).await?;
-        let location_id: Option<String> = sqlx::query_scalar(
-            "SELECT location_id FROM repo_provision_retry WHERE repo_id = ? AND runtime_id = ?",
-        )
-        .bind(&self.repo.id)
-        .bind(runtime)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten();
+        let location_id: Option<String> = self
+            .db
+            .repository_provision_location_id_in_tx(&mut tx, &self.repo.id, runtime)
+            .await?
+            .flatten();
         let location_id = if let Some(id) = location_id {
             id
         } else {
             // A concurrent manual registration wins; never provision over it.
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM repo_location WHERE repo_id = ? AND runtime_id = ?)",
-            )
-            .bind(&self.repo.id)
-            .bind(runtime)
-            .fetch_one(&mut *tx)
-            .await?;
+            let exists: bool = self
+                .db
+                .repository_provision_location_exists_in_tx(&mut tx, &self.repo.id, runtime)
+                .await?;
             if exists {
                 return Err(db::DbError::VersionConflict.into());
             }
             let id = db::new_uuid_v4();
-            sqlx::query("INSERT INTO repo_location (id, repo_id, owner_kind, daemon_id, runtime_id, path, kind, status, created_at, updated_at) VALUES (?, ?, 'daemon', ?, ?, ?, 'managed_clone', 'unverified', ?, ?)")
-                .bind(&id).bind(&self.repo.id).bind(daemon).bind(runtime).bind(&self.candidate.location.path).bind(&now).bind(&now).execute(&mut *tx).await?;
-            sqlx::query("UPDATE repo_provision_retry SET location_id = ? WHERE repo_id = ? AND runtime_id = ?")
-                .bind(&id).bind(&self.repo.id).bind(runtime).execute(&mut *tx).await?;
+            self.db
+                .insert_repository_provision_location_in_tx(
+                    &mut tx,
+                    db::InsertRepositoryProvisionLocationInTxInput {
+                        location_id: &id,
+                        repo_id: &self.repo.id,
+                        daemon_id: daemon,
+                        runtime_id: runtime,
+                        path: &self.candidate.location.path,
+                        created_at: &now,
+                        updated_at: &now,
+                    },
+                )
+                .await?;
+            self.db
+                .record_repository_provision_location_id_in_tx(&mut tx, &id, &self.repo.id, runtime)
+                .await?;
             id
         };
         tx.commit().await?;

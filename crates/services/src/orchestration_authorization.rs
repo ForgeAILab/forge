@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use db::SqliteDb;
 use forge_agent_host::{CanonicalScope, CanonicalScopeType};
-use sqlx::Row;
 
 use crate::{Result, ServiceError};
 
@@ -35,14 +34,14 @@ impl OrchestrationAuthorizationService {
         actor_identity_id: &str,
         scope: &CanonicalScope,
     ) -> Result<String> {
-        let owner_id = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT owner_id FROM agent_identity WHERE id = ?",
-        )
-        .bind(actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten()
-        .ok_or_else(|| ServiceError::not_found("agent_identity", actor_identity_id.to_owned()))?;
+        let owner_id = self
+            .db
+            .orchestration_actor_account_owner(actor_identity_id)
+            .await?
+            .flatten()
+            .ok_or_else(|| {
+                ServiceError::not_found("agent_identity", actor_identity_id.to_owned())
+            })?;
 
         let account_id = match scope.scope_type {
             CanonicalScopeType::Account => {
@@ -54,25 +53,21 @@ impl OrchestrationAuthorizationService {
                 scope.scope_id.clone()
             }
             CanonicalScopeType::AgentChat => {
-                let row =
-                    sqlx::query("SELECT kind, account_id FROM agent_chat WHERE id = ? LIMIT 1")
-                        .bind(&scope.scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::not_found("agent_chat", scope.scope_id.clone())
-                        })?;
-                let kind: String = row.try_get("kind")?;
+                let row = self
+                    .db
+                    .orchestration_main_chat_scope(&scope.scope_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("agent_chat", scope.scope_id.clone()))?;
+                let kind: String = row.kind()?;
                 if kind != "account_main" {
                     return Err(ServiceError::AuthorizationDenied {
                         message: "global Main Agent operations are unavailable in Project Chat"
                             .to_owned(),
                     });
                 }
-                row.try_get::<Option<String>, _>("account_id")?
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation("Main Agent account is unavailable")
-                    })?
+                row.account_id()?.ok_or_else(|| {
+                    ServiceError::invalid_operation("Main Agent account is unavailable")
+                })?
             }
             _ => {
                 return Err(ServiceError::AuthorizationDenied {
@@ -106,16 +101,14 @@ impl OrchestrationAuthorizationService {
     pub(crate) async fn main_account_target(&self, scope: &CanonicalScope) -> Result<String> {
         match scope.scope_type {
             CanonicalScopeType::Account => Ok(scope.scope_id.clone()),
-            CanonicalScopeType::AgentChat => sqlx::query_scalar::<_, Option<String>>(
-                "SELECT account_id FROM agent_chat WHERE id = ? AND kind = 'account_main'",
-            )
-            .bind(&scope.scope_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .flatten()
-            .ok_or_else(|| ServiceError::AuthorizationDenied {
-                message: "global Main Agent operations are unavailable in Project Chat".into(),
-            }),
+            CanonicalScopeType::AgentChat => self
+                .db
+                .orchestration_main_chat_account_target(&scope.scope_id)
+                .await?
+                .flatten()
+                .ok_or_else(|| ServiceError::AuthorizationDenied {
+                    message: "global Main Agent operations are unavailable in Project Chat".into(),
+                }),
             _ => Err(ServiceError::AuthorizationDenied {
                 message: "global Main Agent operation is unavailable in this scope".into(),
             }),
@@ -131,16 +124,11 @@ impl OrchestrationAuthorizationService {
         match scope.scope_type {
             CanonicalScopeType::Project => Ok(scope.scope_id.clone()),
             CanonicalScopeType::AgentChat => {
-                let project_id = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT project_id
-                     FROM agent_chat
-                     WHERE id = ? AND kind = 'project'
-                     LIMIT 1",
-                )
-                .bind(&scope.scope_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .flatten();
+                let project_id = self
+                    .db
+                    .orchestration_direct_chat_project_target(&scope.scope_id)
+                    .await?
+                    .flatten();
                 project_id.ok_or_else(|| {
                     ServiceError::invalid_operation(
                         "Project Agent Chat has no owning Project".to_owned(),
@@ -162,45 +150,25 @@ impl OrchestrationAuthorizationService {
     ) -> Result<String> {
         match scope.scope_type {
             CanonicalScopeType::Project => {
-                let project_id = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT p.id
-                     FROM project AS p
-                     JOIN project_agent_binding AS binding
-                       ON binding.project_id = p.id
-                      AND binding.identity_id = ?
-                      AND binding.state = 'active'
-                     WHERE p.id = ?
-                     LIMIT 1",
-                )
-                .bind(actor_identity_id)
-                .bind(&scope.scope_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .flatten();
+                let project_id = self
+                    .db
+                    .orchestration_bound_project_target(actor_identity_id, &scope.scope_id)
+                    .await?
+                    .flatten();
                 project_id.ok_or_else(|| ServiceError::AuthorizationDenied {
                     message: "Project Agent binding does not own this Project scope".to_owned(),
                 })
             }
             CanonicalScopeType::AgentChat => {
-                let row = sqlx::query(
-                    "SELECT chat.kind, chat.project_id, binding.identity_id
-                     FROM agent_chat AS chat
-                     JOIN project_agent_binding AS binding
-                       ON binding.project_id = chat.project_id
-                      AND binding.identity_id = ?
-                      AND binding.state = 'active'
-                     WHERE chat.id = ? AND chat.kind = 'project'
-                     LIMIT 1",
-                )
-                .bind(actor_identity_id)
-                .bind(&scope.scope_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| ServiceError::AuthorizationDenied {
-                    message: "Project Agent Chat is not bound to this identity".to_owned(),
-                })?;
-                let _kind: String = row.try_get("kind")?;
-                row.try_get::<Option<String>, _>("project_id")?
+                let row = self
+                    .db
+                    .orchestration_bound_project_chat_scope(actor_identity_id, &scope.scope_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::AuthorizationDenied {
+                        message: "Project Agent Chat is not bound to this identity".to_owned(),
+                    })?;
+                let _kind: String = row.kind()?;
+                row.project_id()?
                     .ok_or_else(|| ServiceError::AuthorizationDenied {
                         message: "Project Agent Chat has no owning Project".to_owned(),
                     })

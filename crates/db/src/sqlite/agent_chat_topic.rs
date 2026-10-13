@@ -555,3 +555,236 @@ async fn append_system_message_in_tx(
     .await?;
     Ok(message.id.clone())
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct TopicRotationIntentRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl TopicRotationIntentRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn attempt_count(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("attempt_count")?)
+    }
+    pub fn label(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("label")?)
+    }
+    pub fn requested_summary(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("requested_summary")?)
+    }
+    pub fn cause(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("cause")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn successor_runtime_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("successor_runtime_id")?)
+    }
+    pub fn source_session_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_session_id")?)
+    }
+    pub fn successor_session_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("successor_session_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn topic_rotation_responder_is_native(&self, chat_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(NATIVE_RESPONDER_SQL)
+            .bind(chat_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn due_chat_topic_rotations(
+        &self,
+        now: String,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT r.chat_id FROM agent_chat_topic_rotation r
+         WHERE (r.owner_token IS NULL OR julianday(r.lease_until) <= julianday(?1))
+           AND (r.next_attempt_at IS NULL OR julianday(r.next_attempt_at) <= julianday(?1))
+           AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job j
+                           WHERE j.chat_id = r.chat_id AND j.status = 'leased')
+           AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job j
+                           WHERE j.id = r.origin_turn_id
+                             AND j.status IN ('queued', 'leased', 'retry_wait', 'awaiting_input'))
+         ORDER BY r.attempt_count ASC, r.created_at ASC
+         LIMIT ?2",
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn lease_due_chat_topic_rotation(
+        &self,
+        owner: &str,
+        lease_until: String,
+        chat_id: &str,
+        now: String,
+    ) -> crate::Result<Option<TopicRotationIntentRow>> {
+        let rows = sqlx::query(
+            "UPDATE agent_chat_topic_rotation
+             SET owner_token = ?1, lease_until = ?2, attempt_count = attempt_count + 1
+             WHERE chat_id = ?3
+               AND (owner_token IS NULL OR julianday(lease_until) <= julianday(?4))
+               AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?4))
+               AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job
+                               WHERE chat_id = ?3 AND status = 'leased')
+               AND NOT EXISTS (SELECT 1 FROM agent_chat_turn_job
+                               WHERE id = origin_turn_id
+                                 AND status IN ('queued', 'leased', 'retry_wait', 'awaiting_input'))
+             RETURNING *",
+        )
+        .bind(owner)
+        .bind(lease_until)
+        .bind(chat_id)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| TopicRotationIntentRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn renew_chat_topic_rotation_lease(
+        &self,
+        lease_until: String,
+        owner: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE agent_chat_topic_rotation SET lease_until = ? WHERE owner_token = ?",
+        )
+        .bind(lease_until)
+        .bind(owner)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn refund_unattempted_chat_topic_rotation(
+        &self,
+        chat_id: &str,
+        owner: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE agent_chat_topic_rotation
+                     SET owner_token = NULL, lease_until = NULL,
+                         attempt_count = MAX(attempt_count - 1, 0)
+                     WHERE chat_id = ? AND owner_token = ?",
+        )
+        .bind(chat_id)
+        .bind(owner)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn backoff_failed_chat_topic_rotation(
+        &self,
+        next_attempt_at: String,
+        error_kind: &str,
+        chat_id: &str,
+        owner: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE agent_chat_topic_rotation
+                     SET owner_token = NULL, lease_until = NULL,
+                         next_attempt_at = ?, last_error_kind = ?
+                     WHERE chat_id = ? AND owner_token = ?",
+        )
+        .bind(next_attempt_at)
+        .bind(error_kind)
+        .bind(chat_id)
+        .bind(owner)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delete_non_native_chat_topic_rotation(
+        &self,
+        chat_id: &str,
+        owner: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "DELETE FROM agent_chat_topic_rotation WHERE chat_id = ? AND owner_token = ?",
+        )
+        .bind(chat_id)
+        .bind(owner)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_topic_rotation_source_session_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        source_id: &str,
+        intent_id: &str,
+        owner: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE agent_chat_topic_rotation SET source_session_id = ? WHERE id = ? AND owner_token = ?",)
+.bind(source_id)
+.bind(intent_id)
+.bind(owner)
+.execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn owned_chat_topic_rotation_intent(
+        &self,
+        intent_id: &str,
+        owner: &str,
+    ) -> crate::Result<Option<TopicRotationIntentRow>> {
+        let rows =
+            sqlx::query("SELECT * FROM agent_chat_topic_rotation WHERE id = ? AND owner_token = ?")
+                .bind(intent_id)
+                .bind(owner)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(rows.map(|row| TopicRotationIntentRow { row }))
+    }
+}
+
+/// SQL predicate: the chat's responder (account Main binding or Project
+/// binding -> the identity's selected Profile) runs on the native backend.
+/// The same rule gates the automatic rotation triggers in
+/// `V202610050233__topic_working_sets.sql`.
+const NATIVE_RESPONDER_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM agent_chat c
+    JOIN agent_identity i ON i.id = COALESCE(
+        (SELECT b.identity_id FROM account_main_agent_binding b
+         WHERE b.account_id = c.account_id AND b.state = 'active'),
+        (SELECT b.identity_id FROM project_agent_binding b
+         WHERE b.project_id = c.project_id AND b.state = 'active'))
+    JOIN agent_profile p ON p.id = i.selected_profile_id
+    WHERE c.id = ? AND p.backend_kind = 'native')";
+
+impl SqliteDb {
+    pub async fn native_chat_session_pending_successor(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE successor_session_id = ?)",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}

@@ -2407,28 +2407,20 @@ impl TaskService {
         // acknowledging it. Resolve the path from that result, fenced to this
         // handle and generation, without opening or inferring any server path.
         // Plan operations also use workspace.reset, but do not prepare a path.
-        let receipt = sqlx::query_scalar::<_, String>(
-            "SELECT outcome_json FROM command_receipt
-             WHERE principal_type = 'system' AND principal_id = 'workspace-backend'
-               AND scope_type = 'task' AND scope_id = ?
-               AND operation IN ('daemon.workspace.prepare', 'daemon.workspace.reset')
-               AND json_valid(outcome_json)
-               AND json_extract(outcome_json, '$.metadata.status') = 'result'
-               AND json_type(outcome_json, '$.owner_result.workspace_path') = 'text'
-               AND json_extract(outcome_json, '$.metadata.placement_id') = ?
-               AND json_extract(outcome_json, '$.metadata.generation') = ?
-               AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
-             ORDER BY committed_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&placement.task_id)
-        .bind(&placement.id)
-        .bind(placement.generation)
-        .bind(daemon_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation("daemon placement has no retained preparation result")
-        })?;
+        let receipt = self
+            .db
+            .daemon_workspace_preparation_receipt(
+                &placement.task_id,
+                &placement.id,
+                placement.generation,
+                daemon_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "daemon placement has no retained preparation result",
+                )
+            })?;
         let receipt = parse_json_value("workspace preparation receipt", &receipt)?;
         prepared_owner_execution_path(placement, &receipt["owner_result"])
     }

@@ -11,7 +11,7 @@ use db::{
     WorkspacePlacement, WorkspacePlacementRepo,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 
 use super::capacity::{
     count_agent_capacity, count_machine_capacity, AgentCapacity, MachineCapacity,
@@ -970,9 +970,8 @@ pub async fn load_selection_context(
     // Include non-ready rows for rejection evidence; the pure filter can never
     // select them. Reading all locations also avoids truncating admission at
     // an arbitrary API page boundary.
-    let rows = sqlx::query("SELECT * FROM repo_location WHERE repo_id = ? ORDER BY created_at, id")
-        .bind(&input.repo.id)
-        .fetch_all(&mut **transaction)
+    let rows = db
+        .placement_repository_location_sources_in_tx(transaction, &input.repo.id)
         .await?;
     let mut locations = rows
         .into_iter()
@@ -996,25 +995,22 @@ pub async fn load_selection_context(
         })
         && inherited_root_placement.is_none()
     {
-        let runtimes = sqlx::query("SELECT r.*, j.runtime_id AS retry_runtime, j.location_id AS retry_location, j.attempts AS retry_attempts, j.checks_digest AS retry_digest, j.connection_id AS retry_connection FROM runtime r JOIN daemon d ON d.id = r.daemon_id LEFT JOIN repo_provision_retry j ON j.runtime_id = r.id AND j.repo_id = ? WHERE d.removed_at IS NULL AND d.machine_id <> ? ORDER BY d.created_at, d.id, r.id")
-            .bind(&input.repo.id).bind(db.server_run_cap.embedded_machine_id()).fetch_all(&mut **transaction).await?;
+        let runtimes = db
+            .placement_provision_runtime_sources_in_tx(
+                transaction,
+                &input.repo.id,
+                db.server_run_cap.embedded_machine_id(),
+            )
+            .await?;
         for runtime in runtimes {
-            let id: String = runtime.try_get("id")?;
-            let daemon: String = runtime.try_get("daemon_id")?;
-            let retry_exists = runtime
-                .try_get::<Option<String>, _>("retry_runtime")?
-                .is_some();
-            let retry_location: Option<String> = runtime.try_get("retry_location")?;
+            let id: String = runtime.id()?;
+            let daemon: String = runtime.daemon_id()?;
+            let retry_exists = runtime.retry_runtime()?.is_some();
+            let retry_location: Option<String> = runtime.retry_location()?;
             let exhausted = super::provisioning::ProvisionRetryState {
-                attempts: runtime
-                    .try_get::<Option<i64>, _>("retry_attempts")?
-                    .unwrap_or_default(),
-                inputs_digest: runtime
-                    .try_get::<Option<String>, _>("retry_digest")?
-                    .unwrap_or_default(),
-                connection_id: runtime
-                    .try_get::<Option<i64>, _>("retry_connection")?
-                    .unwrap_or_default(),
+                attempts: runtime.retry_attempts()?.unwrap_or_default(),
+                inputs_digest: runtime.retry_digest()?.unwrap_or_default(),
+                connection_id: runtime.retry_connection()?.unwrap_or_default(),
             }
             .exhausted(
                 input.project_settings,
@@ -1074,7 +1070,7 @@ pub async fn load_selection_context(
                 owner_kind: RepoLocationOwnerKind::Daemon,
                 daemon_id: Some(daemon),
                 runtime_id: Some(id),
-                path: std::path::Path::new(&runtime.try_get::<String, _>("workspace_root")?)
+                path: std::path::Path::new(&runtime.workspace_root()?)
                     .join("repos")
                     .join(&input.repo.id)
                     .to_string_lossy()
@@ -1085,8 +1081,8 @@ pub async fn load_selection_context(
                 last_verified_at: None,
                 last_error: None,
                 version: 1,
-                created_at: runtime.try_get("created_at")?,
-                updated_at: runtime.try_get("updated_at")?,
+                created_at: runtime.created_at()?,
+                updated_at: runtime.updated_at()?,
             });
         }
     }
@@ -1113,16 +1109,16 @@ pub async fn load_selection_context(
             input.server.execution_daemon_id.clone()
         };
         let daemon = match execution_daemon_id.as_deref() {
-            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json, disk_json FROM daemon WHERE id = ? AND removed_at IS NULL")
-                .bind(id)
-                .fetch_optional(&mut **transaction)
-                .await?,
+            Some(id) => {
+                db.placement_execution_daemon_source_in_tx(transaction, id)
+                    .await?
+            }
             None => None,
         };
         let embedded_execution = !daemon_owned
             && (execution_daemon_id.is_none()
                 || daemon.as_ref().is_some_and(|row| {
-                    row.try_get::<String, _>("machine_id")
+                    row.machine_id()
                         .is_ok_and(|id| id == db.server_run_cap.embedded_machine_id())
                 }));
         let remote_execution =
@@ -1143,14 +1139,10 @@ pub async fn load_selection_context(
                 location.runtime_id.as_deref(),
                 execution_daemon_id.as_deref(),
             ) {
-                (Some(runtime_id), Some(daemon_id)) => sqlx::query_scalar::<_, bool>(
-                    "SELECT status = 'ready' FROM runtime WHERE id = ? AND daemon_id = ?",
-                )
-                .bind(runtime_id)
-                .bind(daemon_id)
-                .fetch_optional(&mut **transaction)
-                .await?
-                .unwrap_or(false),
+                (Some(runtime_id), Some(daemon_id)) => db
+                    .placement_runtime_ready_in_tx(transaction, runtime_id, daemon_id)
+                    .await?
+                    .unwrap_or(false),
                 _ => false,
             }
         } else {
@@ -1158,15 +1150,15 @@ pub async fn load_selection_context(
         };
         let visible = match daemon.as_ref() {
             Some(row) => {
-                let owner: Option<String> = row.try_get("owner_id")?;
-                let visibility: String = row.try_get("visibility")?;
+                let owner: Option<String> = row.owner_id()?;
+                let visibility: String = row.visibility()?;
                 visibility == "global" || owner.is_none() || owner.as_deref() == input.task_owner_id
             }
             None => !remote_execution && execution_daemon_id.is_none(),
         };
         let detected: serde_json::Value = daemon
             .as_ref()
-            .map(|row| row.try_get::<String, _>("detected_clis_json"))
+            .map(|row| row.detected_clis_json())
             .transpose()?
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
@@ -1216,16 +1208,23 @@ pub async fn load_selection_context(
             if agent.backend_kind == "cli" {
                 if let Some(daemon_id) = execution_daemon_id.as_deref() {
                     let enabled = match agent.owner_id.as_deref() {
-                        Some(owner) => sqlx::query_scalar::<_, bool>(
-                            "SELECT enabled FROM cli_runtime_policy WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?",
-                        )
-                        .bind(owner).bind(daemon_id).bind(&agent.executor_type)
-                        .fetch_optional(&mut **transaction).await?.unwrap_or(true),
-                        None => sqlx::query_scalar::<_, Option<bool>>(
-                            "SELECT MIN(enabled) FROM cli_runtime_policy WHERE daemon_id = ? AND executor_type = ?",
-                        )
-                        .bind(daemon_id).bind(&agent.executor_type)
-                        .fetch_one(&mut **transaction).await?.unwrap_or(true),
+                        Some(owner) => db
+                            .placement_owned_cli_enabled_in_tx(
+                                transaction,
+                                owner,
+                                daemon_id,
+                                &agent.executor_type,
+                            )
+                            .await?
+                            .unwrap_or(true),
+                        None => db
+                            .placement_unowned_cli_enabled_in_tx(
+                                transaction,
+                                daemon_id,
+                                &agent.executor_type,
+                            )
+                            .await?
+                            .unwrap_or(true),
                     };
                     facts.enabled &= enabled;
                 }
@@ -1234,7 +1233,7 @@ pub async fn load_selection_context(
         }
         let machine_id = if execution_daemon_id.is_none()
             || daemon.as_ref().is_some_and(|row| {
-                row.try_get::<String, _>("machine_id")
+                row.machine_id()
                     .is_ok_and(|id| id == db.server_run_cap.embedded_machine_id())
             }) {
             None
@@ -1246,12 +1245,12 @@ pub async fn load_selection_context(
         } else {
             let reported = daemon
                 .as_ref()
-                .map(|row| row.try_get::<Option<i64>, _>("max_concurrent_runs"))
+                .map(|row| row.max_concurrent_runs())
                 .transpose()?
                 .flatten();
             let admin = daemon
                 .as_ref()
-                .map(|row| row.try_get::<Option<u32>, _>("run_limit"))
+                .map(|row| row.run_limit())
                 .transpose()?
                 .flatten();
             super::capacity::effective_machine_cap(reported, admin)
@@ -1277,7 +1276,7 @@ pub async fn load_selection_context(
         let disk_pressure = if daemon_owned {
             let disk_json = daemon
                 .as_ref()
-                .map(|row| row.try_get::<Option<String>, _>("disk_json"))
+                .map(|row| row.disk_json())
                 .transpose()?
                 .flatten();
             db.disk_admission.daemon_pressure(disk_json.as_deref())
@@ -1373,31 +1372,22 @@ pub async fn load_selection_context(
     })
 }
 
-fn map_location(row: SqliteRow) -> Result<RepoLocation> {
+fn map_location(row: db::PlacementRepoLocationSourceRow) -> Result<RepoLocation> {
     Ok(RepoLocation {
-        id: row.try_get("id")?,
-        repo_id: row.try_get("repo_id")?,
-        owner_kind: row
-            .try_get::<String, _>("owner_kind")?
-            .parse()
-            .map_err(db::DbError::Check)?,
-        daemon_id: row.try_get("daemon_id")?,
-        runtime_id: row.try_get("runtime_id")?,
-        path: row.try_get("path")?,
-        kind: row
-            .try_get::<String, _>("kind")?
-            .parse()
-            .map_err(db::DbError::Check)?,
-        is_default: row.try_get::<i64, _>("is_default")? != 0,
-        status: row
-            .try_get::<String, _>("status")?
-            .parse()
-            .map_err(db::DbError::Check)?,
-        last_verified_at: row.try_get("last_verified_at")?,
-        last_error: row.try_get("last_error")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
+        id: row.id()?,
+        repo_id: row.repo_id()?,
+        owner_kind: row.owner_kind()?.parse().map_err(db::DbError::Check)?,
+        daemon_id: row.daemon_id()?,
+        runtime_id: row.runtime_id()?,
+        path: row.path()?,
+        kind: row.kind()?.parse().map_err(db::DbError::Check)?,
+        is_default: row.is_default()? != 0,
+        status: row.status()?.parse().map_err(db::DbError::Check)?,
+        last_verified_at: row.last_verified_at()?,
+        last_error: row.last_error()?,
+        version: row.version()?,
+        created_at: row.created_at()?,
+        updated_at: row.updated_at()?,
     })
 }
 

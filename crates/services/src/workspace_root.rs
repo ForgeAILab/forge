@@ -13,6 +13,15 @@ pub mod migrate;
 use db::{now_rfc3339, SqliteDb};
 use std::path::{Path, PathBuf};
 
+// Root startup/migration report SQLx errors directly. The DB query helpers
+// wrap those errors in DbError; unwrap them at this existing error boundary.
+fn root_record_error(error: db::DbError) -> sqlx::Error {
+    match error {
+        db::DbError::Sqlx(error) => error,
+        error => sqlx::Error::Protocol(error.to_string()),
+    }
+}
+
 /// The recorded workspace root: an absolute path, written at first start.
 pub const ROOT_KEY: &str = "workspace_root";
 /// What the last start found about the root, for operator status.
@@ -145,14 +154,12 @@ pub async fn root_of(db: &SqliteDb) -> Result<PathBuf, WorkspaceRootError> {
 
 /// The recorded root, if a server ever started on this database.
 pub async fn recorded_root(db: &SqliteDb) -> Result<Option<PathBuf>, WorkspaceRootError> {
-    Ok(
-        sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
-            .bind(ROOT_KEY)
-            .fetch_optional(db.pool())
-            .await?
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from),
-    )
+    Ok(db
+        .workspace_root_setting_value(ROOT_KEY)
+        .await
+        .map_err(root_record_error)?
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from))
 }
 
 /// Decide the workspace root of a starting server and record it.
@@ -332,13 +339,10 @@ pub(crate) async fn stored_roots(db: &SqliteDb) -> Result<Vec<StoredRoot>, sqlx:
         &mut all[at]
     }
     let mut all: Vec<StoredRoot> = Vec::new();
-    let worktrees: Vec<(String, String)> = sqlx::query_as(
-        "SELECT w.worktree_path, w.task_id FROM workspace w
-         LEFT JOIN workspace_placement p ON p.workspace_id = w.id
-         WHERE w.status != 'cleaned' AND COALESCE(p.owner_kind, 'server') = 'server'",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let worktrees: Vec<(String, String)> = db
+        .workspace_root_server_worktrees()
+        .await
+        .map_err(root_record_error)?;
     for (path, task_id) in worktrees {
         let task_root = Path::new(&path).parent();
         let named_for_task = task_root
@@ -350,10 +354,10 @@ pub(crate) async fn stored_roots(db: &SqliteDb) -> Result<Vec<StoredRoot>, sqlx:
             }
         }
     }
-    let clones: Vec<String> =
-        sqlx::query_scalar("SELECT path FROM repo_location WHERE owner_kind = 'server'")
-            .fetch_all(db.pool())
-            .await?;
+    let clones: Vec<String> = db
+        .workspace_root_server_clone_paths()
+        .await
+        .map_err(root_record_error)?;
     for path in clones {
         let path = Path::new(&path);
         let in_repos = path
@@ -366,12 +370,10 @@ pub(crate) async fn stored_roots(db: &SqliteDb) -> Result<Vec<StoredRoot>, sqlx:
             }
         }
     }
-    let logs: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT substr(logs_path, 1, instr(logs_path, '/.forge/logs/') - 1), COUNT(*)
-         FROM execution WHERE instr(logs_path, '/.forge/logs/') > 1 GROUP BY 1",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let logs: Vec<(String, i64)> = db
+        .workspace_root_log_counts()
+        .await
+        .map_err(root_record_error)?;
     for (root, count) in logs {
         if Path::new(&root).is_absolute() && Path::new(&root).parent().is_some() {
             entry(&mut all, &root).logs += count;
@@ -405,10 +407,10 @@ fn looks_like_temp_default(root: &Path) -> bool {
 /// An earlier start found this root in a system temp directory. Kept, so a
 /// launch with another temp directory still reports it.
 async fn was_reported_in_temp(db: &SqliteDb, root: &Path) -> Result<bool, sqlx::Error> {
-    let status = sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
-        .bind(STATUS_KEY)
-        .fetch_optional(db.pool())
-        .await?;
+    let status = db
+        .workspace_root_setting_value(STATUS_KEY)
+        .await
+        .map_err(root_record_error)?;
     Ok(status
         .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
         .is_some_and(|status| {
@@ -429,10 +431,10 @@ async fn foreign_owner(db: &SqliteDb, root: &Path) -> Result<Option<String>, sql
     ) else {
         return Ok(None);
     };
-    let mine = sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
-        .bind(crate::workspace_cleanup::GC_OWNER_KEY)
-        .fetch_optional(db.pool())
-        .await?;
+    let mine = db
+        .workspace_root_setting_value(crate::workspace_cleanup::GC_OWNER_KEY)
+        .await
+        .map_err(root_record_error)?;
     let marker = marker.trim();
     Ok((mine.as_deref() != Some(marker) && !marker.is_empty())
         .then(|| marker.chars().take(64).collect()))
@@ -447,15 +449,14 @@ pub(crate) async fn record_root<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
     root: &Path,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    db::record_workspace_root_setting(
+        executor,
+        ROOT_KEY,
+        root.to_string_lossy().as_ref(),
+        now_rfc3339(),
     )
-    .bind(ROOT_KEY)
-    .bind(root.to_string_lossy().as_ref())
-    .bind(now_rfc3339())
-    .execute(executor)
-    .await?;
+    .await
+    .map_err(root_record_error)?;
     Ok(())
 }
 
@@ -483,21 +484,13 @@ async fn record_status(
     migrate_command: &str,
     warnings: &[String],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-         WHERE system_setting.value != excluded.value",
+    db.record_workspace_root_status(
+        STATUS_KEY,
+        status_value(root, in_system_temp, migrate_command, warnings),
+        now_rfc3339(),
     )
-    .bind(STATUS_KEY)
-    .bind(status_value(
-        root,
-        in_system_temp,
-        migrate_command,
-        warnings,
-    ))
-    .bind(now_rfc3339())
-    .execute(db.pool())
-    .await?;
+    .await
+    .map_err(root_record_error)?;
     Ok(())
 }
 
@@ -518,23 +511,14 @@ impl LiveData {
         let mut workspaces = 0;
         let mut running = 0;
         for spelling in spellings(root) {
-            workspaces += sqlx::query_scalar::<_, i64>(&format!(
-                "SELECT COUNT(*) FROM workspace WHERE status != 'cleaned' AND {}",
-                under_sql("worktree_path")
-            ))
-            .bind(&spelling)
-            .fetch_one(db.pool())
-            .await?;
-            running += sqlx::query_scalar::<_, i64>(&format!(
-                "SELECT COUNT(*) FROM execution e
-                 LEFT JOIN workspace w ON w.id = e.workspace_id
-                 WHERE e.status = 'running' AND ({} OR {})",
-                under_sql("e.logs_path"),
-                under_sql("w.worktree_path")
-            ))
-            .bind(&spelling)
-            .fetch_one(db.pool())
-            .await?;
+            workspaces += db
+                .workspace_root_live_workspace_count(&spelling)
+                .await
+                .map_err(root_record_error)?;
+            running += db
+                .workspace_root_running_execution_count(&spelling)
+                .await
+                .map_err(root_record_error)?;
         }
         // Only this database's clones: a directory under `.repos` named
         // after one of its repository rows, which is what the move takes.
@@ -564,10 +548,10 @@ impl LiveData {
         };
         let mut clones = 0;
         for name in names {
-            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id = ?")
-                .bind(&name)
-                .fetch_one(db.pool())
-                .await?;
+            let rows: i64 = db
+                .workspace_root_repository_count(&name)
+                .await
+                .map_err(root_record_error)?;
             clones += usize::from(rows > 0);
         }
         Ok(Self {
@@ -586,11 +570,6 @@ impl std::fmt::Display for LiveData {
             self.workspaces, self.clones, self.running
         )
     }
-}
-
-/// SQL: `column` is the path bound as `?1` or a path inside it.
-pub(crate) fn under_sql(column: &str) -> String {
-    format!("({column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/')")
 }
 
 /// The ways a stored path may spell `path`: as given, and resolved (on

@@ -214,12 +214,9 @@ pub(crate) async fn server_executor_facts<'a>(
         }
     };
     let mut server = crate::placement::ServerFacts {
-        execution_daemon_id: sqlx::query_scalar::<_, String>(
-            "SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'",
-        )
-        .bind(db.server_run_cap.embedded_machine_id())
-        .fetch_optional(db.pool())
-        .await?,
+        execution_daemon_id: db
+            .placement_server_execution_daemon_id(db.server_run_cap.embedded_machine_id())
+            .await?,
         ..Default::default()
     };
     for role in agents {

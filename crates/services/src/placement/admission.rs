@@ -5,7 +5,7 @@ use db::{
     UpdateWorkspacePlacement, WorkspacePlacement, WorkspacePlacementRepo,
 };
 use serde_json::json;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 
 use crate::Result;
 
@@ -32,8 +32,7 @@ pub(crate) fn placement_update(placement: &WorkspacePlacement) -> UpdateWorkspac
 }
 
 pub async fn sweep_expired_reservations(db: &SqliteDb, now: &str) -> Result<u64> {
-    let expired: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_placement WHERE state IN ('reserved', 'preparing') AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?))")
-        .bind(now).fetch_one(db.pool()).await?;
+    let expired: bool = db.workspace_reservations_expired(now).await?;
     if !expired {
         return Ok(0);
     }
@@ -47,28 +46,13 @@ pub(crate) async fn sweep_expired_reservations_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     now: &str,
 ) -> Result<u64> {
-    let rows = sqlx::query(
-        "SELECT id, version FROM workspace_placement
-         WHERE state IN ('reserved', 'preparing')
-           AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?)",
-    )
-    .bind(now)
-    .fetch_all(&mut **transaction)
-    .await?;
+    let rows = db::expired_workspace_reservations_in_tx(transaction, now).await?;
     let mut expired = 0;
     for row in rows {
-        let id: String = row.try_get("id")?;
-        let version: i64 = row.try_get("version")?;
-        let result = sqlx::query(
-            "UPDATE workspace_placement SET state = 'failed', failure_cause = 'prepare_failed',
-                 reserved_until = NULL, workspace_handle = NULL, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND state IN ('reserved', 'preparing')",
-        )
-        .bind(now)
-        .bind(id)
-        .bind(version)
-        .execute(&mut **transaction)
-        .await?;
+        let id: String = row.id()?;
+        let version: i64 = row.version()?;
+        let result =
+            db::fail_expired_workspace_reservation_in_tx(transaction, now, id, version).await?;
         if result.rows_affected() != 1 {
             return Err(db::DbError::VersionConflict.into());
         }
@@ -174,12 +158,21 @@ pub(crate) async fn resolve_workspace_attention_in_tx(
     // Clear only the machine wait's own deferral, preserving unrelated blockers.
     // Clears only its own marker, so a queued clear is identity-fenced and
     // applies even if the Task changes status first.
-    let _queued_or_applied = db::task_writer::TaskQuery::new(db,task_id,"UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL")
-        .bind(task_id).identity_fenced().execute_in_tx(tx).await?;
-    sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
-        WHERE status <> 'resolved' AND (dedupe_key IN (?, ?, ?) OR (dedupe_key LIKE 'workspace-fence:%' AND json_extract(details_json, '$.task.id') = ?))")
-        .bind(&now).bind(&now).bind(format!("review-ci:{task_id}")).bind(format!("task-owner-wait:{task_id}")).bind(format!("task-environment-wait:{task_id}")).bind(task_id)
-        .execute(&mut **tx).await?;
+    let _queued_or_applied = db
+        .clear_workspace_admission_environment_wait_in_tx(tx, task_id)
+        .await?;
+    db.resolve_workspace_admission_attention_in_tx(
+        tx,
+        db::ResolveWorkspaceAdmissionAttentionInTxInput {
+            resolved_at: &now,
+            updated_at: &now,
+            review_dedupe_key: format!("review-ci:{task_id}"),
+            owner_dedupe_key: format!("task-owner-wait:{task_id}"),
+            environment_dedupe_key: format!("task-environment-wait:{task_id}"),
+            task_id,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -192,8 +185,8 @@ pub(crate) async fn resolve_workspace_attention(db: &SqliteDb, task_id: &str) ->
 
 pub(crate) async fn resolve_review_ci_attention(db: &SqliteDb, task_id: &str) -> Result<()> {
     let now = db::now_rfc3339();
-    sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key = ?")
-        .bind(&now).bind(&now).bind(format!("review-ci:{task_id}")).execute(db.pool()).await?;
+    db.resolve_workspace_review_ci_attention(&now, format!("review-ci:{task_id}"))
+        .await?;
     Ok(())
 }
 
@@ -227,16 +220,23 @@ pub(crate) async fn record_wait_attention_in_tx(
         },
     )
     .await?;
-    sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id,
-        source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at,
-        updated_at, recommended_action, source_sequence)
-        VALUES (?, ?, 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'recover_task', ?)
-        ON CONFLICT(dedupe_key) DO UPDATE SET summary = excluded.summary, details_json = excluded.details_json,
-        source_event_id = excluded.source_event_id, status = 'open', resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL,
-        updated_at = excluded.updated_at, version = attention_projection.version + 1")
-        .bind(db::new_uuid_v4()).bind(kind).bind(&task.project_id).bind(&event.id)
-        .bind(reason).bind(json!({"task": {"id": task.id, "title": task.title}, "cause": reason}).to_string())
-        .bind(dedupe_key).bind(&now).bind(&now).bind(event.sequence).execute(&mut **tx).await?;
+    db.record_workspace_wait_attention_in_tx(
+        tx,
+        db::RecordWorkspaceWaitAttentionInTxInput {
+            id: db::new_uuid_v4(),
+            kind,
+            project_id: &task.project_id,
+            event_id: &event.id,
+            reason,
+            details_json: json!({"task": {"id": task.id, "title": task.title}, "cause": reason})
+                .to_string(),
+            dedupe_key,
+            occurred_at: &now,
+            updated_at: &now,
+            sequence: event.sequence,
+        },
+    )
+    .await?;
     Ok(())
 }
 

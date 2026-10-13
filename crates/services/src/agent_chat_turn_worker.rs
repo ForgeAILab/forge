@@ -34,7 +34,6 @@ use forge_agent_host::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -1048,28 +1047,21 @@ impl FederatedAgentChatTurnRunner {
                 let project_id = chat.project_id.as_deref().ok_or_else(|| {
                     ServiceError::invalid_operation("Project Agent Chat has no Project scope")
                 })?;
-                let row = sqlx::query(
-                    "SELECT identity_id, profile_id, state, version, autonomy_policy_json,
-                            permission_ceiling_json,
-                            operating_skill_revision_id, policy_revision, policy_digest
-                     FROM project_agent_binding
-                     WHERE id = ? AND project_id = ?",
-                )
-                .bind(&binding_id)
-                .bind(project_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "Agent Chat frozen Project binding history is unavailable",
-                    )
-                })?;
-                let identity_id: Option<String> = row.try_get("identity_id")?;
-                let binding_row_version: i64 = row.try_get("version")?;
-                let autonomy_policy_json: String = row.try_get("autonomy_policy_json")?;
-                let permission_json: String = row.try_get("permission_ceiling_json")?;
-                let policy_revision: String = row.try_get("policy_revision")?;
-                let stored_policy_digest: String = row.try_get("policy_digest")?;
+                let row = self
+                    .db
+                    .frozen_project_turn_binding(&binding_id, project_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Agent Chat frozen Project binding history is unavailable",
+                        )
+                    })?;
+                let identity_id: Option<String> = row.identity_id()?;
+                let binding_row_version: i64 = row.version()?;
+                let autonomy_policy_json: String = row.autonomy_policy_json()?;
+                let permission_json: String = row.permission_ceiling_json()?;
+                let policy_revision: String = row.policy_revision()?;
+                let stored_policy_digest: String = row.policy_digest()?;
                 (
                     identity_id.ok_or_else(|| {
                         ServiceError::invalid_operation(
@@ -1080,7 +1072,7 @@ impl FederatedAgentChatTurnRunner {
                     permission_json,
                     policy_revision,
                     Some(stored_policy_digest),
-                    row.try_get("state")?,
+                    row.state()?,
                     binding_row_version,
                     PROJECT_OPERATING_SKILL_KEY,
                 )
@@ -1186,22 +1178,19 @@ impl FederatedAgentChatTurnRunner {
                 operating_skill_content_digest: operating_skill_content_digest.to_owned(),
             }));
         }
-        let skill_row = sqlx::query(
-            "SELECT id, skill_key, canonical_body, content_digest
-             FROM operating_skill_revision WHERE id = ?",
-        )
-        .bind(&operating_skill_revision_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Agent Chat frozen operating-skill revision is no longer available",
-            )
-        })?;
-        let skill_id: String = skill_row.try_get("id")?;
-        let skill_key: String = skill_row.try_get("skill_key")?;
-        let skill_body: String = skill_row.try_get("canonical_body")?;
-        let skill_content_digest: String = skill_row.try_get("content_digest")?;
+        let skill_row = self
+            .db
+            .frozen_turn_operating_skill(&operating_skill_revision_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Agent Chat frozen operating-skill revision is no longer available",
+                )
+            })?;
+        let skill_id: String = skill_row.id()?;
+        let skill_key: String = skill_row.skill_key()?;
+        let skill_body: String = skill_row.canonical_body()?;
+        let skill_content_digest: String = skill_row.content_digest()?;
         if skill_id != operating_skill_revision_id
             || skill_key != expected_skill_key
             || skill_body.trim().is_empty()
@@ -1430,12 +1419,10 @@ impl FederatedAgentChatTurnRunner {
                         "Main Agent Chat unexpectedly has a Project scope",
                     ));
                 }
-                let main_ceiling: String = sqlx::query_scalar(
-                    "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
-                )
-                .bind(&agent.id)
-                .fetch_one(self.db.pool())
-                .await?;
+                let main_ceiling: String = self
+                    .db
+                    .main_turn_account_permission_ceiling(&agent.id)
+                    .await?;
                 let main_ceiling = readable_permission_ceiling(&main_ceiling);
                 // A complete job chooses its Main branch from the persisted
                 // skill revision, not from a lifecycle read taken after the
@@ -1455,93 +1442,29 @@ impl FederatedAgentChatTurnRunner {
                 let instruction_row = if frozen_baseline {
                     None
                 } else if frozen_genesis {
-                    sqlx::query(
-                        "SELECT instruction.id AS instruction_id, instruction.revision,
-                                instruction.body,
-                                genesis.id AS genesis_id, genesis.version AS genesis_version,
-                                genesis.lifecycle AS genesis_lifecycle,
-                                genesis.charter_id, genesis.charter_revision_id, genesis.charter_version,
-                                revision.content_digest AS charter_content_digest,
-                                revision.rendered_digest AS charter_render_digest
-                         FROM agent_chat_instruction_revision AS instruction
-                         JOIN product_genesis_session AS genesis
-                           ON genesis.id = instruction.source_id
-                          AND genesis.main_chat_id = instruction.chat_id
-                         LEFT JOIN project_charter_revision AS revision
-                           ON revision.id = genesis.charter_revision_id
-                         WHERE instruction.chat_id = ?
-                           AND instruction.source_type = 'native'
-                           AND instruction.created_at <= ?
-                           AND genesis.lifecycle IN (
-                               'discovering', 'ready_for_project', 'handed_off', 'cancelled'
-                           )
-                         ORDER BY instruction.revision DESC, instruction.id DESC
-                         LIMIT 1",
-                    )
-                    .bind(&job.chat_id)
-                    .bind(&job.created_at)
-                    .fetch_optional(self.db.pool())
-                    .await?
+                    self.db
+                        .main_turn_genesis_instruction_at_admission(&job.chat_id, &job.created_at)
+                        .await?
                 } else {
-                    sqlx::query(
-                        "SELECT instruction.id AS instruction_id, instruction.revision,
-                                instruction.body,
-                                genesis.id AS genesis_id, genesis.version AS genesis_version,
-                                genesis.lifecycle AS genesis_lifecycle,
-                                genesis.charter_id, genesis.charter_revision_id, genesis.charter_version,
-                                revision.content_digest AS charter_content_digest,
-                                revision.rendered_digest AS charter_render_digest
-                         FROM agent_chat_instruction_revision AS instruction
-                         JOIN product_genesis_session AS genesis
-                           ON genesis.id = instruction.source_id
-                          AND genesis.main_chat_id = instruction.chat_id
-                         LEFT JOIN project_charter_revision AS revision
-                           ON revision.id = genesis.charter_revision_id
-                         WHERE instruction.chat_id = ?
-                           AND instruction.source_type = 'native'
-                           AND genesis.lifecycle IN ('discovering', 'ready_for_project')
-                         ORDER BY instruction.revision DESC, instruction.id DESC
-                         LIMIT 1",
-                    )
-                    .bind(&job.chat_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
+                    self.db
+                        .main_turn_active_genesis_instruction(&job.chat_id)
+                        .await?
                 };
                 if let Some(instruction_row) = instruction_row {
-                    let instruction_id: String = instruction_row.try_get("instruction_id")?;
-                    let instruction_revision: i64 = instruction_row.try_get("revision")?;
-                    let instruction_body: String = instruction_row.try_get("body")?;
-                    let genesis_id: String = instruction_row.try_get("genesis_id")?;
-                    let genesis_version: i64 = instruction_row.try_get("genesis_version")?;
-                    let genesis_lifecycle: String = instruction_row.try_get("genesis_lifecycle")?;
+                    let instruction_id: String = instruction_row.instruction_id()?;
+                    let instruction_revision: i64 = instruction_row.revision()?;
+                    let instruction_body: String = instruction_row.body()?;
+                    let genesis_id: String = instruction_row.genesis_id()?;
+                    let genesis_version: i64 = instruction_row.genesis_version()?;
+                    let genesis_lifecycle: String = instruction_row.genesis_lifecycle()?;
                     let main_skill_row = if let Some(frozen) = frozen_authority.as_ref() {
-                        sqlx::query(
-                            "SELECT sr.id AS current_revision_id,
-                                    sr.id, sr.skill_key, sr.revision,
-                                    sr.schema_version, sr.render_version,
-                                    sr.canonical_body, sr.policy_json,
-                                    sr.policy_digest, sr.content_digest
-                             FROM operating_skill_revision AS sr
-                             WHERE sr.id = ?",
-                        )
-                        .bind(&frozen.operating_skill_revision_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
+                        self.db
+                            .main_turn_frozen_operating_skill(&frozen.operating_skill_revision_id)
+                            .await?
                     } else {
-                        sqlx::query(
-                            "SELECT os.current_revision_id,
-                                    sr.id, sr.skill_key, sr.revision,
-                                    sr.schema_version, sr.render_version,
-                                    sr.canonical_body, sr.policy_json,
-                                    sr.policy_digest, sr.content_digest
-                             FROM operating_skill AS os
-                             JOIN operating_skill_revision AS sr
-                               ON sr.id = os.current_revision_id
-                             WHERE os.id = ? AND os.lifecycle = 'active'",
-                        )
-                        .bind(MAIN_OPERATING_SKILL_KEY)
-                        .fetch_optional(self.db.pool())
-                        .await?
+                        self.db
+                            .main_turn_active_operating_skill(MAIN_OPERATING_SKILL_KEY)
+                            .await?
                     }
                     .ok_or_else(|| {
                         ServiceError::invalid_operation(
@@ -1549,20 +1472,15 @@ impl FederatedAgentChatTurnRunner {
                         )
                     })?;
                     let main_skill_revision: String =
-                        main_skill_row.try_get("current_revision_id")?;
-                    let main_skill_key: String = main_skill_row.try_get("skill_key")?;
-                    let main_skill_revision_number: i64 = main_skill_row.try_get("revision")?;
-                    let main_skill_schema_version: String =
-                        main_skill_row.try_get("schema_version")?;
-                    let main_skill_render_version: String =
-                        main_skill_row.try_get("render_version")?;
-                    let main_skill_canonical_body: String =
-                        main_skill_row.try_get("canonical_body")?;
-                    let main_skill_policy_json: String = main_skill_row.try_get("policy_json")?;
-                    let main_skill_policy_digest: String =
-                        main_skill_row.try_get("policy_digest")?;
-                    let main_skill_content_digest: String =
-                        main_skill_row.try_get("content_digest")?;
+                        main_skill_row.current_revision_id_required()?;
+                    let main_skill_key: String = main_skill_row.skill_key()?;
+                    let main_skill_revision_number: i64 = main_skill_row.revision()?;
+                    let main_skill_schema_version: String = main_skill_row.schema_version()?;
+                    let main_skill_render_version: String = main_skill_row.render_version()?;
+                    let main_skill_canonical_body: String = main_skill_row.canonical_body()?;
+                    let main_skill_policy_json: String = main_skill_row.policy_json()?;
+                    let main_skill_policy_digest: String = main_skill_row.policy_digest()?;
+                    let main_skill_content_digest: String = main_skill_row.content_digest()?;
                     let historical_skill_valid = frozen_authority.as_ref().is_some_and(|frozen| {
                         main_skill_revision == frozen.operating_skill_revision_id
                             && main_skill_key == frozen.operating_skill_key
@@ -1592,15 +1510,15 @@ impl FederatedAgentChatTurnRunner {
                              migrations reseed the operating skill",
                         ));
                     }
-                    let charter_id: Option<String> = instruction_row.try_get("charter_id")?;
+                    let charter_id: Option<String> = instruction_row.charter_id_optional()?;
                     let charter_revision_id: Option<String> =
-                        instruction_row.try_get("charter_revision_id")?;
+                        instruction_row.charter_revision_id_optional()?;
                     let charter_version: Option<i64> =
-                        instruction_row.try_get("charter_version")?;
+                        instruction_row.charter_version_optional()?;
                     let charter_content_digest: Option<String> =
-                        instruction_row.try_get("charter_content_digest")?;
+                        instruction_row.charter_content_digest_optional()?;
                     let charter_render_digest: Option<String> =
-                        instruction_row.try_get("charter_render_digest")?;
+                        instruction_row.charter_render_digest_optional()?;
                     let mut references = vec![
                         OperatingContextReference::included(
                             &genesis_id,
@@ -1700,18 +1618,10 @@ impl FederatedAgentChatTurnRunner {
                     let active_genesis_id = if frozen_authority.is_some() {
                         None
                     } else {
-                        sqlx::query_scalar::<_, Option<String>>(
-                            "SELECT id
-                             FROM product_genesis_session
-                             WHERE main_chat_id = ?
-                               AND lifecycle IN ('discovering', 'ready_for_project')
-                             ORDER BY version DESC, id DESC
-                             LIMIT 1",
-                        )
-                        .bind(&job.chat_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
-                        .flatten()
+                        self.db
+                            .main_turn_active_genesis_id(&job.chat_id)
+                            .await?
+                            .flatten()
                     };
                     if active_genesis_id.is_some() {
                         return Err(ServiceError::invalid_operation(
@@ -1881,26 +1791,15 @@ impl FederatedAgentChatTurnRunner {
         &self,
         account_id: &str,
     ) -> Result<Vec<OperatingContextReference>> {
-        let rows = sqlx::query(
-            "SELECT id, version, updated_at, paused_at, charter_status,
-                    current_charter_revision_id
-             FROM project
-             WHERE owner_id = ?
-             ORDER BY updated_at DESC, id DESC
-             LIMIT 20",
-        )
-        .bind(account_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.main_turn_portfolio_projects(account_id).await?;
         rows.into_iter()
             .map(|row| {
-                let project_id: String = row.try_get("id")?;
-                let version: i64 = row.try_get("version")?;
-                let updated_at: String = row.try_get("updated_at")?;
-                let paused = row.try_get::<Option<String>, _>("paused_at")?.is_some();
-                let charter_status: String = row.try_get("charter_status")?;
-                let charter_revision_id: Option<String> =
-                    row.try_get("current_charter_revision_id")?;
+                let project_id: String = row.id()?;
+                let version: i64 = row.version()?;
+                let updated_at: String = row.updated_at()?;
+                let paused = row.paused_at()?.is_some();
+                let charter_status: String = row.charter_status()?;
+                let charter_revision_id: Option<String> = row.current_charter_revision_id()?;
                 let digest = canonical_context_digest(&serde_json::json!({
                     "project_id": &project_id,
                     "version": version,
@@ -1982,39 +1881,29 @@ impl FederatedAgentChatTurnRunner {
         // full typed binding record.  Reading the exact row also ensures a
         // stale Rust model cannot accidentally turn a missing column into a
         // permissive default.
-        let binding_row = sqlx::query(
-            "SELECT id, project_id, state, version, identity_id,
-                    operating_skill_revision_id, policy_revision, policy_digest,
-                    charter_id, charter_revision_id, charter_setup_required,
-                    admission_receipt_id, charter_approval_id
-             FROM project_agent_binding
-             WHERE id = ? AND project_id = ?",
-        )
-        .bind(&binding.id)
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Agent binding disappeared while admitting the turn",
-            )
-        })?;
-        let binding_state: String = binding_row.try_get("state")?;
-        let binding_version: i64 = binding_row.try_get("version")?;
-        let binding_project_id: String = binding_row.try_get("project_id")?;
-        let binding_identity_id: Option<String> = binding_row.try_get("identity_id")?;
+        let binding_row = self
+            .db
+            .project_turn_binding_authority(&binding.id, project_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project Agent binding disappeared while admitting the turn",
+                )
+            })?;
+        let binding_state: String = binding_row.state()?;
+        let binding_version: i64 = binding_row.version()?;
+        let binding_project_id: String = binding_row.project_id()?;
+        let binding_identity_id: Option<String> = binding_row.identity_id()?;
         let binding_skill_revision_id: Option<String> =
-            binding_row.try_get("operating_skill_revision_id")?;
-        let binding_policy_revision: String = binding_row.try_get("policy_revision")?;
-        let binding_policy_digest: String = binding_row.try_get("policy_digest")?;
-        let binding_charter_id: Option<String> = binding_row.try_get("charter_id")?;
+            binding_row.operating_skill_revision_id()?;
+        let binding_policy_revision: String = binding_row.policy_revision()?;
+        let binding_policy_digest: String = binding_row.policy_digest()?;
+        let binding_charter_id: Option<String> = binding_row.charter_id_optional()?;
         let binding_charter_revision_id: Option<String> =
-            binding_row.try_get("charter_revision_id")?;
-        let binding_charter_setup_required: i64 = binding_row.try_get("charter_setup_required")?;
-        let binding_admission_receipt_id: Option<String> =
-            binding_row.try_get("admission_receipt_id")?;
-        let binding_charter_approval_id: Option<String> =
-            binding_row.try_get("charter_approval_id")?;
+            binding_row.charter_revision_id_optional()?;
+        let binding_charter_setup_required: i64 = binding_row.charter_setup_required()?;
+        let binding_admission_receipt_id: Option<String> = binding_row.admission_receipt_id()?;
+        let binding_charter_approval_id: Option<String> = binding_row.charter_approval_id()?;
         if let Some(frozen) = frozen {
             let historical_binding_version_matches = binding_version == frozen.binding_version
                 || (binding_state == "replaced" && binding_version == frozen.binding_version + 1);
@@ -2048,36 +1937,26 @@ impl FederatedAgentChatTurnRunner {
                     "Legacy Project Agent setup binding is not authenticated",
                 ));
             }
-            let skill_row = sqlx::query(
-                "SELECT sr.id, sr.skill_key, sr.revision,
-                        sr.schema_version, sr.render_version, sr.canonical_body,
-                        sr.policy_json, sr.policy_digest, sr.content_digest,
-                        os.current_revision_id
-                 FROM operating_skill_revision AS sr
-                 JOIN operating_skill AS os ON os.id = sr.operating_skill_id
-                  AND os.current_revision_id = sr.id
-                 WHERE os.lifecycle = 'active' AND sr.skill_key = ?
-                 ORDER BY sr.revision DESC, sr.id DESC LIMIT 1",
-            )
-            .bind(PROJECT_OPERATING_SKILL_KEY)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "Project setup cannot load the server-owned operating skill",
-                )
-            })?;
-            let setup_skill_revision_id: String = skill_row.try_get("id")?;
-            let setup_skill_key: String = skill_row.try_get("skill_key")?;
-            let setup_skill_revision: i64 = skill_row.try_get("revision")?;
-            let setup_skill_schema_version: String = skill_row.try_get("schema_version")?;
-            let setup_skill_render_version: String = skill_row.try_get("render_version")?;
-            let setup_skill_canonical_body: String = skill_row.try_get("canonical_body")?;
-            let setup_skill_policy_json: String = skill_row.try_get("policy_json")?;
-            let setup_skill_policy_digest: String = skill_row.try_get("policy_digest")?;
-            let setup_skill_content_digest: String = skill_row.try_get("content_digest")?;
+            let skill_row = self
+                .db
+                .project_turn_setup_operating_skill(PROJECT_OPERATING_SKILL_KEY)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project setup cannot load the server-owned operating skill",
+                    )
+                })?;
+            let setup_skill_revision_id: String = skill_row.id()?;
+            let setup_skill_key: String = skill_row.skill_key()?;
+            let setup_skill_revision: i64 = skill_row.revision()?;
+            let setup_skill_schema_version: String = skill_row.schema_version()?;
+            let setup_skill_render_version: String = skill_row.render_version()?;
+            let setup_skill_canonical_body: String = skill_row.canonical_body()?;
+            let setup_skill_policy_json: String = skill_row.policy_json()?;
+            let setup_skill_policy_digest: String = skill_row.policy_digest()?;
+            let setup_skill_content_digest: String = skill_row.content_digest()?;
             let setup_skill_current_revision: Option<String> =
-                skill_row.try_get("current_revision_id")?;
+                skill_row.current_revision_id_optional()?;
             if setup_skill_key != PROJECT_OPERATING_SKILL_KEY
                 || setup_skill_revision < 1
                 || setup_skill_schema_version != PROJECT_OPERATING_SKILL_SCHEMA_VERSION
@@ -2227,81 +2106,47 @@ impl FederatedAgentChatTurnRunner {
             ));
         }
 
-        let charter_row = sqlx::query(
-            "SELECT c.id AS charter_id, c.account_id AS charter_account_id,
-                    c.current_approved_revision_id,
-                    c.project_mode, c.version AS charter_version,
-                    r.id AS charter_revision_id, r.lifecycle AS charter_revision_lifecycle,
-                    r.content_digest AS charter_content_digest,
-                    r.rendered_digest AS charter_render_digest,
-                    a.id AS approval_id, a.lifecycle AS approval_lifecycle,
-                    a.content_digest AS approval_content_digest,
-                    a.rendered_digest AS approval_render_digest,
-                    a.expected_charter_version,
-                    a.selected_identity_id, a.selected_profile_id,
-                    a.selected_operating_skill_revision_id,
-                    a.selected_policy_revision, a.selected_policy_digest,
-                    a.approval_event_id,
-                    a.consumed_project_id,
-                    a.approving_principal_type,
-                    a.approving_principal_id,
-                    a.authorization_basis AS approval_authorization_basis,
-                    a.authorization_action AS approval_authorization_action,
-                    a.explicit_event AS approval_authorization_event_id,
-                    a.authorization_occurred_at AS approval_authorization_occurred_at,
-                    a.created_at AS approval_created_at
-             FROM project_charter AS c
-             JOIN project_charter_revision AS r
-               ON r.id = c.current_approved_revision_id
-              AND r.lifecycle = 'approved'
-             JOIN project_charter_approval AS a
-               ON a.charter_id = c.id AND a.revision_id = r.id
-              AND a.lifecycle IN ('active', 'consumed')
-             WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND a.id = ?
-             ORDER BY a.created_at DESC, a.id DESC
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(project_charter_id)
-        .bind(project_charter_revision_id)
-        .bind(binding_charter_approval_id.as_deref())
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Agent turn has no current approved Charter approval receipt",
+        let charter_row = self
+            .db
+            .project_turn_charter_approval(
+                project_id,
+                project_charter_id,
+                project_charter_revision_id,
+                binding_charter_approval_id.as_deref(),
             )
-        })?;
-        let charter_id: String = charter_row.try_get("charter_id")?;
-        let charter_account_id: String = charter_row.try_get("charter_account_id")?;
-        let charter_revision_id: String = charter_row.try_get("charter_revision_id")?;
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project Agent turn has no current approved Charter approval receipt",
+                )
+            })?;
+        let charter_id: String = charter_row.charter_id_required()?;
+        let charter_account_id: String = charter_row.charter_account_id()?;
+        let charter_revision_id: String = charter_row.charter_revision_id_required()?;
         let current_approved_revision_id: Option<String> =
-            charter_row.try_get("current_approved_revision_id")?;
-        let charter_revision_lifecycle: String =
-            charter_row.try_get("charter_revision_lifecycle")?;
-        let charter_version: i64 = charter_row.try_get("charter_version")?;
-        let expected_charter_version: i64 = charter_row.try_get("expected_charter_version")?;
-        let approval_lifecycle: String = charter_row.try_get("approval_lifecycle")?;
-        let approval_id: String = charter_row.try_get("approval_id")?;
-        let approval_content_digest: String = charter_row.try_get("approval_content_digest")?;
-        let approval_render_digest: String = charter_row.try_get("approval_render_digest")?;
-        let charter_content_digest: String = charter_row.try_get("charter_content_digest")?;
-        let charter_render_digest: String = charter_row.try_get("charter_render_digest")?;
-        let consumed_project_id: Option<String> = charter_row.try_get("consumed_project_id")?;
+            charter_row.current_approved_revision_id()?;
+        let charter_revision_lifecycle: String = charter_row.charter_revision_lifecycle()?;
+        let charter_version: i64 = charter_row.charter_version_required()?;
+        let expected_charter_version: i64 = charter_row.expected_charter_version()?;
+        let approval_lifecycle: String = charter_row.approval_lifecycle()?;
+        let approval_id: String = charter_row.approval_id()?;
+        let approval_content_digest: String = charter_row.approval_content_digest()?;
+        let approval_render_digest: String = charter_row.approval_render_digest()?;
+        let charter_content_digest: String = charter_row.charter_content_digest_required()?;
+        let charter_render_digest: String = charter_row.charter_render_digest_required()?;
+        let consumed_project_id: Option<String> = charter_row.consumed_project_id()?;
         let selected_skill_revision_id: Option<String> =
-            charter_row.try_get("selected_operating_skill_revision_id")?;
-        let approval_event_id: Option<String> = charter_row.try_get("approval_event_id")?;
-        let approval_principal_kind: String = charter_row.try_get("approving_principal_type")?;
-        let approval_principal_id: String = charter_row.try_get("approving_principal_id")?;
-        let approval_authorization_basis: String =
-            charter_row.try_get("approval_authorization_basis")?;
-        let approval_authorization_action: String =
-            charter_row.try_get("approval_authorization_action")?;
+            charter_row.selected_operating_skill_revision_id()?;
+        let approval_event_id: Option<String> = charter_row.approval_event_id()?;
+        let approval_principal_kind: String = charter_row.approving_principal_type()?;
+        let approval_principal_id: String = charter_row.approving_principal_id()?;
+        let approval_authorization_basis: String = charter_row.approval_authorization_basis()?;
+        let approval_authorization_action: String = charter_row.approval_authorization_action()?;
         let approval_authorization_event_id: String =
-            charter_row.try_get("approval_authorization_event_id")?;
+            charter_row.approval_authorization_event_id()?;
         let approval_authorization_occurred_at: String =
-            charter_row.try_get("approval_authorization_occurred_at")?;
-        let approval_created_at: String = charter_row.try_get("approval_created_at")?;
+            charter_row.approval_authorization_occurred_at()?;
+        let approval_created_at: String = charter_row.approval_created_at()?;
         let expected_approval_event_id = approval_event_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation(
                 "Project Agent Charter approval has no immutable authorization event",
@@ -2339,36 +2184,28 @@ impl FederatedAgentChatTurnRunner {
             ));
         }
 
-        let skill_row = sqlx::query(
-            "SELECT sr.id, sr.skill_key, sr.revision,
-                    sr.schema_version, sr.render_version, sr.canonical_body,
-                    sr.policy_json, sr.policy_digest, sr.content_digest,
-                    os.current_revision_id
-             FROM operating_skill_revision AS sr
-             JOIN operating_skill AS os ON os.id = sr.operating_skill_id
-             WHERE sr.id = ?",
-        )
-        // Doctrine activation advances the binding's server-owned pointer;
-        // an admitted turn still resolves its immutable selected revision.
-        .bind(
-            frozen
-                .map(|snapshot| snapshot.operating_skill_revision_id.as_str())
-                .unwrap_or(&binding_skill_revision_id),
-        )
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation("Project Agent operating-skill revision is not present")
-        })?;
-        let skill_id: String = skill_row.try_get("id")?;
-        let skill_key: String = skill_row.try_get("skill_key")?;
-        let skill_revision: i64 = skill_row.try_get("revision")?;
-        let skill_schema_version: String = skill_row.try_get("schema_version")?;
-        let skill_render_version: String = skill_row.try_get("render_version")?;
-        let skill_canonical_body: String = skill_row.try_get("canonical_body")?;
-        let skill_policy_json: String = skill_row.try_get("policy_json")?;
-        let skill_policy_digest: String = skill_row.try_get("policy_digest")?;
-        let skill_content_digest: String = skill_row.try_get("content_digest")?;
+        let skill_row = self
+            .db
+            .project_turn_selected_operating_skill(
+                frozen
+                    .map(|snapshot| snapshot.operating_skill_revision_id.as_str())
+                    .unwrap_or(&binding_skill_revision_id),
+            )
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Project Agent operating-skill revision is not present",
+                )
+            })?;
+        let skill_id: String = skill_row.id()?;
+        let skill_key: String = skill_row.skill_key()?;
+        let skill_revision: i64 = skill_row.revision()?;
+        let skill_schema_version: String = skill_row.schema_version()?;
+        let skill_render_version: String = skill_row.render_version()?;
+        let skill_canonical_body: String = skill_row.canonical_body()?;
+        let skill_policy_json: String = skill_row.policy_json()?;
+        let skill_policy_digest: String = skill_row.policy_digest()?;
+        let skill_content_digest: String = skill_row.content_digest()?;
         let historical_skill_valid = frozen.is_some_and(|snapshot| {
             skill_id == snapshot.operating_skill_revision_id
                 && skill_key == snapshot.operating_skill_key
@@ -2392,9 +2229,7 @@ impl FederatedAgentChatTurnRunner {
             && skill_content_digest == PROJECT_OPERATING_SKILL_CONTENT_DIGEST
             && binding_skill_revision_id
                 == format!("{PROJECT_OPERATING_SKILL_KEY}@{skill_revision}")
-            && skill_row
-                .try_get::<Option<String>, _>("current_revision_id")?
-                .as_deref()
+            && skill_row.current_revision_id_optional()?.as_deref()
                 == Some(binding_skill_revision_id.as_str());
         if !historical_skill_valid && !current_skill_valid {
             return Err(ServiceError::invalid_operation(
@@ -2422,30 +2257,19 @@ impl FederatedAgentChatTurnRunner {
                 "Project Charter approval is not an authenticated user authorization",
             ));
         }
-        let approval_event = sqlx::query(
-            "SELECT principal_type, principal_id, authorization_basis, action,
-                    explicit_event, occurred_at
-             FROM project_charter_approval_event
-             WHERE approval_id = ? AND id = ? AND principal_type = 'user'
-               AND principal_id = ? LIMIT 1",
-        )
-        .bind(&approval_id)
-        .bind(expected_approval_event_id)
-        .bind(project_owner_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let approval_event = self
+            .db
+            .project_turn_approval_event(&approval_id, expected_approval_event_id, project_owner_id)
+            .await?;
         let approval_event = approval_event.ok_or_else(|| {
             ServiceError::invalid_operation(
                 "Project Charter approval event is not an exact user authorization",
             )
         })?;
-        if approval_event.try_get::<String, _>("authorization_basis")?
-            != approval_authorization_basis
-            || approval_event.try_get::<String, _>("action")? != approval_authorization_action
-            || approval_event.try_get::<String, _>("explicit_event")?
-                != approval_authorization_event_id
-            || approval_event.try_get::<String, _>("occurred_at")?
-                != approval_authorization_occurred_at
+        if approval_event.authorization_basis()? != approval_authorization_basis
+            || approval_event.action()? != approval_authorization_action
+            || approval_event.explicit_event()? != approval_authorization_event_id
+            || approval_event.occurred_at()? != approval_authorization_occurred_at
         {
             return Err(ServiceError::invalid_operation(
                 "Project Charter approval event is not an exact user authorization",
@@ -2459,33 +2283,23 @@ impl FederatedAgentChatTurnRunner {
         let has_stable_admission_receipt = !admission_receipt_id.trim().is_empty();
         let (handoff_id, handoff_payload_hash, admission_source_kind) =
             if has_stable_admission_receipt {
-                let receipt = sqlx::query(
-                    "SELECT id, project_id, source_kind, handoff_id,
-                        initial_charter_approval_id, initial_charter_id,
-                        initial_charter_revision_id, payload_digest,
-                        validation_schema_version
-                 FROM project_admission_receipt
-                 WHERE id = ? AND project_id = ?",
-                )
-                .bind(admission_receipt_id)
-                .bind(project_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "Project Agent admission receipt is missing or cross-Project",
-                    )
-                })?;
-                let receipt_project_id: String = receipt.try_get("project_id")?;
-                let receipt_source_kind: String = receipt.try_get("source_kind")?;
-                let receipt_handoff_id: Option<String> = receipt.try_get("handoff_id")?;
-                let receipt_initial_approval_id: String =
-                    receipt.try_get("initial_charter_approval_id")?;
-                let receipt_initial_charter_id: String = receipt.try_get("initial_charter_id")?;
-                let receipt_initial_revision_id: String =
-                    receipt.try_get("initial_charter_revision_id")?;
-                let receipt_payload_digest: String = receipt.try_get("payload_digest")?;
-                let receipt_schema: String = receipt.try_get("validation_schema_version")?;
+                let receipt = self
+                    .db
+                    .project_turn_admission_receipt(admission_receipt_id, project_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Project Agent admission receipt is missing or cross-Project",
+                        )
+                    })?;
+                let receipt_project_id: String = receipt.project_id()?;
+                let receipt_source_kind: String = receipt.source_kind()?;
+                let receipt_handoff_id: Option<String> = receipt.handoff_id()?;
+                let receipt_initial_approval_id: String = receipt.initial_charter_approval_id()?;
+                let receipt_initial_charter_id: String = receipt.initial_charter_id()?;
+                let receipt_initial_revision_id: String = receipt.initial_charter_revision_id()?;
+                let receipt_payload_digest: String = receipt.payload_digest()?;
+                let receipt_schema: String = receipt.validation_schema_version()?;
                 if receipt_project_id != project_id
                     || receipt_initial_charter_id != charter_id
                     || receipt_payload_digest.trim().is_empty()
@@ -2504,28 +2318,21 @@ impl FederatedAgentChatTurnRunner {
                                     "Genesis Project admission receipt has no handoff",
                                 )
                             })?;
-                        let handoff = sqlx::query(
-                            "SELECT h.content, h.source_revisions_json, h.status,
-                                h.target_chat_id, target.project_id AS target_project_id
-                         FROM agent_handoff h
-                         JOIN agent_chat target ON target.id = h.target_chat_id
-                         WHERE h.id = ? AND target.kind = 'project'",
-                        )
-                        .bind(receipt_handoff_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::invalid_operation(
-                                "Genesis Project admission handoff is missing",
-                            )
-                        })?;
-                        let handoff_content: String = handoff.try_get("content")?;
-                        let handoff_source_revisions: String =
-                            handoff.try_get("source_revisions_json")?;
-                        let handoff_status: String = handoff.try_get("status")?;
-                        let handoff_target_chat_id: String = handoff.try_get("target_chat_id")?;
+                        let handoff = self
+                            .db
+                            .project_turn_admission_handoff(receipt_handoff_id)
+                            .await?
+                            .ok_or_else(|| {
+                                ServiceError::invalid_operation(
+                                    "Genesis Project admission handoff is missing",
+                                )
+                            })?;
+                        let handoff_content: String = handoff.content()?;
+                        let handoff_source_revisions: String = handoff.source_revisions_json()?;
+                        let handoff_status: String = handoff.status()?;
+                        let handoff_target_chat_id: String = handoff.target_chat_id()?;
                         let handoff_target_project_id: Option<String> =
-                            handoff.try_get("target_project_id")?;
+                            handoff.target_project_id()?;
                         let packet = parse_project_handoff_packet(&handoff_source_revisions)?;
                         let packet_value: Value = serde_json::from_str(&handoff_source_revisions)
                             .map_err(|_| {
@@ -2584,18 +2391,15 @@ impl FederatedAgentChatTurnRunner {
                                 "Charter-adoption admission receipt unexpectedly names a handoff",
                             ));
                         }
-                        let initial_content_digest: Option<String> = sqlx::query_scalar(
-                            "SELECT content_digest FROM project_charter_approval
-                         WHERE id = ? AND charter_id = ? AND revision_id = ?
-                           AND approval_type = 'adoption' AND lifecycle = 'consumed'
-                           AND consumed_project_id = ?",
-                        )
-                        .bind(&receipt_initial_approval_id)
-                        .bind(&receipt_initial_charter_id)
-                        .bind(&receipt_initial_revision_id)
-                        .bind(project_id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                        let initial_content_digest: Option<String> = self
+                            .db
+                            .project_turn_adoption_approval_digest(
+                                &receipt_initial_approval_id,
+                                &receipt_initial_charter_id,
+                                &receipt_initial_revision_id,
+                                project_id,
+                            )
+                            .await?;
                         if initial_content_digest.as_deref()
                             != Some(receipt_payload_digest.as_str())
                         {
@@ -2617,7 +2421,7 @@ impl FederatedAgentChatTurnRunner {
                 ));
             };
 
-        let project_mode = match charter_row.try_get::<String, _>("project_mode")?.as_str() {
+        let project_mode = match charter_row.project_mode()?.as_str() {
             "compact" => api_types::ProjectMode::Compact,
             "standard" => api_types::ProjectMode::Standard,
             _ => {
@@ -3903,57 +3707,19 @@ impl AgentChatTurnWorker {
         let now = now.to_rfc3339();
         let leased_until = lease_deadline();
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let id = sqlx::query_scalar::<_, String>(
-            "WITH candidate AS (
-                 SELECT job.id
-                 FROM agent_chat_turn_job AS job
-                 WHERE job.status IN ('queued', 'retry_wait')
-                   AND NOT EXISTS (SELECT 1 FROM agent_chat_topic_rotation r WHERE r.chat_id = job.chat_id AND r.origin_turn_id IS NOT job.id)
-                   AND job.attempt_count < job.max_attempts
-                   AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ?)
-                   -- A responder whose provider entry is backing off waits
-                   -- without spending an attempt; the first claim after the
-                   -- window lapses is the trial call.
-                   AND NOT EXISTS (
-                       SELECT 1 FROM agent_identity AS responder
-                       JOIN agent_profile AS profile ON profile.id = responder.selected_profile_id
-                       JOIN provider_entry_health AS health
-                         ON health.credential_id = profile.credential_ref
-                       WHERE responder.id = job.responder_identity_id
-                         AND (health.last_error_kind = 'auth'
-                              OR julianday(health.backoff_until) > julianday(?))
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM agent_chat_turn_job AS prior
-                       WHERE prior.id <> job.id
-                         AND prior.responder_identity_id = job.responder_identity_id
-                         AND prior.canonical_scope_id = job.canonical_scope_id
-                         AND prior.status IN ('queued', 'leased', 'retry_wait', 'awaiting_input')
-                         AND (prior.created_at < job.created_at
-                              OR (prior.created_at = job.created_at AND prior.id < job.id))
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM agent_chat_turn_job AS active
-                       WHERE active.chat_id = job.chat_id AND active.status = 'leased'
-                   )
-                 ORDER BY job.created_at ASC, job.id ASC
-                 LIMIT 1
-             )
-             UPDATE agent_chat_turn_job
-             SET status = 'leased', lease_owner = ?, leased_until = ?,
-                 attempt_count = attempt_count + 1, invocation_count = invocation_count + 1, next_attempt_at = NULL,
-                 version = version + 1, updated_at = ?
-             WHERE id = (SELECT id FROM candidate)
-               AND status IN ('queued', 'retry_wait')
-             RETURNING id",
-        )
-        .bind(&now)
-        .bind(&now)
-        .bind(&self.lease_owner)
-        .bind(&leased_until)
-        .bind(&now)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let id = self
+            .db
+            .claim_fifo_chat_turn_in_tx(
+                &mut transaction,
+                db::ClaimFifoChatTurnInTxInput {
+                    available_at: &now,
+                    backoff_at: &now,
+                    lease_owner: &self.lease_owner,
+                    leased_until: &leased_until,
+                    updated_at: &now,
+                },
+            )
+            .await?;
         if let Some(id) = id.as_deref() {
             self.db
                 .append_agent_chat_turn_status_in_tx(&mut transaction, id)
@@ -3971,22 +3737,14 @@ impl AgentChatTurnWorker {
         let now = now_rfc3339();
         let failure_json = serde_json::to_string(&TurnFailure::Unclassified)
             .map_err(|error| ServiceError::Domain(error.to_string()))?;
-        let expired = sqlx::query(
-            "SELECT id, attempt_count, max_attempts, lease_refund_count, version
-             FROM agent_chat_turn_job
-             WHERE status = 'leased' AND leased_until IS NOT NULL AND leased_until <= ?
-             ORDER BY created_at ASC, id ASC",
-        )
-        .bind(&now)
-        .fetch_all(self.db.pool())
-        .await?;
+        let expired = self.db.expired_chat_turn_leases(&now).await?;
         let decision_time = Utc::now();
         for row in expired {
-            let id: String = row.try_get("id")?;
-            let attempt_count: i64 = row.try_get("attempt_count")?;
-            let max_attempts: i64 = row.try_get("max_attempts")?;
-            let refunds: i64 = row.try_get("lease_refund_count")?;
-            let version: i64 = row.try_get("version")?;
+            let id: String = row.id()?;
+            let attempt_count: i64 = row.attempt_count()?;
+            let max_attempts: i64 = row.max_attempts()?;
+            let refunds: i64 = row.lease_refund_count()?;
+            let version: i64 = row.version()?;
             let Some(decision) = crate::agent_chat_turn_policy::recover_expired(
                 api_types::AgentChatTurnStatus::Leased,
                 Some(decision_time - ChronoDuration::seconds(1)),
@@ -4004,29 +3762,25 @@ impl AgentChatTurnWorker {
             };
             let updated = async {
                 let mut transaction = db::begin_immediate(self.db.pool()).await?;
-                let updated = sqlx::query(
-                    "UPDATE agent_chat_turn_job
-                 SET status = ?, lease_owner = NULL, leased_until = NULL,
-                     next_attempt_at = ?, error_code = 'lease_expired',
-                     error_message = ?, failure_class_json = ?, retry_decision = ?, attempt_count = ?,
-                     lease_refund_count = lease_refund_count + ?,
-                     version = version + 1, updated_at = ?
-                 WHERE id = ? AND version = ? AND status = 'leased' AND leased_until IS NOT NULL
-                   AND leased_until <= ?",
-                )
-                .bind(status)
-                .bind(decision.next_attempt_at.map(|at| at.to_rfc3339()))
-                .bind("Agent Chat lease expired")
-                .bind(&failure_json)
-                .bind(decision.retry_decision.as_str())
-                .bind(decision.attempt_count)
-                .bind(i64::from(refunded))
-                .bind(&now)
-                .bind(&id)
-                .bind(version)
-                .bind(&now)
-                .execute(&mut *transaction)
-                .await?;
+                let updated = self
+                    .db
+                    .recover_expired_chat_turn_lease_in_tx(
+                        &mut transaction,
+                        db::RecoverExpiredChatTurnLeaseInTxInput {
+                            status,
+                            next_attempt_at: decision.next_attempt_at.map(|at| at.to_rfc3339()),
+                            error_message: "Agent Chat lease expired",
+                            failure_json: &failure_json,
+                            retry_decision: decision.retry_decision.as_str(),
+                            attempt_count: decision.attempt_count,
+                            refund_increment: i64::from(refunded),
+                            updated_at: &now,
+                            turn_id: &id,
+                            version,
+                            expired_at: &now,
+                        },
+                    )
+                    .await?;
                 if updated.rows_affected() != 0 {
                     self.db
                         .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
@@ -4073,38 +3827,29 @@ impl AgentChatTurnWorker {
         let now = now_rfc3339();
         let failure_json = serde_json::to_string(&TurnFailure::Unclassified)
             .map_err(|error| ServiceError::Domain(error.to_string()))?;
-        let parked_rows = sqlx::query(
-            "SELECT id, pending_interaction_id, version
-             FROM agent_chat_turn_job
-             WHERE status = 'awaiting_input'
-             ORDER BY created_at ASC, id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let parked_rows = self.db.parked_chat_turn_interactions().await?;
 
         for row in parked_rows {
-            let id: String = row.try_get("id")?;
-            let pending_interaction_id: Option<String> = row.try_get("pending_interaction_id")?;
-            let version: i64 = row.try_get("version")?;
+            let id: String = row.id()?;
+            let pending_interaction_id: Option<String> = row.pending_interaction_id()?;
+            let version: i64 = row.version()?;
 
             let Some(interaction_id) = pending_interaction_id else {
                 let _ = async {
                     let mut transaction = db::begin_immediate(self.db.pool()).await?;
-                    let updated = sqlx::query(
-                        "UPDATE agent_chat_turn_job
-                     SET status = 'failed', error_code = 'interaction_orphaned',
-                         error_message = 'turn parked without interaction reference',
-                         failure_class_json = ?, retry_decision = ?,
-                         version = version + 1, updated_at = ?
-                     WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                    )
-                    .bind(&failure_json)
-                    .bind(api_types::TurnRetryDecision::Fail.as_str())
-                    .bind(&now)
-                    .bind(&id)
-                    .bind(version)
-                    .execute(&mut *transaction)
-                    .await?;
+                    let updated = self
+                        .db
+                        .fail_chat_turn_without_interaction_in_tx(
+                            &mut transaction,
+                            db::FailChatTurnWithoutInteractionInTxInput {
+                                failure_json: &failure_json,
+                                retry_decision: api_types::TurnRetryDecision::Fail.as_str(),
+                                updated_at: &now,
+                                turn_id: &id,
+                                version,
+                            },
+                        )
+                        .await?;
                     if updated.rows_affected() != 0 {
                         self.db
                             .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
@@ -4117,31 +3862,28 @@ impl AgentChatTurnWorker {
                 continue;
             };
 
-            let interaction =
-                sqlx::query("SELECT status, expires_at FROM protected_interaction WHERE id = ?")
-                    .bind(&interaction_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
+            let interaction = self
+                .db
+                .chat_turn_protected_interaction(&interaction_id)
+                .await?;
 
             match interaction {
                 None => {
                     let _ = async {
                         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-                        let updated = sqlx::query(
-                            "UPDATE agent_chat_turn_job
-                         SET status = 'failed', error_code = 'interaction_orphaned',
-                             error_message = 'pending interaction not found',
-                             failure_class_json = ?, retry_decision = ?,
-                             version = version + 1, updated_at = ?
-                         WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                        )
-                        .bind(&failure_json)
-                        .bind(api_types::TurnRetryDecision::Fail.as_str())
-                        .bind(&now)
-                        .bind(&id)
-                        .bind(version)
-                        .execute(&mut *transaction)
-                        .await?;
+                        let updated = self
+                            .db
+                            .fail_chat_turn_missing_interaction_in_tx(
+                                &mut transaction,
+                                db::FailChatTurnMissingInteractionInTxInput {
+                                    failure_json: &failure_json,
+                                    retry_decision: api_types::TurnRetryDecision::Fail.as_str(),
+                                    updated_at: &now,
+                                    turn_id: &id,
+                                    version,
+                                },
+                            )
+                            .await?;
                         if updated.rows_affected() != 0 {
                             self.db
                                 .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
@@ -4153,22 +3895,20 @@ impl AgentChatTurnWorker {
                     .await;
                 }
                 Some(irow) => {
-                    let istatus: String = irow.try_get("status")?;
-                    let expires_at: Option<String> = irow.try_get("expires_at")?;
+                    let istatus: String = irow.status()?;
+                    let expires_at: Option<String> = irow.expires_at()?;
                     if istatus == "answered" {
                         let _ = async {
                             let mut transaction = db::begin_immediate(self.db.pool()).await?;
-                            let updated = sqlx::query(
-                                "UPDATE agent_chat_turn_job
-                             SET status = 'queued', pending_interaction_id = NULL,
-                                 next_attempt_at = NULL, version = version + 1, updated_at = ?
-                             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                            )
-                            .bind(&now)
-                            .bind(&id)
-                            .bind(version)
-                            .execute(&mut *transaction)
-                            .await?;
+                            let updated = self
+                                .db
+                                .resume_chat_turn_answered_interaction_in_tx(
+                                    &mut transaction,
+                                    &now,
+                                    &id,
+                                    version,
+                                )
+                                .await?;
                             if updated.rows_affected() != 0 {
                                 self.db
                                     .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
@@ -4180,25 +3920,24 @@ impl AgentChatTurnWorker {
                         .await;
                     } else if istatus == "cancelled" {
                         let _ = async {
-            let mut transaction = db::begin_immediate(self.db.pool()).await?;
-            let updated = sqlx::query(
-                            "UPDATE agent_chat_turn_job
-                             SET status = 'cancelled', pending_interaction_id = NULL,
-                                 error_code = 'interaction_cancelled', failure_class_json = NULL, retry_decision = NULL,
-                                 error_message = 'pending interaction was cancelled',
-                                 version = version + 1, updated_at = ?
-                             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                        )
-                        .bind(&now)
-                        .bind(&id)
-                        .bind(version)
-                        .execute(&mut *transaction).await?;
-            if updated.rows_affected() != 0 {
-                self.db.append_agent_chat_turn_status_in_tx(&mut transaction, &id).await?;
-            }
-            transaction.commit().await?;
-            Ok::<_, ServiceError>(updated)
-        }
+                            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                            let updated = self
+                                .db
+                                .cancel_chat_turn_cancelled_interaction_in_tx(
+                                    &mut transaction,
+                                    &now,
+                                    &id,
+                                    version,
+                                )
+                                .await?;
+                            if updated.rows_affected() != 0 {
+                                self.db
+                                    .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
+                                    .await?;
+                            }
+                            transaction.commit().await?;
+                            Ok::<_, ServiceError>(updated)
+                        }
                         .await;
                     } else if istatus == "expired"
                         || (expires_at.as_deref().is_some()
@@ -4206,22 +3945,19 @@ impl AgentChatTurnWorker {
                     {
                         let _ = async {
                             let mut transaction = db::begin_immediate(self.db.pool()).await?;
-                            let updated = sqlx::query(
-                                "UPDATE agent_chat_turn_job
-                             SET status = 'failed', pending_interaction_id = NULL,
-                                 error_code = 'interaction_expired',
-                                 error_message = 'pending interaction expired',
-                                 failure_class_json = ?, retry_decision = ?,
-                                 version = version + 1, updated_at = ?
-                             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                            )
-                            .bind(&failure_json)
-                            .bind(api_types::TurnRetryDecision::Fail.as_str())
-                            .bind(&now)
-                            .bind(&id)
-                            .bind(version)
-                            .execute(&mut *transaction)
-                            .await?;
+                            let updated = self
+                                .db
+                                .fail_chat_turn_expired_interaction_in_tx(
+                                    &mut transaction,
+                                    db::FailChatTurnExpiredInteractionInTxInput {
+                                        failure_json: &failure_json,
+                                        retry_decision: api_types::TurnRetryDecision::Fail.as_str(),
+                                        updated_at: &now,
+                                        turn_id: &id,
+                                        version,
+                                    },
+                                )
+                                .await?;
                             if updated.rows_affected() != 0 {
                                 self.db
                                     .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
@@ -4336,19 +4072,25 @@ impl AgentChatTurnWorker {
     async fn release_shutdown_lease(&self, job: &AgentChatTurnJob) -> Result<()> {
         async {
             let mut transaction = db::begin_immediate(self.db.pool()).await?;
-            let updated = sqlx::query("UPDATE agent_chat_turn_job SET status = 'queued',
-            lease_owner = NULL, leased_until = NULL, next_attempt_at = NULL,
-            attempt_count = MAX(0, attempt_count - 1), failure_class_json = NULL, retry_decision = NULL,
-            error_code = NULL, error_message = NULL, version = version + 1, updated_at = ?
-            WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?")
-            .bind(now_rfc3339()).bind(&job.id).bind(job.version).bind(&self.lease_owner)
-            .execute(&mut *transaction).await?;
+            let updated = self
+                .db
+                .release_shutdown_chat_turn_lease_in_tx(
+                    &mut transaction,
+                    now_rfc3339(),
+                    &job.id,
+                    job.version,
+                    &self.lease_owner,
+                )
+                .await?;
             if updated.rows_affected() != 0 {
-                self.db.append_agent_chat_turn_status_in_tx(&mut transaction, &job.id).await?;
+                self.db
+                    .append_agent_chat_turn_status_in_tx(&mut transaction, &job.id)
+                    .await?;
             }
             transaction.commit().await?;
             Ok::<_, ServiceError>(updated)
-        }.await?;
+        }
+        .await?;
         Ok(())
     }
 
@@ -4905,25 +4647,15 @@ impl AgentChatTurnWorker {
         &self,
         source_turn_id: &str,
     ) -> Result<Option<GenesisControlTransfer>> {
-        let row = sqlx::query(
-            "SELECT id,
-                    json_extract(outcome_json, '$.admitted_turn_id') AS continuation_turn_id,
-                    json_extract(outcome_json, '$.session_id') AS genesis_session_id
-             FROM command_receipt
-             WHERE operation = ?
-               AND json_extract(outcome_json, '$.source_turn_id') = ?
-               AND json_extract(outcome_json, '$.control_transfer') = 1
-             ORDER BY committed_at DESC, id DESC LIMIT 1",
-        )
-        .bind(MAIN_GENESIS_START_OPERATION)
-        .bind(source_turn_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let row = self
+            .db
+            .genesis_control_transfer_receipt(MAIN_GENESIS_START_OPERATION, source_turn_id)
+            .await?;
         row.map(|row| {
             Ok(GenesisControlTransfer {
-                command_receipt_id: row.try_get("id")?,
-                continuation_turn_id: row.try_get("continuation_turn_id")?,
-                genesis_session_id: row.try_get("genesis_session_id")?,
+                command_receipt_id: row.id()?,
+                continuation_turn_id: row.continuation_turn_id()?,
+                genesis_session_id: row.genesis_session_id()?,
             })
         })
         .transpose()
@@ -4985,61 +4717,52 @@ impl AgentChatTurnWorker {
         // Attention admits the turn and its audit event together; the event
         // names the turn it admitted. That turn, or a manual retry of it,
         // answers the same triggering message.
-        let wake_turn = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT json_extract(payload_json, '$.turn_job_id') FROM domain_event
-             WHERE id = ? AND sequence = ? AND event_type = 'agent.wake.admitted'
-               AND scope_type = 'project' AND scope_id = ?",
-        )
-        .bind(source_event_id)
-        .bind(postcondition.after_event_sequence)
-        .bind(&postcondition.required_scope_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let wake_turn = self
+            .db
+            .delivery_followup_wake_turn(
+                source_event_id,
+                postcondition.after_event_sequence,
+                &postcondition.required_scope_id,
+            )
+            .await?;
         let Some(wake_turn) = wake_turn else {
             return Err(ServiceError::invalid_operation(
                 "Delivery follow-up postcondition does not match its source wake event",
             ));
         };
-        let caused_by_wake = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM agent_chat_turn_job WHERE id = ? AND triggering_message_id = ?",
-        )
-        .bind(wake_turn.as_deref())
-        .bind(&job.triggering_message_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .is_some();
+        let caused_by_wake = self
+            .db
+            .delivery_followup_source_turn(wake_turn.as_deref(), &job.triggering_message_id)
+            .await?
+            .is_some();
         if !caused_by_wake {
             return Err(ServiceError::invalid_operation(
                 "Delivery follow-up turn is not caused by its source wake event",
             ));
         }
-        let canonical_project_chat = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM agent_chat
-             WHERE id = ? AND kind = 'project' AND project_id = ?",
-        )
-        .bind(&job.chat_id)
-        .bind(&postcondition.required_scope_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .is_some();
+        let canonical_project_chat = self
+            .db
+            .delivery_followup_canonical_project_chat(
+                &job.chat_id,
+                &postcondition.required_scope_id,
+            )
+            .await?
+            .is_some();
         if !canonical_project_chat {
             return Err(ServiceError::invalid_operation(
                 "Delivery follow-up postcondition does not match its canonical Project Chat",
             ));
         }
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM domain_event
-             WHERE event_type = ? AND scope_type = ? AND scope_id = ?
-               AND sequence > ?
-             ORDER BY sequence ASC LIMIT 1",
-        )
-        .bind(&postcondition.required_event_type)
-        .bind(&postcondition.required_scope_type)
-        .bind(&postcondition.required_scope_id)
-        .bind(postcondition.after_event_sequence)
-        .fetch_optional(self.db.pool())
-        .await?
-        .is_some())
+        Ok(self
+            .db
+            .delivery_followup_postcondition_event(
+                &postcondition.required_event_type,
+                &postcondition.required_scope_type,
+                &postcondition.required_scope_id,
+                postcondition.after_event_sequence,
+            )
+            .await?
+            .is_some())
     }
 
     fn spawn_lease_renewal(
@@ -5060,17 +4783,7 @@ impl AgentChatTurnWorker {
                     _ = stop.cancelled() => break,
                     _ = interval.tick() => {
                         let now = now_rfc3339();
-                        let result = sqlx::query(
-                            "UPDATE agent_chat_turn_job
-                             SET leased_until = ?, version = version + 1, updated_at = ?
-                             WHERE id = ? AND status = 'leased' AND lease_owner = ?",
-                        )
-                        .bind(lease_deadline())
-                        .bind(&now)
-                        .bind(&job_id)
-                        .bind(&owner)
-                        .execute(db.pool())
-                        .await;
+                        let result = db.renew_chat_turn_worker_lease(lease_deadline(), &now, &job_id, &owner).await;
                         if result.map(|result| result.rows_affected() == 0).unwrap_or(true) {
                             turn_cancellation.cancel();
                             break;
@@ -7028,7 +6741,35 @@ mod tests {
             .find("\n    async fn run_native(")
             .map(|offset| start + offset)
             .expect("Project operating-context loader remains bounded");
-        let loader = &source[start..end];
+        // The loader holds no SQL: its statements are the `project_turn_*`
+        // functions of the db crate, so the boundary is read there.
+        let mut loader = source[start..end].to_owned();
+        assert!(!loader.contains("sqlx::"));
+        let db_sources = [
+            include_str!("../../db/src/sqlite/agent.rs"),
+            include_str!("../../db/src/sqlite/agent_chat.rs"),
+            include_str!("../../db/src/sqlite/orchestration.rs"),
+        ];
+        let mut statements = 0;
+        for db_source in db_sources {
+            for (at, _) in db_source.match_indices("    pub async fn project_turn_") {
+                let body = &db_source[at..];
+                let end = body[1..]
+                    .find("\n    pub ")
+                    .map_or(body.len(), |offset| offset + 1);
+                let name = body["    pub async fn ".len()..]
+                    .split('(')
+                    .next()
+                    .expect("function name");
+                assert!(
+                    source[start..end_of(source, start)].contains(&format!(".{name}(")),
+                    "`{name}` is a Project turn statement the loader does not call"
+                );
+                loader.push_str(&body[..end]);
+                statements += 1;
+            }
+        }
+        assert!(statements >= 8, "the loader's statements were found in db");
 
         assert!(loader.contains("FROM project_admission_receipt"));
         assert!(loader.contains("FROM agent_handoff h"));
@@ -7045,6 +6786,12 @@ mod tests {
                 "Project turn loader must not query historical Main source `{historical_source}`"
             );
         }
+    }
+
+    fn end_of(source: &str, start: usize) -> usize {
+        source[start..]
+            .find("\n    async fn run_native(")
+            .map_or(source.len(), |offset| start + offset)
     }
 
     #[test]

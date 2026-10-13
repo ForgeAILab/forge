@@ -7,12 +7,7 @@ pub(crate) async fn count_running_executions(db: &db::SqliteDb, agent_id: &str) 
     // executions. They intentionally do not consume the identity's Task
     // concurrency quota; the same identity may still be assigned a Task and
     // receives a separate Task-scoped context/lease for that attempt.
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'",
-    )
-    .bind(agent_id)
-    .fetch_one(db.pool())
-    .await?)
+    Ok(db.agent_capacity_running_execution_count(agent_id).await?)
 }
 
 pub(crate) async fn count_occupied_agent_slots(db: &db::SqliteDb, agent_id: &str) -> Result<i64> {

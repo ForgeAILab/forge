@@ -20,7 +20,6 @@ use operation_registry::main_reads::{
     CharterDiffQuery, CharterProjectionQuery, CharterReadQuery, GenesisProjectAgentsQuery,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::main_orchestration_actions::{parse_maturity, parse_project_mode};
 use crate::{
@@ -129,41 +128,28 @@ impl MainOrchestrationQueryService {
     ) -> Result<Value> {
         let account_id = self.main_target(actor_identity_id, scope).await?;
         let limit = 20_i64;
-        let rows = sqlx::query(
-            "SELECT id, genesis_session_id, current_draft_revision_id,
-                    current_approved_revision_id, project_mode, maturity,
-                    lifecycle, version, updated_at
-             FROM project_charter
-             WHERE account_id = ? AND project_id IS NULL
-               AND (? IS NULL OR id = ?)
-               AND (? IS NULL OR genesis_session_id = ?)
-               AND (? IS NULL OR current_draft_revision_id = ?
-                    OR current_approved_revision_id = ?)
-             ORDER BY updated_at DESC, id DESC LIMIT ?",
-        )
-        .bind(account_id)
-        .bind(&query.charter_id)
-        .bind(&query.charter_id)
-        .bind(&query.genesis_session_id)
-        .bind(&query.genesis_session_id)
-        .bind(&query.revision_id)
-        .bind(&query.revision_id)
-        .bind(&query.revision_id)
-        .bind(limit)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .main_unowned_charter_read_sources(
+                account_id,
+                &query.charter_id,
+                &query.genesis_session_id,
+                &query.revision_id,
+                limit,
+            )
+            .await?;
         Ok(json!({
             "scope": "main",
             "items": rows.into_iter().map(|row| json!({
-                "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "genesis_session_id": row.try_get::<Option<String>, _>("genesis_session_id").ok().flatten(),
-                "current_draft_revision_id": row.try_get::<Option<String>, _>("current_draft_revision_id").ok().flatten(),
-                "current_approved_revision_id": row.try_get::<Option<String>, _>("current_approved_revision_id").ok().flatten(),
-                "project_mode": row.try_get::<String, _>("project_mode").unwrap_or_default(),
-                "maturity": row.try_get::<String, _>("maturity").unwrap_or_default(),
-                "lifecycle": row.try_get::<String, _>("lifecycle").unwrap_or_default(),
-                "version": row.try_get::<i64, _>("version").unwrap_or_default(),
-                "updated_at": row.try_get::<String, _>("updated_at").unwrap_or_default(),
+                "id": row.id().unwrap_or_default(),
+                "genesis_session_id": row.genesis_session_id().ok().flatten(),
+                "current_draft_revision_id": row.current_draft_revision_id().ok().flatten(),
+                "current_approved_revision_id": row.current_approved_revision_id().ok().flatten(),
+                "project_mode": row.project_mode().unwrap_or_default(),
+                "maturity": row.maturity().unwrap_or_default(),
+                "lifecycle": row.lifecycle().unwrap_or_default(),
+                "version": row.version().unwrap_or_default(),
+                "updated_at": row.updated_at().unwrap_or_default(),
             })).collect::<Vec<_>>()
         }))
     }
@@ -340,30 +326,13 @@ impl MainOrchestrationQueryService {
         let account_id = self.main_target(actor_identity_id, scope).await?;
         let session_id = match session_id {
             Some(session_id) if !session_id.trim().is_empty() => session_id.to_owned(),
-            _ => {
-                let query = if charter_id.is_some() {
-                    "SELECT id FROM product_genesis_session
-                     WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
-                     ORDER BY CASE WHEN charter_id = ? THEN 0
-                                   WHEN charter_id IS NULL THEN 1
-                                   ELSE 2 END,
-                              updated_at DESC, id DESC LIMIT 1"
-                } else {
-                    "SELECT id FROM product_genesis_session
-                     WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
-                     ORDER BY updated_at DESC, id DESC LIMIT 1"
-                };
-                let mut request = sqlx::query_scalar::<_, String>(query).bind(&account_id);
-                if let Some(charter_id) = charter_id {
-                    request = request.bind(charter_id);
-                }
-                request
-                    .fetch_optional(self.db.pool())
-                    .await?
-                    .ok_or_else(|| {
-                        ServiceError::not_found("product_genesis_session", account_id.clone())
-                    })?
-            }
+            _ => self
+                .db
+                .main_active_genesis_session_id(&account_id, charter_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("product_genesis_session", account_id.clone())
+                })?,
         };
         let session = crate::ProductGenesisService::for_sqlite(Arc::clone(&self.db))
             .get(&session_id)

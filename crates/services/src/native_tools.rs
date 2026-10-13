@@ -57,7 +57,6 @@ use forge_agent_host::{
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -197,9 +196,7 @@ impl CoordinationToolProvider {
                         .authorization
                         .project_orchestration_target(identity_id, &scope)
                         .await?;
-                    let pause = sqlx::query_scalar::<_, Option<String>>(
-                        "SELECT system_pause_reason FROM project WHERE id = ? AND paused_at IS NOT NULL",
-                    ).bind(project_id).fetch_optional(self.db.pool()).await?;
+                    let pause = self.db.native_paused_project_reason(&project_id).await?;
                     if let Some(reason) = pause {
                         cause = Some(db::project_pause_denial(reason.as_deref()));
                         true
@@ -339,49 +336,39 @@ impl CoordinationToolProvider {
         actor_identity_id: &str,
         scope: &CanonicalScope,
     ) -> Result<Value, AgentHostError> {
-        let (query, bind_id) = match scope.scope_type {
-            CanonicalScopeType::Account => (
-                "SELECT id, name, status, paused, visibility FROM agent_identity WHERE id = ?",
-                actor_identity_id,
-            ),
-            CanonicalScopeType::Project => (
-                "SELECT id, name FROM project WHERE id = ?",
-                scope.scope_id.as_str(),
-            ),
-            CanonicalScopeType::AgentChat => (
-                "SELECT id, kind, status, kind AS scope_type, id AS scope_id FROM agent_chat WHERE id = ?",
-                scope.scope_id.as_str(),
-            ),
-            CanonicalScopeType::Task => (
-                "SELECT id, project_id, title, status, priority FROM task WHERE id = ?",
-                scope.scope_id.as_str(),
-            ),
-        };
-        let row = sqlx::query(query)
-            .bind(bind_id)
-            .fetch_optional(self.db.pool())
-            .await
-            .map_err(|_| AgentHostError::ProtectedPersistence)?
-            .ok_or_else(|| {
-                AgentHostError::Authority("current Forge scope is unavailable".into())
-            })?;
+        let row = match scope.scope_type {
+            CanonicalScopeType::Account => {
+                self.db
+                    .native_account_scope_summary(actor_identity_id)
+                    .await
+            }
+            CanonicalScopeType::Project => {
+                self.db.native_project_scope_summary(&scope.scope_id).await
+            }
+            CanonicalScopeType::AgentChat => {
+                self.db.native_chat_scope_summary(&scope.scope_id).await
+            }
+            CanonicalScopeType::Task => self.db.native_task_scope_summary(&scope.scope_id).await,
+        }
+        .map_err(|_| AgentHostError::ProtectedPersistence)?
+        .ok_or_else(|| AgentHostError::Authority("current Forge scope is unavailable".into()))?;
         let mut result = serde_json::Map::new();
         for column in [
-            "id",
-            "name",
-            "title",
-            "status",
-            "paused",
-            "visibility",
-            "scope_type",
-            "scope_id",
-            "project_id",
-            "priority",
+            db::NativeScopeSummaryField::Id,
+            db::NativeScopeSummaryField::Name,
+            db::NativeScopeSummaryField::Title,
+            db::NativeScopeSummaryField::Status,
+            db::NativeScopeSummaryField::Paused,
+            db::NativeScopeSummaryField::Visibility,
+            db::NativeScopeSummaryField::ScopeType,
+            db::NativeScopeSummaryField::ScopeId,
+            db::NativeScopeSummaryField::ProjectId,
+            db::NativeScopeSummaryField::Priority,
         ] {
-            if let Ok(value) = row.try_get::<String, _>(column) {
-                result.insert(column.to_owned(), Value::String(value));
-            } else if let Ok(value) = row.try_get::<i64, _>(column) {
-                result.insert(column.to_owned(), Value::Number(value.into()));
+            if let Ok(value) = row.text(column) {
+                result.insert(column.as_str().to_owned(), Value::String(value));
+            } else if let Ok(value) = row.integer(column) {
+                result.insert(column.as_str().to_owned(), Value::Number(value.into()));
             }
         }
         if scope.scope_type == CanonicalScopeType::Task {
@@ -497,28 +484,21 @@ impl CoordinationToolProvider {
             .await
             .map_err(native_scope_error)?;
         let limit = input.limit.unwrap_or(10).clamp(1, 20) as i64;
-        let rows = sqlx::query(
-            "SELECT id, maturity, lifecycle, project_id, handoff_id, version,
-                    created_at, updated_at
-             FROM product_genesis_session
-             WHERE account_id = ?
-             ORDER BY updated_at DESC, id DESC LIMIT ?",
-        )
-        .bind(account_id)
-        .bind(limit)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let rows = self
+            .db
+            .native_discovery_sessions(&account_id, limit)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
         Ok(json!({
             "items": rows.into_iter().map(|row| json!({
-                "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "maturity": row.try_get::<String, _>("maturity").unwrap_or_default(),
-                "lifecycle": row.try_get::<String, _>("lifecycle").unwrap_or_default(),
-                "project_id": row.try_get::<Option<String>, _>("project_id").ok().flatten(),
-                "handoff_id": row.try_get::<Option<String>, _>("handoff_id").ok().flatten(),
-                "version": row.try_get::<i64, _>("version").unwrap_or_default(),
-                "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
-                "updated_at": row.try_get::<String, _>("updated_at").unwrap_or_default(),
+                "id": row.id().unwrap_or_default(),
+                "maturity": row.maturity().unwrap_or_default(),
+                "lifecycle": row.lifecycle().unwrap_or_default(),
+                "project_id": row.project_id().ok().flatten(),
+                "handoff_id": row.handoff_id().ok().flatten(),
+                "version": row.version().unwrap_or_default(),
+                "created_at": row.created_at().unwrap_or_default(),
+                "updated_at": row.updated_at().unwrap_or_default(),
             })).collect::<Vec<_>>()
         }))
     }
@@ -535,22 +515,18 @@ impl CoordinationToolProvider {
             .await
             .map_err(native_scope_error)?;
         let limit = input.limit.unwrap_or(20).clamp(1, 20) as i64;
-        let rows = sqlx::query(
-            "SELECT id, name, paused_at, created_at, updated_at
-             FROM project WHERE owner_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
-        )
-        .bind(account_id)
-        .bind(limit)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let rows = self
+            .db
+            .native_portfolio_projects(&account_id, limit)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
         Ok(json!({
             "items": rows.into_iter().map(|row| json!({
-                "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "name": row.try_get::<String, _>("name").unwrap_or_default(),
-                "paused": row.try_get::<Option<String>, _>("paused_at").ok().flatten().is_some(),
-                "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
-                "updated_at": row.try_get::<String, _>("updated_at").unwrap_or_default(),
+                "id": row.id().unwrap_or_default(),
+                "name": row.name().unwrap_or_default(),
+                "paused": row.paused_at().ok().flatten().is_some(),
+                "created_at": row.created_at().unwrap_or_default(),
+                "updated_at": row.updated_at().unwrap_or_default(),
             })).collect::<Vec<_>>()
         }))
     }
@@ -795,13 +771,11 @@ impl CoordinationToolProvider {
                 "task.plan requires an execution-bound Task workspace".to_owned(),
             )
         })?;
-        let worktree_path: Option<String> = sqlx::query_scalar(
-            "SELECT worktree_path FROM workspace WHERE id = ? AND status = 'ready'",
-        )
-        .bind(workspace_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let worktree_path: Option<String> = self
+            .db
+            .native_ready_workspace_path(&workspace_id)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         let worktree_path = worktree_path.ok_or_else(|| {
             AgentHostError::Runtime(
                 "this execution has no active workspace for its plan candidate".to_owned(),
@@ -1406,15 +1380,12 @@ impl CoordinationToolProvider {
             ));
         }
         let idempotency_key = format!("outbox:{}:evidence:{line_no}", input.execution_id);
-        let already_ingested = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM task_comment WHERE task_id = ? AND idempotency_key = ? LIMIT 1",
-        )
-        .bind(input.task_id)
-        .bind(&idempotency_key)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| error.to_string())?
-        .is_some();
+        let already_ingested = self
+            .db
+            .native_ingested_task_comment(input.task_id, &idempotency_key)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some();
         if already_ingested {
             return Ok(());
         }
@@ -1443,17 +1414,10 @@ impl CoordinationToolProvider {
         task_id: &str,
         idempotency_key: &str,
     ) -> Result<bool, String> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                 SELECT 1 FROM task_comment
-                 WHERE task_id = ? AND idempotency_key = ?
-             )",
-        )
-        .bind(task_id)
-        .bind(idempotency_key)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(|error| error.to_string())
+        self.db
+            .native_task_worklog_exists(task_id, idempotency_key)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn append_outbox_worklog(
@@ -1568,18 +1532,15 @@ impl CoordinationToolProvider {
         actor_identity_id: &str,
         scope: &CanonicalScope,
     ) -> Result<PathBuf, AgentHostError> {
-        let path: Option<String> = sqlx::query_scalar(
-            "SELECT workspace_path FROM agent_context_scope
-             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?
-               AND workspace_access = 'project_verify'
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(actor_identity_id)
-        .bind(scope_type_name(scope.scope_type))
-        .bind(&scope.scope_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let path: Option<String> = self
+            .db
+            .native_project_verify_workspace_path(
+                actor_identity_id,
+                scope_type_name(scope.scope_type),
+                &scope.scope_id,
+            )
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         path.filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| {
@@ -1699,12 +1660,11 @@ impl CoordinationToolProvider {
         let media_root = self.media_root_handle().ok_or_else(|| {
             AgentHostError::Configuration("media storage is not configured".to_owned())
         })?;
-        let project_version: Option<i64> =
-            sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-                .bind(&project_id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let project_version: Option<i64> = self
+            .db
+            .native_project_version(&project_id)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         let project_version = project_version.ok_or_else(|| {
             AgentHostError::Runtime("the bound Project no longer exists".to_owned())
         })?;
@@ -1929,49 +1889,35 @@ impl CoordinationToolProvider {
         let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
         let task_filter = input.task_id;
 
-        let worklog = sqlx::query(
-            "SELECT c.id, c.task_id, c.worklog_kind, c.role, c.execution_id,
-                    c.content, c.created_at, t.title
-             FROM task_comment c
-             JOIN task t ON t.id = c.task_id
-             WHERE t.project_id = ? AND t.deleted_at IS NULL
-               AND c.author_type = 'agent'
-               AND (? IS NULL OR c.task_id = ?)
-             ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
-        )
-        .bind(project_id)
-        .bind(task_filter.as_deref())
-        .bind(task_filter.as_deref())
-        .bind(limit)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let worklog = self
+            .db
+            .native_project_worklog(
+                project_id,
+                task_filter.as_deref(),
+                task_filter.as_deref(),
+                limit,
+            )
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
 
-        let artifacts = sqlx::query(
-            "SELECT a.id AS asset_id, m.task_id, a.display_filename, a.content_type,
-                    a.byte_size, a.checksum, a.storage_key, m.created_at
-             FROM task_media m
-             JOIN media_asset a ON a.legacy_task_media_id = m.id
-             JOIN task t ON t.id = m.task_id
-             WHERE t.project_id = ? AND t.deleted_at IS NULL AND m.deleted_at IS NULL
-               AND (? IS NULL OR m.task_id = ?)
-             ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
-        )
-        .bind(project_id)
-        .bind(task_filter.as_deref())
-        .bind(task_filter.as_deref())
-        .bind(limit)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let artifacts = self
+            .db
+            .native_project_artifacts(
+                project_id,
+                task_filter.as_deref(),
+                task_filter.as_deref(),
+                limit,
+            )
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
 
         let media_root = self.media_root_handle();
         let artifacts = artifacts
             .into_iter()
             .map(|row| {
-                let content_type: String = row.try_get("content_type").unwrap_or_default();
-                let byte_size: i64 = row.try_get("byte_size").unwrap_or_default();
-                let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+                let content_type: String = row.content_type().unwrap_or_default();
+                let byte_size: i64 = row.byte_size().unwrap_or_default();
+                let storage_key: String = row.storage_key().unwrap_or_default();
                 // Text is what an Agent can actually evaluate; binary artifacts
                 // are named so the user can open them, never inlined.
                 let content = (content_type.starts_with("text/")
@@ -1982,13 +1928,13 @@ impl CoordinationToolProvider {
                     .and_then(|path| std::fs::read_to_string(path).ok())
                     .map(|text| truncate(&text, MAX_INLINE_ARTIFACT_CHARS));
                 json!({
-                    "asset_id": row.try_get::<String, _>("asset_id").unwrap_or_default(),
-                    "task_id": row.try_get::<String, _>("task_id").unwrap_or_default(),
-                    "filename": row.try_get::<String, _>("display_filename").unwrap_or_default(),
+                    "asset_id": row.asset_id().unwrap_or_default(),
+                    "task_id": row.task_id().unwrap_or_default(),
+                    "filename": row.display_filename().unwrap_or_default(),
                     "content_type": content_type,
                     "byte_size": byte_size,
-                    "checksum": row.try_get::<Option<String>, _>("checksum").unwrap_or_default(),
-                    "captured_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
+                    "checksum": row.checksum().unwrap_or_default(),
+                    "captured_at": row.created_at().unwrap_or_default(),
                     "content": content,
                 })
             })
@@ -1999,14 +1945,14 @@ impl CoordinationToolProvider {
             "worklog": worklog
                 .into_iter()
                 .map(|row| json!({
-                    "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                    "task_id": row.try_get::<String, _>("task_id").unwrap_or_default(),
-                    "task_title": truncate(&row.try_get::<String, _>("title").unwrap_or_default(), 160),
-                    "kind": row.try_get::<Option<String>, _>("worklog_kind").unwrap_or_default(),
-                    "role": row.try_get::<Option<String>, _>("role").unwrap_or_default(),
-                    "execution_id": row.try_get::<Option<String>, _>("execution_id").unwrap_or_default(),
-                    "summary": truncate(&row.try_get::<String, _>("content").unwrap_or_default(), 2_000),
-                    "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
+                    "id": row.id().unwrap_or_default(),
+                    "task_id": row.task_id().unwrap_or_default(),
+                    "task_title": truncate(&row.title().unwrap_or_default(), 160),
+                    "kind": row.worklog_kind().unwrap_or_default(),
+                    "role": row.role_optional().unwrap_or_default(),
+                    "execution_id": row.execution_id().unwrap_or_default(),
+                    "summary": truncate(&row.content().unwrap_or_default(), 2_000),
+                    "created_at": row.created_at().unwrap_or_default(),
                 }))
                 .collect::<Vec<_>>(),
             "artifacts": artifacts,
@@ -2019,23 +1965,15 @@ impl CoordinationToolProvider {
         _scope: &CanonicalScope,
         project_id: &str,
     ) -> Result<Value, AgentHostError> {
-        let row = sqlx::query(
-            "SELECT c.id AS charter_id, c.project_mode, c.version AS charter_version,
-                    r.id AS revision_id, r.revision, r.content_digest, r.rendered_digest,
-                    r.rendered_view, r.content_json
-             FROM project_charter AS c
-             JOIN project_charter_revision AS r
-               ON r.id = c.current_approved_revision_id AND r.lifecycle = 'approved'
-             WHERE c.project_id = ?",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?
-        .ok_or_else(|| {
-            AgentHostError::Authority("the bound Project has no approved Charter".to_owned())
-        })?;
-        let revision_id = row.try_get::<String, _>("revision_id").unwrap_or_default();
+        let row = self
+            .db
+            .native_approved_project_charter(project_id)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .ok_or_else(|| {
+                AgentHostError::Authority("the bound Project has no approved Charter".to_owned())
+            })?;
+        let revision_id = row.revision_id().unwrap_or_default();
         // The rendered Charter is prose; `review_requirement_ids` on a Task
         // proposal are exact `<revision_id>:<JSON Pointer>` strings. Without
         // the catalog the Agent has to guess array indices, and every guess is
@@ -2043,7 +1981,7 @@ impl CoordinationToolProvider {
         // outright now that the field is required. Universal requirements are
         // omitted: they already apply to every Task and naming one is an error.
         let selectable_requirements = row
-            .try_get::<String, _>("content_json")
+            .content_json()
             .ok()
             .and_then(|content| {
                 serde_json::from_str::<api_types::ProjectCharterContent>(&content).ok()
@@ -2061,14 +1999,14 @@ impl CoordinationToolProvider {
             .unwrap_or_default();
         Ok(json!({
             "scope": {"type": "project", "id": project_id},
-            "charter_id": row.try_get::<String, _>("charter_id").unwrap_or_default(),
+            "charter_id": row.charter_id().unwrap_or_default(),
             "revision_id": revision_id,
-            "revision": row.try_get::<i64, _>("revision").unwrap_or_default(),
-            "charter_version": row.try_get::<i64, _>("charter_version").unwrap_or_default(),
-            "project_mode": row.try_get::<String, _>("project_mode").unwrap_or_default(),
-            "content_digest": row.try_get::<String, _>("content_digest").unwrap_or_default(),
-            "render_digest": row.try_get::<String, _>("rendered_digest").unwrap_or_default(),
-            "rendered_markdown": row.try_get::<String, _>("rendered_view").unwrap_or_default(),
+            "revision": row.revision().unwrap_or_default(),
+            "charter_version": row.charter_version().unwrap_or_default(),
+            "project_mode": row.project_mode().unwrap_or_default(),
+            "content_digest": row.content_digest().unwrap_or_default(),
+            "render_digest": row.rendered_digest().unwrap_or_default(),
+            "rendered_markdown": row.rendered_view().unwrap_or_default(),
             "selectable_review_requirements": selectable_requirements,
         }))
     }
@@ -2143,27 +2081,19 @@ impl CoordinationToolProvider {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid_arguments("project_id is required".to_owned()))?;
-        let row = sqlx::query(
-            "SELECT p.id, p.name, p.paused_at, p.created_at, p.updated_at,
-                    COUNT(t.id) AS task_count
-             FROM project AS p
-             LEFT JOIN task AS t ON t.project_id = p.id AND t.deleted_at IS NULL
-             WHERE p.id = ? AND p.owner_id = ?
-             GROUP BY p.id",
-        )
-        .bind(project_id)
-        .bind(account_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?
-        .ok_or_else(|| invalid_arguments("Project summary is unavailable".to_owned()))?;
+        let row = self
+            .db
+            .native_owned_project_summary(project_id, &account_id)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .ok_or_else(|| invalid_arguments("Project summary is unavailable".to_owned()))?;
         Ok(json!({
-            "id": row.try_get::<String, _>("id").unwrap_or_default(),
-            "name": row.try_get::<String, _>("name").unwrap_or_default(),
-            "paused": row.try_get::<Option<String>, _>("paused_at").ok().flatten().is_some(),
-            "task_count": row.try_get::<i64, _>("task_count").unwrap_or_default(),
-            "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
-            "updated_at": row.try_get::<String, _>("updated_at").unwrap_or_default(),
+            "id": row.id().unwrap_or_default(),
+            "name": row.name().unwrap_or_default(),
+            "paused": row.paused_at().ok().flatten().is_some(),
+            "task_count": row.task_count().unwrap_or_default(),
+            "created_at": row.created_at().unwrap_or_default(),
+            "updated_at": row.updated_at().unwrap_or_default(),
         }))
     }
 
@@ -2202,30 +2132,16 @@ impl CoordinationToolProvider {
             _ => None,
         };
         let rows = match (scope.scope_type, project_scope_id.as_deref()) {
-            (CanonicalScopeType::Project | CanonicalScopeType::AgentChat, Some(project_id)) => {
-                sqlx::query(
-                    "SELECT id, parent_task_id, subtask_order, version,
-                            title, status, priority, assignee_type, assignee_id,
-                            condition_json
-                     FROM task WHERE project_id = ? AND deleted_at IS NULL
-                     ORDER BY updated_at DESC, id DESC LIMIT ?",
-                )
-                .bind(project_id)
-                .bind(limit)
-                .fetch_all(self.db.pool())
+            (CanonicalScopeType::Project | CanonicalScopeType::AgentChat, Some(project_id)) => self
+                .db
+                .native_project_work_tasks(project_id, limit)
                 .await
-                .map_err(|_| AgentHostError::ProtectedPersistence)?
-            }
-            (CanonicalScopeType::Task, _) => sqlx::query(
-                "SELECT id, parent_task_id, subtask_order, version,
-                        title, status, priority, assignee_type, assignee_id,
-                        condition_json
-                     FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
-            )
-            .bind(&scope.scope_id)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(|_| AgentHostError::ProtectedPersistence)?,
+                .map_err(|_| AgentHostError::ProtectedPersistence)?,
+            (CanonicalScopeType::Task, _) => self
+                .db
+                .native_scope_work_task(&scope.scope_id)
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?,
             _ => {
                 return Err(AgentHostError::Authority(
                     "work is not available in this canonical scope".to_owned(),
@@ -2234,68 +2150,44 @@ impl CoordinationToolProvider {
         };
         let ids = rows
             .iter()
-            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .filter_map(|row| row.id().ok())
             .collect::<Vec<_>>();
         // Dependencies are what distinguish a wired chain from stray Tasks, so
         // the reader that reconciles work has to see the edges, not just rows.
         let mut dependencies: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         if !ids.is_empty() {
-            let placeholders = vec!["?"; ids.len()].join(", ");
-            let sql = format!(
-                "SELECT task_id, depends_on_id FROM task_dependency
-                 WHERE task_id IN ({placeholders}) ORDER BY task_id, depends_on_id"
-            );
-            let mut query = sqlx::query(&sql);
-            for id in &ids {
-                query = query.bind(id);
-            }
-            for row in query
-                .fetch_all(self.db.pool())
+            for row in self
+                .db
+                .native_work_task_dependencies(&ids)
                 .await
                 .map_err(|_| AgentHostError::ProtectedPersistence)?
             {
-                let task_id: String = row.try_get("task_id").unwrap_or_default();
-                let depends_on: String = row.try_get("depends_on_id").unwrap_or_default();
+                let task_id: String = row.task_id().unwrap_or_default();
+                let depends_on: String = row.depends_on_id().unwrap_or_default();
                 dependencies.entry(task_id).or_default().push(depends_on);
             }
         }
         let mut latest_executions: std::collections::HashMap<String, Value> =
             std::collections::HashMap::new();
         if !ids.is_empty() {
-            let placeholders = vec!["?"; ids.len()].join(", ");
-            let sql = format!(
-                "SELECT task_id, id, status, role, agent_session_id, logs_path
-                 FROM (
-                     SELECT task_id, id, status, role, agent_session_id, logs_path,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY task_id ORDER BY created_at DESC, id DESC
-                            ) AS execution_rank
-                     FROM execution
-                     WHERE task_id IN ({placeholders})
-                 )
-                 WHERE execution_rank = 1"
-            );
-            let mut query = sqlx::query(&sql);
-            for id in &ids {
-                query = query.bind(id);
-            }
-            for row in query
-                .fetch_all(self.db.pool())
+            for row in self
+                .db
+                .native_work_latest_task_executions(&ids)
                 .await
                 .map_err(|_| AgentHostError::ProtectedPersistence)?
             {
-                let task_id: String = row.try_get("task_id").unwrap_or_default();
-                let execution_id: String = row.try_get("id").unwrap_or_default();
-                let status: String = row.try_get("status").unwrap_or_default();
-                let role: String = row.try_get("role").unwrap_or_default();
+                let task_id: String = row.task_id().unwrap_or_default();
+                let execution_id: String = row.id().unwrap_or_default();
+                let status: String = row.status().unwrap_or_default();
+                let role: String = row.role_required().unwrap_or_default();
                 let agent_session_id = row
-                    .try_get::<Option<String>, _>("agent_session_id")
+                    .agent_session_id()
                     .ok()
                     .flatten()
                     .map(|value| truncate(&value, 256));
                 let logs_path = row
-                    .try_get::<Option<String>, _>("logs_path")
+                    .logs_path()
                     .ok()
                     .flatten()
                     .map(|value| truncate(&value, 512));
@@ -2334,20 +2226,20 @@ impl CoordinationToolProvider {
         let items = rows
             .into_iter()
             .map(|row| {
-                let id = row.try_get::<String, _>("id").unwrap_or_default();
+                let id = row.id().unwrap_or_default();
                 let depends_on = dependencies.remove(&id).unwrap_or_default();
-                let condition = row.try_get::<String, _>("condition_json").ok()
+                let condition = row.condition_json().ok()
                     .map(|raw| db::task_condition::decode_or_unknown(&raw).public());
                 json!({
                     "id": id,
-                    "parent_task_id": row.try_get::<Option<String>, _>("parent_task_id").ok().flatten(),
-                    "subtask_order": row.try_get::<Option<i64>, _>("subtask_order").ok().flatten(),
-                    "version": row.try_get::<i64, _>("version").unwrap_or_default(),
-                    "title": row.try_get::<String, _>("title").unwrap_or_default(),
-                    "status": row.try_get::<String, _>("status").unwrap_or_default(),
-                    "priority": row.try_get::<i64, _>("priority").unwrap_or_default(),
-                    "assignee_type": row.try_get::<Option<String>, _>("assignee_type").ok().flatten(),
-                    "assignee_id": row.try_get::<Option<String>, _>("assignee_id").ok().flatten(),
+                    "parent_task_id": row.parent_task_id().ok().flatten(),
+                    "subtask_order": row.subtask_order().ok().flatten(),
+                    "version": row.version().unwrap_or_default(),
+                    "title": row.title().unwrap_or_default(),
+                    "status": row.status().unwrap_or_default(),
+                    "priority": row.priority().unwrap_or_default(),
+                    "assignee_type": row.assignee_type().ok().flatten(),
+                    "assignee_id": row.assignee_id().ok().flatten(),
                     "condition": condition,
                     "depends_on": depends_on,
                     "available_actions": offers_by_task.get(&id).cloned().unwrap_or_default(),
@@ -2377,33 +2269,25 @@ impl CoordinationToolProvider {
         scope: &CanonicalScope,
         limit: i64,
     ) -> Result<Value, AgentHostError> {
-        let rows = sqlx::query(
-            "SELECT sequence, id, event_type, entity_type, entity_id, actor_type,
-                    correlation_id, causation_id, causation_depth, created_at
-             FROM domain_event
-             WHERE scope_type = ? AND scope_id = ?
-             ORDER BY sequence DESC LIMIT ?",
-        )
-        .bind(scope_type_name(scope.scope_type))
-        .bind(&scope.scope_id)
-        .bind(limit)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let rows = self
+            .db
+            .native_scope_events(scope_type_name(scope.scope_type), &scope.scope_id, limit)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
         let items = rows
             .into_iter()
             .map(|row| {
                 json!({
-                    "sequence": row.try_get::<i64, _>("sequence").unwrap_or_default(),
-                    "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                    "event_type": row.try_get::<String, _>("event_type").unwrap_or_default(),
-                    "entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(),
-                    "entity_id": row.try_get::<String, _>("entity_id").unwrap_or_default(),
-                    "actor_type": row.try_get::<String, _>("actor_type").unwrap_or_default(),
-                    "correlation_id": row.try_get::<String, _>("correlation_id").unwrap_or_default(),
-                    "causation_id": row.try_get::<Option<String>, _>("causation_id").ok().flatten(),
-                    "causation_depth": row.try_get::<i64, _>("causation_depth").unwrap_or_default(),
-                    "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
+                    "sequence": row.sequence().unwrap_or_default(),
+                    "id": row.id().unwrap_or_default(),
+                    "event_type": row.event_type().unwrap_or_default(),
+                    "entity_type": row.entity_type().unwrap_or_default(),
+                    "entity_id": row.entity_id().unwrap_or_default(),
+                    "actor_type": row.actor_type().unwrap_or_default(),
+                    "correlation_id": row.correlation_id().unwrap_or_default(),
+                    "causation_id": row.causation_id().ok().flatten(),
+                    "causation_depth": row.causation_depth().unwrap_or_default(),
+                    "created_at": row.created_at().unwrap_or_default(),
                 })
             })
             .collect::<Vec<_>>();
@@ -3084,9 +2968,8 @@ impl CoordinationToolProvider {
         paused_project_id: Option<&str>,
     ) -> DeniedBy {
         let project_id = if scope.scope_type == CanonicalScopeType::Task {
-            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                .bind(&scope.scope_id)
-                .fetch_optional(self.db.pool())
+            self.db
+                .native_task_project_id(&scope.scope_id)
                 .await
                 .ok()
                 .flatten()
@@ -3101,15 +2984,13 @@ impl CoordinationToolProvider {
         else {
             return DeniedBy::Unspecified;
         };
-        let reason = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT system_pause_reason FROM project WHERE id = ?",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .ok()
-        .flatten()
-        .flatten();
+        let reason = self
+            .db
+            .native_project_pause_reason(&project_id)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
         db::project_pause_denial(reason.as_deref())
     }
 
@@ -3675,30 +3556,29 @@ impl ForgeToolProvider for CoordinationToolProvider {
         };
         let id = db::new_uuid_v4();
         let now = db::now_rfc3339();
-        let saved = sqlx::query(
-            "INSERT INTO project_command_observation (
-                id, project_id, actor_identity_id, scope_type, scope_id, session_id, turn_id,
-                program, args_json, exit_code, success, output_digest, stdout_excerpt,
-                stderr_excerpt, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&project_id)
-        .bind(actor_identity_id)
-        .bind(scope_type_name(scope.scope_type))
-        .bind(&scope.scope_id)
-        .bind(&observation.session_id)
-        .bind(observation.turn_id.as_deref())
-        .bind(&observation.program)
-        .bind(serde_json::to_string(&observation.args).unwrap_or_else(|_| "[]".to_owned()))
-        .bind(observation.exit_code)
-        .bind(i64::from(observation.success))
-        .bind(&observation.output_digest)
-        .bind(&observation.stdout_excerpt)
-        .bind(&observation.stderr_excerpt)
-        .bind(&now)
-        .execute(self.db.pool())
-        .await;
+        let saved = self
+            .db
+            .insert_native_project_command_observation(
+                db::InsertNativeProjectCommandObservationInput {
+                    id: &id,
+                    project_id: &project_id,
+                    actor_identity_id,
+                    scope_type: scope_type_name(scope.scope_type),
+                    scope_id: &scope.scope_id,
+                    session_id: &observation.session_id,
+                    turn_id: observation.turn_id.as_deref(),
+                    program: &observation.program,
+                    args_json: serde_json::to_string(&observation.args)
+                        .unwrap_or_else(|_| "[]".to_owned()),
+                    exit_code: observation.exit_code,
+                    success: i64::from(observation.success),
+                    output_digest: &observation.output_digest,
+                    stdout_excerpt: &observation.stdout_excerpt,
+                    stderr_excerpt: &observation.stderr_excerpt,
+                    created_at: &now,
+                },
+            )
+            .await;
         if let Err(error) = saved {
             return Err(self
                 .structured_boundary_error(
@@ -3706,7 +3586,10 @@ impl ForgeToolProvider for CoordinationToolProvider {
                     scope,
                     "observe_command",
                     &arguments,
-                    AgentHostError::Runtime(error.to_string()),
+                    AgentHostError::Runtime(match error {
+                        db::DbError::Sqlx(error) => error.to_string(),
+                        error => error.to_string(),
+                    }),
                 )
                 .await);
         }

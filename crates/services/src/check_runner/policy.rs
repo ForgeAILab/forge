@@ -27,26 +27,20 @@ pub const VALUE_REVISION_SALT_KEY: &str = "check_value_revision_salt";
 /// Losing the salt changes every identity, so stored results are simply not
 /// found again.
 async fn salt(db: &db::SqliteDb) -> Result<String> {
-    let read = || {
-        sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key=?")
-            .bind(VALUE_REVISION_SALT_KEY)
-            .fetch_optional(db.pool())
-    };
-    if let Some(salt) = read().await.map_err(db::DbError::from)? {
+    let read = || db.check_value_revision_salt(VALUE_REVISION_SALT_KEY);
+    if let Some(salt) = read().await? {
         return Ok(salt);
     }
     // First use. Two first users race on the key: one row wins and both read
     // it back.
-    sqlx::query("INSERT OR IGNORE INTO system_setting(key,value,updated_at) VALUES(?,?,?)")
-        .bind(VALUE_REVISION_SALT_KEY)
-        .bind(format!("{}{}", db::new_uuid_v4(), db::new_uuid_v4()))
-        .bind(db::now_rfc3339())
-        .execute(db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+    db.insert_check_value_revision_salt(
+        VALUE_REVISION_SALT_KEY,
+        format!("{}{}", db::new_uuid_v4(), db::new_uuid_v4()),
+        db::now_rfc3339(),
+    )
+    .await?;
     read()
-        .await
-        .map_err(db::DbError::from)?
+        .await?
         .ok_or_else(|| ServiceError::invalid_operation("check value salt was not stored"))
 }
 

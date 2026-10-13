@@ -279,3 +279,21 @@ async fn append_inquiry_read_event(
     )
     .await
 }
+
+impl SqliteDb {
+    pub async fn chat_usage_admitted_inquiry_guard_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        inquiry_id: &str,
+        version: i64,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM agent_inquiry
+                 WHERE id = ? AND version = ? AND status = 'running'",
+        )
+        .bind(inquiry_id)
+        .bind(version)
+        .fetch_optional(connection)
+        .await?)
+    }
+}

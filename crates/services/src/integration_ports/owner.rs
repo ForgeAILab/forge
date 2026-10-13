@@ -88,24 +88,18 @@ impl DaemonFences {
 
     /// Every queue this daemon may still be asked about.
     pub async fn live_queue_ids(&self, daemon_id: &str, fence_queue: &str) -> Result<Vec<String>> {
-        let mut live: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM integration_queue WHERE state!='closed' AND json_extract(target_owner_json,'$.daemon_id')=?",
-        )
-        .bind(daemon_id)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let mut live: Vec<String> = self
+            .db
+            .daemon_owned_live_integration_queue_ids(daemon_id)
+            .await?;
         // Queues whose head's Task is placed on this daemon: it performs
         // their rebase although their default checkout is elsewhere, and a
         // claim it was told of must not be dropped by another queue's
         // announcement before that rebase is asked for.
-        let heads: Vec<String> = sqlx::query_scalar(
-            "SELECT q.id FROM integration_queue q JOIN integration_attempt a ON a.id=q.head_attempt_id WHERE q.state!='closed' AND a.daemon_id=?",
-        )
-        .bind(daemon_id)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let heads: Vec<String> = self
+            .db
+            .daemon_task_head_integration_queue_ids(daemon_id)
+            .await?;
         live.extend(heads);
         live.extend(
             self.db

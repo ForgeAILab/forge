@@ -453,16 +453,7 @@ impl AgentResponderStore for SqliteDb {
             else {
                 return Ok(ResolvedAgentResponder::setup(chat));
             };
-            let genesis_active = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(
-                     SELECT 1 FROM product_genesis_session
-                     WHERE main_chat_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
-                 )",
-            )
-            .bind(&chat.id)
-            .fetch_one(self.pool())
-            .await?
-                != 0;
+            let genesis_active = self.chat_has_active_product_genesis(&chat.id).await? != 0;
             let skill_revision = if genesis_active {
                 current_skill_revision(self, MAIN_OPERATING_SKILL_KEY).await?
             } else {
@@ -607,29 +598,17 @@ impl AgentResponderStore for SqliteDb {
 }
 
 async fn current_skill_revision(db: &SqliteDb, skill_key: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT revision.id
-         FROM operating_skill AS skill
-         JOIN operating_skill_revision AS revision
-           ON revision.id = skill.current_revision_id
-          AND revision.operating_skill_id = skill.id
-         WHERE skill.skill_key = ? AND skill.lifecycle = 'active'
-         LIMIT 1",
-    )
-    .bind(skill_key)
-    .fetch_optional(db.pool())
-    .await?)
+    Ok(db
+        .admission_current_operating_skill_revision(skill_key)
+        .await?)
 }
 
 async fn account_permission_ceiling(db: &SqliteDb, identity_id: &str) -> Result<String> {
-    Ok(sqlx::query_scalar::<_, Option<String>>(
-        "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
-    )
-    .bind(identity_id)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten()
-    .unwrap_or_else(|| "{}".to_owned()))
+    Ok(db
+        .admission_account_permission_ceiling(identity_id)
+        .await?
+        .flatten()
+        .unwrap_or_else(|| "{}".to_owned()))
 }
 
 /// Main/Project handoff preparation carries both sides' frozen provenance so

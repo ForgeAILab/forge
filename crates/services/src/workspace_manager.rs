@@ -728,12 +728,11 @@ impl<'a> WorkspaceManager<'a> {
                 reason: "workspace does not exist on its owner".to_owned(),
             });
         }
-        if sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')",
-        )
-        .bind(&workspace.id)
-        .fetch_one(self.db.pool())
-        .await?
+        if self
+            .db
+            .workspace_has_running_execution(&workspace.id)
+            .await
+            .map_err(ServiceError::from)?
         {
             return Err(WorkspaceUnavailable::Busy {
                 reason: "workspace still has a running execution".to_owned(),

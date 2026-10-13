@@ -87,3 +87,144 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+impl SqliteDb {
+    pub async fn insert_workspace_gc_owner(
+        &self,
+        key: &str,
+        owner_id: String,
+        updated_at: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO system_setting (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(owner_id)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_owner_value(&self, key: &str) -> crate::Result<String> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
+                .bind(key)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_workspace_gc_status(
+        &self,
+        key: &str,
+        value: String,
+        updated_at: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+             WHERE system_setting.value != excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_setting_value(&self, key: &str) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
+                .bind(key)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+pub async fn record_workspace_root_setting<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    key: &str,
+    value: &str,
+    updated_at: String,
+) -> crate::Result<()> {
+    sqlx::query(
+        "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(updated_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+impl SqliteDb {
+    pub async fn delete_workspace_root_setting_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        key: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("DELETE FROM system_setting WHERE key = ?")
+            .bind(key)
+            .execute(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn check_value_revision_salt(&self, key: &str) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key=?")
+                .bind(key)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_check_value_revision_salt(
+        &self,
+        key: &str,
+        value: String,
+        updated_at: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(
+            sqlx::query("INSERT OR IGNORE INTO system_setting(key,value,updated_at) VALUES(?,?,?)")
+                .bind(key)
+                .bind(value)
+                .bind(updated_at)
+                .execute(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_workspace_root_status(
+        &self,
+        key: &str,
+        value: String,
+        updated_at: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+         WHERE system_setting.value != excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await?)
+    }
+}

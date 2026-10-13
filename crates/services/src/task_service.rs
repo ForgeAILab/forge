@@ -35,7 +35,6 @@ use executors::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -991,11 +990,10 @@ impl TaskService {
             else {
                 continue;
             };
-            let daemon: Option<(Option<String>, String)> =
-                sqlx::query_as("SELECT removed_at, hostname FROM daemon WHERE id = ?")
-                    .bind(&workspace.daemon_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
+            let daemon: Option<(Option<String>, String)> = self
+                .db
+                .task_delete_check_machine(&workspace.daemon_id)
+                .await?;
             let Some((None, hostname)) = daemon else {
                 // Removed or unknown: the check worker settles the run.
                 continue;
@@ -1018,11 +1016,10 @@ impl TaskService {
                 // Reachable, or a failure phase two reports as it does today.
                 _ => continue,
             };
-            let hostname: Option<String> =
-                sqlx::query_scalar("SELECT hostname FROM daemon WHERE id = ?")
-                    .bind(&daemon_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
+            let hostname: Option<String> = self
+                .db
+                .task_delete_execution_machine_name(&daemon_id)
+                .await?;
             machines.insert(hostname.unwrap_or(daemon_id));
         }
         Ok(machines.into_iter().collect())
@@ -1511,11 +1508,25 @@ impl TaskService {
                     &input.id,
                 )
                 .await?;
-                if let Some(attempt) = crate::workflow::engine::durable::current_hook(&input.task_id) {
-                    self.db.fence_hook_in_tx(&mut transaction, &attempt.step).await?;
-                    let linked = sqlx::query("UPDATE task_hook_checkpoint SET execution_id=? WHERE step_id=? AND hook_index=? AND execution_id IS NULL")
-                        .bind(&execution.id).bind(&attempt.step.id).bind(attempt.index).execute(&mut *transaction).await?.rows_affected();
-                    if linked != 1 { return Err(DbError::VersionConflict.into()); }
+                if let Some(attempt) =
+                    crate::workflow::engine::durable::current_hook(&input.task_id)
+                {
+                    self.db
+                        .fence_hook_in_tx(&mut transaction, &attempt.step)
+                        .await?;
+                    let linked = self
+                        .db
+                        .link_task_hook_execution_in_tx(
+                            &mut transaction,
+                            &execution.id,
+                            &attempt.step.id,
+                            attempt.index,
+                        )
+                        .await?
+                        .rows_affected();
+                    if linked != 1 {
+                        return Err(DbError::VersionConflict.into());
+                    }
                 }
                 transaction.commit().await?;
                 Ok(execution)
@@ -1579,18 +1590,7 @@ impl TaskService {
             // the same Task workspace after this attempt lost admission.
             let deleted: std::result::Result<bool, db::DbError> = async {
                 let mut transaction = db::begin_immediate(self.db.pool()).await?;
-                let removed = sqlx::query(
-                    "DELETE FROM workspace
-                     WHERE id = ? AND task_id = ?
-                       AND NOT EXISTS (
-                           SELECT 1 FROM execution
-                           WHERE execution.workspace_id = workspace.id
-                       )",
-                )
-                .bind(workspace_id)
-                .bind(task_id)
-                .execute(&mut *transaction)
-                .await?
+                let removed = self.db.delete_unacquired_task_workspace_in_tx(&mut transaction, workspace_id, task_id).await?
                 .rows_affected()
                     == 1;
                 if removed {
@@ -1688,29 +1688,17 @@ impl TaskService {
         if execution.status == ExecutionStatus::Running {
             return Ok(());
         }
-        let terminal_event = sqlx::query(
-            "SELECT id
-             FROM domain_event
-             WHERE entity_type = 'task'
-               AND entity_id = ?
-               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
-               AND json_extract(payload_json, '$.previous_lease_owner') = ?
-               AND json_extract(payload_json, '$.execution_id') = ?
-             ORDER BY sequence DESC
-             LIMIT 1",
-        )
-        .bind(&execution.task_id)
-        .bind(&lease_owner)
-        .bind(&execution.id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let terminal_event = self
+            .db
+            .execution_terminal_owner_event_id(&execution.task_id, &lease_owner, &execution.id)
+            .await?;
         let Some(terminal_event) = terminal_event else {
             // Monitor/user terminalization did not persist this connection as
             // the winning owner, so the late result cannot be attributed
             // safely and must not create a misleading diagnostic.
             return Ok(());
         };
-        let terminal_event_id: String = terminal_event.try_get("id")?;
+        let terminal_event_id: String = terminal_event;
         let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? else {
             // The durable receipt remains acknowledgeable after later Task
             // deletion; there is no mutable Task outcome left to repair.
@@ -1783,21 +1771,11 @@ impl TaskService {
             ));
         }
 
-        let previous_owner = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT json_extract(payload_json, '$.previous_lease_owner')
-             FROM domain_event
-             WHERE entity_type = 'task'
-               AND entity_id = ?
-               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
-               AND json_extract(payload_json, '$.execution_id') = ?
-             ORDER BY sequence DESC
-             LIMIT 1",
-        )
-        .bind(&execution.task_id)
-        .bind(&execution.id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
+        let previous_owner = self
+            .db
+            .execution_terminal_previous_owner(&execution.task_id, &execution.id)
+            .await?
+            .flatten();
         Ok(previous_owner
             .as_deref()
             .is_some_and(|owner| remote_owner_belongs_to_daemon(owner, daemon_id)))
@@ -1812,15 +1790,11 @@ impl TaskService {
         receipt: &db::ExecutionTerminalReceipt,
         daemon_id: &str,
     ) -> Result<bool> {
-        let previous_owner = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT json_extract(payload_json, '$.previous_lease_owner')
-             FROM domain_event
-             WHERE id = ?",
-        )
-        .bind(&receipt.event_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
+        let previous_owner = self
+            .db
+            .execution_terminal_receipt_previous_owner(&receipt.event_id)
+            .await?
+            .flatten();
         Ok(previous_owner
             .as_deref()
             .is_some_and(|owner| remote_owner_belongs_to_daemon(owner, daemon_id)))
@@ -2064,23 +2038,18 @@ impl TaskService {
         // a side-effect-free concurrent result.
         let (remote_invocations, usage_settlements) = {
             let mut preparation_tx = db::begin_immediate(self.db.pool()).await?;
-            let authority = sqlx::query(
-                "SELECT status, lease_owner, lease_expires_at, hard_deadline_at
-                 FROM execution WHERE id = ?",
-            )
-            .bind(&notification.execution_id)
-            .fetch_optional(&mut *preparation_tx)
-            .await?;
+            let authority = self
+                .db
+                .execution_terminal_authority_in_tx(&mut preparation_tx, &notification.execution_id)
+                .await?;
             let Some(authority) = authority else {
                 preparation_tx.rollback().await?;
                 return Ok(ExecutionTerminalOutcome::Concurrent { current: None });
             };
-            let authority_status: String = authority.try_get("status")?;
-            let authority_owner: Option<String> = authority.try_get("lease_owner")?;
-            let authority_lease_expires_at: Option<String> =
-                authority.try_get("lease_expires_at")?;
-            let authority_hard_deadline_at: Option<String> =
-                authority.try_get("hard_deadline_at")?;
+            let authority_status: String = authority.status;
+            let authority_owner: Option<String> = authority.lease_owner;
+            let authority_lease_expires_at: Option<String> = authority.lease_expires_at;
+            let authority_hard_deadline_at: Option<String> = authority.hard_deadline_at;
             let authority_ok = if authority_status == ExecutionStatus::Running.to_string() {
                 remote_execution_lease_is_active(
                     authority_owner.as_deref(),
@@ -2090,24 +2059,15 @@ impl TaskService {
                     Utc::now(),
                 )
             } else {
-                let previous_owner = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT json_extract(payload_json, '$.previous_lease_owner')
-                     FROM domain_event
-                     WHERE entity_type = 'task'
-                       AND entity_id = ?
-                       AND event_type IN (
-                           'execution.completed', 'execution.failed',
-                           'execution.cancelled', 'execution.terminal_report.received'
-                       )
-                       AND json_extract(payload_json, '$.execution_id') = ?
-                     ORDER BY sequence DESC
-                     LIMIT 1",
-                )
-                .bind(&current_execution.task_id)
-                .bind(&current_execution.id)
-                .fetch_optional(&mut *preparation_tx)
-                .await?
-                .flatten();
+                let previous_owner = self
+                    .db
+                    .execution_terminal_report_previous_owner_in_tx(
+                        &mut preparation_tx,
+                        &current_execution.task_id,
+                        &current_execution.id,
+                    )
+                    .await?
+                    .flatten();
                 previous_owner
                     .as_deref()
                     .is_some_and(|owner| remote_owner_belongs_to_daemon(owner, daemon_id))

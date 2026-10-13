@@ -360,3 +360,74 @@ impl SqliteDb {
         )
     }
 }
+
+impl SqliteDb {
+    pub async fn workspace_gc_repository_paths(
+        &self,
+    ) -> crate::Result<Vec<(String, Option<String>)>> {
+        Ok(
+            sqlx::query_as::<_, (String, Option<String>)>("SELECT id, local_path FROM repo")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_refusal_repo_remote_url(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar("SELECT remote_url FROM repo WHERE id=?")
+            .bind(repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_repository_count(&self, repo_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id = ?")
+            .bind(repo_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_repair_repository_paths(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT local_path FROM repo WHERE local_path IS NOT NULL AND local_path != ''
+         UNION SELECT path FROM repo_location WHERE owner_kind = 'server'",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_environment_primary_checkout(
+        &self,
+        repo_id: &Option<String>,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar("SELECT local_path FROM repo WHERE id=?")
+            .bind(repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_agent_workspace_repo_live_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM repo WHERE id = ? LIMIT 1")
+                .bind(repo_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}

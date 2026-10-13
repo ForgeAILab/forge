@@ -2,7 +2,6 @@
 //! Integer totals/reasons are additive; run classifications depend on attempt
 //! counts; provenance is an ordered set (last event wins), not an additive sum.
 use super::*;
-use sqlx::Row;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -41,23 +40,21 @@ struct Watermarks {
 }
 impl Watermarks {
     async fn read(connection: &mut sqlx::SqliteConnection) -> Result<Self> {
-        let r = sqlx::query("SELECT * FROM usage_ledger_revision WHERE id = 1")
-            .fetch_one(connection)
-            .await?;
+        let r = db::usage_index_watermarks_on_connection(connection).await?;
         Ok(Self {
-            invocation_rowid: r.try_get("invocation_rowid")?,
-            event_rowid: r.try_get("event_rowid")?,
-            estimate_rowid: r.try_get("estimate_rowid")?,
-            execution_rowid: r.try_get("execution_rowid")?,
-            invocation_revision: r.try_get("invocation_revision")?,
-            execution_revision: r.try_get("execution_revision")?,
-            deletion_generation: r.try_get("deletion_generation")?,
-            owned_executions: r.try_get("owned_execution_count")?,
+            invocation_rowid: r.invocation_rowid()?,
+            event_rowid: r.event_rowid()?,
+            estimate_rowid: r.estimate_rowid()?,
+            execution_rowid: r.execution_rowid()?,
+            invocation_revision: r.invocation_revision()?,
+            execution_revision: r.execution_revision()?,
+            deletion_generation: r.deletion_generation()?,
+            owned_executions: r.owned_execution_count()?,
             rows: [
-                r.try_get("invocation_count")?,
-                r.try_get("event_count")?,
-                r.try_get("estimate_count")?,
-                r.try_get("execution_count")?,
+                r.invocation_count()?,
+                r.event_count()?,
+                r.estimate_count()?,
+                r.execution_count()?,
             ],
         })
     }
@@ -900,19 +897,19 @@ impl State {
         }
         Ok(())
     }
-    fn execution(&mut self, row: &sqlx::sqlite::SqliteRow) -> Result<()> {
-        let raw_id: String = row.try_get("id")?;
+    fn execution(&mut self, row: &db::UsageIndexExecutionRow) -> Result<()> {
+        let raw_id: String = row.id()?;
         let id: Arc<str> = Arc::from(raw_id);
-        let status: String = row.try_get("status")?;
-        let created: String = row.try_get("created_at")?;
-        let updated: String = row.try_get("updated_at")?;
-        let duration: Option<f64> = row.try_get("duration_ms")?;
+        let status: String = row.status()?;
+        let created: String = row.created_at()?;
+        let updated: String = row.updated_at()?;
+        let duration: Option<f64> = row.duration_ms()?;
         let new = Execution {
             run: Arc::new(RunKey {
                 surface: DbUsageSurface::TaskExecution,
                 source_id: id.to_string(),
             }),
-            owner: row.try_get::<Option<String>, _>("agent_id")?.map(Arc::from),
+            owner: row.agent_id()?.map(Arc::from),
             pending: status == "running",
             completed: status == "completed",
             duration: duration.map(|value| (value * DURATION_SCALE) as i128),
@@ -1259,23 +1256,24 @@ impl UsageLedgerIndex {
                 .collect::<Vec<_>>()
         };
         if !missing.is_empty() {
-            let rows=sqlx::query("WITH requested AS (SELECT value AS id FROM json_each(?)) SELECT requested.id,COUNT(e.id) AS n,COALESCE(SUM(e.status='running'),0) AS running,COALESCE(SUM(e.status='completed'),0) AS completed,AVG(CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END) AS duration,COALESCE(SUM(CASE WHEN e.status!='running' AND (e.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*' OR e.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*') THEN 1 ELSE 0 END),0) AS unstable FROM requested LEFT JOIN execution e ON e.agent_id=requested.id GROUP BY requested.id")
-                .bind(serde_json::to_string(&missing).map_err(|_|invalid_transition())?).fetch_all(&mut *tx).await?;
+            let rows = db::usage_index_agent_execution_stats_on_connection(
+                &mut tx,
+                serde_json::to_string(&missing).map_err(|_| invalid_transition())?,
+            )
+            .await?;
             let mut memo = self.fallback.lock().await;
             for row in rows {
-                let id: String = row.try_get("id")?;
-                let n: i64 = row.try_get("n")?;
-                let complete: i64 = row.try_get("completed")?;
+                let id: String = row.id()?;
+                let n: i64 = row.n()?;
+                let complete: i64 = row.completed()?;
                 let value = (
                     db::AgentExecutionStats {
-                        avg_duration_ms: row
-                            .try_get::<Option<f64>, _>("duration")?
-                            .map(|v| v.round() as i64),
+                        avg_duration_ms: row.duration()?.map(|v| v.round() as i64),
                         success_rate: (n > 0).then_some(complete as f64 / n as f64),
                     },
-                    row.try_get("running")?,
+                    row.running()?,
                 );
-                if memo.header == Some(header) && row.try_get::<i64, _>("unstable")? == 0 {
+                if memo.header == Some(header) && row.unstable()? == 0 {
                     memo.room(256);
                     memo.stats.insert(id.clone(), value.clone());
                     memo.bytes += 256;
@@ -1316,18 +1314,29 @@ impl UsageLedgerIndex {
             {
                 None
             } else {
-                let rows=sqlx::query("SELECT i.agent_id AS owner,e.agent_id AS attributed FROM usage_event e JOIN usage_invocation i ON i.id=e.invocation_id WHERE e.rowid>?1 AND e.rowid<=?2
-                  UNION SELECT i.agent_id,e.agent_id FROM cost_estimate_revision r JOIN usage_event e ON e.id=r.usage_event_id JOIN usage_invocation i ON i.id=e.invocation_id WHERE r.rowid>?3 AND r.rowid<=?4
-                  UNION SELECT agent_id,NULL FROM usage_invocation WHERE rowid>?5 AND rowid<=?6
-                  UNION SELECT i.agent_id,NULL FROM usage_changed_invocation c JOIN usage_invocation i ON i.id=c.id WHERE c.revision>?7 AND c.revision<=?8
-                  UNION SELECT agent_id,NULL FROM execution WHERE rowid>?9 AND rowid<=?10")
-                    .bind(old.event_rowid).bind(header.event_rowid).bind(old.estimate_rowid).bind(header.estimate_rowid)
-                    .bind(old.invocation_rowid).bind(header.invocation_rowid).bind(old.invocation_revision).bind(header.invocation_revision)
-                    .bind(old.execution_rowid).bind(header.execution_rowid).fetch_all(&mut *connection).await?;
+                let rows = db::usage_index_affected_agents_on_connection(
+                    &mut *connection,
+                    db::UsageIndexAffectedAgentsOnConnectionInput {
+                        old_event_rowid: old.event_rowid,
+                        event_rowid: header.event_rowid,
+                        old_estimate_rowid: old.estimate_rowid,
+                        estimate_rowid: header.estimate_rowid,
+                        old_invocation_rowid: old.invocation_rowid,
+                        invocation_rowid: header.invocation_rowid,
+                        old_invocation_revision: old.invocation_revision,
+                        invocation_revision: header.invocation_revision,
+                        old_execution_rowid: old.execution_rowid,
+                        execution_rowid: header.execution_rowid,
+                    },
+                )
+                .await?;
                 let mut affected = HashSet::new();
                 for row in rows {
-                    for column in ["owner", "attributed"] {
-                        if let Some(id) = row.try_get::<Option<String>, _>(column)? {
+                    for column in [
+                        db::UsageIndexAffectedAgentField::Owner,
+                        db::UsageIndexAffectedAgentField::Attributed,
+                    ] {
+                        if let Some(id) = row.agent(column)? {
                             affected.insert(id);
                         }
                     }
@@ -1583,11 +1592,11 @@ impl UsageLedgerIndex {
         }
 
         if cold {
-            let row=sqlx::query("SELECT COALESCE((SELECT MAX(rowid) FROM usage_invocation),0) AS i,COALESCE((SELECT MAX(rowid) FROM usage_event),0) AS e,COALESCE((SELECT MAX(rowid) FROM cost_estimate_revision),0) AS r,COALESCE((SELECT MAX(rowid) FROM execution),0) AS x").fetch_one(&mut *tx).await?;
-            actual.invocation_rowid = row.try_get("i")?;
-            actual.event_rowid = row.try_get("e")?;
-            actual.estimate_rowid = row.try_get("r")?;
-            actual.execution_rowid = row.try_get("x")?;
+            let row = db::usage_index_actual_rowids_on_connection(&mut tx).await?;
+            actual.invocation_rowid = row.i()?;
+            actual.event_rowid = row.e()?;
+            actual.estimate_rowid = row.r()?;
+            actual.execution_rowid = row.x()?;
             if actual != observed {
                 tracing::error!(
                     ?observed,
@@ -1722,17 +1731,14 @@ async fn bounded_usage_snapshot(
     let mut first = true;
     let mut totals = HashMap::<Scope, Rollup>::new();
     loop {
-        let boundary = if first { ">=" } else { ">" };
-        let query=format!("SELECT source_id FROM (SELECT DISTINCT source_id FROM usage_invocation WHERE source_id {boundary} ?3 AND (?1 OR agent_id IN (SELECT value FROM json_each(?2))) ORDER BY source_id LIMIT 128)
-            UNION SELECT source_id FROM (SELECT DISTINCT source_id FROM usage_event WHERE source_id {boundary} ?3 AND (?1 OR agent_id IN (SELECT value FROM json_each(?2))) ORDER BY source_id LIMIT 128)
-            UNION SELECT source_id FROM (SELECT id AS source_id FROM execution WHERE id {boundary} ?3 AND (?1 OR agent_id IN (SELECT value FROM json_each(?2))) ORDER BY id LIMIT 128)
-            ORDER BY source_id LIMIT 128");
-        let sources = sqlx::query_scalar::<_, String>(&query)
-            .bind(ids.is_none())
-            .bind(&ids_json)
-            .bind(&after)
-            .fetch_all(&mut *connection)
-            .await?;
+        let sources = db::usage_index_source_batch_on_connection(
+            &mut *connection,
+            first,
+            ids.is_none(),
+            &ids_json,
+            &after,
+        )
+        .await?;
         if sources.is_empty() {
             break;
         }
@@ -1748,22 +1754,19 @@ async fn bounded_usage_snapshot(
                 batch.event(event, 1)?;
             }
         }
-        for row in sqlx::query(
-            "SELECT id,agent_id,status FROM execution WHERE id IN (SELECT value FROM json_each(?))",
+        for row in db::usage_index_execution_domains_on_connection(
+            &mut *connection,
+            serde_json::to_string(&sources).map_err(|_| invalid_transition())?,
         )
-        .bind(serde_json::to_string(&sources).map_err(|_| invalid_transition())?)
-        .fetch_all(&mut *connection)
         .await?
         {
-            let id: String = row.try_get("id")?;
-            let owner = row
-                .try_get::<Option<String>, _>("agent_id")?
-                .map(Arc::<str>::from);
+            let id: String = row.id()?;
+            let owner = row.agent_id()?.map(Arc::<str>::from);
             let run = Arc::new(RunKey {
                 surface: DbUsageSurface::TaskExecution,
                 source_id: id,
             });
-            let domain = Some(Some(row.try_get::<String, _>("status")? == "running"));
+            let domain = Some(Some(row.status()? == "running"));
             batch.run_change((None, run.clone()), None, None, domain)?;
             if owner.is_some() {
                 batch.run_change((owner, run), None, None, domain)?;
@@ -1816,52 +1819,30 @@ async fn effective_events(
     let mut result = Vec::with_capacity(events.len());
     for chunk in events.chunks(150) {
         let ids = chunk.iter().map(|e| e.id.as_str()).collect::<Vec<_>>();
-        let rows=sqlx::query("WITH requested AS (SELECT value AS id FROM json_each(?))
-            SELECT e.id AS event_id, er.id AS applied_id, er.estimated_nano_usd AS applied_nanos,
-              er.rate_revision_id AS applied_rate, er.catalog_snapshot_id AS applied_catalog,
-              er.formula_revision AS applied_formula, er.retrospective AS applied_retrospective,
-              ps.source_kind AS selection_source_kind, ps.catalog_freshness AS selection_catalog_freshness,
-              ps.rate_revision_id AS selection_rate_revision_id, ps.catalog_snapshot_id AS selection_catalog_snapshot_id,
-              r.source_kind AS rate_source_kind, r.catalog_snapshot_id AS rate_catalog_snapshot_id,
-              r.effective_at AS rate_effective_at, c.revision_digest AS catalog_digest,
-              c.fetched_at AS catalog_fetched_at, ep.catalog_freshness AS estimate_catalog_freshness
-            FROM requested JOIN usage_event e ON e.id=requested.id
-            JOIN usage_invocation i ON i.id=e.invocation_id
-            LEFT JOIN cost_estimate_revision er ON er.id=(SELECT prior.id FROM cost_estimate_revision prior
-              WHERE prior.usage_event_id=e.id AND prior.state='applied' AND prior.rowid<=?
-              ORDER BY prior.revision DESC,prior.created_at DESC,prior.id DESC LIMIT 1)
-            LEFT JOIN pricing_selection ps ON ps.id=i.pricing_selection_id
-            LEFT JOIN cost_estimation_run erun ON erun.id=er.run_id
-            LEFT JOIN cost_estimation_preview ep ON ep.id=erun.preview_id
-            LEFT JOIN pricing_rate_revision r ON r.id=COALESCE(er.rate_revision_id,e.rate_revision_id,ps.rate_revision_id)
-            LEFT JOIN pricing_catalog_snapshot c ON c.id=COALESCE(er.catalog_snapshot_id,e.catalog_snapshot_id,r.catalog_snapshot_id,ps.catalog_snapshot_id)")
-            .bind(serde_json::to_string(&ids).map_err(|_|invalid_transition())?).bind(through).fetch_all(&mut *connection).await?;
+        let rows = db::usage_index_effective_event_sources_on_connection(
+            &mut *connection,
+            serde_json::to_string(&ids).map_err(|_| invalid_transition())?,
+            through,
+        )
+        .await?;
         let mut rows = rows
             .into_iter()
-            .map(|r| Ok((r.try_get::<String, _>("event_id")?, r)))
-            .collect::<std::result::Result<HashMap<_, _>, sqlx::Error>>()?;
+            .map(|r| Ok((r.event_id()?, r)))
+            .collect::<std::result::Result<HashMap<_, _>, db::DbError>>()?;
         for original in chunk {
             let row = rows.remove(&original.id).ok_or_else(invalid_transition)?;
             let mut event = original.clone();
-            if row.try_get::<Option<String>, _>("applied_id")?.is_some() {
+            if row.applied_id()?.is_some() {
                 if event.cost_kind == UsageCostKind::ProviderReported {
                     return Err(invalid_transition());
                 }
                 event.cost_kind = UsageCostKind::Estimated;
-                event.estimated_nano_usd = Some(
-                    row.try_get::<Option<i64>, _>("applied_nanos")?
-                        .ok_or_else(invalid_transition)?,
-                );
-                event.rate_revision_id = row
-                    .try_get::<Option<String>, _>("applied_rate")?
-                    .or(event.rate_revision_id);
-                event.catalog_snapshot_id = row
-                    .try_get::<Option<String>, _>("applied_catalog")?
-                    .or(event.catalog_snapshot_id);
-                event.formula_revision = row
-                    .try_get::<Option<String>, _>("applied_formula")?
-                    .or(event.formula_revision);
-                event.retrospective = row.try_get("applied_retrospective")?;
+                event.estimated_nano_usd =
+                    Some(row.applied_nanos()?.ok_or_else(invalid_transition)?);
+                event.rate_revision_id = row.applied_rate()?.or(event.rate_revision_id);
+                event.catalog_snapshot_id = row.applied_catalog()?.or(event.catalog_snapshot_id);
+                event.formula_revision = row.applied_formula()?.or(event.formula_revision);
+                event.retrospective = row.applied_retrospective()?;
             }
             let metadata = event_source_metadata_from_row(&row, &event)?;
             result.push(EffectiveUsageEvent {
@@ -2001,24 +1982,20 @@ async fn citation_repairs(
             // Narrow by immutable provenance ids and variant fields, then seek
             // in the exact source/attempt/invocation/occurrence/event order.
             // Only a removed winner needs this query; ordinary appends do not.
-            let ids=sqlx::query_scalar::<_,String>("SELECT e.id FROM usage_event e
-              JOIN usage_invocation i ON i.id=e.invocation_id
-              LEFT JOIN cost_estimate_revision er ON er.id=(SELECT prior.id FROM cost_estimate_revision prior
-                WHERE prior.usage_event_id=e.id AND prior.state='applied' AND prior.rowid<=?1
-                ORDER BY prior.revision DESC,prior.created_at DESC,prior.id DESC LIMIT 1)
-              LEFT JOIN pricing_selection ps ON ps.id=i.pricing_selection_id
-              LEFT JOIN pricing_rate_revision r ON r.id=COALESCE(er.rate_revision_id,e.rate_revision_id,ps.rate_revision_id)
-              WHERE e.rowid<=?2 AND i.lifecycle!='unsettled'
-                AND (?3 IS NULL OR i.agent_id=?3 OR e.agent_id=?3)
-                AND COALESCE(er.rate_revision_id,e.rate_revision_id,ps.rate_revision_id) IS ?4
-                AND COALESCE(er.catalog_snapshot_id,e.catalog_snapshot_id,r.catalog_snapshot_id,ps.catalog_snapshot_id) IS ?5
-                AND COALESCE(er.formula_revision,e.formula_revision) IS ?6
-                AND COALESCE(er.retrospective,e.retrospective)=?7
-              ORDER BY i.source_id DESC,i.attempt_ordinal DESC,i.id DESC,e.occurred_at DESC,e.id DESC
-              LIMIT 150 OFFSET ?8")
-                .bind(through.estimate_rowid).bind(through.event_rowid).bind(scope.as_deref())
-                .bind(&reference.rate_revision_id).bind(&reference.catalog_snapshot_id).bind(&reference.formula_revision)
-                .bind(reference.retrospective).bind(offset).fetch_all(&mut *connection).await?;
+            let ids = db::usage_index_citation_event_ids_on_connection(
+                &mut *connection,
+                db::UsageIndexCitationEventIdsOnConnectionInput {
+                    estimate_rowid: through.estimate_rowid,
+                    event_rowid: through.event_rowid,
+                    agent_id: scope.as_deref(),
+                    rate_revision_id: &reference.rate_revision_id,
+                    catalog_snapshot_id: &reference.catalog_snapshot_id,
+                    formula_revision: &reference.formula_revision,
+                    retrospective: reference.retrospective,
+                    offset,
+                },
+            )
+            .await?;
             if ids.is_empty() {
                 break None;
             }
@@ -2058,7 +2035,7 @@ async fn citation_repairs(
 enum Change {
     Invocation(Box<UsageInvocation>),
     Event(Box<EffectiveUsageEvent>, i64),
-    Execution(sqlx::sqlite::SqliteRow),
+    Execution(db::UsageIndexExecutionRow),
     RemoveExecution(String),
 }
 impl Change {
@@ -2164,11 +2141,17 @@ impl Change {
                                 .map_or(usize::MAX / 2, |s| s.len() * 2 + 256)
                     })
             }
-            Self::Execution(row) => ["id", "agent_id", "status", "created_at", "updated_at"]
-                .iter()
-                .filter_map(|column| row.try_get::<Option<String>, _>(*column).ok().flatten())
-                .map(|s| s.len() + 16)
-                .sum(),
+            Self::Execution(row) => [
+                db::UsageIndexExecutionTextField::Id,
+                db::UsageIndexExecutionTextField::AgentId,
+                db::UsageIndexExecutionTextField::Status,
+                db::UsageIndexExecutionTextField::CreatedAt,
+                db::UsageIndexExecutionTextField::UpdatedAt,
+            ]
+            .iter()
+            .filter_map(|column| row.optional_text(*column).ok().flatten())
+            .map(|s| s.len() + 16)
+            .sum(),
             Self::RemoveExecution(id) => id.capacity(),
         };
         // Inline values, Vec capacity slack, SQL storage and allocator headers.
@@ -2271,7 +2254,7 @@ impl State {
             Change::Invocation(row) if !self.invocations.contains_key(row.id.as_str()) => (1, 0, 2),
             Change::Execution(row)
                 if row
-                    .try_get::<String, _>("id")
+                    .id()
                     .is_ok_and(|id| !self.executions.contains_key(id.as_str())) =>
             {
                 (0, 1, 2)
@@ -2324,8 +2307,13 @@ async fn read_delta(
     }
     let mut position = old.invocation_revision;
     while !cold && position < new.invocation_revision {
-        let changes=sqlx::query("SELECT c.id,c.revision FROM usage_changed_invocation c JOIN usage_invocation i ON i.id=c.id WHERE c.revision>? AND c.revision<=? AND i.rowid<=?3 ORDER BY c.revision LIMIT 400")
-            .bind(position).bind(new.invocation_revision).bind(old.invocation_rowid).fetch_all(&mut *connection).await?;
+        let changes = db::usage_index_changed_invocations_on_connection(
+            &mut *connection,
+            position,
+            new.invocation_revision,
+            old.invocation_rowid,
+        )
+        .await?;
         #[cfg(test)]
         {
             staged.audit().statements += 1;
@@ -2336,9 +2324,9 @@ async fn read_delta(
         }
         let ids = changes
             .iter()
-            .map(|r| r.try_get("id"))
+            .map(|r| r.id())
             .collect::<std::result::Result<Vec<String>, _>>()?;
-        position = changes.last().expect("changes").try_get("revision")?;
+        position = changes.last().expect("changes").revision()?;
         let rows = db::SqliteDb::usage_invocations_by_ids(connection, &ids).await?;
         #[cfg(test)]
         {
@@ -2383,8 +2371,13 @@ async fn read_delta(
     let mut position = old.estimate_rowid;
     let mut revised = BTreeSet::new();
     while !cold && position < new.estimate_rowid {
-        let rows=sqlx::query("SELECT r.rowid AS revision_rowid,e.id FROM cost_estimate_revision r JOIN usage_event e ON e.id=r.usage_event_id WHERE r.rowid>? AND r.rowid<=? AND e.rowid<=? ORDER BY r.rowid LIMIT 400")
-            .bind(position).bind(new.estimate_rowid).bind(old.event_rowid).fetch_all(&mut *connection).await?;
+        let rows = db::usage_index_changed_estimates_on_connection(
+            &mut *connection,
+            position,
+            new.estimate_rowid,
+            old.event_rowid,
+        )
+        .await?;
         #[cfg(test)]
         {
             staged.audit().statements += 1;
@@ -2394,8 +2387,8 @@ async fn read_delta(
             break;
         }
         for row in rows {
-            position = row.try_get("revision_rowid")?;
-            let id = row.try_get::<String, _>("id")?;
+            position = row.revision_rowid()?;
+            let id = row.id()?;
             let bytes = id.capacity() + 192;
             if revised.insert(id) {
                 // The deduplicated revision set and its eventual Vec are
@@ -2438,8 +2431,12 @@ async fn read_delta(
     }
     let mut position = old.execution_rowid;
     while position < new.execution_rowid {
-        let rows=sqlx::query("SELECT rowid AS execution_rowid,id,agent_id,status,created_at,updated_at,CASE WHEN status!='running' THEN (JULIANDAY(updated_at)-JULIANDAY(created_at))*86400000 END AS duration_ms FROM execution WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT 400")
-            .bind(position).bind(new.execution_rowid).fetch_all(&mut *connection).await?;
+        let rows = db::usage_index_inserted_executions_on_connection(
+            &mut *connection,
+            position,
+            new.execution_rowid,
+        )
+        .await?;
         #[cfg(test)]
         {
             staged.audit().statements += 1;
@@ -2449,7 +2446,7 @@ async fn read_delta(
             break;
         }
         for row in rows {
-            position = row.try_get("execution_rowid")?;
+            position = row.execution_rowid()?;
             staged.push(Change::Execution(row), budget)?;
             if staged.overflowed(budget) {
                 return Ok(());
@@ -2462,8 +2459,18 @@ async fn read_delta(
     let mut position = old.execution_revision;
     let mut last_id = String::new();
     while !cold && position <= new.execution_revision {
-        let rows=sqlx::query("SELECT c.id,c.revision,e.id AS present_id,e.agent_id,e.status,e.created_at,e.updated_at,CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END AS duration_ms FROM usage_changed_execution c LEFT JOIN execution e ON e.id=c.id WHERE (c.revision>? OR (c.revision=? AND c.id>?)) AND c.revision<=? AND (e.rowid<=? OR e.id IS NULL) AND c.revision>?6 ORDER BY c.revision,c.id LIMIT 400")
-            .bind(position).bind(position).bind(&last_id).bind(new.execution_revision).bind(old.execution_rowid).bind(old.execution_revision).fetch_all(&mut *connection).await?;
+        let rows = db::usage_index_changed_executions_on_connection(
+            &mut *connection,
+            db::UsageIndexChangedExecutionsOnConnectionInput {
+                after_revision: position,
+                cursor_revision: position,
+                last_id: &last_id,
+                through_revision: new.execution_revision,
+                through_rowid: old.execution_rowid,
+                old_revision: old.execution_revision,
+            },
+        )
+        .await?;
         #[cfg(test)]
         {
             staged.audit().statements += 1;
@@ -2473,9 +2480,9 @@ async fn read_delta(
             break;
         }
         for row in rows {
-            position = row.try_get("revision")?;
-            last_id = row.try_get("id")?;
-            if let Some(id) = row.try_get::<Option<String>, _>("present_id")? {
+            position = row.revision()?;
+            last_id = row.id()?;
+            if let Some(id) = row.present_id()? {
                 let _ = id;
                 staged.push(Change::Execution(row), budget)?;
                 if staged.overflowed(budget) {

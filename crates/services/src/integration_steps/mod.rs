@@ -381,12 +381,13 @@ impl IntegrationSteps {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         attempt: &IntegrationAttempt,
     ) -> Result<bool> {
-        Ok(sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(&mut **tx)
-            .await?)
+        Ok(db::integration_task_entry_matches_in_tx(
+            tx,
+            &attempt.task_ref,
+            &attempt.expected_status,
+            attempt.expected_epoch,
+        )
+        .await?)
     }
 
     /// State an integration reason for the attempt. The statement is fenced
@@ -447,20 +448,16 @@ impl IntegrationSteps {
             Some(id) => self.db.integration_queue(id).await?,
             None => None,
         };
-        let project_paused: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=? AND p.paused_at IS NOT NULL)",
-        )
-        .bind(&attempt.task_ref)
-        .fetch_one(self.db.pool())
-        .await?;
+        let project_paused: bool = self
+            .db
+            .integration_task_project_paused(&attempt.task_ref)
+            .await?;
         // The machine a pre-queue owner wait named (importer row P15).
-        let waited_owner: Option<String> = sqlx::query_scalar(
-            "SELECT CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.owner_wait.daemon_id') END FROM task WHERE id=?",
-        )
-        .bind(&attempt.task_ref)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
+        let waited_owner: Option<String> = self
+            .db
+            .integration_task_waited_owner(&attempt.task_ref)
+            .await?
+            .flatten();
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let attempt = db::integration_attempt_in_tx(&mut tx, &request.attempt_id).await?;
         match db::integration_step_position(
@@ -790,11 +787,13 @@ impl IntegrationSteps {
             return Err(ServiceError::invalid_operation("injected result failure"));
         }
         let task = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await?;
-        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(self.db.pool())
+        let live: bool = self
+            .db
+            .integration_task_entry_matches(
+                &attempt.task_ref,
+                &attempt.expected_status,
+                attempt.expected_epoch,
+            )
             .await?;
         let ack = |outcome| IntegrationStepAckWrite {
             attempt_id: attempt.id.clone(),
@@ -918,8 +917,14 @@ impl IntegrationSteps {
         if crate::deferred_dispatch::paused_integration(&task)
             .is_some_and(|marker| marker.state == attempt.expected_status)
         {
-            sqlx::query("UPDATE task SET metadata_json=json_set(json_remove(COALESCE(metadata_json,'{}'),'$.paused_integration'),'$.paused_integration_generation',COALESCE(json_extract(metadata_json,'$.paused_integration_generation'),0)+1),updated_at=? WHERE id=? AND version=?")
-                .bind(db::now_rfc3339()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+            self.db
+                .consume_applied_task_integration_pause_in_tx(
+                    &mut tx,
+                    db::now_rfc3339(),
+                    &task.id,
+                    task.version,
+                )
+                .await?;
             self.db
                 .state_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy)
                 .await?;
@@ -949,9 +954,8 @@ impl IntegrationSteps {
         let cascade_id = self.db.enqueue_step_in_tx(&mut tx, &cascade).await?;
         // As the merge hook does for its own follow-up: the landed result
         // goes ahead of a waiting owner command.
-        sqlx::query("UPDATE task_step SET priority=2 WHERE id=?")
-            .bind(&cascade_id)
-            .execute(&mut *tx)
+        self.db
+            .prioritize_applied_integration_cascade_in_tx(&mut tx, &cascade_id)
             .await?;
         tx.commit().await?;
         self.task_service.dispatch_wake.notify_one();

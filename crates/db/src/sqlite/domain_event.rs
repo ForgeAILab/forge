@@ -691,3 +691,203 @@ pub async fn blocker_recovery_transition_exists_in_tx(
     .fetch_one(connection)
     .await?)
 }
+
+impl SqliteDb {
+    pub async fn delivery_followup_wake_turn(
+        &self,
+        event_id: &str,
+        sequence: i64,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.turn_job_id') FROM domain_event
+             WHERE id = ? AND sequence = ? AND event_type = 'agent.wake.admitted'
+               AND scope_type = 'project' AND scope_id = ?",
+        )
+        .bind(event_id)
+        .bind(sequence)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_postcondition_event(
+        &self,
+        event_type: &str,
+        scope_type: &str,
+        scope_id: &str,
+        after_sequence: i64,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM domain_event
+             WHERE event_type = ? AND scope_type = ? AND scope_id = ?
+               AND sequence > ?
+             ORDER BY sequence ASC LIMIT 1",
+        )
+        .bind(event_type)
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(after_sequence)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeScopeEventRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeScopeEventRow {
+    pub fn sequence(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("sequence")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn event_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("event_type")?)
+    }
+    pub fn entity_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("entity_type")?)
+    }
+    pub fn entity_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("entity_id")?)
+    }
+    pub fn actor_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("actor_type")?)
+    }
+    pub fn correlation_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("correlation_id")?)
+    }
+    pub fn causation_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("causation_id")?)
+    }
+    pub fn causation_depth(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("causation_depth")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_scope_events(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<NativeScopeEventRow>> {
+        let rows = sqlx::query(
+            "SELECT sequence, id, event_type, entity_type, entity_id, actor_type,
+                    correlation_id, causation_id, causation_depth, created_at
+             FROM domain_event
+             WHERE scope_type = ? AND scope_id = ?
+             ORDER BY sequence DESC LIMIT ?",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeScopeEventRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_previous_owner(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(execution_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_receipt_previous_owner(
+        &self,
+        event_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE id = ?",
+        )
+        .bind(event_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_report_previous_owner_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+                     FROM domain_event
+                     WHERE entity_type = 'task'
+                       AND entity_id = ?
+                       AND event_type IN (
+                           'execution.completed', 'execution.failed',
+                           'execution.cancelled', 'execution.terminal_report.received'
+                       )
+                       AND json_extract(payload_json, '$.execution_id') = ?
+                     ORDER BY sequence DESC
+                     LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(execution_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_owner_event_id(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT id
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
+               AND json_extract(payload_json, '$.previous_lease_owner') = ?
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(lease_owner)
+        .bind(execution_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| row.try_get("id").map_err(crate::DbError::from))
+            .transpose()
+    }
+}

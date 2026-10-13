@@ -17,7 +17,6 @@ use db::{
 };
 use forge_agent_host::MAIN_PROJECT_CREATE_OPERATION;
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::{
     create_project_from_charter_approval, AgentActionProvenance, AgentActionService,
@@ -361,32 +360,25 @@ async fn main_command_context(
 }
 
 async fn action_account_id(db: &SqliteDb, action: &AgentAction) -> Result<String> {
-    let account_id =
-        sqlx::query_scalar::<_, Option<String>>("SELECT owner_id FROM agent_identity WHERE id = ?")
-            .bind(&action.actor_identity_id)
-            .fetch_optional(db.pool())
-            .await?
-            .flatten()
-            .ok_or_else(|| {
-                ServiceError::not_found("agent_identity", action.actor_identity_id.clone())
-            })?;
+    let account_id = db
+        .main_action_actor_account_owner(&action.actor_identity_id)
+        .await?
+        .flatten()
+        .ok_or_else(|| {
+            ServiceError::not_found("agent_identity", action.actor_identity_id.clone())
+        })?;
     match action.scope_type.as_str() {
         "account" if action.scope_id == account_id => Ok(account_id),
         "agent_chat" => {
-            let row = sqlx::query(
-                "SELECT kind, account_id FROM agent_chat WHERE id = ? AND kind = 'account_main'",
-            )
-            .bind(&action.scope_id)
-            .fetch_optional(db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("Main action scope is not a Main Chat")
+            let row = db
+                .main_action_chat_account_scope(&action.scope_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("Main action scope is not a Main Chat")
+                })?;
+            let chat_account = row.account_id()?.ok_or_else(|| {
+                ServiceError::invalid_operation("Main Chat has no owning account")
             })?;
-            let chat_account =
-                row.try_get::<Option<String>, _>("account_id")?
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation("Main Chat has no owning account")
-                    })?;
             if chat_account != account_id {
                 return Err(ServiceError::invalid_operation(
                     "Main action identity does not own the Main Chat account",
