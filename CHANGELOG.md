@@ -3170,19 +3170,61 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   continuation step was pruned is continued by the merge queue's next sweep
   instead of at the next server start.
 - The recorded (`shadow:`) merge attempt of a Task deleted before the
-  upgrade finished is removed at start; it used to stay for good.
+  upgrade finished is removed at start; it used to stay for good. Rows are
+  deleted from `integration_attempt` at every start, and only these: the
+  current `shadow:` row of a deleted Task that waits (`queued`, `path_wait`,
+  `parked`, `quarantined`, `ejected`, `needs_review`), is not a queue's head
+  and records no effect. History rows, a row that records a landed merge
+  and a row whose effect may be in flight are kept. The log line
+  `shadow attempts of deleted Tasks removed` gives the count; nothing is
+  logged when there is none.
+- Migration `V202610122352` adds an index on
+  `integration_attempt.predecessor_attempt_id`. Index only, no row is
+  changed. Deleting a merge attempt (the start pass above, a Project
+  deletion) no longer scans the whole attempt table once per deleted row.
 
-- A merge taken over at the upgrade as already landed, whose commit the
-  target does not contain (or whose target cannot be asked), no longer asks
-  for its proof for ever. After five asks (about 40 minutes) the attempt is
-  parked for the owner: the Task shows `deferred` / `owner_required` with an Attention item,
-  and Retry puts it back in line (Cancel ends it).
+- A merge taken over at the upgrade as already landed, whose commit is not
+  confirmed on its target, no longer asks for its proof for ever. The Task
+  shows `deferred` / `unresolved_result` while it asks (every 10 minutes)
+  and is then parked for the owner, `deferred` / `owner_required` with an
+  Attention item; Retry puts it back in line (the queue reads the target as
+  it is, and a Task whose commit is on the target is reported once, without
+  a second merge) and Cancel ends it. When it parks:
+  - the target's owner answered that the target does not contain the
+    commit: at the second answer, about 10 minutes;
+  - nobody answered and nobody will (the machine that holds the target's
+    default checkout was removed, the checkout is gone, or a connected
+    machine keeps failing the read): after five such asks in a row, about
+    40 minutes;
+  - the machine that holds the target's default checkout is only not
+    connected (a daemon that is offline when the server starts): never.
+    The Task keeps `unresolved_result` until the machine is back or is
+    removed.
+  Rows that have been asking since the upgrade are counted from their first
+  ask on this build, not from their earlier runs.
 
 - A queued check run whose last consumer is withdrawn (a Hold or Cancel
   during the entry check, a superseded step, a Project delete) is cancelled
   in the withdrawal itself. It used to stay `queued` until a machine slot
   freed, and `checks.by_state.queued` / `waiting_for_slot` in operations
-  status counted it meanwhile. Such a run has no result row.
+  status counted it meanwhile. Such a run has no result row
+  (`checks.by_state.cancelled` counts it; no `check_result` with outcome
+  `cancelled` is written for a run that never started).
+- A queued check run whose consumers all belong to Tasks that were deleted
+  or left the status that asked is cancelled at the check worker's next look
+  (within about a second), without a result row. It used to wait for a
+  machine slot, for up to 30 minutes, counted in `waiting_for_slot`.
+- A merge-queue head whose check was withdrawn by a forced Project deletion
+  that was then refused asks again and gets a fresh run. It used to wait
+  35 minutes, park with `no check verdict arrived`, and do the same after
+  every Retry.
+- Retry Entry Checks on a Task that has no Agent (a Task a person reviews
+  that no Agent ever ran) is accepted. It was offered and then refused with
+  `accepted role action lost its Agent` (HTTP 400), which left a review
+  entry parked on an exhausted CI budget with no way out but Cancel.
+- The merge queue's sweep reads only the `queued` rows taken over at the
+  upgrade when it looks for a missing continuation step (it listed every
+  such row of the database every 30 seconds).
 
 - **A caller that stops waiting for a database connection no longer closes
   it.** The pool pinged an idle connection before handing it out and held it
