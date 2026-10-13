@@ -1258,3 +1258,320 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ProjectEscalationSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ProjectEscalationSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn need(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("need")?)
+    }
+    pub fn task_ids_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_ids_json")?)
+    }
+    pub fn attention_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("attention_id")?)
+    }
+    pub fn notification_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("notification_id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn answer(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("answer")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertProjectEscalationInTxInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub identity_id: Option<&'a str>,
+    pub dedupe_key: &'a str,
+    pub need: &'a str,
+    pub task_ids_json: &'a str,
+    pub attention_id: &'a str,
+    pub notification_id: &'a str,
+    pub created_at: &'a str,
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EscalationBlockerTurnSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EscalationBlockerTurnSourceRow {
+    pub fn turn_job_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("turn_job_id")?)
+    }
+    pub fn responder_identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("responder_identity_id")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn reused_turn_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        turn_id: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT e.* FROM agent_wake_escalation e JOIN agent_wake_blocker b ON b.escalation_id=e.id WHERE b.turn_job_id=? AND e.dedupe_key<>? LIMIT 1")
+            .bind(turn_id)
+            .bind(dedupe_key)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn link_turn_blockers_to_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        escalation_id: &str,
+        turn_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_blocker SET escalation_id=? WHERE turn_job_id=? AND escalation_id IS NULL")
+            .bind(escalation_id)
+            .bind(turn_id)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_project_blocker_recovery_action(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_blocker SET recorded_outcome='recovery_action' WHERE escalation_id IS NULL AND attention_id IN (SELECT id FROM attention_projection WHERE scope_type='project' AND scope_id=? AND json_extract(details_json,'$.entity_id')=?) AND turn_job_id IN (SELECT j.id FROM agent_chat_turn_job j JOIN agent_chat c ON c.id=j.chat_id WHERE c.project_id=? AND j.responder_identity_id=? AND j.status='leased')")
+            .bind(project_id)
+            .bind(task_id)
+            .bind(project_id)
+            .bind(identity_id)
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_project_escalation_sources_on_connection(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        status: Option<&str>,
+        after_created_at: Option<&str>,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT * FROM agent_wake_escalation
+             WHERE project_id = ? AND (? IS NULL OR status = ?)
+               AND (? IS NULL OR created_at > ? OR (created_at = ? AND id > ?))
+             ORDER BY created_at, id LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(status)
+        .bind(status)
+        .bind(after_created_at)
+        .bind(after_created_at)
+        .bind(after_created_at)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(connection)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectEscalationSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_project_escalation_source_on_connection(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=? AND project_id=?")
+            .bind(id)
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn answer_project_escalation_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=? AND project_id=?")
+            .bind(id)
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn answer_project_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        answer: &str,
+        answered_at: &str,
+        id: &str,
+        project_id: &str,
+        expected_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_escalation SET status='answered',answer=?,answered_at=?,version=version+1 WHERE id=? AND project_id=? AND version=? AND status='open'")
+            .bind(answer)
+            .bind(answered_at)
+            .bind(id)
+            .bind(project_id)
+            .bind(expected_version)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn answered_project_escalation_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+    ) -> crate::Result<ProjectEscalationSourceRow> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=?")
+            .bind(id)
+            .fetch_one(connection)
+            .await?;
+        Ok(ProjectEscalationSourceRow { row: rows })
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_escalation_by_dedupe_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE dedupe_key=?")
+            .bind(dedupe_key)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_project_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertProjectEscalationInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_escalation(id,project_id,identity_id,dedupe_key,need,task_ids_json,attention_id,notification_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(input.id)
+            .bind(input.project_id)
+            .bind(input.identity_id)
+            .bind(input.dedupe_key)
+            .bind(input.need)
+            .bind(input.task_ids_json)
+            .bind(input.attention_id)
+            .bind(input.notification_id)
+            .bind(input.created_at)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_blocker_turn_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+        incident_digest: &str,
+    ) -> crate::Result<EscalationBlockerTurnSourceRow> {
+        let rows = sqlx::query("SELECT b.turn_job_id,j.responder_identity_id,j.created_at,j.updated_at FROM agent_wake_blocker b JOIN agent_chat_turn_job j ON j.id=b.turn_job_id WHERE b.attention_id=? AND b.incident_digest=? AND b.legacy_source_event_id IS NULL")
+            .bind(attention_id)
+            .bind(incident_digest)
+            .fetch_one(connection)
+            .await?;
+        Ok(EscalationBlockerTurnSourceRow { row: rows })
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_unlinked_turn_blockers_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        turn_id: &str,
+    ) -> crate::Result<Vec<(String, String, Option<String>)>> {
+        Ok(sqlx::query_as::<_, (String, String, Option<String>)>("SELECT attention_id,incident_digest,recorded_outcome FROM agent_wake_blocker WHERE turn_job_id=? AND escalation_id IS NULL AND legacy_source_event_id IS NULL")
+            .bind(turn_id)
+            .fetch_all(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn link_attention_blocker_to_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        escalation_id: &str,
+        turn_id: &str,
+        attention_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_blocker SET escalation_id=? WHERE turn_job_id=? AND attention_id=? AND escalation_id IS NULL")
+            .bind(escalation_id)
+            .bind(turn_id)
+            .bind(attention_id)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_unlinked_turn_attention_ids(
+        &self,
+        turn_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT attention_id FROM agent_wake_blocker WHERE turn_job_id=? AND escalation_id IS NULL")
+            .bind(turn_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
+}

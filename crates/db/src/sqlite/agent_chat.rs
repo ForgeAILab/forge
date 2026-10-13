@@ -3226,3 +3226,77 @@ impl SqliteDb {
         .await?)
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ActionApproverChatScopeRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ActionApproverChatScopeRow {
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn account_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("account_id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("project_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_approver_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<ActionApproverChatScopeRow>> {
+        let rows = sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(rows.map(|row| ActionApproverChatScopeRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_orchestration_chat_project(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT project_id FROM agent_chat
+                 WHERE id = ? AND kind = 'project' LIMIT 1",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_latest_leased_project_turn_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT j.id FROM agent_chat_turn_job j JOIN agent_chat c ON c.id=j.chat_id WHERE c.project_id=? AND j.responder_identity_id=? AND j.status='leased' ORDER BY j.created_at DESC LIMIT 1")
+            .bind(project_id)
+            .bind(identity_id)
+            .fetch_optional(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_turn_chat_project(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(
+            sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM agent_chat WHERE id=?")
+                .bind(chat_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}

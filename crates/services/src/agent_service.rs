@@ -138,7 +138,6 @@ pub async fn compute_effective_status_for_agents(
     running: &std::collections::HashMap<String, i64>,
     connections: &crate::daemon_transport::DaemonConnectionRegistry,
 ) -> Result<std::collections::HashMap<String, EffectiveStatus>> {
-    use sqlx::Row;
     use std::collections::HashMap;
 
     if agents.is_empty() {
@@ -156,35 +155,14 @@ pub async fn compute_effective_status_for_agents(
             .collect::<Vec<_>>(),
     )
     .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-    let rows = sqlx::query(
-        "WITH requested AS (
-            SELECT json_extract(value,'$.id') AS id,
-                   json_extract(value,'$.profile') AS profile,
-                   json_extract(value,'$.credential') AS credential FROM json_each(?)
-         ), reservations AS (
-            SELECT p.agent_id, COUNT(*) AS n FROM workspace_placement p
-            WHERE p.agent_id IN (SELECT id FROM requested)
-              AND p.state IN ('reserved','preparing')
-              AND julianday(COALESCE(p.reserved_until,datetime(p.updated_at,'+10 minutes'))) > julianday('now')
-              AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.workspace_id=p.workspace_id AND e.status='running')
-            GROUP BY p.agent_id
-         )
-         SELECT requested.id, h.status AS connection_status,
-                c.status AS credential_status, c.enabled AS credential_enabled,
-                p.status AS provider_status, p.last_error_kind, p.backoff_until,
-                COALESCE(reservations.n,0) AS reservations
-         FROM requested LEFT JOIN agent_connection_health h ON h.profile_id=requested.profile
-         LEFT JOIN credential_handle c ON c.id=requested.credential
-         LEFT JOIN provider_entry_health p ON p.credential_id=requested.credential
-         LEFT JOIN reservations ON reservations.agent_id=requested.id",
-    ).bind(requested).fetch_all(db.pool()).await?;
+    let rows = db
+        .agent_status_health_for_requested_agents(&requested)
+        .await?;
     let health: HashMap<String, _> = rows
         .into_iter()
-        .map(|row| Ok((row.try_get::<String, _>("id")?, row)))
-        .collect::<std::result::Result<_, sqlx::Error>>()?;
-    let daemons = sqlx::query("SELECT id,status,detected_clis_json FROM daemon")
-        .fetch_all(db.pool())
-        .await?;
+        .map(|row| Ok((row.id()?, row)))
+        .collect::<std::result::Result<_, db::DbError>>()?;
+    let daemons = db.daemon_executor_statuses().await?;
     let executor_types = serde_json::to_string(
         &agents
             .iter()
@@ -192,15 +170,16 @@ pub async fn compute_effective_status_for_agents(
             .collect::<Vec<_>>(),
     )
     .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-    let rows = sqlx::query("SELECT owner_user_id,daemon_id,executor_type,enabled FROM cli_runtime_policy WHERE executor_type IN (SELECT value FROM json_each(?))")
-        .bind(executor_types).fetch_all(db.pool()).await?;
+    let rows = db
+        .cli_runtime_policies_for_executor_types(&executor_types)
+        .await?;
     let mut policies = HashMap::new();
     let mut global = HashMap::new();
     for row in rows {
-        let owner: String = row.try_get("owner_user_id")?;
-        let daemon: String = row.try_get("daemon_id")?;
-        let executor: String = row.try_get("executor_type")?;
-        let enabled: bool = row.try_get("enabled")?;
+        let owner: String = row.owner_user_id()?;
+        let daemon: String = row.daemon_id()?;
+        let executor: String = row.executor_type()?;
+        let enabled: bool = row.enabled()?;
         global
             .entry((daemon.clone(), executor.clone()))
             .and_modify(|value| *value &= enabled)
@@ -238,24 +217,15 @@ pub async fn compute_effective_status_for_agents(
                 EffectiveStatus::Paused
             } else {
                 if agent.credential_ref.is_some() {
-                    if row
-                        .try_get::<Option<String>, _>("credential_status")?
-                        .as_deref()
-                        != Some("configured")
-                        || row.try_get::<Option<bool>, _>("credential_enabled")? != Some(true)
+                    if row.credential_status()?.as_deref() != Some("configured")
+                        || row.credential_enabled()? != Some(true)
                     {
                         return Ok((agent.id.clone(), EffectiveStatus::SourceDisabled));
                     }
-                    let auth_error = row
-                        .try_get::<Option<String>, _>("provider_status")?
-                        .as_deref()
-                        == Some("error")
-                        && row
-                            .try_get::<Option<String>, _>("last_error_kind")?
-                            .as_deref()
-                            == Some("auth");
+                    let auth_error = row.provider_status()?.as_deref() == Some("error")
+                        && row.last_error_kind()?.as_deref() == Some("auth");
                     let backoff = row
-                        .try_get::<Option<String>, _>("backoff_until")?
+                        .backoff_until()?
                         .and_then(|until| chrono::DateTime::parse_from_rfc3339(&until).ok())
                         .is_some_and(|until| until > now);
                     if auth_error || backoff {
@@ -263,10 +233,7 @@ pub async fn compute_effective_status_for_agents(
                     }
                 }
                 if agent.backend_kind == "native" {
-                    match row
-                        .try_get::<Option<String>, _>("connection_status")?
-                        .as_deref()
-                    {
+                    match row.connection_status()?.as_deref() {
                         Some("healthy") => {}
                         Some("degraded") => {
                             return Ok((agent.id.clone(), EffectiveStatus::ConnectionDegraded))
@@ -274,10 +241,7 @@ pub async fn compute_effective_status_for_agents(
                         _ => return Ok((agent.id.clone(), EffectiveStatus::ConnectionUnavailable)),
                     }
                 } else if let Some(pin) = &agent.daemon_id {
-                    let Some(daemon) = daemons
-                        .iter()
-                        .find(|row| row.get::<String, _>("id") == *pin)
-                    else {
+                    let Some(daemon) = daemons.iter().find(|row| row.id_unchecked() == *pin) else {
                         return Ok((agent.id.clone(), EffectiveStatus::DaemonOffline));
                     };
                     if connections
@@ -286,10 +250,10 @@ pub async fn compute_effective_status_for_agents(
                     {
                         return Ok((agent.id.clone(), EffectiveStatus::DaemonUpgradeRequired));
                     }
-                    if daemon.try_get::<String, _>("status")? == "offline" {
+                    if daemon.status()? == "offline" {
                         return Ok((agent.id.clone(), EffectiveStatus::DaemonOffline));
                     }
-                    if !parse_detected_clis(&daemon.try_get::<String, _>("detected_clis_json")?)?
+                    if !parse_detected_clis(&daemon.detected_clis_json()?)?
                         .iter()
                         .any(|cli| {
                             cli.kind == agent.executor_type
@@ -305,16 +269,15 @@ pub async fn compute_effective_status_for_agents(
                     let candidates = daemons
                         .iter()
                         .filter(|daemon| {
-                            daemon.get::<String, _>("status") == "online"
-                                && parse_detected_clis(
-                                    &daemon.get::<String, _>("detected_clis_json"),
-                                )
-                                .is_ok_and(|clis| {
-                                    clis.iter().any(|cli| {
-                                        cli.kind == agent.executor_type
-                                            && cli.availability.as_deref() == Some("authenticated")
+                            daemon.status_unchecked() == "online"
+                                && parse_detected_clis(&daemon.detected_clis_json_unchecked())
+                                    .is_ok_and(|clis| {
+                                        clis.iter().any(|cli| {
+                                            cli.kind == agent.executor_type
+                                                && cli.availability.as_deref()
+                                                    == Some("authenticated")
+                                        })
                                     })
-                                })
                         })
                         .collect::<Vec<_>>();
                     if candidates.is_empty() {
@@ -322,7 +285,7 @@ pub async fn compute_effective_status_for_agents(
                     }
                     if !candidates
                         .iter()
-                        .any(|daemon| enabled(agent, &daemon.get::<String, _>("id")))
+                        .any(|daemon| enabled(agent, &daemon.id_unchecked()))
                     {
                         return Ok((agent.id.clone(), EffectiveStatus::SourceDisabled));
                     }
@@ -331,7 +294,7 @@ pub async fn compute_effective_status_for_agents(
                     .get(&agent.id)
                     .copied()
                     .unwrap_or(0)
-                    .saturating_add(row.try_get::<i64, _>("reservations")?)
+                    .saturating_add(row.reservations()?)
                     >= agent.max_concurrent_tasks
                 {
                     EffectiveStatus::Busy
@@ -434,16 +397,10 @@ async fn cli_runtime_enabled(
     executor_type: &str,
 ) -> Result<bool> {
     if let Some(owner_user_id) = owner_user_id {
-        return Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT enabled FROM cli_runtime_policy
-             WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?",
-        )
-        .bind(owner_user_id)
-        .bind(daemon_id)
-        .bind(executor_type)
-        .fetch_optional(db.pool())
-        .await?
-        .unwrap_or(true));
+        return Ok(db
+            .owner_cli_runtime_enabled(owner_user_id, daemon_id, executor_type)
+            .await?
+            .unwrap_or(true));
     }
 
     // Legacy/global Agents have no owner to scope the local policy lookup.
@@ -451,15 +408,10 @@ async fn cli_runtime_enabled(
     // daemon/runtime source must still deactivate those Agents; otherwise the
     // provider screen would claim the source is disabled while global Agents
     // continued to receive work through it.
-    Ok(sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT MIN(enabled) FROM cli_runtime_policy
-         WHERE daemon_id = ? AND executor_type = ?",
-    )
-    .bind(daemon_id)
-    .bind(executor_type)
-    .fetch_one(db.pool())
-    .await?
-    .unwrap_or(true))
+    Ok(db
+        .global_cli_runtime_enabled(daemon_id, executor_type)
+        .await?
+        .unwrap_or(true))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -656,18 +608,11 @@ impl AgentService {
         let role_events =
             TaskService::on_agent_deleted_in_tx(&self.db, &mut transaction, &agent_id).await?;
         let now = now_rfc3339();
-        let result = sqlx::query(
-            "UPDATE agent_identity
-             SET archived_at = ?, paused = 1, is_default = 0, status = 'offline',
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND archived_at IS NULL",
-        )
-        .bind(&now)
-        .bind(&now)
-        .bind(&agent_id)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() == 0 {
+        let result = self
+            .db
+            .archive_agent_identity_in_tx(&mut transaction, &now, &now, &agent_id)
+            .await?;
+        if result == 0 {
             return Err(ServiceError::not_found("agent", agent_id));
         }
         transaction.commit().await?;

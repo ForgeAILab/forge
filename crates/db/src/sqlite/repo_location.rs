@@ -381,3 +381,83 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+#[derive(Debug)]
+pub struct EnvironmentProvisionRetryDetailRow {
+    pub started_at: Option<String>,
+    pub last_error: Option<String>,
+    pub attempts: i64,
+    pub checks_digest: String,
+    pub connection_id: i64,
+}
+
+// Preserve the original tuple query's positional decoding and error indices.
+impl<'r> sqlx::FromRow<'r, SqliteRow> for EnvironmentProvisionRetryDetailRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            started_at: row.try_get(0)?,
+            last_error: row.try_get(1)?,
+            attempts: row.try_get(2)?,
+            checks_digest: row.try_get(3)?,
+            connection_id: row.try_get(4)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_probe_visible_daemon_locations(
+        &self,
+        project_id: &str,
+        owner_id: Option<&str>,
+    ) -> crate::Result<Vec<(String, String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>("SELECT l.id, l.daemon_id, l.runtime_id FROM repo_location l JOIN repo r ON r.id = l.repo_id JOIN daemon d ON d.id = l.daemon_id WHERE r.project_id = ? AND l.owner_kind = 'daemon' AND l.status = 'ready' AND (d.visibility = 'global' OR d.owner_id IS NULL OR d.owner_id = ?)")
+            .bind(project_id)
+            .bind(owner_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_probe_server_checkout_path(
+        &self,
+        project_id: &str,
+        primary_repo_id: Option<&str>,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT l.path FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.owner_kind = 'server' AND l.status = 'ready' ORDER BY (r.id = ?) DESC, l.is_default DESC, l.created_at, l.id LIMIT 1")
+            .bind(project_id)
+            .bind(primary_repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_probe_daemon_location(
+        &self,
+        project_id: &str,
+        daemon_id: &str,
+        runtime_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT l.id FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.daemon_id = ? AND l.runtime_id = ? AND l.status = 'ready' ORDER BY l.is_default DESC, l.created_at, l.id LIMIT 1")
+            .bind(project_id)
+            .bind(daemon_id)
+            .bind(runtime_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_provision_retry_detail(
+        &self,
+        repo_id: &str,
+        runtime_id: &str,
+    ) -> crate::Result<Option<EnvironmentProvisionRetryDetailRow>> {
+        Ok(sqlx::query_as::<_, EnvironmentProvisionRetryDetailRow>("SELECT j.started_at, COALESCE(l.last_error, j.last_error), j.attempts, j.checks_digest, j.connection_id FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id = j.location_id WHERE j.repo_id = ? AND j.runtime_id = ?")
+            .bind(repo_id)
+            .bind(runtime_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}

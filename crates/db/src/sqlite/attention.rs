@@ -753,3 +753,36 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+#[derive(Debug)]
+pub struct UpsertEnvironmentWaitAttentionInTxInput<'a> {
+    pub id: String,
+    pub project_id: &'a str,
+    pub event_id: String,
+    pub summary: String,
+    pub details_json: String,
+    pub dedupe_key: String,
+    pub occurred_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn upsert_environment_wait_attention_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: UpsertEnvironmentWaitAttentionInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'environment_not_ready', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'wait') ON CONFLICT(dedupe_key) DO UPDATE SET status = 'open', summary = excluded.summary, details_json = excluded.details_json, source_event_id = excluded.source_event_id, resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL, updated_at = excluded.updated_at, version = attention_projection.version + 1")
+            .bind(input.id)
+            .bind(input.project_id)
+            .bind(input.event_id)
+            .bind(input.summary)
+            .bind(input.details_json)
+            .bind(input.dedupe_key)
+            .bind(input.occurred_at)
+            .bind(input.updated_at)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}

@@ -1230,3 +1230,237 @@ impl SqliteDb {
         )
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ActionOrchestrationCharterStateRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ActionOrchestrationCharterStateRow {
+    pub fn charter_status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_status")?)
+    }
+    pub fn charter_setup_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_setup_required")?)
+    }
+    pub fn current_charter_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_id")?)
+    }
+    pub fn current_charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_orchestration_charter_state(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ActionOrchestrationCharterStateRow>> {
+        let rows = sqlx::query(
+            "SELECT charter_status, charter_setup_required,
+                    current_charter_id, current_charter_revision_id
+             FROM project WHERE id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ActionOrchestrationCharterStateRow { row }))
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectIdentitySourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectIdentitySourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("name")?)
+    }
+    pub fn settings(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("settings")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn charter_status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_status")?)
+    }
+    pub fn charter_setup_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_setup_required")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn project_work_epoch(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("project_work_epoch")?)
+    }
+    pub fn primary_milestone_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("primary_milestone_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_identity_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<EffectiveProjectIdentitySourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, settings, paused_at, charter_status, charter_setup_required,
+                version, created_at, updated_at, project_work_epoch,
+                primary_milestone_id
+         FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| EffectiveProjectIdentitySourceRow { row }))
+    }
+}
+
+pub async fn escalation_project_owner_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> crate::Result<Option<Option<String>>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>("SELECT owner_id FROM project WHERE id=?")
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+impl SqliteDb {
+    pub async fn environment_probe_project_settings_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<String> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id=?")
+                .bind(project_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_provision_repo_project_settings(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT p.settings FROM project p JOIN repo r ON r.project_id=p.id WHERE r.id=?",
+        )
+        .bind(repo_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_wait_project_state_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<(Option<String>, String)> {
+        Ok(sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT paused_at, settings FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_unowned_project_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> crate::Result<Vec<(String,)>> {
+        Ok(
+            sqlx::query_as::<_, (String,)>("SELECT id FROM project WHERE owner_id IS NULL")
+                .fetch_all(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_unowned_project_owner_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        user_id: &str,
+        project_id: &str,
+    ) -> crate::Result<u64> {
+        let result =
+            sqlx::query("UPDATE project SET owner_id = ? WHERE id = ? AND owner_id IS NULL")
+                .bind(user_id)
+                .bind(project_id)
+                .execute(connection)
+                .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn adaptive_task_current_charter_revision(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT current_charter_revision_id FROM project
+             WHERE id = ? AND charter_status = 'charter_backed'
+               AND charter_setup_required = 0",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_worker_project_charter_backed(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project
+                 WHERE id = ? AND charter_status = 'charter_backed'
+                   AND charter_setup_required = 0
+             )",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_assignment_project_charter_backed(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project
+                 WHERE id = ? AND charter_status = 'charter_backed'
+                   AND charter_setup_required = 0
+             )",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
