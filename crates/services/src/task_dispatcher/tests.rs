@@ -5408,6 +5408,7 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
         &agent_id,
     )
     .await;
+    let coder_execution_id = seed_completed_coder_execution(&db, &task.id).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
     let dispatched = dispatcher
@@ -5430,7 +5431,6 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
         .await
         .is_err());
 
-    let coder_execution_id = seed_completed_coder_execution(&db, &task.id).await;
     seed_running_review(
         &db,
         &task.id,
@@ -10503,6 +10503,8 @@ mod lead_operations;
 #[cfg(test)]
 #[path = "tests/refresh_recovery.rs"]
 mod refresh_recovery;
+#[path = "tests/review_candidate.rs"]
+mod review_candidate;
 #[path = "tests/root_lead.rs"]
 mod root_lead;
 #[path = "tests/root_replan.rs"]

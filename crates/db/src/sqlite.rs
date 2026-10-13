@@ -90,6 +90,7 @@ mod attention;
 mod command_finalization;
 mod command_receipt;
 mod commitment;
+mod conflict_hotspot;
 mod daemon;
 pub use daemon::DaemonOperatorIssueRow;
 mod dead_letter;
@@ -126,6 +127,7 @@ pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
 mod pricing;
 mod project;
+pub use project::WorkflowProjectAuthorityRow;
 mod project_execution_setup;
 mod project_hook_run;
 mod project_member;
@@ -151,6 +153,10 @@ pub use schedule::integration_statement_in_tx;
 pub use schedule::{ScheduleRead, INTEGRATION_OWNED_SQL};
 pub use task::MilestoneTaskSourceRow;
 pub use task::{BlockedTaskOperatorRow, TaskOperatorConditionRow, TaskOperatorRetryRow};
+pub use task::{
+    ConflictHandoffHistoryRow, ConflictHandoffSourceRow, InsertWorkflowTransitionLogInput,
+    WriteWorkflowTransitionStateInput, CONFLICT_HANDOFF_QUERY,
+};
 mod task_adaptive;
 mod task_comment;
 mod task_dependency;

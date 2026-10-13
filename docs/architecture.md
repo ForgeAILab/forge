@@ -5904,6 +5904,45 @@ replace validation of that install's retained owner evidence.
 
 ### Task condition actions
 
+**Review without an Agent delivery.** This applies to a review gate whose
+reviewer role is assigned to an Agent, or that has checks configured on a Task
+with a Workspace that is not read-only (without a candidate the reviewer is
+refused dispatch and the checks are skipped); human
+reviewers and owner-approval gates without checks behave as before. A Task (not a coordination root) whose branch
+has commits of its own that the target does not have (merges of the target do
+not count) is a human submission and runs the ordinary configured review checks
+and reviewer. Its completed delivery-evidence row records the exact base/head
+and a human-submission summary, with no Agent, process, lease, session or logs.
+It grants no review authority by itself. Review attempts retain their execution
+foreign key and the ordinary candidate/admission fences. While the
+Workspace's machine is away the branch cannot be read: nothing is decided, no
+"nothing to review" park is stated, and the Task waits for the machine.
+
+With no delivery candidate the review parks as
+`failure { failure_kind: review_blocked }` with `blocking_reason`
+`review_candidate_missing`, "nothing to review", and the existing
+`execution_failed` Attention category. It offers Approve (the owner's decision,
+exactly as before the park existed), Send Back to add work, and Cancel; no
+reviewer retry is offered because there is nothing to retry on. Sending a
+coordination root back holds it in implementation so the owner can add
+corrective subtasks before Release; it cannot immediately advance to the same
+empty review. An ordinary Task takes its configured rejection transition. The
+park is stated once; unchanged dispatcher passes add no Task write, event,
+step, execution or Attention incident.
+
+The candidate of a coordination root is the latest implementation run of any
+subtask, cancelled ones included (their commits are on the root's branch). A
+root with no such run and a lead triggers planning once per review entry and
+charges only the existing `replan` budget; exhaustion leaves the root in the
+existing `budget_exhausted { replan }` park. Without a lead it uses the owner
+park above, naming "every subtask was cancelled" when that is the case. An
+unassigned, check-less gate that requires no human approval still skips into
+`merging` by configuration. The merge entry finishes a root whose subtasks were
+all cancelled as `done` without a merge when it arrives from the review gate
+(skipped by configuration or approved by the owner) and it has no Workspace or
+its branch is proven unchanged and clean. A changed, dirty or unreadable branch
+keeps the ordinary integration handling.
+
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
 
 The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only. A role-launching offer (`start`, role `retry`, `release`) is made for one role, resolved in one place (`workflow::action_role`): the role of the Task's state, else the role of the state a claim would enter (the first outgoing Active state, else the first Gate). The Agent the offer needs, the role stored with the queued action, its replay and the claim all use that role, so `start` on a `todo` Task runs its coder, waits for capacity when the coder is busy, and is not offered while that Agent is paused or offline.
@@ -7801,8 +7840,11 @@ Genesis and Project artifact commands, and chat/usage-index persistence use
 typed DB functions in the corresponding aggregate modules.
 Task lifecycle, role and lead reads, plan transport, workspace-root startup and
 migration, integration adapters, memory backfills, and environment, authorization
-and notification projections also use typed DB query helpers. Workspace-root
-path statements live in `sqlite/workspace_root.rs`; their rewrite transaction
+and notification projections also use typed DB query helpers.
+Task-step queue, conflict-hotspot episodes, periodic worker health and workflow
+transition/hook statements likewise live in their DB aggregate modules; queue
+and workflow services retain each statement's original connection and await order.
+Workspace-root path statements live in `sqlite/workspace_root.rs`; their rewrite transaction
 remains owned by the migration service, including its original deferred begin.
 The services retain policy and transaction ownership; queries participating in
 those transactions accept the caller's `SqliteConnection`. Read projections

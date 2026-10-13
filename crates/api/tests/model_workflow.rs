@@ -381,7 +381,7 @@ impl ScriptedAdapter {
             &format!("{}:read", ctx.execution_id),
         )
         .await
-        .map_err(|e| ExecutorError::Other(e.to_string()))?;
+        .map_err(|e| ExecutorError::Other(format!("model lead read: {e:?}")))?;
         let children = read["subtasks"].as_array().expect("lead reads subtasks");
         let mut calls = vec![(
             "lead.subtask",
@@ -409,10 +409,18 @@ impl ScriptedAdapter {
             .await;
             let value = match result {
                 Ok(value) => value,
-                Err(error) if error.to_string().contains("lead_limit_reached") => continue,
+                Err(forge_agent_host::AgentHostError::StructuredOutcome(outcome))
+                    if outcome.code == api_types::OutcomeCode::ValidationError
+                        && outcome
+                            .details
+                            .as_ref()
+                            .is_some_and(|details| details["refusal"] == "lead_limit_reached") =>
+                {
+                    continue
+                }
                 Err(error) => {
                     return Err(ExecutorError::Other(format!(
-                        "model lead operation: {error}"
+                        "model lead operation {operation}: {error:?}"
                     )))
                 }
             };
@@ -1111,7 +1119,14 @@ impl CodingExecutorAdapter for ScriptedAdapter {
                 if step_check {
                     self.step_check(&ctx).await?;
                 } else {
-                    if let Err(error) = self.replan_operations(&ctx).await {
+                    let operations = self.replan_operations(&ctx).await;
+                    // A crash can close this process's pool while its native
+                    // tool awaits a read. The dead process reports neither a
+                    // tool failure nor a completion to the surviving oracle.
+                    if !self.0.alive.load(Ordering::SeqCst) {
+                        return std::future::pending().await;
+                    }
+                    if let Err(error) = operations {
                         self.0
                             .shared
                             .lead_operation_errors
@@ -3471,7 +3486,10 @@ async fn run_all(mut cases: Vec<(String, Vec<Step>)>, avoid: bool) {
 }
 
 /// Seeds every run covers, so a regression in one of them is a stable failure.
-const FIXED_SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 610875980, 207044633, 749274245];
+const FIXED_SEEDS: [u64; 14] = [
+    1, 2, 3, 5, 8, 909358760, 213412165, 974622785, 637240885, 277839211, 580812352, 610875980,
+    207044633, 749274245,
+];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_sequences_keep_every_task_live() {

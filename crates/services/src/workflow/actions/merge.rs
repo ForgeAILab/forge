@@ -21,6 +21,39 @@ pub struct RunMerge;
 #[async_trait]
 impl HookAction for RunMerge {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        let current = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        match ctx
+            .task_service
+            .empty_cancelled_root_has_no_commits(&current)
+            .await
+        {
+            Ok(true) if passed_review_gate(ctx) => {
+                if let Some(to) = ctx
+                    .workflow
+                    .outgoing_trigger_targets(&ctx.to_state)
+                    .find_map(|(trigger, target)| {
+                        (trigger == api_types::WorkflowTrigger::Accept
+                            && ctx.workflow.state_kind(&target)
+                                == Some(api_types::StateKind::Terminal))
+                        .then_some(target)
+                    })
+                {
+                    return HookResult::Cascade {
+                        to: to.to_owned(),
+                        reason:
+                            "nothing delivered: every subtask was cancelled; no commits to merge"
+                                .into(),
+                        bridge: Default::default(),
+                    };
+                }
+            }
+            // Anything else, an unreadable Workspace included, keeps the
+            // ordinary integration handling below.
+            Ok(_) | Err(_) => {}
+        }
         let Some(merge_service) = ctx.merge_service.as_ref() else {
             return HookResult::Skipped {
                 reason: "merge service not configured".to_string(),
@@ -199,6 +232,17 @@ impl HookAction for RunMerge {
         }
         HookResult::Ok
     }
+}
+
+/// The empty sequence finishes only when it arrives from its review gate:
+/// the gate skipped by configuration, or the owner decided it. A move into
+/// merging from any other state is not a pass of that gate.
+fn passed_review_gate(ctx: &HookContext) -> bool {
+    ctx.workflow.states.iter().any(|state| {
+        state.name == ctx.from_state
+            && state.kind == api_types::StateKind::Gate
+            && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+    })
 }
 
 /// Whether the running hooks step is one the old merge path left: it

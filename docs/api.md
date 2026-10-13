@@ -3367,6 +3367,20 @@ merge-repair Retry hands ownership to fresh review. Both paths retain the
 attempt lineage and launch no coder on the root. The action objects and park
 enums are unchanged.
 
+In review, an Agent reviewer, and configured checks on a Task that has a
+Workspace and is not read-only, need a delivered candidate: an implementation
+run, or the owner's own commits on the Task branch (merges of the target alone
+do not count), which get the ordinary checks and reviewer; the delivery evidence
+records their exact base/head without an Agent implementation run. With no
+candidate, the Task states `review_blocked` with `blocking_reason`
+`review_candidate_missing` and raises the existing `execution_failed` Attention
+category. Its offers are Approve (the owner's decision, as before the park),
+Send Back to add work, and Cancel; a reviewer retry is not offered. A
+lead-managed empty root re-plans within its existing `replan` budget first.
+Sending a root back holds it in implementation until corrective subtasks are
+added and the root is released. Human reviewers and owner-approval gates
+without checks are unchanged.
+
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
 MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Native action reasons/guidance live inside that object; the retired generic envelope `reason`/`decision` properties are removed. Single-Task reads include caller-filtered offers; REST and MCP Task lists omit offers and MCP Task pages use `items`. The Project Agent's admitted native `work.read` projection carries live per-Task offers and versions. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.

@@ -1115,7 +1115,7 @@ impl TaskService {
             .find(|(candidate, _)| *candidate == trigger)
             .map(|(_, target)| target)
             .expect("offer guarantees a workflow target");
-        Ok(self
+        let moved = self
             .transition(
                 task.id.clone(),
                 target,
@@ -1142,7 +1142,21 @@ impl TaskService {
                 },
             )
             .await?
-            .task)
+            .task;
+        // The owner decided a review that had nothing to review. That park
+        // ends with the decision: left on the Task it would be read as the
+        // state of a later, ordinary review.
+        if task
+            .condition
+            .read()
+            .diagnostic
+            .as_ref()
+            .is_some_and(|annotation| annotation.blocking_reason == super::MISSING_REVIEW_CANDIDATE)
+        {
+            return super::transition::clear_manual_advance_error_annotation(&self.db, task, moved)
+                .await;
+        }
+        Ok(moved)
     }
 
     pub(crate) async fn apply_review_check_retry(

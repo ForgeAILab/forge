@@ -406,3 +406,8 @@ pub use sqlite::coordination_root_visible_children_in_connection;
 pub use sqlite::TaskRepositoryAuthoritySourceRow;
 
 pub use sqlite::LatestTaskStateEntrySourceRow;
+
+pub use sqlite::{
+    ConflictHandoffHistoryRow, ConflictHandoffSourceRow, InsertWorkflowTransitionLogInput,
+    WorkflowProjectAuthorityRow, WriteWorkflowTransitionStateInput, CONFLICT_HANDOFF_QUERY,
+};

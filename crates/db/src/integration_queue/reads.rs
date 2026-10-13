@@ -10,6 +10,29 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite};
 
+/// Queue membership read by a Task-step drain, including its present head.
+pub struct IntegrationDrainMemberRow {
+    pub state: String,
+    pub queue_state: Option<String>,
+    pub head_task: Option<String>,
+    pub claimable: bool,
+    pub holds_slot: bool,
+    pub in_entry: bool,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for IntegrationDrainMemberRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            state: row.try_get(0)?,
+            queue_state: row.try_get(1)?,
+            head_task: row.try_get(2)?,
+            claimable: row.try_get(3)?,
+            holds_slot: row.try_get(4)?,
+            in_entry: row.try_get(5)?,
+        })
+    }
+}
+
 /// An attempt "in progress". A finished attempt (`completed`, `cancelled`,
 /// `superseded`) is never current: the table's CHECK says so.
 const LIVE: &str = "a.current=1";
@@ -697,5 +720,52 @@ impl SqliteDb {
             .bind(task_id)
             .fetch_one(self.pool())
             .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_has_due_parked_integration(&self, task_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE task_ref=? AND current=1 \
+                 AND state='parked' AND cancel_requested_at IS NULL AND available_at IS NOT NULL \
+                 AND julianday(available_at)<=julianday('now'))",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_head_check_waits_for_slot(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integration_attempt a \
+                           JOIN check_consumer c ON c.task_id=a.task_ref AND c.origin='integration' AND c.status_epoch=a.expected_epoch \
+                           JOIN check_run r ON r.id=c.run_id \
+                         WHERE a.task_ref=? AND a.current=1 AND a.state='checking' \
+                           AND c.cancelled_at IS NULL AND c.result_id IS NULL \
+                           AND r.state='queued' AND r.capacity_wait_since IS NOT NULL)")
+            .bind(task_id)
+            .fetch_one(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_integration_drain_member(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<IntegrationDrainMemberRow>> {
+        Ok(sqlx::query_as::<_, IntegrationDrainMemberRow>("SELECT a.state, \
+                    (SELECT q.state FROM integration_queue q WHERE q.id=a.queue_id), \
+                    (SELECT h.task_ref FROM integration_queue q JOIN integration_attempt h ON h.id=q.head_attempt_id WHERE q.id=a.queue_id), \
+                    (a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday('now'))), \
+                    EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=a.queue_id AND q.head_attempt_id=a.id), \
+                    (t.status=a.expected_status AND t.status_epoch=a.expected_epoch) \
+             FROM integration_attempt a JOIN task t ON t.id=a.task_ref \
+             WHERE a.task_ref=? AND a.current=1 AND a.queue_id IS NOT NULL AND t.deleted_at IS NULL")
+            .bind(task_id)
+            .fetch_optional(self.pool()).await?)
     }
 }

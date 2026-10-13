@@ -986,6 +986,20 @@ async fn run_ci_steps_skips_when_workspace_missing() {
     )
     .await;
     ctx.state_config = json!({ "ci_steps": ["cargo test"] });
+    // With a delivered run the missing Workspace is what skips the checks;
+    // without one the entry parks as a review with nothing to review.
+    let now = db::now_rfc3339();
+    db::ExecutionRepo::create(
+        &*ctx.db,
+        serde_json::from_value(json!({
+            "id": db::new_uuid_v4(), "task_id": ctx.task_id, "role": "coder",
+            "status": db::ExecutionStatus::Completed,
+            "summary": "delivered", "created_at": now, "updated_at": now
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
 
     let result = run_ci(&ctx).await;
 
@@ -995,8 +1009,11 @@ async fn run_ci_steps_skips_when_workspace_missing() {
     }
 }
 
+/// Configured checks cannot run without a delivered candidate. The entry no
+/// longer skips them silently (which left the Task in review with nothing
+/// queued): it states the "nothing to review" park for the owner.
 #[tokio::test]
-async fn run_ci_steps_skips_when_executor_execution_missing() {
+async fn run_ci_steps_parks_when_executor_execution_missing() {
     let mut ctx = build_test_ctx(
         "task-run-review-runner-missing",
         default_states::IN_PROGRESS,
@@ -1010,9 +1027,23 @@ async fn run_ci_steps_skips_when_executor_execution_missing() {
     let result = run_ci(&ctx).await;
 
     match result {
-        HookResult::Skipped { reason } => assert!(reason.contains("no executor execution")),
+        HookResult::Skipped { reason } => assert!(reason.contains("nothing to review")),
         other => panic!("expected skipped result, got {other:?}"),
     }
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task.condition
+            .read()
+            .diagnostic
+            .as_ref()
+            .is_some_and(|annotation| annotation.blocking_reason
+                == crate::task_service::MISSING_REVIEW_CANDIDATE),
+        "{:?}",
+        task.condition
+    );
 }
 
 #[tokio::test]

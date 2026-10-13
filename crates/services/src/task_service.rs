@@ -68,7 +68,9 @@ mod proposal;
 mod reorder_subtasks;
 mod repository_authority;
 mod review;
+mod review_candidate;
 pub(crate) use review::retired_review_rerun;
+pub(crate) use review_candidate::MISSING_REVIEW_CANDIDATE;
 #[cfg(test)]
 pub(crate) use update::retired_auditor_notice_key;
 pub(crate) use update::state_retired_auditor_notices;

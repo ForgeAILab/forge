@@ -1,4 +1,66 @@
 use super::*;
+
+impl SqliteDb {
+    /// A human-authored branch submission is delivery evidence, not a
+    /// dispatched execution. Keep the exact Git evidence and all authority
+    /// fences in the Review candidate's existing execution record.
+    pub async fn create_branch_review_candidate(
+        &self,
+        task: &Task,
+        project: &Project,
+        workspace: &Workspace,
+        base: &str,
+        head: &str,
+    ) -> Result<Execution> {
+        if !crate::task_writer::owns_task(&task.id) || base == head {
+            return Err(DbError::Check(
+                "branch Review submission requires the Task step and new commits".into(),
+            ));
+        }
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task t JOIN project p ON p.id=t.project_id JOIN workspace w ON w.id=? WHERE t.id=? AND t.version=? AND t.status=? AND t.deleted_at IS NULL AND p.version=? AND p.workflow_definition=? AND w.task_id=COALESCE(t.parent_task_id,t.id) AND w.repo_id=? AND w.branch=? AND w.status='ready' AND w.before_sha IS ? AND w.updated_at=?)")
+            .bind(&workspace.id).bind(&task.id).bind(task.version).bind(&task.status)
+            .bind(project.version).bind(&project.workflow_definition).bind(&workspace.repo_id)
+            .bind(&workspace.branch).bind(&workspace.before_sha).bind(&workspace.updated_at)
+            .fetch_one(&mut *tx).await?;
+        if !valid
+            || latest_review_candidate_in_tx(&mut tx, &task.id)
+                .await?
+                .is_some()
+        {
+            return Err(DbError::VersionConflict);
+        }
+        let now = crate::now_rfc3339();
+        let input = CreateExecution {
+            id: crate::new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: "coder".into(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("human branch submission; no Forge implementation process ran".into()),
+            logs_path: None,
+            before_sha: Some(base.into()),
+            after_sha: Some(head.into()),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let candidate = self.create_execution_in_tx(&mut tx, &input, None).await?;
+        tx.commit().await?;
+        Ok(candidate)
+    }
+}
 use crate::new_uuid_v4;
 use crate::repository::{CreateManualReviewPass, SettleCarriedReview};
 

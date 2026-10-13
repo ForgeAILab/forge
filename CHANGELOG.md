@@ -3294,7 +3294,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   attempt with no way forward. Corrective children can execute under the
   active `merge_failed` root instead of being refused as though it were a
   review gate.
-
+- A Task in review with an Agent reviewer, or with configured checks and a
+  Workspace, and nothing delivered to review (every
+  subtask of a root was cancelled, or the owner moved a Task into review without
+  a run) no longer rests with no next step. It parks as `review_blocked`
+  (`blocking_reason: review_candidate_missing`, "nothing to review") and raises
+  the existing `execution_failed` Attention item. Approve, Send Back and Cancel
+  stay available to the owner, as before. With a lead, the empty root re-plans
+  within its existing `replan` budget first. Human reviewers, owner-approval
+  gates without checks are unchanged.
+- A Task the owner moves into review with their own commits on the Task branch
+  (and no Agent run) now gets the configured checks and Agent reviewer on those
+  commits. Merges of the target branch alone do not count as a submission.
+- A root whose subtasks were all cancelled and whose branch is unchanged now
+  finishes as `done` when it leaves review for `merging` (review skipped by
+  configuration, or approved by the owner) instead of waiting in `merging` for
+  a merge of nothing. A changed, dirty or unreadable branch keeps the ordinary
+  merge handling.
 - Interrupted review-refresh recovery now uses one entry-keyed durable cascade and honors existing failure parks. An unrecoverable `merge_failed` Task raises Attention with Restart/Cancel instead of appending two failed recovery commands on every dispatcher pass; transient recovery uses the Task-step worker's bounded retries. A Task whose machine is away waits for the machine instead; if the park is lifted while the Task stays in `merge_failed`, one new recovery attempt runs (it used to be swallowed by the ended one, leaving the Task with no step and no park).
 - Paused-integration resume, unchanged merge-admission refusals, and accepted role retries waiting for machine capacity no longer append recovery/admission commands on every dispatcher pass. Accepted retries keep their intent and proceed when capacity is released.
 - A planner failure while its Agent is paused no longer leaves the Task clear

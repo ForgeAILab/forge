@@ -192,7 +192,7 @@ impl TaskStepWorker {
             );
             workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
                 && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
-                && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status='done')").bind(task_id).fetch_one(self.db.pool()).await?
+                && self.db.task_has_completed_integration_step(task_id).await?
         } else {
             false
         };
@@ -242,8 +242,7 @@ impl TaskStepWorker {
             }
         }
         if command.preempt {
-            let hooks: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed','suspended') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
-                .bind(task_id).fetch_one(self.db.pool()).await?;
+            let hooks: bool = self.db.task_has_preemptible_work(task_id).await?;
             payload["preempting_hooks"] = serde_json::json!(hooks);
         }
         let id = db::new_uuid_v4();
@@ -466,8 +465,11 @@ impl TaskStepWorker {
         })
     }
     async fn claim_inline_head(&self, task_id: &str) -> Result<Option<TaskStep>> {
-        let lane = sqlx::query_scalar::<_, String>("SELECT lane FROM task_step WHERE task_id=? AND status IN ('pending','claimed') ORDER BY CASE WHEN integration_started_at IS NOT NULL THEN 2 ELSE priority END DESC,seq LIMIT 1")
-            .bind(task_id).fetch_optional(self.db.pool()).await?.unwrap_or_else(||"fast".to_owned());
+        let lane = self
+            .db
+            .task_step_head_lane(task_id)
+            .await?
+            .unwrap_or_else(|| "fast".to_owned());
         Ok(self
             .db
             .claim_step_lane(
@@ -616,14 +618,7 @@ impl TaskStepWorker {
             // line by the worker's sweep, whether or not the Task is still
             // in the entry it was admitted in: one that left is cancelled
             // and its statement cleared.
-            let due: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE task_ref=? AND current=1 \
-                 AND state='parked' AND cancel_requested_at IS NULL AND available_at IS NOT NULL \
-                 AND julianday(available_at)<=julianday('now'))",
-            )
-            .bind(task_id)
-            .fetch_one(self.db.pool())
-            .await?;
+            let due: bool = self.db.task_has_due_parked_integration(task_id).await?;
             if pump && (queued_head.is_some() || suspended || due) {
                 for driver in integration.sweep_once().await? {
                     drivers.spawn(driver.run(stop.child_token()));
@@ -710,17 +705,10 @@ impl TaskStepWorker {
                     // The sweep just tried to admit the head's check. One
                     // still queued behind a full machine is answered only
                     // when a run ends elsewhere: nothing here can advance it.
-                    let waits_for_slot: bool = sqlx::query_scalar(
-                        "SELECT EXISTS(SELECT 1 FROM integration_attempt a \
-                           JOIN check_consumer c ON c.task_id=a.task_ref AND c.origin='integration' AND c.status_epoch=a.expected_epoch \
-                           JOIN check_run r ON r.id=c.run_id \
-                         WHERE a.task_ref=? AND a.current=1 AND a.state='checking' \
-                           AND c.cancelled_at IS NULL AND c.result_id IS NULL \
-                           AND r.state='queued' AND r.capacity_wait_since IS NOT NULL)",
-                    )
-                    .bind(&head_task)
-                    .fetch_one(self.db.pool())
-                    .await?;
+                    let waits_for_slot: bool = self
+                        .db
+                        .integration_head_check_waits_for_slot(&head_task)
+                        .await?;
                     if waits_for_slot && self.db.pending_steps(task_id).await? == 0 {
                         return TaskRepo::get_by_id(&*self.db, task_id, false)
                             .await?
@@ -801,22 +789,17 @@ impl TaskStepWorker {
     /// The flag: the Task is a queued member of a queue that is not open.
     #[cfg(any(test, feature = "test-support"))]
     async fn integration_head_task(&self, task_id: &str) -> Result<(Option<String>, bool)> {
-        /// State, queue state, head Task, claimable, holds the slot, in its entry.
-        type Member = (String, Option<String>, Option<String>, bool, bool, bool);
-        let row: Option<Member> = sqlx::query_as(
-            "SELECT a.state, \
-                    (SELECT q.state FROM integration_queue q WHERE q.id=a.queue_id), \
-                    (SELECT h.task_ref FROM integration_queue q JOIN integration_attempt h ON h.id=q.head_attempt_id WHERE q.id=a.queue_id), \
-                    (a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday('now'))), \
-                    EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=a.queue_id AND q.head_attempt_id=a.id), \
-                    (t.status=a.expected_status AND t.status_epoch=a.expected_epoch) \
-             FROM integration_attempt a JOIN task t ON t.id=a.task_ref \
-             WHERE a.task_ref=? AND a.current=1 AND a.queue_id IS NOT NULL AND t.deleted_at IS NULL",
-        )
-        .bind(task_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        let Some((state, queue_state, head_task, claimable, holds_slot, in_entry)) = row else {
+        let row: Option<db::IntegrationDrainMemberRow> =
+            self.db.task_integration_drain_member(task_id).await?;
+        let Some(db::IntegrationDrainMemberRow {
+            state,
+            queue_state,
+            head_task,
+            claimable,
+            holds_slot,
+            in_entry,
+        }) = row
+        else {
             return Ok((None, false));
         };
         if !in_entry && !holds_slot {
@@ -887,21 +870,12 @@ impl TaskStepWorker {
             &step.task_id,
             control.preempt.clone(),
         );
-        let integration: bool = sqlx::query_scalar(
-            "SELECT integration_started_at IS NOT NULL FROM task_step WHERE id=?",
-        )
-        .bind(&step.id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let integration: bool = self.db.task_step_integration_started(&step.id).await?;
         control
             .critical
             .store(integration, std::sync::atomic::Ordering::SeqCst);
         let mut preempt = control.preempt.subscribe();
-        let requested: bool =
-            sqlx::query_scalar("SELECT preempt_requested_at IS NOT NULL FROM task_step WHERE id=?")
-                .bind(&step.id)
-                .fetch_one(self.db.pool())
-                .await?;
+        let requested: bool = self.db.task_step_preemption_requested(&step.id).await?;
         if requested {
             control.preempt.send_replace(true);
         }
@@ -1171,8 +1145,18 @@ impl TaskStepWorker {
                 )
                 .await?;
                 for operation in operations {
-                    sqlx::query("UPDATE task_step SET status='superseded',last_error=?,updated_at=? WHERE id=? AND task_id=? AND status IN ('failed','parked')")
-                        .bind(if unconfirmed {"remote_operation_unconfirmed"}else{"preempted by owner command"}).bind(db::now_rfc3339()).bind(operation.step_id).bind(&step.task_id).execute(self.db.pool()).await?;
+                    self.db
+                        .supersede_failed_remote_task_step(
+                            if unconfirmed {
+                                "remote_operation_unconfirmed"
+                            } else {
+                                "preempted by owner command"
+                            },
+                            db::now_rfc3339(),
+                            operation.step_id,
+                            &step.task_id,
+                        )
+                        .await?;
                 }
             }
             let result = if command.operation == "engine_transition" {
@@ -1247,11 +1231,13 @@ impl TaskStepWorker {
                 self.db
                     .finish_step_in_tx(&mut tx, step, status, error.as_deref())
                     .await?;
-                sqlx::query("UPDATE task_step SET result_json=? WHERE id=? AND claimed_by=?")
-                    .bind(&stored)
-                    .bind(&step.id)
-                    .bind(&step.claimed_by)
-                    .execute(&mut *tx)
+                self.db
+                    .store_task_step_command_result_in_tx(
+                        &mut tx,
+                        &stored,
+                        &step.id,
+                        &step.claimed_by,
+                    )
                     .await?;
                 tx.commit().await?;
                 Ok(())
@@ -1370,7 +1356,10 @@ impl TaskStepWorker {
             }
             let mut tx = db::begin_immediate(self.db.pool()).await?;
             self.db.fence_hook_in_tx(&mut tx, step).await?;
-            let merged:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND json_type(json_extract(effects_json,'$.merge_outcome'),'$.Done') IS NOT NULL)").bind(&step.id).fetch_one(&mut *tx).await?;
+            let merged: bool = self
+                .db
+                .task_hook_step_merge_done_in_tx(&mut tx, &step.id)
+                .await?;
             if result.failure.is_none() && merged {
                 let task = self
                     .db
@@ -1380,8 +1369,14 @@ impl TaskStepWorker {
                 if crate::deferred_dispatch::paused_integration(&task)
                     .is_some_and(|m| m.state == step.expected_status)
                 {
-                    sqlx::query("UPDATE task SET metadata_json=json_set(json_remove(COALESCE(metadata_json,'{}'),'$.paused_integration'),'$.paused_integration_generation',COALESCE(json_extract(metadata_json,'$.paused_integration_generation'),0)+1),updated_at=? WHERE id=? AND version=?")
-                        .bind(db::now_rfc3339()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+                    self.db
+                        .consume_paused_integration_after_merge_in_tx(
+                            &mut tx,
+                            db::now_rfc3339(),
+                            &task.id,
+                            task.version,
+                        )
+                        .await?;
                     self.db
                         .state_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy)
                         .await?;
@@ -1399,9 +1394,8 @@ impl TaskStepWorker {
                 follow_up.available_at = db::now_rfc3339();
                 self.db.enqueue_step_in_tx(&mut tx, &follow_up).await?;
                 if merged {
-                    sqlx::query("UPDATE task_step SET priority=2 WHERE id=?")
-                        .bind(&follow_up.id)
-                        .execute(&mut *tx)
+                    self.db
+                        .prioritize_merged_follow_up_step_in_tx(&mut tx, &follow_up.id)
                         .await?;
                 }
             } else if let Some(error) = result.merge_failure {
@@ -1598,9 +1592,9 @@ impl TaskStepWorker {
             .get_task_in_tx(&mut tx, &step.task_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", step.task_id.clone()))?;
-        let observed_epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
-            .bind(&step.task_id)
-            .fetch_one(&mut *tx)
+        let observed_epoch: i64 = self
+            .db
+            .task_step_settlement_epoch_in_tx(&mut tx, &step.task_id)
             .await?;
         let matches = task.deleted_at.is_none()
             && task.status == step.expected_status
@@ -1716,9 +1710,18 @@ impl TaskStepWorker {
             serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop"})
                 .to_string()
         });
-        let written = sqlx::query("UPDATE task SET error_annotation=?,blocked_json=COALESCE(?,blocked_json),version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL")
-            .bind(annotation.to_string()).bind(&blocked).bind(&now).bind(&step.task_id).bind(task.version)
-            .execute(&mut **tx).await?.rows_affected();
+        let written = self
+            .db
+            .annotate_task_step_failure_in_tx(
+                tx,
+                annotation.to_string(),
+                &blocked,
+                &now,
+                &step.task_id,
+                task.version,
+            )
+            .await?
+            .rows_affected();
         if written != 1 {
             return Err(db::DbError::VersionConflict.into());
         }

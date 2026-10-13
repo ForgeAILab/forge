@@ -604,6 +604,50 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if dependency_cancelled {
         return offers;
     }
+    // Nothing was delivered for this review, so the reviewer has no
+    // candidate and a reviewer retry would park again. The decision is the
+    // owner's, exactly as before the park existed: approve the gate, send
+    // the Task back to add work, or cancel it (offered above).
+    if task.status == "review"
+        && condition == Some(FailureKind::ReviewBlocked)
+        && snapshot.annotation().is_some_and(|annotation| {
+            annotation.blocking_reason == crate::task_service::MISSING_REVIEW_CANDIDATE
+        })
+    {
+        if target(WorkflowTrigger::Accept).is_some() {
+            offer(
+                TaskAction::Approve {
+                    reason: None,
+                    override_checks: Some(false),
+                },
+                &[],
+                &[Owner],
+                "gate_waiting_for_decision",
+                state
+                    .gate_config
+                    .as_ref()
+                    .and_then(|gate| gate.approve_label.as_deref())
+                    .unwrap_or("Approve"),
+            );
+        }
+        if target(WorkflowTrigger::Reject).is_some() {
+            offer(
+                TaskAction::SendBack {
+                    guidance: String::new(),
+                },
+                &["guidance"],
+                &[Owner],
+                if snapshot.coordination_root {
+                    "root_review_reopen"
+                } else {
+                    "gate_can_reject"
+                },
+                "Send Back to Add Work",
+            );
+        }
+        append_owner_advance(snapshot, &mut offers);
+        return offers;
+    }
     if condition_read.hard_failure {
         if workflow
             .states

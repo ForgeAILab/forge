@@ -140,7 +140,7 @@ pub(super) async fn passes(lead: &Lead, count: usize) {
 /// Wait for the spawned executor task to settle its execution, then let the
 /// dispatcher act on what it left.
 pub(super) async fn until(lead: &Lead, what: &str, done: impl AsyncFn() -> bool) {
-    for _ in 0..200 {
+    for _ in 0..600 {
         if done().await {
             return;
         }
@@ -1121,8 +1121,8 @@ async fn upgrade_matrix_every_root_and_subtask_state_is_owned() {
 }
 
 /// All-cancelled is a complete sequence. The aggregate gate is entered in
-/// both modes. With no candidate a configured reviewer is refused; an
-/// unassigned, check-less gate passes exactly as in the pre-feature product.
+/// both modes. Missing work parks for the owner, or spends the lead re-plan
+/// budget; an unassigned, check-less gate keeps its configured skip.
 #[tokio::test]
 async fn all_cancelled_subtasks_enter_aggregate_review_with_and_without_a_lead() {
     for with_lead in [false, true] {
@@ -1152,19 +1152,38 @@ async fn all_cancelled_subtasks_enter_aggregate_review_with_and_without_a_lead()
                     &lead,
                     "the missing aggregate candidate is stated",
                     async || {
-                        serde_json::to_value(reload(&lead.db, &root.id).await.condition.public())
-                            .unwrap()["primary"]["kind"]
-                            == "dispatch_refusal"
+                        reload(&lead.db, &root.id)
+                            .await
+                            .condition
+                            .reasons()
+                            .any(|reason| {
+                                if with_lead {
+                                    matches!(
+                                        reason,
+                                        db::ParkReason::BudgetExhausted {
+                                            budget_kind: Some(db::budget::Kind::Replan),
+                                            ..
+                                        }
+                                    )
+                                } else {
+                                    matches!(
+                                        reason,
+                                        db::ParkReason::Failure {
+                                            failure_kind: api_types::FailureKind::ReviewBlocked
+                                        }
+                                    )
+                                }
+                            })
                     },
                 )
                 .await;
                 let task = reload(&lead.db, &root.id).await;
                 assert_eq!(task.status, "review");
                 assert!(task
-                    .metadata_json
+                    .error_annotation
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("no implementation execution to review"));
+                    .contains("every subtask was cancelled"));
                 assert!(ReviewRepo::list_by_task(&*lead.db, &root.id)
                     .await
                     .unwrap()
@@ -1189,7 +1208,11 @@ async fn all_cancelled_subtasks_enter_aggregate_review_with_and_without_a_lead()
             let hops = super::root_replan::log(&lead, &root.id).await;
             assert_eq!(
                 hops.iter().filter(|(_, to, _)| to == "review").count(),
-                1,
+                if with_lead && with_reviewer {
+                    usize::try_from(db::budget::Kind::Replan.default_limit()).unwrap() + 1
+                } else {
+                    1
+                },
                 "{hops:?}"
             );
             assert!(
@@ -1202,6 +1225,11 @@ async fn all_cancelled_subtasks_enter_aggregate_review_with_and_without_a_lead()
             assert_eq!(
                 runs.iter().filter(|(role, _)| role == "planner").count(),
                 usize::from(with_lead)
+                    + if with_lead && with_reviewer {
+                        usize::try_from(db::budget::Kind::Replan.default_limit()).unwrap()
+                    } else {
+                        0
+                    }
             );
             assert_eq!(
                 runs.iter().filter(|(role, _)| role == "reviewer").count(),

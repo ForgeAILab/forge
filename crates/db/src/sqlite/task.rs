@@ -6,6 +6,67 @@ use crate::{
 };
 use std::collections::HashSet;
 
+// Existing Project and Task/state/time indexes bound the seek before parsing.
+// One query supplies every eligible path; UTC RFC3339 bounds match DB writers.
+pub const CONFLICT_HANDOFF_QUERY: &str =
+    "SELECT tl.id, tl.task_id, tl.bridge_kind, tl.bridge_payload, tl.created_at
+    FROM task t JOIN transition_log tl ON tl.task_id = t.id
+    WHERE t.project_id = ? AND tl.from_state = 'merging' AND tl.to_state = 'merge_failed'
+      AND tl.triggered_by = ? AND tl.created_at > ? AND tl.created_at <= ?
+    ORDER BY tl.created_at DESC, tl.rowid DESC";
+
+/// Authoritative handoff fields, decoded only when the consumer needs them.
+pub struct ConflictHandoffSourceRow {
+    row: SqliteRow,
+}
+
+impl ConflictHandoffSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn from_state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("from_state")?)
+    }
+    pub fn to_state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("to_state")?)
+    }
+    pub fn triggered_by(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("triggered_by")?)
+    }
+    pub fn bridge_kind(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("bridge_kind")?)
+    }
+    pub fn bridge_payload(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("bridge_payload")?)
+    }
+    pub fn created_at(&self) -> String {
+        self.row.get("created_at")
+    }
+}
+
+/// Historical handoffs decoded in the consumer's original per-row order.
+pub struct ConflictHandoffHistoryRow {
+    row: SqliteRow,
+}
+
+impl ConflictHandoffHistoryRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn bridge_kind(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("bridge_kind")?)
+    }
+    pub fn bridge_payload(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("bridge_payload")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
 /// The Task whose own row decides who holds `role_name` on `task_id`: the
 /// Task itself, except for the step-check role of a subtask in an inherited
 /// workflow state, which its root holds
@@ -5259,5 +5320,251 @@ impl SqliteDb {
         "SELECT id, created_at FROM transition_log WHERE task_id = ? AND to_state = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
     ).bind(task_id).bind(to_state).fetch_optional(self.pool()).await?;
         Ok(rows.map(|row| LatestTaskStateEntrySourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn consume_paused_integration_after_merge_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: String,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET metadata_json=json_set(json_remove(COALESCE(metadata_json,'{}'),'$.paused_integration'),'$.paused_integration_generation',COALESCE(json_extract(metadata_json,'$.paused_integration_generation'),0)+1),updated_at=? WHERE id=? AND version=?")
+            .bind(updated_at)
+            .bind(task_id)
+            .bind(version)
+            .execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_step_settlement_epoch_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+                .bind(task_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn annotate_task_step_failure_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        annotation_json: String,
+        blocked_json: &Option<String>,
+        updated_at: &str,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET error_annotation=?,blocked_json=COALESCE(?,blocked_json),version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL")
+            .bind(annotation_json)
+            .bind(blocked_json)
+            .bind(updated_at)
+            .bind(task_id)
+            .bind(version)
+            .execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn conflict_handoff_source(
+        &self,
+        transition_log_id: &str,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ConflictHandoffSourceRow>> {
+        Ok(sqlx::query("SELECT tl.id, tl.from_state, tl.to_state, tl.triggered_by, tl.bridge_kind, tl.bridge_payload, tl.created_at
+            FROM transition_log tl JOIN task t ON t.id = tl.task_id
+            WHERE tl.id = ? AND t.id = ? AND t.project_id = ?")
+            .bind(transition_log_id)
+            .bind(task_id)
+            .bind(project_id)
+            .fetch_optional(self.pool()).await?.map(|row| ConflictHandoffSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_conflict_handoffs_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        triggered_by: String,
+        after: String,
+        through: String,
+    ) -> crate::Result<Vec<ConflictHandoffHistoryRow>> {
+        Ok(sqlx::query(CONFLICT_HANDOFF_QUERY)
+            .bind(project_id)
+            .bind(triggered_by)
+            .bind(after)
+            .bind(through)
+            .fetch_all(connection)
+            .await?
+            .into_iter()
+            .map(|row| ConflictHandoffHistoryRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_upgrade_refused_task_ids(
+        &self,
+        refusal_code: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE deleted_at IS NULL AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.daemon_upgrade_refusal.code') END = ?")
+            .bind(refusal_code)
+            .fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_current_entry_first_transition_bridge(
+        &self,
+        task_id: &str,
+        to_state: &str,
+    ) -> crate::Result<Option<(String, Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as("SELECT id, bridge_kind, bridge_payload FROM transition_log WHERE task_id = ? AND to_state = ? AND status_epoch = (SELECT status_epoch FROM task WHERE id = ?) ORDER BY created_at, rowid LIMIT 1")
+            .bind(task_id)
+            .bind(to_state)
+            .bind(task_id)
+            .fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workflow_transition_task_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT version FROM task WHERE id=?")
+            .bind(task_id)
+            .fetch_one(connection)
+            .await?)
+    }
+}
+
+pub struct WriteWorkflowTransitionStateInput<'a> {
+    pub target_state: &'a str,
+    pub updated_at: &'a str,
+    pub entry_barrier_json: Option<&'a str>,
+    pub clear_review_passed_at: bool,
+    pub task_id: &'a str,
+    pub has_step: bool,
+    pub version: i64,
+    pub expected_status: Option<&'a str>,
+    pub expected_epoch: Option<i64>,
+}
+
+impl SqliteDb {
+    pub async fn write_workflow_transition_state_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: WriteWorkflowTransitionStateInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END,\n                     status_epoch = status_epoch + (status = ?)\n                 WHERE id = ? AND deleted_at IS NULL AND ((? = 0 AND version = ?) OR (? = 1 AND status = ? AND status_epoch = ?))")
+            .bind(input.target_state)
+            .bind(input.updated_at)
+            .bind(input.entry_barrier_json)
+            .bind(input.clear_review_passed_at)
+            .bind(input.target_state)
+            .bind(input.task_id)
+            .bind(input.has_step)
+            .bind(input.version)
+            .bind(input.has_step)
+            .bind(input.expected_status)
+            .bind(input.expected_epoch)
+            .execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn set_workflow_deferred_dispatch_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        marker_json: &str,
+        task_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch',json(?)) WHERE id=?")
+            .bind(marker_json)
+            .bind(task_id)
+            .execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_workflow_deferred_dispatch_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch') ELSE metadata_json END WHERE id=?")
+            .bind(task_id)
+            .execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn carry_paused_integration_state_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        target_state: &str,
+        task_id: &str,
+        current_status: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.paused_integration.state',?) WHERE id=? AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.paused_integration.state') END=?")
+            .bind(target_state)
+            .bind(task_id)
+            .bind(current_status)
+            .execute(connection).await?)
+    }
+}
+
+pub struct InsertWorkflowTransitionLogInput<'a> {
+    pub id: &'a str,
+    pub task_id: &'a str,
+    pub from_state: &'a str,
+    pub to_state: &'a str,
+    pub trigger_name: Option<&'a str>,
+    pub triggered_by: String,
+    pub trigger_reason: &'a str,
+    pub hook_results_json: String,
+    pub rejection: i64,
+    pub created_at: &'a str,
+    pub bridge_kind: Option<&'a str>,
+    pub bridge_payload: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn insert_workflow_transition_log_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertWorkflowTransitionLogInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO transition_log (
+                            id, task_id, from_state, to_state, trigger_name, triggered_by,
+                            trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))")
+            .bind(input.id)
+            .bind(input.task_id)
+            .bind(input.from_state)
+            .bind(input.to_state)
+            .bind(input.trigger_name)
+            .bind(input.triggered_by)
+            .bind(input.trigger_reason)
+            .bind(input.hook_results_json)
+            .bind(input.rejection)
+            .bind(input.created_at)
+            .bind(input.bridge_kind)
+            .bind(input.bridge_payload)
+            .bind(input.task_id)
+            .execute(connection).await?)
     }
 }

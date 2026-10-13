@@ -26,6 +26,94 @@ pub(super) async fn resolve_workspace(
 
 pub struct RunCiSteps;
 
+/// Both transition entry and recovered dispatch resolve the same candidate.
+/// An empty configured gate must not silently skip its required validation.
+pub(super) async fn prepare_review_entry(
+    ctx: &HookContext,
+    task: &db::Task,
+) -> Result<Option<HookResult>, String> {
+    let Some(state) = ctx
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == ctx.to_state)
+    else {
+        return Ok(None);
+    };
+    if state.kind != api_types::StateKind::Gate
+        || state.canonical_phase != Some(api_types::CanonicalPhase::Review)
+    {
+        return Ok(None);
+    }
+    // An Agent reviewer is refused dispatch for want of a candidate and
+    // configured checks are skipped without one. A human reviewer and an
+    // owner-approval gate wait for a person and keep the decisions they
+    // always had.
+    let agent_reviewer = match effective_role(state) {
+        Some(role) => get_role_assignment(ctx, role)
+            .await?
+            .is_some_and(|assignment| {
+                assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            }),
+        None => false,
+    };
+    // A read-only Task runs no implementation checks, with or without a
+    // candidate: its skipped checks are not a missing validation. Nor are
+    // those of a Task with no Workspace: the owner moves such a Task across
+    // the board by hand and its checks have nowhere to run, as before.
+    let checks = !review_ci_steps(&ctx.state_config)?.is_empty()
+        && (workspace_id(ctx).await.is_some()
+            || match task.parent_task_id.as_deref() {
+                Some(parent) => db::WorkspaceRepo::get_by_task_id(&*ctx.db, parent)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_some(),
+                None => false,
+            })
+        && !task_execution_is_read_only(ctx, task).await?;
+    if !(agent_reviewer || checks) || task.review_passed_at.is_some() {
+        return Ok(None);
+    }
+    // The branch is on a machine that is away: nothing is decided now.
+    if ctx
+        .task_service
+        .review_candidate_workspace_away(task)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "review Project is missing".to_owned())?;
+    if ctx
+        .task_service
+        .prepare_review_candidate(task, &project)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let missing = ctx
+        .task_service
+        .missing_review_candidate(task)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Some(match missing.target {
+        Some(to) => HookResult::Cascade {
+            to,
+            reason: missing.reason,
+            bridge: missing.bridge,
+        },
+        None => HookResult::Skipped {
+            reason: missing.reason,
+        },
+    }))
+}
+
 #[async_trait]
 impl HookAction for RunCiSteps {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
@@ -33,6 +121,11 @@ impl HookAction for RunCiSteps {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
+        match prepare_review_entry(ctx, &task).await {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(reason) => return HookResult::Failed { reason },
+        }
         let read_only = match task_execution_is_read_only(ctx, &task).await {
             Ok(read_only) => read_only,
             Err(reason) => return HookResult::Failed { reason },

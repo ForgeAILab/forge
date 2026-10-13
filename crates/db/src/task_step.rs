@@ -1085,6 +1085,147 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    pub async fn task_has_completed_integration_step(&self, task_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status='done')")
+            .bind(task_id)
+            .fetch_one(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_has_preemptible_work(&self, task_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed','suspended') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
+            .bind(task_id)
+            .fetch_one(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_step_head_lane(&self, task_id: &str) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT lane FROM task_step WHERE task_id=? AND status IN ('pending','claimed') ORDER BY CASE WHEN integration_started_at IS NOT NULL THEN 2 ELSE priority END DESC,seq LIMIT 1")
+            .bind(task_id)
+            .fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_step_integration_started(&self, step_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT integration_started_at IS NOT NULL FROM task_step WHERE id=?",
+        )
+        .bind(step_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_step_preemption_requested(&self, step_id: &str) -> crate::Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT preempt_requested_at IS NOT NULL FROM task_step WHERE id=?")
+                .bind(step_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn supersede_failed_remote_task_step(
+        &self,
+        last_error: &str,
+        updated_at: String,
+        step_id: String,
+        task_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task_step SET status='superseded',last_error=?,updated_at=? WHERE id=? AND task_id=? AND status IN ('failed','parked')")
+            .bind(last_error)
+            .bind(updated_at)
+            .bind(step_id)
+            .bind(task_id)
+            .execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn store_task_step_command_result_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        result_json: &str,
+        step_id: &str,
+        claimed_by: &Option<String>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(
+            sqlx::query("UPDATE task_step SET result_json=? WHERE id=? AND claimed_by=?")
+                .bind(result_json)
+                .bind(step_id)
+                .bind(claimed_by)
+                .execute(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_hook_step_merge_done_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        step_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND json_type(json_extract(effects_json,'$.merge_outcome'),'$.Done') IS NOT NULL)")
+            .bind(step_id)
+            .fetch_one(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn prioritize_merged_follow_up_step_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        step_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task_step SET priority=2 WHERE id=?")
+            .bind(step_id)
+            .execute(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workflow_transition_pending_steps_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_step WHERE task_id=? AND status IN ('pending','claimed')",
+        )
+        .bind(task_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_terminal_cleanup_hook_result_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        result_json: String,
+        step_id: &str,
+        hook_index: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE task_hook_checkpoint SET result_json=? WHERE step_id=? AND hook_index=?",
+        )
+        .bind(result_json)
+        .bind(step_id)
+        .bind(hook_index)
+        .execute(connection)
+        .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,20 @@
 use super::*;
 use crate::{new_uuid_v4, now_rfc3339};
 
+pub struct WorkflowProjectAuthorityRow {
+    row: SqliteRow,
+}
+
+impl WorkflowProjectAuthorityRow {
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+
+    pub fn workflow_definition(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("workflow_definition")?)
+    }
+}
+
 const DEFAULT_PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 
 const PROJECT_VISIBLE_TO_USER: &str = "(owner_id IS NULL OR owner_id = ? OR EXISTS (
@@ -2094,6 +2108,22 @@ impl SqliteDb {
                 .bind(project_id)
                 .fetch_one(self.pool())
                 .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workflow_transition_project_authority_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<WorkflowProjectAuthorityRow>> {
+        Ok(
+            sqlx::query("SELECT version, workflow_definition FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(connection)
+                .await?
+                .map(|row| WorkflowProjectAuthorityRow { row }),
         )
     }
 }

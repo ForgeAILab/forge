@@ -557,6 +557,25 @@ impl TaskDispatcher {
                 .sweep
                 .repairs += repaired;
         }
+        if !p.read.queue_owned
+            && p.read.reviews.is_empty()
+            && !p
+                .read
+                .executions
+                .iter()
+                .any(|execution| execution.status == db::ExecutionStatus::Running)
+            && (matches!(p.read.condition, db::TaskCondition::Clear { .. })
+                || p.read
+                    .condition
+                    .reasons()
+                    .any(|reason| matches!(reason, db::ParkReason::DispatchRefusal { .. })))
+            && self
+                .reconcile_missing_review_candidate(project, &p.workflow, &p.read.task)
+                .await?
+            && !self.reread(p, project).await?
+        {
+            return Ok(outcome);
+        }
         let mut gate = true;
         let mut refused = false;
         for _ in 0..4 {

@@ -865,3 +865,19 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn schedule_terminal_hook_workspace_cleanup_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        deadline: String,
+        updated_at: String,
+        task_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE workspace SET cleanup_after=COALESCE(cleanup_after,?),updated_at=? WHERE task_id=? AND status!='cleaned'")
+            .bind(deadline)
+            .bind(updated_at)
+            .bind(task_id)
+            .execute(connection).await?)
+    }
+}
