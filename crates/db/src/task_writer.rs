@@ -267,16 +267,12 @@ impl TaskMutationReply {
     }
 }
 
-/// Longest wait on an accepted mutation that is claimed and does not settle:
-/// one step lease (after which a lost claimer's step is taken over) plus
-/// SQLite's lock timeout for the take-over's own write.
-const CLAIMED_MUTATION_WAIT: Duration = Duration::from_secs(if cfg!(test) { 4 } else { 90 });
 /// How often a waiter looks again at a claimed step whose lease has lapsed
 /// and that could not be taken over yet.
 const LAPSED_CLAIM_POLL: Duration = Duration::from_millis(250);
 
 /// Time left on a step lease; `None` once it has lapsed.
-fn lease_remaining(lease_until: &str) -> Option<Duration> {
+pub fn lease_remaining(lease_until: &str) -> Option<Duration> {
     let until = chrono::DateTime::parse_from_rfc3339(lease_until).ok()?;
     (until.with_timezone(&chrono::Utc) - chrono::Utc::now())
         .to_std()
@@ -289,6 +285,26 @@ pub fn lease_deadline() -> String {
 }
 
 impl SqliteDb {
+    /// Ceiling shared by command and mutation waiters once their step is
+    /// claimed. Defaults to one 60-second lease plus SQLite's 30-second
+    /// lock timeout; a timeout leaves the accepted step durable.
+    pub fn claimed_task_step_wait(&self) -> Duration {
+        *self
+            .claimed_task_step_wait
+            .lock()
+            .expect("claimed step wait")
+    }
+
+    /// Test configuration belongs to the handle, including its clones, so
+    /// service tests do not depend on whether the db crate has `cfg(test)`.
+    #[cfg(any(test, feature = "test-template"))]
+    pub fn set_claimed_task_step_wait(&self, wait: Duration) {
+        *self
+            .claimed_task_step_wait
+            .lock()
+            .expect("claimed step wait") = wait;
+    }
+
     pub async fn record_mutation_reply_in_tx<T: Serialize>(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -590,8 +606,8 @@ impl SqliteDb {
             // Like command waiters, the queue deadline bounds only the
             // predecessor wait: a mutation that owns the lease is not
             // answered `task_busy` while its persistence waits for SQLite's
-            // write lock. A command waiter learns of a lost claimer from its
-            // reply channel; a mutation has none, so the lease is its bound.
+            // write lock. Both waiters use the lease to detect a lost
+            // claimer, independently of notifications or reply channels.
             let wake = if step.status == "pending" {
                 if now >= deadline {
                     return Err(DbError::TaskBusy {
@@ -601,7 +617,7 @@ impl SqliteDb {
                 }
                 deadline
             } else {
-                let ceiling = *claimed_until.get_or_insert(now + CLAIMED_MUTATION_WAIT);
+                let ceiling = *claimed_until.get_or_insert(now + self.claimed_task_step_wait());
                 if now >= ceiling {
                     return Err(DbError::TaskBusy {
                         pending_steps: self.pending_steps(task_id).await?,
@@ -961,6 +977,7 @@ mod tests {
         let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
         crate::run_migrations(&pool).await.unwrap();
         let db = SqliteDb::new(pool);
+        db.set_claimed_task_step_wait(Duration::from_secs(4));
         let now = crate::now_rfc3339();
         sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
             .bind(&now)
