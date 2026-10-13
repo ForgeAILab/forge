@@ -87,7 +87,8 @@ async fn project_default_review_config(
 
 fn map_launch_error(error: ServiceError) -> ApiError {
     match error {
-        ServiceError::InvalidOperation { message } => {
+        ServiceError::InvalidOperation { message }
+        | ServiceError::SubtaskDispatchWait { message } => {
             if message.contains("terminal status") {
                 ApiError::conflict_with_code("task.terminal", message)
             } else {

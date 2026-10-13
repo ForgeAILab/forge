@@ -285,7 +285,8 @@ pub async fn follow_up_execution(
 
 fn map_follow_up_error(error: ServiceError) -> ApiError {
     match error {
-        ServiceError::InvalidOperation { message } => {
+        ServiceError::InvalidOperation { message }
+        | ServiceError::SubtaskDispatchWait { message } => {
             if message.contains("follow-up requires a completed, failed, or cancelled execution") {
                 ApiError::conflict_with_code("follow_up.execution_active", message)
             } else if message.contains("parent execution has no resumable session") {

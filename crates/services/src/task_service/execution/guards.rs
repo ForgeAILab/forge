@@ -91,10 +91,12 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
         if crate::task_hierarchy::root_blocked(&parent) {
-            return Err(ServiceError::invalid_operation(format!(
+            return Err(ServiceError::SubtaskDispatchWait {
+                message: format!(
                 "subtask {} cannot execute while coordination root {} is blocked or has an error",
                 task.id, parent.id
-            )));
+            ),
+            });
         }
 
         let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id)

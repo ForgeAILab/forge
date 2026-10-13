@@ -41,6 +41,15 @@ pub(crate) struct QueuedRecovery {
     pub continuation: bool,
 }
 
+impl QueuedRecovery {
+    pub(crate) fn launches_role(&self) -> bool {
+        matches!(
+            self.request.offer.reason.as_str(),
+            "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
+        )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct QueuedTaskAction {
     pub action: api_types::TaskAction,

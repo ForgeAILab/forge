@@ -278,9 +278,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         origin.status = gate.name.clone();
         db::budget::limit(&origin, kind, Some(&gate.config), gate.gate_config.as_ref()).ok()
     };
-    let exhausted = condition.is_some_and(|kind| {
-        kind.is_budget_exhausted_annotation() || kind.is_retry_exhausted_metadata()
-    }) || retry_gate.is_some_and(|gate| {
+    let gate_exhausted = retry_gate.is_some_and(|gate| {
         gate_budget(gate).is_some_and(|budget| {
             db::budget::gate_entry_exhausted(
                 &gate.name,
@@ -292,6 +290,10 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             )
         })
     });
+    let exhausted = gate_exhausted
+        || condition.is_some_and(|kind| {
+            kind.is_budget_exhausted_annotation() || kind.is_retry_exhausted_metadata()
+        });
     let blocked_execution_id = snapshot
         .annotation()
         .and_then(|annotation| annotation.blocked_execution_id);
@@ -786,7 +788,8 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             // A coordination root parked on its spent re-plan budget has no
             // run to retry: the fresh budget is the whole recovery, and the
             // root's own next step (re-plan, or its aggregate review) follows.
-            if condition == Some(FailureKind::RetryExhausted)
+            if !gate_exhausted
+                && condition == Some(FailureKind::RetryExhausted)
                 && role.is_some()
                 && (snapshot.has_agent && !snapshot.project_paused)
                 && !condition_read
@@ -2175,6 +2178,31 @@ pub(crate) mod tests {
             )));
             assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
             assert!(offers.iter().any(|offer| offer.action.verb() == "restart"));
+        }
+    }
+
+    #[test]
+    fn a_spent_step_gate_offers_gate_budget_recovery_instead_of_execution_recovery() {
+        let mut snapshot = snapshot("lead_check", Some(FailureKind::RetryExhausted));
+        snapshot.workflow =
+            crate::workflow::inherited_subtask_workflow::inherited_subtask_workflow();
+        snapshot.task.parent_task_id = Some("root".to_owned());
+        for (spent, reason) in [
+            (0, "execution_retry_exhausted"),
+            (2, "retry_budget_exhausted"),
+        ] {
+            snapshot
+                .budget_spent
+                .insert(db::budget::gate_key("lead_check"), spent);
+            let offers = projected_actions(&snapshot);
+            assert_eq!(
+                offers
+                    .iter()
+                    .find(|offer| offer.action.verb() == "retry")
+                    .unwrap()
+                    .reason,
+                reason
+            );
         }
     }
 

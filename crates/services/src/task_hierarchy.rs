@@ -698,10 +698,10 @@ pub(crate) async fn ensure_subtask_dispatch_order(db: &SqliteDb, task: &Task) ->
     };
     let (parent, workflow) = coordination_root_context(db, parent_task_id).await?;
     if !coordination_root_allows_child_dispatch(&parent, &workflow) {
-        return Err(ServiceError::invalid_operation(format!(
+        return Err(ServiceError::SubtaskDispatchWait { message: format!(
             "subtask {} cannot start while coordination root {} is blocked or not in its implementation state",
             task.id, parent_task_id
-        )));
+        ) });
     }
     let children = ordered_children(db, parent_task_id).await?;
     let next = next_incomplete_child(&children, &workflow);
@@ -711,10 +711,12 @@ pub(crate) async fn ensure_subtask_dispatch_order(db: &SqliteDb, task: &Task) ->
     let waiting_on = next
         .map(|candidate| candidate.id.as_str())
         .unwrap_or("the completed sequence");
-    Err(ServiceError::invalid_operation(format!(
-        "subtask {} cannot start yet; ordered execution is waiting on {}",
-        task.id, waiting_on
-    )))
+    Err(ServiceError::SubtaskDispatchWait {
+        message: format!(
+            "subtask {} cannot start yet; ordered execution is waiting on {}",
+            task.id, waiting_on
+        ),
+    })
 }
 
 /// Load a coordination root and the Project workflow used for child policy.

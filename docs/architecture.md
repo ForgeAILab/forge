@@ -6156,6 +6156,18 @@ auto-attached after-enter check is not added to a gate that already checks on
 entry). A subtask never enters a merge state (the inherited workflow has
 none), so merge-queue returns of the root never spend this budget.
 
+The gate's spent ledger selects gate-budget recovery even when its park is
+encoded as `retry_exhausted`; execution-budget recovery does not reset that
+ledger. Retry resets the budget and creates a new gate entry, then retains
+the lead's accepted role continuation while the root re-plans. The child
+shows `parent { cause: planning }` until the root returns to implementation.
+Queued role actions obey the same parent and sibling admission rules as
+ordinary dispatch. Because the root and child have separate writers,
+admission may lose after an eligibility read: `SubtaskDispatchWait` and a
+role launch's database authority conflict retain the accepted intent rather
+than restoring its old park. The root's status change marks its children
+for scheduling, so the continuation runs when the root releases them.
+
 Removing the root's lead stops a step check that is still running
 (`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
 next dispatcher pass. Archiving the Agent that is the lead is the same lead

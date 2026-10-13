@@ -479,7 +479,15 @@ impl TaskService {
             ServiceError::Db(
                 db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. }
             )
-        ) && current.version != task.version;
+        ) && (current.version != task.version
+            || crate::deferred_dispatch::queued_recovery(&current)
+                .is_some_and(|intent| intent.launches_role()));
+        // The root and child have separate writers. A root re-plan can win
+        // after this action's eligibility read; its admission refusal is a
+        // wait, even if the root has already finished when we settle it.
+        if matches!(error, ServiceError::SubtaskDispatchWait { .. }) {
+            return Ok(true);
+        }
         let waiting = claim_race
             || matches!(
                 error,
@@ -669,10 +677,7 @@ impl TaskService {
             &project.workflow_definition,
             &queued.request.actor,
         );
-        if matches!(
-            queued.request.offer.reason.as_str(),
-            "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
-        ) {
+        if queued.launches_role() {
             let role = crate::workflow::action_role(&workflow, &task.status).ok_or_else(|| {
                 ServiceError::invalid_operation("queued action lost its workflow role")
             })?;
@@ -728,6 +733,12 @@ impl TaskService {
                         ));
                     }
                 }
+            }
+            // A queued action is subject to the same hierarchy wait as an
+            // ordinary dispatch. Do not claim it or restore its saved park
+            // while the root plans, is held, or an earlier sibling runs.
+            if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await? {
+                return Ok(false);
             }
         }
         if let Some(agent_id) = queued.request.agent_id.as_deref() {
@@ -1541,6 +1552,15 @@ impl TaskService {
                 api_types::UserActionSource::Api,
             ));
             return Box::pin(self.rerun_review(id, requested_by)).await;
+        }
+        if updated.status == crate::workflow::default_states::LEAD_CHECK
+            && updated.parent_task_id.is_some()
+        {
+            // Validate the existing rework in a new entry, under the reset
+            // gate budget. Its role continuation waits for any root re-plan.
+            return self
+                .recover_retry_current_state_hooks(updated, Some(reason))
+                .await;
         }
         Ok(updated)
     }

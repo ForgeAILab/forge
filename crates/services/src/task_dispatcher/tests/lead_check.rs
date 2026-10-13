@@ -21,6 +21,7 @@ struct StepExecutor {
     /// Bytes every implementation run commits to the shared workspace, in a
     /// file named after its Task (0: it commits nothing).
     commit_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    hold_root_planner: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn git_in(worktree: &str, args: &[&str]) {
@@ -80,6 +81,12 @@ impl TaskExecutor for StepExecutor {
             return completed(None);
         }
         if task.parent_task_id.is_none() {
+            if self
+                .hold_root_planner
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.release.acquire().await.unwrap().forget();
+            }
             return completed(None);
         }
         let reply = self.replies.lock().unwrap().pop_front();
@@ -132,6 +139,7 @@ struct Steps {
     commit_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// The scripted replies no step check has taken yet.
     replies: Arc<std::sync::Mutex<VecDeque<String>>>,
+    hold_root_planner: Arc<std::sync::atomic::AtomicBool>,
     _dirs: (TempDir, TempDir),
 }
 
@@ -148,6 +156,7 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
     let event_bus = Arc::new(EventBus::new(64));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let commit_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hold_root_planner = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let replies = Arc::new(std::sync::Mutex::new(
         replies
             .iter()
@@ -160,6 +169,7 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
         db: Arc::clone(&db),
         replies: Arc::clone(&replies),
         hold_coder,
+        hold_root_planner: Arc::clone(&hold_root_planner),
     });
     let task_service = Arc::new(
         TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
@@ -182,6 +192,7 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
         release,
         commit_bytes,
         replies,
+        hold_root_planner,
         _dirs: (repo, workspace),
     }
 }
@@ -1010,6 +1021,115 @@ async fn the_spent_budget_park_is_shown_once_and_retry_has_the_lead_check_the_wo
         !executions(&steps.db, &second.id).await.is_empty()
     })
     .await;
+}
+
+/// Retry is accepted while the root's automatic re-plan still owns the
+/// workspace. The root cannot finish until released, forcing replay of the
+/// child's accepted action to encounter the planning parent.
+#[tokio::test]
+async fn retry_of_a_spent_lead_check_waits_for_the_roots_replan() {
+    let steps = steps(&[HELD_FAIL, FAIL, PASS], Some("second")).await;
+    let (root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the first check holds its verdict", async || {
+        running_check(&steps.db, &first.id).await && steps.replies.lock().unwrap().len() == 2
+    })
+    .await;
+    steps
+        .hold_root_planner
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    steps.release.add_permits(1);
+    until(
+        &steps,
+        "the root re-plans the spent child gate",
+        async || {
+            reload(&steps.db, &root.id).await.status == "planning"
+                && running_check(&steps.db, &root.id).await
+                && reload(&steps.db, &first.id)
+                    .await
+                    .condition
+                    .read()
+                    .failure_kind
+                    == Some(api_types::FailureKind::RetryExhausted)
+        },
+    )
+    .await;
+    let parked = reload(&steps.db, &first.id).await;
+    steps
+        .dispatcher
+        .task_service
+        .perform_task_action(
+            &first.id,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
+            parked.version,
+        )
+        .await
+        .expect("Retry is accepted while the root plans");
+    passes(&steps, 3).await;
+    let waiting = reload(&steps.db, &first.id).await;
+    assert!(
+        crate::deferred_dispatch::queued_recovery(&waiting).is_some(),
+        "the accepted Retry survives the planning parent\n{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(
+        gate_spent(&steps.db, &first.id).await,
+        0,
+        "a new gate budget window"
+    );
+    assert!(
+        waiting.condition.reasons().any(|reason| matches!(reason,
+        db::ParkReason::Parent { cause, .. } if cause == "planning")),
+        "the wait names the root's planning step"
+    );
+    // Admission can also lose after the dispatcher's eligibility read.
+    // Exercise that refusal boundary with the real hierarchy denial, and
+    // with a database authority conflict whose child version did not move.
+    let refused = crate::task_hierarchy::ensure_subtask_dispatch_order(&steps.db, &waiting)
+        .await
+        .expect_err("the root is still planning");
+    assert!(matches!(refused, ServiceError::SubtaskDispatchWait { .. }));
+    for refusal in [refused, ServiceError::Db(db::DbError::VersionConflict)] {
+        assert!(steps
+            .dispatcher
+            .task_service
+            .settle_queued_task_action_refusal(&waiting, &refusal)
+            .await
+            .unwrap());
+        assert!(
+            crate::deferred_dispatch::queued_recovery(&reload(&steps.db, &first.id).await)
+                .is_some(),
+            "the admission race retains Retry"
+        );
+    }
+    assert_eq!(
+        executions(&steps.db, &first.id).await.len(),
+        5,
+        "nothing executes beside the root's re-plan"
+    );
+    steps.release.add_permits(1);
+    until(
+        &steps,
+        "the lead checks the rework after the root finishes",
+        async || reload(&steps.db, &first.id).await.status == "done",
+    )
+    .await;
+    assert_eq!(
+        executions(&steps.db, &first.id).await,
+        vec![
+            ("coder".to_owned(), "completed".to_owned()),
+            ("planner".to_owned(), "completed".to_owned()),
+            ("coder".to_owned(), "completed".to_owned()),
+            ("planner".to_owned(), "completed".to_owned()),
+            ("coder".to_owned(), "completed".to_owned()),
+            ("planner".to_owned(), "completed".to_owned())
+        ]
+    );
 }
 
 /// The lead is removed while its check runs: the run is stopped, its verdict

@@ -3205,6 +3205,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Retry on a subtask's spent `lead_check` gate resets the gate budget and
+  validates the existing rework. If its root is still re-planning, the
+  accepted Retry waits for the root and resumes afterward instead of losing
+  its intent and restoring the spent-budget park with `recovery_required`.
+
 - A Task that re-enters `merging` while the attempt of its previous entry is
   still the head of the queue is admitted at the release of that head (the
   driver signals it) instead of at the admission's next 100 ms look.
