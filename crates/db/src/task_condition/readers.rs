@@ -584,6 +584,14 @@ pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotat
     ))
 }
 
+/// Whether a schedule park record is the Project pause.
+pub(super) fn is_scheduler_pause(raw: &Value) -> bool {
+    matches!(
+        owner_park(raw),
+        Some((ParkReason::ProjectPaused { state: None }, _))
+    )
+}
+
 /// Scheduler pause is an observer, restated from its record on every write.
 /// Never let an owned check statement retain it after that record is cleared.
 pub(super) fn without_scheduler_pause(mut condition: TaskCondition) -> TaskCondition {

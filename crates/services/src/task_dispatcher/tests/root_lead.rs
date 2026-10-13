@@ -1431,6 +1431,113 @@ async fn a_project_pause_over_a_held_planning_root_parks_every_child_and_resume_
     assert!(executions(&lead.db, &child.id).await.is_empty());
 }
 
+/// Fifty Tasks without a lead, in mixed states. Under a pause every
+/// non-terminal Task without a run is parked and none is `clear`; a failure
+/// keeps its own primary reason; a settled Task and a live run are left
+/// alone. After the resume no Task is left on `project_paused` and every
+/// Task shows the reasons it showed before the pause.
+#[tokio::test]
+async fn a_project_pause_parks_fifty_mixed_tasks_and_resume_leaves_none_parked_on_it() {
+    let lead = lead_fixture(false).await;
+    let mut tasks = Vec::new();
+    for n in 0..12 {
+        tasks.push(seed_task(&lead.db, &lead.project, &format!("backlog {n}"), "backlog", 1).await);
+        tasks.push(seed_task(&lead.db, &lead.project, &format!("todo {n}"), "todo", 1).await);
+    }
+    let mut failed = Vec::new();
+    for n in 0..6 {
+        let task =
+            seed_task(&lead.db, &lead.project, &format!("failed {n}"), "in_progress", 1).await;
+        assign_role(&lead.db, &task.id, "coder", &lead.coder).await;
+        failed.push(super::root_replan::park_child(&lead, &task, "failed work").await.id);
+        tasks.push(task);
+    }
+    let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
+    assign_role(&lead.db, &root.id, "coder", &lead.coder).await;
+    for n in 0..9 {
+        tasks.push(seed_subtask(&lead.db, &root, &format!("child {n}"), "todo", n).await);
+    }
+    tasks.push(root);
+    for n in 0..10 {
+        tasks.push(seed_task(&lead.db, &lead.project, &format!("done {n}"), "done", 1).await);
+    }
+    assert_eq!(tasks.len(), 50);
+    let reasons = |task: &Task| format!("{:?}", task.condition.reasons().collect::<Vec<_>>());
+    let paused_on = |task: &Task| {
+        task.condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::ProjectPaused { state: None }))
+    };
+    passes(&lead, 4).await;
+    let mut before = Vec::new();
+    for task in &tasks {
+        let task = reload(&lead.db, &task.id).await;
+        assert!(!paused_on(&task), "{} {:?}", task.title, task.condition);
+        before.push((reasons(&task), executions(&lead.db, &task.id).await));
+    }
+
+    ProjectRepo::set_paused_at(&*lead.db, &lead.project, Some(now_rfc3339()))
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    for (task, (_, runs)) in tasks.iter().zip(&before) {
+        let task = reload(&lead.db, &task.id).await;
+        // The pause starts nothing.
+        assert_eq!(&executions(&lead.db, &task.id).await, runs, "{}", task.title);
+        if runs.iter().any(|(_, status)| status == "running") {
+            // A live run stays `running`: the pause holds future dispatch.
+            assert!(
+                matches!(task.condition, db::TaskCondition::Running { .. }),
+                "{} {:?}",
+                task.title,
+                task.condition
+            );
+            continue;
+        }
+        if task.status == "done" {
+            assert!(!paused_on(&task), "{} {:?}", task.title, task.condition);
+            continue;
+        }
+        assert!(
+            !matches!(task.condition, db::TaskCondition::Clear { .. }),
+            "{} is clear under a pause",
+            task.title
+        );
+        if failed.contains(&task.id) {
+            // The failure stays the primary reason, with its own exit.
+            assert_eq!(
+                task.condition.read().failure_kind,
+                Some(api_types::FailureKind::RetryExhausted),
+                "{:?}",
+                task.condition
+            );
+            assert!(
+                !matches!(
+                    &task.condition,
+                    db::TaskCondition::Parked {
+                        primary: db::ParkReason::ProjectPaused { .. },
+                        ..
+                    }
+                ),
+                "{:?}",
+                task.condition
+            );
+        } else {
+            assert!(paused_on(&task), "{} {:?}", task.title, task.condition);
+        }
+    }
+
+    ProjectRepo::set_paused_at(&*lead.db, &lead.project, None)
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    for (task, (was, _)) in tasks.iter().zip(&before) {
+        let task = reload(&lead.db, &task.id).await;
+        assert!(!paused_on(&task), "{} {:?}", task.title, task.condition);
+        assert_eq!(&reasons(&task), was, "{}", task.title);
+    }
+}
+
 #[tokio::test]
 async fn a_later_subtask_names_its_sequence_wait_without_changing_the_no_lead_root() {
     let lead = lead_fixture(false).await;

@@ -3428,12 +3428,26 @@ its parent does not let run: `cause` is `held` (the owner holds the parent;
 releasing the parent is the exit), `blocked` (the parent is parked on a failure
 or a blocked entry; recovering the parent is the exit), `planning` (the
 parent's lead is planning; the subtask starts when the planner finishes and no
-action is needed) or `not_coordinating`
-(the parent is in a state that runs no subtasks, such as `backlog`). It is a
+action is needed), `not_coordinating`
+(the parent is in a state that runs no subtasks, such as `backlog`) or
+`sequence` (the parent runs its subtasks in order and an earlier sibling is not
+done or cancelled yet; the exit is that sibling finishing, and it applies to
+every parent with ordered subtasks, with or without a lead). It is a
 wait, not a failure: `details.failure_kind` stays empty, `start` is not offered
 on the subtask while it lasts, and it clears by itself when the parent lets its
-subtasks run again. A subtask that only waits for an earlier sibling shows no
-such reason. The reason `agent` (`agent_id`, `status`) is shown by a Task whose
+subtasks run again. `cause` is an open string: render a value you do not know
+as a wait on the parent. The reason `project_paused` with `state: null` is
+shown by every non-terminal Task of a paused Project that has no run and no
+reason of its own: a Task that is `clear` or waits for a retry deadline, its
+parent or its Agent. It is the same kind of wait (no failure kind, no
+diagnostic); the exit is
+resuming the Project (`POST /api/v1/projects/{id}/resume`), and the reason is removed
+by the scheduler's next pass over the Task after the resume. A Task that is
+held, failed, blocked, waiting for a person, waiting for its checks or in the
+merge queue keeps that reason as `primary` (the pause is at most an entry of
+`additional`), and a Task whose run is live stays `running`. `project_paused`
+with a `state` name is the older, unrelated park of a state entry refused
+under a pause. The reason `agent` (`agent_id`, `status`) is shown by a Task whose
 Agent cannot take work: `status` is the Agent's effective status (`paused`,
 `daemon_offline`, `deactivated`, ...). It is the same kind of wait: no failure
 kind, `start` and `retry` stay hidden as before, and it clears when the Agent

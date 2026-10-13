@@ -830,9 +830,18 @@ impl ConditionFacts {
     /// Combine the legacy mapping with these facts. Legacy is authoritative:
     /// a condition parks exactly where today's readers hold the Task.
     pub fn apply(&self, condition: TaskCondition) -> TaskCondition {
+        // A Project pause holds future dispatch, not work already under way:
+        // a Task whose run or state entry is live keeps showing that, and the
+        // pause becomes its park when the run ends. Every other scheduler
+        // park is only ever recorded for a Task with no live work.
+        let live = self.terminal.is_none() && (self.hooks.is_some() || self.execution.is_some());
+        let owner_park = self
+            .owner_park
+            .as_ref()
+            .filter(|raw| !(live && super::readers::is_scheduler_pause(raw)));
         let condition = self.apply_lifecycle(super::readers::apply_owner_park(
             check::without_reason(integration::without_reason(condition)),
-            self.owner_park.as_ref(),
+            owner_park,
         ));
         let condition = match &self.integration {
             Some(reason) => integration::overlay(condition, reason, self.integration_handoff_ready),

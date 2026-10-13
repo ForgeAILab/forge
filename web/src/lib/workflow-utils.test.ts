@@ -530,10 +530,23 @@ describe('integration conditions', () => {
       message:
         "The parent task's lead is planning. This subtask runs when the plan is done and the parent starts its subtasks.",
     })
+    expect(getTaskWaitNotice(parkedOn({ kind: 'parent', parent_id: 'root', cause: 'sequence' }))).toEqual({
+      title: 'Waiting for an earlier subtask',
+      message: 'Subtasks run in order. This subtask runs when the ones before it are done or cancelled.',
+    })
     // A cause this build does not know still reads as a wait on the parent.
     expect(
       getTaskWaitNotice(parkedOn({ kind: 'parent', parent_id: 'root', cause: 'some_new_cause' }))?.title,
     ).toBe('Waiting for parent task')
+  })
+
+  it('says a Task of a paused Project waits for the Project, and leaves a state-entry pause alone', () => {
+    expect(getTaskWaitNotice(parkedOn({ kind: 'project_paused', state: null }))).toEqual({
+      title: 'Project paused',
+      message:
+        'This task waits for its Project to resume. Resume the Project in its settings; nothing on the task needs repair.',
+    })
+    expect(getTaskWaitNotice(parkedOn({ kind: 'project_paused', state: 'merging' }))).toBeNull()
   })
 
   it('shows a root that left todo for in_progress as running its subtasks, not as stalled', () => {

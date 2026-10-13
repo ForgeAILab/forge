@@ -1024,8 +1024,22 @@ impl TaskService {
                     // under the gate's spent window. The queue ID fences the
                     // reset receipt; redelivery before admission sees zero
                     // spending and cannot open another window.
-                    let task = if task.parent_task_id.is_some()
-                        && task.status == crate::workflow::default_states::LEAD_CHECK
+                    // The offer names the lead for every caller, so its
+                    // authority list does not say who accepted it: only the
+                    // root's lead itself opens the window. The owner's or the
+                    // Project Agent's ordinary Retry keeps the spent window.
+                    let accepted_by_lead = match &request.actor {
+                        api_types::Actor::Agent { agent_id, .. }
+                            if task.parent_task_id.is_some()
+                                && task.status == crate::workflow::default_states::LEAD_CHECK =>
+                        {
+                            crate::task_hierarchy::lead_verbs(&self.db, &task)
+                                .await?
+                                .is_some_and(|(lead, _)| lead == *agent_id)
+                        }
+                        _ => false,
+                    };
+                    let task = if accepted_by_lead
                         && matches!(&request.action, api_types::TaskAction::Retry { .. })
                         && request
                             .offer

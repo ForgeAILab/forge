@@ -318,8 +318,9 @@ pub enum ConditionReason {
         remaining: Vec<String>,
     },
     /// A subtask waits for its parent Task. `cause` is `held`, `blocked`,
-    /// `planning` (the parent's lead is planning) or `not_coordinating`; the
-    /// exit is on the parent.
+    /// `planning` (the parent's lead is planning), `not_coordinating` or
+    /// `sequence` (the parent runs its subtasks and an earlier sibling is
+    /// unfinished); the exit is on the parent, or on that sibling.
     Parent {
         parent_id: String,
         cause: String,
