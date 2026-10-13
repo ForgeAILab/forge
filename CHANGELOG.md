@@ -23,8 +23,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   subtask's `retry`, `restart` and `cancel` offers; Attention items with
   `recommended_action = answer_lead_input`; comment kinds `handoff` and
   `request_input`; `task.adaptive` events with `actor_type = task_lead`; error
-  code `LEAD_OPERATION_REFUSED`. Migration `V202610130038` rebuilds
-  `task_comment` for the two comment kinds and keeps every row.
+  code `LEAD_OPERATION_REFUSED`. A lead cannot name itself as a worker
+  (`lead_self_assignment`), and a subtask counts as started after any run on
+  it that is not a step check. Migration `V202610130038` rebuilds
+  `task_comment` for the two comment kinds and keeps every row; the first
+  start after the upgrade copies the table once (measured: about 13 seconds
+  for 200,000 comments, 180 MB) and needs free disk of about that table's
+  size while it does.
 - **Resolving an Attention item that carries a lead's question needs an
   answer.** `POST /api/v1/mission-control/attention/{id}/resolve` accepts an
   optional `answer` (`AttentionResolveRequest`). It is required for an item

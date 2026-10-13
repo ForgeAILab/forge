@@ -6020,11 +6020,26 @@ disposition (`coordination_root_replan`): the root shows the typed
 `dispatch_refusal` park and the sweep reads it again whenever the root's row
 changes.
 
-Composed worst case for one root in one budget window: the lead runs at most
-once at kickoff plus five times for re-plans (each run under the Execution
-budget of the root like any role run), and the aggregate review runs at most
-`max_rejections` times (default 2) before `review_budget_exhausted`. A Retry
-with a new budget (owner or Project Agent) opens the next window.
+Composed worst case for one root in one budget window, with nobody acting on
+it (no owner, no Project Agent), at the default limits: the lead plans at most
+6 times (kickoff plus 5 re-plans; up to 3 more runs if its own runs fail, the
+root's Execution budget), and creates at most 24 subtasks beside the `n` it
+was given. One subtask in one of its own budget windows costs at most 9 runs
+(3 submissions, i.e. the first and 2 step-check returns, 3 failed worker runs
+under its Execution budget, 3 step checks). A lead recovery is a Retry with a
+new budget for that subtask, at most 2 per subtask, so the hard bound is 27
+runs per subtask and `27 × (n + 24) + 9 + 3` runs for the root (3 = the
+aggregate review's entries); for `n = 5` that is 795. Subtasks run in order
+and a re-plan is triggered by one parked subtask, so at most 5 recoveries can
+happen in the window and the reachable bound is `9 × (n + 24) + 5 × 9 + 12`:
+318 runs for `n = 5`. Every term ends in a typed park with an Attention item
+and an action: `budget_exhausted { replan }` on the root (Retry with a new
+budget), `retry_exhausted` on the subtask whose recoveries are spent (the root
+waits on `children`; the Project Agent is woken for that subtask),
+`review_budget_exhausted` on the root. A question to the owner
+(`lead.request_input`) adds one lead run per answer and needs a person each
+time. A Retry with a new budget on the root (owner or Project Agent) opens the
+next window; the Project Agent's own wake budgets bound how often it does.
 
 **Lead operations.** The lead changes the breakdown with five registered
 operations (`operation-registry::task_lead`, on the Task propose aggregate
