@@ -5534,7 +5534,9 @@ the transition graph. There is one current attempt per Task and one current
 reservation per queue sequence. Successors retain sequence, while eligible
 position is computed by the read surface. Nullable foreign keys preserve
 opaque Task/project/workspace/execution/location refs after cleanup. Task
-removal keeps history; repository/Project deletion cascades its owned rows.
+removal keeps history, except the Task's current, resting `shadow:` row, which
+the next start deletes (`delete_orphan_shadow_attempts`); repository/Project
+deletion cascades its owned rows.
 
 Attempts store candidate/original/target/integrated SHAs, predecessor lineage,
 full conflict/repair/guard paths, owner binding, effect intent/receipts,
@@ -5770,7 +5772,10 @@ A result is never reported merged merely from `integrated_sha`. The target's
 current owner proves it contains the exact candidate before `done`, including
 imported landed rows and sibling target advances. Wrong-owner/generation receipts,
 a forged SHA, an unavailable owner or a rewound target produce a typed
-`unresolved_result`; a proven missing commit queues again. Git/RPC proof is
+`unresolved_result`; a proven missing commit queues again when a worker holds
+the row (`not_landed`), and parks an imported row for its owner at the second
+such answer (no worker holds a slot for it; see the bounds table of
+"`merging` is the integration queue"). Git/RPC proof is
 outside the write transaction; the transaction rechecks attempt and Task entry.
 
 ### Deletion, recovery and operational limits
