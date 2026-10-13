@@ -3244,6 +3244,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Web coordination roots no longer offer refused interactive launches, withdrawn lead questions preserve typed drafts with copy and dismiss controls, board subtask exits use the server's effective workflow, and out-of-order Task events cannot overwrite newer cached state.
 - `409 integration_unresolved` names the machine that performs the outstanding effect. For a rebase run on another machine than the merge target's it used to name the target's machine, so its "reconnect or remove that machine" hint pointed at the wrong one.
 - The Task list's ETag can no longer stay equal when one merge-queue member leaves and another joins with equal counters while the newest member timestamp does not move (a wall clock set back): the validator now carries the exact set of current members.
 - A Task command whose attempt failed before it ran and was re-queued no longer answers its caller with that attempt's transient error while the command stays queued and runs later (a caller that asked again got the command applied twice). The caller now waits, within its 5-second (Cancel/Hold: 15-second) bound, for the retry's own answer, or gets `409 task_busy` with the command still accepted.

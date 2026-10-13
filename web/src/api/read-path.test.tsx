@@ -241,7 +241,7 @@ describe('task list read path', () => {
     ).toBe(4)
   })
 
-  it('patches status immediately and throttles the filtered-page fallback', async () => {
+  it('patches versioned status moves immediately and throttles the filtered-page fallback', async () => {
     vi.useFakeTimers()
     queryClient()
     client.setQueryData(qk.tasks('project-1', '{"status":"review"}'), {
@@ -250,10 +250,13 @@ describe('task list read path', () => {
     })
     routeSsePayload(
       {
-        event_type: 'task.status_changed',
+        event_type: 'task.moved',
         entity_id: 'task-1',
         project_id: 'project-1',
         new_status: 'review',
+        new_board_position: 1,
+        task_version: 3,
+        board_revision: 2,
         timestamp: 'now',
       },
       client,

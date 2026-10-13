@@ -1,5 +1,7 @@
 import { Link } from '@tanstack/react-router'
+import { useTaskRelationsQuery } from '@/api/hooks'
 import { cn } from '@/lib/cn'
+import { rootHoldsRuns } from '@/lib/root-lead'
 import { budgetExhaustedNotice } from '@/lib/workflow-utils'
 import { workflowLabelFromKind } from '@/components/workflow-health-badge'
 import { TaskInteractiveLaunch } from './task-interactive-launch'
@@ -68,7 +70,13 @@ export function WorkflowExceptionPanel({
   assessment?: ReviewAssessment | null
 }) {
   const exception = task.workflow_exception
+  const relations = useTaskRelationsQuery(
+    task.id,
+    task.project_id,
+    Boolean(exception) && task.parent_task_id == null,
+  )
   if (!exception) return null
+  const runsHeldForSubtasks = rootHoldsRuns(task, (relations.data?.subtasks.length ?? 0) > 0)
   const failure = task.condition.details.failed
   const budgetNotice = budgetExhaustedNotice(task)
   return (
@@ -105,7 +113,7 @@ export function WorkflowExceptionPanel({
         </p>
       ))}
       <TaskActionButtons taskId={task.id} version={task.version} offers={exception.actions} />
-      <TaskInteractiveLaunch taskId={task.id} />
+      {!runsHeldForSubtasks ? <TaskInteractiveLaunch taskId={task.id} /> : null}
     </section>
   )
 }

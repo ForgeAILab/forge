@@ -192,7 +192,69 @@ function EscalationAnswer({
   )
 }
 
-function AttentionCard({ item }: { item: AttentionItem }) {
+type LeadAnswerDraft = { answer: string; position: number }
+type LeadAnswerDrafts = Record<string, LeadAnswerDraft>
+
+function WithdrawnLeadDraft({
+  id,
+  answer,
+  onDismiss,
+}: {
+  id: string
+  answer: string
+  onDismiss: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState(false)
+  return (
+    <article
+      id={`attention-${id}`}
+      className="space-y-2 rounded-lg border border-border-subtle bg-muted p-4"
+      role="status"
+    >
+      <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">
+        This question was withdrawn; your draft: <span className="text-foreground">{answer}</span>
+      </p>
+      <div className="flex flex-wrap gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(answer)
+              setCopied(true)
+              setCopyError(false)
+            } catch {
+              setCopyError(true)
+            }
+          }}
+        >
+          {copied ? 'Copied' : 'Copy draft'}
+        </Button>
+        <Button variant="outline" size="sm" onClick={onDismiss}>
+          Dismiss draft
+        </Button>
+      </div>
+      {copyError ? (
+        <p className="text-xs text-muted-foreground">
+          Could not copy. Select your draft to copy it.
+        </p>
+      ) : null}
+    </article>
+  )
+}
+
+function AttentionCard({
+  item,
+  answer,
+  onAnswerChange,
+  onAnswered,
+}: {
+  item: AttentionItem
+  answer: string
+  onAnswerChange: (answer: string) => void
+  onAnswered: () => void
+}) {
   const isProgressWarning = item.category === 'progress_warning'
   const taskId = isProgressWarning ? attentionTaskId(item) : null
   const retryAction = attentionRetryAction(item)
@@ -292,7 +354,14 @@ function AttentionCard({ item }: { item: AttentionItem }) {
           {escalation && item.lifecycle !== 'resolved' ? (
             <EscalationAnswer item={item} escalation={escalation} />
           ) : null}
-          {isLeadInput(item) ? <LeadInputAnswer item={item} /> : null}
+          {isLeadInput(item) ? (
+            <LeadInputAnswer
+              item={item}
+              answer={answer}
+              onAnswerChange={onAnswerChange}
+              onAnswered={onAnswered}
+            />
+          ) : null}
           {retryTurn.error ? (
             <p className="mt-2 text-xs text-destructive" role="alert">
               {retryTurn.error.message}
@@ -755,15 +824,41 @@ function MissionContent({
   chatIsLoading,
   chatIsError,
   onRetryChats,
+  leadDrafts,
+  onLeadDraftChange,
+  onDismissLeadDraft,
 }: {
   data: MissionControlResponse
   chatEntries: AgentChatEntry[]
   chatIsLoading: boolean
   chatIsError: boolean
   onRetryChats: () => void
+  leadDrafts: LeadAnswerDrafts
+  onLeadDraftChange: (id: string, answer: string, position: number) => void
+  onDismissLeadDraft: (id: string) => void
 }) {
   const attention = data.needs_attention
   const humanInput = attention.filter((item) => item.category === 'human_input_required')
+  const humanInputRows: { id: string; item: AttentionItem | null }[] = humanInput.map((item) => ({
+    id: item.id,
+    item,
+  }))
+  const attentionIds = new Set(attention.map((item) => item.id))
+  const withdrawnDrafts = Object.entries(leadDrafts)
+    .filter(([id, draft]) => !attentionIds.has(id) && draft.answer.trim())
+    .sort(([, a], [, b]) => a.position - b.position)
+  for (const [id, draft] of withdrawnDrafts) {
+    humanInputRows.splice(draft.position, 0, { id, item: null })
+  }
+  const renderAttentionCard = (item: AttentionItem, position: number) => (
+    <AttentionCard
+      key={item.id}
+      item={item}
+      answer={leadDrafts[item.id]?.answer ?? ''}
+      onAnswerChange={(answer) => onLeadDraftChange(item.id, answer, position)}
+      onAnswered={() => onDismissLeadDraft(item.id)}
+    />
+  )
   const commitments = attention.filter((item) => item.category === 'commitment_overdue')
   const otherAttention = attention.filter(
     (item) => item.category !== 'human_input_required' && item.category !== 'commitment_overdue',
@@ -785,6 +880,7 @@ function MissionContent({
   const coordinationActivity = data.coordination_activity
   const hasAny =
     attention.length +
+      withdrawnDrafts.length +
       data.review_ready.length +
       data.active_work.length +
       relevantAgentHealth.length +
@@ -853,23 +949,28 @@ function MissionContent({
           count={otherAttention.length}
           icon={<WarningCircle size={16} />}
         >
-          <div className="space-y-2 p-3">
-            {otherAttention.map((item) => (
-              <AttentionCard key={item.id} item={item} />
-            ))}
-          </div>
+          <div className="space-y-2 p-3">{otherAttention.map(renderAttentionCard)}</div>
         </ProjectionSection>
       ) : null}
-      {humanInput.length > 0 ? (
+      {humanInputRows.length > 0 ? (
         <ProjectionSection
           title="Questions / human input"
           count={humanInput.length}
           icon={<Question size={16} />}
         >
           <div className="space-y-2 p-3">
-            {humanInput.map((item) => (
-              <AttentionCard key={item.id} item={item} />
-            ))}
+            {humanInputRows.map((row, position) =>
+              row.item ? (
+                renderAttentionCard(row.item, position)
+              ) : (
+                <WithdrawnLeadDraft
+                  key={row.id}
+                  id={row.id}
+                  answer={leadDrafts[row.id].answer}
+                  onDismiss={() => onDismissLeadDraft(row.id)}
+                />
+              ),
+            )}
           </div>
         </ProjectionSection>
       ) : null}
@@ -879,11 +980,7 @@ function MissionContent({
           count={commitments.length}
           icon={<Clock size={16} />}
         >
-          <div className="space-y-2 p-3">
-            {commitments.map((item) => (
-              <AttentionCard key={item.id} item={item} />
-            ))}
-          </div>
+          <div className="space-y-2 p-3">{commitments.map(renderAttentionCard)}</div>
         </ProjectionSection>
       ) : null}
       {data.review_ready.length > 0 ? (
@@ -932,6 +1029,14 @@ function MissionContent({
 export function MissionControlPage() {
   const query = useMissionControlQuery()
   const chatsQuery = useAgentChatsQuery()
+  const [leadDrafts, setLeadDrafts] = useState<LeadAnswerDrafts>({})
+  const dismissLeadDraft = (id: string) => {
+    setLeadDrafts((drafts) => {
+      const next = { ...drafts }
+      delete next[id]
+      return next
+    })
+  }
   const computedAt = query.data?.computed_at ? Date.parse(query.data.computed_at) : Number.NaN
   const isStale = Boolean(
     query.data &&
@@ -997,6 +1102,11 @@ export function MissionControlPage() {
           chatIsLoading={chatsQuery.isLoading}
           chatIsError={chatsQuery.isError}
           onRetryChats={() => void chatsQuery.refetch()}
+          leadDrafts={leadDrafts}
+          onLeadDraftChange={(id, answer, position) =>
+            setLeadDrafts((drafts) => ({ ...drafts, [id]: { answer, position } }))
+          }
+          onDismissLeadDraft={dismissLeadDraft}
         />
       ) : null}
       {query.data ? (
