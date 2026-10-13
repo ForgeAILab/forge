@@ -1149,6 +1149,103 @@ async fn start_time_import_of_a_large_history_is_bounded() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The Task list's validator for the merge queue: a member that leaves one
+/// queue and a member that joins another between two reads change it, even
+/// when their `revision` and `queue_seq` are equal and the newest
+/// `updated_at` of the Project's members did not move (a wall clock set
+/// back). Sums over the current members cancelled out there.
+#[tokio::test]
+async fn list_revision_changes_when_one_member_leaves_and_another_joins_with_equal_counters() {
+    let db = fixture().await;
+    for id in ["c", "d"] {
+        sqlx::query("INSERT INTO task(id,project_id,title,status,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'merging',?,?,?)").bind(id).bind(id).bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+    }
+    let qa = db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    let qb = db
+        .create_or_get_integration_queue("r", "release")
+        .await
+        .unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for (task, queue) in [("a", &qa), ("b", &qa), ("d", &qb), ("c", &qb)] {
+        let attempt = db
+            .admit_integration_attempt(admission(queue, task, &format!("etag:{task}")))
+            .await
+            .unwrap();
+        ids.insert(task, attempt.id);
+    }
+    // `a` is the newest member throughout; `c` has not joined yet.
+    sqlx::query("UPDATE integration_attempt SET updated_at='2099-01-01T00:00:00Z' WHERE id=?")
+        .bind(&ids["a"])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_attempt SET current=0 WHERE id=?")
+        .bind(&ids["c"])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let before = integration_list_revision(db.pool(), "p").await.unwrap();
+    // `b` leaves its queue; `c` joins the other with `b`'s counters.
+    sqlx::query("UPDATE integration_attempt SET current=1,revision=(SELECT revision FROM integration_attempt WHERE id=?1),queue_seq=(SELECT queue_seq FROM integration_attempt WHERE id=?1) WHERE id=?2")
+        .bind(&ids["b"]).bind(&ids["c"]).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE integration_attempt SET current=0 WHERE id=?")
+        .bind(&ids["b"])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_ne!(
+        before,
+        integration_list_revision(db.pool(), "p").await.unwrap()
+    );
+}
+
+/// A rebase is performed by the daemon that has the Task's checkout, which
+/// can be another machine than the queue target's. While its receipt is
+/// outstanding the refusal names that performing machine: the way out is its
+/// reconnect or removal, not the target machine's.
+#[tokio::test]
+async fn unresolved_integration_names_the_machine_that_performs_the_effect() {
+    use crate::RepoRepo;
+    let db = fixture().await;
+    for (id, host) in [("da", "rebase-host"), ("db", "target-host")] {
+        sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES (?,?,?,'linux','aarch64','offline',?,?)").bind(id).bind(format!("m-{id}")).bind(host).bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+    }
+    let q = db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    let attempt = db
+        .admit_integration_attempt(admission(&q, "a", "effect-owner:a:0"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_queue SET target_owner_json='{\"daemon_id\":\"db\"}',head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&attempt.id).bind(&q.id).execute(db.pool()).await.unwrap();
+    let refused_machine = |db: SqliteDb| async move {
+        match RepoRepo::delete(&db, "r").await {
+            Err(DbError::IntegrationUnresolved { task_id, machine }) => {
+                assert_eq!(task_id, "a");
+                machine
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+    };
+    // The effect is performed by the target owner itself.
+    sqlx::query("UPDATE integration_attempt SET effect_intent_json='{\"request\":{\"fence\":{\"target_owner\":{\"daemon_id\":\"db\"}},\"witness\":{}}}' WHERE id=?")
+        .bind(&attempt.id).execute(db.pool()).await.unwrap();
+    assert_eq!(refused_machine(db.clone()).await, "target-host");
+    // The rebase is performed on another daemon.
+    sqlx::query("UPDATE integration_attempt SET effect_intent_json='{\"request\":{\"fence\":{\"target_owner\":{\"daemon_id\":\"db\"}},\"witness\":{\"effect_owner\":{\"daemon_id\":\"da\"}}}}' WHERE id=?")
+        .bind(&attempt.id).execute(db.pool()).await.unwrap();
+    assert_eq!(refused_machine(db.clone()).await, "rebase-host");
+    // The rebase is performed by the server for a daemon-owned target.
+    sqlx::query("UPDATE integration_attempt SET effect_intent_json='{\"request\":{\"fence\":{\"target_owner\":{\"daemon_id\":\"db\"}},\"witness\":{\"effect_owner\":{\"owner_kind\":\"server\"}}}}' WHERE id=?")
+        .bind(&attempt.id).execute(db.pool()).await.unwrap();
+    assert_eq!(refused_machine(db.clone()).await, "the server");
+}
+
 /// A merge the importer took over with an unknown result records the old
 /// path's operation as `uncertain` on the machine that ran it, without a
 /// fenced intent. Removing that machine settles it (it used to stay unknown

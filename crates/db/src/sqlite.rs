@@ -177,6 +177,7 @@ pub struct SqliteDb {
     >,
     pub(crate) task_step_executor:
         Arc<std::sync::Mutex<Option<std::sync::Weak<dyn crate::task_writer::TaskStepExecutor>>>>,
+    pub(crate) claimed_task_step_wait: Arc<std::sync::Mutex<std::time::Duration>>,
     pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
     /// Disk-pressure admission: off until the running server configures it.
     pub disk_admission: Arc<crate::machine_disk::DiskAdmission>,
@@ -200,6 +201,9 @@ impl SqliteDb {
             condition_checks: Default::default(),
             task_step_controls: Default::default(),
             task_step_executor: Default::default(),
+            claimed_task_step_wait: Arc::new(std::sync::Mutex::new(
+                std::time::Duration::from_secs(90),
+            )),
             task_step_activity: Default::default(),
             readiness_decode_warnings: Default::default(),
             domain_event_hooks,

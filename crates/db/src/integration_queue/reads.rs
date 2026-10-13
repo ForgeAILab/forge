@@ -267,9 +267,11 @@ where
 /// only validator a cached list has for the `integration` summary. A lease
 /// renewal changes nothing here. Every member of a queue belongs to the
 /// queue's own Project (admission refuses any other), so the Project's
-/// members are all the members whose place can move. The sums are over
-/// values that only grow (`revision`, `queue_seq`), so a member that leaves
-/// and one that joins between two reads cannot cancel out.
+/// members are all the members whose place can move. The sums alone can
+/// cancel out when one member leaves and another joins between two reads
+/// (equal `revision` and `queue_seq`, and a newest `updated_at` that did not
+/// move: a wall clock set back), so the value also carries the exact set of
+/// current members, each with its own `revision`, which only grows.
 pub async fn integration_list_revision<'e, E>(executor: E, project_id: &str) -> Result<String>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
@@ -279,15 +281,16 @@ where
         .fetch_one(executor)
         .await?;
     Ok(format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
         row.try_get::<i64, _>("members")?,
         row.try_get::<i64, _>("revisions")?,
         row.try_get::<i64, _>("seqs")?,
         row.try_get::<String, _>("newest")?,
-        row.try_get::<String, _>("queues")?
+        row.try_get::<String, _>("queues")?,
+        row.try_get::<String, _>("member_set")?
     ))
 }
-const LIST_REVISION: &str = "SELECT COUNT(*) AS members,COALESCE(SUM(a.revision),0) AS revisions,COALESCE(SUM(a.queue_seq),0) AS seqs,COALESCE(MAX(a.updated_at),'') AS newest,COALESCE(group_concat(DISTINCT q.id||':'||q.state||':'||COALESCE(q.head_attempt_id,'')),'') AS queues FROM integration_attempt a LEFT JOIN integration_queue q ON q.id=a.queue_id WHERE a.project_ref=? AND a.current=1";
+const LIST_REVISION: &str = "SELECT COUNT(*) AS members,COALESCE(SUM(a.revision),0) AS revisions,COALESCE(SUM(a.queue_seq),0) AS seqs,COALESCE(MAX(a.updated_at),'') AS newest,COALESCE(group_concat(DISTINCT q.id||':'||q.state||':'||COALESCE(q.head_attempt_id,'')),'') AS queues,COALESCE((SELECT group_concat(m.id||'@'||m.revision) FROM (SELECT id,revision FROM integration_attempt WHERE project_ref=?1 AND current=1 ORDER BY id) m),'') AS member_set FROM integration_attempt a LEFT JOIN integration_queue q ON q.id=a.queue_id WHERE a.project_ref=?1 AND a.current=1";
 
 /// One row of the change watch: a queue, and one member in progress (or
 /// none, for a queue with no member). `member_view` is every attempt column
