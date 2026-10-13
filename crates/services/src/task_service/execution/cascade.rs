@@ -2496,10 +2496,21 @@ impl TaskService {
             });
             Ok((task, None, reason.to_owned()))
         } else {
-            let target = review_state
-                .and_then(|state| state.gate_config.as_ref())
-                .and_then(|gate| gate.reject_target.clone())
-                .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
+            // A coordination root with a lead re-plans: its rejection goes to
+            // its planning state (`effective_reject_target`). Every other
+            // Task keeps the configured target.
+            let lead_assigned =
+                crate::task_hierarchy::coordination_root_lead(&self.db, task, &workflow)
+                    .await?
+                    .is_some();
+            let configured =
+                crate::task_hierarchy::effective_reject_target(&workflow, &task.status, false);
+            let target = crate::task_hierarchy::effective_reject_target(
+                &workflow,
+                &task.status,
+                lead_assigned,
+            );
+            let replans = target != configured;
             // The remediation target is the review gate's `reject_target`,
             // and `in_progress` when the gate names none: that fallback is
             // why a workflow whose gate has no `reject_target` still sends
@@ -2563,6 +2574,27 @@ impl TaskService {
                     },
                 });
                 return Ok((task, None, reason.to_owned()));
+            }
+            if replans {
+                // One re-plan per rejected review, charged under the receipt
+                // the planning entry carries. With none left the root parks
+                // in review, typed, for its owner.
+                let (receipt, _) = self.review_replan_receipt(task).await?;
+                if self.charge_replan(task, &receipt).await?
+                    == crate::task_service::replan::ReplanCharge::Exhausted
+                {
+                    let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                    let task = self
+                        .block_replan_exhausted(&current, "its aggregate review was rejected")
+                        .await?;
+                    return Ok((
+                        task,
+                        None,
+                        crate::task_service::replan::REPLAN_EXHAUSTED_REASON.to_owned(),
+                    ));
+                }
             }
             tracing::debug!(
                 task_id = %task.id,
@@ -2753,12 +2785,18 @@ impl TaskService {
             }
         }
         let from = task.status.clone();
+        // A lead root's rejection enters planning as a re-plan.
+        let bridge = if rejection {
+            self.review_rejection_bridge(task, target, reason).await?
+        } else {
+            Default::default()
+        };
         match self
             .transition(
                 task.id.clone(),
                 target.to_owned(),
                 TransitionOptions {
-                    bridge: Default::default(),
+                    bridge,
                     version: task.version,
                     reason: Some(reason.to_owned()),
                     triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow),

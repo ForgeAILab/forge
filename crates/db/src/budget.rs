@@ -22,6 +22,13 @@ pub enum Kind {
     ReviewCiInfrastructure,
     /// Clean-checkout review checks re-run after a timeout, per evaluation.
     ReviewCheckRerun,
+    /// A coordination root's entries into its planning state after kickoff:
+    /// one per rejected aggregate review and one per parked subtask. Charged
+    /// only on a root that has a lead, so it is not in [`Kind::PERSISTED`]:
+    /// no row exists, and nothing is projected, for any other Task. Its
+    /// limit is fixed ([`Kind::default_limit`]): `retry_budgets` does not
+    /// configure it, in any config, like the other system-owned kinds.
+    Replan,
 }
 impl Kind {
     pub const PERSISTED: [Self; 9] = [
@@ -49,6 +56,7 @@ impl Kind {
             Self::ReportCorrection => "report_correction",
             Self::ReviewCiInfrastructure => "review_ci_infrastructure",
             Self::ReviewCheckRerun => "review_check_rerun",
+            Self::Replan => "replan",
         }
     }
     pub const fn default_limit(self) -> i32 {
@@ -59,7 +67,8 @@ impl Kind {
             Self::TargetMovedRebase
             | Self::ConflictHandoff
             | Self::ReviewCarry
-            | Self::ReviewCiInfrastructure => 5,
+            | Self::ReviewCiInfrastructure
+            | Self::Replan => 5,
             Self::ReportCorrection | Self::ReviewCheckRerun => 2,
         }
     }
@@ -189,6 +198,23 @@ pub async fn spent(pool: &sqlx::SqlitePool, task: &str, key: &str) -> Result<i64
             .await?
             .unwrap_or(0),
     )
+}
+/// Whether `step` already holds a receipt for `key` in the Task's current
+/// budget window: the charge it names was made and is not made again.
+pub async fn receipt_recorded(
+    pool: &sqlx::SqlitePool,
+    task: &str,
+    key: &str,
+    step: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM task_budget_charge c JOIN task_budget b USING(task_id,kind) WHERE c.task_id=? AND c.kind=? AND c.window_id=b.window_id AND c.step_id=?)",
+    )
+    .bind(task)
+    .bind(key)
+    .bind(step)
+    .fetch_one(pool)
+    .await?)
 }
 pub async fn load(pool: &sqlx::SqlitePool, task: &str) -> Result<HashMap<String, i64>> {
     let rows = sqlx::query("SELECT kind, spent FROM task_budget WHERE task_id = ?")
@@ -452,6 +478,13 @@ pub fn projection(
         Kind::ReportCorrection.key().into(),
         i64::from(Kind::ReportCorrection.default_limit()),
     );
+    // Only a root that re-planned has this row; no other Task shows it.
+    if let Some(spent) = counts.get(Kind::Replan.key()) {
+        out.insert(
+            Kind::Replan.key().into(),
+            remaining(i64::from(Kind::Replan.default_limit()), *spent),
+        );
+    }
     Ok(out)
 }
 
@@ -1039,6 +1072,56 @@ mod tests {
         let db = SqliteDb::new(pool);
         let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
         (db, task)
+    }
+
+    /// The re-plan limit is fixed: no `retry_budgets` value, Task-wide or
+    /// per state, changes it, and what is projected is counted against it.
+    #[tokio::test]
+    async fn the_replan_limit_is_fixed_and_projected_only_once_spent() {
+        let (db, mut task) = fixture().await;
+        task.task_state_config = Some(
+            json!({"retry_budgets":{"replan":1},"in_progress":{"retry_budgets":{"replan":9}}})
+                .to_string(),
+        );
+        let merged = json!({"retry_budgets":{"replan":9}});
+        assert_eq!(limit(&task, Kind::Replan, None, None).unwrap(), 5);
+        assert_eq!(limit(&task, Kind::Replan, Some(&merged), None).unwrap(), 5);
+        assert!(!Kind::PERSISTED.contains(&Kind::Replan));
+        let workflow = WorkflowDefinition::default();
+        let before = projection(
+            &task,
+            &workflow,
+            &load(db.pool(), &task.id).await.unwrap(),
+            3,
+        )
+        .unwrap();
+        assert!(!before.contains_key("replan"), "{before:?}");
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(
+            charge(&mut tx, &task.id, "replan", 5, "replan:child:park")
+                .await
+                .unwrap()
+                .charged
+        );
+        tx.commit().await.unwrap();
+        assert!(
+            receipt_recorded(db.pool(), &task.id, "replan", "replan:child:park")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !receipt_recorded(db.pool(), &task.id, "replan", "replan:child:other")
+                .await
+                .unwrap()
+        );
+        let after = projection(
+            &task,
+            &workflow,
+            &load(db.pool(), &task.id).await.unwrap(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(after.get("replan"), Some(&4), "{after:?}");
     }
 
     #[tokio::test]

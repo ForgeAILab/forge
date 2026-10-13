@@ -3857,3 +3857,124 @@ async fn resolved_then_reopened_blocker_is_woken_again() {
     assert_eq!(service.sweep_once_at(&later).await.unwrap(), 1);
     assert_eq!((turns(&f).await, audit35_escalations(&f).await), (2, 1));
 }
+
+/// Root lead, stage 2: the one lead filter of the blocker sweep. A subtask's
+/// blocker under a coordination root with a lead wakes nobody while the lead
+/// is about to re-plan for it; once the lead re-planned and left the park in
+/// place, the same open blocker wakes the Project Agent on the next sweep.
+/// Without a lead it wakes the Project Agent at once, as before.
+#[tokio::test]
+async fn a_subtask_blocker_under_a_lead_wakes_the_project_agent_only_after_the_replan() {
+    for with_lead in [true, false] {
+        let f = chat_turn_fixture().await;
+        let now = now_rfc3339();
+        let (root, child) = (new_uuid_v4(), new_uuid_v4());
+        for (id, parent, status) in [
+            (&root, None, "in_progress"),
+            (&child, Some(&root), "in_progress"),
+        ] {
+            sqlx::query(
+                "INSERT INTO task (id, project_id, parent_task_id, title, description, status, priority, subtask_order, created_at, updated_at)
+                 VALUES (?, ?, ?, 'Step', 'fixture', ?, 0, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(&f.project_id)
+            .bind(parent)
+            .bind(status)
+            .bind(&now)
+            .bind(&now)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        }
+        let parked_at = "2026-10-12T01:00:00+00:00";
+        sqlx::query("UPDATE task SET blocked_json = ?, error_annotation = ? WHERE id = ?")
+            .bind(
+                serde_json::json!({"reason": "retries exhausted", "created_at": parked_at, "kind": "retry_exhausted"})
+                    .to_string(),
+            )
+            .bind(
+                serde_json::json!({"type": "retry_exhausted", "blocking_reason": "retries exhausted", "message": "retries exhausted", "blocked_at": parked_at})
+                    .to_string(),
+            )
+            .bind(&child)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        if with_lead {
+            sqlx::query(
+                "INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+                 VALUES (?, ?, 'planner', 'agent', ?, ?, ?)",
+            )
+            .bind(new_uuid_v4())
+            .bind(&root)
+            .bind(&f.identity_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        }
+        let blocker = incident(&f, "execution_failed", "subtask-parked").await;
+        sqlx::query("UPDATE attention_projection SET details_json = ? WHERE id = ?")
+            .bind(
+                serde_json::json!({"scope_type": "project", "scope_id": f.project_id, "entity_type": "task", "entity_id": child})
+                    .to_string(),
+            )
+            .bind(&blocker.id)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        let service = AttentionService::new(f.db.clone());
+        let admitted = service.sweep_once_at(&now_rfc3339()).await.unwrap();
+        if !with_lead {
+            assert_eq!(
+                (admitted, turns(&f).await),
+                (1, 1),
+                "no lead: woken as before"
+            );
+            continue;
+        }
+        assert_eq!(
+            (admitted, turns(&f).await),
+            (0, 0),
+            "the lead is about to re-plan for this park: nobody is woken"
+        );
+        // The lead re-planned for this park and left it in place: the root
+        // implements again and the park is the Project Agent's.
+        db::TransitionLogRepo::insert(
+            &*f.db,
+            db::CreateTransitionLog {
+                id: new_uuid_v4(),
+                task_id: root.clone(),
+                from_state: "in_progress".to_owned(),
+                to_state: "planning".to_owned(),
+                trigger_name: None,
+                triggered_by: "system:task_dispatcher".to_owned(),
+                bridge: api_types::TransitionBridge {
+                    bridge_kind: Some(api_types::TransitionBridgeKind::Replan),
+                    bridge_payload: Some(serde_json::json!({
+                        "trigger": "subtask_parked",
+                        "subject_id": child,
+                        "receipt": format!("replan:{child}:{parked_at}"),
+                    })),
+                },
+                trigger_reason: "subtask parked".to_owned(),
+                hook_results_json: None,
+                rejection: false,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let later = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        assert_eq!(
+            (
+                service.sweep_once_at(&later).await.unwrap(),
+                turns(&f).await
+            ),
+            (1, 1),
+            "the park the lead left in place wakes the Project Agent"
+        );
+    }
+}

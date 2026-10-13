@@ -42,6 +42,9 @@ pub(crate) const DISPATCH_FAILED_ANNOTATION: &str = "dispatch_failed";
 struct ReviewEntryFailure {
     task: db::Task,
     cascade: Option<(String, String)>,
+    /// The bridge of that cascade: `replan` for a coordination root with a
+    /// lead, none otherwise.
+    bridge: api_types::TransitionBridge,
 }
 
 fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
@@ -589,6 +592,7 @@ impl WorkflowExecution<'_> {
             return Ok(Some(ReviewEntryFailure {
                 task: task.clone(),
                 cascade: None,
+                bridge: Default::default(),
             }));
         }
         let Some(review) = latest_review(&self.db, &task.id).await? else {
@@ -613,9 +617,18 @@ impl WorkflowExecution<'_> {
             .task_service
             .review_failure_target(&task, Some(&review.execution_id))
             .await?;
+        let bridge = match &target {
+            Some(target) => {
+                self.task_service
+                    .review_rejection_bridge(&task, target, &reason)
+                    .await?
+            }
+            None => Default::default(),
+        };
         Ok(Some(ReviewEntryFailure {
             task,
             cascade: target.map(|target| (target, reason)),
+            bridge,
         }))
     }
 
@@ -1132,9 +1145,18 @@ impl WorkflowExecution<'_> {
             let is_agent_cancellation = actor.is_agent()
                 && WorkflowEngine::is_cancellation_target(workflow, &target_state)
                 && from_state.kind != StateKind::Terminal;
+            // A coordination root's re-plan (review rejected, or a subtask
+            // parked) enters the planning state over an edge no workflow
+            // declares. Only the workflow itself may take it; the source
+            // state's exit conditions describe going forward and do not
+            // apply to it.
+            let replan_entry = transition.is_none()
+                && actor.is_system()
+                && crate::task_hierarchy::replan_edge(workflow, &bridge, &target_state);
             let none_allowance = transition.is_none()
                 && (((current_status == target_state || to_state.kind == StateKind::Initial)
                     && skip_before_exit)
+                    || replan_entry
                     || (WorkflowEngine::is_cancellation_target(workflow, &target_state)
                         && from_state.kind != StateKind::Terminal));
             let strict_missing_edge = transition.is_none() && !none_allowance;
@@ -1176,6 +1198,7 @@ impl WorkflowExecution<'_> {
                     }
                     None if skip_before_exit && to_state.kind == StateKind::Initial => true,
                     None if skip_before_exit && current_status == target_state => true,
+                    None if replan_entry => true,
                     None if WorkflowEngine::is_cancellation_target(workflow, &target_state)
                         && from_state.kind != StateKind::Terminal =>
                     {

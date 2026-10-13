@@ -42,21 +42,21 @@ impl TaskExecutor for LeadExecutor {
     }
 }
 
-struct Lead {
-    db: Arc<db::SqliteDb>,
-    project: String,
-    coder: String,
-    planner: String,
-    dispatcher: TaskDispatcher,
-    rx: mpsc::UnboundedReceiver<ExecutionContext>,
+pub(super) struct Lead {
+    pub(super) db: Arc<db::SqliteDb>,
+    pub(super) project: String,
+    pub(super) coder: String,
+    pub(super) planner: String,
+    pub(super) dispatcher: TaskDispatcher,
+    pub(super) rx: mpsc::UnboundedReceiver<ExecutionContext>,
     _dirs: (TempDir, TempDir),
 }
 
-async fn lead_fixture(planner_completes: bool) -> Lead {
+pub(super) async fn lead_fixture(planner_completes: bool) -> Lead {
     fixture(planner_completes, false).await
 }
 
-async fn fixture(planner_completes: bool, fail_planner: bool) -> Lead {
+pub(super) async fn fixture(planner_completes: bool, fail_planner: bool) -> Lead {
     let db = Arc::new(sqlite_db().await);
     let (repo, workspace) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (project, _) = seed_project_repo(&db, repo.path()).await;
@@ -96,11 +96,11 @@ async fn fixture(planner_completes: bool, fail_planner: bool) -> Lead {
     }
 }
 
-async fn reload(db: &db::SqliteDb, id: &str) -> Task {
+pub(super) async fn reload(db: &db::SqliteDb, id: &str) -> Task {
     TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap()
 }
 
-async fn executions(db: &db::SqliteDb, task: &str) -> Vec<(String, String)> {
+pub(super) async fn executions(db: &db::SqliteDb, task: &str) -> Vec<(String, String)> {
     sqlx::query_as("SELECT role, status FROM execution WHERE task_id=? ORDER BY created_at, id")
         .bind(task)
         .fetch_all(db.pool())
@@ -108,7 +108,7 @@ async fn executions(db: &db::SqliteDb, task: &str) -> Vec<(String, String)> {
         .unwrap()
 }
 
-async fn park(db: &db::SqliteDb, task: &str) -> String {
+pub(super) async fn park(db: &db::SqliteDb, task: &str) -> String {
     sqlx::query_scalar::<_, String>("SELECT reason_json FROM task_schedule_park WHERE task_id=?")
         .bind(task)
         .fetch_optional(db.pool())
@@ -117,7 +117,7 @@ async fn park(db: &db::SqliteDb, task: &str) -> String {
         .unwrap_or_default()
 }
 
-async fn passes(lead: &Lead, count: usize) {
+pub(super) async fn passes(lead: &Lead, count: usize) {
     for _ in 0..count {
         lead.dispatcher.check_once_and_drain().await.unwrap();
     }
@@ -125,7 +125,7 @@ async fn passes(lead: &Lead, count: usize) {
 
 /// Wait for the spawned executor task to settle its execution, then let the
 /// dispatcher act on what it left.
-async fn until(lead: &Lead, what: &str, done: impl AsyncFn() -> bool) {
+pub(super) async fn until(lead: &Lead, what: &str, done: impl AsyncFn() -> bool) {
     for _ in 0..200 {
         if done().await {
             return;
@@ -153,7 +153,7 @@ async fn until(lead: &Lead, what: &str, done: impl AsyncFn() -> bool) {
     panic!("timed out waiting until {what}\ntasks: {tasks:#?}\nexecutions: {runs:#?}\nsteps: {steps:#?}");
 }
 
-async fn root_with_child(lead: &Lead, with_planner: bool) -> (Task, Task) {
+pub(super) async fn root_with_child(lead: &Lead, with_planner: bool) -> (Task, Task) {
     let root = seed_task(&lead.db, &lead.project, "root", "todo", 1).await;
     let child = seed_subtask(&lead.db, &root, "child", "todo", 0).await;
     assign_role(

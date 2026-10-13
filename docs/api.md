@@ -3227,7 +3227,11 @@ agent default.
 `bridge_kind` and `bridge_payload` alongside the original human `trigger_reason`.
 Kinds are `review_refresh`, `target_moved_rebase`, `conflict_handoff`,
 `retry_window_reset`, `recovery`, `gate_skipped`, `gate_approved`, `gate_rejected`,
-`ci_only_review_passed` and `review_carry`.
+`ci_only_review_passed`, `review_carry` and `replan`. `replan` marks a
+coordination root with a lead entering its planning state again; its payload
+is `{ trigger: "aggregate_review" | "subtask_parked", subject_id, receipt,
+reason }` (the Review or the subtask). A rejected aggregate review of such a
+root goes to `planning` instead of the review gate's `reject_target`.
 `target_moved_rebase` is history only: a clean rebase happens inside `merging`
 since the merge queue is active and writes no transition. Conflict payloads contain a `paths`
 array; recovery/reset payloads contain the recorded `verb`. Ordinary history
@@ -6225,6 +6229,12 @@ recovery is disabled.
 Additional kind keys are `merge_fix`, `execution`, `workflow_guard`,
 `target_moved_rebase`, `conflict_handoff`, `review_carry`,
 `automatic_review_recovery`, `review_ci_infrastructure`, and `report_correction`.
+A coordination root that has re-planned also reports `replan` (limit 5 per
+budget window: one per rejected aggregate review and one per parked subtask);
+no other Task has the key. The limit is fixed: `retry_budgets.replan` is not
+read anywhere. When it is spent the root's condition is
+`budget_exhausted` with `budget_kind: "replan"`, and Retry with a new budget
+is the offered action.
 Merging's gate cap and the repair budget are separate constraints. Disabled
 automatic recovery reports zero. `report_correction` reports the allowance for
 a new invocation; its live counter is volatile and is not Task-level spending.

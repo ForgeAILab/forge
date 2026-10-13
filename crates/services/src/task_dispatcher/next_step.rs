@@ -24,6 +24,13 @@ pub enum Step {
     FailedReview,
     ClearPlanningWait,
     AdvanceRoot,
+    /// Send a coordination root with a lead back to its planning state: its
+    /// current subtask `child_id` parked needing a decision. `park`
+    /// identifies that park; one re-plan is made for it.
+    ReplanRoot {
+        child_id: String,
+        park: String,
+    },
     ApplyDefaults,
     /// Leave an optional gate that nobody holds for the terminal state it
     /// accepts into (a step check whose root has no lead any more).
@@ -163,6 +170,11 @@ pub struct Facts {
     pub root: bool,
     pub root_advance: bool,
     pub root_role_allowed: bool,
+    /// A coordination root with a lead whose current subtask parked needing
+    /// a decision, and that has not re-planned for that park: the subtask
+    /// and the identity of its park
+    /// (`RootRolePolicy::replan_due`).
+    pub root_replan: Option<(String, String)>,
     pub child_ready: bool,
     /// The parent that does not let this subtask run, and why.
     pub parent_wait: Option<(String, String)>,
@@ -436,6 +448,20 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
             condition_park(s.condition)
         } else {
             Next::Step(Step::AdvanceRoot)
+        };
+    }
+    // Level-triggered re-plan, beside the root advance: the root implements
+    // (`Active`), so the two never hold together. A paused Project, an
+    // integration wait, a held or blocked root and a human wait all resolved
+    // above. A refused re-plan is recorded and holds like any refusal.
+    if let (Some((child_id, park)), Some(StateKind::Active)) = (&f.root_replan, kind) {
+        return if f.disposition_current {
+            condition_park(s.condition)
+        } else {
+            Next::Step(Step::ReplanRoot {
+                child_id: child_id.clone(),
+                park: park.clone(),
+            })
         };
     }
     if f.disposition_current {
@@ -1241,6 +1267,91 @@ mod tests {
                 recovery: Action::ApproveOrMove,
                 ..
             })
+        ));
+    }
+    /// `ReplanRoot` sits beside the root advance: it is the step of an
+    /// implementing root, and everything that stops a root stops it first.
+    #[test]
+    fn a_due_replan_is_the_step_of_an_implementing_root_and_nothing_else() {
+        let workflow = WorkflowEngine::resolve_workflow("{}");
+        let condition = TaskCondition::Clear {
+            evidence: ConditionEvidence::default(),
+        };
+        let base = Facts {
+            root: true,
+            child_ready: true,
+            reviewer_ready: true,
+            root_replan: Some(("child".into(), "park".into())),
+            ..Facts::default()
+        };
+        let resolve = |state: &str, facts: &Facts| {
+            next_step(&Snapshot {
+                state,
+                condition: &condition,
+                workflow: &workflow,
+                facts,
+            })
+        };
+        let replan = Next::Step(Step::ReplanRoot {
+            child_id: "child".into(),
+            park: "park".into(),
+        });
+        assert_eq!(resolve("in_progress", &base), replan);
+        // Without the fact the root waits on its subtasks, as before.
+        let waits = resolve(
+            "in_progress",
+            &Facts {
+                root_replan: None,
+                ..base.clone()
+            },
+        );
+        assert!(matches!(
+            &waits,
+            Next::Park(Park {
+                reason: Reason::Children,
+                ..
+            })
+        ));
+        // Never from a gate, an initial or a terminal state.
+        for state in ["todo", "planning", "review", "merging", "done"] {
+            assert_ne!(resolve(state, &base), replan, "{state}");
+        }
+        // A paused Project, a blocked root, a human wait, a queue-owned root
+        // and an owner command all come first.
+        for stop in [
+            Facts {
+                paused: true,
+                ..base.clone()
+            },
+            Facts {
+                blocking: true,
+                ..base.clone()
+            },
+            Facts {
+                human_wait: true,
+                ..base.clone()
+            },
+            Facts {
+                queue_owned: true,
+                ..base.clone()
+            },
+            Facts {
+                queued_recovery: true,
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(resolve("in_progress", &stop), replan, "{stop:?}");
+        }
+        // A refused re-plan is recorded and holds like any other refusal.
+        assert!(matches!(
+            resolve(
+                "in_progress",
+                &Facts {
+                    disposition_current: true,
+                    ..base
+                }
+            ),
+            Next::Park(_)
         ));
     }
 }

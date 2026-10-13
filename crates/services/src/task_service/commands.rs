@@ -22,6 +22,7 @@ impl TaskCommand {
             "maybe_cascade_executor_completion"
             | "block_cancelled_dependencies"
             | "advance_coordination_root"
+            | "replan_coordination_root"
             | "settle_removed_machine"
             | "settle_retired_review_rerun" => db::task_writer::EffectFence::Identity,
             _ => db::task_writer::EffectFence::Entry,
@@ -578,6 +579,15 @@ impl TaskService {
                             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
 
                     encode(Box::pin(self.advance_coordination_root(&parent_task_id)).await?)
+                }
+                "replan_coordination_root" => {
+                    let (root_id, child_id, park): (String, String, String) =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+
+                    encode(
+                        Box::pin(self.replan_coordination_root(&root_id, &child_id, &park)).await?,
+                    )
                 }
                 "review_failure_target" => {
                     let (id, status, execution): (String, String, Option<String>) =
