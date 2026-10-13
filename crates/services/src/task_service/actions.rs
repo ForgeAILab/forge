@@ -451,19 +451,32 @@ impl TaskService {
                                         let cleared = self
                                             .reset_root_review_budget_for_reopen(&task, guidance)
                                             .await?;
-                                        let target = snapshot
+                                        // A gate with a reject transition
+                                        // (review) is sent back as every
+                                        // other owner send-back is. The merge
+                                        // gate has none: its repair route is
+                                        // the gate's configured target, which
+                                        // only recovery may take.
+                                        if snapshot
                                             .workflow
                                             .outgoing_trigger_targets(&task.status)
-                                            .find(|(trigger, _)| {
-                                                *trigger == WorkflowTrigger::Reject
-                                            })
-                                            .map(|(_, target)| target)
-                                            .or_else(|| {
-                                                snapshot
-                                                    .workflow
-                                                    .gate_reject_target(&task.status)
-                                                    .map(str::to_owned)
-                                            })
+                                            .any(|(trigger, _)| trigger == WorkflowTrigger::Reject)
+                                        {
+                                            return self
+                                                .apply_gate_decision(
+                                                    &cleared,
+                                                    &snapshot.workflow,
+                                                    WorkflowTrigger::Reject,
+                                                    Some(guidance.clone()),
+                                                    actor.clone(),
+                                                    false,
+                                                )
+                                                .await;
+                                        }
+                                        let target = snapshot
+                                            .workflow
+                                            .gate_reject_target(&task.status)
+                                            .map(str::to_owned)
                                             .expect("root reopen offer guarantees a reject route");
                                         self.transition_recovery_rejection(
                                             &cleared,

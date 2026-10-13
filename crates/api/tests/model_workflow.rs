@@ -3141,12 +3141,6 @@ impl World {
                     // Corrective work in this harness is supplied through
                     // subtasks. Prefer that offered route to claiming that a
                     // manual edit of the root's checkout has been completed.
-                    .filter(|offer| {
-                        offer["reason"] != "manual_merge_repair"
-                            || !offers
-                                .iter()
-                                .any(|other| other["reason"] == "root_review_reopen")
-                    })
                     .cloned()
                     .collect();
                 if !forward.is_empty() {
