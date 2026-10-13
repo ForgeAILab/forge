@@ -513,6 +513,37 @@ async fn a_spent_replan_budget_parks_the_root_with_a_typed_park_and_an_exit() {
     passes(&lead, 3).await;
     assert_eq!(reload(&lead.db, &root.id).await.version, blocked.version);
 
+    // The owner is told: the park is an open Attention item of the root.
+    let attention = crate::AttentionService::new(Arc::clone(&lead.db));
+    while attention.project_once(100).await.unwrap().processed_events > 0 {}
+    let items: Vec<(String, String)> = sqlx::query_as(
+        "SELECT attention_type, recommended_action FROM attention_projection WHERE status = 'open'
+         AND attention_type != 'delivery_followup'
+         AND (scope_id = ?1 OR json_extract(details_json, '$.entity_id') = ?1
+              OR json_extract(details_json, '$.task_id') = ?1)",
+    )
+    .bind(&root.id)
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !items.is_empty(),
+        "a root parked on its spent re-plan budget raises Attention"
+    );
+    // What the lead may repeat was spent in this window too.
+    let mut tx = lead.db.pool().begin().await.unwrap();
+    db::budget::charge(
+        &mut tx,
+        &root.id,
+        db::budget::LEAD_SUBTASKS_KEY,
+        db::budget::LEAD_SUBTASKS_LIMIT,
+        "created-earlier",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(spent(&lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await, 1);
+
     // The exit: the owner's retry with a fresh budget lets the lead plan.
     let service = &lead.dispatcher.task_service;
     let offers = service.test_action_values(&root.id).await.unwrap();
@@ -542,6 +573,11 @@ async fn a_spent_replan_budget_parks_the_root_with_a_typed_park_and_an_exit() {
     )
     .await;
     assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    assert_eq!(
+        spent(&lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await,
+        0,
+        "the new window is the lead's bounds' new window too"
+    );
 }
 
 /// A crash between the charge and the planning entry leaves a receipt and
