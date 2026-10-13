@@ -29,6 +29,19 @@ function OutcomeIcon({ outcome }: { outcome: string }) {
   return <Warning size={12} className="text-amber-400" weight="fill" />
 }
 
+/**
+ * The words for a mechanical transition the reader would otherwise have to
+ * infer: a re-plan by the root's lead, and a gate nobody had to pass (the
+ * step check of a subtask whose root has no lead).
+ */
+function bridgeLabel(entry: TransitionLogEntry): string | null {
+  if (entry.bridge_kind === 'replan') return 're-plan by the lead'
+  if (entry.bridge_kind === 'gate_skipped') {
+    return entry.from_state === 'lead_check' ? 'no lead: check skipped' : 'gate skipped'
+  }
+  return null
+}
+
 export function TransitionTimeline({ taskId }: { taskId: string }) {
   const query = useTransitionLogQuery(taskId)
 
@@ -76,6 +89,7 @@ export function TransitionTimeline({ taskId }: { taskId: string }) {
         const fromColors = getStateColors(entry.from_state)
         const toColors = getStateColors(entry.to_state)
         const isLast = idx === entries.length - 1
+        const bridge = bridgeLabel(entry)
 
         return (
           <div key={entry.id} className="flex gap-3 px-4">
@@ -118,6 +132,11 @@ export function TransitionTimeline({ taskId }: { taskId: string }) {
                     rejection
                   </span>
                 )}
+                {bridge ? (
+                  <span className="rounded bg-muted px-1.5 py-0.5 text-micro font-medium text-muted-foreground">
+                    {bridge}
+                  </span>
+                ) : null}
                 {entry.bridge_kind === 'ci_only_review_passed' && (
                   <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-micro font-medium text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">
                     CI-only re-review

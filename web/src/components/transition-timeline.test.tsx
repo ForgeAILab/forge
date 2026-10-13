@@ -19,6 +19,32 @@ describe('typed transition history', () => {
     render(<TransitionTimeline taskId="task" />)
     expect(screen.getByText('CI-only re-review')).not.toBeNull()
   })
+  it('labels a re-plan and a skipped step check from the typed bridge kind', () => {
+    query.mockReturnValue({
+      data: [
+        { ...entry('replan', 'subtask parked'), id: 'a', from_state: 'in_progress', to_state: 'planning' },
+        { ...entry('gate_skipped', 'no assignee'), id: 'b', from_state: 'lead_check', to_state: 'done' },
+        { ...entry('gate_skipped', 'no assignee'), id: 'c', from_state: 'planning', to_state: 'in_progress' },
+      ],
+      isLoading: false,
+      isError: false,
+    })
+    render(<TransitionTimeline taskId="task" />)
+    expect(screen.getByText('re-plan by the lead')).not.toBeNull()
+    expect(screen.getByText('no lead: check skipped')).not.toBeNull()
+    expect(screen.getByText('gate skipped')).not.toBeNull()
+    // The inherited state is named, not left as an unknown-state fallback.
+    expect(screen.getByText('lead check').className).not.toContain('purple')
+  })
+  it('adds no bridge label to an ordinary or a rejected transition', () => {
+    query.mockReturnValue({
+      data: [entry(null, 'user action'), { ...entry('gate_rejected', 'returned'), id: 'r' }],
+      isLoading: false,
+      isError: false,
+    })
+    render(<TransitionTimeline taskId="task" />)
+    expect(screen.queryByText(/re-plan|skipped/)).toBeNull()
+  })
   it('does not classify marker words in ordinary audit prose', () => {
     query.mockReturnValue({ data: [entry(null, 'CI-only pass_ci_only [review-refresh]')], isLoading: false, isError: false })
     render(<TransitionTimeline taskId="task" />)

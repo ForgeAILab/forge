@@ -1,15 +1,23 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '@/api/client'
 import type { Agent, Task, WorkflowDefinition } from '@/types/generated'
 import { TaskDetailSidebar } from './task-detail-sidebar'
 
-const { relations, agents } = vi.hoisted(() => ({ relations: vi.fn(), agents: vi.fn() }))
+const { relations, agents, assign, toastError } = vi.hoisted(() => ({
+  relations: vi.fn(),
+  agents: vi.fn(),
+  assign: vi.fn(),
+  toastError: vi.fn(),
+}))
+
+vi.mock('sonner', () => ({ toast: { error: toastError, success: vi.fn(), info: vi.fn() } }))
 
 vi.mock('@/api/hooks', () => {
   const mutation = () => ({ mutate: vi.fn(), isPending: false })
   return {
-    useAssignRole: mutation,
+    useAssignRole: () => ({ mutate: assign, isPending: false }),
     useRemoveRole: mutation,
     useDuplicateTask: mutation,
     useUpdateTask: mutation,
@@ -225,5 +233,50 @@ describe('the lead on the Task detail sidebar', () => {
     expect(screen.getByRole('button', { name: 'Assign Planner' })).not.toBeNull()
     expect(screen.getByRole('button', { name: 'Assign Coder' })).not.toBeNull()
     expect(screen.queryByRole('button', { name: 'Assign Lead' })).toBeNull()
+  })
+
+  it('assigns the lead on the root and shows a refusal as a readable message', () => {
+    relations.mockReturnValue({
+      data: { parent: null, subtasks: [{ id: 'sub-1', status: 'todo', parent_task_id: 'root-1' }] },
+    })
+    agents.mockReturnValue([
+      agent('lead-agent', 'Ada Lead', 'native'),
+      agent('cli-agent', 'Codex CLI', 'cli'),
+    ])
+    renderSidebar(task({ id: 'root-1', status: 'todo' }), rootWorkflow)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Assign Lead' }))
+    const listbox = within(screen.getByRole('listbox'))
+    expect((listbox.getByRole('option', { name: /Codex CLI/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect(listbox.queryByRole('option', { name: /Human/ })).toBeNull()
+    fireEvent.click(listbox.getByRole('option', { name: /Ada Lead/ }))
+
+    expect(assign).toHaveBeenCalledTimes(1)
+    const [request, options] = assign.mock.calls[0]
+    expect(request).toMatchObject({
+      taskId: 'root-1',
+      roleName: 'planner',
+      body: { assignee_type: 'agent', assignee_id: 'lead-agent' },
+    })
+
+    const refusal = (code: string) =>
+      new ApiError('raw server text root-1', 422, undefined, {
+        code,
+        message: 'raw server text root-1',
+      } as never)
+    options.onError(refusal('LEAD_REQUIRES_NATIVE_PROFILE'))
+    options.onError(refusal('LEAD_ROLE_NOT_SUPPORTED'))
+    options.onError(refusal('STEP_CHECK_ROLE_HELD_BY_ROOT'))
+    const shown = toastError.mock.calls.map(([message]) => String(message))
+    expect(shown[0]).toMatch(/must be a native Agent/)
+    expect(shown[1]).toMatch(/only the built-in planner role can lead/)
+    expect(shown[2]).toMatch(/Assign the lead on the parent task/)
+    expect(shown.join(' ')).not.toContain('raw server text')
+
+    // Any other refusal keeps the server's own message.
+    options.onError(refusal('version_conflict'))
+    expect(String(toastError.mock.calls[3][0])).toContain('raw server text')
   })
 })

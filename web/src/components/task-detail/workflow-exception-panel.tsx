@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { cn } from '@/lib/cn'
+import { budgetExhaustedNotice } from '@/lib/workflow-utils'
 import { workflowLabelFromKind } from '@/components/workflow-health-badge'
 import { TaskInteractiveLaunch } from './task-interactive-launch'
 import { TaskActionButtons } from './task-action-buttons'
@@ -69,10 +70,16 @@ export function WorkflowExceptionPanel({
   const exception = task.workflow_exception
   if (!exception) return null
   const failure = task.condition.details.failed
+  const budgetNotice = budgetExhaustedNotice(task)
   return (
     <section className="space-y-3 rounded-lg border border-warning/40 bg-warning/10 p-4">
       <h3 className="text-sm font-semibold">{workflowLabelFromKind(exception.type)}</h3>
       <p className="text-sm">{exception.message}</p>
+      {budgetNotice ? (
+        <p data-testid="budget-exhausted-notice" className="text-sm">
+          <span className="font-medium">{budgetNotice.title}.</span> {budgetNotice.message}
+        </p>
+      ) : null}
       {exception.type === 'review_needs_owner' ? (
         <div className="text-xs text-muted-foreground">
           {assessment?.fixable_by === 'owner' ? (

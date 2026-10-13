@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { reorderSubtasks } from '@/api/client'
 import { useCreateTask, useTaskRelationsQuery } from '@/api/hooks'
 import { qk } from '@/api/query-keys'
+import { TaskStatusBadge } from '@/components/task-controls'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -164,8 +165,9 @@ export function TaskSubtasksPanel({ task, executions }: { task: Task; executions
                 <div className="flex items-start gap-2">
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">{subtask.title}</p>
-                    <p className="mt-0.5 text-xs text-muted-foreground">
-                      {subtask.status} - order {subtask.subtask_order ?? index + 1}
+                    <p className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <TaskStatusBadge status={subtask.status} />
+                      <span>order {subtask.subtask_order ?? index + 1}</span>
                     </p>
                   </div>
                   <div className="flex shrink-0 items-center gap-1">

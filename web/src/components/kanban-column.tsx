@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/cn'
-import { isInitialKind } from '@/lib/workflow-utils'
+import { isInitialKind, showsSubState } from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
 import type { TaskListItem as Task } from '@/types/generated'
 import type { ColumnGroup } from '@/lib/workflow-utils'
@@ -190,7 +190,7 @@ export function KanbanColumn({
                 key={task.id}
                 task={task}
                 index={index}
-                showSubStateBadge={column.states.length > 1}
+                showSubStateBadge={showsSubState(column, task.status)}
                 subStateLabel={column.stateLabels?.[task.status]}
                 dragDisabled={dragDisabled}
                 dragDisabledReason={dragDisabledReason}

@@ -384,6 +384,8 @@ export function TaskCommentsPanel({
         {commentsLoading ? (
           <Skeleton className="h-24 w-full" />
         ) : comments.length > 0 ? (
+          // Seam (stage 4, lead operations): the comment kinds `handoff` and
+          // `request_input` written by a root's lead get their own style here.
           comments.map((comment) => (
             <div key={comment.id} className="rounded-md border p-3">
               <div className="flex items-center justify-between gap-2">

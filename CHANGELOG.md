@@ -2884,6 +2884,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Web: the lead of a coordination root.** A root Task with subtasks shows a Lead picker (the `planner` role; native Agents only, a CLI Agent is listed disabled with the reason) beside its Default worker picker; a subtask shows its root's lead read-only and no picker for it; `lead_check` is rendered as the Lead Check gate on Task detail, in the subtask list, on the board's working column and as a manual transition source; refused assignments (`LEAD_REQUIRES_NATIVE_PROFILE`, `LEAD_ROLE_NOT_SUPPORTED`, `STEP_CHECK_ROLE_HELD_BY_ROOT`) read as plain messages; and the waits and budgets of the lead have words (waiting for the lead's plan, running subtasks, the spent re-plan budget, the `replan` and `lead_check` budget rows, the re-plan and skipped-gate transitions, a native lead refused on a daemon workspace).
 - **Merge-queue receipts have a retention period.** The hourly storage pass
   now empties the owner receipts and observations of merge attempts that
   finished more than `server.check_retention_days` ago (default 30; `0`

@@ -9,14 +9,29 @@ const labels: Record<string, string> = {
   machine_capacity: 'Machine run capacity reached',
   disk_pressure: 'Workspace disk is under its free-space floor',
   executor_unavailable: 'Executor unavailable',
+  native_backend_unsupported: 'Daemon workspaces run CLI Agents only',
 }
+
+/**
+ * A coordination root on a daemon-owned placement accepts a lead, but the
+ * lead is a native Agent and cannot run there: the root parks on this
+ * refusal. The two ways out are the owner's.
+ */
+const NATIVE_LEAD_REFUSAL =
+  'The lead is a native Agent and cannot plan on a daemon workspace, so this task is parked. Remove the lead (Assignees, Lead, Unassigned) to run without one, or change the Project placement so this task runs on the server.'
 
 export function TaskPlacementDiagnostics({
   diagnostics,
+  hasLead = false,
 }: {
   diagnostics: TaskPlacementDiagnostic[]
+  /** The Task is a coordination root with a lead (`effective_lead.source = own`). */
+  hasLead?: boolean
 }) {
   if (!diagnostics.length) return null
+  const leadRefused =
+    hasLead &&
+    diagnostics.some((diagnostic) => diagnostic.filter_codes.includes('native_backend_unsupported'))
   return (
     <section aria-label="Placement diagnostics" role="status" className="min-w-0 space-y-2">
       <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -39,6 +54,11 @@ export function TaskPlacementDiagnostics({
           ))}
         </div>
       ))}
+      {leadRefused ? (
+        <p data-testid="lead-placement-refusal" className="break-words text-xs">
+          {NATIVE_LEAD_REFUSAL}
+        </p>
+      ) : null}
     </section>
   )
 }
