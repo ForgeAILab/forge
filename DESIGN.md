@@ -149,6 +149,22 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **States:** default, hover where relevant, focus ring, disabled, invalid, loading where asynchronous.
 - **Accessibility:** programmatic label, described errors, keyboard operation, and contrast in both themes.
 
+### Lead questions and notes
+
+- Mission Control lead questions reuse the existing labelled Textarea and outline
+  Button. Show the full question, a 1–4000 character hint, and inline validation
+  and server errors. Pending and successful submissions disable the form;
+  failures preserve the answer. Resolved questions retain their text without a form.
+- The Task sidebar names the wait “Lead question”, shows the question, and links
+  to that Attention card's answer control. Loading, missing and failed projections
+  have explicit text and a Mission Control link.
+- Lead handoffs use a quiet muted panel and a handoff icon; questions use a quiet
+  warning border and a question icon. Both name the author as Lead and keep the
+  Markdown body. A handoff on a subtask explains that the worker sees it first.
+- Offers that include the lead show a muted “Who can act” line. Coordination
+  activity names the lead's Agent, retaining its ID as fallback. Reuse existing
+  semantic colors, spacing, focus and responsive wrapping; no new tokens or motion.
+
 ### Card and panel
 
 - **Structure:** semantic section/article with optional header, content, metadata, and actions.

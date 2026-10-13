@@ -9,6 +9,43 @@ import {
   toastApiError,
 } from './api-error'
 
+describe('lead operation refusals', () => {
+  it.each([
+    ['outside_lead_subtree', 'only on its root task'],
+    ['not_leading', 'no longer running as the root'],
+    ['wrong_target', 'Choose the required task'],
+    ['subtask_started', 'This subtask has started'],
+    ['lead_limit_reached', 'reached the limit'],
+    ['action_not_offered', 'not currently offered'],
+    ['lead_input_pending', 'already waiting for an answer'],
+    ['lead_self_assignment', 'cannot assign itself as a worker'],
+  ])('explains %s and retains the request ID', (refusal, explanation) => {
+    const error = new ApiError('raw refusal', 422, undefined, {
+      code: 'LEAD_OPERATION_REFUSED',
+      message: 'raw refusal',
+      request_id: 'request-1',
+      details: { refusal },
+    })
+    expect(getApiErrorMessage(error)).toContain(explanation)
+    expect(getApiErrorMessage(error)).toContain('Request ID: request-1')
+    expect(getApiErrorMessage(error)).not.toContain('raw refusal')
+  })
+
+  it('reads refusal codes from JSON bodies and preserves unknown server messages', () => {
+    const error = (refusal: string) =>
+      new ApiError(
+        JSON.stringify({
+          code: 'LEAD_OPERATION_REFUSED',
+          message: 'Server explanation',
+          details: { refusal },
+        }),
+        422,
+      )
+    expect(getApiErrorMessage(error('lead_self_assignment'))).toContain('Choose another Agent')
+    expect(getApiErrorMessage(error('future_reason'))).toBe('Server explanation')
+  })
+})
+
 describe('placement admission errors', () => {
   it('includes candidate reasons for daemon upgrade refusals', () => {
     const error = new ApiError('Upgrade the daemon', 409, undefined, {

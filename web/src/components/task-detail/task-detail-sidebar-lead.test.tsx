@@ -5,11 +5,19 @@ import { ApiError } from '@/api/client'
 import type { Agent, Task, WorkflowDefinition } from '@/types/generated'
 import { TaskDetailSidebar } from './task-detail-sidebar'
 
-const { relations, agents, assign, toastError } = vi.hoisted(() => ({
+const { relations, agents, assign, toastError, missionQuery } = vi.hoisted(() => ({
   relations: vi.fn(),
   agents: vi.fn(),
   assign: vi.fn(),
   toastError: vi.fn(),
+  missionQuery: vi.fn(),
+}))
+
+vi.mock('@/features/federation/hooks', () => ({ useMissionControlQuery: () => missionQuery() }))
+vi.mock('@tanstack/react-router', () => ({
+  Link: ({ children, to, hash }: { children: React.ReactNode; to: string; hash?: string }) => (
+    <a href={`${to}${hash ? `#${hash}` : ''}`}>{children}</a>
+  ),
 }))
 
 vi.mock('sonner', () => ({ toast: { error: toastError, success: vi.fn(), info: vi.fn() } }))
@@ -160,6 +168,69 @@ function renderSidebar(value: Task, workflow: WorkflowDefinition) {
 }
 
 describe('the lead on the Task detail sidebar', () => {
+  it('shows the lead_input question and links to that exact Attention answer control', () => {
+    relations.mockReturnValue({ data: { parent: null, subtasks: [] } })
+    agents.mockReturnValue([])
+    missionQuery.mockReturnValue({
+      data: {
+        needs_attention: [
+          {
+            id: 'unrelated',
+            category: 'human_input_required',
+            scope_type: 'task',
+            scope_id: 'other-root',
+            lifecycle: 'open',
+            recommended_action: 'answer_lead_input',
+            details: { question: 'Unrelated question' },
+          },
+          {
+            id: 'question-1',
+            category: 'human_input_required',
+            scope_type: 'task',
+            scope_id: 'root-1',
+            lifecycle: 'open',
+            recommended_action: 'answer_lead_input',
+            details: { question: 'Which parser should we use?' },
+          },
+        ],
+      },
+    })
+    const value = task({ id: 'root-1', status: 'planning' })
+    value.condition = {
+      kind: 'parked',
+      primary: { kind: 'human_decision', boundary: 'lead_input' },
+      additional: [],
+      resume: { kind: 'reconcile' },
+      since: null,
+      details: { ...value.condition.details, human_wait: true },
+    }
+    renderSidebar(value, rootWorkflow)
+    expect(screen.getByText('Lead question')).toBeTruthy()
+    expect(screen.getByText('Which parser should we use?')).toBeTruthy()
+    expect(screen.queryByText('Unrelated question')).toBeNull()
+    expect(screen.queryByText('Plan ready - awaiting review')).toBeNull()
+    expect(
+      screen.getByRole('link', { name: 'Answer the lead in Mission Control' }).getAttribute('href'),
+    ).toBe('/mission-control#attention-question-1')
+  })
+
+  it('keeps a plan_review wait labelled as a plan review', () => {
+    relations.mockReturnValue({ data: { parent: null, subtasks: [] } })
+    agents.mockReturnValue([])
+    const value = task({ status: 'planning' })
+    value.condition = {
+      kind: 'parked',
+      primary: { kind: 'human_decision', boundary: 'plan_review' },
+      additional: [],
+      resume: { kind: 'reconcile' },
+      since: null,
+      details: { ...value.condition.details, human_wait: true },
+    }
+    renderSidebar(value, rootWorkflow)
+    expect(screen.getByText('Plan ready - awaiting review')).toBeTruthy()
+    expect(screen.queryByText('Lead question')).toBeNull()
+    expect(missionQuery).not.toHaveBeenCalled()
+  })
   it('shows the step-check gate and the lead for a subtask in lead_check', () => {
     relations.mockReturnValue({ data: { parent: { id: 'root-1', title: 'Root' }, subtasks: [] } })
     agents.mockReturnValue([agent('lead-agent', 'Ada Lead', 'native')])

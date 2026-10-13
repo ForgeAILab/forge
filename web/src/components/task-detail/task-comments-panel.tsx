@@ -1,4 +1,11 @@
-import { DownloadSimple, GearSix, Paperclip, Spinner } from '@phosphor-icons/react'
+import {
+  ArrowBendDownRight,
+  DownloadSimple,
+  GearSix,
+  Paperclip,
+  Question,
+  Spinner,
+} from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import rehypeSanitize, {
@@ -384,12 +391,17 @@ export function TaskCommentsPanel({
         {commentsLoading ? (
           <Skeleton className="h-24 w-full" />
         ) : comments.length > 0 ? (
-          // Seam (stage 4, lead operations): the comment kinds `handoff` and
-          // `request_input` written by a root's lead get their own style here.
           comments.map((comment) => (
-            <div key={comment.id} className="rounded-md border p-3">
+            <div
+              key={comment.id}
+              className={cn(
+                'rounded-md border p-3',
+                comment.kind === 'handoff' && 'border-border-subtle bg-muted/30',
+                comment.kind === 'request_input' && 'border-warning/30 bg-warning/5',
+              )}
+            >
               <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
                   {comment.author_type === 'system' ? (
                     <GearSix size={12} />
                   ) : (
@@ -399,7 +411,13 @@ export function TaskCommentsPanel({
                       size="xs"
                     />
                   )}
-                  <span className="font-medium text-foreground">{comment.author_name}</span>{' '}
+                  <span className="font-medium text-foreground">
+                    {comment.kind === 'handoff' || comment.kind === 'request_input'
+                      ? comment.author_name.toLowerCase() === 'lead'
+                        ? 'Lead'
+                        : `Lead · ${comment.author_name}`
+                      : comment.author_name}
+                  </span>{' '}
                   <span>· {formatDate(comment.created_at)}</span>
                 </div>
                 {comment.author_type === 'user' ? (
@@ -422,6 +440,21 @@ export function TaskCommentsPanel({
                   </Button>
                 ) : null}
               </div>
+              {comment.kind === 'handoff' || comment.kind === 'request_input' ? (
+                <p className="mt-2 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+                  {comment.kind === 'handoff' ? (
+                    <ArrowBendDownRight size={12} aria-hidden />
+                  ) : (
+                    <Question size={12} aria-hidden />
+                  )}
+                  <span className="font-medium">
+                    {comment.kind === 'handoff' ? 'Handoff' : 'Question for the owner'}
+                  </span>
+                  {comment.kind === 'handoff' && task.parent_task_id ? (
+                    <span>· Shown first to the worker in its next implementation run.</span>
+                  ) : null}
+                </p>
+              ) : null}
               <div
                 className={cn(
                   'mt-2 prose prose-sm max-w-none dark:prose-invert',

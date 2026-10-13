@@ -2913,6 +2913,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Web support for answering root-lead questions in Mission Control, linked from Task detail, with distinct handoff/question comments, lead offer audiences, readable operation refusals, and named lead activity.
+
 - Task comments return an optional `kind` (`progress`, `decision`,
   `validation`, `blocker`, `handoff`, `request_input`).
 - A hand-off note of a root's lead is the first thing a subtask's next

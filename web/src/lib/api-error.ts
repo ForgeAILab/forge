@@ -21,11 +21,32 @@ export function getApiErrorMessage(error: unknown, fallback = 'Request failed'):
     } catch {
       // Non-JSON error bodies are already usable as-is.
     }
+    const leadRefusal = getApiConflictDetails(error)?.refusal
+    if (getApiErrorCode(error) === 'LEAD_OPERATION_REFUSED' && typeof leadRefusal === 'string') {
+      message = leadRefusalMessages[leadRefusal] ?? message
+    }
     const placementRejections = getPlacementRejectionMessage(error)
     return `${message}${placementRejections ? ` ${placementRejections}` : ''}${requestId ? ` Request ID: ${requestId}` : ''}`
   }
   if (error instanceof Error) return error.message
   return fallback
+}
+
+/** Public LeadRefusal::code() values in crates/services/src/lib.rs. */
+const leadRefusalMessages: Record<string, string> = {
+  outside_lead_subtree: 'The lead can act only on its root task and that root’s subtasks.',
+  not_leading: 'This Agent is no longer running as the root’s lead.',
+  wrong_target:
+    'This lead operation targets the root’s planning run or one of its subtasks. Choose the required task.',
+  subtask_started:
+    'This subtask has started. The lead can no longer edit, cancel or reorder it through the breakdown operation.',
+  lead_limit_reached:
+    'The lead has reached the limit for this operation. The owner can review the root’s budget and recovery options.',
+  action_not_offered:
+    'This recovery action is not currently offered to the lead. Refresh the subtask’s actions.',
+  lead_input_pending:
+    'The lead is already waiting for an answer. Answer its open question in Mission Control.',
+  lead_self_assignment: 'The lead cannot assign itself as a worker. Choose another Agent.',
 }
 
 export function getApiErrorCode(error: unknown): string | undefined {

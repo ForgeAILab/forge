@@ -28,6 +28,14 @@ beforeEach(() => {
   apiFetch.mockReset()
 })
 describe('descriptor action forms', () => {
+  it('shows the lead among the people who can act on an offered recovery', () => {
+    mount(offer({ verb: 'retry' }, [], { authority: ['owner', 'project_agent', 'lead'] }))
+    const button = screen.getByRole('button', { name: 'retry' })
+    const audience = screen.getByText('Who can act: Owner, Project Agent, Lead')
+    expect(button.getAttribute('aria-describedby')).toBe(audience.id)
+    fireEvent.click(button)
+    expect(mutate.mock.calls[0][0]).toEqual({ taskId: 't', version: 5, action: { verb: 'retry' } })
+  })
   it('requires caller guidance and posts the action and version', () => {
     mount(
       offer({ verb: 'send_back', guidance: '' }, [

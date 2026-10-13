@@ -16,10 +16,9 @@ import type {
  * implementation: the root's lead checks the step, and a root without a lead
  * skips the gate in the same step that entered it.
  *
- * Seam for the lead's operations (stage 4, not built here): the comment kinds
- * `handoff` and `request_input` belong in `task-comments-panel`, and the
- * `lead_input` human boundary belongs beside the `plan_review` wait in the
- * Task detail sidebars. Nothing in this module reads them.
+ * Lead-operation comments (`handoff`, `request_input`) are rendered in
+ * `task-comments-panel`. The `lead_input` wait in the Task sidebar links to
+ * the question's answer control in Mission Control.
  */
 
 /** The inherited subtask status between implementation and done. */

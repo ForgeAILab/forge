@@ -1,4 +1,5 @@
 import { apiFetch } from '@/api/client'
+import type { AttentionResolveRequest } from '@/types/generated/bindings/AttentionResolveRequest'
 import type {
   AgentProviderCapabilitiesResponse,
   CancelProviderAuthorizationRequest,
@@ -389,12 +390,21 @@ export function getMissionControl(): Promise<MissionControlResponse> {
   return apiFetch<MissionControlResponse>(federationApiPaths.missionControl)
 }
 
-export function resolveAttentionItem(id: string, expectedVersion: number): Promise<AttentionItem> {
+export function resolveAttentionItem(
+  id: string,
+  expectedVersion: number,
+  answer?: AttentionResolveRequest['answer'],
+): Promise<AttentionItem> {
+  // JSON numbers are used on the wire; ts-rs represents this i64 as bigint.
+  const input: Omit<AttentionResolveRequest, 'expected_version'> & { expected_version: number } = {
+    expected_version: expectedVersion,
+    ...(answer === undefined ? {} : { answer }),
+  }
   return apiFetch<AttentionItem>(
     `${federationApiPaths.missionControl}/attention/${encodeURIComponent(id)}/resolve`,
     {
       method: 'POST',
-      body: JSON.stringify({ expected_version: expectedVersion }),
+      body: JSON.stringify(input),
     },
   )
 }

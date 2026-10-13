@@ -37,6 +37,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { roleAssignmentErrorMessage } from '@/lib/root-lead'
 import { TaskActionButtons } from './task-action-buttons'
+import { TaskLeadInputWait } from './task-lead-input-wait'
 import { useEffect, useState, type ReactNode } from 'react'
 import type {
   Agent,
@@ -113,6 +114,11 @@ export function TaskDetailSidebar({
     effectiveWorkflow?.roles.find((role) => role.name === 'coder')?.name ??
     'coder'
   const effectiveAvailableTransitions = availableTransitions
+  const condition = task?.condition
+  const leadInputWait = condition?.kind === 'parked' &&
+    [condition.primary, ...condition.additional].some((reason) =>
+      reason.kind === 'human_decision' && reason.boundary === 'lead_input',
+    )
 
   const closeReassignmentDialog = () => {
     setPendingSelection(null)
@@ -197,9 +203,11 @@ export function TaskDetailSidebar({
               </span>
             </SidebarField>
 
-            {/* Seam (stage 4): the `lead_input` human boundary (a lead's question
-                for the owner) gets its own label and answer control here. */}
-            {task.condition.details.human_wait ? (
+            {leadInputWait ? (
+              <SidebarField label="Lead question">
+                <TaskLeadInputWait taskId={task.id} />
+              </SidebarField>
+            ) : task.condition.details.human_wait ? (
               <SidebarField label={task.status === 'planning' ? 'Plan' : 'Review'}>
                 <Badge className="border-transparent bg-violet-100 text-violet-900 dark:bg-violet-950 dark:text-violet-300 text-[11px]">
                   {task.status === 'planning' ? 'Plan ready - awaiting review' : 'Awaiting human'}

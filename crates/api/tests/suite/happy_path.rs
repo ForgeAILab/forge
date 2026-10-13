@@ -599,6 +599,13 @@ struct TestHarness {
 }
 
 async fn test_app(workspace_root: &Path) -> TestHarness {
+    test_app_with_registry(workspace_root, cli_adapters::test_support::test_registry()).await
+}
+
+async fn test_app_with_registry(
+    workspace_root: &Path,
+    registry: executors::AdapterRegistry,
+) -> TestHarness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
@@ -620,7 +627,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     )
     .await
     .expect("seed test user");
-    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
+    let adapter_registry = Arc::new(registry);
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
@@ -1332,5 +1339,326 @@ async fn single_machine_environment_recheck_resumes_task_dispatch() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
+}
+
+/// Like model_workflow's scripted native lead: the native profile names the
+/// test adapter, so planning and step checks run without a provider. The kickoff
+/// stays live until the test releases it; the checks return fail, pass, pass.
+struct HappyPathLead {
+    kickoff: Arc<tokio::sync::Semaphore>,
+    checks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl executors::CodingExecutorAdapter for HappyPathLead {
+    fn kind(&self) -> executors::ExecutorKind {
+        executors::ExecutorKind::Codex
+    }
+
+    fn check_availability(&self) -> executors::AvailabilityInfo {
+        executors::AvailabilityInfo {
+            status: executors::AvailabilityStatus::Authenticated,
+            authenticated_at: None,
+            config_path: None,
+        }
+    }
+
+    async fn discover_options(
+        &self,
+        _ctx: executors::DiscoverContext,
+    ) -> Result<executors::DiscoveredOptions, executors::ExecutorError> {
+        Ok(executors::DiscoveredOptions::default())
+    }
+
+    async fn execute(
+        &self,
+        ctx: executors::ExecutionContext,
+    ) -> Result<executors::ExecutionResult, executors::ExecutorError> {
+        let reply = if ctx.description.contains("Step-check doctrine:") {
+            if self
+                .checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                "The first step needs its second line.\n{\"result\":\"fail\",\"reason\":\"append the second line\"}"
+            } else {
+                "The step is accepted.\n{\"result\":\"pass\",\"reason\":\"deliverable verified\"}"
+            }
+        } else {
+            assert!(ctx
+                .description
+                .contains("You are the lead of this Forge coordination root"));
+            self.kickoff.acquire().await.unwrap().forget();
+            "The breakdown is ready; run the two steps in order."
+        };
+        if let Some(parent) = Path::new(&ctx.logs_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        executors::LogWriter::new(&ctx.logs_path, ctx.execution_id, 1024 * 1024)
+            .write(
+                executors::LogKind::Assistant,
+                executors::LogStream::Main,
+                json!({"text": reply}),
+            )
+            .await?;
+        Ok(executors::ExecutionResult {
+            status: executors::ExecutionOutcome::Completed,
+            summary: Some(reply.to_owned()),
+            agent_session_id: Some("happy-path-lead-session".to_owned()),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+}
+
+async fn drive_lead_happy_path(
+    harness: &TestHarness,
+    dispatcher: &services::TaskDispatcher,
+    task_id: &str,
+    status: &str,
+) -> TaskResponse {
+    for _ in 0..200 {
+        dispatcher
+            .check_once()
+            .await
+            .expect("dispatcher reconciles");
+        let task = common::drain(&harness.state, &harness.app, task_id).await;
+        if task.status == status {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let last = common::drain(&harness.state, &harness.app, task_id).await;
+    panic!("lead happy path did not reach {status}; last Task: {last:?}");
+}
+
+#[tokio::test]
+async fn root_lead_kickoff_returned_step_and_aggregate_review_finish() {
+    let repo_dir = common::TestDir::new("forge-lead-happy-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces = common::TestDir::new("forge-lead-happy-workspaces");
+    let kickoff = Arc::new(tokio::sync::Semaphore::new(0));
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = cli_adapters::test_support::test_registry();
+    registry.register(Box::new(HappyPathLead {
+        kickoff: Arc::clone(&kickoff),
+        checks: Arc::clone(&checks),
+    }));
+    let harness = test_app_with_registry(workspaces.path(), registry).await;
+    let dispatcher = services::TaskDispatcher::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.event_bus),
+        Arc::clone(&harness.state.task_service),
+    );
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "Lead happy path"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({"name": "repo", "local_path": repo_path, "remote_url": repo_path,
+            "default_branch": run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])}),
+        StatusCode::OK,
+    )
+    .await;
+    let daemon = register_daemon_and_report_shell(&harness.app, workspaces.path()).await;
+    let worker: AgentResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({"name": "Default worker", "executor_type": "shell", "daemon_id": daemon}),
+        StatusCode::OK,
+    )
+    .await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &worker.id,
+        &worker.id,
+    )
+    .await;
+
+    // Same native-profile seam used by model_workflow::Action::AssignLead.
+    let now = db::now_rfc3339();
+    let lead_id = db::new_uuid_v4();
+    let lead = db::AgentRepo::create_identity_with_profile(
+        &*harness.state.db,
+        db::CreateAgentIdentity {
+            id: lead_id.clone(),
+            name: "Happy path lead".to_owned(),
+            description: None,
+            max_concurrent_tasks: 2,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        db::CreateAgentProfile {
+            id: db::new_uuid_v4(),
+            identity_id: lead_id.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: "codex".to_owned(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: Some(daemon),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("scripted native lead creates");
+    db::AgentConnectionHealthRepo::upsert_connection_health(
+        &*harness.state.db,
+        db::UpsertAgentConnectionHealth {
+            profile_id: lead.profile_id,
+            status: "healthy".to_owned(),
+            capability_status_json: "{}".to_owned(),
+            checked_at: Some(now.clone()),
+            error_code: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("lead connection is healthy");
+    let root: TaskResponse = json_request(
+        &harness.app, Method::POST, &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title": "Root with lead", "description": "Two checked deliverables",
+            "role_assignments": [
+                {"role_name": "planner", "assignee_type": "agent", "assignee_id": lead_id},
+                {"role_name": "coder", "assignee_type": "agent", "assignee_id": worker.id},
+                {"role_name": "reviewer", "assignee_type": "agent", "assignee_id": worker.id}
+            ],
+            "review_config": {"ci_steps": ["test $(wc -l < first.txt) -eq 2 && test -f second.txt"],
+                "review_prompt": r#"python3 - <<'PY'
+import json, os
+contract = json.loads(os.environ['FORGE_REVIEW_CONTRACT'])
+print(f"Checked {len(contract['context']['requirements'])} requirements against both deliverables.")
+print(json.dumps({'result': 'pass', 'reason': 'Both ordered steps are present and the returned step is fixed'}))
+PY"#}}),
+        StatusCode::OK,
+    ).await;
+    let mut children = Vec::new();
+    for (title, command) in [
+        ("first", "printf 'first\\n' >> first.txt && git add first.txt && git commit -m 'first step'"),
+        ("second", "test $(wc -l < first.txt) -eq 2 && printf 'second\\n' > second.txt && git add second.txt && git commit -m 'second step'"),
+    ] {
+        let child: TaskResponse = json_request(
+            &harness.app, Method::POST, &format!("/api/v1/projects/{}/tasks", project.id),
+            json!({"title": title, "description": command, "parent_task_id": root.id}), StatusCode::OK,
+        ).await;
+        assert!(child.role_assignments.iter().all(|row| row.role_name != "coder"), "the subtask inherits its default worker");
+        assert_eq!(child.effective_coder.as_ref().and_then(|row| row.assignee_id.as_deref()), Some(worker.id.as_str()));
+        children.push(child);
+    }
+    let planning = drive_lead_happy_path(&harness, &dispatcher, &root.id, "planning").await;
+    assert_eq!(
+        planning
+            .effective_lead
+            .unwrap()
+            .assignment
+            .assignee_id
+            .as_deref(),
+        Some(lead_id.as_str())
+    );
+    let child_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution e JOIN task t ON t.id=e.task_id WHERE t.parent_task_id=?",
+    )
+    .bind(&root.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(child_runs, 0, "children cannot run during kickoff planning");
+    kickoff.add_permits(1);
+    let done = drive_lead_happy_path(&harness, &dispatcher, &root.id, "done").await;
+    assert_eq!(done.status, "done");
+    for child in &children {
+        let task = common::drain(&harness.state, &harness.app, &child.id).await;
+        assert_eq!(task.status, "done");
+        assert!(
+            ReviewRepo::list_by_task(&*harness.state.db, &child.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a step check is not aggregate review"
+        );
+    }
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "fail, pass, pass"
+    );
+    let returned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transition_log WHERE task_id=? AND from_state='lead_check' AND to_state='in_progress' AND rejection=1 AND bridge_kind='gate_rejected'")
+        .bind(&children[0].id).fetch_one(harness.state.db.pool()).await.unwrap();
+    assert_eq!(returned, 1, "the lead returned the first step exactly once");
+    let spent: i64 = sqlx::query_scalar(
+        "SELECT spent FROM task_budget WHERE task_id=? AND kind='gate:lead_check'",
+    )
+    .bind(&children[0].id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(spent, 1);
+    let runs: Vec<(String, String, String)> = sqlx::query_as("SELECT task_id, role, agent_id FROM execution WHERE task_id=? OR task_id IN (?,?) ORDER BY created_at,rowid")
+        .bind(&root.id).bind(&children[0].id).bind(&children[1].id).fetch_all(harness.state.db.pool()).await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .filter(|(id, role, agent)| id == &root.id && role == "planner" && agent == &lead_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        runs.iter()
+            .filter(|(_, role, agent)| role == "coder" && agent == &worker.id)
+            .count(),
+        3,
+        "the default worker runs the first step twice and the second once"
+    );
+    assert_eq!(
+        runs.iter()
+            .filter(|(id, role, agent)| id != &root.id && role == "planner" && agent == &lead_id)
+            .count(),
+        3
+    );
+    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &root.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, db::ReviewStatus::Passed);
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("first.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(
+        repo_path.join("second.txt").exists(),
+        "aggregate merge delivered both steps"
+    );
     common::assert_scheduler_clean(&harness.state).await;
 }
