@@ -553,3 +553,69 @@ impl SqliteDb {
         Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_commitment_lifecycle WHERE commitment_id = ? AND dedupe_key = ?").bind(id).bind(key).fetch_one(&mut **tx).await? > 0)
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectCommitmentSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectCommitmentSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn due_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("due_at")?)
+    }
+    pub fn originating_task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("originating_task_id")?)
+    }
+    pub fn evidence_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("evidence_required")?)
+    }
+    pub fn blocked_reason(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("blocked_reason")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn evidence_count(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("evidence_count")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_commitment_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectCommitmentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.status, c.due_at, c.originating_task_id,
+                c.evidence_required, c.blocked_reason, c.version, c.updated_at,
+                (SELECT COUNT(*) FROM agent_commitment_evidence e
+                 WHERE e.commitment_id = c.id) AS evidence_count
+         FROM agent_commitment c
+         JOIN project_agent_binding b
+           ON b.project_id = c.scope_id
+          AND b.identity_id = c.owner_identity_id
+          AND b.state = 'active'
+         WHERE c.scope_type = 'project' AND c.scope_id = ?
+         ORDER BY COALESCE(c.due_at, c.updated_at) ASC, c.updated_at ASC, c.id ASC
+         LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectCommitmentSourceRow { row })
+            .collect())
+    }
+}

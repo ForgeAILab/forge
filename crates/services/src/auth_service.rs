@@ -355,82 +355,55 @@ impl AuthService {
         let mut tx = db::begin_immediate(pool).await?;
 
         // Double-check inside the transaction to handle concurrent first registrations.
-        let already_done: bool = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM system_setting WHERE key = 'bootstrap_completed'",
-        )
-        .fetch_one(&mut *tx)
-        .await?
-            > 0;
+        let already_done: bool = self.db.bootstrap_completion_count_in_tx(&mut tx).await? > 0;
         if already_done {
             return Ok(());
         }
 
-        sqlx::query("UPDATE user SET is_admin = 1, updated_at = ? WHERE id = ?")
-            .bind(now_rfc3339())
-            .bind(user_id)
-            .execute(&mut *tx)
+        self.db
+            .bootstrap_first_user_admin_in_tx(&mut tx, now_rfc3339(), user_id)
             .await?;
 
-        sqlx::query(
-            "UPDATE agent_identity
-             SET owner_id = ?, visibility = 'account'
-             WHERE owner_id IS NULL",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+        self.db
+            .bootstrap_unowned_agent_identities_in_tx(&mut tx, user_id)
+            .await?;
 
-        sqlx::query(
-            "UPDATE daemon SET owner_id = ?, visibility = 'account' WHERE owner_id IS NULL",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+        self.db
+            .bootstrap_unowned_daemons_in_tx(&mut tx, user_id)
+            .await?;
 
         let orphaned_projects: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM project WHERE owner_id IS NULL")
-                .fetch_all(&mut *tx)
-                .await?;
+            self.db.bootstrap_unowned_project_ids_in_tx(&mut tx).await?;
 
         let now = now_rfc3339();
         for (project_id,) in &orphaned_projects {
-            sqlx::query("UPDATE project SET owner_id = ? WHERE id = ? AND owner_id IS NULL")
-                .bind(user_id)
-                .bind(project_id)
-                .execute(&mut *tx)
+            self.db
+                .bootstrap_unowned_project_owner_in_tx(&mut tx, user_id, project_id)
                 .await?;
 
-            let member_exists: bool = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM project_member WHERE project_id = ? AND user_id = ?",
-            )
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_one(&mut *tx)
-            .await?
+            let member_exists: bool = self
+                .db
+                .bootstrap_project_member_count_in_tx(&mut tx, project_id, user_id)
+                .await?
                 > 0;
 
             if !member_exists {
-                sqlx::query(
-                    "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
-                     VALUES (?, ?, ?, 'owner', ?, ?)",
-                )
-                .bind(new_uuid_v4())
-                .bind(project_id)
-                .bind(user_id)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await?;
+                self.db
+                    .bootstrap_project_owner_member_in_tx(
+                        &mut tx,
+                        new_uuid_v4(),
+                        project_id,
+                        user_id,
+                        &now,
+                        &now,
+                    )
+                    .await?;
             }
         }
 
-        sqlx::query(
-            "INSERT INTO system_setting (key, value, updated_at) VALUES ('bootstrap_completed', 'true', ?) \
-             ON CONFLICT(key) DO NOTHING",
-        )
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+        self.db
+            .mark_bootstrap_completed_in_tx(&mut tx, &now)
+            .await?;
 
         tx.commit().await?;
 

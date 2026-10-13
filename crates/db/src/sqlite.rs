@@ -1857,3 +1857,58 @@ pub use workspace::{
     InsertCreatingAdmissionWorkspaceInTxInput, InsertPreparedServerWorkspaceInTxInput,
     MarkPreparedAdmissionWorkspaceReadyInTxInput, RecordedOwnerWorkspaceHeadInput,
 };
+
+pub use agent::{AgentStatusHealthRow, CliRuntimePolicyStatusRow};
+
+pub use daemon::DaemonExecutorStatusRow;
+
+pub use task::{TaskActionScopeAssignmentRow, TaskActionScopeRoleRow};
+
+pub use agent::{
+    ActionApproverIdentityRow, ActionApproverProjectBindingRow, TaskActionActorPolicyRow,
+};
+
+pub use agent_chat::ActionApproverChatScopeRow;
+
+pub use project::ActionOrchestrationCharterStateRow;
+
+pub use orchestration::{
+    EffectiveProjectApprovedDocumentSourceRow, EffectiveProjectCanonicalConflictSourceRow,
+    EffectiveProjectDecisionSourceRow, EffectiveProjectGoverningCharterSourceRow,
+    EffectiveProjectMilestoneSourceRow, EffectiveProjectReadinessSourceRow,
+    EffectiveProjectReconciliationSourceRow, EffectiveProjectReleaseSourceRow,
+    EffectiveProjectValidationOutcomeCountRow, ProjectAdoptionCharterSourceRow,
+};
+
+pub use project::EffectiveProjectIdentitySourceRow;
+
+pub use task::EffectiveProjectTaskStatusCountRow;
+
+pub use commitment::EffectiveProjectCommitmentSourceRow;
+
+pub use inbox::EffectiveProjectInboxSourceRow;
+
+pub use domain_event::EffectiveProjectEventWatermarkRow;
+
+pub use agent_wake::{
+    EscalationBlockerTurnSourceRow, InsertProjectEscalationInTxInput, ProjectEscalationSourceRow,
+};
+
+pub use domain_event::blocker_recovery_transition_exists_in_tx;
+pub use project::escalation_project_owner_on_connection;
+pub use project_member::escalation_project_member_exists_on_connection;
+
+pub use repo_location::EnvironmentProvisionRetryDetailRow;
+
+pub use attention::UpsertEnvironmentWaitAttentionInTxInput;
+
+pub use orchestration::{
+    AdaptiveTaskGovernanceSourceRow, TaskExecutionCharterGovernanceSourceRow,
+    TaskGovernanceDocumentRevisionSourceRow, WorkspaceLeaseCharterGateRow,
+};
+
+pub use task::{WorkspaceLeaseRoleAssignmentRow, WorkspaceLeaseTaskAssignmentRow};
+
+pub use workspace_lease::InsertIssuedWorkspaceLeaseInTxInput;
+
+pub use orchestration::task_governance_document_revision_source_on_pool;

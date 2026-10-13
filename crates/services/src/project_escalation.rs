@@ -14,7 +14,7 @@ use db::{
     CreateNotification, DomainEventRepo, SqliteDb,
 };
 use serde_json::{json, Value};
-use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
+use sqlx::{Sqlite, SqliteConnection, Transaction};
 use std::sync::Arc;
 
 pub const ESCALATE_DESCRIPTION: &str = "Ask the Project owner for the exact need blocking named Tasks; creates one Notification and Attention item.";
@@ -72,8 +72,10 @@ impl ProjectEscalationService {
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let (identity_id, actor) = match authority {
             EscalationAuthority::Agent(identity_id) => {
-                let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_agent_binding WHERE project_id=? AND identity_id=? AND state='active')")
-                    .bind(project_id).bind(identity_id).fetch_one(&mut *tx).await?;
+                let active: bool = self
+                    .db
+                    .escalation_active_project_binding_in_tx(&mut tx, project_id, identity_id)
+                    .await?;
                 if !active {
                     return Err(ServiceError::invalid_operation(
                         "only the bound Project Agent may escalate",
@@ -87,8 +89,10 @@ impl ProjectEscalationService {
             }
         };
         for task_id in &request.task_ids {
-            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND project_id=? AND deleted_at IS NULL)")
-                .bind(task_id).bind(project_id).fetch_one(&mut *tx).await?;
+            let valid: bool = self
+                .db
+                .escalation_visible_project_task_in_tx(&mut tx, task_id, project_id)
+                .await?;
             if !valid {
                 return Err(ServiceError::invalid_operation(
                     "escalation Task is outside this Project",
@@ -98,14 +102,19 @@ impl ProjectEscalationService {
         let dedupe = format!("project-escalate:{project_id}:{key}");
         // Only the Agent's own live turn links its blockers to this handoff.
         let turn_id: Option<String> = match identity_id {
-            Some(identity_id) => sqlx::query_scalar("SELECT j.id FROM agent_chat_turn_job j JOIN agent_chat c ON c.id=j.chat_id WHERE c.project_id=? AND j.responder_identity_id=? AND j.status='leased' ORDER BY j.created_at DESC LIMIT 1")
-                .bind(project_id).bind(identity_id).fetch_optional(&mut *tx).await?,
+            Some(identity_id) => {
+                self.db
+                    .escalation_latest_leased_project_turn_in_tx(&mut tx, project_id, identity_id)
+                    .await?
+            }
             None => None,
         };
         if let Some(turn_id) = turn_id.as_deref() {
             // A second tool call during the same blocker turn reuses its owner handoff.
-            let reused = sqlx::query("SELECT e.* FROM agent_wake_escalation e JOIN agent_wake_blocker b ON b.escalation_id=e.id WHERE b.turn_job_id=? AND e.dedupe_key<>? LIMIT 1")
-                .bind(turn_id).bind(&dedupe).fetch_optional(&mut *tx).await?;
+            let reused = self
+                .db
+                .reused_turn_escalation_in_tx(&mut tx, turn_id, &dedupe)
+                .await?;
             if let Some(row) = reused {
                 return escalation_response(&row);
             }
@@ -123,8 +132,9 @@ impl ProjectEscalationService {
             )
             .await?;
         if let Some(turn_id) = turn_id.as_deref() {
-            sqlx::query("UPDATE agent_wake_blocker SET escalation_id=? WHERE turn_job_id=? AND escalation_id IS NULL")
-                .bind(&result.id).bind(turn_id).execute(&mut *tx).await?;
+            self.db
+                .link_turn_blockers_to_escalation_in_tx(&mut tx, &result.id, turn_id)
+                .await?;
         }
         tx.commit().await?;
         Ok(result)
@@ -136,8 +146,9 @@ impl ProjectEscalationService {
         identity_id: &str,
         task_id: &str,
     ) -> Result<()> {
-        sqlx::query("UPDATE agent_wake_blocker SET recorded_outcome='recovery_action' WHERE escalation_id IS NULL AND attention_id IN (SELECT id FROM attention_projection WHERE scope_type='project' AND scope_id=? AND json_extract(details_json,'$.entity_id')=?) AND turn_job_id IN (SELECT j.id FROM agent_chat_turn_job j JOIN agent_chat c ON c.id=j.chat_id WHERE c.project_id=? AND j.responder_identity_id=? AND j.status='leased')")
-            .bind(project_id).bind(task_id).bind(project_id).bind(identity_id).execute(self.db.pool()).await?;
+        self.db
+            .record_project_blocker_recovery_action(project_id, task_id, identity_id)
+            .await?;
         Ok(())
     }
     pub async fn list_for_owner(
@@ -157,30 +168,22 @@ impl ProjectEscalationService {
         }
         let after = cursor.map(decode_cursor).transpose()?;
         let limit = limit.unwrap_or(50).clamp(1, MAX_LIST_LIMIT);
-        let rows = sqlx::query(
-            "SELECT * FROM agent_wake_escalation
-             WHERE project_id = ? AND (? IS NULL OR status = ?)
-               AND (? IS NULL OR created_at > ? OR (created_at = ? AND id > ?))
-             ORDER BY created_at, id LIMIT ?",
-        )
-        .bind(project_id)
-        .bind(status)
-        .bind(status)
-        .bind(after.as_ref().map(|a| a.0.as_str()))
-        .bind(after.as_ref().map(|a| a.0.as_str()))
-        .bind(after.as_ref().map(|a| a.0.as_str()))
-        .bind(after.as_ref().map(|a| a.1.as_str()))
-        .bind(limit + 1)
-        .fetch_all(&mut *conn)
-        .await?;
+        let rows = self
+            .db
+            .owner_project_escalation_sources_on_connection(
+                &mut conn,
+                project_id,
+                status,
+                after.as_ref().map(|a| a.0.as_str()),
+                after.as_ref().map(|a| a.1.as_str()),
+                limit + 1,
+            )
+            .await?;
         let has_more = rows.len() as i64 > limit;
         let mut items = Vec::with_capacity(rows.len());
         let mut last = None;
         for row in rows.iter().take(limit as usize) {
-            last = Some((
-                row.try_get::<String, _>("created_at")?,
-                row.try_get::<String, _>("id")?,
-            ));
+            last = Some((row.created_at()?, row.id()?));
             items.push(escalation_response(row)?);
         }
         Ok(ProjectEscalationListResponse {
@@ -201,10 +204,9 @@ impl ProjectEscalationService {
     ) -> Result<ProjectEscalationResponse> {
         let mut conn = self.db.pool().acquire().await?;
         require_owner(&mut conn, project_id, owner_id).await?;
-        let row = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=? AND project_id=?")
-            .bind(id)
-            .bind(project_id)
-            .fetch_optional(&mut *conn)
+        let row = self
+            .db
+            .owner_project_escalation_source_on_connection(&mut conn, id, project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project_escalation", id.to_owned()))?;
         escalation_response(&row)
@@ -223,18 +225,25 @@ impl ProjectEscalationService {
         }
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         require_owner(&mut tx, project_id, owner_id).await?;
-        let current =
-            sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=? AND project_id=?")
-                .bind(id)
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project_escalation", id.to_owned()))?;
+        let current = self
+            .db
+            .answer_project_escalation_source_in_tx(&mut tx, id, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project_escalation", id.to_owned()))?;
         let response = escalation_response(&current)?;
         let now = now_rfc3339();
-        let changed=sqlx::query("UPDATE agent_wake_escalation SET status='answered',answer=?,answered_at=?,version=version+1 WHERE id=? AND project_id=? AND version=? AND status='open'")
-            .bind(&request.answer).bind(&now).bind(id).bind(project_id).bind(request.expected_version).execute(&mut *tx).await?;
-        if changed.rows_affected() == 0 {
+        let changed = self
+            .db
+            .answer_project_escalation_in_tx(
+                &mut tx,
+                &request.answer,
+                &now,
+                id,
+                project_id,
+                request.expected_version,
+            )
+            .await?;
+        if changed == 0 {
             return Err(db::DbError::VersionConflict.into());
         }
         let answer_event=self.db.append_event_in_tx(&mut tx, &CreateDomainEvent {
@@ -249,9 +258,9 @@ impl ProjectEscalationService {
                 &now,
             )
             .await?;
-        let row = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=?")
-            .bind(id)
-            .fetch_one(&mut *tx)
+        let row = self
+            .db
+            .answered_project_escalation_source_in_tx(&mut tx, id)
             .await?;
         let result = escalation_response(&row)?;
         tx.commit().await?;
@@ -302,11 +311,7 @@ impl ProjectEscalationService {
         key: &str,
         turn_id: Option<&str>,
     ) -> Result<ProjectEscalationResponse> {
-        if let Some(row) = sqlx::query("SELECT * FROM agent_wake_escalation WHERE dedupe_key=?")
-            .bind(key)
-            .fetch_optional(&mut **tx)
-            .await?
-        {
+        if let Some(row) = self.db.project_escalation_by_dedupe_in_tx(tx, key).await? {
             let existing = escalation_response(&row)?;
             if existing.need != need || existing.task_ids != task_ids {
                 return Err(db::DbError::IdempotencyConflict.into());
@@ -388,8 +393,22 @@ impl ProjectEscalationService {
                 },
             )
             .await?;
-        sqlx::query("INSERT INTO agent_wake_escalation(id,project_id,identity_id,dedupe_key,need,task_ids_json,attention_id,notification_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
-            .bind(&id).bind(project_id).bind(identity_id).bind(key).bind(need).bind(json!(task_ids).to_string()).bind(&attention_id).bind(&notification_id).bind(&now).execute(&mut **tx).await?;
+        self.db
+            .insert_project_escalation_in_tx(
+                tx,
+                db::InsertProjectEscalationInTxInput {
+                    id: &id,
+                    project_id,
+                    identity_id,
+                    dedupe_key: key,
+                    need,
+                    task_ids_json: &json!(task_ids).to_string(),
+                    attention_id: &attention_id,
+                    notification_id: &notification_id,
+                    created_at: &now,
+                },
+            )
+            .await?;
         Ok(ProjectEscalationResponse {
             id,
             project_id: project_id.to_owned(),
@@ -421,8 +440,10 @@ impl ProjectEscalationService {
                 .get("entity_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let raw = sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=? AND project_id=? AND deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'")
-                .bind(task_id).bind(&current.scope_id).fetch_optional(&mut *tx).await?;
+            let raw = self
+                .db
+                .escalation_unsettled_task_condition_in_tx(&mut tx, task_id, &current.scope_id)
+                .await?;
             let persists = raw
                 .and_then(|raw| db::task_condition::decode(&raw).ok())
                 .is_some_and(|condition| {
@@ -450,14 +471,18 @@ impl ProjectEscalationService {
         {
             return Ok(false);
         }
-        let row = sqlx::query("SELECT b.turn_job_id,j.responder_identity_id,j.created_at,j.updated_at FROM agent_wake_blocker b JOIN agent_chat_turn_job j ON j.id=b.turn_job_id WHERE b.attention_id=? AND b.incident_digest=? AND b.legacy_source_event_id IS NULL")
-            .bind(&current.id).bind(&digest).fetch_one(&mut *tx).await?;
-        let turn_id: String = row.try_get("turn_job_id")?;
-        let identity: Option<String> = row.try_get("responder_identity_id")?;
-        let turn_started: String = row.try_get("created_at")?;
-        let turn_ended: String = row.try_get("updated_at")?;
-        let linked: Vec<(String, String, Option<String>)> = sqlx::query_as("SELECT attention_id,incident_digest,recorded_outcome FROM agent_wake_blocker WHERE turn_job_id=? AND escalation_id IS NULL AND legacy_source_event_id IS NULL")
-            .bind(&turn_id).fetch_all(&mut *tx).await?;
+        let row = self
+            .db
+            .escalation_blocker_turn_source_in_tx(&mut tx, &current.id, &digest)
+            .await?;
+        let turn_id: String = row.turn_job_id()?;
+        let identity: Option<String> = row.responder_identity_id()?;
+        let turn_started: String = row.created_at()?;
+        let turn_ended: String = row.updated_at()?;
+        let linked: Vec<(String, String, Option<String>)> = self
+            .db
+            .escalation_unlinked_turn_blockers_in_tx(&mut tx, &turn_id)
+            .await?;
         let mut needs = Vec::new();
         let mut task_ids = Vec::new();
         let mut escalated = Vec::new();
@@ -506,15 +531,19 @@ impl ProjectEscalationService {
             )
             .await?;
         for id in escalated {
-            sqlx::query("UPDATE agent_wake_blocker SET escalation_id=? WHERE turn_job_id=? AND attention_id=? AND escalation_id IS NULL")
-                .bind(&result.id).bind(&turn_id).bind(&id).execute(&mut *tx).await?;
+            self.db
+                .link_attention_blocker_to_escalation_in_tx(&mut tx, &result.id, &turn_id, &id)
+                .await?;
         }
         tx.commit().await?;
         Ok(true)
     }
     /// Escalate a completed blocker turn that left its blockers unchanged.
     pub async fn escalate_silent_turn(&self, turn_id: &str) -> Result<()> {
-        let ids:Vec<String>=sqlx::query_scalar("SELECT attention_id FROM agent_wake_blocker WHERE turn_job_id=? AND escalation_id IS NULL").bind(turn_id).fetch_all(self.db.pool()).await?;
+        let ids: Vec<String> = self
+            .db
+            .escalation_unlinked_turn_attention_ids(turn_id)
+            .await?;
         for id in ids {
             if let Some(attention) = db::AttentionRepo::get_attention(&*self.db, &id).await? {
                 self.escalate_blocker(&attention).await?;
@@ -543,12 +572,11 @@ impl ProjectEscalationService {
         }
     }
     async fn raise_cannot_run_notice(&self, job: &db::AgentChatTurnJob) -> Result<()> {
-        let project_id: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM agent_chat WHERE id=?")
-                .bind(&job.chat_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .flatten();
+        let project_id: Option<String> = self
+            .db
+            .escalation_turn_chat_project(&job.chat_id)
+            .await?
+            .flatten();
         let Some(project_id) = project_id else {
             return Ok(());
         };
@@ -600,20 +628,13 @@ impl ProjectEscalationService {
 /// 404 for anyone who cannot see the Project; 403 for a member who is not its owner.
 async fn require_owner(conn: &mut SqliteConnection, project_id: &str, user_id: &str) -> Result<()> {
     let owner: Option<Option<String>> =
-        sqlx::query_scalar("SELECT owner_id FROM project WHERE id=?")
-            .bind(project_id)
-            .fetch_optional(&mut *conn)
-            .await?;
+        db::escalation_project_owner_on_connection(conn, project_id).await?;
     match owner {
         Some(Some(owner)) if owner == user_id => Ok(()),
         Some(_) => {
-            let member: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM project_member WHERE project_id=? AND user_id=?)",
-            )
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_one(&mut *conn)
-            .await?;
+            let member: bool =
+                db::escalation_project_member_exists_on_connection(conn, project_id, user_id)
+                    .await?;
             if member {
                 Err(ServiceError::AuthorizationDenied {
                     message: "only the Project owner may read or answer an escalation".to_owned(),
@@ -649,16 +670,9 @@ async fn recovery_transition_recorded(
         return Ok(false);
     };
     for task_id in task_ids {
-        let recorded: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM domain_event
-             WHERE entity_type='task' AND entity_id=? AND event_type='task.transitioned'
-               AND actor_type='agent' AND actor_id=? AND created_at>=?)",
-        )
-        .bind(task_id)
-        .bind(identity)
-        .bind(turn_started)
-        .fetch_one(&mut *conn)
-        .await?;
+        let recorded: bool =
+            db::blocker_recovery_transition_exists_in_tx(conn, task_id, identity, turn_started)
+                .await?;
         if recorded {
             return Ok(true);
         }
@@ -722,18 +736,18 @@ fn blocker_need(attention: &AttentionProjection) -> String {
     bounded_chars(&line, MAX_NEED_LINE_CHARS)
 }
 
-fn escalation_response(row: &sqlx::sqlite::SqliteRow) -> Result<ProjectEscalationResponse> {
+fn escalation_response(row: &db::ProjectEscalationSourceRow) -> Result<ProjectEscalationResponse> {
     Ok(ProjectEscalationResponse {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        need: row.try_get("need")?,
-        task_ids: serde_json::from_str(&row.try_get::<String, _>("task_ids_json")?)
+        id: row.id()?,
+        project_id: row.project_id()?,
+        need: row.need()?,
+        task_ids: serde_json::from_str(&row.task_ids_json()?)
             .map_err(|e| ServiceError::Domain(e.to_string()))?,
-        attention_id: row.try_get("attention_id")?,
-        notification_id: row.try_get("notification_id")?,
-        status: row.try_get("status")?,
-        answer: row.try_get("answer")?,
-        version: row.try_get("version")?,
+        attention_id: row.attention_id()?,
+        notification_id: row.notification_id()?,
+        status: row.status()?,
+        answer: row.answer()?,
+        version: row.version()?,
     })
 }
 pub(crate) fn blocker_task_ids(attention: &AttentionProjection) -> Vec<String> {

@@ -373,3 +373,67 @@ impl SqliteDb {
         Ok(stored)
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectInboxSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectInboxSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn source_type(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_type")?)
+    }
+    pub fn source_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_id")?)
+    }
+    pub fn correlation_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("correlation_id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_inbox_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectInboxSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT i.id, i.kind, i.status, i.source_type, i.source_id,
+                i.correlation_id, i.version, i.created_at, i.updated_at
+         FROM agent_inbox_item i
+         JOIN project_agent_binding b
+           ON b.project_id = i.scope_id
+          AND b.identity_id = i.recipient_identity_id
+          AND b.state = 'active'
+         WHERE i.scope_type = 'project' AND i.scope_id = ?
+           AND i.status <> 'dismissed'
+         ORDER BY i.updated_at DESC, i.id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectInboxSourceRow { row })
+            .collect())
+    }
+}

@@ -537,6 +537,71 @@ impl SqliteDb {
     }
 }
 
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct DaemonExecutorStatusRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl DaemonExecutorStatusRow {
+    pub fn id_unchecked(&self) -> String {
+        self.row.get("id")
+    }
+    pub fn status_unchecked(&self) -> String {
+        self.row.get("status")
+    }
+    pub fn detected_clis_json_unchecked(&self) -> String {
+        self.row.get("detected_clis_json")
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn detected_clis_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("detected_clis_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_executor_statuses(&self) -> crate::Result<Vec<DaemonExecutorStatusRow>> {
+        let rows = sqlx::query("SELECT id,status,detected_clis_json FROM daemon")
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DaemonExecutorStatusRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_machine_hostname(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT hostname FROM daemon WHERE id = ?")
+                .bind(daemon_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_unowned_daemons_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        user_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE daemon SET owner_id = ?, visibility = 'account' WHERE owner_id IS NULL",
+        )
+        .bind(user_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

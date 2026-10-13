@@ -198,3 +198,19 @@ fn map_refresh_token(row: SqliteRow) -> Result<RefreshToken> {
         created_at: row.try_get("created_at")?,
     })
 }
+
+impl SqliteDb {
+    pub async fn bootstrap_first_user_admin_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: String,
+        user_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE user SET is_admin = 1, updated_at = ? WHERE id = ?")
+            .bind(updated_at)
+            .bind(user_id)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}

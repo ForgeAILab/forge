@@ -7682,15 +7682,17 @@ removing Project repository setup no longer deletes Tasks through a Repo
 foreign-key cascade.
 
 Operator status, milestone readiness/release persistence, workspace cleanup,
-Attention/wake projections, Task workspace admission, and recovery persistence
-use typed `SqliteDb` functions in the corresponding DB aggregate modules.
+Attention/wake projections, Task workspace admission, recovery persistence,
+Agent status/coordination, Project runtime/escalation, placement environment waits,
+first-user bootstrap, and Task governance persistence use typed `SqliteDb`
+functions in the corresponding DB aggregate modules.
 The services retain policy and transaction ownership; queries participating in
 those transactions accept the caller's `SqliteConnection`. Read projections
 return named row structs, while SQL execution and row decoding produce `DbError`
 for conversion to `ServiceError` at the service boundary. Projections whose
 callers conditionally decode fields or ignore decoding failures retain typed
-field results so the service handles those errors at the original point; nested
-wake-budget savepoints and fenced Task writes retain caller transaction ownership.
+field results or query-specific typed accessors so the service handles those
+errors at the original point; nested wake-budget savepoints and fenced Task writes retain caller transaction ownership.
 
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.

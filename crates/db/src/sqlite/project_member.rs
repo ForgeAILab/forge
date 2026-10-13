@@ -102,3 +102,59 @@ fn map_project_member(row: SqliteRow) -> Result<ProjectMember> {
         updated_at: row.try_get("updated_at")?,
     })
 }
+
+pub async fn escalation_project_member_exists_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+    user_id: &str,
+) -> crate::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM project_member WHERE project_id=? AND user_id=?)",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_one(connection)
+    .await?)
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_project_member_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        user_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_member WHERE project_id = ? AND user_id = ?",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_project_owner_member_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: String,
+        project_id: &str,
+        user_id: &str,
+        created_at: &str,
+        updated_at: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
+                     VALUES (?, ?, ?, 'owner', ?, ?)",
+        )
+        .bind(id)
+        .bind(project_id)
+        .bind(user_id)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

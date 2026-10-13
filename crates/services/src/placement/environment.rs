@@ -211,9 +211,8 @@ async fn record_probe_error(
     }) {
         return Ok(());
     }
-    let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
-        .bind(&row.project_id)
-        .fetch_one(&mut *tx)
+    let raw: String = db
+        .environment_probe_project_settings_in_tx(&mut tx, &row.project_id)
         .await?;
     let settings: api_types::ProjectSettings = serde_json::from_str(&raw)
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
@@ -228,8 +227,13 @@ async fn record_probe_error(
         .expect("machine")
         .to_string();
     // Only matching Task waits receive diagnostics; readiness facts are unchanged.
-    db::task_writer::BulkTaskQuery::new(db,"UPDATE task SET metadata_json=json_set(metadata_json,'$.environment_wait.last_error',?,'$.deferred_dispatch.reason',COALESCE(json_extract(metadata_json,'$.deferred_dispatch.reason'),'environment_probe_pending') || '; last failure: ' || ?) WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND json_extract(metadata_json,'$.environment_wait.kind')='environment_probe_pending'")
-        .bind(&error).bind(&error).bind(&row.project_id).bind(machine).execute_in_tx(&mut tx).await?;
+    db.record_environment_probe_error_for_task_waits_in_tx(
+        &mut tx,
+        &error,
+        &row.project_id,
+        machine,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -574,7 +578,9 @@ pub(crate) async fn schedule_project_probes(
         return Ok(());
     }
     if let Some(registry) = registry {
-        let locations: Vec<(String, String, String)> = sqlx::query_as("SELECT l.id, l.daemon_id, l.runtime_id FROM repo_location l JOIN repo r ON r.id = l.repo_id JOIN daemon d ON d.id = l.daemon_id WHERE r.project_id = ? AND l.owner_kind = 'daemon' AND l.status = 'ready' AND (d.visibility = 'global' OR d.owner_id IS NULL OR d.owner_id = ?)").bind(&project.id).bind(&project.owner_id).fetch_all(db.pool()).await?;
+        let locations: Vec<(String, String, String)> = db
+            .environment_probe_visible_daemon_locations(&project.id, project.owner_id.as_deref())
+            .await?;
         for (location_id, daemon_id, runtime_id) in locations {
             let machine = EnvironmentMachine::Daemon {
                 daemon_id,
@@ -627,13 +633,18 @@ pub(crate) async fn schedule_project_probes(
     }) {
         return Ok(());
     }
-    let path: Option<String> = sqlx::query_scalar("SELECT l.path FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.owner_kind = 'server' AND l.status = 'ready' ORDER BY (r.id = ?) DESC, l.is_default DESC, l.created_at, l.id LIMIT 1")
-        .bind(&project.id).bind(&project.primary_repo_id).fetch_optional(db.pool()).await?;
+    let path: Option<String> = db
+        .environment_probe_server_checkout_path(&project.id, project.primary_repo_id.as_deref())
+        .await?;
     // A retained host row is also a probe target after its location is removed;
     // use the repository's server checkout rather than waiting for a new Task.
     let path = if path.is_none() && observed.is_some() {
-        sqlx::query_scalar::<_, Option<String>>("SELECT local_path FROM repo WHERE project_id = ? ORDER BY (id = ?) DESC, created_at, id LIMIT 1")
-            .bind(&project.id).bind(&project.primary_repo_id).fetch_optional(db.pool()).await?.flatten()
+        db.environment_probe_retained_server_repo_path(
+            &project.id,
+            project.primary_repo_id.as_deref(),
+        )
+        .await?
+        .flatten()
     } else {
         path
     };
@@ -683,8 +694,9 @@ pub(crate) async fn target_for_machine(
                             .contains(&WorkspaceRunPurpose::EnvironmentProbe)
                 })
             {
-                let location: Option<String> = sqlx::query_scalar("SELECT l.id FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.daemon_id = ? AND l.runtime_id = ? AND l.status = 'ready' ORDER BY l.is_default DESC, l.created_at, l.id LIMIT 1")
-                    .bind(&project.id).bind(daemon_id).bind(runtime_id).fetch_optional(db.pool()).await?;
+                let location: Option<String> = db
+                    .environment_probe_daemon_location(&project.id, daemon_id, runtime_id)
+                    .await?;
                 if location.is_none() {
                     let settings: api_types::ProjectSettings =
                         serde_json::from_str(&project.settings)
@@ -936,9 +948,8 @@ pub(crate) async fn defer_refusal(
     let kind = "environment_probe_pending";
     let label = machine_name(db, &machine).await?;
     let progress = provisioning_wait_detail(db, &refusal.repo_id, &machine, registry).await?;
-    let current: Option<String> = sqlx::query_scalar("SELECT metadata_json FROM task WHERE id=?")
-        .bind(&task.id)
-        .fetch_optional(db.pool())
+    let current: Option<String> = db
+        .environment_probe_task_metadata(&task.id)
         .await?
         .flatten();
     let previous: serde_json::Value = current
@@ -970,9 +981,16 @@ pub(crate) async fn defer_refusal(
     // The dispatcher refuses outside the Task lease, where this wait is
     // queued: identity-fenced to the status it was computed for, so it lands
     // unless the Task has moved on (then it is moot).
-    let changed = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?), '$.environment_wait', json(?)) WHERE id = ? AND version = ? AND status = ?")
-        .bind(marker.to_string()).bind(wait.to_string()).bind(&task.id).bind(task.version).bind(&task.status)
-        .identity_fenced().execute_in_tx(&mut tx).await?;
+    let changed = db
+        .persist_environment_probe_pending_wait_in_tx(
+            &mut tx,
+            &task.id,
+            marker.to_string(),
+            wait.to_string(),
+            task.version,
+            &task.status,
+        )
+        .await?;
     if changed.applied().is_some_and(|rows| rows != 1) {
         return Err(db::DbError::VersionConflict.into());
     }
@@ -982,13 +1000,10 @@ pub(crate) async fn defer_refusal(
 pub(crate) async fn machine_name(db: &SqliteDb, machine: &EnvironmentMachine) -> Result<String> {
     match machine {
         EnvironmentMachine::Server => Ok("server".into()),
-        EnvironmentMachine::Daemon { daemon_id, .. } => Ok(sqlx::query_scalar::<_, String>(
-            "SELECT hostname FROM daemon WHERE id = ?",
-        )
-        .bind(daemon_id)
-        .fetch_optional(db.pool())
-        .await?
-        .unwrap_or_else(|| "daemon machine".into())),
+        EnvironmentMachine::Daemon { daemon_id, .. } => Ok(db
+            .environment_machine_hostname(daemon_id)
+            .await?
+            .unwrap_or_else(|| "daemon machine".into())),
     }
 }
 
@@ -1007,19 +1022,22 @@ async fn provisioning_wait_detail(
     };
     // One read: a provisioning job that verifies the location deletes this
     // retry row concurrently, so a second lookup could find it gone.
-    type RetryDetail = (Option<String>, Option<String>, i64, String, i64);
-    let detail: Option<RetryDetail> = sqlx::query_as("SELECT j.started_at, COALESCE(l.last_error, j.last_error), j.attempts, j.checks_digest, j.connection_id FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id = j.location_id WHERE j.repo_id = ? AND j.runtime_id = ?").bind(repo).bind(runtime_id).fetch_optional(db.pool()).await?;
-    let Some((started, error, attempts, inputs_digest, connection_id)) = detail else {
+    let detail: Option<db::EnvironmentProvisionRetryDetailRow> = db
+        .environment_provision_retry_detail(repo, runtime_id)
+        .await?;
+    let Some(db::EnvironmentProvisionRetryDetailRow {
+        started_at: started,
+        last_error: error,
+        attempts,
+        checks_digest: inputs_digest,
+        connection_id,
+    }) = detail
+    else {
         return Ok(String::new());
     };
     let retry =
         super::provisioning::ProvisionRetryState::from((attempts, inputs_digest, connection_id));
-    let raw: String = sqlx::query_scalar(
-        "SELECT p.settings FROM project p JOIN repo r ON r.project_id=p.id WHERE r.id=?",
-    )
-    .bind(repo)
-    .fetch_one(db.pool())
-    .await?;
+    let raw: String = db.environment_provision_repo_project_settings(repo).await?;
     let settings: api_types::ProjectSettings = serde_json::from_str(&raw)
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     let exhausted = retry.exhausted(
@@ -1037,9 +1055,8 @@ async fn provisioning_wait_detail(
                 .max(0)
         })
         .unwrap_or(0);
-    let remote: Option<String> = sqlx::query_scalar("SELECT remote_url FROM repo WHERE id=?")
-        .bind(repo)
-        .fetch_optional(db.pool())
+    let remote: Option<String> = db
+        .environment_provision_repo_remote_url(repo)
         .await?
         .flatten();
     let error =
@@ -1065,11 +1082,9 @@ pub(crate) async fn persist_machine_wait(
 ) -> Result<()> {
     let label = machine_name(db, machine).await?;
     let mut tx = db::begin_immediate(db.pool()).await?;
-    let project: (Option<String>, String) =
-        sqlx::query_as("SELECT paused_at, settings FROM project WHERE id = ?")
-            .bind(&task.project_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let project: (Option<String>, String) = db
+        .environment_wait_project_state_in_tx(&mut tx, &task.project_id)
+        .await?;
     if project.0.is_some() {
         return Ok(());
     } // The Project pause is the sole signal on one machine.
@@ -1084,13 +1099,10 @@ pub(crate) async fn persist_machine_wait(
         return Ok(());
     }
     let marker = serde_json::json!({"machine":machine,"checks":checks});
-    let current: Option<String> =
-        sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ? AND version = ?")
-            .bind(&task.id)
-            .bind(task.version)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(db::DbError::VersionConflict)?;
+    let current: Option<String> = db
+        .environment_wait_task_metadata_at_version_in_tx(&mut tx, &task.id, task.version)
+        .await?
+        .ok_or(db::DbError::VersionConflict)?;
     let unchanged = db::TaskMetadata::parse(current.as_deref())
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
         .extra
@@ -1100,9 +1112,16 @@ pub(crate) async fn persist_machine_wait(
     // Queued outside the lease (dispatcher admission): identity-fenced to the
     // status this wait belongs to, so the event below never describes a wait
     // that a status change silently dropped.
-    let written = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json = json_set(json_remove(COALESCE(metadata_json, '{}'), '$.owner_wait'), '$.environment_wait', json(?), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ? AND status = ?")
-        .bind(marker.to_string()).bind(deferral.to_string()).bind(&task.id).bind(task.version).bind(&task.status)
-        .identity_fenced().execute_in_tx(&mut tx).await?;
+    let written = db
+        .persist_environment_machine_wait_in_tx(
+            &mut tx,
+            &task.id,
+            marker.to_string(),
+            deferral.to_string(),
+            task.version,
+            &task.status,
+        )
+        .await?;
     if written.applied().is_some_and(|rows| rows != 1) {
         return Err(db::DbError::VersionConflict.into());
     }
@@ -1130,9 +1149,7 @@ pub(crate) async fn persist_machine_wait(
             },
         )
         .await?;
-        sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'environment_not_ready', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'wait') ON CONFLICT(dedupe_key) DO UPDATE SET status = 'open', summary = excluded.summary, details_json = excluded.details_json, source_event_id = excluded.source_event_id, resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL, updated_at = excluded.updated_at, version = attention_projection.version + 1")
-            .bind(db::new_uuid_v4()).bind(&task.project_id).bind(event_id).bind(format!("Waiting for environment on {}: {}",label,checks.join(", ")))
-            .bind(serde_json::json!({"task":{"id":task.id,"title":task.title},"machine":machine,"checks":checks,"cause":"environment_not_ready"}).to_string()).bind(format!("task-environment-wait:{}",task.id)).bind(&now).bind(&now).execute(&mut *tx).await?;
+        db.upsert_environment_wait_attention_in_tx(&mut tx, db::UpsertEnvironmentWaitAttentionInTxInput { id: db::new_uuid_v4(), project_id: &task.project_id, event_id, summary: format!("Waiting for environment on {}: {}",label,checks.join(", ")), details_json: serde_json::json!({"task":{"id":task.id,"title":task.title},"machine":machine,"checks":checks,"cause":"environment_not_ready"}).to_string(), dedupe_key: format!("task-environment-wait:{}",task.id), occurred_at: &now, updated_at: &now }).await?;
     }
     tx.commit().await?;
     Ok(())

@@ -23,6 +23,7 @@ use forge_agent_host::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use sqlx::Row;
 
 use crate::task_service::TaskService;
@@ -993,30 +994,17 @@ async fn task_action_scope_access(
     scope_id: &str,
     requested_permission: &str,
 ) -> Result<Option<String>> {
-    let task_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM task WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(scope_id)
-    .fetch_one(db.pool())
-    .await?;
+    let task_exists = db.action_scope_visible_task_count(scope_id).await?;
     if task_exists == 0 {
         return Err(ServiceError::not_found("task", scope_id));
     }
-    let task = sqlx::query("SELECT status, assignee_type, assignee_id FROM task WHERE id = ?")
-        .bind(scope_id)
-        .fetch_one(db.pool())
+    let task = db.task_action_scope_assignment(scope_id).await?;
+    let direct_assignee_type: Option<String> = task.assignee_type()?;
+    let direct_assignee_id: Option<String> = task.assignee_id()?;
+    let status: String = task.status()?;
+    let assignments = db
+        .task_action_scope_roles(scope_id, actor_identity_id)
         .await?;
-    let direct_assignee_type: Option<String> = task.try_get("assignee_type")?;
-    let direct_assignee_id: Option<String> = task.try_get("assignee_id")?;
-    let status: String = task.try_get("status")?;
-    let assignments = sqlx::query(
-        "SELECT role_name FROM task_role_assignment
-                 WHERE task_id = ? AND assignee_type = 'agent' AND assignee_id = ?",
-    )
-    .bind(scope_id)
-    .bind(actor_identity_id)
-    .fetch_all(db.pool())
-    .await?;
     let assigned = direct_assignee_type.as_deref() == Some("agent")
         && direct_assignee_id.as_deref() == Some(actor_identity_id)
         || !assignments.is_empty();
@@ -1032,7 +1020,7 @@ async fn task_action_scope_access(
     }
     let roles = assignments
         .iter()
-        .filter_map(|row| row.try_get::<String, _>("role_name").ok())
+        .filter_map(|row| row.role_name().ok())
         .collect::<Vec<_>>();
     if requested_permission == "task_write"
         && !roles.is_empty()
@@ -1061,35 +1049,24 @@ async fn authorize_action_approver(
     action: &AgentAction,
     approver_identity_id: &str,
 ) -> Result<()> {
-    let approver = sqlx::query(
-        "SELECT owner_id, paused, archived_at, account_permission_ceiling,
-                selected_profile_id
-         FROM agent_identity WHERE id = ?",
-    )
-    .bind(approver_identity_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| ServiceError::not_found("approver identity", approver_identity_id))?;
-    let paused: i64 = approver.try_get("paused")?;
-    let archived_at: Option<String> = approver.try_get("archived_at")?;
+    let approver = db
+        .action_approver_identity(approver_identity_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("approver identity", approver_identity_id))?;
+    let paused: i64 = approver.paused()?;
+    let archived_at: Option<String> = approver.archived_at()?;
     if paused != 0 || archived_at.is_some() {
         return Err(ServiceError::invalid_operation(
             "paused or archived identities cannot approve actions",
         ));
     }
-    let approver_owner: Option<String> = approver.try_get("owner_id")?;
-    let account_permission_ceiling: String = approver.try_get("account_permission_ceiling")?;
-    let selected_profile_id: Option<String> = approver.try_get("selected_profile_id")?;
+    let approver_owner: Option<String> = approver.owner_id()?;
+    let account_permission_ceiling: String = approver.account_permission_ceiling()?;
+    let selected_profile_id: Option<String> = approver.selected_profile_id()?;
     let profile_policy = if let Some(profile_id) = selected_profile_id {
-        sqlx::query_scalar::<_, String>(
-            "SELECT tool_policy_json FROM agent_profile
-             WHERE id = ? AND identity_id = ?",
-        )
-        .bind(profile_id)
-        .bind(approver_identity_id)
-        .fetch_optional(db.pool())
-        .await?
-        .unwrap_or_else(|| "{}".to_owned())
+        db.action_approver_profile_policy(&profile_id, approver_identity_id)
+            .await?
+            .unwrap_or_else(|| "{}".to_owned())
     } else {
         "{}".to_owned()
     };
@@ -1104,47 +1081,34 @@ async fn authorize_action_approver(
     let authorized = match action.scope_type.as_str() {
         "account" => approver_owner.as_deref() == Some(action.scope_id.as_str()),
         "project" => {
-            let binding = sqlx::query(
-                "SELECT permission_ceiling_json FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-            )
-            .bind(&action.scope_id)
-            .bind(approver_identity_id)
-            .fetch_optional(db.pool())
-            .await?;
+            let binding = db
+                .action_approver_project_binding(&action.scope_id, approver_identity_id)
+                .await?;
             binding.is_some_and(|row| {
-                row.try_get::<String, _>("permission_ceiling_json")
+                row.permission_ceiling_json()
                     .is_ok_and(|ceiling| permission_set(&ceiling).contains("approve_actions"))
             })
         }
         "agent_chat" => {
-            let chat =
-                sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
-                    .bind(&action.scope_id)
-                    .fetch_optional(db.pool())
-                    .await?;
+            let chat = db.action_approver_chat_scope(&action.scope_id).await?;
             let Some(chat) = chat else {
                 return Err(ServiceError::not_found(
                     "agent_chat",
                     action.scope_id.clone(),
                 ));
             };
-            let kind: String = chat.try_get("kind")?;
+            let kind: String = chat.kind()?;
             match kind.as_str() {
-                "account_main" => {
-                    approver_owner == chat.try_get::<Option<String>, _>("account_id")?
-                }
+                "account_main" => approver_owner == chat.account_id()?,
                 "project" => {
-                    let project_id: Option<String> = chat.try_get("project_id")?;
+                    let project_id: Option<String> = chat.project_id()?;
                     if let Some(project_id) = project_id {
-                        let permission_ceiling = sqlx::query_scalar::<_, String>(
-                            "SELECT permission_ceiling_json FROM project_agent_binding
-                             WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-                        )
-                        .bind(project_id)
-                        .bind(approver_identity_id)
-                        .fetch_optional(db.pool())
-                        .await?;
+                        let permission_ceiling = db
+                            .action_approver_chat_project_permission(
+                                &project_id,
+                                approver_identity_id,
+                            )
+                            .await?;
                         permission_ceiling.as_deref().is_some_and(|ceiling| {
                             permission_set(ceiling).contains("approve_actions")
                         })
@@ -1156,35 +1120,16 @@ async fn authorize_action_approver(
             }
         }
         "task" => {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT (
-                    EXISTS (
-                        SELECT 1 FROM task
-                        WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM task_role_assignment
-                        WHERE task_id = ? AND assignee_type = 'agent' AND assignee_id = ?
-                    )
-                )",
-            )
-            .bind(&action.scope_id)
-            .bind(approver_identity_id)
-            .bind(&action.scope_id)
-            .bind(approver_identity_id)
-            .fetch_one(db.pool())
-            .await?
+            db.action_approver_task_assignment_exists(&action.scope_id, approver_identity_id)
+                .await?
                 != 0
         }
         "agent" => {
             approver_owner
-                == sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT owner_id FROM agent_identity WHERE id = ?",
-                )
-                .bind(&action.scope_id)
-                .fetch_optional(db.pool())
-                .await?
-                .flatten()
+                == db
+                    .action_scope_agent_owner(&action.scope_id)
+                    .await?
+                    .flatten()
         }
         _ => false,
     };
@@ -1240,33 +1185,24 @@ async fn evaluate_action_policy(
         {
             return Ok((AgentActionPolicyResult::Denied, Some(reason)));
         }
-        let row = sqlx::query(
-            "SELECT paused, archived_at, account_permission_ceiling, selected_profile_id
-         FROM agent_identity WHERE id = ?",
-        )
-        .bind(actor_identity_id)
-        .fetch_optional(db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
-        let paused: i64 = row.try_get("paused")?;
-        let archived_at: Option<String> = row.try_get("archived_at")?;
+        let row = db
+            .task_action_actor_policy(actor_identity_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
+        let paused: i64 = row.paused()?;
+        let archived_at: Option<String> = row.archived_at()?;
         if paused != 0 || archived_at.is_some() {
             return Ok((
                 AgentActionPolicyResult::Denied,
                 Some("actor identity is paused or archived".to_owned()),
             ));
         }
-        let account_policy: String = row.try_get("account_permission_ceiling")?;
-        let profile_id: Option<String> = row.try_get("selected_profile_id")?;
+        let account_policy: String = row.account_permission_ceiling()?;
+        let profile_id: Option<String> = row.selected_profile_id()?;
         let profile_policy = if let Some(profile_id) = profile_id {
-            sqlx::query_scalar::<_, String>(
-                "SELECT tool_policy_json FROM agent_profile WHERE id = ? AND identity_id = ?",
-            )
-            .bind(profile_id)
-            .bind(actor_identity_id)
-            .fetch_optional(db.pool())
-            .await?
-            .unwrap_or_else(|| "{}".to_owned())
+            db.task_action_actor_profile_policy(&profile_id, actor_identity_id)
+                .await?
+                .unwrap_or_else(|| "{}".to_owned())
         } else {
             "{}".to_owned()
         };
@@ -1320,12 +1256,7 @@ async fn evaluate_action_policy(
                     "permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"
                 ),
                 AuthorityDenial::Revoked => {
-                    let paused: i64 = sqlx::query_scalar(
-                        "SELECT paused OR archived_at IS NOT NULL FROM agent_identity WHERE id=?",
-                    )
-                    .bind(actor_identity_id)
-                    .fetch_one(db.pool())
-                    .await?;
+                    let paused: i64 = db.action_actor_paused_or_archived(actor_identity_id).await?;
                     if paused != 0 {
                         "actor identity is paused or archived".into()
                     } else {
@@ -1359,14 +1290,10 @@ async fn evaluate_action_policy(
     if is_project_orchestration_mutation(operation) {
         let project_id = match scope_type {
             "project" => Some(scope_id.to_owned()),
-            "agent_chat" => sqlx::query_scalar::<_, Option<String>>(
-                "SELECT project_id FROM agent_chat
-                 WHERE id = ? AND kind = 'project' LIMIT 1",
-            )
-            .bind(scope_id)
-            .fetch_optional(db.pool())
-            .await?
-            .flatten(),
+            "agent_chat" => db
+                .action_orchestration_chat_project(scope_id)
+                .await?
+                .flatten(),
             _ => None,
         };
         let Some(project_id) = project_id else {
@@ -1375,23 +1302,14 @@ async fn evaluate_action_policy(
                 Some("Project orchestration requires a bound Project scope".to_owned()),
             ));
         };
-        let state = sqlx::query(
-            "SELECT charter_status, charter_setup_required,
-                    current_charter_id, current_charter_revision_id
-             FROM project WHERE id = ? LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("project", scope_id.to_owned()))?;
-        let charter_status: String = state.try_get("charter_status")?;
-        let setup_required: i64 = state.try_get("charter_setup_required")?;
-        let has_charter = state
-            .try_get::<Option<String>, _>("current_charter_id")?
-            .is_some()
-            && state
-                .try_get::<Option<String>, _>("current_charter_revision_id")?
-                .is_some();
+        let state = db
+            .action_orchestration_charter_state(&project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", scope_id.to_owned()))?;
+        let charter_status: String = state.charter_status()?;
+        let setup_required: i64 = state.charter_setup_required()?;
+        let has_charter =
+            state.current_charter_id()?.is_some() && state.current_charter_revision_id()?.is_some();
         let is_setup = charter_status == "legacy_unverified" && setup_required != 0;
         let is_charter_amendment =
             charter_status == "charter_backed" && setup_required == 0 && has_charter;

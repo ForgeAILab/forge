@@ -642,3 +642,52 @@ impl SqliteDb {
 .await?)
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectEventWatermarkRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectEventWatermarkRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn sequence(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("sequence")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_event_watermark(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<EffectiveProjectEventWatermarkRow>> {
+        let rows = sqlx::query(
+            "SELECT id, sequence FROM domain_event
+         WHERE scope_type = 'project' AND scope_id = ?
+         ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| EffectiveProjectEventWatermarkRow { row }))
+    }
+}
+
+pub async fn blocker_recovery_transition_exists_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    identity_id: &str,
+    turn_started: &str,
+) -> crate::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM domain_event
+             WHERE entity_type='task' AND entity_id=? AND event_type='task.transitioned'
+               AND actor_type='agent' AND actor_id=? AND created_at>=?)",
+    )
+    .bind(task_id)
+    .bind(identity_id)
+    .bind(turn_started)
+    .fetch_one(connection)
+    .await?)
+}

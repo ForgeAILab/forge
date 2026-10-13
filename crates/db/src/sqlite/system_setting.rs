@@ -59,3 +59,31 @@ impl SqliteDb {
         Ok(result)
     }
 }
+
+impl SqliteDb {
+    pub async fn bootstrap_completion_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM system_setting WHERE key = 'bootstrap_completed'",
+        )
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn mark_bootstrap_completed_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO system_setting (key, value, updated_at) VALUES ('bootstrap_completed', 'true', ?) \
+             ON CONFLICT(key) DO NOTHING")
+            .bind(updated_at)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}

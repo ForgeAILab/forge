@@ -508,3 +508,117 @@ impl WorkspaceLeaseRepo for SqliteDb {
         Ok(expired)
     }
 }
+
+#[derive(Debug)]
+pub struct InsertIssuedWorkspaceLeaseInTxInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub task_id: &'a str,
+    pub task_version: i64,
+    pub execution_id: &'a str,
+    pub operation_idempotency_key: &'a str,
+    pub repository_binding_id: &'a str,
+    pub base_ref: &'a str,
+    pub role: &'a str,
+    pub capabilities_json: &'a str,
+    pub principal_id: &'a str,
+    pub capability_profile_revision: &'a str,
+    pub capability_profile_digest: String,
+    pub issued_at: &'a str,
+    pub expires_at: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+fn map_issued_workspace_lease_row(row: sqlx::sqlite::SqliteRow) -> WorkspaceLease {
+    WorkspaceLease {
+        id: row.get("id"),
+        project_id: row.get("project_id"),
+        task_id: row.get("task_id"),
+        task_version: row.get("task_version"),
+        execution_id: row.get("execution_id"),
+        operation_idempotency_key: row.get("operation_idempotency_key"),
+        repository_binding_id: row.get("repository_binding_id"),
+        base_ref: row.get("base_ref"),
+        role: row.get("role"),
+        capabilities_json: row.get("capabilities_json"),
+        assigned_principal_type: row.get("assigned_principal_type"),
+        assigned_principal_id: row.get("assigned_principal_id"),
+        capability_profile_revision: row.get("capability_profile_revision"),
+        capability_profile_digest: row.get("capability_profile_digest"),
+        issuing_principal_type: row.get("issuing_principal_type"),
+        issuing_principal_id: row.get("issuing_principal_id"),
+        status: row.get("status"),
+        issued_at: row.get("issued_at"),
+        expires_at: row.get("expires_at"),
+        revoked_at: row.get("revoked_at"),
+        version: row.get("version"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_issued_workspace_lease_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertIssuedWorkspaceLeaseInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO workspace_lease (
+                id, project_id, task_id, task_version, execution_id,
+                operation_idempotency_key,
+                repository_binding_id, base_ref, role, capabilities_json,
+                assigned_principal_type, assigned_principal_id,
+                capability_profile_revision, capability_profile_digest,
+                issuing_principal_type, issuing_principal_id, status, issued_at,
+                expires_at, revoked_at, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?,
+                       'system', 'task-service-scheduler', 'active', ?, ?, NULL, 1, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.project_id)
+        .bind(input.task_id)
+        .bind(input.task_version)
+        .bind(input.execution_id)
+        .bind(input.operation_idempotency_key)
+        .bind(input.repository_binding_id)
+        .bind(input.base_ref)
+        .bind(input.role)
+        .bind(input.capabilities_json)
+        .bind(input.principal_id)
+        .bind(input.capability_profile_revision)
+        .bind(input.capability_profile_digest)
+        .bind(input.issued_at)
+        .bind(input.expires_at)
+        .bind(input.created_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn issued_workspace_lease_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        lease_id: &str,
+    ) -> crate::Result<WorkspaceLease> {
+        let row = sqlx::query(
+            "SELECT id, project_id, task_id, task_version, execution_id,
+                    operation_idempotency_key,
+                    repository_binding_id, base_ref, role, capabilities_json,
+                    assigned_principal_type, assigned_principal_id,
+                    capability_profile_revision, capability_profile_digest,
+                    issuing_principal_type, issuing_principal_id, status,
+                    issued_at, expires_at, revoked_at, version, created_at,
+                    updated_at
+             FROM workspace_lease WHERE id = ?",
+        )
+        .bind(lease_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(map_issued_workspace_lease_row(row))
+    }
+}

@@ -332,3 +332,31 @@ impl SqliteDb {
         .transpose()
     }
 }
+
+impl SqliteDb {
+    pub async fn environment_probe_retained_server_repo_path(
+        &self,
+        project_id: &str,
+        primary_repo_id: Option<&str>,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>("SELECT local_path FROM repo WHERE project_id = ? ORDER BY (id = ?) DESC, created_at, id LIMIT 1")
+            .bind(project_id)
+            .bind(primary_repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_provision_repo_remote_url(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(
+            sqlx::query_scalar::<_, Option<String>>("SELECT remote_url FROM repo WHERE id=?")
+                .bind(repo_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}

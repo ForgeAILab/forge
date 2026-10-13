@@ -126,3 +126,41 @@ pub use sqlite::{
     StartWakeBudgetWindowInTxInput, VisibleAttentionAgentBindingsInput, WakeBudgetWindowRow,
     WakeChatCanonicalScopeRow, WakeIncidentContextRow, WakeSweepCandidateRow,
 };
+
+pub use sqlite::{AgentStatusHealthRow, CliRuntimePolicyStatusRow, DaemonExecutorStatusRow};
+
+pub use sqlite::{
+    ActionApproverChatScopeRow, ActionApproverIdentityRow, ActionApproverProjectBindingRow,
+    ActionOrchestrationCharterStateRow, TaskActionActorPolicyRow, TaskActionScopeAssignmentRow,
+    TaskActionScopeRoleRow,
+};
+
+pub use sqlite::{
+    EffectiveProjectApprovedDocumentSourceRow, EffectiveProjectCanonicalConflictSourceRow,
+    EffectiveProjectCommitmentSourceRow, EffectiveProjectDecisionSourceRow,
+    EffectiveProjectEventWatermarkRow, EffectiveProjectGoverningCharterSourceRow,
+    EffectiveProjectIdentitySourceRow, EffectiveProjectInboxSourceRow,
+    EffectiveProjectMilestoneSourceRow, EffectiveProjectReadinessSourceRow,
+    EffectiveProjectReconciliationSourceRow, EffectiveProjectReleaseSourceRow,
+    EffectiveProjectTaskStatusCountRow, EffectiveProjectValidationOutcomeCountRow,
+    ProjectAdoptionCharterSourceRow,
+};
+
+pub use sqlite::{
+    EscalationBlockerTurnSourceRow, InsertProjectEscalationInTxInput, ProjectEscalationSourceRow,
+};
+
+pub use sqlite::{
+    blocker_recovery_transition_exists_in_tx, escalation_project_member_exists_on_connection,
+    escalation_project_owner_on_connection,
+};
+
+pub use sqlite::{EnvironmentProvisionRetryDetailRow, UpsertEnvironmentWaitAttentionInTxInput};
+
+pub use sqlite::{
+    AdaptiveTaskGovernanceSourceRow, InsertIssuedWorkspaceLeaseInTxInput,
+    TaskExecutionCharterGovernanceSourceRow, TaskGovernanceDocumentRevisionSourceRow,
+    WorkspaceLeaseCharterGateRow, WorkspaceLeaseRoleAssignmentRow, WorkspaceLeaseTaskAssignmentRow,
+};
+
+pub use sqlite::task_governance_document_revision_source_on_pool;

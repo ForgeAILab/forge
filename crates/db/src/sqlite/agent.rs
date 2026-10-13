@@ -1504,3 +1504,378 @@ impl SqliteDb {
         Ok(active_sessions)
     }
 }
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct AgentStatusHealthRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl AgentStatusHealthRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn connection_status(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("connection_status")?)
+    }
+    pub fn credential_status(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("credential_status")?)
+    }
+    pub fn credential_enabled(&self) -> crate::Result<Option<bool>> {
+        Ok(self.row.try_get("credential_enabled")?)
+    }
+    pub fn provider_status(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("provider_status")?)
+    }
+    pub fn last_error_kind(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("last_error_kind")?)
+    }
+    pub fn backoff_until(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("backoff_until")?)
+    }
+    pub fn reservations(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("reservations")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct CliRuntimePolicyStatusRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl CliRuntimePolicyStatusRow {
+    pub fn owner_user_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("owner_user_id")?)
+    }
+    pub fn daemon_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("daemon_id")?)
+    }
+    pub fn executor_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("executor_type")?)
+    }
+    pub fn enabled(&self) -> crate::Result<bool> {
+        Ok(self.row.try_get("enabled")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn agent_status_health_for_requested_agents(
+        &self,
+        requested_json: &str,
+    ) -> crate::Result<Vec<AgentStatusHealthRow>> {
+        let rows = sqlx::query("WITH requested AS (
+            SELECT json_extract(value,'$.id') AS id,
+                   json_extract(value,'$.profile') AS profile,
+                   json_extract(value,'$.credential') AS credential FROM json_each(?)
+         ), reservations AS (
+            SELECT p.agent_id, COUNT(*) AS n FROM workspace_placement p
+            WHERE p.agent_id IN (SELECT id FROM requested)
+              AND p.state IN ('reserved','preparing')
+              AND julianday(COALESCE(p.reserved_until,datetime(p.updated_at,'+10 minutes'))) > julianday('now')
+              AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.workspace_id=p.workspace_id AND e.status='running')
+            GROUP BY p.agent_id
+         )
+         SELECT requested.id, h.status AS connection_status,
+                c.status AS credential_status, c.enabled AS credential_enabled,
+                p.status AS provider_status, p.last_error_kind, p.backoff_until,
+                COALESCE(reservations.n,0) AS reservations
+         FROM requested LEFT JOIN agent_connection_health h ON h.profile_id=requested.profile
+         LEFT JOIN credential_handle c ON c.id=requested.credential
+         LEFT JOIN provider_entry_health p ON p.credential_id=requested.credential
+         LEFT JOIN reservations ON reservations.agent_id=requested.id")
+            .bind(requested_json)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AgentStatusHealthRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn cli_runtime_policies_for_executor_types(
+        &self,
+        executor_types_json: &str,
+    ) -> crate::Result<Vec<CliRuntimePolicyStatusRow>> {
+        let rows = sqlx::query("SELECT owner_user_id,daemon_id,executor_type,enabled FROM cli_runtime_policy WHERE executor_type IN (SELECT value FROM json_each(?))")
+            .bind(executor_types_json)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CliRuntimePolicyStatusRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_cli_runtime_enabled(
+        &self,
+        owner_user_id: &str,
+        daemon_id: &str,
+        executor_type: &str,
+    ) -> crate::Result<Option<bool>> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT enabled FROM cli_runtime_policy
+             WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?",
+        )
+        .bind(owner_user_id)
+        .bind(daemon_id)
+        .bind(executor_type)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn global_cli_runtime_enabled(
+        &self,
+        daemon_id: &str,
+        executor_type: &str,
+    ) -> crate::Result<Option<bool>> {
+        Ok(sqlx::query_scalar::<_, Option<bool>>(
+            "SELECT MIN(enabled) FROM cli_runtime_policy
+         WHERE daemon_id = ? AND executor_type = ?",
+        )
+        .bind(daemon_id)
+        .bind(executor_type)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn archive_agent_identity_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        archived_at: &str,
+        updated_at: &str,
+        agent_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET archived_at = ?, paused = 1, is_default = 0, status = 'offline',
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND archived_at IS NULL",
+        )
+        .bind(archived_at)
+        .bind(updated_at)
+        .bind(agent_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ActionApproverIdentityRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ActionApproverIdentityRow {
+    pub fn owner_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("owner_id")?)
+    }
+    pub fn paused(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("paused")?)
+    }
+    pub fn archived_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("archived_at")?)
+    }
+    pub fn account_permission_ceiling(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("account_permission_ceiling")?)
+    }
+    pub fn selected_profile_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("selected_profile_id")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ActionApproverProjectBindingRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ActionApproverProjectBindingRow {
+    pub fn permission_ceiling_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("permission_ceiling_json")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct TaskActionActorPolicyRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl TaskActionActorPolicyRow {
+    pub fn paused(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("paused")?)
+    }
+    pub fn archived_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("archived_at")?)
+    }
+    pub fn account_permission_ceiling(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("account_permission_ceiling")?)
+    }
+    pub fn selected_profile_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("selected_profile_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_approver_identity(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Option<ActionApproverIdentityRow>> {
+        let rows = sqlx::query(
+            "SELECT owner_id, paused, archived_at, account_permission_ceiling,
+                selected_profile_id
+         FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ActionApproverIdentityRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_approver_profile_policy(
+        &self,
+        profile_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT tool_policy_json FROM agent_profile
+             WHERE id = ? AND identity_id = ?",
+        )
+        .bind(profile_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_approver_project_binding(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<ActionApproverProjectBindingRow>> {
+        let rows = sqlx::query(
+            "SELECT permission_ceiling_json FROM project_agent_binding
+                 WHERE project_id = ? AND identity_id = ? AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ActionApproverProjectBindingRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_approver_chat_project_permission(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT permission_ceiling_json FROM project_agent_binding
+                             WHERE project_id = ? AND identity_id = ? AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_scope_agent_owner(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT owner_id FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_action_actor_policy(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Option<TaskActionActorPolicyRow>> {
+        let rows = sqlx::query(
+            "SELECT paused, archived_at, account_permission_ceiling, selected_profile_id
+         FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| TaskActionActorPolicyRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_action_actor_profile_policy(
+        &self,
+        profile_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT tool_policy_json FROM agent_profile WHERE id = ? AND identity_id = ?",
+        )
+        .bind(profile_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_actor_paused_or_archived(&self, identity_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT paused OR archived_at IS NOT NULL FROM agent_identity WHERE id=?",
+        )
+        .bind(identity_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_active_project_binding_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM project_agent_binding WHERE project_id=? AND identity_id=? AND state='active')")
+            .bind(project_id)
+            .bind(identity_id)
+            .fetch_one(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_unowned_agent_identities_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        user_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_identity
+             SET owner_id = ?, visibility = 'account'
+             WHERE owner_id IS NULL",
+        )
+        .bind(user_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

@@ -15,7 +15,6 @@ use api_types::{
 use db::SqliteDb;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::Row;
 
 use crate::{Result, ServiceError};
 
@@ -315,29 +314,10 @@ pub async fn load_project_adoption_charter(
     db: &SqliteDb,
     project_id: &str,
 ) -> Result<Option<ProjectAdoptionCharterProjection>> {
-    let row = sqlx::query(
-        "SELECT c.id AS charter_id, c.version AS charter_version,
-                r.id AS revision_id, r.revision, r.content_digest,
-                r.rendered_digest, r.content_json
-         FROM project AS p
-         JOIN project_charter AS c ON c.project_id = p.id
-         JOIN project_charter_revision AS r
-           ON r.id = c.current_draft_revision_id
-          AND r.charter_id = c.id
-         WHERE p.id = ?
-           AND p.charter_status = 'legacy_unverified'
-           AND p.charter_setup_required = 1
-           AND c.current_approved_revision_id IS NULL
-           AND r.lifecycle IN ('draft', 'proposed')
-         ORDER BY c.updated_at DESC, c.id DESC
-         LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = db.project_adoption_charter_source(project_id).await?;
 
     row.map(|row| {
-        let content_json: String = row.try_get("content_json")?;
+        let content_json: String = row.content_json()?;
         if content_json.len() > MAX_ADOPTION_CHARTER_CONTENT_BYTES {
             return Err(ServiceError::conflict(
                 "current adoption Charter content exceeds the bounded read limit",
@@ -346,12 +326,12 @@ pub async fn load_project_adoption_charter(
         let content = serde_json::from_str::<ProjectCharterContent>(&content_json)
             .map_err(|_| ServiceError::conflict("current adoption Charter content is invalid"))?;
         Ok(ProjectAdoptionCharterProjection {
-            charter_id: row.try_get("charter_id")?,
-            revision_id: row.try_get("revision_id")?,
-            revision: row.try_get("revision")?,
-            version: row.try_get("charter_version")?,
-            content_digest: row.try_get("content_digest")?,
-            render_digest: row.try_get("rendered_digest")?,
+            charter_id: row.charter_id()?,
+            revision_id: row.revision_id()?,
+            revision: row.revision()?,
+            version: row.charter_version()?,
+            content_digest: row.content_digest()?,
+            render_digest: row.rendered_digest()?,
             content,
         })
     })
@@ -364,128 +344,88 @@ pub async fn load_effective_project_state(
     limit: Option<i64>,
 ) -> Result<ProjectEffectiveStateProjection> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let project = sqlx::query(
-        "SELECT id, name, settings, paused_at, charter_status, charter_setup_required,
-                version, created_at, updated_at, project_work_epoch,
-                primary_milestone_id
-         FROM project WHERE id = ?",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+    let project = db
+        .effective_project_identity_source(project_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
 
-    let project_version: i64 = project.try_get("version")?;
-    let project_work_epoch: i64 = project.try_get("project_work_epoch")?;
-    let primary_milestone_id: Option<String> = project.try_get("primary_milestone_id")?;
+    let project_version: i64 = project.version()?;
+    let project_work_epoch: i64 = project.project_work_epoch()?;
+    let primary_milestone_id: Option<String> = project.primary_milestone_id()?;
     let (default_review_ci_steps, default_review_setup_steps) =
-        default_review_steps(project.try_get("settings")?)?;
+        default_review_steps(project.settings()?)?;
     let identity = ProjectIdentityProjection {
-        id: project.try_get("id")?,
-        name: project.try_get("name")?,
-        paused: project.try_get::<Option<String>, _>("paused_at")?.is_some(),
-        charter_status: project.try_get("charter_status")?,
-        charter_setup_required: project.try_get::<i64, _>("charter_setup_required")? != 0,
+        id: project.id()?,
+        name: project.name()?,
+        paused: project.paused_at()?.is_some(),
+        charter_status: project.charter_status()?,
+        charter_setup_required: project.charter_setup_required()? != 0,
         default_review_ci_steps,
         default_review_setup_steps,
         version: project_version,
-        created_at: project.try_get("created_at")?,
-        updated_at: project.try_get("updated_at")?,
+        created_at: project.created_at()?,
+        updated_at: project.updated_at()?,
     };
 
-    let governing_charter = sqlx::query(
-        "SELECT c.id, c.version, r.id AS revision_id, r.revision,
-                r.content_digest, r.render_version, r.rendered_digest
-         FROM project_charter c
-         JOIN project_charter_revision r
-           ON r.id = c.current_approved_revision_id
-          AND r.charter_id = c.id
-         WHERE c.project_id = ?
-           AND c.lifecycle = 'attached'
-           AND r.lifecycle = 'approved'
-         ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .map(|row| {
-        Ok::<_, sqlx::Error>(CharterReferenceProjection {
-            id: row.try_get("id")?,
-            revision_id: row.try_get("revision_id")?,
-            revision: row.try_get("revision")?,
-            version: row.try_get("version")?,
-            content_digest: row.try_get("content_digest")?,
-            render_version: row.try_get("render_version")?,
-            render_digest: row.try_get("rendered_digest")?,
+    let governing_charter = db
+        .effective_project_governing_charter_source(project_id)
+        .await?
+        .map(|row| {
+            Ok::<_, db::DbError>(CharterReferenceProjection {
+                id: row.id()?,
+                revision_id: row.revision_id()?,
+                revision: row.revision()?,
+                version: row.version()?,
+                content_digest: row.content_digest()?,
+                render_version: row.render_version()?,
+                render_digest: row.rendered_digest()?,
+            })
         })
-    })
-    .transpose()?;
+        .transpose()?;
 
-    let approved_documents = sqlx::query(
-        "SELECT d.id, d.kind, d.title, d.current_approved_revision_id AS revision_id,
-                d.version, d.lifecycle, r.revision, r.content_digest,
-                r.render_version, r.rendered_digest
-         FROM project_document d
-         JOIN project_document_revision r
-           ON r.id = d.current_approved_revision_id AND r.document_id = d.id
-         WHERE d.project_id = ? AND r.lifecycle = 'approved'
-         ORDER BY d.updated_at DESC, d.id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(ApprovedDocumentProjection {
-            id: row.try_get("id")?,
-            kind: row.try_get("kind")?,
-            title: row.try_get("title")?,
-            revision_id: row.try_get("revision_id")?,
-            revision: row.try_get("revision")?,
-            version: row.try_get("version")?,
-            lifecycle: row.try_get("lifecycle")?,
-            content_digest: row.try_get("content_digest")?,
-            render_version: row.try_get("render_version")?,
-            render_digest: row.try_get("rendered_digest")?,
+    let approved_documents = db
+        .effective_project_approved_document_sources(project_id, limit)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ApprovedDocumentProjection {
+                id: row.id()?,
+                kind: row.kind()?,
+                title: row.title()?,
+                revision_id: row.revision_id()?,
+                revision: row.revision()?,
+                version: row.version()?,
+                lifecycle: row.lifecycle()?,
+                content_digest: row.content_digest()?,
+                render_version: row.render_version()?,
+                render_digest: row.rendered_digest()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let decision_rows = sqlx::query(
-        "SELECT id, state, decision_class, question, selected_outcome,
-                rationale, principal_type, principal_id, authority_basis,
-                authorization_action, explicit_event, authorization_occurred_at,
-                charter_revision_id, source_refs_json,
-                affected_records_json, created_at
-         FROM project_decision
-         WHERE project_id = ? AND state IN ('active', 'invalidated')
-         ORDER BY created_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
+    let decision_rows = db
+        .effective_project_decision_sources(project_id, limit)
+        .await?;
     let mut active_decisions = Vec::new();
     let mut invalidated_decisions = Vec::new();
     for row in decision_rows {
         let decision = DecisionProjection {
-            id: row.try_get("id")?,
-            state: row.try_get("state")?,
-            decision_class: row.try_get("decision_class")?,
-            question: row.try_get("question")?,
-            selected_outcome: row.try_get("selected_outcome")?,
-            rationale: row.try_get("rationale")?,
-            principal_type: row.try_get("principal_type")?,
-            principal_id: row.try_get("principal_id")?,
-            authority_basis: row.try_get("authority_basis")?,
-            authorization_action: row.try_get("authorization_action")?,
-            explicit_event: row.try_get("explicit_event")?,
-            authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-            charter_revision_id: row.try_get("charter_revision_id")?,
-            source_refs: json_value_array(row.try_get("source_refs_json")?)?,
-            affected_records: json_object_value(row.try_get("affected_records_json")?)?,
-            created_at: row.try_get("created_at")?,
+            id: row.id()?,
+            state: row.state()?,
+            decision_class: row.decision_class()?,
+            question: row.question()?,
+            selected_outcome: row.selected_outcome()?,
+            rationale: row.rationale()?,
+            principal_type: row.principal_type()?,
+            principal_id: row.principal_id()?,
+            authority_basis: row.authority_basis()?,
+            authorization_action: row.authorization_action()?,
+            explicit_event: row.explicit_event()?,
+            authorization_occurred_at: row.authorization_occurred_at()?,
+            charter_revision_id: row.charter_revision_id()?,
+            source_refs: json_value_array(row.source_refs_json()?)?,
+            affected_records: json_object_value(row.affected_records_json()?)?,
+            created_at: row.created_at()?,
         };
         if decision.state == "invalidated" {
             invalidated_decisions.push(decision);
@@ -494,310 +434,190 @@ pub async fn load_effective_project_state(
         }
     }
 
-    let reconciliation_required = sqlx::query(
-        "SELECT id, conflict_id, record_type, record_id, record_revision,
-                record_digest, state, version, updated_at
-         FROM project_reconciliation_record
-         WHERE project_id = ? AND state = 'required'
-         ORDER BY updated_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(ReconciliationProjection {
-            id: row.try_get("id")?,
-            conflict_id: row.try_get("conflict_id")?,
-            record_type: row.try_get("record_type")?,
-            record_id: row.try_get("record_id")?,
-            record_revision: row.try_get("record_revision")?,
-            record_digest: row.try_get("record_digest")?,
-            state: row.try_get("state")?,
-            version: row.try_get("version")?,
-            updated_at: row.try_get("updated_at")?,
+    let reconciliation_required = db
+        .effective_project_required_reconciliation_sources(project_id, limit)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ReconciliationProjection {
+                id: row.id()?,
+                conflict_id: row.conflict_id()?,
+                record_type: row.record_type()?,
+                record_id: row.record_id()?,
+                record_revision: row.record_revision()?,
+                record_digest: row.record_digest()?,
+                state: row.state()?,
+                version: row.version()?,
+                updated_at: row.updated_at()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let canonical_conflicts = sqlx::query(
-        "SELECT id, domain, governing_record_type, governing_record_id,
-                governing_record_revision, governing_record_digest,
-                conflicting_record_type, conflicting_record_id,
-                conflicting_record_revision, conflicting_record_digest,
-                affected_paths_json, conflict_code, description, created_at
-         FROM project_canonical_conflict
-         WHERE project_id = ?
-         ORDER BY created_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(CanonicalConflictProjection {
-            id: row.try_get("id")?,
-            domain: row.try_get("domain")?,
-            governing_record_type: row.try_get("governing_record_type")?,
-            governing_record_id: row.try_get("governing_record_id")?,
-            governing_record_revision: row.try_get("governing_record_revision")?,
-            governing_record_digest: row.try_get("governing_record_digest")?,
-            conflicting_record_type: row.try_get("conflicting_record_type")?,
-            conflicting_record_id: row.try_get("conflicting_record_id")?,
-            conflicting_record_revision: row.try_get("conflicting_record_revision")?,
-            conflicting_record_digest: row.try_get("conflicting_record_digest")?,
-            affected_paths: json_string_array(row.try_get("affected_paths_json")?)?,
-            conflict_code: row.try_get("conflict_code")?,
-            description: row.try_get("description")?,
-            created_at: row.try_get("created_at")?,
+    let canonical_conflicts = db
+        .effective_project_canonical_conflict_sources(project_id, limit)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(CanonicalConflictProjection {
+                id: row.id()?,
+                domain: row.domain()?,
+                governing_record_type: row.governing_record_type()?,
+                governing_record_id: row.governing_record_id()?,
+                governing_record_revision: row.governing_record_revision()?,
+                governing_record_digest: row.governing_record_digest()?,
+                conflicting_record_type: row.conflicting_record_type()?,
+                conflicting_record_id: row.conflicting_record_id()?,
+                conflicting_record_revision: row.conflicting_record_revision()?,
+                conflicting_record_digest: row.conflicting_record_digest()?,
+                affected_paths: json_string_array(row.affected_paths_json()?)?,
+                conflict_code: row.conflict_code()?,
+                description: row.description()?,
+                created_at: row.created_at()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let task_counts = sqlx::query(
-        "SELECT status AS key, COUNT(*) AS count
-         FROM task WHERE project_id = ? AND deleted_at IS NULL
-         GROUP BY status ORDER BY status ASC",
-    )
-    .bind(project_id)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(CountProjection {
-            key: row.try_get("key")?,
-            count: row.try_get("count")?,
+    let task_counts = db
+        .effective_project_task_status_counts(project_id)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(CountProjection {
+                key: row.key()?,
+                count: row.count()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let task_total = task_counts.iter().map(|item| item.count).sum();
 
-    let validation_counts = sqlx::query(
-        "SELECT COALESCE(r.outcome, 'missing') AS key, COUNT(*) AS count
-         FROM project_milestone_check c
-         JOIN project_milestone m
-           ON m.id = c.milestone_id AND m.project_id = c.project_id
-          AND m.current_definition_revision_id = c.definition_revision_id
-         LEFT JOIN project_milestone_check_result r
-           ON r.id = c.current_result_id
-          AND r.definition_revision_id = c.definition_revision_id
-         WHERE c.project_id = ?
-         GROUP BY COALESCE(r.outcome, 'missing') ORDER BY key ASC",
-    )
-    .bind(project_id)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(CountProjection {
-            key: row.try_get("key")?,
-            count: row.try_get("count")?,
+    let validation_counts = db
+        .effective_project_validation_outcome_counts(project_id)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(CountProjection {
+                key: row.key()?,
+                count: row.count()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let validation_total = validation_counts.iter().map(|item| item.count).sum();
 
     // Coordination state is scoped through the active Project Agent binding
     // before retrieval.  This prevents a Project projection from exposing a
     // different identity's private obligations or inbox while still making
     // open reconciliation work visible after a binding/session rotation.
-    let commitments = sqlx::query(
-        "SELECT c.id, c.status, c.due_at, c.originating_task_id,
-                c.evidence_required, c.blocked_reason, c.version, c.updated_at,
-                (SELECT COUNT(*) FROM agent_commitment_evidence e
-                 WHERE e.commitment_id = c.id) AS evidence_count
-         FROM agent_commitment c
-         JOIN project_agent_binding b
-           ON b.project_id = c.scope_id
-          AND b.identity_id = c.owner_identity_id
-          AND b.state = 'active'
-         WHERE c.scope_type = 'project' AND c.scope_id = ?
-         ORDER BY COALESCE(c.due_at, c.updated_at) ASC, c.updated_at ASC, c.id ASC
-         LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(ProjectCommitmentProjection {
-            id: row.try_get("id")?,
-            status: row.try_get("status")?,
-            due_at: row.try_get("due_at")?,
-            originating_task_id: row.try_get("originating_task_id")?,
-            evidence_required: row.try_get::<i64, _>("evidence_required")? != 0,
-            evidence_count: row.try_get("evidence_count")?,
-            blocked_reason: row.try_get("blocked_reason")?,
-            version: row.try_get("version")?,
-            updated_at: row.try_get("updated_at")?,
+    let commitments = db
+        .effective_project_commitment_sources(project_id, limit)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ProjectCommitmentProjection {
+                id: row.id()?,
+                status: row.status()?,
+                due_at: row.due_at()?,
+                originating_task_id: row.originating_task_id()?,
+                evidence_required: row.evidence_required()? != 0,
+                evidence_count: row.evidence_count()?,
+                blocked_reason: row.blocked_reason()?,
+                version: row.version()?,
+                updated_at: row.updated_at()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let inbox = sqlx::query(
-        "SELECT i.id, i.kind, i.status, i.source_type, i.source_id,
-                i.correlation_id, i.version, i.created_at, i.updated_at
-         FROM agent_inbox_item i
-         JOIN project_agent_binding b
-           ON b.project_id = i.scope_id
-          AND b.identity_id = i.recipient_identity_id
-          AND b.state = 'active'
-         WHERE i.scope_type = 'project' AND i.scope_id = ?
-           AND i.status <> 'dismissed'
-         ORDER BY i.updated_at DESC, i.id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(ProjectInboxProjection {
-            id: row.try_get("id")?,
-            kind: row.try_get("kind")?,
-            status: row.try_get("status")?,
-            source_type: row.try_get("source_type")?,
-            source_id: row.try_get("source_id")?,
-            correlation_id: row.try_get("correlation_id")?,
-            version: row.try_get("version")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
+    let inbox = db
+        .effective_project_inbox_sources(project_id, limit)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ProjectInboxProjection {
+                id: row.id()?,
+                kind: row.kind()?,
+                status: row.status()?,
+                source_type: row.source_type()?,
+                source_id: row.source_id()?,
+                correlation_id: row.correlation_id()?,
+                version: row.version()?,
+                created_at: row.created_at()?,
+                updated_at: row.updated_at()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let milestone_rows = sqlx::query(
-        "SELECT m.id, m.milestone_key, m.display_label, m.lifecycle,
-                m.current_definition_revision_id, m.version,
-                m.blocker_reason_json, m.stale_reason_json,
-                m.reconciliation_reason_json,
-                r.content_digest AS definition_digest,
-                r.acceptance_checks_json, r.evidence_requirements_json
-         FROM project_milestone m
-         LEFT JOIN project_milestone_revision r
-           ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
-         WHERE m.project_id = ?
-           AND (
-                m.lifecycle IN ('planned', 'active', 'ready_for_release')
-                OR m.id = (SELECT primary_milestone_id FROM project WHERE id = ?)
-           )
-         ORDER BY m.milestone_sequence ASC, m.id ASC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
+    let milestone_rows = db
+        .effective_project_milestone_sources(project_id, limit)
+        .await?;
     let active_milestones = milestone_rows
         .into_iter()
         .map(|row| {
             Ok(MilestoneProjection {
-                id: row.try_get("id")?,
-                milestone_key: row.try_get("milestone_key")?,
-                display_label: row.try_get("display_label")?,
-                lifecycle: row.try_get("lifecycle")?,
-                definition_revision_id: row.try_get("current_definition_revision_id")?,
-                definition_digest: row.try_get("definition_digest")?,
-                acceptance_checks: json_typed_array(row.try_get("acceptance_checks_json")?)?,
-                evidence_requirements: json_typed_array(
-                    row.try_get("evidence_requirements_json")?,
-                )?,
-                version: row.try_get("version")?,
-                blocker_reasons: json_value_array(row.try_get("blocker_reason_json")?)?,
-                stale_reasons: json_value_array(row.try_get("stale_reason_json")?)?,
-                reconciliation_reasons: json_value_array(
-                    row.try_get("reconciliation_reason_json")?,
-                )?,
+                id: row.id()?,
+                milestone_key: row.milestone_key()?,
+                display_label: row.display_label()?,
+                lifecycle: row.lifecycle()?,
+                definition_revision_id: row.current_definition_revision_id()?,
+                definition_digest: row.definition_digest()?,
+                acceptance_checks: json_typed_array(row.acceptance_checks_json()?)?,
+                evidence_requirements: json_typed_array(row.evidence_requirements_json()?)?,
+                version: row.version()?,
+                blocker_reasons: json_value_array(row.blocker_reason_json()?)?,
+                stale_reasons: json_value_array(row.stale_reason_json()?)?,
+                reconciliation_reasons: json_value_array(row.reconciliation_reason_json()?)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
     validate_primary_milestone_pointer(&active_milestones, primary_milestone_id.as_deref())?;
 
-    let readiness_rows = sqlx::query(
-        "SELECT id, milestone_id, definition_revision_id,
-                event_watermark, outcome,
-                blocking_reasons_json, readiness_digest, created_at
-         FROM project_readiness_snapshot
-         WHERE project_id = ?
-         ORDER BY created_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit.saturating_mul(4))
-    .fetch_all(db.pool())
-    .await?;
+    let readiness_rows = db
+        .effective_project_readiness_sources(project_id, limit.saturating_mul(4))
+        .await?;
     let mut seen_milestones = BTreeMap::new();
     for row in readiness_rows {
-        let milestone_id: String = row.try_get("milestone_id")?;
+        let milestone_id: String = row.milestone_id()?;
         if seen_milestones.contains_key(&milestone_id) {
             continue;
         }
         let snapshot = ReadinessSnapshotProjection {
-            id: row.try_get("id")?,
+            id: row.id()?,
             milestone_id: milestone_id.clone(),
-            definition_revision_id: row.try_get("definition_revision_id")?,
-            event_watermark: row.try_get("event_watermark")?,
-            outcome: row.try_get("outcome")?,
-            blocking_reasons: json_value_array(row.try_get("blocking_reasons_json")?)?,
-            readiness_digest: row.try_get("readiness_digest")?,
-            created_at: row.try_get("created_at")?,
+            definition_revision_id: row.definition_revision_id()?,
+            event_watermark: row.event_watermark()?,
+            outcome: row.outcome()?,
+            blocking_reasons: json_value_array(row.blocking_reasons_json()?)?,
+            readiness_digest: row.readiness_digest()?,
+            created_at: row.created_at()?,
         };
         seen_milestones.insert(milestone_id, snapshot);
     }
     let by_milestone = seen_milestones.into_values().collect::<Vec<_>>();
     let latest = by_milestone.first().cloned();
 
-    let releases = sqlx::query(
-        "SELECT id, milestone_id, release_sequence, release_revision,
-                release_identifier, readiness_snapshot_id, readiness_digest,
-                snapshot_digest,
-                created_at
-         FROM project_release
-         WHERE project_id = ?
-         ORDER BY created_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(ReleaseProjection {
-            id: row.try_get("id")?,
-            milestone_id: row.try_get("milestone_id")?,
-            release_sequence: row.try_get("release_sequence")?,
-            release_revision: row.try_get("release_revision")?,
-            release_identifier: row.try_get("release_identifier")?,
-            readiness_snapshot_id: row.try_get("readiness_snapshot_id")?,
-            readiness_digest: row.try_get("readiness_digest")?,
-            snapshot_digest: row.try_get("snapshot_digest")?,
-            created_at: row.try_get("created_at")?,
+    let releases = db
+        .effective_project_release_sources(project_id, limit)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ReleaseProjection {
+                id: row.id()?,
+                milestone_id: row.milestone_id()?,
+                release_sequence: row.release_sequence()?,
+                release_revision: row.release_revision()?,
+                release_identifier: row.release_identifier()?,
+                readiness_snapshot_id: row.readiness_snapshot_id()?,
+                readiness_digest: row.readiness_digest()?,
+                snapshot_digest: row.snapshot_digest()?,
+                created_at: row.created_at()?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let document_ids = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM project_document
-         WHERE project_id = ? AND current_draft_revision_id IS NOT NULL
-           AND (current_approved_revision_id IS NULL
-                OR current_draft_revision_id != current_approved_revision_id)
-         ORDER BY updated_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
-    let decision_candidate_ids = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM project_decision_candidate
-         WHERE project_id = ? AND lifecycle IN ('draft', 'proposed')
-         ORDER BY updated_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
+    let document_ids = db
+        .effective_project_unreleased_document_ids(project_id, limit)
+        .await?;
+    let decision_candidate_ids = db
+        .effective_project_decision_candidate_ids(project_id, limit)
+        .await?;
     let active_milestone_ids = active_milestones
         .iter()
         .map(|milestone| milestone.id.clone())
@@ -807,16 +627,9 @@ pub async fn load_effective_project_state(
         .map(|record| record.id.clone())
         .collect();
 
-    let watermark_row = sqlx::query(
-        "SELECT id, sequence FROM domain_event
-         WHERE scope_type = 'project' AND scope_id = ?
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let watermark_row = db.effective_project_event_watermark(project_id).await?;
     let (source_event_watermark, source_event_sequence) = match watermark_row {
-        Some(row) => (row.try_get("id")?, row.try_get("sequence")?),
+        Some(row) => (row.id()?, row.sequence()?),
         None => (format!("project-work-epoch:{project_work_epoch}"), 0),
     };
 
