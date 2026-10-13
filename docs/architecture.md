@@ -4690,7 +4690,12 @@ role Retry probes machine capacity before issuing its replay command: while
 the slot is full it keeps the accepted intent and its existing capacity park.
 The machine's release or capacity change lets the normal replay proceed.
 
-What the entry hook still decides itself, before the queue: a subtask, a Task
+What the entry hook still decides itself, before the queue: a subtask has no
+merge of its own (its commits land with the root's merge), so it leaves the
+merge state by that state's landed-merge target (`done`), and a dispatcher
+pass makes the same move for a subtask it finds resting there
+(`Step::AdmitIntegration`), so a subtask never rests in a merge state with no
+step and no park; a Task
 without a worktree or a server without a merge service is skipped as before; a
 handed-off conflict file that still adds conflict markers blocks the Task for
 manual repair; a candidate that cannot be named (no implementation run, lost
