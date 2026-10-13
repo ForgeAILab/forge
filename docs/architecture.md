@@ -6037,22 +6037,27 @@ have none of them.
 | `lead.subtask` `create` | appends one subtask (the server fills the parent) | the root | the root no longer accepts subtasks (`SUBTASK_PARENT_CLOSED`); a creation bound is spent |
 | `lead.subtask` `update` / `cancel` | title or description; cancel through the Task action | a subtask that never had an implementation run | the subtask started (`subtask_started`); stale `version` |
 | `lead.subtask` `reorder` | the untouched `todo` suffix, through the sequence command | all subtasks of the root | the order moves the terminal prefix or the current subtask |
-| `lead.subtask` `assign` | the worker (`coder`) of a subtask, or with no `task_id` the root's default worker | the root or a subtask | the Agent is not usable in the Project |
+| `lead.subtask` `assign` | the worker (`coder`) of a subtask, or with no `task_id` the root's default worker | the root or a subtask | the Agent is not usable in the Project; the Agent is the lead itself (`lead_self_assignment`, also for `create` with an assignee) |
 | `lead.recover` | one Task action the action system offers the lead (`retry`, `restart`, `cancel`) at the subtask's version | a subtask | the action is not offered to the lead now (`action_not_offered`); the recovery bound is spent |
 | `lead.handoff` | a `handoff` comment; the subtask's next implementation prompt starts with the newest five | a subtask | more than 20 notes on the subtask |
-| `lead.request_input` | asks the owner one question (below) | the root, from its planning run only | a step check asks (`wrong_target`); the root already waits (`lead_input_pending`) |
+| `lead.request_input` | asks the owner one question (below) | the root | the root already waits (`lead_input_pending`) |
 
 Not granted: repository writes, merge, a review decision, cancelling or
-moving the root, milestones, the Charter, releases, dependencies. A step
-check's verdict is its result block, not an operation.
+moving the root, milestones, the Charter, releases, dependencies, and making
+itself a worker. A subtask the lead creates has a title, a description and
+optionally a worker: no workflow, review configuration, check command or hook
+is an input of any lead operation. A step check has none of the operations:
+its run returns a verdict (its result block) and changes nothing, and a step
+it cannot pass reaches the lead's planning run through the re-plan.
 
 Authority is decided in two places and nowhere else.
 
 1. *Who is a lead* is a fact of the principal. The authority loader
    (`db::effective_authority`) derives `Principal::TaskAgent::lead_root_id`
-   from the session's one running execution: its role is the step-check role
-   and it runs on a root that has subtasks, or on a subtask resting in
-   `lead_check`, and the root's own row of that role names this identity.
+   from the session's one running execution: its role is the step-check role,
+   it runs on a root that has subtasks, and the root's own row of that role
+   names this identity. A step check (the same Agent and role on a subtask in
+   `lead_check`) and a planner on a plain Task lead nothing.
    `PrincipalRule::TaskLead` admits the five operations on that fact plus the
    Task scope's `task_read`; no permission name was added. Advertisement uses
    the same evaluator, so an ordinary planner, worker or reviewer session is
@@ -6062,9 +6067,9 @@ Authority is decided in two places and nowhere else.
    operations at its next call and keeps its Task records.
 2. *Is the target in the subtree* is one predicate at one boundary.
    `TaskService::bind_lead` is called first by every lead command: it repeats
-   the workflow's side of the lead rule (`RootRolePolicy::lead`, the root in
-   its planning state or the run's Task in `lead_check`, the execution still
-   running under the lead's role) and resolves the target through
+   the workflow's side of the lead rule (`RootRolePolicy::lead`, the run on
+   the root, the root in its planning state, the execution still running
+   under the lead's role) and resolves the target through
    `task_hierarchy::ensure_in_lead_subtree` (the root or one of its direct
    subtasks, same Project). A handler obtains its target only from that call.
    A Task of another root, of another Project, a deleted or unknown id all
@@ -6072,7 +6077,8 @@ Authority is decided in two places and nowhere else.
 
 Refusals are typed (`ServiceError::LeadOperationRefused`, reason codes
 `outside_lead_subtree`, `not_leading`, `wrong_target`, `subtask_started`,
-`lead_limit_reached`, `action_not_offered`, `lead_input_pending`) and reach
+`lead_limit_reached`, `action_not_offered`, `lead_input_pending`,
+`lead_self_assignment`) and reach
 the lead as an ordinary tool result with the reason in `details.refusal`.
 
 The effects are the existing commands. Create and reorder are the adaptive
@@ -6090,7 +6096,11 @@ audience of the offers the lead may take (`task_hierarchy::lead_verbs`:
 `retry`, `restart`, `cancel` while the subtask is parked on something the lead
 decides, `subtask_decision_park`, the allow-list the re-plan uses; `cancel`
 while it never started), and a caller that is only the lead is offered nothing
-else. Assign is `reassign_role` after REST's Project usability check.
+else. "Started" is any run on the subtask other than a step check, whatever
+the Project's workflow calls its implementation role. Assign is
+`reassign_role`, the command REST's role assignment uses, after the same
+Project usability check (owner and pricing admission included); the lead may
+name any Agent usable in the Project except itself.
 
 Every operation carries the envelope's `dedupe_key`. Version checks are the
 subtask's `version` (update, cancel, recover) and the root's version and the
@@ -6108,7 +6118,7 @@ the Project Agent's Retry with a new budget on the root opens the next window.
 | recoveries of one subtask | 2 per budget window (`lead_recover:<subtask>`) | the same; the subtask stays parked, the root returns to `in_progress`, waits on its subtasks and the Project Agent is woken for the park (one re-plan per park) |
 | hand-off notes on one subtask | 20 | the same |
 | open questions per root | 1 | `lead_input_pending` |
-| lead runs | one at kickoff, one per re-plan (5), one per step check return (2 per subtask), one per answered question | the existing budgets |
+| lead runs | one at kickoff, one per re-plan (5), one per answered question; a step check is one more run of the lead's Agent per submitted step (at most 3 per subtask and Execution window: `gate:lead_check` is 2 rejections), without lead operations | the existing budgets |
 
 A refused call spends nothing. A charge and the command it guards are not one
 transaction: a crash between them spends a unit and creates nothing, and the
@@ -6132,8 +6142,12 @@ one Attention item for the owner (`human_input_required`, recommended action
 `answer_lead_input`, dedupe key `lead-input:<root>:<comment>`; it never wakes
 an Agent), and a wait on the root: `awaiting_human` with reason `lead_input`,
 which the condition reads as `human_decision { boundary: lead_input }`. The
-three are written in that order, each idempotent on the call's key, and the
-wait last: a crash before it leaves a question and an item that hold nothing.
+three are one transaction (`SqliteDb::open_lead_input_wait_in_tx` inside the
+transaction of the comment and the item): a question is never shown without
+the root waiting for its answer, the root never waits on a question nobody is
+shown, and of two questions sent at once one is asked and the other is
+refused without leaving a comment. A repeated call with the same key writes
+nothing. An item whose root was deleted is closed by resolving it.
 
 | Root | Condition | Result | Mechanism |
 |---|---|---|---|

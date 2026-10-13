@@ -1248,11 +1248,13 @@ async fn a_second_question_while_the_root_waits_is_refused() {
     assert_eq!(items, 1);
 }
 
-/// A step check is a lead run too: from the subtask it checks, the lead acts
-/// on its root's other subtasks, and on nothing else. It cannot ask the
-/// owner a question (its answer is its verdict).
+/// A step check is a verdict on one subtask and nothing else. Its run is the
+/// lead's Agent in the lead's role, but it leads nothing: the server derives
+/// no root for it, no `lead.*` operation is in its scope, and the breakdown
+/// is not changed by it. (The planning run on the root is the one place the
+/// lead changes the breakdown; a step it cannot pass ends there by itself.)
 #[tokio::test]
-async fn a_step_check_run_acts_on_its_roots_subtasks_only() {
+async fn a_step_check_run_has_no_lead_operation() {
     let ops = ops_fixture(false).await;
     let lead = &ops.lead;
     let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
@@ -1268,7 +1270,6 @@ async fn a_step_check_run_acts_on_its_roots_subtasks_only() {
     seed_completed_coder_execution(&lead.db, &checked.id).await;
     assign_role(&lead.db, &root.id, CODER, &lead.coder).await;
     assign_role(&lead.db, &root.id, PLANNER, &lead.planner).await;
-    let (_, foreign) = other_root(lead).await;
     until(lead, "the step check runs", async || {
         running(lead, &checked.id, PLANNER).await
     })
@@ -1280,54 +1281,287 @@ async fn a_step_check_run_acts_on_its_roots_subtasks_only() {
         .await
         .unwrap()
         .principal;
-    assert!(matches!(
-        principal,
-        operation_registry::authority::Principal::TaskAgent { lead_root_id: Some(id), .. } if id == root.id
-    ));
-
+    assert!(
+        matches!(
+            principal,
+            operation_registry::authority::Principal::TaskAgent {
+                lead_root_id: None,
+                ..
+            }
+        ),
+        "{principal:?}"
+    );
     let waiting = reload(&lead.db, &next.id).await;
-    ops.call(&checked.id, "lead.subtask", json!({"action": "update", "task_id": waiting.id, "version": waiting.version, "description": "build on the first step's parser"}), "update")
+    for (operation, payload) in [
+        ("lead.read", json!({})),
+        (
+            "lead.subtask",
+            json!({"action": "update", "task_id": waiting.id, "version": waiting.version, "description": "rewritten by a step check"}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action": "create", "title": "third step"}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action": "cancel", "task_id": waiting.id, "version": waiting.version, "reason": "no"}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action": "assign", "task_id": waiting.id, "agent_id": lead.planner}),
+        ),
+        (
+            "lead.recover",
+            json!({"task_id": waiting.id, "action": {"verb": "cancel"}, "version": waiting.version}),
+        ),
+        (
+            "lead.handoff",
+            json!({"task_id": waiting.id, "note": "note"}),
+        ),
+        (
+            "lead.request_input",
+            json!({"question": "is this good enough?"}),
+        ),
+    ] {
+        let denied = ops
+            .call(&checked.id, operation, payload.clone(), &format!("{operation}:{payload}"))
+            .await
+            .unwrap_err();
+        assert!(
+            denied.contains("OperationNotInScope") || denied.contains("operation_not_in_scope"),
+            "{operation}: {denied}"
+        );
+    }
+    // The command boundary says the same to a caller that got past the
+    // registry (a principal resolved before the rule, a direct service call).
+    let execution: String = sqlx::query_scalar(
+        "SELECT id FROM execution WHERE task_id=? AND role='planner' AND status='running'",
+    )
+    .bind(&checked.id)
+    .fetch_one(lead.db.pool())
+    .await
+    .unwrap();
+    let refused = ops
+        .service
+        .lead_create_subtask(
+            &crate::LeadRun {
+                identity_id: lead.planner.clone(),
+                execution_id: execution,
+                task_id: checked.id.clone(),
+                root_id: root.id.clone(),
+            },
+            "third step".to_owned(),
+            None,
+            None,
+            "direct",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            crate::ServiceError::LeadOperationRefused {
+                refusal: crate::LeadRefusal::NotLeading,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(children(lead, &root.id).await.len(), 2);
+    let untouched = reload(&lead.db, &next.id).await;
+    assert_eq!(untouched.version, waiting.version);
+    assert_eq!(untouched.status, "todo");
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+}
+
+/// Two questions sent at once by one run: one is asked, the other is
+/// refused, and there is one comment, one Attention item and one wait. (The
+/// comment, the item and the wait are one transaction.)
+#[tokio::test]
+async fn two_questions_at_once_ask_one() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let (root, _) = root_with_child(lead, true).await;
+    until(lead, "the root plans", async || {
+        running(lead, &root.id, PLANNER).await
+    })
+    .await;
+    // The session exists before the two calls race.
+    session(&lead.db, &lead.planner, &root.id).await;
+    let (first, second) = tokio::join!(
+        ops.call(
+            &root.id,
+            "lead.request_input",
+            json!({"question": "A or B?"}),
+            "q1",
+        ),
+        ops.call(
+            &root.id,
+            "lead.request_input",
+            json!({"question": "C or D?"}),
+            "q2",
+        ),
+    );
+    let (asked, refused) = match (first, second) {
+        (Ok(asked), Err(refused)) | (Err(refused), Ok(asked)) => (asked, refused),
+        other => panic!("exactly one question is asked: {other:?}"),
+    };
+    assert!(refused.contains("lead_input_pending"), "{refused}");
+    let questions = comments(lead, &root.id)
+        .await
+        .into_iter()
+        .filter(|comment| comment.worklog_kind.as_deref() == Some("request_input"))
+        .collect::<Vec<_>>();
+    assert_eq!(questions.len(), 1, "the refused question left no comment");
+    assert_eq!(asked["comment_id"], questions[0].id.as_str());
+    let items: Vec<String> = sqlx::query_scalar(
+        "SELECT dedupe_key FROM attention_projection WHERE recommended_action='answer_lead_input' AND status='open'",
+    )
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        items,
+        vec![format!("lead-input:{}:{}", root.id, questions[0].id)]
+    );
+    let waiting = reload(&lead.db, &root.id).await;
+    let metadata: Value = serde_json::from_str(waiting.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["awaiting_human_marker_id"], questions[0].id.as_str());
+}
+
+/// A lead cannot make itself a worker (its runs read the repository; a
+/// worker's run writes it), on a subtask, as the root's default worker or on
+/// a subtask it creates.
+#[tokio::test]
+async fn a_lead_never_assigns_itself_as_a_worker() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let (root, child) = root_with_child(lead, true).await;
+    until(lead, "the root plans", async || {
+        running(lead, &root.id, PLANNER).await
+    })
+    .await;
+    for (payload, key) in [
+        (
+            json!({"action": "assign", "task_id": child.id, "agent_id": lead.planner}),
+            "self-child",
+        ),
+        (
+            json!({"action": "assign", "agent_id": lead.planner}),
+            "self-default",
+        ),
+        (
+            json!({"action": "create", "title": "mine", "assignee_id": lead.planner}),
+            "self-create",
+        ),
+    ] {
+        let refused = ops
+            .call(&root.id, "lead.subtask", payload, key)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("lead_self_assignment"), "{key}: {refused}");
+    }
+    let coders: Vec<String> = sqlx::query_scalar(
+        "SELECT a.assignee_id FROM task_role_assignment a JOIN task t ON t.id=a.task_id
+         WHERE a.role_name='coder' AND (t.id=? OR t.parent_task_id=?)",
+    )
+    .bind(&root.id)
+    .bind(&root.id)
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert!(!coders.contains(&lead.planner), "{coders:?}");
+    assert_eq!(children(lead, &root.id).await.len(), 1);
+}
+
+/// "Started" is any run on the subtask that is not the step check, whatever
+/// the Project's workflow calls its implementation role.
+#[tokio::test]
+async fn a_subtask_started_under_any_role_name_is_not_rewritten() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let (root, child) = root_with_child(lead, true).await;
+    seed_completed_coder_execution(&lead.db, &child.id).await;
+    sqlx::query("UPDATE execution SET role='builder' WHERE task_id=?")
+        .bind(&child.id)
+        .execute(lead.db.pool())
         .await
         .unwrap();
-    assert_eq!(
-        reload(&lead.db, &next.id).await.description.as_deref(),
-        Some("build on the first step's parser")
-    );
+    until(lead, "the root plans", async || {
+        running(lead, &root.id, PLANNER).await
+    })
+    .await;
+    let child = reload(&lead.db, &child.id).await;
+    for (payload, key) in [
+        (
+            json!({"action": "update", "task_id": child.id, "version": child.version, "title": "rewritten"}),
+            "update",
+        ),
+        (
+            json!({"action": "cancel", "task_id": child.id, "version": child.version, "reason": "drop"}),
+            "cancel",
+        ),
+    ] {
+        let refused = ops
+            .call(&root.id, "lead.subtask", payload, key)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("subtask_started") || refused.contains("unavailable"),
+            "{key}: {refused}"
+        );
+    }
+    let after = reload(&lead.db, &child.id).await;
+    assert_eq!((after.title, after.status), (child.title, child.status));
+}
+
+/// A question whose root was deleted can still be closed by its owner: the
+/// item is resolved and nothing else is written.
+#[tokio::test]
+async fn a_question_of_a_deleted_root_is_resolved_without_an_answer_target() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let (root, _) = root_with_child(lead, true).await;
+    until(lead, "the root plans", async || {
+        running(lead, &root.id, PLANNER).await
+    })
+    .await;
     ops.call(
-        &checked.id,
-        "lead.handoff",
-        json!({"task_id": waiting.id, "note": "the parser returns rows, not lines"}),
-        "note",
+        &root.id,
+        "lead.request_input",
+        json!({"question": "A or B?"}),
+        "q1",
     )
     .await
     .unwrap();
-    let created = ops
-        .call(
-            &checked.id,
-            "lead.subtask",
-            json!({"action": "create", "title": "third step"}),
-            "create",
-        )
+    let (item, version): (String, i64) = sqlx::query_as(
+        "SELECT id, version FROM attention_projection WHERE recommended_action='answer_lead_input'",
+    )
+    .fetch_one(lead.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET deleted_at=? WHERE id=?")
+        .bind(now_rfc3339())
+        .bind(&root.id)
+        .execute(lead.db.pool())
         .await
         .unwrap();
-    assert_eq!(children(lead, &root.id).await.len(), 3, "{created}");
-
-    let refused = ops
-        .call(
-            &checked.id,
-            "lead.request_input",
-            json!({"question": "is this good enough?"}),
-            "ask",
-        )
+    let owner: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id=?")
+        .bind(&lead.project)
+        .fetch_one(lead.db.pool())
         .await
-        .unwrap_err();
-    assert!(refused.contains("wrong_target"), "{refused}");
-    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
-    let foreign = reload(&lead.db, &foreign.id).await;
-    let refused = ops
-        .call(&checked.id, "lead.subtask", json!({"action": "update", "task_id": foreign.id, "version": foreign.version, "title": "mine"}), "escape")
+        .unwrap();
+    sqlx::query("INSERT OR IGNORE INTO user (id, email, password_hash, created_at, updated_at) VALUES (?, 'owner@example.test', 'unused', ?, ?)")
+        .bind(&owner)
+        .bind(now_rfc3339())
+        .bind(now_rfc3339())
+        .execute(lead.db.pool())
         .await
-        .unwrap_err();
-    assert!(refused.contains("outside_lead_subtree"), "{refused}");
-    assert_eq!(reload(&lead.db, &foreign.id).await.title, "other child");
+        .unwrap();
+    let attention = crate::attention_service::AttentionService::new(Arc::clone(&lead.db));
+    let resolved = attention
+        .resolve_with_answer(&owner, &item, version, Some("B"))
+        .await
+        .unwrap();
+    assert_eq!(resolved.status, "resolved");
 }

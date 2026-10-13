@@ -2840,7 +2840,7 @@ tool. What REST, MCP and event consumers see of them:
   principal.
 - `422 LEAD_OPERATION_REFUSED` (`details.refusal`: `outside_lead_subtree`,
   `not_leading`, `wrong_target`, `subtask_started`, `lead_limit_reached`,
-  `action_not_offered`, `lead_input_pending`) is the typed refusal of a lead
+  `action_not_offered`, `lead_input_pending`, `lead_self_assignment`) is the typed refusal of a lead
   command. Native sessions receive it as a tool result; REST and MCP map it
   for completeness and have no route that returns it today.
 - The budget rows `lead_subtasks`, `lead_subtasks_run:<execution>` and

@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 pub struct LeadRun {
     pub identity_id: String,
     pub execution_id: String,
-    /// The Task the run executes on: the root (a planning run) or one of
-    /// its subtasks (a step check).
+    /// The Task the run executes on. A lead run executes on its root: a
+    /// step check on a subtask is not one and is refused at the boundary.
     pub task_id: String,
     pub root_id: String,
 }
@@ -37,8 +37,6 @@ pub struct LeadRun {
 pub(crate) struct LeadBinding {
     pub run: LeadRun,
     pub root: Task,
-    /// The run is the planning run on the root (not a step check).
-    pub on_root: bool,
     pub role: String,
 }
 
@@ -67,16 +65,17 @@ fn clip(text: &str, chars: usize) -> (String, bool) {
 
 /// Whether a subtask ever had an implementation run admitted. Such a subtask
 /// has work in the shared workspace: the lead may recover it, reassign it or
-/// leave it a note, and may not rewrite, reorder or drop it.
+/// leave it a note, and may not rewrite, reorder or drop it. Every run on a
+/// subtask that is not its root's step check counts, whatever the Project's
+/// workflow calls its implementation role (and an owner's interactive
+/// session too: it had the workspace).
 pub(crate) async fn subtask_started(db: &SqliteDb, task_id: &str) -> Result<bool> {
-    let runs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role IN ('coder','worker','executor')",
-    )
-    .bind(task_id)
-    .fetch_one(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
-    Ok(runs > 0)
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND role <> ?)")
+        .bind(task_id)
+        .bind(db::inherited_subtask::STEP_CHECK_ROLE)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|error| db::DbError::from(error).into())
 }
 
 /// End the wait a lead's question put on `task`, whichever way it ends: the
@@ -195,10 +194,10 @@ pub(crate) async fn answer_lead_input(
 
 impl TaskService {
     /// THE command boundary of every lead operation. `run` must be a running
-    /// execution of the root's lead in the place a lead runs (the planning
-    /// state of the root, or the step check of one of its subtasks), and
-    /// `target`, when given, must be that root or one of its subtasks in the
-    /// same Project. Anything else is a typed refusal and nothing is written.
+    /// execution of the root's lead on the root, in the root's planning
+    /// state, and `target`, when given, must be that root or one of its
+    /// subtasks in the same Project. A step check on a subtask is not such a
+    /// run. Anything else is a typed refusal and nothing is written.
     pub(crate) async fn bind_lead(
         &self,
         run: &LeadRun,
@@ -235,22 +234,13 @@ impl TaskService {
         if execution.role != lead.role_name {
             return Err(not_leading("its execution does not run the lead's role"));
         }
-        let on_root = run.task_id == root.id;
-        if on_root {
-            if policy.planning_state() != Some(root.status.as_str()) {
-                return Err(not_leading("the root is not in its planning state"));
-            }
-        } else {
-            let checked = TaskRepo::get_by_id(&*self.db, &run.task_id, false)
-                .await?
-                .filter(|task| {
-                    task.parent_task_id.as_deref() == Some(root.id.as_str())
-                        && task.status == db::inherited_subtask::STEP_CHECK_STATE
-                })
-                .is_some();
-            if !checked {
-                return Err(not_leading("its Task is not a subtask in its step check"));
-            }
+        if run.task_id != root.id {
+            return Err(not_leading(
+                "it does not run on the root (a step check returns a verdict and changes nothing)",
+            ));
+        }
+        if policy.planning_state() != Some(root.status.as_str()) {
+            return Err(not_leading("the root is not in its planning state"));
         }
         let target = match target {
             Some(id) => {
@@ -263,7 +253,6 @@ impl TaskService {
                 run: run.clone(),
                 role: execution.role,
                 root,
-                on_root,
             },
             target,
         ))
@@ -289,6 +278,19 @@ impl TaskService {
                     "subtask {} already had an implementation run; use lead.recover, lead.subtask assign or lead.handoff",
                     task.id
                 ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A lead never makes itself a worker: its runs read the repository, and
+    /// a worker's run writes it. The owner may give one Agent both roles; a
+    /// lead's own operation may not.
+    fn ensure_not_self_assignment(run: &LeadRun, agent_id: &str) -> Result<()> {
+        if agent_id == run.identity_id {
+            return Err(refused(
+                LeadRefusal::SelfAssignment,
+                "a lead does not assign itself as a worker; name another Agent that is usable in this Project",
             ));
         }
         Ok(())
@@ -515,6 +517,7 @@ impl TaskService {
         crate::task_hierarchy::ensure_parent_accepts_subtasks(root, &workflow)?;
         if let Some(agent_id) = assignee_id.as_deref() {
             validate_required("assignee_id", agent_id)?;
+            Self::ensure_not_self_assignment(run, agent_id)?;
             crate::ensure_execution_role_principal(
                 &self.db,
                 &root.project_id,
@@ -735,6 +738,7 @@ impl TaskService {
         let (binding, target) = self.bind_lead(run, task_id).await?;
         let task = target.unwrap_or_else(|| binding.root.clone());
         validate_required("agent_id", agent_id)?;
+        Self::ensure_not_self_assignment(run, agent_id)?;
         let role = crate::workflow::default_roles::CODER;
         crate::ensure_execution_role_principal(&self.db, &task.project_id, role, agent_id).await?;
         let now = now_rfc3339();
@@ -876,9 +880,10 @@ impl TaskService {
     /// on the root, the owner gets one Attention item for it, and the root
     /// waits in its planning state (`human_decision { lead_input }`): the
     /// planning gate does not accept this run, and the lead is dispatched
-    /// again only when the answer cleared the wait. The three writes are
-    /// ordered so that every prefix of them is safe to stop at: a comment
-    /// and an item without a wait hold nothing, and the wait is written last.
+    /// again only when the answer cleared the wait. The comment, the item and
+    /// the wait are ONE transaction: a question is never shown without the
+    /// root waiting for its answer (the run would be accepted and the answer
+    /// lost), and the root never waits on a question nobody is shown.
     pub async fn lead_request_input(
         &self,
         run: &LeadRun,
@@ -886,12 +891,6 @@ impl TaskService {
         key: &str,
     ) -> Result<Value> {
         let (binding, _) = self.bind_lead(run, None).await?;
-        if !binding.on_root {
-            return Err(refused(
-                LeadRefusal::WrongTarget,
-                "lead.request_input is for the planning run on the root; a step check answers with its verdict",
-            ));
-        }
         let question = question.trim();
         if question.is_empty()
             || question.chars().count() > operation_registry::task_lead::MAX_NOTE_CHARS
@@ -902,132 +901,127 @@ impl TaskService {
             )));
         }
         let root = &binding.root;
-        let metadata: Value = root
-            .metadata_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .unwrap_or(Value::Null);
-        let pending = metadata["awaiting_human"] == true;
-        let idempotency = format!("lead:{}:{key}", db::COMMENT_KIND_REQUEST_INPUT);
+        let now = now_rfc3339();
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let comment = self
+            .db
+            .create_task_comment_in_tx(
+                &mut tx,
+                &CreateTaskComment {
+                    id: new_uuid_v4(),
+                    task_id: root.id.clone(),
+                    author_type: CommentAuthorType::Agent,
+                    author_id: Some(run.identity_id.clone()),
+                    author_name: "lead".to_owned(),
+                    content: question.to_owned(),
+                    execution_id: Some(run.execution_id.clone()),
+                    role: Some(binding.role.clone()),
+                    worklog_kind: Some(db::COMMENT_KIND_REQUEST_INPUT.to_owned()),
+                    idempotency_key: Some(format!(
+                        "lead:{}:{key}",
+                        db::COMMENT_KIND_REQUEST_INPUT
+                    )),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await?;
+        if comment.content != question {
+            return Err(db::DbError::IdempotencyConflict.into());
+        }
+        let dedupe = lead_input_dedupe_key(&root.id, &comment.id);
         let asked: Option<String> =
-            sqlx::query_scalar("SELECT id FROM task_comment WHERE task_id=? AND idempotency_key=?")
-                .bind(&root.id)
-                .bind(&idempotency)
-                .fetch_optional(self.db.pool())
+            sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key=?")
+                .bind(&dedupe)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(db::DbError::from)?;
-        if pending && metadata["awaiting_human_marker_id"].as_str() != asked.as_deref() {
+        let waiting = json!({
+            "operation": "lead.request_input", "task_id": root.id, "comment_id": comment.id,
+            "waiting": true,
+            "next": "End this run now. The root waits for the owner's answer and the lead runs again with it.",
+        });
+        if asked.is_some() {
+            // A retry of a question that was asked (and maybe answered
+            // since): nothing is written twice and no wait is opened again.
+            return Ok(waiting);
+        }
+        if !self
+            .db
+            .open_lead_input_wait_in_tx(&mut tx, &root.id, &comment.id, &run.execution_id, &now)
+            .await?
+        {
+            // Dropping the transaction takes the comment back.
             return Err(refused(
                 LeadRefusal::InputPending,
                 "this root already waits for a person; end the run, it starts again with the answer",
             ));
         }
-        let comment = self
-            .lead_comment(
-                &binding,
-                &root.id,
-                db::COMMENT_KIND_REQUEST_INPUT,
-                question,
-                key,
-            )
-            .await?;
-        let dedupe = lead_input_dedupe_key(&root.id, &comment.id);
-        let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM attention_projection WHERE dedupe_key=?)",
+        let event = db::DomainEventRepo::append_event_in_tx(
+            &*self.db,
+            &mut tx,
+            &db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.lead_input_requested".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: root.id.clone(),
+                actor_type: "agent".to_owned(),
+                actor_id: Some(run.identity_id.clone()),
+                scope_type: "project".to_owned(),
+                scope_id: root.project_id.clone(),
+                correlation_id: run.execution_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(dedupe.clone()),
+                payload_json: json!({"task_id": root.id, "comment_id": comment.id}).to_string(),
+                created_at: now.clone(),
+            },
         )
-        .bind(&dedupe)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db::DbError::from)?;
-        if !exists {
-            let now = now_rfc3339();
-            let event = db::DomainEventRepo::append_event_in_tx(
-                &*self.db,
+        .await?;
+        self.db
+            .insert_attention_in_tx(
                 &mut tx,
-                &db::CreateDomainEvent {
+                db::CreateAttentionProjection {
                     id: new_uuid_v4(),
-                    event_type: "task.lead_input_requested".to_owned(),
-                    entity_type: "task".to_owned(),
-                    entity_id: root.id.clone(),
-                    actor_type: "agent".to_owned(),
-                    actor_id: Some(run.identity_id.clone()),
+                    attention_type: "human_input_required".to_owned(),
                     scope_type: "project".to_owned(),
                     scope_id: root.project_id.clone(),
-                    correlation_id: run.execution_id.clone(),
-                    causation_id: None,
-                    causation_depth: 0,
-                    dedupe_key: Some(dedupe.clone()),
-                    payload_json: json!({"task_id": root.id, "comment_id": comment.id}).to_string(),
-                    created_at: now.clone(),
+                    identity_id: Some(run.identity_id.clone()),
+                    source_event_id: event.id,
+                    priority: 95,
+                    status: "open".to_owned(),
+                    summary: clip(question.lines().next().unwrap_or(question), 160).0,
+                    details_json: json!({
+                        "task_id": root.id,
+                        "comment_id": comment.id,
+                        "question": question,
+                        "execution_id": run.execution_id,
+                    })
+                    .to_string(),
+                    dedupe_key: dedupe,
+                    occurred_at: now.clone(),
+                    updated_at: now,
+                    acknowledged_at: None,
+                    snoozed_until: None,
+                    resolved_at: None,
+                    updated_by_user_id: None,
+                    recommended_action: crate::attention_service::ANSWER_LEAD_INPUT.to_owned(),
+                    source_sequence: Some(event.sequence),
                 },
             )
             .await?;
-            self.db
-                .insert_attention_in_tx(
-                    &mut tx,
-                    db::CreateAttentionProjection {
-                        id: new_uuid_v4(),
-                        attention_type: "human_input_required".to_owned(),
-                        scope_type: "project".to_owned(),
-                        scope_id: root.project_id.clone(),
-                        identity_id: Some(run.identity_id.clone()),
-                        source_event_id: event.id,
-                        priority: 95,
-                        status: "open".to_owned(),
-                        summary: clip(question.lines().next().unwrap_or(question), 160).0,
-                        details_json: json!({
-                            "task_id": root.id,
-                            "comment_id": comment.id,
-                            "question": question,
-                            "execution_id": run.execution_id,
-                        })
-                        .to_string(),
-                        dedupe_key: dedupe,
-                        occurred_at: now.clone(),
-                        updated_at: now,
-                        acknowledged_at: None,
-                        snoozed_until: None,
-                        resolved_at: None,
-                        updated_by_user_id: None,
-                        recommended_action: crate::attention_service::ANSWER_LEAD_INPUT.to_owned(),
-                        source_sequence: Some(event.sequence),
-                    },
-                )
-                .await?;
-        }
         tx.commit().await.map_err(db::DbError::from)?;
-        if !pending {
-            TaskRepo::mutate_metadata(
-                &*self.db,
-                &root.id,
-                None,
-                vec![
-                    db::TaskMetadataMutation::Set {
-                        key: "awaiting_human".to_owned(),
-                        value: json!(true),
-                    },
-                    db::TaskMetadataMutation::Set {
-                        key: "awaiting_human_reason".to_owned(),
-                        value: json!(db::LEAD_INPUT_WAIT),
-                    },
-                    db::TaskMetadataMutation::Set {
-                        key: "awaiting_human_marker_id".to_owned(),
-                        value: json!(comment.id),
-                    },
-                    db::TaskMetadataMutation::Set {
-                        key: "lead_input_execution_id".to_owned(),
-                        value: json!(run.execution_id),
-                    },
-                ],
-                &now_rfc3339(),
-            )
-            .await?;
-        }
-        Ok(json!({
-            "operation": "lead.request_input", "task_id": root.id, "comment_id": comment.id,
-            "waiting": true,
-            "next": "End this run now. The root waits for the owner's answer and the lead runs again with it.",
-        }))
+        self.publish(ForgeEvent {
+            event_type: "comment.created".to_owned(),
+            entity_id: comment.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::CommentCreated {
+                task_id: root.id.clone(),
+                comment_id: comment.id.clone(),
+                author_type: "agent".to_owned(),
+                author_name: comment.author_name.clone(),
+            },
+        });
+        Ok(waiting)
     }
 }

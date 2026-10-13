@@ -309,10 +309,12 @@ pub(super) async fn resolve_command_replay(
 
 /// A fresh command of a coordination root's lead (principal `task_lead`):
 /// the execution it names as its correlation is still running for this
-/// identity in the lead's role, on the command's source root or on a subtask
-/// of it in its step check, and the root's own row of that role still names
-/// this identity. A lead removed, replaced or stopped between the service's
-/// boundary check and this transaction writes nothing.
+/// identity in the lead's role ON the command's source root, and the root's
+/// own row of that role still names this identity. Both names come from the
+/// service (`TaskService::lead_adaptive_command`), never from a tool payload;
+/// they are checked here against the rows, so a lead removed, replaced or
+/// stopped between the service's boundary check and this transaction writes
+/// nothing, and neither does a run that is not the root's planning run.
 async fn reauthorize_task_lead_command_in_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     receipt: &CreateCommandReceipt,
@@ -320,22 +322,19 @@ async fn reauthorize_task_lead_command_in_tx(
     let leads: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM execution e
-         JOIN task t ON t.id = e.task_id AND t.deleted_at IS NULL
-         JOIN task root ON root.id = COALESCE(t.parent_task_id, t.id)
+         JOIN task root ON root.id = e.task_id
               AND root.parent_task_id IS NULL AND root.deleted_at IS NULL
          JOIN task_role_assignment a ON a.task_id = root.id AND a.role_name = e.role
               AND a.assignee_type = 'agent' AND a.assignee_id = e.agent_id
          WHERE e.id = ? AND e.agent_id = ? AND e.status = 'running' AND e.role = ?
            AND root.project_id = ?
-           AND root.id = json_extract(?, '$.source_task_id')
-           AND (t.parent_task_id IS NULL OR t.status = ?)",
+           AND root.id = json_extract(?, '$.source_task_id')",
     )
     .bind(&receipt.correlation_id)
     .bind(&receipt.principal_id)
     .bind(crate::inherited_subtask::STEP_CHECK_ROLE)
     .bind(&receipt.scope_id)
     .bind(&receipt.outcome_json)
-    .bind(crate::inherited_subtask::STEP_CHECK_STATE)
     .fetch_one(&mut **transaction)
     .await?;
     if receipt.scope_type != "project" || receipt.operation != "task.adaptive" || leads == 0 {

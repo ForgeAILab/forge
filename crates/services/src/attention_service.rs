@@ -1926,10 +1926,16 @@ impl AttentionService {
                     "Attention item has no question to answer",
                 ));
             };
-            crate::task_service::lead::answer_lead_input(
+            match crate::task_service::lead::answer_lead_input(
                 &self.db, task_id, comment_id, answer, "owner",
             )
-            .await?;
+            .await
+            {
+                // A deleted root has nobody to read the answer; its question
+                // is closed all the same, so the item is never unresolvable.
+                Ok(_) | Err(ServiceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
             // The answer resolved the item with the wait. A root that had
             // already left its planning state has no wait left: close it here.
             let latest = self

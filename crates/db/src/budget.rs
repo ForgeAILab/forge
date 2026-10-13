@@ -86,7 +86,7 @@ impl Kind {
 /// Subtasks the lead created under the root, per budget window.
 pub const LEAD_SUBTASKS_KEY: &str = "lead_subtasks";
 pub const LEAD_SUBTASKS_LIMIT: i64 = 24;
-/// Subtasks one lead run (one planning run or step check) created.
+/// Subtasks one lead run (one planning run on the root) created.
 pub const LEAD_SUBTASKS_PER_RUN_LIMIT: i64 = 8;
 pub fn lead_subtasks_run_key(execution: &str) -> String {
     format!("lead_subtasks_run:{execution}")

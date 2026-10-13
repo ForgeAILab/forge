@@ -9,9 +9,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Breaking
 
 - **A root's lead can change the breakdown, recover a parked subtask, leave
-  hand-off notes and ask the owner a question.** The lead's planning run (and
-  its step check on a subtask) has five native operations, limited to its own
-  root's subtasks: `lead.read`, `lead.subtask` (create, update, cancel,
+  hand-off notes and ask the owner a question.** The lead's planning run on
+  the root (not its step check on a subtask, which returns a verdict and
+  changes nothing) has five native operations, limited to its own root's
+  subtasks: `lead.read`, `lead.subtask` (create, update, cancel,
   reorder, assign), `lead.recover`, `lead.handoff` and `lead.request_input`.
   After a parked subtask the lead can retry or cancel it and add what replaces
   it; after a rejected aggregate review it can add fix subtasks, and the root

@@ -365,6 +365,8 @@ pub enum LeadRefusal {
     ActionNotOffered,
     /// The root already waits for an answer to an earlier question.
     InputPending,
+    /// The lead named itself as a worker.
+    SelfAssignment,
 }
 impl LeadRefusal {
     pub const fn code(self) -> &'static str {
@@ -376,6 +378,7 @@ impl LeadRefusal {
             Self::LimitReached => "lead_limit_reached",
             Self::ActionNotOffered => "action_not_offered",
             Self::InputPending => "lead_input_pending",
+            Self::SelfAssignment => "lead_self_assignment",
         }
     }
 }
