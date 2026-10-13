@@ -6,6 +6,7 @@ import {
   leadCandidateDisabledReason,
   roleAssignmentErrorMessage,
   roleSlots,
+  rootHoldsRuns,
   stepCheckLabel,
   stepCheckNotice,
 } from './root-lead'
@@ -135,5 +136,47 @@ describe('the lead of a coordination root', () => {
     }
     expect(roleAssignmentErrorMessage(refusal('version_conflict'))).toBeUndefined()
     expect(roleAssignmentErrorMessage(new Error('offline'))).toBeUndefined()
+  })
+})
+
+describe('launching a run on a coordination root', () => {
+  const idle = { kind: 'idle' } as never
+  const waitingOnSubtasks = {
+    kind: 'parked',
+    primary: { kind: 'children', root_id: 'root-1', remaining: ['a'] },
+    additional: [],
+  } as never
+  const root = { parent_task_id: null, effective_lead: null, condition: idle }
+
+  it('offers no run while the root coordinates its subtasks: the server refuses one', () => {
+    // `ensure_ordered_execution_admission`: a root with subtasks runs its lead
+    // in planning and its aggregate reviewer in review, and nothing else.
+    for (const status of ['todo', 'in_progress', 'blocked', 'merge_failed', 'planning']) {
+      expect(rootHoldsRuns({ ...root, status }, true), status).toBe(true)
+    }
+    expect(rootHoldsRuns({ ...root, status: 'review' }, true)).toBe(false)
+  })
+
+  it('knows a coordination root without the subtask list: its wait or its lead says so', () => {
+    expect(
+      rootHoldsRuns({ ...root, status: 'in_progress', condition: waitingOnSubtasks }, false),
+    ).toBe(true)
+    expect(
+      rootHoldsRuns(
+        {
+          ...root,
+          status: 'in_progress',
+          effective_lead: { assignment: assignment('lead-1'), source: 'own' } as never,
+        },
+        false,
+      ),
+    ).toBe(true)
+  })
+
+  it('leaves a plain Task and a subtask launchable', () => {
+    expect(rootHoldsRuns({ ...root, status: 'in_progress' }, false)).toBe(false)
+    expect(
+      rootHoldsRuns({ ...root, parent_task_id: 'root-1', status: 'in_progress' }, false),
+    ).toBe(false)
   })
 })
