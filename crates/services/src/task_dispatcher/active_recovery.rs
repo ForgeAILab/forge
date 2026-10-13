@@ -1223,7 +1223,6 @@ impl TaskDispatcher {
     /// evidence, before a cached refusal or CI readiness can hide it.
     pub(super) async fn reconcile_missing_review_candidate(
         &self,
-        project: &Project,
         workflow: &WorkflowDefinition,
         task: &Task,
     ) -> Result<bool> {
@@ -1234,24 +1233,20 @@ impl TaskDispatcher {
         }) else {
             return Ok(false);
         };
-        let assigned = match crate::workflow::effective_role(state) {
+        // Only an Agent reviewer is refused dispatch for want of a
+        // candidate. A human reviewer, an owner-approval gate and a
+        // check-only gate keep the decisions and checks they always had.
+        let agent_reviewer = match crate::workflow::effective_role(state) {
             Some(role) => crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
                 .await?
-                .is_some_and(|resolved| resolved.assignment.assignee_id.is_some()),
+                .is_some_and(|resolved| {
+                    resolved.assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                        && resolved.assignment.assignee_id.is_some()
+                }),
             None => false,
         };
-        let config =
-            helpers::merged_state_config(state, project, task.task_state_config.as_deref());
-        let checks = config
-            .get("ci_steps")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|steps| !steps.is_empty());
-        if (!assigned
-            && !checks
-            && !state
-                .gate_config
-                .as_ref()
-                .is_some_and(|gate| gate.requires_user_approval()))
+        if !agent_reviewer
+            || task.review_passed_at.is_some()
             || crate::task_service::latest_executor_execution_for_task(&self.db, task)
                 .await?
                 .is_some()

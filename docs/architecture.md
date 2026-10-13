@@ -5900,34 +5900,40 @@ replace validation of that install's retained owner evidence.
 
 ### Task condition actions
 
-**Review without an Agent delivery.** A Task branch with a head different from
-its recorded base is a human submission and runs the ordinary configured
-review checks and reviewer. Its completed delivery-evidence row records the
-exact base/head and a human-submission summary, with no Agent, process, lease,
-session or logs. It grants no review authority by itself. Review attempts retain
-their execution foreign key and the ordinary candidate/admission fences.
+**Review without an Agent delivery.** This applies only to a review gate whose
+reviewer role is assigned to an Agent; human reviewers, owner-approval gates and
+check-only gates behave as before. A Task (not a coordination root) whose branch
+has commits of its own that the target does not have (merges of the target do
+not count) is a human submission and runs the ordinary configured review checks
+and reviewer. Its completed delivery-evidence row records the exact base/head
+and a human-submission summary, with no Agent, process, lease, session or logs.
+It grants no review authority by itself. Review attempts retain their execution
+foreign key and the ordinary candidate/admission fences.
 
-A configured review with no delivery candidate instead parks as
-`failure { failure_kind: review_blocked }`, with “nothing to review” and the
-existing `execution_failed` Attention category. It offers Cancel and Send Back
-to add work, and refuses Approve (including an override) and candidate retries.
-Sending a coordination root back holds it in implementation so the owner can
-add corrective subtasks before Release; it cannot immediately advance to the
-same empty review. An ordinary Task takes its configured rejection transition.
-The park is stated once; unchanged dispatcher passes add no Task write, event,
+With no delivery candidate the review parks as
+`failure { failure_kind: review_blocked }` with `blocking_reason`
+`review_candidate_missing`, "nothing to review", and the existing
+`execution_failed` Attention category. It offers Approve (the owner's decision,
+exactly as before the park existed), Send Back to add work, and Cancel; no
+reviewer retry is offered because there is nothing to retry on. Sending a
+coordination root back holds it in implementation so the owner can add
+corrective subtasks before Release; it cannot immediately advance to the same
+empty review. An ordinary Task takes its configured rejection transition. The
+park is stated once; unchanged dispatcher passes add no Task write, event,
 step, execution or Attention incident.
 
-For a root whose children were all cancelled, cancelled children supply no
-aggregate candidate. With a lead, missing work triggers planning once per
-review entry and charges only the existing `replan` budget. Exhaustion leaves
-the root in the existing `budget_exhausted { replan }` park. Without a lead it
-uses the owner park above, naming “every subtask was cancelled.” An unassigned,
-check-less gate that requires no human approval still skips into `merging` by
-configuration; no delivery or required validation is claimed by that skip.
-The merge entry completes an all-cancelled sequence as a no-op when there is
-no Workspace or its branch is proven unchanged and clean. A changed, dirty or
-unavailable branch keeps the ordinary integration handling and is never
-discarded by that no-op.
+The candidate of a coordination root is the latest implementation run of any
+subtask, cancelled ones included (their commits are on the root's branch). A
+root with no such run and a lead triggers planning once per review entry and
+charges only the existing `replan` budget; exhaustion leaves the root in the
+existing `budget_exhausted { replan }` park. Without a lead it uses the owner
+park above, naming "every subtask was cancelled" when that is the case. An
+unassigned, check-less gate that requires no human approval still skips into
+`merging` by configuration. The merge entry finishes a root whose subtasks were
+all cancelled as `done` without a merge when it arrives from the review gate
+(skipped by configuration or approved by the owner) and it has no Workspace or
+its branch is proven unchanged and clean. A changed, dirty or unreadable branch
+keeps the ordinary integration handling.
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
 

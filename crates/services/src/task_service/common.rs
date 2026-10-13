@@ -14,12 +14,6 @@ pub(crate) async fn latest_executor_execution_for_task(
 
     let mut latest = None;
     for task_id in task_ids {
-        if children
-            .iter()
-            .any(|child| child.id == task_id && child.status == "cancelled")
-        {
-            continue;
-        }
         let Some(candidate) = ExecutionRepo::latest_review_candidate_by_task_and_roles(
             db,
             &task_id,

@@ -1423,34 +1423,39 @@ async fn review_without_candidate_owner_actions_work_over_http() {
             }
             "cancel" => json!({"verb":"cancel"}),
             _ => {
-                json!({"verb":"approve","override":verb == "approve_override","reason":"Owner approval cannot replace missing validation"})
+                json!({"verb":"approve","override":verb == "approve_override","reason":"Owner decides the empty review"})
             }
         };
-        let approve = verb.starts_with("approve");
         let result: serde_json::Value = json_request(
             &harness.app,
             Method::POST,
             &uri,
             json!({"version":common::task_action_version(&harness.app,&uri).await,"action":action}),
-            if approve {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::OK
-            },
+            StatusCode::OK,
         )
         .await;
-        if approve {
-            assert_eq!(result["code"], "action_unavailable", "{result}");
-        } else {
-            assert_eq!(
-                result["status"],
-                if verb == "cancel" {
-                    "cancelled"
-                } else {
-                    "in_progress"
-                }
-            );
-        }
+        // The owner's Approve is a deliberate decision and keeps working: it
+        // passes the gate into merging and the park is gone.
+        assert_eq!(
+            result["status"],
+            match verb {
+                "cancel" => "cancelled",
+                "send_back" => "in_progress",
+                _ => "merging",
+            },
+            "{verb}: {result}"
+        );
+        let after = common::drain(&harness.state, &harness.app, &task_id).await;
+        assert!(
+            !after
+                .condition
+                .details()
+                .diagnostic
+                .as_ref()
+                .is_some_and(|annotation| annotation.blocking_reason == "review_candidate_missing"),
+            "{verb}: {:?}",
+            after.condition
+        );
     }
 }
 

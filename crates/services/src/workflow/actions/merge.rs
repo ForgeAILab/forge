@@ -30,11 +30,7 @@ impl HookAction for RunMerge {
             .empty_cancelled_root_has_no_commits(&current)
             .await
         {
-            Ok(true)
-                if unconfigured_review_source(ctx, &current)
-                    .await
-                    .unwrap_or(false) =>
-            {
+            Ok(true) if passed_review_gate(ctx) => {
                 if let Some(to) = ctx
                     .workflow
                     .outgoing_trigger_targets(&ctx.to_state)
@@ -54,8 +50,9 @@ impl HookAction for RunMerge {
                     };
                 }
             }
-            Ok(_) => {}
-            Err(error) => return failed(ctx, error),
+            // Anything else, an unreadable Workspace included, keeps the
+            // ordinary integration handling below.
+            Ok(_) | Err(_) => {}
         }
         let Some(merge_service) = ctx.merge_service.as_ref() else {
             return HookResult::Skipped {
@@ -237,38 +234,15 @@ impl HookAction for RunMerge {
     }
 }
 
-/// Only a gate configured to skip validation may finish an empty sequence.
-/// A direct move into merging cannot turn missing configured review into a pass.
-async fn unconfigured_review_source(ctx: &HookContext, task: &db::Task) -> Result<bool, String> {
-    let Some(state) = ctx.workflow.states.iter().find(|state| {
+/// The empty sequence finishes only when it arrives from its review gate:
+/// the gate skipped by configuration, or the owner decided it. A move into
+/// merging from any other state is not a pass of that gate.
+fn passed_review_gate(ctx: &HookContext) -> bool {
+    ctx.workflow.states.iter().any(|state| {
         state.name == ctx.from_state
             && state.kind == api_types::StateKind::Gate
             && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-    }) else {
-        return Ok(false);
-    };
-    let Some(role) = crate::workflow::effective_role(state) else {
-        return Ok(false);
-    };
-    if super::common::get_role_assignment(ctx, role)
-        .await?
-        .is_some_and(|assignment| assignment.assignee_id.is_some())
-        || state
-            .gate_config
-            .as_ref()
-            .is_some_and(|gate| gate.requires_user_approval())
-    {
-        return Ok(false);
-    }
-    let project = db::ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let config = crate::workflow::engine::effective_state_config(
-        state,
-        project.as_ref(),
-        task.task_state_config.as_deref(),
-    );
-    Ok(super::common::review_ci_steps(&config)?.is_empty())
+    })
 }
 
 /// Whether the running hooks step is one the old merge path left: it

@@ -578,13 +578,32 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if dependency_cancelled {
         return offers;
     }
-    // Nothing has been delivered for this review. An owner's advance is
-    // not validation, and a reviewer retry has no candidate to validate.
+    // Nothing was delivered for this review, so the reviewer has no
+    // candidate and a reviewer retry would park again. The decision is the
+    // owner's, exactly as before the park existed: approve the gate, send
+    // the Task back to add work, or cancel it (offered above).
     if task.status == "review"
+        && condition == Some(FailureKind::ReviewBlocked)
         && snapshot.annotation().is_some_and(|annotation| {
             annotation.blocking_reason == crate::task_service::MISSING_REVIEW_CANDIDATE
         })
     {
+        if target(WorkflowTrigger::Accept).is_some() {
+            offer(
+                TaskAction::Approve {
+                    reason: None,
+                    override_checks: Some(false),
+                },
+                &[],
+                &[Owner],
+                "gate_waiting_for_decision",
+                state
+                    .gate_config
+                    .as_ref()
+                    .and_then(|gate| gate.approve_label.as_deref())
+                    .unwrap_or("Approve"),
+            );
+        }
         if target(WorkflowTrigger::Reject).is_some() {
             offer(
                 TaskAction::SendBack {
@@ -600,6 +619,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Send Back to Add Work",
             );
         }
+        append_owner_advance(snapshot, &mut offers);
         return offers;
     }
     if condition_read.hard_failure {
@@ -1008,32 +1028,30 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         } else {
             vec![Owner]
         };
-        if task.status != "review" || implementation_candidate {
-            offer(
-                TaskAction::Approve {
-                    reason: None,
-                    override_checks: Some(false),
-                },
-                &[],
-                &authorities,
-                if task.status == "review"
-                    && snapshot
-                        .latest_review
-                        .as_ref()
-                        .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-                    && target(WorkflowTrigger::Accept).as_deref() == Some("merging")
-                {
-                    "human_review_decision"
-                } else {
-                    "gate_waiting_for_decision"
-                },
-                state
-                    .gate_config
+        offer(
+            TaskAction::Approve {
+                reason: None,
+                override_checks: Some(false),
+            },
+            &[],
+            &authorities,
+            if task.status == "review"
+                && snapshot
+                    .latest_review
                     .as_ref()
-                    .and_then(|gate| gate.approve_label.as_deref())
-                    .unwrap_or("Approve"),
-            );
-        }
+                    .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
+                && target(WorkflowTrigger::Accept).as_deref() == Some("merging")
+            {
+                "human_review_decision"
+            } else {
+                "gate_waiting_for_decision"
+            },
+            state
+                .gate_config
+                .as_ref()
+                .and_then(|gate| gate.approve_label.as_deref())
+                .unwrap_or("Approve"),
+        );
         if one_shot_allowed && !exhausted {
             offer(
                 retry(None, None, Some(true)),
@@ -1394,14 +1412,6 @@ fn lead_audience(caller: &ActionCaller, offers: &mut Vec<Offer>) {
 }
 
 fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
-    if snapshot.task.status == "review"
-        && !snapshot.executions.iter().any(|execution| {
-            execution.status == ExecutionStatus::Completed
-                && matches!(execution.role.as_str(), "executor" | "coder" | "worker")
-        })
-    {
-        return;
-    }
     if !snapshot.caller.owner || snapshot.advance_target.is_none() {
         return;
     }
@@ -1610,12 +1620,10 @@ pub async fn load_snapshot(
             }
         }
     }
-    let mut review_candidate_id = None;
     if task.status == "review" {
         if let Some(candidate) =
             crate::task_service::latest_executor_execution_for_task(db, &task).await?
         {
-            review_candidate_id = Some(candidate.id.clone());
             if !executions
                 .iter()
                 .any(|execution| execution.id == candidate.id)
@@ -1698,16 +1706,6 @@ pub async fn load_snapshot(
     .await?;
     let coordination_root =
         crate::task_hierarchy::coordination_root_has_subtasks(db, &task).await?;
-    if coordination_root && task.status == "review" {
-        // A historical Review can reference a cancelled child's delivery,
-        // or work from before this Task became a root. It is history, not
-        // current aggregate authority for approval or a manual pass.
-        executions.retain(|execution| {
-            execution.status != ExecutionStatus::Completed
-                || !matches!(execution.role.as_str(), "executor" | "coder" | "worker")
-                || review_candidate_id.as_deref() == Some(execution.id.as_str())
-        });
-    }
     let owner_disconnected = placement.as_ref().is_some_and(|placement| {
         placement.state == db::PlacementState::Disconnected
             || (placement.state == db::PlacementState::Failed
@@ -2385,15 +2383,6 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .requires_user_approval = Some(true);
-        assert!(!projected_actions(&snapshot)
-            .iter()
-            .any(|offer| offer.action.verb() == "approve"));
-        snapshot.executions.push(super::condition_matrix::exec(
-            "candidate",
-            "coder",
-            ExecutionStatus::Completed,
-            false,
-        ));
         assert!(projected_actions(&snapshot)
             .iter()
             .any(|offer| offer.reason == "gate_waiting_for_decision"));
@@ -2683,18 +2672,8 @@ mod condition_matrix {
         projected.task.condition =
             db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
         let actual = super::available_actions(&projected);
-        let mut expected =
+        let expected =
             super::legacy::available_actions(&super::legacy::TaskSnapshot::from(&projected));
-        // This intentional change removes only approval of undelivered work;
-        // every other field and offer still matches the recorded resolver.
-        if projected.task.status == "review"
-            && !projected.executions.iter().any(|execution| {
-                execution.status == ExecutionStatus::Completed
-                    && matches!(execution.role.as_str(), "executor" | "coder" | "worker")
-            })
-        {
-            expected.retain(|offer| offer.action.verb() != "approve");
-        }
         assert_eq!(
             serde_json::to_value(&actual).unwrap(),
             serde_json::to_value(expected).unwrap(),

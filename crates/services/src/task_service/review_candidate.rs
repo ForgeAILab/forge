@@ -122,16 +122,18 @@ impl TaskService {
         task: &Task,
         project: &Project,
     ) -> Result<Option<Execution>> {
-        let children = crate::task_hierarchy::children_if_root(&self.db, task).await?;
-        if !children.is_empty() && children.iter().all(|child| child.status == "cancelled") {
-            return Ok(None);
-        }
+        // An implementation run is the candidate wherever it was one
+        // before, including the run of a subtask that was cancelled after it
+        // delivered commits to the root's branch.
         if let Some(candidate) = latest_executor_execution_for_task(&self.db, task).await? {
             return Ok(Some(candidate));
         }
         // A coordination root reviews delivered children, never a fabricated
         // root implementation. Human child submissions use their own entry.
-        if !children.is_empty() {
+        if !crate::task_hierarchy::children_if_root(&self.db, task)
+            .await?
+            .is_empty()
+        {
             return Ok(None);
         }
         let Some(workspace) = WorkspaceRepo::get_by_task_id(
@@ -158,11 +160,28 @@ impl TaskService {
         else {
             return Ok(None);
         };
+        let target =
+            crate::merge_service::target_branch(&task.merge_config, &repo.default_branch)?;
+        // Commits the target already has, and merges of the target into the
+        // branch, are not a submission: only the branch's own commits are.
+        let own = io
+            .git_read(
+                &[
+                    "rev-list",
+                    "--count",
+                    "--no-merges",
+                    &format!("{target}..{}", head.trim()),
+                ],
+                true,
+            )
+            .await
+            .map_err(ServiceError::invalid_operation)?;
+        if own.is_some_and(|count| count.trim() == "0") {
+            return Ok(None);
+        }
         let base = match workspace.before_sha.as_deref() {
             Some(base) => base.to_owned(),
             None => {
-                let target =
-                    crate::merge_service::target_branch(&task.merge_config, &repo.default_branch)?;
                 let Some(base) = io
                     .git_read(&["merge-base", &target, &head], true)
                     .await
@@ -263,7 +282,14 @@ impl TaskService {
         }
         // Leave an unchanged park byte-for-byte. It has no Review verdict or
         // retry run: only adding work or cancellation can resolve it.
-        if task
+        if task.condition.reasons().any(|reason| {
+            matches!(
+                reason,
+                db::ParkReason::Failure {
+                    failure_kind: api_types::FailureKind::ReviewBlocked
+                }
+            )
+        }) && task
             .condition
             .read()
             .diagnostic

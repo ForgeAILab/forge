@@ -188,18 +188,6 @@ impl TaskService {
             }
             .into());
         }
-        // Persisted corruption remains a server error for review decisions,
-        // even when the candidate guard correctly withholds their offer.
-        if snapshot.task.status == "review"
-            && matches!(
-                &action,
-                TaskAction::Approve { .. } | TaskAction::SendBack { .. }
-            )
-        {
-            if let Some(review) = snapshot.latest_review.as_ref() {
-                super::strict_review_details(review)?;
-            }
-        }
         let offers = available_actions(&snapshot);
         let selected = offers.iter().find(|offer| {
             offer.action.verb() == action.verb()
@@ -277,6 +265,16 @@ impl TaskService {
             validate_required("reason", reason.unwrap_or_default())?;
         } else if let Some(reason) = reason {
             validate_required("reason", reason)?;
+        }
+        if snapshot.task.status == "review"
+            && matches!(
+                action,
+                TaskAction::Approve { .. } | TaskAction::SendBack { .. }
+            )
+        {
+            if let Some(review) = snapshot.latest_review.as_ref() {
+                super::strict_review_details(review)?;
+            }
         }
         let actor = match actor {
             Actor::User {
@@ -1103,7 +1101,7 @@ impl TaskService {
             .find(|(candidate, _)| *candidate == trigger)
             .map(|(_, target)| target)
             .expect("offer guarantees a workflow target");
-        Ok(self
+        let moved = self
             .transition(
                 task.id.clone(),
                 target,
@@ -1130,7 +1128,21 @@ impl TaskService {
                 },
             )
             .await?
-            .task)
+            .task;
+        // The owner decided a review that had nothing to review. That park
+        // ends with the decision: left on the Task it would be read as the
+        // state of a later, ordinary review.
+        if task
+            .condition
+            .read()
+            .diagnostic
+            .as_ref()
+            .is_some_and(|annotation| annotation.blocking_reason == super::MISSING_REVIEW_CANDIDATE)
+        {
+            return super::transition::clear_manual_advance_error_annotation(&self.db, task, moved)
+                .await;
+        }
+        Ok(moved)
     }
 
     pub(crate) async fn apply_review_check_retry(

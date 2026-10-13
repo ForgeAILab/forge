@@ -48,11 +48,14 @@ async fn assert_missing_candidate(lead: &root_lead::Lead, id: &str) {
         "{actions:?}"
     );
     assert!(actions.iter().any(|offer| offer.action.verb() == "cancel"));
+    // The owner's Approve stays: it is their decision, as before the park.
     assert!(
-        !actions
-            .iter()
-            .any(|offer| matches!(offer.action.verb(), "approve" | "retry")),
+        actions.iter().any(|offer| offer.action.verb() == "approve"),
         "{actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|offer| offer.action.verb() == "retry"),
+        "a reviewer retry has no candidate: {actions:?}"
     );
     let service = crate::AttentionService::new(lead.db.clone());
     service.project_once(1000).await.unwrap();
@@ -103,12 +106,26 @@ async fn all_cancelled_root_without_a_lead_parks_and_owner_actions_work() {
             .perform_task_action_as(&root.id, command, task.version, owner())
             .await;
         if action == "approve" {
-            assert!(result.is_err(), "missing validation cannot be approved");
-            assert_eq!(reload(&lead.db, &root.id).await, task);
+            // The owner decided the empty review. Nothing was delivered, so
+            // nothing is merged and the root finishes.
+            result.unwrap();
+            passes(&lead, 4).await;
+            let current = reload(&lead.db, &root.id).await;
+            assert_eq!(current.status, "done", "{:?}", current.condition);
+            assert!(executions(&lead.db, &root.id).await.is_empty());
         } else {
             result.unwrap();
             passes(&lead, 4).await;
             let current = reload(&lead.db, &root.id).await;
+            assert!(
+                action == "cancel"
+                    || current.condition.read().diagnostic.as_ref().is_none_or(
+                        |annotation| annotation.blocking_reason
+                            != crate::task_service::MISSING_REVIEW_CANDIDATE
+                    ),
+                "the park ends with the owner's decision: {:?}",
+                current.condition
+            );
             assert_eq!(
                 current.status,
                 if action == "cancel" {
@@ -214,118 +231,6 @@ async fn all_cancelled_unconfigured_root_finishes_without_a_merge() {
         .await
         .iter()
         .any(|(from, to, _)| from == "review" && to == "merging"));
-}
-
-#[tokio::test]
-async fn an_old_failed_review_cannot_pay_for_new_empty_entries_or_supply_a_cancelled_candidate() {
-    let lead = root_lead::lead_fixture(true).await;
-    let root = seed_task(
-        &lead.db,
-        &lead.project,
-        "cancelled after old review",
-        "in_progress",
-        0,
-    )
-    .await;
-    let child = seed_subtask(&lead.db, &root, "cancelled", "cancelled", 0).await;
-    let candidate = seed_completed_coder_execution(&lead.db, &child.id).await;
-    let now = now_rfc3339();
-    ReviewRepo::create(
-        &*lead.db,
-        db::CreateReview {
-            id: new_uuid_v4(),
-            task_id: root.id.clone(),
-            execution_id: candidate,
-            attempt_number: 1,
-            status: ReviewStatus::Failed,
-            step_results_json: serde_json::json!({"ci_steps":[]}).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .unwrap();
-    assign_role(&lead.db, &root.id, "planner", &lead.planner).await;
-    assign_role(&lead.db, &root.id, "reviewer", &lead.coder).await;
-    until(
-        &lead,
-        "empty entries spend the re-plan budget despite an older failed review",
-        async || {
-            reload(&lead.db, &root.id)
-                .await
-                .condition
-                .reasons()
-                .any(|reason| {
-                    matches!(
-                        reason,
-                        db::ParkReason::BudgetExhausted {
-                            budget_kind: Some(db::budget::Kind::Replan),
-                            ..
-                        }
-                    )
-                })
-        },
-    )
-    .await;
-    assert_eq!(
-        db::budget::spent(lead.db.pool(), &root.id, "replan")
-            .await
-            .unwrap(),
-        i64::from(db::budget::Kind::Replan.default_limit())
-    );
-    assert_eq!(
-        ReviewRepo::list_by_task(&*lead.db, &root.id)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    let actions = offers(&lead, &root.id).await;
-    assert!(
-        !actions.iter().any(|offer| offer.action.verb() == "approve"),
-        "a cancelled child is no current candidate: {actions:?}"
-    );
-    assert!(actions
-        .iter()
-        .any(|offer| offer.action.verb() == "send_back"));
-    let counts = write_counts(&lead.db).await;
-    passes(&lead, 20).await;
-    assert_eq!(write_counts(&lead.db).await, counts);
-}
-
-#[tokio::test]
-async fn a_direct_move_to_merging_cannot_pass_a_missing_configured_review() {
-    let lead = root_lead::lead_fixture(false).await;
-    let root = seed_task(
-        &lead.db,
-        &lead.project,
-        "configured empty root",
-        "review",
-        0,
-    )
-    .await;
-    seed_subtask(&lead.db, &root, "cancelled", "cancelled", 0).await;
-    assign_role(&lead.db, &root.id, "reviewer", &lead.coder).await;
-    let root = reload(&lead.db, &root.id).await;
-    let _ = lead
-        .dispatcher
-        .task_service
-        .transition(
-            root.id.clone(),
-            "merging".into(),
-            crate::task_service::TransitionOptions {
-                triggered_by: owner(),
-                ..root.version.into()
-            },
-        )
-        .await;
-    passes(&lead, 4).await;
-    assert_ne!(reload(&lead.db, &root.id).await.status, "done");
-    assert!(ReviewRepo::list_by_task(&*lead.db, &root.id)
-        .await
-        .unwrap()
-        .is_empty());
 }
 
 #[tokio::test]
@@ -472,4 +377,94 @@ async fn human_branch_commits_are_reviewed_without_an_agent_implementation_run()
     assert_eq!(candidate.before_sha.as_deref(), Some(base.as_str()));
     assert_eq!(candidate.after_sha.as_deref(), Some(head.as_str()));
     assert!(candidate.summary.unwrap().contains("human"));
+}
+
+/// A branch that only merged its target has no commits of its own: it is not
+/// a human submission, and the review parks for the owner.
+#[tokio::test]
+async fn a_branch_with_only_merges_of_its_target_is_no_candidate() {
+    let db = Arc::new(sqlite_db().await);
+    let (repo, ws) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (project, repo_id) = seed_project_repo(&db, repo.path()).await;
+    let agent = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project, "merged target only", "in_progress", 0).await;
+    assign_role(&db, &task.id, "reviewer", &agent).await;
+    let base = run_git(repo.path(), &["rev-parse", "HEAD"]);
+    let target = run_git(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let branch = workspace::task_branch_name(&task.id);
+    let path = ws.path().join(&task.id).join("forge");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    git::create_worktree(repo.path(), &branch, &path)
+        .await
+        .unwrap();
+    std::fs::write(repo.path().join("target.txt"), "target moved\n").unwrap();
+    run_git(repo.path(), &["add", "-A"]);
+    run_git(repo.path(), &["commit", "-m", "target moved"]);
+    run_git(&path, &["merge", "--no-ff", "-m", "merge target", &target]);
+    assert_ne!(run_git(&path, &["rev-parse", "HEAD"]), base);
+    let now = now_rfc3339();
+    WorkspaceRepo::create(
+        &*db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id,
+            worktree_path: path.to_string_lossy().into_owned(),
+            branch,
+            status: WorkspaceStatus::Ready,
+            before_sha: Some(base),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), ws.path()).await;
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    dispatcher
+        .task_service
+        .transition(
+            task.id.clone(),
+            "review".to_owned(),
+            crate::task_service::TransitionOptions {
+                version: task.version,
+                triggered_by: owner(),
+                ..task.version.into()
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        dispatcher.check_once_and_drain().await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "no reviewer runs without a candidate"
+    );
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status, "review");
+    assert!(
+        task.condition
+            .read()
+            .diagnostic
+            .as_ref()
+            .is_some_and(|annotation| annotation.blocking_reason
+                == crate::task_service::MISSING_REVIEW_CANDIDATE),
+        "{:?}",
+        task.condition
+    );
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs, 0, "no delivery evidence is recorded");
 }

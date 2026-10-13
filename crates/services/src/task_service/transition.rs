@@ -1112,7 +1112,7 @@ pub(crate) fn next_workflow_state(
         })
 }
 
-async fn clear_manual_advance_error_annotation(
+pub(super) async fn clear_manual_advance_error_annotation(
     db: &SqliteDb,
     source_task: &Task,
     advanced_task: Task,

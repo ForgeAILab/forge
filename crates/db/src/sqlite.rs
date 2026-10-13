@@ -775,7 +775,6 @@ async fn latest_review_candidate_in_tx(
              JOIN task candidate_task ON candidate_task.id = e.task_id
              WHERE candidate_task.parent_task_id = ?
                AND candidate_task.deleted_at IS NULL
-               AND candidate_task.status <> 'cancelled'
                AND e.status IN ('completed', 'running')
                AND e.role IN ('executor', 'coder', 'worker')
              ORDER BY e.created_at DESC, e.id DESC

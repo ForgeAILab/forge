@@ -45,16 +45,19 @@ pub(super) async fn prepare_review_entry(
     {
         return Ok(None);
     }
-    let assigned = match effective_role(state) {
+    // Only an Agent reviewer is refused dispatch for want of a candidate.
+    // A human reviewer, an owner-approval gate and a check-only gate keep
+    // the decisions and checks they always had.
+    let agent_reviewer = match effective_role(state) {
         Some(role) => get_role_assignment(ctx, role)
             .await?
-            .is_some_and(|assignment| assignment.assignee_id.is_some()),
+            .is_some_and(|assignment| {
+                assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            }),
         None => false,
     };
-    if !assigned
-        && review_ci_steps(&ctx.state_config)?.is_empty()
-        && !gate_requires_user_approval(ctx)
-    {
+    if !agent_reviewer || task.review_passed_at.is_some() {
         return Ok(None);
     }
     let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
