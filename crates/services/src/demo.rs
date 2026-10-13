@@ -232,6 +232,14 @@ async fn find_or_create_null_agent(db: &SqliteDb, now: &str) -> Result<String> {
 }
 
 async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
+    // The first user to register takes over every ownerless daemon, this one
+    // included. A later `--demo` start must register it as that owner's, or
+    // the repository refuses the upsert as another user's machine.
+    let existing = DaemonRepo::get_by_machine_id(db, "demo").await?;
+    let (owner_id, visibility) = existing.map_or_else(
+        || (None, "global".to_owned()),
+        |daemon| (daemon.owner_id, daemon.visibility),
+    );
     let daemon = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
@@ -244,8 +252,8 @@ async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
             labels_json: r#"{"demo":"true"}"#.to_owned(),
             status: DaemonStatus::Online,
             registration_token_hash: None,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            owner_id,
+            visibility,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
         },
@@ -402,6 +410,70 @@ mod tests {
             .expect("task count succeeds");
 
         assert_eq!(task_count, DEMO_TASKS.len() as i64);
+    }
+
+    /// What a second `forge --demo` start sees once somebody has registered:
+    /// the first user owns every seeded row.
+    #[tokio::test]
+    async fn test_install_demo_data_idempotent_after_first_user_registers() {
+        let db = std::sync::Arc::new(test_db().await);
+        install_demo_data(&db)
+            .await
+            .expect("first install succeeds");
+
+        let auth = crate::auth_service::AuthService::new(
+            std::sync::Arc::clone(&db),
+            b"test-secret".to_vec(),
+            4,
+        );
+        let user = auth
+            .register("first@example.com", "password123", None)
+            .await
+            .expect("first user registers");
+
+        async fn snapshot(db: &SqliteDb) -> Vec<(String, i64, Option<String>)> {
+            let mut rows = Vec::new();
+            for table in ["project", "repo", "agent_identity", "daemon", "task"] {
+                let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("count succeeds");
+                let owner: Option<String> = match table {
+                    "project" | "agent_identity" | "daemon" => {
+                        sqlx::query_scalar(&format!("SELECT MIN(owner_id) FROM {table}"))
+                            .fetch_one(db.pool())
+                            .await
+                            .expect("owner read succeeds")
+                    }
+                    _ => None,
+                };
+                rows.push((table.to_owned(), count, owner));
+            }
+            rows
+        }
+
+        let before = snapshot(&db).await;
+        for (table, _count, owner) in &before {
+            if matches!(table.as_str(), "project" | "agent_identity" | "daemon") {
+                assert_eq!(
+                    owner.as_deref(),
+                    Some(user.id.as_str()),
+                    "the first user owns the seeded {table}"
+                );
+            }
+        }
+
+        install_demo_data(&db)
+            .await
+            .expect("install after the first registration succeeds");
+
+        assert_eq!(snapshot(&db).await, before);
+        let daemon = DaemonRepo::get_by_machine_id(&*db, "demo")
+            .await
+            .expect("daemon read succeeds")
+            .expect("demo daemon exists");
+        assert_eq!(daemon.owner_id.as_deref(), Some(user.id.as_str()));
+        assert_eq!(daemon.visibility, "account");
     }
 
     #[tokio::test]
