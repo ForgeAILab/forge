@@ -998,6 +998,8 @@ export interface Comment {
   author_id?: string | null
   author_name: string
   content: string
+  /** CommentResponse.kind in crates/api-types/src/repo_review.rs; absent on ordinary comments. */
+  kind?: string | null
   created_at: string
   updated_at: string
 }

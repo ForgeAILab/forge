@@ -57,6 +57,28 @@ pub(super) async fn lead_fixture(planner_completes: bool) -> Lead {
 }
 
 pub(super) async fn fixture(planner_completes: bool, fail_planner: bool) -> Lead {
+    fixture_with(|db, tx| {
+        if planner_completes || fail_planner {
+            Arc::new(LeadExecutor {
+                db,
+                sender: tx,
+                fail_planner,
+            })
+        } else {
+            Arc::new(RecordingExecutor { sender: tx })
+        }
+    })
+    .await
+}
+
+/// The fixture with an executor the caller builds (stage 4 scripts what the
+/// lead's run does).
+pub(super) async fn fixture_with(
+    executor: impl FnOnce(
+        Arc<db::SqliteDb>,
+        mpsc::UnboundedSender<ExecutionContext>,
+    ) -> Arc<dyn TaskExecutor>,
+) -> Lead {
     let db = Arc::new(sqlite_db().await);
     let (repo, workspace) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (project, _) = seed_project_repo(&db, repo.path()).await;
@@ -64,15 +86,7 @@ pub(super) async fn fixture(planner_completes: bool, fail_planner: bool) -> Lead
     let planner = crate::test_support::seed_native_agent(&db).await;
     let event_bus = Arc::new(EventBus::new(64));
     let (tx, rx) = mpsc::unbounded_channel();
-    let task_executor: Arc<dyn TaskExecutor> = if planner_completes || fail_planner {
-        Arc::new(LeadExecutor {
-            db: Arc::clone(&db),
-            sender: tx,
-            fail_planner,
-        })
-    } else {
-        Arc::new(RecordingExecutor { sender: tx })
-    };
+    let task_executor = executor(Arc::clone(&db), tx);
     let task_service = Arc::new(
         TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
             .with_task_executor(task_executor)

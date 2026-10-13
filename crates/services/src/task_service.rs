@@ -76,6 +76,7 @@ pub(crate) use update::state_retired_auditor_notices;
 pub(crate) use update::RETIRED_AUDITOR_CONFIG;
 mod roles;
 pub(crate) use roles::RoleSweepEvent;
+pub(crate) mod lead;
 pub(crate) mod replan;
 mod subtask;
 mod transition;
@@ -91,6 +92,7 @@ pub use adaptive::{
 pub(crate) use common::latest_executor_execution_for_task;
 pub use create_subtasks::NewSubtaskInput;
 pub use dependencies::TaskDependencyAction;
+pub use lead::LeadRun;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };

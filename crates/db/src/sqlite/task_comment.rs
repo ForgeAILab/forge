@@ -104,4 +104,69 @@ impl SqliteDb {
             .map_err(Into::into)
             .and_then(map_task_comment)
     }
+
+    /// Put the wait of a lead's question on its root, inside the transaction
+    /// that writes the question and its Attention item: all three exist or
+    /// none does. `Ok(false)`: the root already waits for a person on another
+    /// question (or another human boundary) and nothing was written; the
+    /// caller drops the transaction. `Ok(true)`: the root waits on
+    /// `comment_id` (now, or already: a retry of the same question).
+    pub async fn open_lead_input_wait_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        root_id: &str,
+        comment_id: &str,
+        execution_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT metadata_json FROM task WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(root_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let mut metadata = crate::TaskMetadata::parse(raw.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        if metadata.extra.get("awaiting_human") == Some(&serde_json::Value::Bool(true)) {
+            return Ok(metadata
+                .extra
+                .get("awaiting_human_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some(crate::LEAD_INPUT_WAIT)
+                && metadata
+                    .extra
+                    .get("awaiting_human_marker_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(comment_id));
+        }
+        for (key, value) in [
+            ("awaiting_human", serde_json::Value::Bool(true)),
+            ("awaiting_human_reason", crate::LEAD_INPUT_WAIT.into()),
+            ("awaiting_human_marker_id", comment_id.into()),
+            ("lead_input_execution_id", execution_id.into()),
+        ] {
+            metadata.extra.insert(key.to_owned(), value);
+        }
+        let metadata_json = metadata.to_json();
+        let condition = crate::task_condition::metadata_condition(
+            transaction,
+            root_id,
+            metadata_json.as_deref(),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE task
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(metadata_json.as_deref())
+        .bind(condition.is_some())
+        .bind(condition)
+        .bind(now)
+        .bind(root_id)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(true)
+    }
 }

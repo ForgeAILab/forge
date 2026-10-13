@@ -1,6 +1,7 @@
 use api_types::{
     AgentDetailResponse, AttentionItem, AttentionListResponse, AttentionMutationRequest,
-    AttentionSnoozeRequest, MissionControlHomeResponse, MissionControlQuery,
+    AttentionResolveRequest, AttentionSnoozeRequest, MissionControlHomeResponse,
+    MissionControlQuery,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -106,12 +107,17 @@ pub async fn resolve(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(id): Path<String>,
-    Json(body): Json<AttentionMutationRequest>,
+    Json(body): Json<AttentionResolveRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
     let service = AttentionService::new(state.db);
     Ok(Json(attention_service::attention_item(
         service
-            .resolve(&user.user_id, &id, body.expected_version)
+            .resolve_with_answer(
+                &user.user_id,
+                &id,
+                body.expected_version,
+                body.answer.as_deref(),
+            )
             .await?,
     )?))
 }

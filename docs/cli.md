@@ -272,6 +272,24 @@ review`, `merge check failed`, `merge stopped: <cause>` or `merged; closing
 the Task`. `wait` adds the server's message and, when Forge retries by itself,
 the time of the next try.
 
+A root Task with subtasks is a coordination root. Its `planner` assignment is
+the lead (a native Agent), and its `coder` assignment is the default worker
+inherited by subtasks without their own worker. The lead plans at kickoff and
+after a re-plan; it never becomes the worker by inheritance. Assign the lead
+on the root, not on a subtask. `task show --output json` includes
+`effective_lead` with `source: own` or `inherited_from_root`.
+
+Subtasks pass through `lead_check` (displayed as “Lead Check”) between
+`in_progress` and `done`. The root's lead checks the step: a pass finishes it,
+a failure returns it to the worker. Without a lead the gate is skipped
+automatically. The next subtask starts after the preceding step is accepted;
+the root still needs aggregate review before it is done.
+
+A root waiting on `human_decision { boundary: lead_input }` needs the owner's
+answer. Mission Control shows the question and its Resolve answer box; the web
+Task detail links to it. This is separate from plan approval. Resolving its
+Attention item requires `expected_version` and `answer` (1–4000 characters).
+
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
 to preview the prompt for a transition target instead of the task's current
 state.
@@ -872,6 +890,14 @@ accepts `--compiler-cache-wrapper`, `--compiler-cache-max-bytes` and
 `forge-ctl task actions <id>` prints current offers and version. `forge-ctl task action <id> <verb> [--version N] [flags]` applies one; without `--version` it reads the current version first. Verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`.
 
 Retry flags are `--fresh-session [true|false]`, `--refresh-workspace [true|false]`, `--reset-budget [true|false]`, `--guidance TEXT`, and `--reason TEXT`. Send-back requires nonblank `--guidance TEXT`. Approval uses `--override [true|false]`; when omitted, the server uses the matching offer's value, which can be true (an override), so check `task actions` first. An override requires `--reason TEXT`. Hold, release, restart and cancel accept `--reason TEXT`. One-shot retry (`--reset-budget false`) also requires a reason. Bare boolean flags mean true. Flags belonging to another verb are rejected locally. Offers define any further required reason and allowed values. `task cancel` is removed; use `task action <id> cancel`.
+
+Root budgets include `replan` (5 re-plans per budget window for roots with a
+lead); subtask budgets include `lead_check` (2 returned steps by default,
+stored as `gate:lead_check`). `--reset-budget true` opens a new budget window
+for the Task, including `replan` on a root or `lead_check` on a subtask. It
+does not select an individual budget kind. The lead's operation ledger rows
+(`lead_subtasks`, `lead_subtasks_run:<execution>`, `lead_recover:<subtask>`)
+are not projected in `budgets`; only resetting the root's window resets them.
 
 `--output json` prints the offer/version object or the resulting Task. An HTTP 409 `action_unavailable` prints the current available actions (the structured error object in JSON mode) and exits with code **3**; other failures use the normal nonzero error exit. A stale version remains a version conflict. There is no `execution` command group in forge-ctl; individual execution stop is available through `POST /api/v1/executions/{id}/stop` and the web Stop control.
 

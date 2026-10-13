@@ -61,6 +61,17 @@ fn advertised_proposal_line(
         }
         return spec.contract_line();
     }
+    if operation_registry::task_lead::IDS.contains(&spec.id) {
+        return format!(
+            "{}: {}; {} {}",
+            spec.id,
+            schema_signature(&spec.input.schema, 0),
+            spec.summary,
+            spec.guidance
+        )
+        .trim_end()
+        .to_owned();
+    }
     if operation_registry::task_proposals::IDS.contains(&spec.id) {
         return format!(
             "{}: {}; {} Payload <=65536 serialized UTF-8 bytes.",
@@ -382,6 +393,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
     for operation in operations {
         if !operation_registry::task_records::IDS.contains(&operation.as_str())
             && !operation_registry::task_proposals::IDS.contains(&operation.as_str())
+            && !operation_registry::task_lead::IDS.contains(&operation.as_str())
         {
             continue;
         }

@@ -13,7 +13,23 @@ pub struct ActionCaller {
     pub assigned_agent: bool,
     pub project_agent: bool,
     pub reviewer: bool,
+    /// The caller is the lead of this subtask's coordination root and
+    /// `lead_verbs` is not empty. It then sees the offers the Project Agent
+    /// sees on this subtask, limited to those verbs.
+    pub lead: bool,
+    /// What the lead of this subtask's root may do to it now, whoever asks
+    /// (`task_hierarchy::lead_verbs`): recover it while it is parked on
+    /// something the lead decides, cancel it while it has not started. The
+    /// offers of these verbs name the lead in their audience. Empty for
+    /// every Task that is not a subtask of a root with a lead.
+    pub lead_verbs: Vec<&'static str>,
 }
+
+/// The recovery actions a lead may apply to a subtask of its root that is
+/// parked on something the lead decides.
+pub const LEAD_RECOVERY_VERBS: [&str; 3] = ["retry", "restart", "cancel"];
+/// What a lead may do to a subtask that has not started.
+pub const LEAD_UNSTARTED_VERBS: [&str; 1] = ["cancel"];
 
 impl ActionCaller {
     pub fn owner() -> Self {
@@ -26,8 +42,9 @@ impl ActionCaller {
         authorities.iter().any(|authority| match authority {
             ActionAuthority::Owner => self.owner,
             ActionAuthority::AssignedAgent => self.assigned_agent,
-            ActionAuthority::ProjectAgent => self.project_agent,
+            ActionAuthority::ProjectAgent => self.project_agent || self.lead,
             ActionAuthority::Reviewer => self.reviewer,
+            ActionAuthority::Lead => self.lead,
         })
     }
 }
@@ -134,6 +151,12 @@ pub fn integration_retry_offered(task: &Task, attempt_id: &str) -> bool {
 }
 
 pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
+    let mut offers = derive_offers(snapshot);
+    lead_audience(&snapshot.caller, &mut offers);
+    offers
+}
+
+fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
     use ActionAuthority::{Owner, ProjectAgent};
     let task = &snapshot.task;
     let condition_read = task.condition.read();
@@ -1302,6 +1325,26 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     offers
 }
 
+/// The lead's part of a subtask's offers: the verbs the lead may apply now
+/// (`ActionCaller::lead_verbs`) name the lead wherever the Project Agent is
+/// offered them, and a caller that is only the lead is offered nothing else.
+fn lead_audience(caller: &ActionCaller, offers: &mut Vec<Offer>) {
+    if caller.lead_verbs.is_empty() {
+        return;
+    }
+    for offer in offers.iter_mut() {
+        if caller.lead_verbs.contains(&offer.action.verb())
+            && offer.authority.contains(&ActionAuthority::ProjectAgent)
+            && !offer.authority.contains(&ActionAuthority::Lead)
+        {
+            offer.authority.push(ActionAuthority::Lead);
+        }
+    }
+    if caller.lead && !caller.owner && !caller.project_agent {
+        offers.retain(|offer| offer.authority.contains(&ActionAuthority::Lead));
+    }
+}
+
 fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
     if !snapshot.caller.owner || snapshot.advance_target.is_none() {
         return;
@@ -1415,6 +1458,8 @@ pub fn caller_for(
                 assignment.role_name == "reviewer"
                     && assignment.assignee_id.as_ref() == Some(agent_id)
             }),
+            lead: false,
+            lead_verbs: Vec::new(),
         },
         Actor::System { .. } => ActionCaller::default(),
     }
@@ -1460,7 +1505,14 @@ pub async fn load_snapshot(
         .await?
         .filter(|binding| binding.state == "active")
         .and_then(|binding| binding.identity_id);
-    let caller = caller_for(actor, project_agent.as_deref(), &assignments);
+    let mut caller = caller_for(actor, project_agent.as_deref(), &assignments);
+    // What the lead of this subtask's root may do to it now: those offers
+    // name the lead, and the lead itself is offered them.
+    if let Some((lead, verbs)) = crate::task_hierarchy::lead_verbs(db, &task).await? {
+        caller.lead = !verbs.is_empty()
+            && matches!(actor, Actor::Agent { agent_id, .. } if *agent_id == lead);
+        caller.lead_verbs = verbs;
+    }
     let role = workflow
         .states
         .iter()

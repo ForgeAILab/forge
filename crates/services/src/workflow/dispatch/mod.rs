@@ -519,6 +519,35 @@ pub fn build_effective_prompt(
     (prompt, selection)
 }
 
+/// Whether a comment is a hand-off note of the root's lead.
+pub(crate) fn is_handoff_note(comment: &db::TaskComment) -> bool {
+    comment.worklog_kind.as_deref() == Some(db::COMMENT_KIND_HANDOFF)
+}
+
+/// The lead's hand-off notes for this Task, for the top of an implementation
+/// prompt: the newest few, oldest first, each attributed to the lead. They
+/// are left out of the ordinary comment list below them.
+pub(crate) fn handoff_notes_section(ctx: &AgentDispatchContext) -> Option<String> {
+    let notes = ctx
+        .comments
+        .iter()
+        .filter(|comment| is_handoff_note(comment))
+        .collect::<Vec<_>>();
+    if notes.is_empty() {
+        return None;
+    }
+    let keep = crate::task_service::lead::HANDOFF_NOTES_IN_PROMPT;
+    let mut section = String::from(
+        "\nHand-off notes from the lead of this feature (read these first; the lead planned this step and checks it when you finish):\n",
+    );
+    for note in &notes[notes.len().saturating_sub(keep)..] {
+        section.push_str("- lead: ");
+        section.push_str(&note.content);
+        section.push('\n');
+    }
+    Some(section)
+}
+
 pub(crate) fn default_tool_names(role: &str) -> Vec<String> {
     match role {
         default_roles::CODER | default_roles::WORKER => vec![

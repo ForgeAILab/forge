@@ -247,6 +247,7 @@ impl ForgeToolProvider for AuthorityBoundProvider {
             self.check(actor, scope, operation, true).await?;
             if operation_registry::task_records::IDS.contains(&operation)
                 || operation_registry::task_proposals::IDS.contains(&operation)
+                || operation_registry::task_lead::IDS.contains(&operation)
             {
                 return Ok(());
             }

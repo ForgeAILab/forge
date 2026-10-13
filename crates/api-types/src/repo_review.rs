@@ -411,6 +411,11 @@ pub struct CommentResponse {
     pub author_id: Option<String>,
     pub author_name: String,
     pub content: String,
+    /// What kind of entry an Agent run wrote: a worklog kind (`progress`,
+    /// `decision`, `validation`, `blocker`), or a lead's `handoff` note or
+    /// `request_input` question. Absent on ordinary comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

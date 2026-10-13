@@ -393,6 +393,25 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         if f.dependency_wait {
             return condition_park(s.condition);
         }
+        // Behind a root whose lead is planning, the accepted action waits
+        // like the subtask itself: replaying it would only be refused by the
+        // order check and park the subtask again. The root's return to its
+        // implementation state marks its subtasks, and the action runs then.
+        // (The lead's own `lead.recover` is such an action.)
+        if let Some((parent_id, cause)) = f
+            .parent_wait
+            .as_ref()
+            .filter(|(_, cause)| cause == "planning")
+        {
+            return park(
+                Reason::ParentWait {
+                    parent_id: parent_id.clone(),
+                    cause: cause.clone(),
+                },
+                Owner::Worker,
+                Action::WaitForOwner,
+            );
+        }
         return Next::Step(Step::QueuedRecovery);
     }
     if f.integrate && !f.blocking {

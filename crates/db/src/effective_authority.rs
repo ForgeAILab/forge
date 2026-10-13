@@ -206,6 +206,7 @@ async fn load(
             });
         }
         let role = caller.role;
+        let lead_root_id = caller.lead_root_id;
         let execution = caller.execution;
         // Preserve the optional Project-binding ceiling a Task session held
         // before Task authority joined this resolver.
@@ -219,6 +220,7 @@ async fn load(
             execution_id: execution.map(|execution| execution.id).unwrap_or_default(),
             role: role.unwrap_or(TaskRole::Reviewer),
             runtime_session_id: runtime_session_id.map(str::to_owned),
+            lead_root_id,
         }
     } else if let Some(project_id) = project_id {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE id = ?")
@@ -303,6 +305,8 @@ struct TaskCaller {
     admitted: bool,
     /// Present only when exactly one does.
     execution: Option<TaskRecordExecution>,
+    /// The coordination root that one execution leads, if it leads one.
+    lead_root_id: Option<String>,
 }
 /// One lookup for Task session admission and Task record provenance. The
 /// execution's recorded session id is deliberately not compared: a resumed
@@ -379,7 +383,12 @@ async fn task_caller(
     } else {
         None
     };
+    let lead_root_id = match &execution {
+        Some(execution) => lead_root(connection, task_id, identity_id, &execution.role).await?,
+        None => None,
+    };
     Ok(TaskCaller {
+        lead_root_id,
         session: session
             .map(|session| -> Result<TaskSession> {
                 Ok(TaskSession {
@@ -392,6 +401,39 @@ async fn task_caller(
         admitted,
         execution,
     })
+}
+
+/// The coordination root a running execution of `role` on `task_id` leads:
+/// `task_id` itself, when it is a root that has subtasks and whose own row of
+/// the lead's role (`inherited_subtask::STEP_CHECK_ROLE`) names this
+/// identity. A step check (the same Agent and role on a subtask resting in
+/// the step-check state) leads nothing: it returns a verdict and has no
+/// operation that changes the breakdown. Execution admission already decided
+/// that the run may exist (the planning state, the lead assigned); this reads
+/// who holds the role now, so a removed or replaced lead leads nothing from
+/// its next call on. The services repeat the workflow's side of the rule at
+/// the command boundary.
+async fn lead_root(
+    connection: &mut SqliteConnection,
+    task_id: &str,
+    identity_id: &str,
+    role: &str,
+) -> Result<Option<String>> {
+    if role != crate::inherited_subtask::STEP_CHECK_ROLE {
+        return Ok(None);
+    }
+    let leads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task t JOIN task_role_assignment a ON a.task_id = t.id
+         WHERE t.id = ? AND t.parent_task_id IS NULL AND t.deleted_at IS NULL
+           AND a.role_name = ? AND a.assignee_type = 'agent' AND a.assignee_id = ?
+           AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = t.id AND c.deleted_at IS NULL)",
+    )
+    .bind(task_id)
+    .bind(role)
+    .bind(identity_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok((leads > 0).then(|| task_id.to_owned()))
 }
 
 #[cfg(test)]

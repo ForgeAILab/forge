@@ -10,6 +10,7 @@ import {
   listContextManifests,
   listPricingCatalogModels,
   refreshPricingCatalog,
+  resolveAttentionItem,
   updateAgentPricing,
   updateCliRuntimePricing,
   updateProviderPricing,
@@ -18,6 +19,32 @@ import {
 const { apiFetch } = vi.hoisted(() => ({ apiFetch: vi.fn() }))
 
 vi.mock('@/api/client', () => ({ apiFetch }))
+
+describe('Attention resolve API', () => {
+  afterEach(() => apiFetch.mockReset())
+  it('posts the generated resolve fields for an answer, encoding the item ID', async () => {
+    apiFetch.mockResolvedValueOnce({ id: 'question/1' })
+    await resolveAttentionItem('question/1', 7, 'Use parser A')
+    expect(apiFetch).toHaveBeenCalledExactlyOnceWith(
+      '/mission-control/attention/question%2F1/resolve',
+      {
+        method: 'POST',
+        body: JSON.stringify({ expected_version: 7, answer: 'Use parser A' }),
+      },
+    )
+  })
+  it('omits answer when resolving an ordinary Attention item', async () => {
+    apiFetch.mockResolvedValueOnce({ id: 'ordinary' })
+    await resolveAttentionItem('ordinary', 2)
+    expect(apiFetch).toHaveBeenCalledExactlyOnceWith(
+      '/mission-control/attention/ordinary/resolve',
+      {
+        method: 'POST',
+        body: JSON.stringify({ expected_version: 2 }),
+      },
+    )
+  })
+})
 
 describe('context-manifest API adapter', () => {
   afterEach(() => {

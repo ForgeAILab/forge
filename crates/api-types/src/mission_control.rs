@@ -97,6 +97,18 @@ pub struct AttentionMutationRequest {
     pub expected_version: i64,
 }
 
+/// Resolve an Attention item. `answer` is the owner's reply to an item that
+/// asks a question (`recommended_action: answer_lead_input`): it is required
+/// there, at most 4000 characters, and refused on any other item.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct AttentionResolveRequest {
+    pub expected_version: i64,
+    #[serde(default)]
+    #[ts(optional)]
+    pub answer: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct AttentionSnoozeRequest {

@@ -2087,3 +2087,65 @@ async fn a_step_check_that_writes_the_workspace_is_discarded_and_fails() {
     assert_ne!(moved.status, "done", "a failed check passes nothing");
     assert_eq!(executions(&steps.db, &second.id).await, Vec::new());
 }
+
+/// The manual exits the board and Task detail offer for a card in the step
+/// check (done, in_progress, cancelled) are the owner's own decision on the
+/// step, and the server takes each: the lead's running check is ended and
+/// its verdict is not applied afterwards.
+#[tokio::test]
+async fn the_owner_can_take_a_step_out_of_the_gate_by_hand() {
+    for target in ["done", "in_progress", "cancelled"] {
+        let steps = steps(&[HELD_FAIL], Some("second")).await;
+        let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+        until(&steps, "the step check runs", async || {
+            running_check(&steps.db, &first.id).await
+        })
+        .await;
+        let resting = reload(&steps.db, &first.id).await;
+        assert_eq!(resting.status, "lead_check");
+        let check: String = sqlx::query_scalar(
+            "SELECT id FROM execution WHERE task_id=? AND role='planner' AND status='running'",
+        )
+        .bind(&first.id)
+        .fetch_one(steps.db.pool())
+        .await
+        .unwrap();
+        // What REST's transition route passes for a manual change.
+        let options = crate::task_service::TransitionOptions::from((
+            resting.version,
+            Some("the owner decided".to_owned()),
+        ));
+        let moved = steps
+            .dispatcher
+            .task_service
+            .transition(&first.id, target.to_owned(), options)
+            .await;
+        assert!(moved.is_ok(), "{target}: {:?}", moved.err());
+        passes(&steps, 3).await;
+        steps.release.add_permits(8);
+        passes(&steps, 3).await;
+        // The check that ran when the owner decided is over. (Sent back to
+        // implementation, the step is worked on and checked again: that is a
+        // new check of new work.)
+        let status: String = sqlx::query_scalar("SELECT status FROM execution WHERE id=?")
+            .bind(&check)
+            .fetch_one(steps.db.pool())
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "running",
+            "{target}: the lead's check does not outlive the owner's decision"
+        );
+        let after = reload(&steps.db, &first.id).await;
+        if target != "in_progress" {
+            assert_eq!(after.status, target, "{}", dump(&steps.db).await);
+            assert!(!running_check(&steps.db, &first.id).await, "{target}");
+        }
+        // Passing or dropping the step by hand charges no return. (Sending
+        // it back is a return like the lead's own and may be charged as one.)
+        if target != "in_progress" {
+            assert_eq!(gate_spent(&steps.db, &first.id).await, 0, "{target}");
+        }
+        assert!(gate_spent(&steps.db, &first.id).await <= 1, "{target}");
+    }
+}

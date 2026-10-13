@@ -31,6 +31,8 @@ mod execution_terminal_receipt;
 mod file_backed_migration;
 #[path = "suite/foreign_key_pragma_migration.rs"]
 mod foreign_key_pragma_migration;
+#[path = "suite/lead_comment_kinds.rs"]
+mod lead_comment_kinds;
 #[path = "suite/level_triggered_wakes_upgrade.rs"]
 mod level_triggered_wakes_upgrade;
 #[path = "suite/main_chat_topics.rs"]

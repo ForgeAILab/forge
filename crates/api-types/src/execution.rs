@@ -133,6 +133,9 @@ pub enum ActionAuthority {
     AssignedAgent,
     ProjectAgent,
     Reviewer,
+    /// The lead of the Task's coordination root (the Task is a subtask
+    /// parked on something the lead decides).
+    Lead,
 }
 
 /// A parameter is required when another offered boolean has this value.

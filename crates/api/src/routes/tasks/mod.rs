@@ -122,6 +122,7 @@ fn comment_response(comment: db::TaskComment) -> CommentResponse {
         author_id: comment.author_id,
         author_name: comment.author_name,
         content: comment.content,
+        kind: comment.worklog_kind,
         created_at: comment.created_at,
         updated_at: comment.updated_at,
     }

@@ -445,6 +445,7 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::LeadRequiresNativeProfile { .. }
         | ServiceError::LeadRoleNotSupported { .. }
         | ServiceError::StepCheckRoleHeldByRoot { .. }
+        | ServiceError::LeadOperationRefused { .. }
         | ServiceError::WorkspaceResetRequired { .. }
         | ServiceError::TerminalSessionLimit { .. }
         | ServiceError::TerminalNotFound => (

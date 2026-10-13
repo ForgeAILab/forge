@@ -1291,6 +1291,20 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         covered_operations.insert(operation.to_owned());
     }
 
+    // The lead operations are offered only to a run that leads a
+    // coordination root, never to this worker session. They are driven
+    // through this same provider boundary, as a lead, in
+    // `task_dispatcher::tests::lead_operations`.
+    for operation in operation_registry::task_lead::IDS {
+        assert!(
+            !task_propose_operations
+                .iter()
+                .any(|value| value == operation),
+            "a Task session that leads nothing must not be offered {operation}"
+        );
+        covered_operations.insert((*operation).to_owned());
+    }
+
     // Dispatching an inquiry belongs to a Main *Chat*, not to the bare
     // Account scope above: the Account scope is what an inquiry sub-agent
     // itself runs under, and withholding the operation there is what caps

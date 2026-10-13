@@ -16,6 +16,8 @@ import {
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
+import { LeadInputAnswer, isLeadInput } from '@/components/lead-input-answer'
+import { useAgentQuery } from '@/api/hooks'
 import {
   useAgentChatsQuery,
   useAgentChatTurnsQuery,
@@ -204,6 +206,7 @@ function AttentionCard({ item }: { item: AttentionItem }) {
     ) ?? false
   return (
     <article
+      id={`attention-${item.id}`}
       className={`rounded-lg border p-4 ${attentionTone(item)}`}
       role={isProgressWarning ? 'status' : undefined}
       aria-live={isProgressWarning ? 'polite' : undefined}
@@ -220,7 +223,7 @@ function AttentionCard({ item }: { item: AttentionItem }) {
               {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
             </h3>
             <StateBadge status={item.lifecycle} />
-            {item.lifecycle !== 'resolved' ? (
+            {item.lifecycle !== 'resolved' && !isLeadInput(item) ? (
               <Button
                 variant="ghost"
                 size="sm"
@@ -289,6 +292,7 @@ function AttentionCard({ item }: { item: AttentionItem }) {
           {escalation && item.lifecycle !== 'resolved' ? (
             <EscalationAnswer item={item} escalation={escalation} />
           ) : null}
+          {isLeadInput(item) ? <LeadInputAnswer item={item} /> : null}
           {retryTurn.error ? (
             <p className="mt-2 text-xs text-destructive" role="alert">
               {retryTurn.error.message}
@@ -481,6 +485,11 @@ function ActivityMetadata({ label, value }: { label: string; value: string }) {
 }
 
 function CoordinationActivityRow({ item }: { item: CoordinationActivityItem }) {
+  const lead = useAgentQuery(item.actor_type === 'task_lead' ? item.actor_id : undefined)
+  const actor =
+    item.actor_type === 'task_lead'
+      ? `Lead · ${lead.data?.name ?? item.actor_id}`
+      : `${humanize(item.actor_type)} · ${item.actor_id}`
   const isDirectCommand = item.activity_kind === 'direct_command'
   const kindLabel = isDirectCommand ? 'Direct command receipt' : 'Approval action'
   return (
@@ -517,7 +526,7 @@ function CoordinationActivityRow({ item }: { item: CoordinationActivityItem }) {
         </time>
       </div>
       <dl className="mt-4 grid min-w-0 gap-x-4 gap-y-3 border-t border-border-subtle pt-3 xl:grid-cols-4">
-        <ActivityMetadata label="Actor" value={`${humanize(item.actor_type)} · ${item.actor_id}`} />
+        <ActivityMetadata label="Actor" value={actor} />
         <ActivityMetadata label="Scope" value={`${humanize(item.scope_type)} · ${item.scope_id}`} />
         <ActivityMetadata label="Input digest" value={item.input_digest} />
         <ActivityMetadata label="Correlation" value={item.correlation_id} />
