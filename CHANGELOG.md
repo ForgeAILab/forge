@@ -3301,6 +3301,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Owned check and integration results retain their authority under that
   pause. Mapping revision 7 refreshes existing condition projections on upgrade.
 
+- Legacy merge imports missing their execution or pinned workspace now park their Tasks as `deferred/owner_required`, with the retained cause, Attention, an integration summary, Retry and Cancel. This also repairs quarantines from an earlier start. Retry admits the Task's present branch through normal admission and performs a full head check; it never merges the import's old candidate blindly.
+- After the owner's Retry of a quarantined import, a later admission of the same merge entry (its placement was verified again) no longer blocks the Task with `integration_admission_failed` for the execution it never had, and the attempt that replaces the retried one still runs the head check.
+- A Task parked for a quarantined import adds no Task-step row and no scheduler generation on later dispatcher passes or starts (the sweep used to ask for its admission at every pass).
+- The merge summary's `action_hint` of a stopped merge is `resume_project`, not `retry`, while the Task's Project is paused: `retry` is withheld during a pause, so the hint named an action that answered `409 action_unavailable`.
+- Startup recovery no longer creates no-op command history and scheduler generations for active Tasks with no running execution to recover.
+- The migration runner checkpoints and truncates the WAL after the committed bundle, releasing the retained WAL from table rebuilds. Unused pages in the main database remain available for reuse.
 - Web coordination roots no longer offer refused interactive launches, withdrawn lead questions preserve typed drafts with copy and dismiss controls, board subtask exits use the server's effective workflow, and out-of-order Task events cannot overwrite newer cached state.
 - `409 integration_unresolved` names the machine that performs the outstanding effect. For a rebase run on another machine than the merge target's it used to name the target's machine, so its "reconnect or remove that machine" hint pointed at the wrong one.
 - The Task list's ETag can no longer stay equal when one merge-queue member leaves and another joins with equal counters while the newest member timestamp does not move (a wall clock set back): the validator now carries the exact set of current members.

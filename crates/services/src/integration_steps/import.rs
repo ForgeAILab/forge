@@ -6,11 +6,13 @@
 //! 1. [`import_at_start`] runs the storage importer
 //!    (`SqliteDb::import_integration_pass`) until nothing is left. It only
 //!    classifies and writes attempt rows.
-//! 2. For every *current* attempt that came from the importer, or from the
+//! 2. For every current attempt that came from the importer, or from the
 //!    passive shadow recording that preceded the queue, and has no
 //!    continuation step yet, it enqueues one identity-fenced
 //!    `integration/import_continue` Task step, keyed
 //!    `integration-import:<attempt id>`.
+//!    A missing-execution/workspace quarantine with no successor gets the same
+//!    step: it states an owner park, without making the attempt current.
 //!
 //! The step ([`IntegrationSteps::import_continue`]) is the Task writer. It
 //! re-reads the attempt and the Task under the Task's step lease and applies
@@ -59,10 +61,10 @@ pub struct ImportReport {
     pub continuations: u32,
 }
 
-/// Current attempts nothing has continued yet: imported rows and shadow
-/// rows, of Tasks that still exist, without their continuation step.
+/// Uncontinued current pre-queue rows and missing-source non-current imports
+/// with no successor, of Tasks that still exist in the imported entry.
 const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
-    WHERE a.current=1 AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
+    WHERE (a.current=1 OR (@IMPORT_PARK@)) AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
       AND EXISTS(SELECT 1 FROM task t WHERE t.id=a.task_ref AND t.deleted_at IS NULL) \
       AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref \
                      AND s.causation_key='integration-import:'||a.id) \
@@ -147,10 +149,13 @@ pub(crate) async fn enqueue_missing_continuations(
     let ids: Vec<String> = if queued_only {
         db.queued_imports_without_continuation().await?
     } else {
-        sqlx::query_scalar(UNCONTINUED)
-            .fetch_all(db.pool())
-            .await
-            .map_err(db::DbError::from)?
+        sqlx::query_scalar(&UNCONTINUED.replace(
+            "@IMPORT_PARK@",
+            db::integration_queue::UNOWNED_QUARANTINED_IMPORT,
+        ))
+        .fetch_all(db.pool())
+        .await
+        .map_err(db::DbError::from)?
     };
     let mut enqueued = 0;
     for id in ids {
@@ -251,7 +256,28 @@ impl IntegrationSteps {
         let Some(attempt) = self.db.integration_attempt(&request.attempt_id).await? else {
             return Ok(StepOutcome::Skip("attempt is gone".into()));
         };
-        if !attempt.current || attempt.state.terminal() {
+        if !attempt.current {
+            // A prior start may have committed an incomplete quarantine with
+            // no current attempt and no continuation. The shared snapshot
+            // rechecks its entry and absence of a successor under the lease.
+            if self
+                .db
+                .unowned_quarantined_import(&attempt.task_ref)
+                .await?
+                .is_some_and(|import| import.id == attempt.id)
+            {
+                if let Some(task) = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await?
+                {
+                    self.task_service
+                        .reconcile_integration_admission(&task)
+                        .await?;
+                }
+            }
+            return Ok(StepOutcome::Skip(
+                "non-current import condition reconciled".into(),
+            ));
+        }
+        if attempt.state.terminal() {
             return Ok(StepOutcome::Skip("the attempt is history".into()));
         }
         let live: bool = sqlx::query_scalar(db::STEP_FENCE)
@@ -402,11 +428,13 @@ impl IntegrationSteps {
                         import: super::deferral::import_facts(&attempt, waited_owner.clone()),
                     });
                 // A paused Project is the Task's reason; integration adds none.
-                let reason = (!paused).then(|| IntegrationReason::Deferred {
-                    attempt_id: attempt_ref(&attempt.id),
-                    cause,
-                    owner_id,
-                    message: bounded(&message),
+                let reason = (!paused || attempt.state == S::Quarantined).then(|| {
+                    IntegrationReason::Deferred {
+                        attempt_id: attempt_ref(&attempt.id),
+                        cause,
+                        owner_id,
+                        message: bounded(&message),
+                    }
                 });
                 self.import_state(step, &attempt, reason).await
             }

@@ -106,8 +106,8 @@ pub(crate) async fn admit(
             epoch,
             task.version,
         );
-        attempt.execution_id = Some(facts.execution_id.clone());
-        attempt.execution_ref = Some(facts.execution_id.clone());
+        attempt.execution_id = facts.execution_id.clone();
+        attempt.execution_ref = facts.execution_id.clone();
         attempt.workspace_id = Some(facts.workspace.id.clone());
         attempt.workspace_ref = Some(facts.workspace.id.clone());
         attempt.placement_id = Some(placement.id.clone());
@@ -135,13 +135,12 @@ pub(crate) async fn admit(
     for _ in 0..3 {
         let Some(current) = db.current_integration_attempt(&task.id).await? else {
             let reviewed = reviewed_before_rebase(db, None, task, &facts.candidate_sha).await?;
-            match db
-                .admit_integration_attempt(build(
-                    format!("admit:{}:{epoch}", task.id),
-                    reviewed.as_deref(),
-                ))
-                .await
-            {
+            let mut successor = build(format!("admit:{}:{epoch}", task.id), reviewed.as_deref());
+            successor.predecessor_attempt_id = db
+                .unowned_quarantined_import(&task.id)
+                .await?
+                .map(|import| import.id);
+            match db.admit_integration_attempt(successor).await {
                 Ok(attempt) => return Ok(attempt),
                 // Another admission of this Task got in; read it.
                 Err(DbError::VersionConflict) => continue,

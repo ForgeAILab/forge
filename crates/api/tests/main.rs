@@ -3,6 +3,9 @@
 
 mod common;
 
+#[path = "suite/integration_quarantine.rs"]
+mod integration_quarantine;
+
 #[path = "suite/account_resource_binding.rs"]
 mod account_resource_binding;
 

@@ -298,13 +298,14 @@ pub fn task_integration_summary(
     // system releases (proved against `available_actions` by test).
     // `resume_project` is a Project action and no Task
     // offer: it is said only while the member's own Project is paused.
+    // A paused Project withholds every Retry (the action system answers 409
+    // with the pause as the cause), so the hint is the Project's resume: the
+    // stopped merge offers its Retry once the Project runs again.
+    let retry_offered = task
+        .is_some_and(|task| crate::task_actions::integration_retry_offered(task, &row.attempt_id));
     let action_hint = match wait.as_ref().map(|wait| wait.code) {
-        _ if task.is_some_and(|task| {
-            crate::task_actions::integration_retry_offered(task, &row.attempt_id)
-        }) =>
-        {
-            Some(IntegrationActionHint::Retry)
-        }
+        _ if retry_offered && project_paused => Some(IntegrationActionHint::ResumeProject),
+        _ if retry_offered => Some(IntegrationActionHint::Retry),
         Some(IntegrationWaitCode::TaskHeld) if matches!(gate, Some(GateCause::Held)) => {
             Some(IntegrationActionHint::Release)
         }

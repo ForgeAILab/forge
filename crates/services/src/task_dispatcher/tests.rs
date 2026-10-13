@@ -9725,7 +9725,7 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
         .await
         .unwrap();
     let intent = crate::merge_service::MergeIntent {
-        execution_id: facts.execution_id,
+        execution_id: facts.execution_id.expect("implementation execution"),
         workspace_id: facts.workspace.id,
         candidate_sha: facts.candidate_sha,
         target_branch: facts.target_branch,

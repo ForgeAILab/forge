@@ -6,6 +6,152 @@ use super::*;
 use crate::integration_worker::{HeadDriver, Pass};
 use api_types::TaskAction;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quarantined_imports_without_execution_or_pinned_workspace_park_and_retry_current_head() {
+    for missing_execution in [true, false] {
+        let world = World::new().await;
+        let old_head = world.legacy_task("orphan", "orphan.txt", "merging").await;
+        if !missing_execution {
+            let execution = world.seed_execution("orphan", "executor", None).await;
+            sqlx::query("UPDATE execution SET workspace_id=NULL WHERE id=?")
+                .bind(execution)
+                .execute(world.db.pool())
+                .await
+                .unwrap();
+        }
+        // Reproduce a previous build's start: it committed the import but
+        // never enqueued a continuation for its non-current quarantine.
+        let imported = world.db.import_integration_pass(100).await.unwrap();
+        assert_eq!(imported.quarantined, 1);
+        let id: String =
+            sqlx::query_scalar("SELECT id FROM integration_attempt WHERE task_ref='orphan'")
+                .fetch_one(world.db.pool())
+                .await
+                .unwrap();
+        let orphan = world.attempt(&id).await;
+        assert!(!orphan.current);
+        assert_eq!(orphan.state, S::Quarantined);
+        assert_eq!(
+            orphan.failure_kind,
+            Some(db::IntegrationFailureKind::CorruptImport)
+        );
+        assert_eq!(
+            orphan.failure_message.as_deref(),
+            Some("missing execution or pinned workspace")
+        );
+        let report = import::import_at_start(&world.db).await.unwrap();
+        assert_eq!(report.imported, 0);
+        assert_eq!(
+            report.continuations, 1,
+            "a previous start's quarantine needs its park step"
+        );
+        world
+            .until("orphan", "the quarantine is an owner park", || async {
+                integration(&world.task("orphan").await)["cause"] == "owner_required"
+            })
+            .await;
+        let parked = world.task("orphan").await;
+        assert_eq!(parked.status, "merging");
+        assert!(matches!(parked.condition, db::TaskCondition::Parked { .. }));
+        assert_eq!(
+            integration(&parked)["message"],
+            "missing execution or pinned workspace"
+        );
+        let summary = crate::integration_reads::task_integration(&world.db, &parked)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.state, api_types::IntegrationMemberState::Deferred);
+        assert_eq!(
+            summary.wait.unwrap().code,
+            api_types::IntegrationWaitCode::OwnerRequired
+        );
+        assert_eq!(
+            summary.action_hint,
+            Some(api_types::IntegrationActionHint::Retry)
+        );
+        let offers = world.offers("orphan").await;
+        assert!(
+            offers.contains(&("retry".into(), "integration_retry".into())),
+            "{offers:?}"
+        );
+        assert!(offers.iter().any(|(verb, _)| verb == "cancel"));
+        crate::AttentionService::new(world.db.clone())
+            .project_once(100)
+            .await
+            .unwrap();
+        let attention: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE status='open' AND json_extract(details_json,'$.entity_id')='orphan'")
+            .fetch_one(world.db.pool()).await.unwrap();
+        assert_eq!(attention, 1);
+        let operations = crate::OperatorStatusService::new_for_test(world.db.clone())
+            .compute_status()
+            .await
+            .unwrap();
+        assert_eq!(operations.integration_queues.quarantined_imports, 1);
+        let unchanged = import::import_at_start(&world.db).await.unwrap();
+        assert_eq!((unchanged.imported, unchanged.continuations), (0, 0));
+
+        // An unpinned historical execution cannot prove review provenance.
+        // Supply a present implementation run rather than rewriting history.
+        // The no-execution case also proves Retry can use the current branch
+        // without inventing a historical run.
+        if !missing_execution {
+            world.seed_execution("orphan", "executor", None).await;
+        }
+        // Retry must bind and check the present HEAD, not the import's candidate.
+        std::fs::write(world.tree("orphan").join("current.txt"), "current\n").unwrap();
+        git::commit_all(&world.tree("orphan"), "current candidate")
+            .await
+            .unwrap();
+        let current_head = git::get_current_sha(&world.tree("orphan")).await.unwrap();
+        assert_ne!(old_head, current_head);
+        review_ci(&world, "orphan", &["test -f current.txt"]).await;
+        let production = Production::new(&world);
+        world
+            .act(
+                "orphan",
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+            )
+            .await;
+        let admitted = world
+            .db
+            .current_integration_attempt("orphan")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.state, S::Queued);
+        assert_ne!(admitted.id, orphan.id);
+        assert_eq!(
+            admitted.original_candidate_sha.as_deref(),
+            Some(current_head.as_str())
+        );
+        let running = production.run();
+        world
+            .until(
+                "orphan",
+                "Retry validates and merges the present branch",
+                || async { world.task("orphan").await.status == "done" },
+            )
+            .await;
+        assert!(world.on_main("current.txt").await);
+        assert_eq!(world.merges("orphan").await, 1);
+        let checks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE id IN (SELECT run_id FROM check_consumer WHERE origin='integration' AND task_id='orphan')")
+            .fetch_one(world.db.pool()).await.unwrap();
+        assert_eq!(
+            checks, 1,
+            "the quarantined import cannot skip the head check"
+        );
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    }
+}
+
 impl World {
     /// A Task in `merging` that nothing has admitted (no attempt, no entry
     /// step), with its implementation run, then admitted by the reconciler's
@@ -2830,4 +2976,538 @@ async fn sweeps_and_the_start_pass_enqueue_one_continuation_for_one_row() {
             .unwrap(),
         0
     );
+}
+
+// ----- quarantined incomplete import: adversarial cases --------------------
+
+fn retry_action() -> TaskAction {
+    TaskAction::Retry {
+        reason: None,
+        fresh_session: None,
+        refresh_workspace: None,
+        reset_budget: None,
+        guidance: None,
+    }
+}
+
+impl World {
+    /// A `merging` Task with no execution, imported as the non-current
+    /// `missing execution or pinned workspace` quarantine and parked by the
+    /// start's continuation. Returns the quarantined attempt's id.
+    async fn parked_quarantine(&self, task: &str) -> String {
+        let imported = self.db.import_integration_pass(100).await.unwrap();
+        assert_eq!(imported.quarantined, 1);
+        import::import_at_start(&self.db).await.unwrap();
+        self.until(task, "the quarantine is an owner park", || async {
+            integration(&self.task(task).await)["cause"] == "owner_required"
+        })
+        .await;
+        sqlx::query_scalar(
+            "SELECT id FROM integration_attempt WHERE task_ref=? AND admission_key LIKE 'import:%'",
+        )
+        .bind(task)
+        .fetch_one(self.db.pool())
+        .await
+        .unwrap()
+    }
+    /// Every Task-step row and scheduler generation of the Task.
+    async fn bookkeeping(&self, task: &str) -> (Vec<(String, String)>, Vec<(i64, i64, i64)>, i64) {
+        let steps = sqlx::query_as("SELECT id,status FROM task_step WHERE task_id=? ORDER BY id")
+            .bind(task)
+            .fetch_all(self.db.pool())
+            .await
+            .unwrap();
+        let dirty = sqlx::query_as(
+            "SELECT generation,dirty,external FROM task_schedule_dirty WHERE task_id=?",
+        )
+        .bind(task)
+        .fetch_all(self.db.pool())
+        .await
+        .unwrap();
+        let attempts = self
+            .scalar(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                task,
+            )
+            .await;
+        (steps, dirty, attempts)
+    }
+    async fn main_commits(&self) -> usize {
+        git_out(&self.repo(), &["rev-list", "--count", "refs/heads/main"])
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+}
+
+/// A parked quarantine is level-triggered, but a level that is already
+/// stated writes nothing: later sweeps and later starts add no Task step, no
+/// scheduler generation and no attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_quarantined_import_writes_nothing_on_later_sweeps_and_starts() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    world.parked_quarantine("orphan").await;
+    let dispatcher = dispatcher(&world).await;
+    // The first pass after the park may write the scheduler's own park row.
+    for _ in 0..3 {
+        dispatcher.reconcile_all().await.unwrap();
+        world.service.drain("orphan").await.unwrap();
+    }
+    let parked = world.task("orphan").await;
+    let before = world.bookkeeping("orphan").await;
+    assert!(
+        before.1.iter().all(|row| row.1 == 0),
+        "still dirty: {before:?}"
+    );
+    for _ in 0..3 {
+        let again = import::import_at_start(&world.db).await.unwrap();
+        assert_eq!((again.imported, again.continuations), (0, 0));
+        dispatcher.reconcile_all().await.unwrap();
+        world.service.drain("orphan").await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(world.bookkeeping("orphan").await, before);
+    let after = world.task("orphan").await;
+    assert_eq!(after.condition, parked.condition);
+    assert_eq!(after.version, parked.version);
+    assert_eq!(integration(&after)["cause"], "owner_required");
+}
+
+/// The old server finished the merge in Git and died before recording it:
+/// the import finds no execution and quarantines. The owner's Retry must
+/// find the commit in the target and report the Task as landed: no second
+/// merge, no new commit on the target, no park for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_of_a_quarantined_import_whose_commit_already_landed_settles_without_a_second_merge()
+{
+    for target_moved_after in [false, true] {
+        let world = World::new().await;
+        let candidate = world.legacy_task("orphan", "orphan.txt", "merging").await;
+        git_out(&world.repo(), &["merge", "--ff-only", "task-orphan"])
+            .await
+            .expect("the old merge landed");
+        if target_moved_after {
+            world.move_target("later.txt").await;
+        }
+        let target = world.main_tip().await;
+        let commits = world.main_commits().await;
+        world.parked_quarantine("orphan").await;
+        review_ci(&world, "orphan", &["test -f orphan.txt"]).await;
+        let production = Production::new(&world);
+        let running = production.run();
+        world.act("orphan", retry_action()).await;
+        world
+            .until("orphan", "the landed Task is reported", || async {
+                world.task("orphan").await.status == "done"
+            })
+            .await;
+        assert_eq!(world.main_tip().await, target, "moved={target_moved_after}");
+        assert_eq!(world.main_commits().await, commits);
+        assert!(world.on_main("orphan.txt").await);
+        assert!(git_out(
+            &world.repo(),
+            &["merge-base", "--is-ancestor", &candidate, "refs/heads/main"]
+        )
+        .await
+        .is_some());
+        assert!(world.merges("orphan").await <= 1);
+        let _ = production.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    }
+}
+
+/// Retry twice, and the importer and the sweep beside it: one admitted
+/// successor, which the quarantine never competes with again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_retry_and_later_passes_leave_one_successor_of_a_quarantined_import() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    let quarantine = world.parked_quarantine("orphan").await;
+    let head = git::get_current_sha(&world.tree("orphan")).await.unwrap();
+    world.act("orphan", retry_action()).await;
+    let admitted = world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.original_candidate_sha.as_deref(), Some(&*head));
+    assert_eq!(
+        admitted.predecessor_attempt_id.as_deref(),
+        Some(&*quarantine)
+    );
+    // The second Retry is refused or returns the same row: never a third.
+    let version = world.task("orphan").await.version;
+    let _ = world
+        .service
+        .perform_task_action("orphan", retry_action(), version)
+        .await;
+    let stated = integration(&world.task("orphan").await);
+    assert_eq!(stated["attempt_id"], admitted.id, "{stated}");
+    assert_ne!(stated["cause"], "owner_required", "{stated}");
+    assert!(world
+        .db
+        .unowned_quarantined_import("orphan")
+        .await
+        .unwrap()
+        .is_none());
+    let dispatcher = dispatcher(&world).await;
+    let again = import::import_at_start(&world.db).await.unwrap();
+    assert_eq!((again.imported, again.continuations), (0, 0));
+    dispatcher.reconcile_all().await.unwrap();
+    let rows = || async {
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?",
+                "orphan",
+            )
+            .await
+    };
+    assert_eq!(rows().await, 2);
+    // The successor merges once, with its head check.
+    review_ci(&world, "orphan", &["test -f orphan.txt"]).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .until("orphan", "the successor merges", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            world.task("orphan").await.status == "done"
+        })
+        .await;
+    assert_eq!(world.merges("orphan").await, 1);
+    assert_eq!(rows().await, 2);
+    world
+        .until("orphan", "the successor is completed", || async {
+            world
+                .scalar::<String>(
+                    "SELECT state FROM integration_attempt WHERE id=?",
+                    &admitted.id,
+                )
+                .await
+                == "completed"
+        })
+        .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
+/// Hold keeps the park behind the hold, Release brings Retry back, and
+/// Cancel ends the Task. A Task that left the entry, or was deleted, is not
+/// the quarantine's any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_release_and_cancel_of_a_parked_quarantined_import() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    world.parked_quarantine("orphan").await;
+    let dispatcher = dispatcher(&world).await;
+    world.act("orphan", TaskAction::Hold { reason: None }).await;
+    for _ in 0..2 {
+        dispatcher.reconcile_all().await.unwrap();
+        world.service.drain("orphan").await.unwrap();
+    }
+    let held = world.task("orphan").await;
+    assert_eq!(held.status, "merging");
+    assert!(
+        matches!(
+            held.condition,
+            db::TaskCondition::Parked {
+                primary: db::ParkReason::Held { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        held.condition
+    );
+    assert_eq!(integration(&held)["cause"], "owner_required");
+    let offers = world.offers("orphan").await;
+    assert!(
+        offers.iter().any(|(verb, _)| verb == "release"),
+        "{offers:?}"
+    );
+    world
+        .act("orphan", TaskAction::Release { reason: None })
+        .await;
+    world
+        .until("orphan", "Retry is offered again after Release", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            world
+                .offers("orphan")
+                .await
+                .contains(&("retry".into(), "integration_retry".into()))
+        })
+        .await;
+    assert!(world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(world
+        .db
+        .unowned_quarantined_import("orphan")
+        .await
+        .unwrap()
+        .is_some());
+    let cancelled = world
+        .act("orphan", TaskAction::Cancel { reason: None })
+        .await;
+    assert_eq!(cancelled.status, "cancelled");
+    assert!(world
+        .db
+        .unowned_quarantined_import("orphan")
+        .await
+        .unwrap()
+        .is_none());
+    let report = import::import_at_start(&world.db).await.unwrap();
+    assert_eq!(report.continuations, 0);
+}
+
+/// Every other `corrupt_import` cause keeps the policy it had: the row is
+/// history, and the sweep admits the Task through the normal admission from
+/// its present rows. A Task that admission cannot name a candidate for is
+/// blocked, typed, with Retry and Cancel; it is never left `clear`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_corrupt_import_cause_is_admitted_by_the_sweep_or_blocked_typed() {
+    let world = World::new().await;
+    for task in ["noexec", "exec"] {
+        world
+            .legacy_task(task, &format!("{task}.txt"), "merging")
+            .await;
+        // The old entry's checkpoint is not an object: `corrupt_import`,
+        // "hook effects are not an object", with no queue.
+        world.old_merge_step(task, json!([])).await;
+        world.touch(task).await;
+    }
+    world.seed_execution("exec", "executor", None).await;
+    let report = import::import_at_start(&world.db).await.unwrap();
+    assert_eq!(
+        (report.quarantined, report.continuations),
+        (2, 0),
+        "{report:?}"
+    );
+    for task in ["noexec", "exec"] {
+        assert!(world
+            .db
+            .unowned_quarantined_import(task)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let production = Production::new(&world);
+    let running = production.run();
+    let dispatcher = dispatcher(&world).await;
+    world
+        .until("exec", "the Task with a candidate merges", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            world.task("exec").await.status == "done"
+        })
+        .await;
+    world
+        .until("noexec", "the Task without one is blocked", || async {
+            dispatcher.reconcile_all().await.unwrap();
+            world.task("noexec").await.blocked_json.is_some()
+        })
+        .await;
+    let blocked = world.task("noexec").await;
+    assert_eq!(blocked.status, "merging");
+    assert!(
+        blocked
+            .blocked_json
+            .as_deref()
+            .unwrap()
+            .contains("integration_admission_failed"),
+        "{:?}",
+        blocked.blocked_json
+    );
+    let offers = world.offers("noexec").await;
+    for verb in ["retry", "cancel"] {
+        assert!(
+            offers.iter().any(|(offered, _)| offered == verb),
+            "{offers:?}"
+        );
+    }
+    assert!(!world.on_main("noexec.txt").await);
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
+/// The Task's worktree and branch are gone: Retry is refused with the cause,
+/// nothing is admitted or merged, and the park keeps Retry and Cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_of_a_quarantined_import_whose_branch_is_gone_is_refused_and_the_park_stays() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    world.parked_quarantine("orphan").await;
+    git_out(
+        &world.repo(),
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            world.tree("orphan").to_str().unwrap(),
+        ],
+    )
+    .await
+    .expect("worktree removed");
+    git_out(&world.repo(), &["branch", "-D", "task-orphan"])
+        .await
+        .expect("branch deleted");
+    let tip = world.main_tip().await;
+    let version = world.task("orphan").await.version;
+    let refused = world
+        .service
+        .perform_task_action("orphan", retry_action(), version)
+        .await;
+    assert!(
+        refused.is_err(),
+        "a Retry with no branch admitted something"
+    );
+    let parked = world.task("orphan").await;
+    assert_eq!(parked.status, "merging");
+    assert_eq!(integration(&parked)["cause"], "owner_required");
+    assert!(world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .is_none());
+    let offers = world.offers("orphan").await;
+    assert!(
+        offers.contains(&("retry".into(), "integration_retry".into())),
+        "{offers:?}"
+    );
+    assert!(offers.iter().any(|(verb, _)| verb == "cancel"));
+    assert_eq!(world.main_tip().await, tip);
+}
+
+/// The legacy execution exists but names no workspace: nothing can prove
+/// what its review covered. Retry admits the present branch, the head's
+/// review authority refuses it, and the Task leaves the queue for its repair
+/// state with the cause. It is never merged unreviewed and never `clear`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_with_an_unpinned_legacy_execution_never_merges_without_review() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    let execution = world.seed_execution("orphan", "executor", None).await;
+    sqlx::query("UPDATE execution SET workspace_id=NULL WHERE id=?")
+        .bind(execution)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.parked_quarantine("orphan").await;
+    let tip = world.main_tip().await;
+    let production = Production::new(&world);
+    let running = production.run();
+    world.act("orphan", retry_action()).await;
+    world
+        .until(
+            "orphan",
+            "the unreviewable candidate is sent back",
+            || async { world.task("orphan").await.status == "merge_failed" },
+        )
+        .await;
+    assert_eq!(world.main_tip().await, tip);
+    assert!(!world.on_main("orphan.txt").await);
+    assert_eq!(world.merges("orphan").await, 0);
+    let offers = world.offers("orphan").await;
+    for verb in ["restart", "cancel"] {
+        assert!(
+            offers.iter().any(|(offered, _)| offered == verb),
+            "{offers:?}"
+        );
+    }
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
+/// A paused Project withholds Retry, and the summary must not hint an action
+/// the action system refuses: it names the Project's resume, and Retry is
+/// hinted and offered once the Project runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quarantined_import_of_a_paused_project_hints_the_resume_and_then_retry() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    sqlx::query("UPDATE project SET paused_at=? WHERE id='p'")
+        .bind(db::now_rfc3339())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.parked_quarantine("orphan").await;
+    let hint = || async {
+        crate::integration_reads::task_integration(&world.db, &world.task("orphan").await)
+            .await
+            .unwrap()
+            .unwrap()
+            .action_hint
+    };
+    let retry = ("retry".to_owned(), "integration_retry".to_owned());
+    let offers = world.offers("orphan").await;
+    assert!(!offers.contains(&retry), "{offers:?}");
+    assert!(offers.iter().any(|(verb, _)| verb == "cancel"));
+    assert_eq!(
+        hint().await,
+        Some(api_types::IntegrationActionHint::ResumeProject)
+    );
+    sqlx::query("UPDATE project SET paused_at=NULL WHERE id='p'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    assert!(world.offers("orphan").await.contains(&retry));
+    assert_eq!(hint().await, Some(api_types::IntegrationActionHint::Retry));
+}
+
+/// The head check a retried quarantined import owes is owed by every
+/// successor of that Retry in the same entry: an attempt that replaces the
+/// retried one (its placement was verified again) must not fast-forward an
+/// unchanged target unchecked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successor_of_a_retried_quarantined_import_still_owes_the_head_check() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    let quarantine = world.parked_quarantine("orphan").await;
+    review_ci(&world, "orphan", &["test -f orphan.txt"]).await;
+    world.act("orphan", retry_action()).await;
+    let first = world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.predecessor_attempt_id.as_deref(), Some(&*quarantine));
+    // Recovery verified the placement again: the binding is stale and the
+    // sweep replaces the attempt through admission.
+    sqlx::query("UPDATE workspace_placement SET generation=generation+1 WHERE task_id='orphan'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let row = world.task("orphan").await;
+    assert!(world
+        .service
+        .reconcile_integration_admission(&row)
+        .await
+        .unwrap());
+    let second = world
+        .db
+        .current_integration_attempt("orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.predecessor_attempt_id.as_deref(), Some(&*first.id));
+    let production = Production::new(&world);
+    let running = production.run();
+    world
+        .until("orphan", "the successor merges", || async {
+            world.task("orphan").await.status == "done"
+        })
+        .await;
+    let checks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE id IN (SELECT run_id FROM check_consumer WHERE origin='integration' AND task_id='orphan')")
+        .fetch_one(world.db.pool()).await.unwrap();
+    assert_eq!(checks, 1, "the successor merged without the head check");
+    assert_eq!(world.merges("orphan").await, 1);
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }

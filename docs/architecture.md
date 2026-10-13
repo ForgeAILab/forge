@@ -5612,6 +5612,48 @@ live legacy merge hook owns it. A suspended older hook completes its recorded
 rebase/read-only outcome and hands over through the same admission function.
 There are no shadow observation writers in the active merge path.
 
+An import missing its execution or pinned workspace (`corrupt_import`,
+"missing execution or pinned workspace") is non-current because it has no
+resolvable queue. Wholly unreadable or contradictory legacy evidence keeps
+its existing continuation policy.
+While it is the Task's only attempt and the Task still occupies that merge
+entry, startup continuation and the dispatcher's sweep state
+`deferred/owner_required` with its cause and raise the normal Attention
+interruption. This includes quarantines committed by a previous start.
+The Task integration summary exposes the quarantine, and operations status
+counts it in `integration_queues.quarantined_imports`. Nothing readmits it
+automatically. Retry uses normal admission to bind the Task's current branch,
+workspace and ready placement; if the legacy execution or its workspace pin
+is absent, only this explicit retry may use the Task's present workspace.
+No execution or review evidence is fabricated. The new attempt retains the
+quarantine as predecessor, requires the full head check even on an unchanged
+target, and must pass normal review authority before fast-forwarding. If no
+current workspace can be recovered, Retry reports the missing source and
+keeps the park; Cancel ends the Task.
+
+Once the owner has retried the entry, every later admission of that same
+entry (a placement verified again, an attempt sent back or parked unbound)
+uses the same source, and every attempt of it owes the head check, not only
+the one the Retry admitted.
+
+The park is level-triggered and idempotent. The dispatcher's sweep asks for
+its statement only while the Task's condition does not carry it (never
+stated, or lost); a stated park is not a missing merge entry, so later passes
+and later starts write no Task step and no scheduler generation for it. A
+later admitted attempt, a Task that left the merge entry and a deleted Task
+are not the quarantine's: the predicate matches none of them. While the
+Project is paused the sweep leaves the Task to the pause, Retry is withheld
+like every other retry and the summary hints `resume_project`. A candidate
+that is already contained in the target is reported as merged after the head
+check; no commit is added to the target. Retry is refused, and the park kept,
+when the Task's worktree and branch are both gone or the Task has no
+workspace at all. When the legacy execution exists but names
+no workspace, the head's review authority cannot be proven: the attempt is
+sent back to the repair state and nothing merges. Every other `corrupt_import`
+cause keeps the earlier policy: the row is history and the sweep admits the
+Task through normal admission from its present rows, or blocks it with
+`integration_admission_failed` when no candidate can be named.
+
 The continuation binds a runnable candidate, states a wait/owner action, or
 reports a landed result after the target-owner proof. A held/offline/lost-owner
 row is not readmitted merely because its candidate was unnamed. Offline P15
@@ -7600,6 +7642,14 @@ start, before applying anything, in two cases:
 Without that check, the second migration would be skipped without an error and
 its schema would never exist. The one known reconciled exception is a V053
 `integration_credentials` row from early hosts, which V054 repairs.
+
+After the whole bundle and its reconciliation finish, outside every migration
+transaction and before workers start, the runner requests
+`PRAGMA wal_checkpoint(TRUNCATE)`. A successful checkpoint syncs committed
+pages and truncates the WAL to zero bytes. An external reader can keep the
+checkpoint busy; SQLite then retains the WAL safely. This does not compact
+the main database: pages freed by a table rebuild remain on its freelist for
+reuse. No automatic VACUUM is performed.
 
 To recover a refused host, compare `SELECT version, name FROM _migration` with
 `crates/db/migrations/`. Apply the build's migration by hand if its schema is

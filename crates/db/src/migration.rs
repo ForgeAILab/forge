@@ -76,6 +76,11 @@ async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
     reconcile_project_admission_bindings(pool).await?;
     crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
 
+    // All migration transactions are committed; workers have not started.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
@@ -345,6 +350,9 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
     }
 
     crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

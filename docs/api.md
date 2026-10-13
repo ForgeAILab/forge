@@ -2925,7 +2925,7 @@ cancelled). MCP `forge_get_task` and `forge_list_tasks` return the same field.
 | `phase` | Set while `state` is `owned`: `validating`, `rebasing`, `checking`, `awaiting_carry`, `awaiting_authorization`, `fast_forwarding`, `reconciling` |
 | `position` | Members ahead of this one: `0` at the head, `n` for a waiter with `n` ahead, `null` when the Task is not in line (sent back, deferred) |
 | `wait` | Why the merge is not moving, or `null`: `{ code, message, machine_id, machine_name, retry_at }` |
-| `action_hint` | `retry` (Task action `retry`, offered as `integration_retry`), `release` (Task action `release`), `resume_project` (the Project action `POST /api/v1/projects/{id}/resume`; never a Task offer), or `null`. A hint only: `available_actions` on Task detail is the authority. `retry` is computed by the function the `integration_retry` offer is built from, so it is hinted exactly when that offer exists: a merge the queue stopped a moment ago, whose Task the park step has not told yet, reads `deferred` with no hint |
+| `action_hint` | `retry` (Task action `retry`, offered as `integration_retry`), `release` (Task action `release`), `resume_project` (the Project action `POST /api/v1/projects/{id}/resume`; never a Task offer), or `null`. A hint only: `available_actions` on Task detail is the authority. `retry` is computed by the function the `integration_retry` offer is built from, so it is hinted exactly when that offer exists: a merge the queue stopped a moment ago, whose Task the park step has not told yet, reads `deferred` with no hint A stopped merge of a paused Project hints `resume_project`, never `retry`: every `retry` is withheld while the Project is paused (`409 action_unavailable` names the pause) and is offered again once it runs. |
 | `timings` | `{ enqueued_at, head_since, rounds, queued_ms, rebase_ms, check_ms, fast_forward_ms }`. `head_since` is `null` while the Task waits; durations are cumulative over the attempt's rounds and `null` until the phase has run |
 
 `wait.code` is one of `queue` (others are ahead), `queue_suspended`,
@@ -3974,6 +3974,22 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `task_steps.in_flight` | Steps this process is executing now. |
 | `task_steps.oldest_pending_age_seconds` | Age of the oldest pending step, or `null` for an empty queue. |
 | `task_steps.last_error`, `.last_error_at`, `.restart_count` | Worker health for `worker_name = "task_steps"`, as for periodic workers. |
+
+A `merging` Task whose only merge attempt is an import quarantined for
+"missing execution or pinned workspace" (a merge that was in flight on an
+older version and cannot be continued) is parked: its condition and its
+integration summary read `deferred` / `owner_required` with that cause, and an
+Attention item is raised. The Task's existing `retry` action (reason
+`integration_retry`) admits a new attempt from the Task's present branch and
+workspace through the normal admission, with a full head check and normal
+review authority; a branch whose commit is already in the target is reported
+as merged and nothing is merged twice. `cancel` ends the Task. Nothing admits
+such a Task by itself. While the Task's Project is paused `retry` is withheld
+like every other retry and the summary hints `resume_project`.
+`integration_queues.quarantined_imports` counts import
+history rows, so it does not go down after the retry or the cancellation: the
+open Attention items are the outstanding ones. No request, response or action
+enum is added.
 
 Dead-letter history remains visible after the one-hour degraded-health window.
 IDs are stable and opaque; the stored worker/item key identifies the source for

@@ -1176,7 +1176,14 @@ impl HeadDriver {
             .is_some_and(|original| original != facts.candidate_head);
         let checked = a.checks_commit_sha.as_deref() == Some(&facts.candidate_head);
         let elapsed = millis(started, self.w.clock.now());
-        let skip_check = facts.target_in_candidate && (!rebased_by_queue || checked);
+        // Every attempt of an entry that was imported as a missing-source
+        // quarantine owes the head check, not only the attempt the owner's
+        // Retry admitted: a successor of that attempt has no more proof of
+        // its candidate than it had.
+        let retried_incomplete_import = self.w.db.retried_quarantined_import(&a.task_ref).await?;
+        let skip_check = facts.target_in_candidate
+            && (!rebased_by_queue || checked)
+            && (!retried_incomplete_import || checked);
         let lost = !facts.target_in_candidate;
         let now = self.w.clock.now();
         self.timings(&a.id, |timings| {

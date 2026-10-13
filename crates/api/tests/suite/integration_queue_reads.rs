@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use crate::common;
 #[path = "../fixtures/integration_queue.rs"]
-mod fixture;
+pub(super) mod fixture;
 use api_types::{
     IntegrationActionHint, IntegrationMemberState, IntegrationPhase, IntegrationQueueState,
     IntegrationWaitCode,

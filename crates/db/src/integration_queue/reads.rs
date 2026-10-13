@@ -2,7 +2,8 @@
 //! `forge-ctl`, the SSE projector). Plain SELECTs on the caller's executor:
 //! nothing here opens a write transaction or changes a row.
 use super::{
-    IntegrationAttemptState, IntegrationFailureKind, IntegrationPhaseTimings, IntegrationQueueState,
+    IntegrationAttemptState, IntegrationFailureKind, IntegrationPhaseTimings,
+    IntegrationQueueState, UNOWNED_QUARANTINED_IMPORT,
 };
 use crate::{DbError, Result, SqliteDb};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -137,7 +138,7 @@ where
         return Ok(Vec::new());
     }
     sqlx::query(&format!(
-        "SELECT {MEMBER_COLUMNS},{AHEAD} AS ahead FROM integration_attempt a {MEMBER_JOINS} WHERE a.task_ref IN (SELECT value FROM json_each(?)) AND {LIVE}"
+        "SELECT {MEMBER_COLUMNS},{AHEAD} AS ahead FROM integration_attempt a {MEMBER_JOINS} WHERE a.task_ref IN (SELECT value FROM json_each(?1)) AND {LIVE} UNION ALL SELECT {MEMBER_COLUMNS},{AHEAD} AS ahead FROM integration_attempt a {MEMBER_JOINS} WHERE a.task_ref IN (SELECT value FROM json_each(?1)) AND ({UNOWNED_QUARANTINED_IMPORT})"
     ))
     .bind(ids_json(task_ids)?)
     .fetch_all(executor)
