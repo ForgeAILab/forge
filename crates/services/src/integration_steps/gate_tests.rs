@@ -3422,3 +3422,39 @@ async fn retry_with_an_unpinned_legacy_execution_never_merges_without_review() {
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
+
+/// A paused Project withholds Retry, and the summary must not hint an action
+/// the action system refuses: it names the Project's resume, and Retry is
+/// hinted and offered once the Project runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quarantined_import_of_a_paused_project_hints_the_resume_and_then_retry() {
+    let world = World::new().await;
+    world.legacy_task("orphan", "orphan.txt", "merging").await;
+    sqlx::query("UPDATE project SET paused_at=? WHERE id='p'")
+        .bind(db::now_rfc3339())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.parked_quarantine("orphan").await;
+    let hint = || async {
+        crate::integration_reads::task_integration(&world.db, &world.task("orphan").await)
+            .await
+            .unwrap()
+            .unwrap()
+            .action_hint
+    };
+    let retry = ("retry".to_owned(), "integration_retry".to_owned());
+    let offers = world.offers("orphan").await;
+    assert!(!offers.contains(&retry), "{offers:?}");
+    assert!(offers.iter().any(|(verb, _)| verb == "cancel"));
+    assert_eq!(
+        hint().await,
+        Some(api_types::IntegrationActionHint::ResumeProject)
+    );
+    sqlx::query("UPDATE project SET paused_at=NULL WHERE id='p'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    assert!(world.offers("orphan").await.contains(&retry));
+    assert_eq!(hint().await, Some(api_types::IntegrationActionHint::Retry));
+}

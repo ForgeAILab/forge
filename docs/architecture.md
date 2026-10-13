@@ -5631,6 +5631,24 @@ target, and must pass normal review authority before fast-forwarding. If no
 current workspace can be recovered, Retry reports the missing source and
 keeps the park; Cancel ends the Task.
 
+The park is level-triggered and idempotent. The dispatcher's sweep asks for
+its statement only while the Task's condition does not carry it (never
+stated, or lost); a stated park is not a missing merge entry, so later passes
+and later starts write no Task step and no scheduler generation for it. A
+later admitted attempt, a Task that left the merge entry and a deleted Task
+are not the quarantine's: the predicate matches none of them. While the
+Project is paused the sweep leaves the Task to the pause, Retry is withheld
+like every other retry and the summary hints `resume_project`. A candidate
+that is already contained in the target is reported as merged after the head
+check; no commit is added to the target. Retry is refused, and the park kept,
+when the Task's worktree and branch are both gone or the machine that owns a
+daemon checkout does not answer. When the legacy execution exists but names
+no workspace, the head's review authority cannot be proven: the attempt is
+sent back to the repair state and nothing merges. Every other `corrupt_import`
+cause keeps the earlier policy: the row is history and the sweep admits the
+Task through normal admission from its present rows, or blocks it with
+`integration_admission_failed` when no candidate can be named.
+
 The continuation binds a runnable candidate, states a wait/owner action, or
 reports a landed result after the target-owner proof. A held/offline/lost-owner
 row is not readmitted merely because its candidate was unnamed. Offline P15
