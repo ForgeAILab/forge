@@ -11,15 +11,37 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Removing or replacing a coordination root's lead now cancels its live
   planning execution. Removal advances through the no-lead path; replacement
   starts the new lead once. Operations from the old execution are refused.
-- Failed planner executions now use the bounded Execution retry path that
-  coder failures use. Pausing the Agent holds a scheduled retry until resume;
-  exhausted retries leave a typed failure with an owner Retry action.
-- An unstarted subtask waiting behind an incomplete sibling now shows
-  `parent { cause: sequence }`, including when that sibling has no live run.
-  Start is not offered while the existing sequence guard would refuse it.
-  The root's state and execution policy are unchanged.
-- Project pause now exposes the existing `project_paused` typed condition on
-  children waiting for a planning root. Resume restores their parent wait.
+- **A failed planner run is retried automatically, on every Task.** A
+  planner run that fails (any Task with a planning step, with or without a
+  lead) used to leave the Task in `planning` with no run and a clear
+  condition until the owner pressed Retry Planning. It is now retried like a
+  failed coder run: at most 3 automatic retries per Task (the Task's one
+  Execution retry budget, shared with its coder runs, 10 s / 20 s / 40 s
+  apart), then the Task is blocked on `executor_failed` with a Retry action
+  and an Attention item. After the upgrade a Task that is resting on a failed
+  planner run starts its retries by itself. A run that could not be launched
+  (setup or dispatch refusal) and a run stopped by a person are not retried,
+  as before. A usage-limit failure waits for the provider's reset time as
+  before; a retry that falls due while the Agent is paused waits for the
+  Agent and shows `agent` instead of a past-due `deferred`.
+- **A subtask waiting for an earlier sibling says so, under every parent.**
+  A subtask that has not started because an earlier subtask of the same
+  parent is not done used to read `clear` and offered a Start the server
+  refused. It now reads `parked` on `parent { cause: "sequence" }` and does
+  not offer Start. `sequence` is a new value of the open string `cause`
+  (`docs/api.md`, Task condition); the web app labels it "Waiting for an
+  earlier subtask". Which subtask runs when is unchanged.
+- **Every waiting Task of a paused Project shows `project_paused`.** While a
+  Project is paused, a non-terminal Task with no run and no reason of its own
+  (it read `clear`, `deferred`, or parked on its parent or its Agent) now
+  reads `parked` on `project_paused` with `state: null`; the web app shows
+  "Project paused". A Task whose run is live stays `running`, and a Task that
+  is held, failed, blocked, waiting for a person, for its checks or in the
+  merge queue keeps its own primary reason. Resuming the Project removes the
+  reason on the scheduler's next pass and every Task shows what it showed
+  before. The reason is never shown for a Project that is not paused. Existing
+  databases are refreshed once in the background after the upgrade (condition
+  mapping revision 7), in slices, without blocking startup.
 - Hold and Cancel are offered while a root waits for the owner's answer to
   its lead's question, including after the asking execution has ended.
   Release preserves the pending question and waits for the answer.
@@ -3267,7 +3289,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   The root's two recoveries per subtask remain charged and bounded.
 
 - Startup recovery reclaims orphaned executions in planning, review and
-  inherited step-check gates as well as implementation states.
+  inherited step-check gates as well as implementation states. It reads the
+  running executions instead of every open Task, so a start with nothing to
+  recover costs one query and writes nothing. An Agent heartbeat timeout
+  still stops the runs of Tasks in implementation states only.
+- A Task whose run is live no longer loses its `running` condition when its
+  Project is paused.
 - Project pause keeps a visible typed park on children waiting for a held
   planning root; resume restores the parent wait when it still applies.
   Owned check and integration results retain their authority under that

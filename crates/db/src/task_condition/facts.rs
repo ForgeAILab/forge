@@ -390,7 +390,7 @@ impl Families {
         &SQL.get_or_init(|| {
             (0..8usize)
                 .map(|bits| {
-                    let mut columns = String::from("t.error_annotation,t.blocked_json,t.failed_json,t.entry_barrier_json,t.metadata_json,t.condition_json,t.version,t.status,t.status_epoch,t.created_at,t.parent_task_id,t.project_id,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
+                    let mut columns = String::from("t.error_annotation,t.blocked_json,t.failed_json,t.entry_barrier_json,t.metadata_json,t.condition_json,t.version,t.status,t.status_epoch,t.created_at,t.parent_task_id,t.project_id,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT paused_at FROM project WHERE id=t.project_id) IS NULL)) AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
                     let mut joins = String::new();
                     if bits & 1 != 0 {
                         // An engine or board entry logs its epoch and is the
@@ -447,7 +447,7 @@ impl Snapshot {
             Err(sqlx::Error::Database(e))
                 if e.message().contains("no such table: task_schedule_park") =>
             {
-                let old = query.replace("(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS owner_park", "NULL AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
+                let old = query.replace("(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT paused_at FROM project WHERE id=t.project_id) IS NULL)) AS owner_park", "NULL AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
                 sqlx::query(&old).bind(id).fetch_optional(&mut *c).await?
             }
             Err(e) => return Err(e.into()),

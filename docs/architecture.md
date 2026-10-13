@@ -5923,7 +5923,12 @@ while the Project is paused, a child waiting on its parent shows
 `project_paused` instead. Resume restores the parent wait if it still applies.
 Every non-terminal child retains a typed park through either change. A
 `project_paused` scheduler park has `state: null` and its exit is Resume Project,
-only while that Project is actually paused. It is restated from the scheduler
+only while that Project is actually paused: the condition reader ignores a
+pause record whose Project has no `paused_at` (`Families::sql`,
+`set_condition`), so a record a resumed Project left behind states nothing
+and the invariant check repairs a condition that still shows it. A Task whose
+run or state entry is live keeps `running` / `entering` under a pause
+(`ConditionFacts::apply`); the pause becomes its park when the run ends. It is restated from the scheduler
 record, never carried by a check or integration statement. The condition write
 compares against that record under the current Task epoch in the same
 transaction; observer waits never invalidate an owned result. Thus: a check wait still owns its result
@@ -5934,9 +5939,10 @@ condition or status marks its children for the scheduler). A Task whose Agent ca
 take work is shown the same way: `Reason::AgentWait` is a visible schedule
 park and the stored condition is `parked` on `agent { agent_id, status }`
 (the Agent's effective status), cleared on the pass that finds the Agent
-available. A due execution retry or queued action keeps its continuation
-while it shows the Project, parent or Agent park; removing that park never
-loses the accepted retry. A Task past its initial state whose Agent is at its run limit
+available. A retry (queued action or deadline) keeps its continuation while
+it shows the Project or Agent park, and a queued action while it shows the
+parent park; removing that park never loses the accepted retry. A retry
+deadline under a parent or capacity wait stays `deferred`. A Task past its initial state whose Agent is at its run limit
 resolves `Reason::AgentCapacity`, also a visible schedule park: its stored
 condition is `parked` on `capacity { scope: agent }` and it is woken by the
 Agent's wait record when a run ends. A Task still waiting for its first run
@@ -6181,7 +6187,9 @@ retry of the same key is not charged again.
 A lead's Retry opens a fresh budget window on the subtask, including
 `gate:lead_check`; the root's `lead_recover:<subtask>` charge stays in the
 root's window. A queued role Retry that still carries gate spending records
-one `retry_window_reset` before validation, identified by its queue ID.
+one `retry_window_reset` before validation, identified by its queue ID, and
+only when the actor that accepted it is the root's lead (the offer names the
+lead for every caller, so the offer alone does not say who accepted it).
 Redelivery sees that reset and never opens another window.
 
 A recovery the lead accepts while its root plans is not replayed against the
@@ -7415,9 +7423,14 @@ the terminal CAS for embedded owner-lease expiry or a reached hard deadline.
 A separate semantic-progress scan emits warnings without terminalizing a live
 owner. Hard deadlines are recovered distinctly from ordinary owner-lease expiry.
 
-Startup crash recovery scans every non-terminal Task under its effective
-workflow, including the planning gate, review gates and the inherited
-`lead_check` gate (which need not be in the Project workflow). It marks every
+Startup crash recovery starts from the running executions (one query, then
+one read per Task that has one; `recovery::tasks_with_running_executions`),
+so its cost follows the number of interrupted runs, not the number of Tasks,
+and a start with nothing to recover writes nothing. It covers every
+non-terminal state of the Task's effective workflow, including the planning
+gate, review gates and the inherited `lead_check` gate (which need not be in
+the Project workflow). An Agent heartbeat timeout is narrower: it stops the
+runs of that Agent's Tasks in implementation states only. Startup recovery marks every
 interrupted execution whose terminal CAS it wins with `resume_policy = auto`,
 regardless of its workflow state or whether the attempt has a reusable runtime
 session. It leaves

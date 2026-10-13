@@ -669,10 +669,18 @@ pub(super) fn apply_owner_park(condition: TaskCondition, raw: Option<&Value>) ->
                 resume,
                 mut evidence,
                 ..
-            } => {
-                // A queued action or a due execution retry retains its
-                // continuation while the Project, parent or Agent holds it.
-                // State that typed wait without dropping the accepted intent.
+            } if matches!(
+                &reason,
+                ParkReason::ProjectPaused { .. } | ParkReason::Agent { .. }
+            ) || (matches!(&reason, ParkReason::Parent { .. })
+                && matches!(&resume, ConditionContinuation::ResumeQueuedCommand { .. })) =>
+            {
+                // An accepted role action remains queued while the root
+                // plans or an earlier sibling runs, and a retry (queued or
+                // by deadline) is held while the Project is paused or the
+                // Agent cannot take work. State that typed wait without
+                // losing the continuation. A retry deadline under a parent
+                // or capacity wait stays the Task's own timer.
                 evidence
                     .presentation
                     .get_or_insert_with(Default::default)

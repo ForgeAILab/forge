@@ -1664,7 +1664,9 @@ impl SqliteDb {
         // in this transaction, so a pause/parent/Agent wait cannot make an
         // otherwise valid check or integration statement disagree with itself.
         let owner_park: Option<String> = sqlx::query_scalar(
-            "SELECT reason_json FROM task_schedule_park WHERE task_id=? AND epoch=?",
+            // The pause record counts only while the Project is paused: the
+            // same rule as the snapshot the producer reads (`Families::sql`).
+            "SELECT reason_json FROM task_schedule_park WHERE task_id=?1 AND epoch=?2 AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT p.paused_at FROM project p JOIN task t ON t.project_id=p.id WHERE t.id=?1) IS NULL)",
         )
         .bind(task_id)
         .bind(row.get::<i64, _>(8))

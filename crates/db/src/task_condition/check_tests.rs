@@ -326,6 +326,11 @@ async fn scheduler_project_pause_does_not_override_or_outlive_a_check() {
     let db = db().await;
     let id = "check-project-pause";
     task(&db, id).await;
+    sqlx::query("UPDATE project SET paused_at=? WHERE id='p'")
+        .bind(crate::now_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
     let step = claim(&db, id).await;
     crate::task_writer::in_task_step(step, async {
         db.record_schedule_park(id, 0, &json!({"reason":"ProjectPaused"}).to_string())
@@ -364,4 +369,49 @@ async fn scheduler_project_pause_does_not_override_or_outlive_a_check() {
         db.check_task_condition_invariant(&resumed).await.unwrap();
     })
     .await;
+}
+
+/// The pause record is a park only while the Project is paused. A record a
+/// resumed Project left behind (older builds never removed it) states
+/// nothing, and the invariant check repairs a condition that still shows it.
+#[tokio::test]
+async fn a_pause_record_is_no_park_unless_the_project_is_paused() {
+    let db = db().await;
+    let id = "stale-project-pause";
+    task(&db, id).await;
+    let paused_on = |task: &Task| {
+        task.condition
+            .reasons()
+            .any(|reason| matches!(reason, ParkReason::ProjectPaused { state: None }))
+    };
+    let pause = json!({"reason":"ProjectPaused", "owner":"User", "action":"ResumeProject"});
+    db.record_schedule_park(id, 0, &pause.to_string())
+        .await
+        .unwrap();
+    let stale = read(&db, id).await;
+    assert!(!paused_on(&stale), "{:?}", stale.condition);
+    db.check_task_condition_invariant(&stale).await.unwrap();
+
+    sqlx::query("UPDATE project SET paused_at=? WHERE id='p'")
+        .bind(crate::now_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions_of(&[id.to_owned()]).await.unwrap();
+    let paused = read(&db, id).await;
+    assert!(paused_on(&paused), "{:?}", paused.condition);
+    db.check_task_condition_invariant(&paused).await.unwrap();
+
+    // Resumed, and the scheduler has not passed over the Task yet.
+    sqlx::query("UPDATE project SET paused_at=NULL WHERE id='p'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db.check_task_condition_invariant(&paused).await.is_err());
+    assert_eq!(
+        db.check_task_conditions_of(&[id.to_owned()]).await.unwrap(),
+        1
+    );
+    let resumed = read(&db, id).await;
+    assert!(!paused_on(&resumed), "{:?}", resumed.condition);
 }
