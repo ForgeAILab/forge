@@ -10,7 +10,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const BEFORE: i64 = 202610121119;
+/// The migration before this one in the bundle.
+const BEFORE: i64 = 202610122352;
 const THIS: i64 = 202610130038;
 
 fn temp(name: &str) -> PathBuf {
@@ -49,6 +50,73 @@ async fn rows(pool: &db::SqlitePool) -> Vec<String> {
     .into_iter()
     .map(|row| row.get::<String, _>("line"))
     .collect()
+}
+
+/// The shape of `task_comment` that must not change: columns (order, type,
+/// NOT NULL, default, primary key), foreign keys, and every index and trigger
+/// with its definition. The table's own SQL is left out: its CHECK is what
+/// the migration changes.
+async fn shape(pool: &db::SqlitePool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for row in sqlx::query("PRAGMA table_info(task_comment)")
+        .fetch_all(pool)
+        .await
+        .expect("columns read")
+    {
+        lines.push(format!(
+            "column {} {} {} notnull={} default={:?} pk={}",
+            row.get::<i64, _>("cid"),
+            row.get::<String, _>("name"),
+            row.get::<String, _>("type"),
+            row.get::<i64, _>("notnull"),
+            row.get::<Option<String>, _>("dflt_value"),
+            row.get::<i64, _>("pk"),
+        ));
+    }
+    let mut keys = Vec::new();
+    for row in sqlx::query("PRAGMA foreign_key_list(task_comment)")
+        .fetch_all(pool)
+        .await
+        .expect("foreign keys read")
+    {
+        keys.push(format!(
+            "fk {}.{} -> {}.{} on_delete={}",
+            "task_comment",
+            row.get::<String, _>("from"),
+            row.get::<String, _>("table"),
+            row.get::<Option<String>, _>("to").unwrap_or_default(),
+            row.get::<String, _>("on_delete"),
+        ));
+    }
+    keys.sort();
+    lines.extend(keys);
+    for row in sqlx::query(
+        "SELECT type, name, COALESCE(sql, '') AS sql FROM sqlite_master
+         WHERE tbl_name='task_comment' AND type IN ('index', 'trigger') ORDER BY type, name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("indexes and triggers read")
+    {
+        lines.push(format!(
+            "{} {} {}",
+            row.get::<String, _>("type"),
+            row.get::<String, _>("name"),
+            row.get::<String, _>("sql")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+    }
+    // Nothing else in the database refers to the table by name.
+    let referrers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name <> 'task_comment' AND sql LIKE '%task_comment%'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("referrers read");
+    lines.push(format!("referrers {referrers}"));
+    lines
 }
 
 #[tokio::test]
@@ -130,8 +198,19 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
     // Before the migration the two kinds are refused.
     assert!(sqlx::query("INSERT INTO task_comment (id, task_id, author_type, author_name, content, worklog_kind, created_at, updated_at) VALUES ('early', 'task', 'agent', 'lead', 'note', 'handoff', ?, ?)")
         .bind(now).bind(now).execute(&pool).await.is_err());
+    // A long body, and a comment of a Task that was deleted (soft: its
+    // comments stay; a hard delete cascades and leaves none to migrate).
+    sqlx::query("INSERT INTO task (id, project_id, title, task_type, status, deleted_at, created_at, updated_at) VALUES ('gone', 'project', 'G', 'task', 'todo', ?, ?, ?)")
+        .bind(now).bind(now).bind(now).execute(&pool).await.expect("deleted task inserts");
+    sqlx::query("INSERT INTO task_comment (id, task_id, author_type, author_name, content, created_at, updated_at) VALUES ('c7', 'gone', 'user', 'owner', ?, ?, ?)")
+        .bind("long \u{e9}\u{4e2d} ".repeat(40_000)).bind(now).bind(now).execute(&pool).await.expect("long comment inserts");
     let before = rows(&pool).await;
-    assert_eq!(before.len(), 6);
+    assert_eq!(before.len(), 7);
+    let shape_before = shape(&pool).await;
+    assert!(
+        shape_before.contains(&"referrers 0".to_owned()),
+        "{shape_before:?}"
+    );
 
     run_migrations_from(&pool, &all_dir)
         .await
@@ -144,6 +223,18 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
         before,
         "every row and column value is kept"
     );
+
+    assert_eq!(
+        shape(&pool).await,
+        shape_before,
+        "columns, foreign keys, indexes and triggers are what they were"
+    );
+    let ddl: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_comment'")
+            .fetch_one(&pool)
+            .await
+            .expect("table reads");
+    assert!(ddl.contains("'handoff', 'request_input'"), "{ddl}");
 
     let indexes: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_comment' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -211,7 +302,7 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
             .fetch_one(&pool)
             .await
             .expect("count reads"),
-        8
+        9
     );
     pool.close().await;
     let _ = fs::remove_file(path);

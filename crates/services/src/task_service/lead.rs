@@ -779,6 +779,11 @@ impl TaskService {
         let task = Self::lead_subtask_target(&binding, target)?;
         let actor = Actor::agent(&run.identity_id);
         let bound = db::budget::lead_recover_key(&task.id);
+        // The charge is identified by the request, not by the key alone: the
+        // key is the lead's own, and one key sent again with each new version
+        // of the subtask is a new recovery and is charged as one.
+        let request = format!("{key}:v{version}");
+        let key = request.as_str();
         // A retry of the same request after it was applied.
         if task.version != version
             && db::budget::receipt_recorded(self.db.pool(), &binding.root.id, &bound, key).await?

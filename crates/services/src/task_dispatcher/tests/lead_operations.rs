@@ -1565,3 +1565,60 @@ async fn a_question_of_a_deleted_root_is_resolved_without_an_answer_target() {
         .unwrap();
     assert_eq!(resolved.status, "resolved");
 }
+
+/// The recover bound counts recoveries, not keys: the call's key is the
+/// lead's own, and sending the same key with each new version of the subtask
+/// must not make the second and third recovery free.
+#[tokio::test]
+async fn a_reused_key_does_not_make_a_recovery_free() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let (root, child, _) = root_with_parked_child(lead, true).await;
+    until(lead, "the root plans", async || {
+        running(lead, &root.id, PLANNER).await
+    })
+    .await;
+    let bound = db::budget::lead_recover_key(&child.id);
+    for round in 1..=2_i64 {
+        let parked = reload(&lead.db, &child.id).await;
+        ops.call(
+            &root.id,
+            "lead.recover",
+            json!({"task_id": child.id, "action": {"verb": "retry"}, "version": parked.version}),
+            "same-key",
+        )
+        .await
+        .unwrap();
+        assert_eq!(spent(lead, &root.id, &bound).await, round);
+        // The subtask is parked again by the same failure.
+        TaskRepo::mutate_metadata(
+            &*lead.db,
+            &child.id,
+            None,
+            vec![db::TaskMetadataMutation::Remove {
+                key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+            }],
+            &now_rfc3339(),
+        )
+        .await
+        .unwrap();
+        super::root_replan::park_child(lead, &child, "the build fails again").await;
+        assert!(
+            crate::task_hierarchy::subtask_decision_park(&reload(&lead.db, &child.id).await)
+                .is_some(),
+            "the fixture parks the subtask again"
+        );
+    }
+    let parked = reload(&lead.db, &child.id).await;
+    let refused = ops
+        .call(
+            &root.id,
+            "lead.recover",
+            json!({"task_id": child.id, "action": {"verb": "retry"}, "version": parked.version}),
+            "same-key",
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("lead_limit_reached"), "{refused}");
+    assert_eq!(spent(lead, &root.id, &bound).await, 2);
+}
