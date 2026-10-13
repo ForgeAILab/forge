@@ -5325,6 +5325,54 @@ async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
     .await;
 }
 
+/// Reached by `FORGE_MODEL_SEED=974622785` on a slow CI runner and fixed;
+/// the sequence below is that seed's without its crash. The crash only chose
+/// the history: on the runner the lead's planning run was committed before
+/// the crash, so the root went on to coordinate and subtask 2 started; on a
+/// fast host the crash wins and the seed never gets there.
+///
+/// The owner approves the running subtask twice. A user acts under the
+/// Project workflow, so the first approval moves the subtask to `review`
+/// (a state the inherited subtask workflow does not have), where it parks
+/// with nothing to review; the second passes that gate into `merging`. A
+/// subtask does not merge: the `run_merge` entry answered `Skipped`, and the
+/// dispatcher's admission sweep takes root Tasks only, so the subtask rested
+/// in `merging` with a `clear` condition, no step and no park. It now ends
+/// `done` there (its work lands with the root's merge), from the entry and
+/// from any later dispatcher pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subtask_approved_into_the_merge_state_finishes() {
+    use Action::{AdvanceClock, AssignLead, CreateLeadRoot, Finish, Take};
+    let name = "the owner approves a subtask through review into merging";
+    let sequence = vec![
+        step(CreateLeadRoot),
+        step(AssignLead(0)),
+        step(Finish(2, Outcome::UsageLimit)),
+        step(Take(1, "cancel")),
+        step(AdvanceClock),
+        step(Finish(2, Outcome::Success)),
+        step(Take(2, "approve")),
+        step(Take(2, "approve")),
+    ];
+    let trace = run(&sequence, false)
+        .await
+        .unwrap_or_else(|failure| panic!("{}", report(name, &sequence, &failure)));
+    // The sequence must walk the history it names, or it proves nothing.
+    assert!(
+        trace[5].contains("2:in_progress/running/")
+            && trace[6].contains("-> approve:")
+            && trace[6].contains("2:review/parked/failure(review_candidate_missing)")
+            && trace[7].contains("-> approve:"),
+        "{name}: the subtask did not reach its merge state\n{}",
+        trace.join("\n")
+    );
+    assert!(
+        trace[7].contains(" 2:done/settled/"),
+        "{name}: the subtask did not finish\n{}",
+        trace.join("\n")
+    );
+}
+
 /// Reached by `FORGE_MODEL_LONG=1 FORGE_MODEL_SEED=951857209` and fixed;
 /// minimized below. Task 3's review is rejected (scripted) while other Tasks
 /// hold the coder's runs; it goes back to `in_progress` and stayed there with

@@ -696,6 +696,15 @@ impl TaskDispatcher {
                     r.integration_statement.as_ref(),
                     &r.condition,
                 ));
+        // Level-triggered: whatever left a subtask in a merge state (an
+        // entry that skipped, a move without hooks), every pass asks until
+        // it has left. No merge service is needed to finish it.
+        f.subtask_in_merge_state = t.parent_task_id.is_some()
+            && merge_state
+            && !f.disposition_current
+            && !f.blocking
+            && !f.paused
+            && crate::integration_steps::gate::task_row_gate(t).is_none();
         Prepared {
             read: r,
             workflow: w,

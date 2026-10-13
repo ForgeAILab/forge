@@ -32,6 +32,11 @@ pub(crate) fn merge_state(workflow: &api_types::WorkflowDefinition, name: &str) 
         })
 }
 
+/// Why a subtask leaves a merge state without an attempt (the transition
+/// reason of the entry hook and of the sweep).
+pub(crate) const SUBTASK_HAS_NO_MERGE: &str =
+    "subtasks do not merge: the work lands with the root Task's merge";
+
 /// The state a merge outcome moves the Task to, by role. The merge hook and
 /// its steps name their targets as the default workflow does (`done`,
 /// `merge_failed`, `review`). A workflow that defines a state of that name
@@ -267,8 +272,45 @@ impl crate::TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
     }
 
+    /// A subtask resting in a merge state (its entry answered before the
+    /// hook finished subtasks, a manual move entered without hooks, the
+    /// entry's cascade was lost): it has nothing to admit, so it leaves by
+    /// the state's landed-merge target, as its entry hook does. The guards
+    /// are the admission's own: not a Task its owner stopped, and not an
+    /// entry whose hooks are still to run. `Ok(true)`: the subtask moved.
+    async fn finish_subtask_in_merge_state(
+        &self,
+        task: &db::Task,
+        workflow: &api_types::WorkflowDefinition,
+    ) -> Result<bool> {
+        if super::gate::task_gate(&self.db, &task.id).await?.is_some()
+            || db::TaskStepRepo::entry_hooks_pending(&*self.db, &task.id).await?
+        {
+            return Ok(false);
+        }
+        Box::pin(self.transition(
+            task.id.clone(),
+            role_target(
+                workflow,
+                &task.status,
+                crate::workflow::default_states::DONE,
+            ),
+            crate::task_service::TransitionOptions {
+                bridge: Default::default(),
+                version: task.version,
+                reason: Some(SUBTASK_HAS_NO_MERGE.to_owned()),
+                triggered_by: crate::worker_runtime::queue::cascade_actor(),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        ))
+        .await?;
+        Ok(true)
+    }
+
     /// The reconciler's step for one Task (`Step::AdmitIntegration`): admit a
-    /// Task that is in a merge state and has no attempt anything owns.
+    /// Task that is in a merge state and has no attempt anything owns. A
+    /// subtask is not admitted: it finishes (`finish_subtask_in_merge_state`).
     /// Every condition is read again here, under the Task's step lease.
     /// `Ok(true)`: the Task has a queued attempt now.
     pub(crate) async fn reconcile_integration_admission(&self, task: &db::Task) -> Result<bool> {
@@ -291,7 +333,7 @@ impl crate::TaskService {
         let Some(task) = TaskRepo::get_by_id(&*self.db, &task.id, false).await? else {
             return Ok(false);
         };
-        if task.parent_task_id.is_some() || task.archived_at.is_some() {
+        if task.archived_at.is_some() {
             return Ok(false);
         }
         let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
@@ -304,6 +346,9 @@ impl crate::TaskService {
         );
         if !merge_state(&workflow, &task.status) {
             return Ok(false);
+        }
+        if task.parent_task_id.is_some() {
+            return self.finish_subtask_in_merge_state(&task, &workflow).await;
         }
         let owned: bool = self.db.integration_reconcile_task_owned(&task.id).await?;
         // Rebind stale released owners through admission first. Healthy

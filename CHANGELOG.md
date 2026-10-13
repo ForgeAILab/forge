@@ -24,6 +24,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   as before. A usage-limit failure waits for the provider's reset time as
   before; a retry that falls due while the Agent is paused waits for the
   Agent and shows `agent` instead of a past-due `deferred`.
+- **A subtask moved into `merging` finishes `done`.** A subtask its owner
+  approved through `review` into `merging` (or moved there by hand) used to
+  rest there with a `clear` condition, no step and no park: subtasks do not
+  merge, and the merge entry skipped them. The entry now moves it to the
+  merge state's landed-merge target (`done`), its work landing with the root
+  Task's merge, and every dispatcher pass does the same for a subtask already
+  resting there (after the upgrade such a subtask finishes by itself).
 - **A subtask waiting for an earlier sibling says so, under every parent.**
   A subtask that has not started because an earlier subtask of the same
   parent is not done used to read `clear` and offered a Start the server
