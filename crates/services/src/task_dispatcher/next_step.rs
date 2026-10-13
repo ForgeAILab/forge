@@ -432,7 +432,7 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         }
         return Next::Step(Step::QueuedRecovery);
     }
-    if f.integrate && !f.blocking {
+    if f.integrate && !f.blocking && !f.disposition_current {
         return Next::Step(Step::Integrate);
     }
     // Level-triggered admission. It replaces the entry replay
@@ -445,6 +445,13 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         return Next::Step(Step::AdmitIntegration);
     }
     if let Some(target) = &f.review_refresh {
+        // An interrupted hop is recoverable only while no owner blocker or
+        // recorded refusal owns it. In particular, a failed cascade already
+        // raised Attention and offers Restart/Cancel; replaying its unchanged
+        // guard failure would append command history on every sweep.
+        if f.blocking || f.disposition_current {
+            return condition_park(s.condition);
+        }
         return Next::Step(Step::ReviewRefresh {
             target: target.clone(),
         });

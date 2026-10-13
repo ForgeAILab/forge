@@ -4665,6 +4665,24 @@ If review authority cannot carry to the rebased commit, a `needs_review`
 send-back still goes through repair to fresh review. Rows of that shape written
 before the upgrade are still read (history, budgets, the review-entry carry).
 
+An interrupted review-refresh hop is recovered by one durable cascade keyed
+to the Task's status entry and reviewer target. Its retries use the Task-step
+worker's eight-attempt bound; a refused guard or exhausted recovery records
+the existing `cascade_failed` owner park and raises Attention. The dispatcher
+honors that park (and any other owner blocker or current dispatch refusal)
+before asking for a refresh again. Unchanged passes append no commands or
+scheduler generations. Restart begins again from the coder with fresh
+execution provenance; Cancel ends the Task. A missing historical Review row
+alone does not prevent the normal fresh-review hop.
+
+The paused-integration resume hop uses the same entry-keyed cascade and honors
+a current refusal. Merge admission also honors an unchanged admission refusal,
+and records one when no merge service is configured, while still repairing a
+missing or stale integration statement. An accepted
+role Retry probes machine capacity before issuing its replay command: while
+the slot is full it keeps the accepted intent and its existing capacity park.
+The machine's release or capacity change lets the normal replay proceed.
+
 What the entry hook still decides itself, before the queue: a subtask, a Task
 without a worktree or a server without a merge service is skipped as before; a
 handed-off conflict file that still adds conflict markers blocks the Task for

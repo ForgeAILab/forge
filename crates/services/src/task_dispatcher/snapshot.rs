@@ -657,6 +657,11 @@ impl TaskDispatcher {
             .is_some_and(|statement| statement["current"] == false);
         f.missing_merge_entry = t.parent_task_id.is_none()
             && merge_state
+            && (!f.disposition_current
+                || crate::integration_steps::reconcile::statement_stale(
+                    r.integration_statement.as_ref(),
+                    &r.condition,
+                ))
             && ((!r.integration_owned && !import_park)
                 || crate::integration_steps::reconcile::statement_stale(
                     r.integration_statement.as_ref(),

@@ -3421,6 +3421,21 @@ async fn retry_with_an_unpinned_legacy_execution_never_merges_without_review() {
     }
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let dispatcher = dispatcher(&world).await;
+    dispatcher.reconcile_all().await.unwrap();
+    world.service.drain("orphan").await.unwrap();
+    let before = world.bookkeeping("orphan").await;
+    for _ in 0..20 {
+        dispatcher.reconcile_all().await.unwrap();
+        world.service.drain("orphan").await.unwrap();
+        assert_eq!(world.bookkeeping("orphan").await, before);
+    }
+    let parked = world.task("orphan").await;
+    assert_eq!(
+        parked.condition.read().failure_kind,
+        Some(api_types::FailureKind::CascadeFailed)
+    );
+    assert!(db::material_blocker(&parked.condition).requires_intervention);
 }
 
 /// A paused Project withholds Retry, and the summary must not hint an action

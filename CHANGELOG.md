@@ -3244,6 +3244,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Interrupted review-refresh recovery now uses one entry-keyed durable cascade and honors existing failure parks. An unrecoverable `merge_failed` Task raises Attention with Restart/Cancel instead of appending two failed recovery commands on every dispatcher pass; transient recovery uses the Task-step worker's bounded retries.
+- Paused-integration resume, unchanged merge-admission refusals, and accepted role retries waiting for machine capacity no longer append recovery/admission commands on every dispatcher pass. Accepted retries keep their intent and proceed when capacity is released.
 - Legacy merge imports missing their execution or pinned workspace now park their Tasks as `deferred/owner_required`, with the retained cause, Attention, an integration summary, Retry and Cancel. This also repairs quarantines from an earlier start. Retry admits the Task's present branch through normal admission and performs a full head check; it never merges the import's old candidate blindly.
 - After the owner's Retry of a quarantined import, a later admission of the same merge entry (its placement was verified again) no longer blocks the Task with `integration_admission_failed` for the execution it never had, and the attempt that replaces the retried one still runs the head check.
 - A Task parked for a quarantined import adds no Task-step row and no scheduler generation on later dispatcher passes or starts (the sweep used to ask for its admission at every pass).
