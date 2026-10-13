@@ -331,7 +331,6 @@ impl CrashRecovery {
         tracing::info!(recovered_tasks = recovered, "crash recovery completed");
         Ok(recovered)
     }
-
 }
 
 async fn reconcile_unreplayable_local_usage_invocations(db: &SqliteDb) -> Result<u64> {

@@ -336,12 +336,8 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
             .bind(task_id)
             .execute(&mut **transaction)
             .await?;
-        crate::task_condition::produce(
-            &mut **transaction,
-            task_id,
-            crate::ConditionChange::Legacy,
-        )
-        .await?;
+        crate::task_condition::produce(transaction, task_id, crate::ConditionChange::Legacy)
+            .await?;
     }
     sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
         .bind(project_id)

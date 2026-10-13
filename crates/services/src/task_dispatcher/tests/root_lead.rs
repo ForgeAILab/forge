@@ -1441,15 +1441,34 @@ async fn a_project_pause_parks_fifty_mixed_tasks_and_resume_leaves_none_parked_o
     let lead = lead_fixture(false).await;
     let mut tasks = Vec::new();
     for n in 0..12 {
-        tasks.push(seed_task(&lead.db, &lead.project, &format!("backlog {n}"), "backlog", 1).await);
+        tasks.push(
+            seed_task(
+                &lead.db,
+                &lead.project,
+                &format!("backlog {n}"),
+                "backlog",
+                1,
+            )
+            .await,
+        );
         tasks.push(seed_task(&lead.db, &lead.project, &format!("todo {n}"), "todo", 1).await);
     }
     let mut failed = Vec::new();
     for n in 0..6 {
-        let task =
-            seed_task(&lead.db, &lead.project, &format!("failed {n}"), "in_progress", 1).await;
+        let task = seed_task(
+            &lead.db,
+            &lead.project,
+            &format!("failed {n}"),
+            "in_progress",
+            1,
+        )
+        .await;
         assign_role(&lead.db, &task.id, "coder", &lead.coder).await;
-        failed.push(super::root_replan::park_child(&lead, &task, "failed work").await.id);
+        failed.push(
+            super::root_replan::park_child(&lead, &task, "failed work")
+                .await
+                .id,
+        );
         tasks.push(task);
     }
     let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
@@ -1483,7 +1502,12 @@ async fn a_project_pause_parks_fifty_mixed_tasks_and_resume_leaves_none_parked_o
     for (task, (_, runs)) in tasks.iter().zip(&before) {
         let task = reload(&lead.db, &task.id).await;
         // The pause starts nothing.
-        assert_eq!(&executions(&lead.db, &task.id).await, runs, "{}", task.title);
+        assert_eq!(
+            &executions(&lead.db, &task.id).await,
+            runs,
+            "{}",
+            task.title
+        );
         if runs.iter().any(|(_, status)| status == "running") {
             // A live run stays `running`: the pause holds future dispatch.
             assert!(

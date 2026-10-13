@@ -411,10 +411,11 @@ async fn a_pause_record_is_no_park_unless_the_project_is_paused() {
     assert!(!paused_on(&resumed), "{:?}", resumed.condition);
     db.check_task_condition_invariant(&resumed).await.unwrap();
     assert!(db.task_condition_violations().await.unwrap().is_empty());
-    let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_schedule_park WHERE task_id=?")
-        .bind(id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+    let records: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_schedule_park WHERE task_id=?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     assert_eq!(records, 0);
 }
