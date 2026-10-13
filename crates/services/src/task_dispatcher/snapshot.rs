@@ -645,9 +645,19 @@ impl TaskDispatcher {
         // Read from the attempt row, not from the condition: an imported
         // row whose statement was refused has a row and no witness, and a
         // superseded attempt leaves a witness and no row.
+        // A quarantined import that is the Task's only attempt is owned by
+        // nothing and is never admitted by the sweep: its owner's Retry is.
+        // Once its park is stated there is nothing to do for it, so the
+        // sweep asks only while the statement is missing or stale. Asking at
+        // every pass would write a command step and a scheduler generation
+        // per pass, for ever.
+        let import_park = r
+            .integration_statement
+            .as_ref()
+            .is_some_and(|statement| statement["current"] == false);
         f.missing_merge_entry = t.parent_task_id.is_none()
             && merge_state
-            && (!r.integration_owned
+            && ((!r.integration_owned && !import_park)
                 || crate::integration_steps::reconcile::statement_stale(
                     r.integration_statement.as_ref(),
                     &r.condition,
