@@ -3088,3 +3088,183 @@ pub(super) async fn list_page(
     };
     page_from_items(items, &query.page, offset, total)
 }
+
+impl SqliteDb {
+    pub async fn workspace_cleanup_task_ids_after(
+        &self,
+        after: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        let result =
+            sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE id > ? ORDER BY id LIMIT ?")
+                .bind(after)
+                .bind(limit)
+                .fetch_all(self.pool())
+                .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskOperatorConditionRow {
+    pub id: String,
+    pub title: String,
+    pub condition_json: String,
+    pub updated_at: String,
+}
+
+impl SqliteDb {
+    pub async fn tasks_with_exhausted_infrastructure_checks(
+        &self,
+    ) -> crate::Result<Vec<TaskOperatorConditionRow>> {
+        let rows = sqlx::query(
+            "SELECT id, title, condition_json, updated_at FROM task
+             WHERE condition_json LIKE '%infrastructure_exhausted%'
+               AND deleted_at IS NULL AND archived_at IS NULL
+               AND status NOT IN ('done', 'cancelled')
+             ORDER BY updated_at DESC, id ASC LIMIT 50",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TaskOperatorConditionRow {
+                    id: row.try_get("id")?,
+                    title: row.try_get("title")?,
+                    condition_json: row.try_get("condition_json")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl SqliteDb {
+    pub async fn open_tasks_with_retired_auditor(&self) -> crate::Result<Vec<String>> {
+        let result = sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND status NOT IN ('done','cancelled') AND task_state_config IS NOT NULL AND json_valid(task_state_config) AND COALESCE(json_extract(task_state_config,'$.review.auditor_agent_id'), json_extract(task_state_config,'$.auditor_agent_id')) IS NOT NULL ORDER BY id LIMIT 11")
+            .fetch_all(self.pool()).await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockedTaskOperatorRow {
+    pub id: String,
+    pub title: String,
+    pub condition_json: String,
+    pub updated_at: String,
+}
+
+impl SqliteDb {
+    pub async fn blocked_task_operator_rows(&self) -> crate::Result<Vec<BlockedTaskOperatorRow>> {
+        let rows = sqlx::query("SELECT id, title, condition_json, updated_at
+             FROM task
+             WHERE (status = 'blocked' OR json_extract(condition_json,'$.evidence.presentation.interruption_present') = 1)
+               AND deleted_at IS NULL
+               AND archived_at IS NULL
+               AND status NOT IN ('done', 'cancelled')
+             ORDER BY updated_at DESC, id ASC")
+.fetch_all(self.pool()).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(BlockedTaskOperatorRow {
+                    id: row.try_get("id")?,
+                    title: row.try_get("title")?,
+                    condition_json: row.try_get("condition_json")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskOperatorRetryRow {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub condition_json: String,
+    pub attempt_count: i64,
+    pub execution_spent: i64,
+    pub last_error: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn task_operator_retry_rows(&self) -> crate::Result<Vec<TaskOperatorRetryRow>> {
+        let rows = sqlx::query("SELECT
+                t.id AS task_id,
+                t.title,
+                t.status,
+                t.condition_json,
+                COUNT(tl.id) AS attempt_count,
+                COALESCE((
+                    SELECT b.spent FROM task_budget b
+                    WHERE b.task_id = t.id AND b.kind = 'execution'
+                ), 0) AS execution_spent,
+                (
+                    SELECT e.error
+                    FROM execution e
+                    WHERE e.task_id = t.id AND e.status = 'failed'
+                    ORDER BY COALESCE(e.stopped_at, e.updated_at) DESC, e.id DESC
+                    LIMIT 1
+                ) AS last_error
+             FROM task t
+             LEFT JOIN transition_log tl ON tl.task_id = t.id AND tl.rejection = 1
+             WHERE t.deleted_at IS NULL
+               AND t.status NOT IN ('done', 'cancelled')
+             GROUP BY t.id, t.title, t.status, t.condition_json
+             HAVING COUNT(tl.id) >= 1 OR json_extract(t.condition_json,'$.evidence.presentation.retry_display.reason') IS NOT NULL OR execution_spent > 0
+             ORDER BY attempt_count DESC, t.updated_at DESC, t.id ASC")
+.fetch_all(self.pool()).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TaskOperatorRetryRow {
+                    task_id: row.try_get("task_id")?,
+                    title: row.try_get("title")?,
+                    status: row.try_get("status")?,
+                    condition_json: row.try_get("condition_json")?,
+                    attempt_count: row.try_get("attempt_count")?,
+                    execution_spent: row.try_get("execution_spent")?,
+                    last_error: row.try_get("last_error")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneTaskSourceRow {
+    pub version: i64,
+    pub task_type: String,
+    pub status: String,
+    pub deleted_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl SqliteDb {
+    pub async fn milestone_task_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneTaskSourceRow>> {
+        let row = sqlx::query(
+            "SELECT version, task_type, status, deleted_at, updated_at
+                 FROM task WHERE id = ? AND project_id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        row.map(|row| {
+            Ok(MilestoneTaskSourceRow {
+                version: row.try_get("version")?,
+                task_type: row.try_get("task_type")?,
+                status: row.try_get("status")?,
+                deleted_at: row.try_get("deleted_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+    }
+}

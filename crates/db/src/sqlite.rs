@@ -77,6 +77,7 @@ use tokio::sync::Notify;
 
 mod action;
 mod agent;
+pub use agent::AgentOperatorPressureRow;
 mod agent_chat;
 mod chat_ledger;
 mod chat_read_events;
@@ -90,6 +91,7 @@ mod command_finalization;
 mod command_receipt;
 mod commitment;
 mod daemon;
+pub use daemon::DaemonOperatorIssueRow;
 mod dead_letter;
 pub use dead_letter::{DeadLetter, DeadLetterAction, DeadLetterPage};
 mod domain_event;
@@ -97,6 +99,7 @@ pub use domain_event::EventSubscription;
 mod embedded_agent;
 pub(crate) mod environment_readiness;
 mod execution;
+pub use execution::{ActiveExecutionOperatorRow, RecentFailedExecutionOperatorRow};
 mod external_link;
 mod inbox;
 mod integration;
@@ -107,6 +110,17 @@ mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
+pub use orchestration::{
+    ActiveCheckWaiverSourceRow, CharterReadinessSourceRow, InsertMilestoneReadinessInput,
+    InsertMilestoneReadinessSourceInput, InsertMilestoneReleaseInput,
+    InsertReleaseDecisionReferenceInput, InsertReleaseDocumentReferenceInput,
+    InsertReleaseGitReferenceInput, InsertReleaseReviewReferenceInput,
+    InsertReleaseTaskReferenceInput, InsertReleaseValidationReferenceInput,
+    MilestoneCharterAuthorityRow, MilestoneCheckResultRow, MilestoneDecisionRow,
+    MilestoneDefinitionReadinessSourceRow, MilestoneDocumentSourceRow, MilestoneReadinessSourceRow,
+    MilestoneWaiverAffectedRow, ProjectAgentIdentityRow, ReleaseCharterRevisionSourceRow,
+    ReleaseReferenceRow, UpdateMilestoneReadinessProjectionInput,
+};
 mod outbox;
 pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
@@ -119,17 +133,24 @@ mod project_provisioning;
 mod project_review_config;
 mod provider_authorization;
 mod repo;
+pub use repo::MilestoneRepositoryContextRow;
 mod repo_location;
 mod review;
 pub use review::AttemptCarryBase;
 mod runtime;
 mod schedule;
 mod shared_media;
+pub use shared_media::{
+    InsertReleaseEvidencePinInput, MilestoneEvidenceRow, MilestoneReleasePinMetadataRow,
+    ReleaseEvidencePinRow,
+};
 mod skill;
 mod system_setting;
 mod task;
 pub use schedule::integration_statement_in_tx;
 pub use schedule::{ScheduleRead, INTEGRATION_OWNED_SQL};
+pub use task::MilestoneTaskSourceRow;
+pub use task::{BlockedTaskOperatorRow, TaskOperatorConditionRow, TaskOperatorRetryRow};
 mod task_adaptive;
 mod task_comment;
 mod task_dependency;
@@ -141,6 +162,8 @@ mod task_terminal_session;
 mod user_auth;
 mod workflow;
 mod workspace;
+pub use workspace::OverdueWorkspaceCleanupRow;
+pub use workspace::{RecordWorkspaceCleanupFailureInput, WorkspaceCleanupAttentionRow};
 mod workspace_lease;
 mod workspace_placement;
 

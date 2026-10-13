@@ -962,6 +962,24 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    pub async fn pending_and_claimed_task_step_counts(
+        &self,
+    ) -> crate::Result<(i64, i64, Option<String>)> {
+        let result = sqlx::query_as("SELECT COALESCE(SUM(status='pending'),0),COALESCE(SUM(status='claimed'),0),MIN(CASE WHEN status='pending' THEN created_at END) FROM task_step WHERE status IN ('pending','claimed')")
+            .fetch_one(self.pool()).await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn current_failed_and_parked_task_step_counts(&self) -> crate::Result<(i64, i64)> {
+        let result = sqlx::query_as("SELECT COALESCE(SUM(s.status='failed'),0),COALESCE(SUM(s.status='parked'),0) FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.status IN ('failed','parked') AND t.deleted_at IS NULL AND json_extract(t.condition_json,'$.evidence.presentation.failed_step_id')=s.id")
+            .fetch_one(self.pool()).await?;
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

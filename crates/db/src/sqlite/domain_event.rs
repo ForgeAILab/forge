@@ -551,3 +551,25 @@ fn map_event_consumer_cutover(
         created_at: row.try_get("created_at")?,
     })
 }
+
+impl SqliteDb {
+    pub async fn milestone_source_event_watermark_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let result = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE scope_type = 'project' AND scope_id = ?
+               AND event_type NOT IN (
+                   'milestone.readiness.evaluated',
+                   'project_release.candidate_requested'
+               )
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(result)
+    }
+}

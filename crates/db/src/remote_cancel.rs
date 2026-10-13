@@ -248,3 +248,12 @@ impl SqliteDb {
             .fetch_all(self.pool()).await?.into_iter().map(row_operation).collect())
     }
 }
+
+impl SqliteDb {
+    pub async fn pending_remote_cancel_count(&self) -> crate::Result<i64> {
+        let result = sqlx::query_scalar("SELECT COUNT(*) FROM pending_remote_cancel")
+            .fetch_one(self.pool())
+            .await?;
+        Ok(result)
+    }
+}

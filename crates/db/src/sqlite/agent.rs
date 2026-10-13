@@ -796,3 +796,49 @@ impl SqliteDb {
             .collect()
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct AgentOperatorPressureRow {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub daemon_id: Option<String>,
+    pub max_concurrent_tasks: i64,
+    pub running_executions: i64,
+}
+
+impl SqliteDb {
+    pub async fn agent_operator_pressure_rows(
+        &self,
+    ) -> crate::Result<Vec<AgentOperatorPressureRow>> {
+        let rows = sqlx::query("SELECT
+                a.id AS agent_id,
+                a.name AS agent_name,
+                a.daemon_id,
+                a.max_concurrent_tasks,
+                (
+                    SELECT COUNT(*)
+                    FROM execution e
+                    WHERE e.agent_id = a.id AND e.status = 'running'
+                ) + (
+                    SELECT COUNT(*) FROM workspace_placement p
+                    WHERE p.agent_id = a.id AND p.state IN ('reserved', 'preparing')
+                       AND julianday(COALESCE(p.reserved_until, datetime(p.updated_at, '+10 minutes'))) > julianday('now')
+                      AND NOT EXISTS (SELECT 1 FROM execution e
+                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
+                ) AS running_executions
+             FROM agent_current a
+             ORDER BY a.name ASC, a.id ASC")
+.fetch_all(self.pool()).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AgentOperatorPressureRow {
+                    agent_id: row.try_get("agent_id")?,
+                    agent_name: row.try_get("agent_name")?,
+                    daemon_id: row.try_get("daemon_id")?,
+                    max_concurrent_tasks: row.try_get("max_concurrent_tasks")?,
+                    running_executions: row.try_get("running_executions")?,
+                })
+            })
+            .collect()
+    }
+}

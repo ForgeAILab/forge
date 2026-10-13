@@ -278,13 +278,10 @@ impl WorkspaceCleanupScheduler {
         // This path must also handle malformed workspace rows, so read and
         // update only the retry columns instead of decoding the full model.
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let previous_attempts = sqlx::query_scalar::<_, i64>(
-            "SELECT cleanup_attempts FROM workspace
-             WHERE task_id = ? AND status != 'cleaned'",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let previous_attempts = self
+            .db
+            .workspace_cleanup_attempts_in_tx(&mut transaction, task_id)
+            .await?;
         let Some(previous_attempts) = previous_attempts else {
             transaction.commit().await?;
             return Ok(());
@@ -302,19 +299,18 @@ impl WorkspaceCleanupScheduler {
         let last_cleanup_error = cleanup_error.to_string();
         let last_cleanup_error =
             crate::project_environment::bounded_output_tail(&last_cleanup_error);
-        sqlx::query(
-            "UPDATE workspace
-             SET cleanup_attempts = cleanup_attempts + ?,
-                 last_cleanup_error = ?, cleanup_after = ?, updated_at = ?
-             WHERE task_id = ? AND status != 'cleaned'",
-        )
-        .bind(if owner_unreachable { 0_i64 } else { 1_i64 })
-        .bind(last_cleanup_error)
-        .bind(cleanup_after.to_rfc3339())
-        .bind(now_rfc3339())
-        .bind(task_id)
-        .execute(&mut *transaction)
-        .await?;
+        self.db
+            .record_workspace_cleanup_failure_in_tx(
+                &mut transaction,
+                &db::RecordWorkspaceCleanupFailureInput {
+                    increment: if owner_unreachable { 0_i64 } else { 1_i64 },
+                    last_error: &last_cleanup_error,
+                    cleanup_after: &(cleanup_after.to_rfc3339()),
+                    updated_at: &(now_rfc3339()),
+                    task_id,
+                },
+            )
+            .await?;
         transaction.commit().await?;
         if !owner_unreachable && previous_attempts + 1 >= CLEANUP_ATTENTION_ATTEMPTS {
             // The retry is already recorded; a failed notice must not undo it.
@@ -328,40 +324,30 @@ impl WorkspaceCleanupScheduler {
     /// One open item per workspace, however many retries follow. It is
     /// reopened only after a success resolved it.
     async fn raise_cleanup_attention(&self, task_id: &str) -> Result<()> {
-        use sqlx::Row as _;
-
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let Some(row) = sqlx::query(
-            "SELECT w.id, w.worktree_path, w.cleanup_attempts, w.last_cleanup_error,
-                    t.project_id, t.title
-             FROM workspace w JOIN task t ON t.id = w.task_id
-             WHERE w.task_id = ? AND w.status != 'cleaned'",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *transaction)
-        .await?
+        let Some(row) = self
+            .db
+            .workspace_cleanup_attention_in_tx(&mut transaction, task_id)
+            .await?
         else {
             transaction.commit().await?;
             return Ok(());
         };
-        let workspace_id: String = row.try_get("id")?;
+        let workspace_id: String = row.id.clone();
         let dedupe_key = cleanup_attention_key(&workspace_id);
-        let open = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (SELECT 1 FROM attention_projection
-                            WHERE dedupe_key = ? AND status <> 'resolved')",
-        )
-        .bind(&dedupe_key)
-        .fetch_one(&mut *transaction)
-        .await?;
+        let open = self
+            .db
+            .cleanup_attention_is_open_in_tx(&mut transaction, &dedupe_key)
+            .await?;
         if open != 0 {
             transaction.commit().await?;
             return Ok(());
         }
-        let project_id: String = row.try_get("project_id")?;
-        let title: String = row.try_get("title")?;
-        let path: String = row.try_get("worktree_path")?;
-        let attempts: i64 = row.try_get("cleanup_attempts")?;
-        let last_error: Option<String> = row.try_get("last_cleanup_error")?;
+        let project_id: String = row.project_id.clone();
+        let title: String = row.title.clone();
+        let path: String = row.worktree_path.clone();
+        let attempts: i64 = row.cleanup_attempts;
+        let last_error: Option<String> = row.last_cleanup_error.clone();
         let now = now_rfc3339();
         let event = db::DomainEventRepo::append_event_in_tx(
             &*self.db,
@@ -428,32 +414,11 @@ impl WorkspaceCleanupScheduler {
 
     async fn clear_cleanup_after(&self, task_id: &str) -> Result<()> {
         let now = now_rfc3339();
-        sqlx::query(
-            "UPDATE workspace
-             SET cleanup_after = NULL, cleanup_attempts = 0,
-                 last_cleanup_error = NULL, updated_at = ?
-             WHERE task_id = ?
-               AND (cleanup_after IS NOT NULL OR cleanup_attempts != 0
-                    OR last_cleanup_error IS NOT NULL)",
-        )
-        .bind(&now)
-        .bind(task_id)
-        .execute(self.db.pool())
-        .await?;
+        self.db.clear_workspace_cleanup_retry(&now, task_id).await?;
         // Nothing is left to reclaim for this Task, so nothing is left to report.
-        sqlx::query(
-            "UPDATE attention_projection
-             SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
-                 updated_at = ?, version = version + 1
-             WHERE status <> 'resolved'
-               AND dedupe_key IN (SELECT 'workspace-cleanup:' || id FROM workspace
-                                  WHERE task_id = ?)",
-        )
-        .bind(&now)
-        .bind(&now)
-        .bind(task_id)
-        .execute(self.db.pool())
-        .await?;
+        self.db
+            .resolve_task_workspace_cleanup_attention(&now, task_id)
+            .await?;
         Ok(())
     }
 
@@ -483,15 +448,10 @@ impl WorkspaceCleanupScheduler {
     pub(crate) async fn tick(&self) -> Result<()> {
         // Short of disk: collect now instead of waiting for the sweep timer.
         self.reclaim_under_pressure().await;
-        let task_ids = sqlx::query_scalar::<_, String>(
-            "SELECT task_id FROM workspace
-             WHERE status != 'cleaned' AND (cleanup_after <= ? OR (status = 'cleaning' AND cleanup_after IS NULL))
-             ORDER BY cleanup_after, id LIMIT ?",
-        )
-        .bind(now_rfc3339())
-        .bind(SWEEP_LIMIT)
-        .fetch_all(self.db.pool())
-        .await?;
+        let task_ids = self
+            .db
+            .due_workspace_cleanup_task_ids(&(now_rfc3339()), SWEEP_LIMIT)
+            .await?;
         let started = Instant::now();
         for task_id in task_ids {
             if let Err(error) = self.cleanup_terminal_task(&task_id).await {
@@ -517,12 +477,10 @@ impl WorkspaceCleanupScheduler {
     }
 
     async fn sweep_backfill(&self, cursor: &mut SweepCursor, started: Instant) -> Result<()> {
-        let task_ids =
-            sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE id > ? ORDER BY id LIMIT ?")
-                .bind(&cursor.task_id)
-                .bind(SWEEP_LIMIT)
-                .fetch_all(self.db.pool())
-                .await?;
+        let task_ids = self
+            .db
+            .workspace_cleanup_task_ids_after(&cursor.task_id, SWEEP_LIMIT)
+            .await?;
         for task_id in &task_ids {
             cursor.task_id = task_id.clone();
             if let Err(error) = self.cleanup_terminal_task(task_id).await {
@@ -536,16 +494,10 @@ impl WorkspaceCleanupScheduler {
             cursor.task_id.clear();
         }
 
-        let repo_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM repo WHERE id > ?
-             UNION SELECT repo_id AS id FROM workspace WHERE repo_id > ?
-             ORDER BY id LIMIT ?",
-        )
-        .bind(&cursor.repo_id)
-        .bind(&cursor.repo_id)
-        .bind(SWEEP_LIMIT)
-        .fetch_all(self.db.pool())
-        .await?;
+        let repo_ids = self
+            .db
+            .workspace_cleanup_repo_ids_after(&cursor.repo_id, SWEEP_LIMIT)
+            .await?;
         for repo_id in &repo_ids {
             cursor.repo_id = repo_id.clone();
             // Broad pruning is safe only in Forge-owned repository caches.
@@ -649,22 +601,10 @@ impl WorkspaceCleanupScheduler {
             }
         }
         let workspace_id = workspace.as_ref().map(|workspace| workspace.id.as_str());
-        let active = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (
-                SELECT 1 FROM execution
-                WHERE (task_id = ? OR workspace_id = ?) AND status = 'running'
-             ) OR EXISTS (
-                SELECT 1 FROM workspace_lease wl
-                LEFT JOIN execution e ON e.id = wl.execution_id
-                WHERE (wl.task_id = ? OR e.workspace_id = ?) AND wl.status = 'active'
-             )",
-        )
-        .bind(task_id)
-        .bind(workspace_id)
-        .bind(task_id)
-        .bind(workspace_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let active = self
+            .db
+            .workspace_cleanup_has_active_execution_or_lease(task_id, workspace_id)
+            .await?;
         if active != 0 {
             info!(
                 task_id,
@@ -679,16 +619,7 @@ impl WorkspaceCleanupScheduler {
         // process. Neither is stopped by deletion; both end by themselves
         // (a check by its wall limit, at most a day), and the cleanup comes
         // due again every tick until they have.
-        let checking = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (
-                SELECT 1 FROM check_consumer c JOIN check_run r ON r.id = c.run_id
-                WHERE c.task_id = ?
-                  AND r.state IN ('running', 'cancelling', 'cleaning', 'uncertain')
-             )",
-        )
-        .bind(task_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let checking = self.db.task_has_live_cleanup_check(task_id).await?;
         // A server-owned Task root is `<workspace root>/<root Task id>`.
         let task_root = self
             .workspace_root
@@ -794,15 +725,10 @@ impl WorkspaceCleanupScheduler {
         let Some(repo) = db::RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await? else {
             return Ok(None);
         };
-        let shared = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (SELECT 1 FROM workspace
-                            WHERE repo_id = ? AND branch = ? AND id != ? AND status != 'cleaned')",
-        )
-        .bind(&workspace.repo_id)
-        .bind(&workspace.branch)
-        .bind(&workspace.id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let shared = self
+            .db
+            .workspace_branch_is_shared(&workspace.repo_id, &workspace.branch, &workspace.id)
+            .await?;
         if shared != 0 {
             return Ok(None);
         }
@@ -906,9 +832,9 @@ impl WorkspaceCleanupScheduler {
             cleanup_state_update(placement, PlacementState::Cleaning, &now),
         )
         .await?;
-        sqlx::query("UPDATE workspace SET status = 'cleaning', cleanup_after = COALESCE(cleanup_after, ?), updated_at = ? WHERE id = ?")
-            .bind(&now).bind(&now).bind(&placement.workspace_id)
-            .execute(&mut *transaction).await?;
+        self.db
+            .mark_workspace_cleaning_in_tx(&mut transaction, &now, &placement.workspace_id)
+            .await?;
         transaction.commit().await?;
         Ok(updated)
     }
@@ -952,28 +878,16 @@ impl WorkspaceCleanupScheduler {
                     Err(error) => return Err(error.into()),
                 }
             }
-            sqlx::query(
-                "UPDATE workspace
-                         SET status = 'cleaned', cleanup_after = NULL,
-                             cleanup_attempts = 0, last_cleanup_error = NULL,
-                             error = NULL, updated_at = ?
-                         WHERE id = ?",
-            )
-            .bind(&now)
-            .bind(&current.workspace_id)
-            .execute(&mut *transaction)
-            .await?;
-            sqlx::query(
-                "UPDATE attention_projection
-                 SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
-                     updated_at = ?, version = version + 1
-                 WHERE dedupe_key = ? AND status <> 'resolved'",
-            )
-            .bind(&now)
-            .bind(&now)
-            .bind(cleanup_attention_key(&current.workspace_id))
-            .execute(&mut *transaction)
-            .await?;
+            self.db
+                .mark_workspace_cleaned_in_tx(&mut transaction, &now, &current.workspace_id)
+                .await?;
+            self.db
+                .resolve_workspace_cleanup_attention_in_tx(
+                    &mut transaction,
+                    &now,
+                    &cleanup_attention_key(&current.workspace_id),
+                )
+                .await?;
             transaction.commit().await?;
             return WorkspaceRepo::get_by_id(&*self.db, &current.workspace_id)
                 .await?

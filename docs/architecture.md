@@ -7414,6 +7414,13 @@ unselected Repo rows retain their repository identities;
 removing Project repository setup no longer deletes Tasks through a Repo
 foreign-key cascade.
 
+Operator status, milestone readiness/release persistence, and workspace cleanup
+use typed `SqliteDb` functions in the corresponding DB aggregate modules.
+The services retain policy and transaction ownership; queries participating in
+those transactions accept the caller's `SqliteConnection`. Read projections
+return named row structs, while SQL execution and row decoding produce `DbError`
+for conversion to `ServiceError` at the service boundary.
+
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.
 
