@@ -424,7 +424,20 @@ export function outgoingWorkflowEdges(
   fromState: string,
 ): WorkflowEdge[] {
   const state = workflow.states.find((candidate) => candidate.name === fromState)
-  if (!state) return []
+  if (!state) {
+    // The step check is a state of the inherited subtask workflow. Read
+    // against a Project workflow (the board), it keeps the gate's own exits:
+    // accept to done, return to the worker, cancel.
+    if (fromState !== INHERITED_STEP_CHECK_STATE) return []
+    const exits: Array<[WorkflowTrigger, string]> = [
+      ['accept', 'done'],
+      ['reject', 'in_progress'],
+      ['fail', workflow.cancellation_state ?? 'cancelled'],
+    ]
+    return exits
+      .filter(([, to]) => workflow.states.some((candidate) => candidate.name === to))
+      .map(([trigger, to]) => ({ from: fromState, to, trigger }))
+  }
   const edges = Object.entries(state.triggers ?? {})
     .filter(
       (entry): entry is [WorkflowTrigger, NonNullable<(typeof state.triggers)[WorkflowTrigger]>] =>

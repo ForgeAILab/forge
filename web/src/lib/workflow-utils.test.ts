@@ -10,6 +10,7 @@ import {
   getStaleBlockingAnnotation,
   getTaskWaitNotice,
   getStateColors,
+  getValidDropColumns,
   getTaskWorkflowWarning,
   groupByColumns,
   isActiveStatus,
@@ -112,6 +113,34 @@ describe('deriveColumns', () => {
     expect(showsSubState(column, 'in_progress')).toBe(false)
     // The other columns are untouched.
     expect(columns.filter((candidate) => candidate.inheritedStates).length).toBe(1)
+  })
+
+  it('gives a lead_check card on a Project workflow the exits of the gate', () => {
+    const workflow: WorkflowDefinition = {
+      roles: [],
+      states: [
+        state('todo', 'initial', 'Todo', 'Todo'),
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        state('review', 'gate', 'Review', 'Review'),
+        state('done', 'terminal', 'Done', 'Done'),
+        state('cancelled', 'terminal', 'Cancelled', 'Cancelled'),
+      ],
+      configuration: [],
+      cancellation_state: 'cancelled',
+    }
+    expect(outgoingWorkflowEdges(workflow, 'lead_check')).toEqual([
+      { from: 'lead_check', to: 'done', trigger: 'accept' },
+      { from: 'lead_check', to: 'in_progress', trigger: 'reject' },
+      { from: 'lead_check', to: 'cancelled', trigger: 'fail' },
+    ])
+    expect(getValidDropColumns(workflow, 'lead_check')).toEqual(['done', 'in_progress', 'cancelled'])
+    // Never review: the step check is not a review.
+    expect(workflowTriggerTargets(workflow, 'lead_check')).not.toContain('review')
+    // A workflow without those states offers nothing it cannot reach, and any
+    // other unknown state still has no edges.
+    const bare = { ...workflow, states: [state('queued', 'initial', 'Queued', 'Queued')] }
+    expect(outgoingWorkflowEdges(bare, 'lead_check')).toEqual([])
+    expect(outgoingWorkflowEdges(workflow, 'some_unknown_state')).toEqual([])
   })
 
   it('keeps the state where the workflow itself defines lead_check', () => {
