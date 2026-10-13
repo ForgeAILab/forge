@@ -10498,6 +10498,8 @@ async fn unchanged_reconciliation_does_not_enqueue_a_second_step() {
 mod equivalence;
 #[path = "tests/lead_check.rs"]
 mod lead_check;
+#[path = "tests/lead_operations.rs"]
+mod lead_operations;
 #[path = "tests/root_lead.rs"]
 mod root_lead;
 #[path = "tests/root_replan.rs"]

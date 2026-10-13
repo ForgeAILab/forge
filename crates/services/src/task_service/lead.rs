@@ -479,12 +479,12 @@ impl TaskService {
         // changed since (the adaptive receipt is keyed on the lead and key).
         if let Some(receipt) = db::CommandReceiptRepo::get_command_receipt_by_identity(
             &*self.db,
-            "agent",
+            db::inherited_subtask::TASK_LEAD_PRINCIPAL,
             &run.identity_id,
             "project",
             &root.project_id,
             super::adaptive::TASK_ADAPTIVE_COMMAND,
-            key,
+            &Self::lead_command_key(&binding, key),
         )
         .await?
         {
@@ -560,6 +560,12 @@ impl TaskService {
         }))
     }
 
+    /// Command receipts are unique per Project, operation and key, so the
+    /// lead's key is scoped to its root and identity.
+    fn lead_command_key(binding: &LeadBinding, key: &str) -> String {
+        format!("lead:{}:{}:{key}", binding.root.id, binding.run.identity_id)
+    }
+
     fn lead_adaptive_command(
         &self,
         binding: &LeadBinding,
@@ -576,13 +582,16 @@ impl TaskService {
             expected_board_revision: board_revision,
             operation,
             rationale: rationale.to_owned(),
-            actor_type: "agent".to_owned(),
+            // The lead is the command's actor, as a lead: the receipt and
+            // the event carry it, and the database repeats the lead check
+            // under the writer transaction (`task_lead` principal).
+            actor_type: db::inherited_subtask::TASK_LEAD_PRINCIPAL.to_owned(),
             actor_id: binding.run.identity_id.clone(),
             policy_result: "allowed".to_owned(),
             policy_revision: None,
             policy_digest: None,
             requested_permission: Some("task_read".to_owned()),
-            idempotency_key: key.to_owned(),
+            idempotency_key: Self::lead_command_key(binding, key),
             correlation_id: binding.run.execution_id.clone(),
             causation_id: None,
             causation_depth: 0,

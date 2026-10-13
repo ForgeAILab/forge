@@ -856,28 +856,36 @@ pub(crate) async fn ensure_in_lead_subtree(
     })
 }
 
-/// The Agent that leads `task`'s root, when `task` is a subtask parked on
-/// something that lead decides ([`subtask_decision_park`]). `None` for every
-/// other Task: a root, a subtask of a root without a lead, a subtask that is
-/// not parked or parked on something that is the owner's.
-pub(crate) async fn lead_deciding_subtask_park(
+/// The lead of `task`'s root and what it may do to `task` now through the
+/// Task action system: the recovery verbs while `task` is parked on something
+/// the lead decides ([`subtask_decision_park`]), cancel while `task` never had
+/// an implementation run. `None` for every Task that is not a subtask of a
+/// root with a lead; nothing is read for a root.
+pub(crate) async fn lead_verbs(
     db: &SqliteDb,
     task: &Task,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Vec<&'static str>)>> {
     let Some(parent_task_id) = task.parent_task_id.as_deref() else {
         return Ok(None);
     };
-    if subtask_decision_park(task).is_none() {
-        return Ok(None);
-    }
     let (root, workflow) = match coordination_root_context(db, parent_task_id).await {
         Ok(context) => context,
         Err(ServiceError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error),
     };
-    Ok(root_lead(db, &root, &workflow)
+    let Some(lead) = root_lead(db, &root, &workflow)
         .await?
-        .and_then(|lead| lead.assignee_id))
+        .and_then(|lead| lead.assignee_id)
+    else {
+        return Ok(None);
+    };
+    let mut verbs = Vec::new();
+    if subtask_decision_park(task).is_some() {
+        verbs.extend(crate::task_actions::LEAD_RECOVERY_VERBS);
+    } else if !crate::task_service::lead::subtask_started(db, &task.id).await? {
+        verbs.extend(crate::task_actions::LEAD_UNSTARTED_VERBS);
+    }
+    Ok(Some((lead, verbs)))
 }
 
 /// Database form of "this Task is a coordination root and has a lead":
