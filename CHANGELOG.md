@@ -3205,6 +3205,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Prevent normal WAL contention from timing out an accepted Task mutation, and restart an unlaunched lead check after its Agent resumes.
+
 - A Task that re-enters `merging` while the attempt of its previous entry is
   still the head of the queue is admitted at the release of that head (the
   driver signals it) instead of at the admission's next 100 ms look.

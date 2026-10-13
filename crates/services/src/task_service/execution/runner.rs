@@ -1,4 +1,5 @@
 use super::*;
+use crate::embedded_task_executor::is_read_only_task_role;
 use crate::workspace_backend::ResolvedWorkspace;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::sync::mpsc;
@@ -242,6 +243,16 @@ impl TaskService {
         // checking at this boundary closes the gap between execution-row
         // creation and adapter launch/recovery.
         if let Err(error) = self.verify_execution_workspace_authority(&execution).await {
+            if self
+                .defer_launch_for_paused_agent(&execution, &error)
+                .await?
+                .is_some()
+            {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id.clone(),
+                    accepted: false,
+                });
+            }
             // Authority can be revoked or superseded between execution-row
             // creation and this dispatch attempt.  Stop the attempt and
             // revoke any remaining grant before surfacing the denial.
@@ -522,6 +533,12 @@ impl TaskService {
         {
             Ok(task) => task,
             Err(error) => {
+                if let Some(deferred) = self
+                    .defer_launch_for_paused_agent(&execution, &error)
+                    .await?
+                {
+                    return Ok(deferred);
+                }
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
                     .fail_execution_before_dispatch(&execution.id, failure_message)
@@ -543,7 +560,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
-        if read_only_execution_role(&execution.role)
+        if is_read_only_task_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
             executors::mark_worktree_read_only(&mut agent_config);
@@ -663,6 +680,12 @@ impl TaskService {
         {
             Ok(task) => task,
             Err(error) => {
+                if let Some(deferred) = self
+                    .defer_launch_for_paused_agent(&execution_before_launch, &error)
+                    .await?
+                {
+                    return Ok(deferred);
+                }
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
                     .fail_execution_before_dispatch(&execution_before_launch.id, failure_message)
@@ -1185,7 +1208,7 @@ impl TaskService {
             // Name the actual trigger: read-only is forced either by the
             // execution role (reviewer/planner) or by the task_type
             // (planning_task/discovery). The remedy differs.
-            result.error = Some(if read_only_execution_role(&execution.role) {
+            result.error = Some(if is_read_only_task_role(&execution.role) {
                 format!(
                     "read-only execution produced worktree changes, which were discarded: \
                      role '{}' never receives write access. Implementation work belongs to \
@@ -1718,6 +1741,28 @@ mod tests {
     const T0: &str = "2025-01-01T00:00:00+00:00";
     const T1: &str = "2025-01-01T00:00:01+00:00";
     const T20: &str = "2025-01-01T00:00:20+00:00";
+
+    #[test]
+    fn runner_and_native_task_roles_share_read_only_policy() {
+        for (role, read_only) in [
+            ("planner", true),
+            ("reviewer", true),
+            ("worker", false),
+            ("coder", false),
+            ("executor", false),
+            ("auditor", false),
+            ("interactive", false),
+            ("system", false),
+            ("custom", false),
+        ] {
+            assert_eq!(is_read_only_task_role(role), read_only, "runner: {role}");
+            assert_eq!(
+                is_read_only_task_role(role),
+                crate::embedded_task_executor::is_read_only_task_role(role),
+                "runner and native Task session disagree for {role}"
+            );
+        }
+    }
 
     #[test]
     fn placement_path_uses_fenced_owner_preparation_result() {
@@ -2376,7 +2421,7 @@ impl TaskService {
         }
         executor_config["_forge_plan_transport"] =
             json!(resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon);
-        if read_only_execution_role(&execution.role)
+        if is_read_only_task_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
             executors::mark_worktree_read_only(&mut executor_config);
@@ -2472,14 +2517,6 @@ fn prepared_owner_execution_path(
         ));
     }
     Ok(prepared.workspace_path)
-}
-
-/// Roles whose executions never receive worktree write access, regardless of
-/// task_type: the reviewer validates and the planner authors plans through
-/// Task metadata/native tools, never through worktree writes.
-fn read_only_execution_role(role: &str) -> bool {
-    role == crate::workflow::default_roles::REVIEWER
-        || role == crate::workflow::default_roles::PLANNER
 }
 
 fn execution_description(

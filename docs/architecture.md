@@ -6119,6 +6119,7 @@ role from its own rows, and no row is copied onto it.
 | `lead_check`, nothing running | the root has a lead (a restart between the entry and the run) | the step check | `Step::Role` | — |
 | `lead_check`, a check running | the lead is removed, or the Agent that is the lead is archived | the run is stopped; then `done`, bridge `gate_skipped`, in the next dispatcher pass | `TaskService::wake_step_checks_of` (from role removal and, for an archived Agent, `TaskService::lead_removed_from` after the archive sweep), then `Step::SkipGate` | — |
 | `lead_check`, nothing running | the lead's Agent is paused (or cannot be reached) | stays; `parked` with `agent { agent_id, status }` naming the lead's Agent; the check starts when the Agent is resumed | `next_step` (`Reason::AgentWait`), as for a planning root whose planner is paused | — |
+| `lead_check`, admitted check has not launched | the lead's Agent is paused between admission and launch | the unlaunched attempt ends auto-resumable; the subtask parks on the Agent and resume starts a fresh check | `TaskService::defer_launch_for_paused_agent`; no persistent setup refusal | — |
 | `lead_check`, a check running | the lead's Agent is paused | the run goes on and its verdict settles the step (a pause starts nothing and stops nothing) | — | — |
 
 "No dispatcher decision" in the no-lead row means the skip does not depend on
@@ -6703,6 +6704,12 @@ continues if the HTTP waiter expires. Cross-Task wakes enqueue without waiting f
 another Task lane, and explicit initial role assignments publish in the new Task's
 birth transaction. A root Cancel commits under the root lease and enqueues each
 child's cancel as the child's own preempting step; it never waits on a child lease.
+
+Repository mutation waiters use the same predecessor-only deadline. SQLite
+write-lock acquisition and a claimed mutation's persistence and release are
+not cancelled by the five-second queue response ceiling; SQLite's busy timeout
+bounds database lock waits. A mutation still pending behind another Task step
+returns `task_busy` at the deadline and remains queued.
 
 Cancel/Hold preempts scripts, CI and startup at a safe point. Integration is
 protected from its start (`integration_started_at`) through its result and

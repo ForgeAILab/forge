@@ -538,52 +538,59 @@ impl SqliteDb {
 
     async fn wait_task_mutation<T: DeserializeOwned>(&self, task_id: &str, id: &str) -> Result<T> {
         let notify = self.domain_event_notify();
-        let wait = async {
-            loop {
-                let changed = notify.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                let step = self
-                    .task_steps(task_id)
-                    .await?
-                    .into_iter()
-                    .find(|s| s.id == id)
-                    .ok_or(DbError::NotFound)?;
-                if let Some(reply) = step.result_json.filter(|_| {
-                    (step.status == "done" || step.status == "failed") && step.lease_until.is_none()
-                }) {
-                    let reply: TaskMutationReply =
-                        serde_json::from_str(&reply).map_err(|e| DbError::Check(e.to_string()))?;
-                    return reply.decode();
-                }
-                if !matches!(
-                    step.status.as_str(),
-                    "pending" | "claimed" | "done" | "failed"
-                ) {
-                    return Err(DbError::VersionConflict);
-                }
-                let executor = self
-                    .task_step_executor
-                    .lock()
-                    .expect("step executor")
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade);
-                if let Some(executor) = executor {
-                    executor.drive_inline(task_id).await?;
-                } else {
-                    // Repository-only users can execute persistence heads.
-                    // An engine head remains owned by the installed worker.
-                    self.drive_mutation_head(task_id).await?;
-                }
-                changed.await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let changed = notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let step = self
+                .task_steps(task_id)
+                .await?
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or(DbError::NotFound)?;
+            if let Some(reply) = step.result_json.filter(|_| {
+                (step.status == "done" || step.status == "failed") && step.lease_until.is_none()
+            }) {
+                let reply: TaskMutationReply =
+                    serde_json::from_str(&reply).map_err(|e| DbError::Check(e.to_string()))?;
+                return reply.decode();
             }
-        };
-        match tokio::time::timeout(Duration::from_secs(5), wait).await {
-            Ok(result) => result,
-            Err(_) => Err(DbError::TaskBusy {
-                pending_steps: self.pending_steps(task_id).await?,
-                retry_after_ms: 250,
-            }),
+            if !matches!(
+                step.status.as_str(),
+                "pending" | "claimed" | "done" | "failed"
+            ) {
+                return Err(DbError::VersionConflict);
+            }
+            // Like command waiters, bound only the predecessor wait. Once
+            // this mutation owns the lease, its persistence and release are
+            // governed by SQLite's lock timeout, not the Task queue deadline.
+            if step.status != "pending" {
+                changed.await;
+                continue;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DbError::TaskBusy {
+                    pending_steps: self.pending_steps(task_id).await?,
+                    retry_after_ms: 250,
+                });
+            }
+            let executor = self
+                .task_step_executor
+                .lock()
+                .expect("step executor")
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            // Do not cancel a claim waiting for SQLite's writer lock at the
+            // shorter queue deadline. Its own SQLx timeout bounds that wait.
+            if let Some(executor) = executor {
+                executor.drive_inline(task_id).await?;
+            } else {
+                self.drive_mutation_head(task_id).await?;
+            }
+            let _ = tokio::time::timeout_at(deadline, changed).await;
+            // Re-read even at the deadline: the head may now be claimed or
+            // committed, without another notification having arrived yet.
         }
     }
 
