@@ -414,11 +414,7 @@ impl Drop for TaskStepActivity {
             .remove(&self.id);
     }
 }
-/// A queued check run nobody claimed and nobody waits for any more becomes
-/// `cancelled` (the `queued -> cancelled` edge of `CHECK_RUN_TRANSITIONS`,
-/// as `transition_check_run` writes it for an unleased run). `?1` and `?2`
-/// are the time; the caller appends the runs it means.
-const CANCEL_UNWATCHED_QUEUED_RUNS: &str = "UPDATE check_run SET state='cancelled',version=version+1,updated_at=?1,finished_at=?2,capacity_wait_since=NULL WHERE state='queued' AND lease_owner IS NULL AND lease_until IS NULL AND NOT EXISTS(SELECT 1 FROM check_consumer c WHERE c.run_id=check_run.id AND c.cancelled_at IS NULL)";
+use crate::check_run::CANCEL_UNWATCHED_QUEUED_RUNS;
 
 impl SqliteDb {
     /// Check lease ownership and the producing status entry in the writer

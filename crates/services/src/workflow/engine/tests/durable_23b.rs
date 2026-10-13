@@ -2036,6 +2036,23 @@ async fn a_refused_project_deletion_re_requests_the_entry_checks_it_cancelled() 
             .await
             .unwrap();
     assert_ne!(second, first);
+    // The re-ask got a fresh run. The withdrawn run was cancelled in the
+    // withdrawal (it never ran and has no result row); the run the second
+    // consumer waited for is another one, and it ran.
+    let runs: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT c.id,r.state,(SELECT COUNT(*) FROM check_result x WHERE x.run_id=r.id) FROM check_consumer c JOIN check_run r ON r.id=c.run_id ORDER BY c.created_at,c.rowid",
+    )
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        runs,
+        vec![
+            (first.clone(), "cancelled".to_owned(), 0),
+            (second.clone(), "succeeded".to_owned(), 1),
+        ]
+    );
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 2);
     assert_eq!(
         db::budget::spent(fixture.db.pool(), &fixture.task.id, "review")
             .await

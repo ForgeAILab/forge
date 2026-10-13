@@ -1117,8 +1117,9 @@ impl TaskService {
 
     /// Force deletion stops the Project's unfinished check runs first and
     /// waits, until `settle_until`, for each to settle. Their consumers are
-    /// cancelled, so nobody waits for a result: a queued run is cancelled
-    /// here, a running one is cancelled on its owner by the check worker
+    /// cancelled, so nobody waits for a result: a queued run is cancelled in
+    /// that same write (`cancel_project_check_consumers`; it gets no result
+    /// row), a running one is cancelled on its owner by the check worker
     /// (which notices a run without consumers within about a second). A run
     /// that has not settled by then stays live, and the deletion guard then
     /// refuses: the row that fences the process is never deleted from under
@@ -1150,9 +1151,11 @@ impl TaskService {
                 if state != "queued" {
                     continue;
                 }
-                // A queued run has spawned nothing: it is settled as
-                // cancelled at once instead of at the worker's next sweep
-                // (or, on a full machine, when a slot frees).
+                // Only a queued run that still has a consumer the write
+                // above did not withdraw (one whose answer was already
+                // applied) is left here. It has spawned nothing: it is
+                // settled as cancelled at once instead of at the worker's
+                // next sweep.
                 let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
                 match db::CheckRunRepo::claim_check_run(
                     &*self.db,
