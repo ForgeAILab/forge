@@ -131,23 +131,55 @@ pub(super) async fn record_observation_in_tx(
     }
 }
 
+/// The passive-stage (`shadow:`) attempt that is still the *current* row of
+/// a Task that was deleted (`task.deleted_at` is set, or the Task row is
+/// gone; nothing in Forge undeletes a Task). Only a row at rest: one that
+/// waits (`queued`, `path_wait`, `parked`, `quarantined`, `ejected`,
+/// `needs_review`), is no queue's head and records no effect (no intent, no
+/// operation that runs or is unknown). A row in any state in which an owner
+/// may have been asked for an effect (`validating` to `applied`) is kept as
+/// evidence, and so is every history row (`current=0`): a successor's
+/// `predecessor_attempt_id` is therefore never nulled by this delete, and a
+/// terminal row (which a Review's `integration_checks` or a Task's lineage
+/// may name) is never touched. Walks the partial index of current rows
+/// (`integration_attempt_current_task`), not the attempt history.
+pub(super) const ORPHAN_SHADOW_ATTEMPTS: &str = "FROM integration_attempt INDEXED BY integration_attempt_current_task \
+     WHERE current=1 AND admission_key LIKE 'shadow:%' \
+       AND state IN ('queued','path_wait','parked','quarantined','ejected','needs_review') \
+       AND effect_intent_json IS NULL \
+       AND (current_operation_state IS NULL OR current_operation_state NOT IN ('running','uncertain')) \
+       AND NOT EXISTS(SELECT 1 FROM task t WHERE t.id=integration_attempt.task_ref AND t.deleted_at IS NULL) \
+       AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.head_attempt_id=integration_attempt.id)";
+
+/// Current pre-queue attempts (imported rows and shadow rows) that are
+/// `queued`, of Tasks that still exist, without their continuation step.
+/// Read by the queue worker's sweep every 30 s: it seeks the `queued` rows
+/// (`integration_attempt_retention`; the live members of the queues, not the
+/// history) and probes the unique `(task_id, causation_key)` of the steps.
+pub(super) const QUEUED_WITHOUT_CONTINUATION: &str =
+    "SELECT a.id FROM integration_attempt a INDEXED BY integration_attempt_retention \
+     WHERE a.state='queued' AND a.current=1 \
+       AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
+       AND EXISTS(SELECT 1 FROM task t WHERE t.id=a.task_ref AND t.deleted_at IS NULL) \
+       AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref \
+                      AND s.causation_key='integration-import:'||a.id) \
+     ORDER BY a.id";
+
 impl crate::SqliteDb {
-    /// Delete the passive-stage (`shadow:`) attempts of Tasks that no longer
-    /// exist. Such a row gets no continuation step (the Task is gone), holds
-    /// no slot and is never superseded: nothing else ends it. Kept: a row
-    /// that is its queue's head, and one with an unsettled or unknown effect
-    /// (its result is still evidence of a possible merge). Returns the rows
-    /// deleted.
+    /// Delete the current `shadow:` attempts of deleted Tasks that are at
+    /// rest ([`ORPHAN_SHADOW_ATTEMPTS`]). Such a row gets no continuation
+    /// step (the Task is gone), holds no slot and is never superseded:
+    /// nothing else ends it. Returns the rows deleted.
     pub async fn delete_orphan_shadow_attempts(&self) -> crate::Result<u64> {
-        Ok(sqlx::query(
-            "DELETE FROM integration_attempt WHERE admission_key LIKE 'shadow:%' \
-               AND effect_intent_json IS NULL \
-               AND (current_operation_state IS NULL OR current_operation_state NOT IN ('running','uncertain')) \
-               AND NOT EXISTS(SELECT 1 FROM task t WHERE t.id=integration_attempt.task_ref AND t.deleted_at IS NULL) \
-               AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.head_attempt_id=integration_attempt.id)",
-        )
-        .execute(self.pool())
-        .await?
-        .rows_affected())
+        Ok(sqlx::query(&format!("DELETE {ORPHAN_SHADOW_ATTEMPTS}"))
+            .execute(self.pool())
+            .await?
+            .rows_affected())
+    }
+    /// The ids [`QUEUED_WITHOUT_CONTINUATION`] lists.
+    pub async fn queued_imports_without_continuation(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(QUEUED_WITHOUT_CONTINUATION)
+            .fetch_all(self.pool())
+            .await?)
     }
 }

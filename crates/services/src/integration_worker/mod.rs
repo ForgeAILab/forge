@@ -477,8 +477,9 @@ impl IntegrationQueueWorker {
         }
         // A pre-queue `queued` row is claimable only once its import
         // continuation settled; one whose settled step was pruned gets it
-        // again here instead of at the next start. One indexed read when
-        // there is nothing to do.
+        // again here instead of at the next start. One read of the current
+        // `queued` rows (`QUEUED_WITHOUT_CONTINUATION`), no write when there
+        // is nothing to do.
         if let Err(error) = self.steps.continue_queued_imports().await {
             tracing::warn!(target: "services::integration_worker", %error, "integration import continuations were not enqueued; the next sweep retries");
         }

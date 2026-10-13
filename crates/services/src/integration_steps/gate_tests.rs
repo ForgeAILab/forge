@@ -2767,3 +2767,67 @@ async fn a_pre_queue_queued_row_without_its_continuation_step_is_continued_by_th
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
+
+/// Two sweeps at once, and a sweep beside the start pass, enqueue one
+/// continuation for a pre-queue `queued` row and count it once: the step's
+/// key is unique per Task. A history row and a row that is not `queued` get
+/// no step from the sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweeps_and_the_start_pass_enqueue_one_continuation_for_one_row() {
+    let world = World::new().await;
+    let world = &world;
+    let a = world.reconciled("twice", "twice.txt").await;
+    let parked = world.reconciled("resting", "resting.txt").await;
+    for id in [&a.id, &parked.id] {
+        world
+            .set(id, "import_source_json='{\"version\":1,\"priority\":10}'")
+            .await;
+    }
+    world
+        .set(
+            &parked.id,
+            "state='parked',failure_kind='owner_required',failure_message='held'",
+        )
+        .await;
+    let steps = |task: &'static str, id: String| async move {
+        let key = format!("integration-import:{id}");
+        world
+            .db
+            .task_steps(task)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.causation_key == key)
+            .count()
+    };
+    let (one, two, start) = tokio::join!(
+        import::enqueue_missing_continuations(&world.db, true),
+        import::enqueue_missing_continuations(&world.db, true),
+        import::enqueue_missing_continuations(&world.db, true),
+    );
+    assert_eq!(
+        one.unwrap() + two.unwrap() + start.unwrap(),
+        1,
+        "one enqueue is counted"
+    );
+    assert_eq!(steps("twice", a.id.clone()).await, 1);
+    assert_eq!(
+        steps("resting", parked.id.clone()).await,
+        0,
+        "the sweep continues `queued` rows only"
+    );
+    // The start pass lists every current pre-queue row, once.
+    let (sweep, start) = tokio::join!(
+        import::enqueue_missing_continuations(&world.db, true),
+        import::enqueue_missing_continuations(&world.db, false),
+    );
+    assert_eq!(sweep.unwrap() + start.unwrap(), 1);
+    assert_eq!(steps("twice", a.id.clone()).await, 1);
+    assert_eq!(steps("resting", parked.id.clone()).await, 1);
+    assert_eq!(
+        import::enqueue_missing_continuations(&world.db, false)
+            .await
+            .unwrap(),
+        0
+    );
+}

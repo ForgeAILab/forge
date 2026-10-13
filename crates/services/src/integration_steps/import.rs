@@ -61,7 +61,7 @@ pub struct ImportReport {
 
 /// Current attempts nothing has continued yet: imported rows and shadow
 /// rows, of Tasks that still exist, without their continuation step.
-const UNCONTINUED: &str = "SELECT a.id,a.state FROM integration_attempt a \
+const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
     WHERE a.current=1 AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
       AND EXISTS(SELECT 1 FROM task t WHERE t.id=a.task_ref AND t.deleted_at IS NULL) \
       AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref \
@@ -142,15 +142,18 @@ pub(crate) async fn enqueue_missing_continuations(
     db: &Arc<SqliteDb>,
     queued_only: bool,
 ) -> Result<u32> {
-    let ids: Vec<(String, String)> = sqlx::query_as(UNCONTINUED)
-        .fetch_all(db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+    // The sweep's read seeks the `queued` rows only; the start's lists every
+    // current pre-queue row once.
+    let ids: Vec<String> = if queued_only {
+        db.queued_imports_without_continuation().await?
+    } else {
+        sqlx::query_scalar(UNCONTINUED)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db::DbError::from)?
+    };
     let mut enqueued = 0;
-    for (id, state) in ids {
-        if queued_only && state != "queued" {
-            continue;
-        }
+    for id in ids {
         match enqueue_continuation(db, &id).await {
             Ok(true) => enqueued += 1,
             Ok(false) => {}
@@ -188,6 +191,20 @@ async fn enqueue_continuation(db: &Arc<SqliteDb>, attempt_id: &str) -> Result<bo
         db::now_rfc3339(),
     )?;
     let mut tx = db::begin_immediate(db.pool()).await?;
+    // One continuation per attempt, whoever asks (two sweeps, a sweep beside
+    // the start): the step's key is unique per Task and a second enqueue
+    // inserts nothing. Only the insert is counted.
+    let existed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND causation_key=?)",
+    )
+    .bind(&input.task_id)
+    .bind(&input.causation_key)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db::DbError::from)?;
+    if existed {
+        return Ok(false);
+    }
     let id = db.enqueue_step_in_tx(&mut tx, &input).await?;
     // Identity-fenced: a Task that changed status since the import still
     // gets its continuation, which then finds the entry gone and writes
