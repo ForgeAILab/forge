@@ -382,7 +382,18 @@ impl TaskStepWorker {
                             .and_then(db::task_writer::lease_remaining)
                     })
                     .min();
-                deadline.min(now + predecessor_lease.unwrap_or(deadline - now))
+                // Its own retry waits out a back-off: drive it when due.
+                let backoff = chrono::DateTime::parse_from_rfc3339(&own.available_at)
+                    .ok()
+                    .and_then(|due| {
+                        (due.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .to_std()
+                            .ok()
+                    })
+                    .map(|left| left + Duration::from_millis(5));
+                deadline
+                    .min(now + predecessor_lease.unwrap_or(deadline - now))
+                    .min(now + backoff.unwrap_or(deadline - now))
             } else {
                 let ceiling = *claimed_until.get_or_insert(now + self.db.claimed_task_step_wait());
                 if now >= ceiling {
@@ -944,8 +955,12 @@ impl TaskStepWorker {
             // The work is over; what is left records how it ended. A busy
             // database there is waited out: giving up would leave the step
             // claimed until its lease lapses and cost it an attempt.
-            wait_out_busy(|| self.settle_failed_attempt(&step, &error)).await?;
-            if step.kind == "command" {
+            let requeued = wait_out_busy(|| self.settle_failed_attempt(&step, &error)).await?;
+            // A re-queued command is still accepted and runs on its retry:
+            // its waiter is not answered with this attempt's error (a caller
+            // told "error" asks again, and both commands would run). It
+            // keeps waiting, within its bound, for the retry's answer.
+            if step.kind == "command" && !requeued {
                 if let Some(reply) = self
                     .task_service
                     .task_step_replies
@@ -967,8 +982,9 @@ impl TaskStepWorker {
         Ok(())
     }
     /// Record a failed attempt of a step this worker still owns. Every write
-    /// is fenced by the claim, so repeating the whole of it is safe.
-    async fn settle_failed_attempt(&self, step: &TaskStep, error: &ServiceError) -> Result<()> {
+    /// is fenced by the claim, so repeating the whole of it is safe. `true`
+    /// when the step was re-queued for another attempt.
+    async fn settle_failed_attempt(&self, step: &TaskStep, error: &ServiceError) -> Result<bool> {
         let current = self
             .db
             .task_steps(&step.task_id)
@@ -980,11 +996,11 @@ impl TaskStepWorker {
             .is_some_and(|s| s.status == "claimed" && s.claimed_by == step.claimed_by)
         {
             tracing::warn!(step_id = %step.id, %error, "task step attempt lost ownership or was already settled");
-            return Ok(());
+            return Ok(false);
         }
         if !self.db.step_entry_matches(step).await? {
             self.settle(step, "superseded", Some(&error.to_string()), false)
-                .await
+                .await?;
         } else if step.attempts < MAX_STEP_ATTEMPTS
             && (database_busy(error)
                 || matches!(
@@ -998,15 +1014,16 @@ impl TaskStepWorker {
             // after a lapsed lease, instead of failing its phase.
             self.db
                 .retry_step(step, &error.to_string(), &retry_due(step.attempts))
-                .await
-                .map_err(ServiceError::from)
+                .await?;
+            return Ok(true);
         } else if step.kind == "hooks" {
             self.fail_committed_hook_phase(step, &error.to_string())
-                .await
+                .await?;
         } else {
             self.settle(step, "failed", Some(&error.to_string()), true)
-                .await
+                .await?;
         }
+        Ok(false)
     }
     async fn preempt_step(&self, step: &TaskStep) -> Result<()> {
         let operations = self.db.running_remote_task_operations(&step.id).await?;

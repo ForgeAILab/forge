@@ -6900,9 +6900,20 @@ owner for 90 seconds (one 60-second lease plus SQLite's 30-second lock
 timeout) returns `task_busy` and remains queued: no caller waits without a
 bound. The db handle carries that shared claimed-wait ceiling; tests shorten
 it through a test-only setter. Dropping a command waiter removes its reply
-registration while leaving its durable step and worker intact. A retryable
-attempt still re-queues the same step and answers its caller with the attempt's
-error; a lost reply sender for a live step is re-registered for a later attempt.
+registration while leaving its durable step and worker intact. The inline
+claim of a head, its liveness witness and its runner are one spawned job, never
+part of the waiter: a request dropped while the claim's commit is in flight
+cannot leave the step claimed with nothing running it. A command attempt that
+fails before it ran and is re-queued does not answer its caller: the command
+is still accepted, so the waiter drives the retry when its back-off is due and
+returns that answer, or `task_busy` at its deadline; only a settled failure
+answers with the error. A lost reply sender for a live step is re-registered
+for a later attempt. After the command ran, a busy database at its settlement
+is waited out and never re-queues it (the step is failed, and its caller still
+gets the command's own answer, if the lock never clears); a failed lease
+release is repeated and never replaces the committed answer. A waiter that
+reads a released step before its reply arrives waits up to 250 ms for the
+typed reply before it uses the stored result.
 
 Cancel/Hold preempts scripts, CI and startup at a safe point. Integration is
 protected from its start (`integration_started_at`) through its result and

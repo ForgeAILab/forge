@@ -547,8 +547,12 @@ async fn command_waiter_returns_typed_busy_under_a_live_owner_that_completes_lat
     );
 }
 
+/// A command whose attempt failed before it ran and was re-queued is still
+/// accepted: it runs on its retry. Its caller is not answered with the
+/// attempt's transient error (a caller told "error" asks again, and both
+/// commands then run); it waits, within its bound, for the retry's answer.
 #[tokio::test]
-async fn command_waiter_retryable_attempt_preserves_requeue_and_new_reply_registration() {
+async fn command_waiter_gets_the_answer_of_its_requeued_command_not_the_attempt_error() {
     let (db, mut worker) = fixture().await;
     let gate = CommandGate::new(CommandPoint::BeforeCommand, CommandFault::Retry);
     worker.command_test_gate = Some(gate.clone());
@@ -563,41 +567,17 @@ async fn command_waiter_retryable_attempt_preserves_requeue_and_new_reply_regist
     });
     gate.wait().await;
     gate.resume.notify_one();
-    let answer = tokio::time::timeout(Duration::from_secs(3), waiter)
+    let answer = tokio::time::timeout(Duration::from_secs(4), waiter)
         .await
-        .unwrap()
+        .expect("the retry is driven at its back-off, inside the waiter's bound")
         .unwrap();
-    assert!(
-        matches!(answer, Err(ServiceError::RateLimited { .. })),
-        "the attempt's typed error is retained: {answer:?}"
+    assert_eq!(
+        answer.expect("the re-queued command's own answer").status,
+        "todo"
     );
-    gate.take_job().await.unwrap();
-    let first = db.task_steps("t").await.unwrap().remove(0);
-    assert_eq!(first.status, "pending", "the failed attempt was re-queued");
-    assert_eq!(first.attempts, 1);
-    assert!(first.last_error.is_some());
-    assert!(worker
-        .task_service
-        .task_step_replies
-        .lock()
-        .unwrap()
-        .is_empty());
-    // Make the backoff due without sleeping through it. The next request
-    // registers a fresh sender, drives the old retry and gets its own reply.
-    db.ready_step(&first.id).await.unwrap();
-    let next = tokio::time::timeout(
-        Duration::from_secs(3),
-        worker.request_command::<db::Task>("t", read_current_task_command()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(next.status, "todo");
     let rows = db.task_steps("t").await.unwrap();
-    assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|step| step.status == "done"));
-    assert_eq!(rows[0].attempts, 2);
-    assert_eq!(rows[1].attempts, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].status.as_str(), rows[0].attempts), ("done", 2));
     assert!(worker
         .task_service
         .task_step_replies
