@@ -3292,6 +3292,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - An unconfigured review still skips into merging; an all-cancelled root with
   no commits now completes as a no-op instead of waiting for an implementation
   execution that does not exist. Changed or dirty branches are preserved.
+- Interrupted review-refresh recovery now uses one entry-keyed durable cascade and honors existing failure parks. An unrecoverable `merge_failed` Task raises Attention with Restart/Cancel instead of appending two failed recovery commands on every dispatcher pass; transient recovery uses the Task-step worker's bounded retries. A Task whose machine is away waits for the machine instead; if the park is lifted while the Task stays in `merge_failed`, one new recovery attempt runs (it used to be swallowed by the ended one, leaving the Task with no step and no park).
+- Paused-integration resume, unchanged merge-admission refusals, and accepted role retries waiting for machine capacity no longer append recovery/admission commands on every dispatcher pass. Accepted retries keep their intent and proceed when capacity is released.
 - A planner failure while its Agent is paused no longer leaves the Task clear
   without a run after resume; it retries within the Execution budget.
 - A queued lead recovery opens a fresh step-check budget window before

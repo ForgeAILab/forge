@@ -1107,14 +1107,33 @@ impl TaskDispatcher {
                 Ok(0)
             }
             Step::Publication => self.reconcile_publication_task(task).await,
-            Step::QueuedRecovery => Box::pin(self.task_service.dispatch_queued_recovery(task))
-                .await
-                .map(u64::from),
-            Step::Integrate => self
-                .task_service
-                .retry_paused_integration(task)
-                .await
-                .map(u64::from),
+            Step::QueuedRecovery => {
+                // An accepted role Retry keeps its intent while the machine
+                // is full. Probe the slot before issuing its replay command;
+                // the probe's unchanged capacity wait is idempotent.
+                if let Some(queued) =
+                    deferred_dispatch::queued_recovery(task).filter(|queued| queued.launches_role())
+                {
+                    if let Some(id) = queued.request.agent_id.as_deref() {
+                        if let Some(agent) = db::AgentRepo::get_by_id(&*self.db, id).await? {
+                            if crate::placement::machine_precheck::wait_before_dispatch(
+                                &self.db,
+                                &self.task_service,
+                                task,
+                                &agent,
+                                queued.request.role_name.as_deref(),
+                            )
+                            .await?
+                            {
+                                return Ok(0);
+                            }
+                        }
+                    }
+                }
+                Box::pin(self.task_service.dispatch_queued_recovery(task))
+                    .await
+                    .map(u64::from)
+            }
             Step::AdmitIntegration => self
                 .task_service
                 .reconcile_integration_admission(task)
@@ -1130,23 +1149,87 @@ impl TaskDispatcher {
                     .await?;
                 Ok(1)
             }
-            Step::ReviewRefresh { target } => {
-                self.task_service
-                    .transition(
-                        task.id.clone(),
+            Step::ReviewRefresh { .. } | Step::Integrate => {
+                // Recover through the durable cascade, just like the original
+                // review-refresh hop. A command failure only answers its caller;
+                // a cascade has bounded retries and records CascadeFailed for
+                // the owner when the hop cannot complete. One identity per entry
+                // also prevents two rounds of this pass from issuing it twice.
+                let (target, bridge, reason, key) = match step {
+                    Step::ReviewRefresh { target } => (
                         target.clone(),
-                        crate::task_service::TransitionOptions {
-                            bridge: api_types::TransitionBridge::new(
-                                api_types::TransitionBridgeKind::ReviewRefresh,
-                            ),
-                            version: task.version,
-                            reason: Some("Recover interrupted review refresh".into()),
-                            triggered_by: Actor::system(SystemComponent::TaskDispatcher),
-                            rejection: false,
-                            defer_dispatch_seconds: None,
-                        },
+                        api_types::TransitionBridge::new(
+                            api_types::TransitionBridgeKind::ReviewRefresh,
+                        ),
+                        "Recover interrupted review refresh",
+                        "review-refresh-recovery",
+                    ),
+                    Step::Integrate => {
+                        // A merge state's own queue admission remains its
+                        // existing owner. Here only an interrupted status hop
+                        // is resumed, over the workflow's accept edge.
+                        let current = deferred_dispatch::paused_integration(task)
+                            .is_some_and(|marker| marker.state == task.status);
+                        let Some(target) = p
+                            .workflow
+                            .auto_transition_target(&task.status)
+                            .filter(|_| current)
+                        else {
+                            return self
+                                .task_service
+                                .retry_paused_integration(task)
+                                .await
+                                .map(u64::from);
+                        };
+                        (
+                            target.to_owned(),
+                            Default::default(),
+                            "resuming integration after project pause",
+                            "paused-integration-recovery",
+                        )
+                    }
+                    _ => unreachable!("matched a recovery hop"),
+                };
+                // One hop per entry and per ended attempt. While an attempt
+                // is queued the identity is unchanged, so a second round or
+                // pass adds nothing. An attempt that failed parked the Task
+                // (`CascadeFailed`), and nothing is issued under that park.
+                // Once its owner lifts the park without leaving the state,
+                // the next attempt has its own identity: the ended one must
+                // not swallow it and leave the Task with neither a step nor
+                // a park that says why.
+                let ended: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM task_step WHERE task_id=? AND expected_epoch=? AND status IN ('failed','parked','superseded') AND substr(causation_key,1,length(?))=?",
+                )
+                .bind(&task.id)
+                .bind(p.read.epoch)
+                .bind(format!("{key}:"))
+                .bind(format!("{key}:"))
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db::DbError::from)?;
+                let cascade = self
+                    .task_service
+                    .workflow_execution()
+                    .cascade_step_input(
+                        task,
+                        &p.workflow,
+                        target.clone(),
+                        reason.into(),
+                        bridge,
+                        false,
+                        false,
+                        Some(crate::workflow::engine::WorkflowAuthority {
+                            project_version: project.version,
+                            workflow_definition: project.workflow_definition.clone(),
+                            clear_review_passed_at_on_commit: false,
+                        }),
+                        None,
+                        format!("{key}:{}:{}:{target}:{ended}", task.id, p.read.epoch),
+                        Some(p.read.epoch),
                     )
                     .await?;
+                db::TaskStepRepo::enqueue_step(&*self.db, &cascade).await?;
                 Ok(1)
             }
             Step::SettleExecution { .. } => {

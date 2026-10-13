@@ -1328,6 +1328,180 @@ fn shapes_of_case(case: usize) -> Vec<&'static str> {
         .collect()
 }
 
+async fn idle_bookkeeping(c: &Ctx) -> Vec<(String, i64, i64)> {
+    sqlx::query_as("SELECT title, (SELECT COUNT(*) FROM task_step WHERE task_id=task.id), COALESCE((SELECT generation FROM task_schedule_dirty WHERE task_id=task.id),0) FROM task WHERE project_id=? ORDER BY title,id")
+        .bind(&c.pid).fetch_all(c.db.pool()).await.unwrap()
+}
+
+async fn unchanged_shapes(case: usize) {
+    let mut findings = Vec::new();
+    for name in shapes_of_case(case) {
+        let c = ctx(false).await;
+        Box::pin(apply(name, &c)).await;
+        let mut baseline = Vec::new();
+        for pass in 1..=20 {
+            tokio::time::timeout(Duration::from_secs(20), c.dispatcher.reconcile_all())
+                .await
+                .unwrap_or_else(|_| panic!("{name}: pass {pass} timed out"))
+                .unwrap();
+            c.dispatcher.drain_steps().await.unwrap();
+            let after = idle_bookkeeping(&c).await;
+            if pass == 2 {
+                baseline = after;
+            } else if pass > 2 && after != baseline {
+                findings.push(format!("{name}: pass {pass}: {baseline:?} -> {after:?}"));
+                // Report each further write once, against the pass before it.
+                baseline = after;
+            }
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "unchanged dispatcher fixtures wrote after pass 2:\n{}",
+        findings.join("\n")
+    );
+}
+
+macro_rules! unchanged_cases {
+    ($($name:ident => $case:expr,)+) => {
+        mod unchanged_condition_guard {
+            $(#[test]
+            fn $name() {
+                super::on_runtime(|| super::unchanged_shapes($case));
+            })+
+        }
+    };
+}
+
+unchanged_cases! {
+    shapes_0_mod_8 => 0,
+    shapes_1_mod_8 => 1,
+    shapes_2_mod_8 => 2,
+    shapes_3_mod_8 => 3,
+    shapes_4_mod_8 => 4,
+    shapes_5_mod_8 => 5,
+    shapes_6_mod_8 => 6,
+    shapes_7_mod_8 => 7,
+}
+
+#[test]
+fn unchanged_failure_condition_matrix_guard() {
+    on_runtime(|| async {
+        use api_types::FailureKind::*;
+        let c = ctx(false).await;
+        // The action matrix's shared fixture factory supplies each annotation.
+        let kinds = [
+            MergeConflict,
+            TargetRepoDirty,
+            DirtyWorktree,
+            CiFailed,
+            ReviewGateFailed,
+            ReviewBudgetExhausted,
+            ReviewBlocked,
+            ReviewNeedsOwner,
+            EnvironmentNotReady,
+            RetryExhausted,
+            MergeFixBudgetExhausted,
+            WorkflowGuardRejected,
+            InternalCommandFailed,
+            ExecutorFailed,
+            WorkspaceFailed,
+            WorkspaceResetRequired,
+            WorkspaceError,
+            BeforeWorkHookTimeout,
+            BeforeWorkHookFailed,
+            MaxTurnsExceeded,
+            ManualStop,
+            RecoveryRequired,
+            ExecutorUnavailable,
+            Unknown,
+            WorkflowLoop,
+            CascadeFailed,
+            DispatchFailed,
+            DependencyCancelled,
+        ];
+        for state in [
+            "backlog",
+            "todo",
+            "planning",
+            "in_progress",
+            "review",
+            "merging",
+            "merge_failed",
+            "done",
+            "cancelled",
+        ] {
+            for kind in kinds {
+                let t = task(&c, &format!("{state}/{kind}"), state).await;
+                let sample = crate::task_actions::test_support::snapshot(state, Some(kind));
+                ann(&c, &t.id, sample.task.error_annotation.as_deref().unwrap()).await;
+            }
+            for kind in [
+                RetryExhausted,
+                ReviewGateFailed,
+                MergeFixBudgetExhausted,
+                ExecutorFailed,
+                ManualStop,
+            ] {
+                let t = task(&c, &format!("{state}/blocked:{kind}"), state).await;
+                sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+                    .bind(serde_json::json!({"kind":kind,"reason":"fixture","created_at":now_rfc3339()}).to_string())
+                    .bind(&t.id).execute(c.db.pool()).await.unwrap();
+                raw(&c, &t.id, "title=title").await;
+            }
+            for extra in [
+                "failed_json",
+                "legacy_annotation",
+                "barrier_blocked",
+                "queued",
+                "awaiting_human_meta",
+                "pr_merge_wait",
+            ] {
+                let t = task(&c, &format!("{state}/{extra}"), state).await;
+                match extra {
+                    "failed_json" => raw(&c,&t.id,r#"failed_json='{"kind":"executor_failed","reason":"fixture"}'"#).await,
+                    "legacy_annotation" => ann(&c,&t.id,r#"{"message":"old free-form annotation"}"#).await,
+                    "barrier_blocked" => {
+                        sqlx::query("UPDATE task SET entry_barrier_json=? WHERE id=?")
+                            .bind(serde_json::json!({"status":"blocked","state":state}).to_string())
+                            .bind(&t.id).execute(c.db.pool()).await.unwrap();
+                        raw(&c,&t.id,"title=title").await;
+                    }
+                    "queued" => meta(&c,&t.id,serde_json::json!({"queued_recovery":{"id":"q"}})).await,
+                    "awaiting_human_meta" => meta(&c,&t.id,serde_json::json!({"awaiting_human":true})).await,
+                    "pr_merge_wait" => meta(&c,&t.id,serde_json::json!({"awaiting_human":true,"awaiting_human_reason":"pull_request_merge"})).await,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let mut baseline = Vec::new();
+        let mut findings = Vec::new();
+        for pass in 1..=20 {
+            tokio::time::timeout(Duration::from_secs(60), c.dispatcher.reconcile_all())
+                .await
+                .unwrap()
+                .unwrap();
+            c.dispatcher.drain_steps().await.unwrap();
+            let after = idle_bookkeeping(&c).await;
+            if pass == 2 {
+                baseline = after;
+            } else if pass > 2 && after != baseline {
+                for (before, after) in baseline.iter().zip(&after) {
+                    if before != after {
+                        findings.push(format!("pass {pass}: {before:?} -> {after:?}"));
+                    }
+                }
+                baseline = after;
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "unchanged failure conditions wrote after pass 2:\n{}",
+            findings.join("\n")
+        );
+    });
+}
+
 async fn shapes(mode: &'static str, prime: bool, case: usize) {
     let only = std::env::var("SCHEDULER_EQUIVALENCE_ONLY").ok();
     // A recording is one file per section: the first case writes all of it.

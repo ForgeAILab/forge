@@ -10502,6 +10502,9 @@ mod lead_check;
 mod lead_operations;
 #[path = "tests/review_candidate.rs"]
 mod review_candidate;
+#[cfg(test)]
+#[path = "tests/refresh_recovery.rs"]
+mod refresh_recovery;
 #[path = "tests/root_lead.rs"]
 mod root_lead;
 #[path = "tests/root_replan.rs"]
