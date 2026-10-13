@@ -1252,7 +1252,12 @@ impl TaskDispatcher {
         let checks = config
             .get("ci_steps")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|steps| !steps.is_empty());
+            .is_some_and(|steps| !steps.is_empty())
+            // A read-only Task runs no implementation checks, with or
+            // without a candidate: skipping them is not a missing validation.
+            && !crate::workflow::actions::task_is_read_only(&self.db, task)
+                .await
+                .map_err(ServiceError::invalid_operation)?;
         if !(agent_reviewer || checks)
             || task.review_passed_at.is_some()
             || crate::task_service::latest_executor_execution_for_task(&self.db, task)

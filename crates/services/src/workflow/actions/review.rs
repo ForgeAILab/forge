@@ -58,9 +58,11 @@ pub(super) async fn prepare_review_entry(
             }),
         None => false,
     };
-    if !(agent_reviewer || !review_ci_steps(&ctx.state_config)?.is_empty())
-        || task.review_passed_at.is_some()
-    {
+    // A read-only Task runs no implementation checks, with or without a
+    // candidate: its skipped checks are not a missing validation.
+    let checks = !review_ci_steps(&ctx.state_config)?.is_empty()
+        && !task_execution_is_read_only(ctx, task).await?;
+    if !(agent_reviewer || checks) || task.review_passed_at.is_some() {
         return Ok(None);
     }
     // The branch is on a machine that is away: nothing is decided now.
