@@ -6120,4 +6120,8 @@ mod normalization_tests;
 mod registry_tests;
 
 #[cfg(test)]
+#[path = "typed_tools/lead_tests.rs"]
+mod lead_tests;
+
+#[cfg(test)]
 mod proposal_registry_tests;

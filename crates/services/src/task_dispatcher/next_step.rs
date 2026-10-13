@@ -398,7 +398,11 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         // order check and park the subtask again. The root's return to its
         // implementation state marks its subtasks, and the action runs then.
         // (The lead's own `lead.recover` is such an action.)
-        if let Some((parent_id, cause)) = f.parent_wait.as_ref().filter(|(_, cause)| cause == "planning") {
+        if let Some((parent_id, cause)) = f
+            .parent_wait
+            .as_ref()
+            .filter(|(_, cause)| cause == "planning")
+        {
             return park(
                 Reason::ParentWait {
                     parent_id: parent_id.clone(),

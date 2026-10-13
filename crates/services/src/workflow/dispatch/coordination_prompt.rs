@@ -243,7 +243,9 @@ impl PromptBuilder for CoordinationPlannerPromptBuilder {
             })
             .collect::<Vec<_>>();
         if !notes.is_empty() {
-            user.push_str("\nYour questions and the owner's answers and notes on this root (oldest first):\n");
+            user.push_str(
+                "\nYour questions and the owner's answers and notes on this root (oldest first):\n",
+            );
             for note in &notes[notes.len().saturating_sub(ROOT_NOTES)..] {
                 user.push_str(&format!(
                     "- {}: {}\n",

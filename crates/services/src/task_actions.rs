@@ -1509,8 +1509,8 @@ pub async fn load_snapshot(
     // What the lead of this subtask's root may do to it now: those offers
     // name the lead, and the lead itself is offered them.
     if let Some((lead, verbs)) = crate::task_hierarchy::lead_verbs(db, &task).await? {
-        caller.lead =
-            !verbs.is_empty() && matches!(actor, Actor::Agent { agent_id, .. } if *agent_id == lead);
+        caller.lead = !verbs.is_empty()
+            && matches!(actor, Actor::Agent { agent_id, .. } if *agent_id == lead);
         caller.lead_verbs = verbs;
     }
     let role = workflow

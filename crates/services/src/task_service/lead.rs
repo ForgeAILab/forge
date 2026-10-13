@@ -110,15 +110,19 @@ pub(crate) async fn clear_lead_input_wait(
         vec![db::TaskMetadataMutation::CompareAndMutate {
             key: "awaiting_human_marker_id".to_owned(),
             expected: json!(current),
-            mutations: ["awaiting_human", "awaiting_human_reason", "awaiting_human_marker_id"]
-                .into_iter()
-                // The asking run stays marked while the root plans (its
-                // completion is never an Accept); it goes when the root left.
-                .chain(marker.is_none().then_some("lead_input_execution_id"))
-                .map(|key| db::TaskMetadataMutation::Remove {
-                    key: key.to_owned(),
-                })
-                .collect(),
+            mutations: [
+                "awaiting_human",
+                "awaiting_human_reason",
+                "awaiting_human_marker_id",
+            ]
+            .into_iter()
+            // The asking run stays marked while the root plans (its
+            // completion is never an Accept); it goes when the root left.
+            .chain(marker.is_none().then_some("lead_input_execution_id"))
+            .map(|key| db::TaskMetadataMutation::Remove {
+                key: key.to_owned(),
+            })
+            .collect(),
         }],
         &now_rfc3339(),
     )
@@ -203,7 +207,10 @@ impl TaskService {
         let not_leading = |why: &str| {
             refused(
                 LeadRefusal::NotLeading,
-                format!("this run does not lead coordination root {}: {why}", run.root_id),
+                format!(
+                    "this run does not lead coordination root {}: {why}",
+                    run.root_id
+                ),
             )
         };
         let execution = ExecutionRepo::get_by_id(&*self.db, &run.execution_id)
@@ -246,7 +253,9 @@ impl TaskService {
             }
         }
         let target = match target {
-            Some(id) => Some(crate::task_hierarchy::ensure_in_lead_subtree(&self.db, &root, id).await?),
+            Some(id) => {
+                Some(crate::task_hierarchy::ensure_in_lead_subtree(&self.db, &root, id).await?)
+            }
             None => None,
         };
         Ok((
@@ -428,8 +437,10 @@ impl TaskService {
             "truncated": truncated,
         });
         if let Some(task) = target.filter(|task| task.id != root.id) {
-            let (description, clipped) =
-                clip(task.description.as_deref().unwrap_or_default(), READ_TEXT_CHARS * 8);
+            let (description, clipped) = clip(
+                task.description.as_deref().unwrap_or_default(),
+                READ_TEXT_CHARS * 8,
+            );
             let executions: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
                 "SELECT role, status, error, created_at FROM execution WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 5",
             )
@@ -828,8 +839,7 @@ impl TaskService {
         let (binding, target) = self.bind_lead(run, Some(task_id)).await?;
         let task = Self::lead_subtask_target(&binding, target)?;
         let note = note.trim();
-        if note.is_empty() || note.chars().count() > operation_registry::task_lead::MAX_NOTE_CHARS
-        {
+        if note.is_empty() || note.chars().count() > operation_registry::task_lead::MAX_NOTE_CHARS {
             return Err(ServiceError::invalid_operation(format!(
                 "a hand-off note is 1 to {} characters",
                 operation_registry::task_lead::MAX_NOTE_CHARS
@@ -899,14 +909,13 @@ impl TaskService {
             .unwrap_or(Value::Null);
         let pending = metadata["awaiting_human"] == true;
         let idempotency = format!("lead:{}:{key}", db::COMMENT_KIND_REQUEST_INPUT);
-        let asked: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM task_comment WHERE task_id=? AND idempotency_key=?",
-        )
-        .bind(&root.id)
-        .bind(&idempotency)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let asked: Option<String> =
+            sqlx::query_scalar("SELECT id FROM task_comment WHERE task_id=? AND idempotency_key=?")
+                .bind(&root.id)
+                .bind(&idempotency)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db::DbError::from)?;
         if pending && metadata["awaiting_human_marker_id"].as_str() != asked.as_deref() {
             return Err(refused(
                 LeadRefusal::InputPending,
@@ -914,16 +923,23 @@ impl TaskService {
             ));
         }
         let comment = self
-            .lead_comment(&binding, &root.id, db::COMMENT_KIND_REQUEST_INPUT, question, key)
+            .lead_comment(
+                &binding,
+                &root.id,
+                db::COMMENT_KIND_REQUEST_INPUT,
+                question,
+                key,
+            )
             .await?;
         let dedupe = lead_input_dedupe_key(&root.id, &comment.id);
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attention_projection WHERE dedupe_key=?)")
-                .bind(&dedupe)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db::DbError::from)?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM attention_projection WHERE dedupe_key=?)",
+        )
+        .bind(&dedupe)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db::DbError::from)?;
         if !exists {
             let now = now_rfc3339();
             let event = db::DomainEventRepo::append_event_in_tx(

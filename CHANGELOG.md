@@ -8,6 +8,29 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A root's lead can change the breakdown, recover a parked subtask, leave
+  hand-off notes and ask the owner a question.** The lead's planning run (and
+  its step check on a subtask) has five native operations, limited to its own
+  root's subtasks: `lead.read`, `lead.subtask` (create, update, cancel,
+  reorder, assign), `lead.recover`, `lead.handoff` and `lead.request_input`.
+  After a parked subtask the lead can retry or cancel it and add what replaces
+  it; after a rejected aggregate review it can add fix subtasks, and the root
+  returns to `in_progress` and to review when they are done. Roots without a
+  lead are not affected. New values that clients must tolerate:
+  `human_decision.boundary = lead_input` (a root in `planning` waiting for
+  the owner's answer to its lead's question); `authority` value `lead` on a
+  subtask's `retry`, `restart` and `cancel` offers; Attention items with
+  `recommended_action = answer_lead_input`; comment kinds `handoff` and
+  `request_input`; `task.adaptive` events with `actor_type = task_lead`; error
+  code `LEAD_OPERATION_REFUSED`. Migration `V202610130038` rebuilds
+  `task_comment` for the two comment kinds and keeps every row.
+- **Resolving an Attention item that carries a lead's question needs an
+  answer.** `POST /api/v1/mission-control/attention/{id}/resolve` accepts an
+  optional `answer` (`AttentionResolveRequest`). It is required for an item
+  whose `recommended_action` is `answer_lead_input` and refused on every other
+  item; existing callers that send only `expected_version` are unchanged for
+  every existing item.
+
 - **A coordination root moves to `in_progress` when it has a subtask to run,
   and its subtasks run only while it is there.** A root Task with subtasks
   used to rest in `todo` while its subtasks ran. It now moves to its
@@ -2878,6 +2901,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- Task comments return an optional `kind` (`progress`, `decision`,
+  `validation`, `blocker`, `handoff`, `request_input`).
+- A hand-off note of a root's lead is the first thing a subtask's next
+  implementation prompt shows, ahead of the description and ordinary comments.
+- What a lead may repeat is bounded on its root: 8 subtasks created per lead
+  run and 24 per budget window, 2 recoveries per subtask per budget window, 20
+  hand-off notes per subtask, one open question per root. A Retry with a new
+  budget on the root opens the next window.
 
 - **Merge-queue receipts have a retention period.** The hourly storage pass
   now empties the owner receipts and observations of merge attempts that

@@ -4,7 +4,9 @@
 //! boundary are all in the path. In the end-to-end tests the lead's run is
 //! scripted in the test executor: the run issues its operations and
 //! completes, and the dispatcher does the rest.
-use super::root_lead::{executions, fixture_with, park, passes, reload, root_with_child, until, Lead};
+use super::root_lead::{
+    executions, fixture_with, park, passes, reload, root_with_child, until, Lead,
+};
 use super::root_replan::{log, root_with_failed_review, root_with_parked_child, spent};
 use super::*;
 use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
@@ -79,9 +81,11 @@ impl TaskExecutor for ScriptedLead {
                     (operation, payload)
                 }
             };
-            let result = lead_call(&self.db, &service, &lead, &task_id, operation, payload, &key)
-                .await
-                .map_err(|error| format!("{error:?}"));
+            let result = lead_call(
+                &self.db, &service, &lead, &task_id, operation, payload, &key,
+            )
+            .await
+            .map_err(|error| format!("{error:?}"));
             self.results
                 .lock()
                 .unwrap()
@@ -333,7 +337,9 @@ async fn calls_succeeded(ops: &Ops, count: usize) {
 }
 
 async fn children(lead: &Lead, root: &str) -> Vec<Task> {
-    TaskRepo::list_subtasks_ordered(&*lead.db, root).await.unwrap()
+    TaskRepo::list_subtasks_ordered(&*lead.db, root)
+        .await
+        .unwrap()
 }
 
 async fn running(lead: &Lead, task: &str, role: &str) -> bool {
@@ -426,18 +432,47 @@ async fn a_lead_updates_its_own_subtask_and_never_another_roots() {
     let foreign = reload(&lead.db, &b1.id).await;
     let escapes = [
         ("lead.read", json!({"task_id": foreign.id})),
-        ("lead.subtask", json!({"action": "cancel", "task_id": foreign.id, "version": foreign.version, "reason": "not mine"})),
-        ("lead.subtask", json!({"action": "assign", "task_id": foreign.id, "agent_id": lead.coder})),
-        ("lead.subtask", json!({"action": "reorder", "ordered_task_ids": [foreign.id]})),
-        ("lead.subtask", json!({"action": "update", "task_id": root_b.id, "version": 1, "title": "mine now"})),
-        ("lead.recover", json!({"task_id": foreign.id, "action": {"verb": "retry"}, "version": foreign.version})),
-        ("lead.recover", json!({"task_id": "no-such-task", "action": {"verb": "cancel"}, "version": 1})),
-        ("lead.handoff", json!({"task_id": foreign.id, "note": "a note for someone else's worker"})),
-        ("lead.handoff", json!({"task_id": root_b.id, "note": "a note on someone else's root"})),
+        (
+            "lead.subtask",
+            json!({"action": "cancel", "task_id": foreign.id, "version": foreign.version, "reason": "not mine"}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action": "assign", "task_id": foreign.id, "agent_id": lead.coder}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action": "reorder", "ordered_task_ids": [foreign.id]}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action": "update", "task_id": root_b.id, "version": 1, "title": "mine now"}),
+        ),
+        (
+            "lead.recover",
+            json!({"task_id": foreign.id, "action": {"verb": "retry"}, "version": foreign.version}),
+        ),
+        (
+            "lead.recover",
+            json!({"task_id": "no-such-task", "action": {"verb": "cancel"}, "version": 1}),
+        ),
+        (
+            "lead.handoff",
+            json!({"task_id": foreign.id, "note": "a note for someone else's worker"}),
+        ),
+        (
+            "lead.handoff",
+            json!({"task_id": root_b.id, "note": "a note on someone else's root"}),
+        ),
     ];
     for (index, (operation, payload)) in escapes.into_iter().enumerate() {
         let refused = ops
-            .call(&root_a.id, operation, payload.clone(), &format!("escape-{index}"))
+            .call(
+                &root_a.id,
+                operation,
+                payload.clone(),
+                &format!("escape-{index}"),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -446,7 +481,10 @@ async fn a_lead_updates_its_own_subtask_and_never_another_roots() {
         );
     }
     let after = reload(&lead.db, &b1.id).await;
-    assert_eq!((after.status.as_str(), after.version), ("todo", foreign.version));
+    assert_eq!(
+        (after.status.as_str(), after.version),
+        ("todo", foreign.version)
+    );
     assert!(comments(lead, &b1.id).await.is_empty());
     assert!(comments(lead, &root_b.id).await.is_empty());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_role_assignment WHERE task_id=?")
@@ -458,9 +496,18 @@ async fn a_lead_updates_its_own_subtask_and_never_another_roots() {
     // The root itself is never a subtask target of its own lead.
     let own_root = reload(&lead.db, &root_a.id).await;
     for (operation, payload) in [
-        ("lead.subtask", json!({"action": "cancel", "task_id": own_root.id, "version": own_root.version, "reason": "give up"})),
-        ("lead.recover", json!({"task_id": own_root.id, "action": {"verb": "cancel"}, "version": own_root.version})),
-        ("lead.handoff", json!({"task_id": own_root.id, "note": "to myself"})),
+        (
+            "lead.subtask",
+            json!({"action": "cancel", "task_id": own_root.id, "version": own_root.version, "reason": "give up"}),
+        ),
+        (
+            "lead.recover",
+            json!({"task_id": own_root.id, "action": {"verb": "cancel"}, "version": own_root.version}),
+        ),
+        (
+            "lead.handoff",
+            json!({"task_id": own_root.id, "note": "to myself"}),
+        ),
     ] {
         let refused = ops
             .call(&root_a.id, operation, payload, &format!("root-{operation}"))
@@ -487,8 +534,14 @@ async fn an_ordinary_planner_run_has_no_lead_operation() {
     .await;
     for (operation, payload) in [
         ("lead.read", json!({})),
-        ("lead.subtask", json!({"action": "create", "title": "smuggled"})),
-        ("lead.recover", json!({"task_id": root.id, "action": {"verb": "cancel"}, "version": 1})),
+        (
+            "lead.subtask",
+            json!({"action": "create", "title": "smuggled"}),
+        ),
+        (
+            "lead.recover",
+            json!({"task_id": root.id, "action": {"verb": "cancel"}, "version": 1}),
+        ),
         ("lead.handoff", json!({"task_id": root.id, "note": "note"})),
         ("lead.request_input", json!({"question": "may I?"})),
     ] {
@@ -512,7 +565,10 @@ async fn an_ordinary_planner_run_has_no_lead_operation() {
     };
     assert!(matches!(
         principal(plain.id.clone()).await,
-        operation_registry::authority::Principal::TaskAgent { lead_root_id: None, .. }
+        operation_registry::authority::Principal::TaskAgent {
+            lead_root_id: None,
+            ..
+        }
     ));
     assert!(matches!(
         principal(root.id.clone()).await,
@@ -520,13 +576,19 @@ async fn an_ordinary_planner_run_has_no_lead_operation() {
     ));
     // The lead's own run keeps the lead operations; removing the lead takes
     // them away from the run that is still going.
-    assert!(ops.call(&root.id, "lead.read", json!({}), "read").await.is_ok());
+    assert!(ops
+        .call(&root.id, "lead.read", json!({}), "read")
+        .await
+        .is_ok());
     sqlx::query("DELETE FROM task_role_assignment WHERE task_id=? AND role_name='planner'")
         .bind(&root.id)
         .execute(lead.db.pool())
         .await
         .unwrap();
-    assert!(ops.call(&root.id, "lead.read", json!({}), "read-2").await.is_err());
+    assert!(ops
+        .call(&root.id, "lead.read", json!({}), "read-2")
+        .await
+        .is_err());
 }
 
 /// What a lead may do to a subtask depends on whether it started. A started
@@ -543,7 +605,10 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
         running(lead, &root.id, PLANNER).await
     })
     .await;
-    let read = ops.call(&root.id, "lead.read", json!({}), "read").await.unwrap();
+    let read = ops
+        .call(&root.id, "lead.read", json!({}), "read")
+        .await
+        .unwrap();
     assert_eq!(read["subtasks"].as_array().unwrap().len(), 2, "{read}");
     assert_eq!(read["subtasks"][0]["started"], true, "{read}");
     assert_eq!(read["subtasks"][0]["lead_decides_park"], true, "{read}");
@@ -551,8 +616,14 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
 
     let current = reload(&lead.db, &started.id).await;
     for (key, payload) in [
-        ("update", json!({"action": "update", "task_id": current.id, "version": current.version, "title": "rewritten"})),
-        ("cancel", json!({"action": "cancel", "task_id": current.id, "version": current.version, "reason": "drop it"})),
+        (
+            "update",
+            json!({"action": "update", "task_id": current.id, "version": current.version, "title": "rewritten"}),
+        ),
+        (
+            "cancel",
+            json!({"action": "cancel", "task_id": current.id, "version": current.version, "reason": "drop it"}),
+        ),
     ] {
         let refused = ops
             .call(&root.id, "lead.subtask", payload, key)
@@ -562,44 +633,80 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
     }
     // The sequence command keeps the started subtask where it is.
     assert!(ops
-        .call(&root.id, "lead.subtask", json!({"action": "reorder", "ordered_task_ids": [later.id, current.id]}), "reorder-started")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "reorder", "ordered_task_ids": [later.id, current.id]}),
+            "reorder-started"
+        )
         .await
         .is_err());
     let unchanged = reload(&lead.db, &started.id).await;
     assert_eq!(
-        (unchanged.title.as_str(), unchanged.status.as_str(), unchanged.subtask_order),
+        (
+            unchanged.title.as_str(),
+            unchanged.status.as_str(),
+            unchanged.subtask_order
+        ),
         ("first step", "in_progress", Some(0))
     );
 
     // Assign (the subtask's worker, and the root's default worker) and a
     // hand-off note are accepted on the started subtask.
     let assigned = ops
-        .call(&root.id, "lead.subtask", json!({"action": "assign", "task_id": current.id, "agent_id": lead.coder}), "assign")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "assign", "task_id": current.id, "agent_id": lead.coder}),
+            "assign",
+        )
         .await
         .unwrap();
     assert_eq!(assigned["default_worker"], false, "{assigned}");
     let default_worker = ops
-        .call(&root.id, "lead.subtask", json!({"action": "assign", "agent_id": lead.coder}), "assign-default")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "assign", "agent_id": lead.coder}),
+            "assign-default",
+        )
         .await
         .unwrap();
     assert_eq!(default_worker["default_worker"], true, "{default_worker}");
     let note = ops
-        .call(&root.id, "lead.handoff", json!({"task_id": current.id, "note": "the linker needs the static feature"}), "note")
+        .call(
+            &root.id,
+            "lead.handoff",
+            json!({"task_id": current.id, "note": "the linker needs the static feature"}),
+            "note",
+        )
         .await
         .unwrap();
     assert_eq!(note["role"], PLANNER, "{note}");
     let notes = comments(lead, &started.id).await;
-    assert!(notes.iter().any(|comment| comment.worklog_kind.as_deref() == Some("handoff")
-        && comment.content == "the linker needs the static feature"
-        && comment.author_id.as_deref() == Some(lead.planner.as_str())));
+    assert!(notes
+        .iter()
+        .any(|comment| comment.worklog_kind.as_deref() == Some("handoff")
+            && comment.content == "the linker needs the static feature"
+            && comment.author_id.as_deref() == Some(lead.planner.as_str())));
 
     // Create: the server fills the parent; the same key creates one subtask.
     let created = ops
-        .call(&root.id, "lead.subtask", json!({"action": "create", "title": "third step", "description": "added by the lead"}), "create")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "create", "title": "third step", "description": "added by the lead"}),
+            "create",
+        )
         .await
         .unwrap();
     let again = ops
-        .call(&root.id, "lead.subtask", json!({"action": "create", "title": "third step", "description": "added by the lead"}), "create")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "create", "title": "third step", "description": "added by the lead"}),
+            "create",
+        )
         .await
         .unwrap();
     assert_eq!(created["task_id"], again["task_id"], "{created} {again}");
@@ -608,10 +715,18 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
     assert_eq!(all.len(), 3);
     assert_eq!(all[2].title, "third step");
     assert_eq!(all[2].parent_task_id.as_deref(), Some(root.id.as_str()));
-    assert_eq!((all[2].status.as_str(), all[2].subtask_order), ("todo", Some(2)));
+    assert_eq!(
+        (all[2].status.as_str(), all[2].subtask_order),
+        ("todo", Some(2))
+    );
     // A payload cannot name another parent: the contract has no such field.
     assert!(ops
-        .call(&root.id, "lead.subtask", json!({"action": "create", "title": "elsewhere", "parent_task_id": later.id}), "parent")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "create", "title": "elsewhere", "parent_task_id": later.id}),
+            "parent"
+        )
         .await
         .is_err());
 
@@ -621,12 +736,20 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
     ops.call(&root.id, "lead.subtask", json!({"action": "update", "task_id": waiting.id, "version": waiting.version, "title": "second step, narrowed"}), "update-later")
         .await
         .unwrap();
-    ops.call(&root.id, "lead.subtask", json!({"action": "reorder", "ordered_task_ids": [current.id, all[2].id, waiting.id]}), "reorder")
-        .await
-        .unwrap();
+    ops.call(
+        &root.id,
+        "lead.subtask",
+        json!({"action": "reorder", "ordered_task_ids": [current.id, all[2].id, waiting.id]}),
+        "reorder",
+    )
+    .await
+    .unwrap();
     let order = children(lead, &root.id).await;
     assert_eq!(
-        order.iter().map(|task| task.title.as_str()).collect::<Vec<_>>(),
+        order
+            .iter()
+            .map(|task| task.title.as_str())
+            .collect::<Vec<_>>(),
         vec!["first step", "third step", "second step, narrowed"]
     );
     let waiting = reload(&lead.db, &later.id).await;
@@ -644,13 +767,23 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
     // The per-run bound: one was created above, seven more fit, the next is
     // refused, typed, and creates nothing.
     for index in 0..7 {
-        ops.call(&root.id, "lead.subtask", json!({"action": "create", "title": format!("extra {index}")}), &format!("extra-{index}"))
-            .await
-            .unwrap();
+        ops.call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "create", "title": format!("extra {index}")}),
+            &format!("extra-{index}"),
+        )
+        .await
+        .unwrap();
     }
     let before = children(lead, &root.id).await.len();
     let refused = ops
-        .call(&root.id, "lead.subtask", json!({"action": "create", "title": "one too many"}), "too-many")
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action": "create", "title": "one too many"}),
+            "too-many",
+        )
         .await
         .unwrap_err();
     assert!(refused.contains("lead_limit_reached"), "{refused}");
@@ -688,7 +821,11 @@ async fn a_lead_recovers_a_parked_subtask_and_it_runs_again() {
     assert_eq!(
         log(lead, &root.id).await,
         vec![
-            ("in_progress".to_owned(), "planning".to_owned(), Some("replan".to_owned())),
+            (
+                "in_progress".to_owned(),
+                "planning".to_owned(),
+                Some("replan".to_owned())
+            ),
             ("planning".to_owned(), "in_progress".to_owned(), None),
         ]
     );
@@ -703,7 +840,10 @@ async fn a_lead_recovers_a_parked_subtask_and_it_runs_again() {
         "the park ended: {:?}",
         recovered.condition
     );
-    assert!(!running(lead, &later.id, CODER).await, "one subtask at a time");
+    assert!(
+        !running(lead, &later.id, CODER).await,
+        "one subtask at a time"
+    );
     // The root waits on its subtasks; no further lead run is started.
     passes(lead, 4).await;
     assert_eq!(
@@ -739,9 +879,13 @@ async fn a_third_recovery_of_one_subtask_is_refused() {
         child.id.clone(),
         json!({"task_id": child.id, "action": {"verb": "retry"}}),
     )]]);
-    until(lead, "the lead ran and the root implements again", async || {
-        !ops.results().is_empty() && reload(&lead.db, &root.id).await.status == "in_progress"
-    })
+    until(
+        lead,
+        "the lead ran and the root implements again",
+        async || {
+            !ops.results().is_empty() && reload(&lead.db, &root.id).await.status == "in_progress"
+        },
+    )
     .await;
     passes(lead, 3).await;
     let results = ops.results();
@@ -755,7 +899,11 @@ async fn a_third_recovery_of_one_subtask_is_refused() {
         "{}",
         park(&lead.db, &root.id).await
     );
-    assert_eq!(spent(lead, &root.id, "replan").await, 1, "one re-plan per park");
+    assert_eq!(
+        spent(lead, &root.id, "replan").await,
+        1,
+        "one re-plan per park"
+    );
     assert!(
         !crate::task_hierarchy::lead_handles_subtask_park(&lead.db, &child.id)
             .await
@@ -790,7 +938,10 @@ async fn a_lead_drops_a_parked_subtask_and_adds_its_replacement() {
     })
     .await;
     let results = ops.results();
-    assert!(results.iter().all(|(_, result)| result.is_ok()), "{results:?}");
+    assert!(
+        results.iter().all(|(_, result)| result.is_ok()),
+        "{results:?}"
+    );
     assert_eq!(reload(&lead.db, &child.id).await.status, "cancelled");
     let all = children(lead, &root.id).await;
     assert_eq!(
@@ -808,7 +959,10 @@ async fn a_lead_drops_a_parked_subtask_and_adds_its_replacement() {
     // review while it has not run.
     passes(lead, 4).await;
     assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
-    assert_eq!(spent(lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await, 1);
+    assert_eq!(
+        spent(lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await,
+        1
+    );
 }
 
 /// End to end, a rejected aggregate review becomes fix work: the lead adds a
@@ -830,21 +984,34 @@ async fn a_lead_turns_a_rejected_review_into_a_fix_subtask_that_runs() {
     })
     .await;
     let results = ops.results();
-    assert!(results.iter().all(|(_, result)| result.is_ok()), "{results:?}");
+    assert!(
+        results.iter().all(|(_, result)| result.is_ok()),
+        "{results:?}"
+    );
     assert_eq!(
         log(lead, &root.id).await[1..],
         [
-            ("review".to_owned(), "planning".to_owned(), Some("replan".to_owned())),
+            (
+                "review".to_owned(),
+                "planning".to_owned(),
+                Some("replan".to_owned())
+            ),
             ("planning".to_owned(), "in_progress".to_owned(), None),
         ]
     );
     passes(lead, 4).await;
     let implementing = reload(&lead.db, &root.id).await;
-    assert_eq!(implementing.status, "in_progress", "the root waits for the fix");
+    assert_eq!(
+        implementing.status, "in_progress",
+        "the root waits for the fix"
+    );
     assert_eq!(spent(lead, &root.id, "replan").await, 1);
     assert_eq!(spent(lead, &root.id, "review").await, 1);
     let fix = &children(lead, &root.id).await[1];
-    assert_eq!((fix.title.as_str(), fix.status.as_str()), ("fix the build", "in_progress"));
+    assert_eq!(
+        (fix.title.as_str(), fix.status.as_str()),
+        ("fix the build", "in_progress")
+    );
 }
 
 /// A hand-off note is the first thing the subtask's next implementation run
@@ -855,7 +1022,11 @@ async fn a_handoff_note_is_first_in_the_subtasks_next_implementation_prompt() {
     let ops = ops_fixture(true).await;
     let (root, child) = root_with_child(&ops.lead, true).await;
     ops.service
-        .add_user_comment(&child.id, "owner".to_owned(), "an ordinary comment".to_owned())
+        .add_user_comment(
+            &child.id,
+            "owner".to_owned(),
+            "an ordinary comment".to_owned(),
+        )
         .await
         .unwrap();
     ops.script(vec![vec![Call::Raw(
@@ -871,7 +1042,11 @@ async fn a_handoff_note_is_first_in_the_subtasks_next_implementation_prompt() {
         })
         .await;
     }
-    assert!(ops.results().iter().all(|(_, result)| result.is_ok()), "{:?}", ops.results());
+    assert!(
+        ops.results().iter().all(|(_, result)| result.is_ok()),
+        "{:?}",
+        ops.results()
+    );
     let prompt: Option<String> =
         sqlx::query_scalar("SELECT prompt FROM execution WHERE task_id=? AND role='coder'")
             .bind(&child.id)
@@ -882,9 +1057,14 @@ async fn a_handoff_note_is_first_in_the_subtasks_next_implementation_prompt() {
     let note = prompt
         .find("Hand-off notes from the lead")
         .unwrap_or_else(|| panic!("the note is in the prompt: {prompt}"));
-    assert!(prompt.contains("- lead: start from the parser; the lexer is done"), "{prompt}");
+    assert!(
+        prompt.contains("- lead: start from the parser; the lexer is done"),
+        "{prompt}"
+    );
     let description = prompt.find("echo subtask").expect("the description");
-    let ordinary = prompt.find("an ordinary comment").expect("the ordinary comment");
+    let ordinary = prompt
+        .find("an ordinary comment")
+        .expect("the ordinary comment");
     assert!(note < description && note < ordinary, "{prompt}");
     assert_eq!(
         prompt.matches("start from the parser").count(),
@@ -943,9 +1123,15 @@ async fn a_lead_question_parks_the_root_until_the_owner_answers() {
     .fetch_one(lead.db.pool())
     .await
     .unwrap();
-    assert_eq!((action.as_str(), status.as_str()), ("answer_lead_input", "open"));
+    assert_eq!(
+        (action.as_str(), status.as_str()),
+        ("answer_lead_input", "open")
+    );
     let held = park(&lead.db, &child.id).await;
-    assert!(held.contains("ParentWait") && held.contains("planning"), "{held}");
+    assert!(
+        held.contains("ParentWait") && held.contains("planning"),
+        "{held}"
+    );
 
     // Ten passes and a restart: the lead is not run again and nothing moves.
     passes(lead, 10).await;
@@ -974,17 +1160,25 @@ async fn a_lead_question_parks_the_root_until_the_owner_answers() {
         .await
         .unwrap();
     assert_eq!(resolved.status, "resolved");
-    until(lead, "the lead ran again and the root implements", async || {
-        executions(&lead.db, &root.id).await
-            == vec![
-                (PLANNER.to_owned(), "completed".to_owned()),
-                (PLANNER.to_owned(), "completed".to_owned()),
-            ]
-            && reload(&lead.db, &root.id).await.status == "in_progress"
-            && running(lead, &child.id, CODER).await
-    })
+    until(
+        lead,
+        "the lead ran again and the root implements",
+        async || {
+            executions(&lead.db, &root.id).await
+                == vec![
+                    (PLANNER.to_owned(), "completed".to_owned()),
+                    (PLANNER.to_owned(), "completed".to_owned()),
+                ]
+                && reload(&lead.db, &root.id).await.status == "in_progress"
+                && running(lead, &child.id, CODER).await
+        },
+    )
     .await;
-    assert_eq!(spent(lead, &root.id, "replan").await, 0, "an answer is not a re-plan");
+    assert_eq!(
+        spent(lead, &root.id, "replan").await,
+        0,
+        "an answer is not a re-plan"
+    );
     let condition =
         serde_json::to_string(&reload(&lead.db, &root.id).await.condition.public()).unwrap();
     assert!(!condition.contains("lead_input"), "{condition}");
@@ -1016,17 +1210,32 @@ async fn a_second_question_while_the_root_waits_is_refused() {
     })
     .await;
     let first = ops
-        .call(&root.id, "lead.request_input", json!({"question": "A or B?"}), "q1")
+        .call(
+            &root.id,
+            "lead.request_input",
+            json!({"question": "A or B?"}),
+            "q1",
+        )
         .await
         .unwrap();
     // The same request again answers the same question.
     let replay = ops
-        .call(&root.id, "lead.request_input", json!({"question": "A or B?"}), "q1")
+        .call(
+            &root.id,
+            "lead.request_input",
+            json!({"question": "A or B?"}),
+            "q1",
+        )
         .await
         .unwrap();
     assert_eq!(first["comment_id"], replay["comment_id"]);
     let refused = ops
-        .call(&root.id, "lead.request_input", json!({"question": "and C?"}), "q2")
+        .call(
+            &root.id,
+            "lead.request_input",
+            json!({"question": "and C?"}),
+            "q2",
+        )
         .await
         .unwrap_err();
     assert!(refused.contains("lead_input_pending"), "{refused}");
@@ -1037,4 +1246,88 @@ async fn a_second_question_while_the_root_waits_is_refused() {
     .await
     .unwrap();
     assert_eq!(items, 1);
+}
+
+/// A step check is a lead run too: from the subtask it checks, the lead acts
+/// on its root's other subtasks, and on nothing else. It cannot ask the
+/// owner a question (its answer is its verdict).
+#[tokio::test]
+async fn a_step_check_run_acts_on_its_roots_subtasks_only() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
+    let checked = seed_subtask(
+        &lead.db,
+        &root,
+        "first step",
+        db::inherited_subtask::STEP_CHECK_STATE,
+        0,
+    )
+    .await;
+    let next = seed_subtask(&lead.db, &root, "second step", "todo", 1).await;
+    seed_completed_coder_execution(&lead.db, &checked.id).await;
+    assign_role(&lead.db, &root.id, CODER, &lead.coder).await;
+    assign_role(&lead.db, &root.id, PLANNER, &lead.planner).await;
+    let (_, foreign) = other_root(lead).await;
+    until(lead, "the step check runs", async || {
+        running(lead, &checked.id, PLANNER).await
+    })
+    .await;
+    let runtime = session(&lead.db, &lead.planner, &checked.id).await;
+    let principal = lead
+        .db
+        .resolve_task_effective_authority(&lead.planner, None, &checked.id, "task_read", &runtime)
+        .await
+        .unwrap()
+        .principal;
+    assert!(matches!(
+        principal,
+        operation_registry::authority::Principal::TaskAgent { lead_root_id: Some(id), .. } if id == root.id
+    ));
+
+    let waiting = reload(&lead.db, &next.id).await;
+    ops.call(&checked.id, "lead.subtask", json!({"action": "update", "task_id": waiting.id, "version": waiting.version, "description": "build on the first step's parser"}), "update")
+        .await
+        .unwrap();
+    assert_eq!(
+        reload(&lead.db, &next.id).await.description.as_deref(),
+        Some("build on the first step's parser")
+    );
+    ops.call(
+        &checked.id,
+        "lead.handoff",
+        json!({"task_id": waiting.id, "note": "the parser returns rows, not lines"}),
+        "note",
+    )
+    .await
+    .unwrap();
+    let created = ops
+        .call(
+            &checked.id,
+            "lead.subtask",
+            json!({"action": "create", "title": "third step"}),
+            "create",
+        )
+        .await
+        .unwrap();
+    assert_eq!(children(lead, &root.id).await.len(), 3, "{created}");
+
+    let refused = ops
+        .call(
+            &checked.id,
+            "lead.request_input",
+            json!({"question": "is this good enough?"}),
+            "ask",
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("wrong_target"), "{refused}");
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    let foreign = reload(&lead.db, &foreign.id).await;
+    let refused = ops
+        .call(&checked.id, "lead.subtask", json!({"action": "update", "task_id": foreign.id, "version": foreign.version, "title": "mine"}), "escape")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("outside_lead_subtree"), "{refused}");
+    assert_eq!(reload(&lead.db, &foreign.id).await.title, "other child");
 }

@@ -5891,6 +5891,7 @@ serves completion (every subtask terminal: on to aggregate review).
 | `review`, lead assigned | the aggregate review was rejected and the Review budget allows a retry | `planning`, bridge `replan`, `rejection`; charges `review` (as before) and `replan` | `review_failure_target` through `task_hierarchy::effective_reject_target` |
 | `review`, lead assigned | the same, with the `replan` budget spent | stays in `review`; parked `budget_exhausted { budget_kind: replan }` | `review_failure_target` |
 | `review`, no lead | the aggregate review was rejected | the gate's `reject_target`, as before | unchanged |
+| `planning`, lead assigned | the lead asked the owner a question (`lead.request_input`) and its run ended | stays; parked `human_decision { boundary: lead_input }` until the owner answers, then the lead runs again; no `replan` charge | `next_step` `human_wait`; the answer clears the wait |
 
 **Re-plan.** A coordination root with a lead goes back to its planning state
 for two triggers, and its lead runs again there with the trigger's evidence in
@@ -5982,14 +5983,126 @@ budget of the root like any role run), and the aggregate review runs at most
 `max_rejections` times (default 2) before `review_budget_exhausted`. A Retry
 with a new budget (owner or Project Agent) opens the next window.
 
-Stage 2 limit. The lead has no operation that changes the breakdown yet
-(create, cancel, reorder, recover and hand-off arrive with the lead
-operations). Until then a re-plan can change the root's plan text and
-nothing else: after a parked subtask it costs one lead run, the root returns
-to `in_progress`, waits on its subtasks and the Project Agent is woken for
-the park (one run per park, never a second for the same park); after a
-rejected review it costs one lead run, the root returns to review with the
-same work and the next rejection spends the Review budget.
+**Lead operations.** The lead changes the breakdown with five registered
+operations (`operation-registry::task_lead`, on the Task propose aggregate
+`forge_scope_propose`). They are native Task-scope operations; MCP and REST
+have none of them.
+
+| Operation | What it does | Target | Refused when |
+|---|---|---|---|
+| `lead.read` | the root's subtasks (id, version, order, state, condition, started, hand-off notes); with `task_id`, one subtask's description, last runs, comments and the recovery actions offered to the lead | the root or a subtask | — |
+| `lead.subtask` `create` | appends one subtask (the server fills the parent) | the root | the root no longer accepts subtasks (`SUBTASK_PARENT_CLOSED`); a creation bound is spent |
+| `lead.subtask` `update` / `cancel` | title or description; cancel through the Task action | a subtask that never had an implementation run | the subtask started (`subtask_started`); stale `version` |
+| `lead.subtask` `reorder` | the untouched `todo` suffix, through the sequence command | all subtasks of the root | the order moves the terminal prefix or the current subtask |
+| `lead.subtask` `assign` | the worker (`coder`) of a subtask, or with no `task_id` the root's default worker | the root or a subtask | the Agent is not usable in the Project |
+| `lead.recover` | one Task action the action system offers the lead (`retry`, `restart`, `cancel`) at the subtask's version | a subtask | the action is not offered to the lead now (`action_not_offered`); the recovery bound is spent |
+| `lead.handoff` | a `handoff` comment; the subtask's next implementation prompt starts with the newest five | a subtask | more than 20 notes on the subtask |
+| `lead.request_input` | asks the owner one question (below) | the root, from its planning run only | a step check asks (`wrong_target`); the root already waits (`lead_input_pending`) |
+
+Not granted: repository writes, merge, a review decision, cancelling or
+moving the root, milestones, the Charter, releases, dependencies. A step
+check's verdict is its result block, not an operation.
+
+Authority is decided in two places and nowhere else.
+
+1. *Who is a lead* is a fact of the principal. The authority loader
+   (`db::effective_authority`) derives `Principal::TaskAgent::lead_root_id`
+   from the session's one running execution: its role is the step-check role
+   and it runs on a root that has subtasks, or on a subtask resting in
+   `lead_check`, and the root's own row of that role names this identity.
+   `PrincipalRule::TaskLead` admits the five operations on that fact plus the
+   Task scope's `task_read`; no permission name was added. Advertisement uses
+   the same evaluator, so an ordinary planner, worker or reviewer session is
+   never offered a `lead.*` operation and pays nothing for them in its tool
+   prefix. Within a turn the fact can be lost and never gained
+   (`EffectiveAuthority::narrowed`): a lead removed mid-run loses the lead
+   operations at its next call and keeps its Task records.
+2. *Is the target in the subtree* is one predicate at one boundary.
+   `TaskService::bind_lead` is called first by every lead command: it repeats
+   the workflow's side of the lead rule (`RootRolePolicy::lead`, the root in
+   its planning state or the run's Task in `lead_check`, the execution still
+   running under the lead's role) and resolves the target through
+   `task_hierarchy::ensure_in_lead_subtree` (the root or one of its direct
+   subtasks, same Project). A handler obtains its target only from that call.
+   A Task of another root, of another Project, a deleted or unknown id all
+   answer the same refusal (`outside_lead_subtree`) and nothing is written.
+
+Refusals are typed (`ServiceError::LeadOperationRefused`, reason codes
+`outside_lead_subtree`, `not_leading`, `wrong_target`, `subtask_started`,
+`lead_limit_reached`, `action_not_offered`, `lead_input_pending`) and reach
+the lead as an ordinary tool result with the reason in `details.refusal`.
+
+The effects are the existing commands. Create and reorder are the adaptive
+Task command (`split`, `sequence`) with the lead as its principal, recorded as
+principal type `task_lead` on the command receipt and its `task.adaptive`
+event; the database repeats the lead check under the writer transaction for
+that principal (`reauthorize_task_lead_command_in_tx`: the receipt's
+correlation is the lead's running execution on the command's source root),
+because the Project Agent's binding check does not apply to it. The receipt's
+idempotency key is the call's `dedupe_key` scoped to the root and the lead, so
+a repeated call returns the first subtask. Update is `update_task` plus one
+`decision` comment that names the lead's execution. Cancel and recover are
+Task actions performed as the lead's Agent: `ActionAuthority::Lead` is in the
+audience of the offers the lead may take (`task_hierarchy::lead_verbs`:
+`retry`, `restart`, `cancel` while the subtask is parked on something the lead
+decides, `subtask_decision_park`, the allow-list the re-plan uses; `cancel`
+while it never started), and a caller that is only the lead is offered nothing
+else. Assign is `reassign_role` after REST's Project usability check.
+
+Every operation carries the envelope's `dedupe_key`. Version checks are the
+subtask's `version` (update, cancel, recover) and the root's version and the
+board revision inside the adaptive command (create, reorder).
+
+Bounds on what a lead can repeat are rows on the ROOT in the budget ledger
+(`db::budget::LEAD_*`), in the root's budget window, so nothing the lead does
+to a subtask (a retry with a new budget included) resets them; the owner's or
+the Project Agent's Retry with a new budget on the root opens the next window.
+
+| What | Bound | When it is spent |
+|---|---|---|
+| subtasks created in one lead run | 8 (`lead_subtasks_run:<execution>`) | `lead_limit_reached`; the run can do everything else |
+| subtasks created under one root | 24 per budget window (`lead_subtasks`) | the same |
+| recoveries of one subtask | 2 per budget window (`lead_recover:<subtask>`) | the same; the subtask stays parked, the root returns to `in_progress`, waits on its subtasks and the Project Agent is woken for the park (one re-plan per park) |
+| hand-off notes on one subtask | 20 | the same |
+| open questions per root | 1 | `lead_input_pending` |
+| lead runs | one at kickoff, one per re-plan (5), one per step check return (2 per subtask), one per answered question | the existing budgets |
+
+A refused call spends nothing. A charge and the command it guards are not one
+transaction: a crash between them spends a unit and creates nothing, and the
+retry of the same key is not charged again.
+
+A recovery the lead accepts while its root plans is not replayed against the
+order check: the subtask keeps the typed wait `parent { cause: planning }`
+until the root is back in its implementation state, and the accepted action
+runs then (`next_step`: a queued recovery behind a planning root). So after a
+parked subtask the lead retries it, or cancels it and adds what replaces it,
+its run ends, the root returns to `in_progress` and the sequence goes on; after
+a rejected review the lead adds fix subtasks, and the root returns to
+`in_progress` and to review only when they are done. A lead that changes
+nothing leaves the bounded no-op of the re-plan: the root waits on its
+subtasks and the Project Agent is woken for the park, or the root returns to
+review and the next rejection spends the Review budget.
+
+**The lead's question (`lead.request_input`).** The question is a
+`request_input` comment on the root with the lead's execution as provenance,
+one Attention item for the owner (`human_input_required`, recommended action
+`answer_lead_input`, dedupe key `lead-input:<root>:<comment>`; it never wakes
+an Agent), and a wait on the root: `awaiting_human` with reason `lead_input`,
+which the condition reads as `human_decision { boundary: lead_input }`. The
+three are written in that order, each idempotent on the call's key, and the
+wait last: a crash before it leaves a question and an item that hold nothing.
+
+| Root | Condition | Result | Mechanism |
+|---|---|---|---|
+| `planning`, the lead's run asked | the run ends | stays in `planning`; the run is not the gate's Accept and is not settled again | `maybe_cascade_executor_completion` (`lead_asked_input`); the snapshot leaves that run out of `terminal_execution` |
+| `planning`, waiting | every pass, a restart | parked `human_decision { lead_input }`, owner the user; no lead run; subtasks `parent { cause: planning }` | `next_step` `human_wait` |
+| `planning`, waiting | the owner resolves the item with an answer (`POST …/attention/{id}/resolve` with `answer`) | the answer is a user comment on the root, the wait is cleared, the item resolved, the root woken; the lead runs again with its questions and the owner's answers in its input | `AttentionService::resolve_with_answer` → `lead::answer_lead_input`, then `Step::Role` |
+| any | the root leaves `planning` another way (Approve, move, cancel) | the wait is cleared and the item resolved | `lead::clear_lead_input_wait` in the transition |
+
+An answer is no transition, so it charges no re-plan. The loop "ask, answer,
+ask again" needs a person for every round and one question is open at a time.
+Resolving the item without an answer is refused; an answer on any other item
+is refused.
 
 Project Agent wakes. Project-scope blocker wakes are admitted in one place,
 the blocker sweep (the event path defers them to it), and the sweep has one
@@ -9326,6 +9439,16 @@ for a different entry is refused instead of answered with the first entry.
 File evidence is read from that execution's workspace (the Task's when the
 execution recorded none). Planner and implementation roles can stage a plan;
 reviewers can record observations and cannot author a plan.
+
+`task_lead` owns the five operations of a coordination root's lead
+(`lead.read`, `lead.subtask`, `lead.recover`, `lead.handoff`,
+`lead.request_input`): closed inputs with no field that names a root, a
+parent or an actor, principal rule `TaskLead`, permission `task_read`. The
+Task principal carries `lead_root_id` when its one running execution leads a
+root (see "Root Tasks and ordered subtasks", Lead operations). The measured
+cost in a lead session's tool prefix is 2,634 bytes (the propose tool goes
+from 1,835 to 4,469 bytes); a test fails above 10,000 bytes and proves that
+no other Task session is offered them.
 
 `task_proposals` owns the Project Agent's eight-verb `task.action`,
 `task.dependency`, `task.adaptive` and `task.propose` contracts. It reuses the

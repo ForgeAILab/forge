@@ -202,7 +202,7 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
 }
 
 #[derive(Debug, Default)]
-struct RecordingProvider(std::sync::Mutex<Vec<(String, Value)>>);
+pub(super) struct RecordingProvider(std::sync::Mutex<Vec<(String, Value)>>);
 #[async_trait]
 impl ForgeToolProvider for RecordingProvider {
     async fn read(

@@ -1268,7 +1268,10 @@ async fn lead_contracts_are_closed_and_dispatch_every_variant() {
     let inputs = [
         ("lead.read", json!({})),
         ("lead.read", json!({"task_id":"child"})),
-        ("lead.subtask", json!({"action":"create","title":"Fix the build"})),
+        (
+            "lead.subtask",
+            json!({"action":"create","title":"Fix the build"}),
+        ),
         (
             "lead.subtask",
             json!({"action":"update","task_id":"child","version":1,"description":"narrower"}),
@@ -1277,14 +1280,26 @@ async fn lead_contracts_are_closed_and_dispatch_every_variant() {
             "lead.subtask",
             json!({"action":"cancel","task_id":"child","version":1,"reason":"superseded"}),
         ),
-        ("lead.subtask", json!({"action":"reorder","ordered_task_ids":["b","a"]})),
-        ("lead.subtask", json!({"action":"assign","agent_id":"agent"})),
-        ("lead.subtask", json!({"action":"assign","task_id":"child","agent_id":"agent"})),
+        (
+            "lead.subtask",
+            json!({"action":"reorder","ordered_task_ids":["b","a"]}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action":"assign","agent_id":"agent"}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action":"assign","task_id":"child","agent_id":"agent"}),
+        ),
         (
             "lead.recover",
             json!({"task_id":"child","action":{"verb":"retry"},"version":2}),
         ),
-        ("lead.handoff", json!({"task_id":"child","note":"start from the parser"})),
+        (
+            "lead.handoff",
+            json!({"task_id":"child","note":"start from the parser"}),
+        ),
         ("lead.request_input", json!({"question":"Which database?"})),
     ];
     for (id, input) in &inputs {
@@ -1318,12 +1333,20 @@ async fn lead_contracts_are_closed_and_dispatch_every_variant() {
         ("lead.subtask", json!({"action":"create"})),
         ("lead.subtask", json!({"action":"update","task_id":"child"})),
         ("lead.subtask", json!({"action":"merge","task_id":"child"})),
-        ("lead.recover", json!({"task_id":"child","action":{"verb":"retry"}})),
+        (
+            "lead.recover",
+            json!({"task_id":"child","action":{"verb":"retry"}}),
+        ),
         ("lead.handoff", json!({"task_id":"child"})),
         ("lead.request_input", json!({})),
     ] {
         assert!(
-            catalog.lookup(id).unwrap().dispatch(&context, invalid.clone()).await.is_err(),
+            catalog
+                .lookup(id)
+                .unwrap()
+                .dispatch(&context, invalid.clone())
+                .await
+                .is_err(),
             "{id} {invalid}"
         );
     }
@@ -1347,7 +1370,12 @@ fn only_a_running_lead_is_admitted_to_the_lead_operations() {
             scope_type: "task".into(),
             scope_id: "root".into(),
             profile_id: "profile".into(),
-            layers: vec![authority::scope_permissions("task", "task_read", false, false)],
+            layers: vec![authority::scope_permissions(
+                "task",
+                "task_read",
+                false,
+                false,
+            )],
             binding_id: None,
             setup_required: false,
             active: true,
@@ -1364,7 +1392,9 @@ fn only_a_running_lead_is_admitted_to_the_lead_operations() {
             "{id}"
         );
         // No execution to attribute the effect to.
-        assert!(authority(TaskRole::Planner, "", Some("root")).evaluate(spec).is_err());
+        assert!(authority(TaskRole::Planner, "", Some("root"))
+            .evaluate(spec)
+            .is_err());
         for role in [TaskRole::Worker, TaskRole::Reviewer] {
             assert!(authority(role, "run", None).evaluate(spec).is_err(), "{id}");
         }
@@ -1392,16 +1422,24 @@ fn only_a_running_lead_is_admitted_to_the_lead_operations() {
     // else; gaining it never widens an admitted turn.
     let lost = lead.narrowed(&planner).unwrap();
     let gained = planner.narrowed(&lead).unwrap();
-    let moved = lead.narrowed(&authority(TaskRole::Planner, "run", Some("other"))).unwrap();
+    let moved = lead
+        .narrowed(&authority(TaskRole::Planner, "run", Some("other")))
+        .unwrap();
     for narrowed in [&lost, &gained, &moved] {
         for id in task_lead::IDS {
-            assert!(narrowed.evaluate(PROPOSAL_CATALOG.lookup(id).unwrap()).is_err());
+            assert!(narrowed
+                .evaluate(PROPOSAL_CATALOG.lookup(id).unwrap())
+                .is_err());
         }
         assert!(narrowed
             .evaluate(PROPOSAL_CATALOG.lookup("task.worklog").unwrap())
             .is_ok());
     }
-    assert!(lead.narrowed(&lead).unwrap().evaluate(PROPOSAL_CATALOG.lookup("lead.read").unwrap()).is_ok());
+    assert!(lead
+        .narrowed(&lead)
+        .unwrap()
+        .evaluate(PROPOSAL_CATALOG.lookup("lead.read").unwrap())
+        .is_ok());
     assert_eq!(
         lead.narrowed(&authority(TaskRole::Planner, "next-run", Some("root"))),
         Err(authority::AuthorityDenial::Revoked)

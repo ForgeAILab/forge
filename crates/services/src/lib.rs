@@ -332,8 +332,7 @@ pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{
     AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, LeadRun,
-    NewSubtaskInput,
-    TaskDependencyAction, TaskProposalCommandResult, TaskService,
+    NewSubtaskInput, TaskDependencyAction, TaskProposalCommandResult, TaskService,
 };
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;

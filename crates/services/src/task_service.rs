@@ -91,8 +91,8 @@ pub use adaptive::{
 };
 pub(crate) use common::latest_executor_execution_for_task;
 pub use create_subtasks::NewSubtaskInput;
-pub use lead::LeadRun;
 pub use dependencies::TaskDependencyAction;
+pub use lead::LeadRun;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };

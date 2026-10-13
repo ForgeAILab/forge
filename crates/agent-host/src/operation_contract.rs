@@ -61,9 +61,18 @@ fn advertised_proposal_line(
         }
         return spec.contract_line();
     }
-    if operation_registry::task_proposals::IDS.contains(&spec.id)
-        || operation_registry::task_lead::IDS.contains(&spec.id)
-    {
+    if operation_registry::task_lead::IDS.contains(&spec.id) {
+        return format!(
+            "{}: {}; {} {}",
+            spec.id,
+            schema_signature(&spec.input.schema, 0),
+            spec.summary,
+            spec.guidance
+        )
+        .trim_end()
+        .to_owned();
+    }
+    if operation_registry::task_proposals::IDS.contains(&spec.id) {
         return format!(
             "{}: {}; {} Payload <=65536 serialized UTF-8 bytes.",
             spec.id,

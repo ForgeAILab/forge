@@ -76,11 +76,51 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
         .bind(now).bind(now).execute(&pool).await.expect("execution inserts");
     for (id, author, author_id, execution, role, kind, key) in [
         ("c1", "user", None, None, None, None, None),
-        ("c2", "agent", Some("agent"), Some("execution"), Some("coder"), Some("progress"), Some("key-1")),
-        ("c3", "agent", Some("agent"), Some("execution"), Some("coder"), Some("blocker"), Some("key-2")),
-        ("c4", "system", None, None, None, None, Some("review-result:1")),
-        ("c5", "agent", Some("agent"), None, Some("reviewer"), Some("validation"), None),
-        ("c6", "agent", None, Some("execution"), Some("coder"), Some("decision"), None),
+        (
+            "c2",
+            "agent",
+            Some("agent"),
+            Some("execution"),
+            Some("coder"),
+            Some("progress"),
+            Some("key-1"),
+        ),
+        (
+            "c3",
+            "agent",
+            Some("agent"),
+            Some("execution"),
+            Some("coder"),
+            Some("blocker"),
+            Some("key-2"),
+        ),
+        (
+            "c4",
+            "system",
+            None,
+            None,
+            None,
+            None,
+            Some("review-result:1"),
+        ),
+        (
+            "c5",
+            "agent",
+            Some("agent"),
+            None,
+            Some("reviewer"),
+            Some("validation"),
+            None,
+        ),
+        (
+            "c6",
+            "agent",
+            None,
+            Some("execution"),
+            Some("coder"),
+            Some("decision"),
+            None,
+        ),
     ] {
         sqlx::query("INSERT INTO task_comment (id, task_id, author_type, author_id, author_name, content, execution_id, role, worklog_kind, idempotency_key, created_at, updated_at) VALUES (?, 'task', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(id).bind(author).bind(author_id).bind(format!("name of {id}")).bind(format!("content of {id}\nsecond line | with a bar"))
@@ -99,7 +139,11 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
     run_migrations_from(&pool, &all_dir)
         .await
         .expect("applying the bundle again changes nothing");
-    assert_eq!(rows(&pool).await, before, "every row and column value is kept");
+    assert_eq!(
+        rows(&pool).await,
+        before,
+        "every row and column value is kept"
+    );
 
     let indexes: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_comment' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -109,11 +153,19 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
     .expect("indexes read");
     assert_eq!(
         indexes,
-        ["idx_task_comment_execution", "idx_task_comment_idempotency", "idx_task_comment_task_id"]
+        [
+            "idx_task_comment_execution",
+            "idx_task_comment_idempotency",
+            "idx_task_comment_task_id"
+        ]
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE name='task_comment_new'")
-            .fetch_one(&pool).await.expect("leftover reads"),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='task_comment_new'"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("leftover reads"),
         0
     );
     let violations = sqlx::query("PRAGMA foreign_key_check")
@@ -122,7 +174,10 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
         .expect("foreign keys check");
     assert!(violations.is_empty());
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys").fetch_one(&pool).await.expect("pragma reads"),
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("pragma reads"),
         1,
         "foreign keys are on again"
     );
@@ -139,14 +194,23 @@ async fn the_lead_comment_kinds_migration_keeps_every_comment_and_its_indexes() 
     assert!(sqlx::query("INSERT INTO task_comment (id, task_id, author_type, author_name, content, idempotency_key, created_at, updated_at) VALUES ('dup', 'task', 'agent', 'coder', 'again', 'key-1', ?, ?)")
         .bind(now).bind(now).execute(&pool).await.is_err());
     sqlx::query("DELETE FROM execution WHERE id='execution'")
-        .execute(&pool).await.expect("execution deletes");
+        .execute(&pool)
+        .await
+        .expect("execution deletes");
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_comment WHERE execution_id IS NOT NULL")
-            .fetch_one(&pool).await.expect("count reads"),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task_comment WHERE execution_id IS NOT NULL"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count reads"),
         0
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_comment").fetch_one(&pool).await.expect("count reads"),
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_comment")
+            .fetch_one(&pool)
+            .await
+            .expect("count reads"),
         8
     );
     pool.close().await;

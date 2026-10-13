@@ -1,6 +1,7 @@
 use api_types::{
-    AgentDetailResponse, AttentionItem, AttentionListResponse, AttentionMutationRequest, AttentionResolveRequest,
-    AttentionSnoozeRequest, MissionControlHomeResponse, MissionControlQuery,
+    AgentDetailResponse, AttentionItem, AttentionListResponse, AttentionMutationRequest,
+    AttentionResolveRequest, AttentionSnoozeRequest, MissionControlHomeResponse,
+    MissionControlQuery,
 };
 use axum::{
     extract::{Path, Query, State},
