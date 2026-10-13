@@ -774,6 +774,98 @@ async fn handing_off_repair_restores_the_owner_recovery_deadline() {
     .await;
 }
 
+/// The forced order of model seeds 207044633, 580812352, 345192600 and
+/// 912969855: the owner holds a running subtask whose coder is its root's.
+/// Every call below carries the Task version, status, entry and workflow it
+/// has just read, and nothing else writes, so a refusal is the stop fence's
+/// own. The fence must compare the assignment the run was admitted under (the
+/// child's own coder, else its parent's); looking only at the child's own row
+/// answered `version_conflict` to a Hold whose Task had not moved.
+#[tokio::test]
+async fn the_stop_fence_reads_a_subtasks_inherited_coder_and_still_refuses_another_assignment() {
+    let db = db().await;
+    for id in ["root", "child", "own"] {
+        task(&db, id).await;
+    }
+    sqlx::query(
+        "UPDATE task SET parent_task_id='root', status='in_progress' WHERE id IN ('child','own')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let now = crate::now_rfc3339();
+    for (id, holder) in [("root-coder", "root"), ("own-coder", "own")] {
+        sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,'coder','user','owner',?,?)")
+            .bind(id).bind(holder).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    }
+    let coder = |id: &'static str| {
+        let db = &db;
+        async move {
+            crate::TaskRoleAssignmentRepo::get_by_task_and_role(db, id, "coder")
+                .await
+                .unwrap()
+        }
+    };
+    let stop = |id: &'static str, expected: Option<crate::TaskRoleAssignment>| {
+        let db = &db;
+        async move {
+            let current = read(db, id).await;
+            TaskRepo::set_error_annotation_if_no_running_execution(
+                db,
+                id,
+                current.version,
+                &current.status,
+                None,
+                "{}",
+                Some("coder"),
+                expected,
+                &json!({"type":"before_work_hook_failed"}).to_string(),
+                &crate::now_rfc3339(),
+                "stopped",
+                None,
+                vec![],
+            )
+            .await
+        }
+    };
+    let inherited = coder("root").await.unwrap();
+    let own = coder("own").await.unwrap();
+    assert!(coder("child").await.is_none(), "the child has no coder row");
+    let before = read(&db, "child").await;
+    let held = stop("child", Some(inherited.clone()))
+        .await
+        .expect("the inherited coder is the assignment the run was admitted under");
+    assert!(held.error_annotation.is_some());
+    assert_eq!(
+        held.version,
+        before.version + 1,
+        "one write: the stop's own"
+    );
+    // The fence is still a fence: no assignment, or another Task's, is not
+    // the one a run was admitted under.
+    assert!(matches!(
+        stop("child", None).await,
+        Err(crate::DbError::VersionConflict)
+    ));
+    assert!(matches!(
+        stop("own", Some(inherited.clone())).await,
+        Err(crate::DbError::VersionConflict)
+    ));
+    assert!(stop("own", Some(own)).await.is_ok());
+    // The root's coder was replaced after the snapshot: the old run's stop
+    // does not annotate the new assignment's window.
+    sqlx::query(
+        "UPDATE task_role_assignment SET updated_at='2099-01-01T00:00:00Z' WHERE id='root-coder'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        stop("child", Some(inherited)).await,
+        Err(crate::DbError::VersionConflict)
+    ));
+}
+
 /// One reason of each behaviour: an ordinary wait, a repair that carries
 /// lineage, and an owner blocker.
 fn sample_reasons() -> Vec<IntegrationReason> {
