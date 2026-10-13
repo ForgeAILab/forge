@@ -1241,11 +1241,17 @@ impl TaskService {
                 | "manually_held"
                 | "merge_fix_retry"
                 | "review_failed"
-                | "entry_barrier_blocked"
         ) {
             Some(snapshot.action_agent_id.clone().ok_or_else(|| {
                 ServiceError::invalid_operation("accepted role action lost its Agent")
             })?)
+        } else if offer.reason == "entry_barrier_blocked" {
+            // Retry Entry Checks runs the entry's hooks again; no Agent
+            // takes part in that. The role's Agent is recorded when the
+            // Task has one, and a Task without one (reviewed by a person,
+            // never run by an Agent) is not refused the action it was
+            // offered.
+            snapshot.action_agent_id.clone()
         } else {
             None
         };

@@ -162,6 +162,32 @@ impl CheckWorkerRepo for SqliteDb {
         if current.version != run.version || current.state != CheckRunState::Queued {
             return Err(DbError::VersionConflict);
         }
+        // Nobody waits for it any more: every consumer was withdrawn, or its
+        // Task was deleted or left the status entry that asked (that last
+        // kind is only found here; the withdrawal writers cancel the run
+        // themselves). The run is cancelled now instead of waiting for a
+        // slot it would be given only to be cancelled in it. The caller
+        // reads "the run moved". The probe is a read: a run somebody waits
+        // for costs no write here.
+        let watched: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c JOIN task t ON t.id=c.task_id AND t.status_epoch=c.status_epoch AND t.deleted_at IS NULL WHERE c.run_id=? AND c.cancelled_at IS NULL)")
+            .bind(&run.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !watched {
+            sqlx::query(WITHDRAW_STALE_CONSUMERS)
+                .bind(now)
+                .bind(&run.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(&format!("{CANCEL_UNWATCHED_QUEUED_RUNS} AND id=?3"))
+                .bind(now)
+                .bind(now)
+                .bind(&run.id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Err(DbError::VersionConflict);
+        }
         // Whether this run already told its consumers it waits for a slot.
         let waited: bool =
             sqlx::query_scalar("SELECT capacity_wait_since IS NOT NULL FROM check_run WHERE id=?")
@@ -315,8 +341,11 @@ impl CheckWorkerRepo for SqliteDb {
     }
     async fn active_check_consumers(&self, id: &str, now: &str) -> Result<Vec<CheckConsumer>> {
         let mut tx = begin_immediate(self.pool()).await?;
-        sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE run_id=? AND cancelled_at IS NULL AND NOT EXISTS(SELECT 1 FROM task t WHERE t.id=check_consumer.task_id AND t.status_epoch=check_consumer.status_epoch AND t.deleted_at IS NULL)")
-            .bind(now).bind(id).execute(&mut *tx).await?;
+        sqlx::query(WITHDRAW_STALE_CONSUMERS)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query("SELECT * FROM check_consumer WHERE run_id=? AND cancelled_at IS NULL ORDER BY created_at,id").bind(id).fetch_all(&mut *tx).await?;
         tx.commit().await?;
         rows.into_iter().map(map_consumer).collect()

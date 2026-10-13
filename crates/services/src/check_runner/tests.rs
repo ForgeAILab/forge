@@ -759,8 +759,17 @@ async fn owner_gone_settles_uncertainty_and_cancelled_consumers_never_launch() {
         .await
         .unwrap();
     let owner = Arc::new(TestOwner::default());
-    let worker = CheckRunWorker::new(store.clone(), owner.clone());
-    worker.drive(admit(&store, &run).await).await.unwrap();
+    let _worker = CheckRunWorker::new(store.clone(), owner.clone());
+    // Nobody waits for it (the Task left the entry that asked): the
+    // admission look cancels the queued run itself, before any slot.
+    let now = db::now_rfc3339();
+    let until = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+    assert!(matches!(
+        store
+            .admit_check_run(&run, "test-worker", &now, &until)
+            .await,
+        Err(db::DbError::VersionConflict)
+    ));
     assert_eq!(owner.runs.load(Ordering::SeqCst), 0);
     assert_eq!(
         store.check_run(&run.id).await.unwrap().unwrap().state,

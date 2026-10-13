@@ -134,6 +134,31 @@ impl TargetProofSource for TargetOwnerProof {
     }
 }
 
+/// The machine that holds `queue`'s default checkout, when it is a daemon
+/// this server still knows (not removed) and that is not connected now: the
+/// one case of "no answer" that ends by itself, when the machine comes
+/// back. `None` for a server-owned checkout, a connected or removed machine,
+/// and a queue without a default checkout (nobody will ever answer those).
+pub(crate) async fn target_owner_away(
+    db: &SqliteDb,
+    daemons: Option<&Arc<DaemonConnectionRegistry>>,
+    queue: &IntegrationQueue,
+) -> crate::Result<Option<String>> {
+    let Some(location_id) = queue.target_location_id.as_deref() else {
+        return Ok(None);
+    };
+    let daemon_id: Option<String> = sqlx::query_scalar(
+        "SELECT l.daemon_id FROM repo_location l JOIN daemon d ON d.id=l.daemon_id \
+         WHERE l.id=? AND l.owner_kind='daemon' AND d.removed_at IS NULL",
+    )
+    .bind(location_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db::DbError::from)?
+    .flatten();
+    Ok(daemon_id.filter(|id| !daemons.is_some_and(|registry| registry.get(id).is_some())))
+}
+
 /// The attempt's own records agree on what merged, before any Git is read.
 /// `Ok`: the commit to prove. `Err`: why the row cannot be reported.
 ///

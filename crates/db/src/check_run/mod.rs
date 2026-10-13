@@ -347,6 +347,19 @@ fn map_result(row: SqliteRow) -> Result<StoredCheckResult> {
         created_at: row.try_get("created_at")?,
     })
 }
+/// A queued check run nobody claimed and nobody waits for any more becomes
+/// `cancelled` (the `queued -> cancelled` edge of `CHECK_RUN_TRANSITIONS`,
+/// as `transition_check_run` writes it for an unleased run). It never ran,
+/// so it gets no `check_result` row: nothing reads the result of a run that
+/// has no live consumer (a withdrawn consumer is `Lost` to its step, the
+/// delivery outbox and the infrastructure retry join `check_result`, the
+/// acknowledgement needs a dispatch, retention needs only the terminal
+/// state). `?1` and `?2` are the time; the caller appends the runs it means.
+pub(crate) const CANCEL_UNWATCHED_QUEUED_RUNS: &str = "UPDATE check_run SET state='cancelled',version=version+1,updated_at=?1,finished_at=?2,capacity_wait_since=NULL WHERE state='queued' AND lease_owner IS NULL AND lease_until IS NULL AND NOT EXISTS(SELECT 1 FROM check_consumer c WHERE c.run_id=check_run.id AND c.cancelled_at IS NULL)";
+/// A consumer whose Task was deleted or left the status entry it asked from
+/// waits for nothing: it is withdrawn. Bind the time, then the run.
+pub(crate) const WITHDRAW_STALE_CONSUMERS: &str = "UPDATE check_consumer SET cancelled_at=? WHERE run_id=? AND cancelled_at IS NULL AND NOT EXISTS(SELECT 1 FROM task t WHERE t.id=check_consumer.task_id AND t.status_epoch=check_consumer.status_epoch AND t.deleted_at IS NULL)";
+
 const LIVE: &str = "SELECT * FROM check_run WHERE identity_key=? AND state IN ('queued','running','cancelling','cleaning','uncertain')";
 /// `certified` already holds the pass-and-cleanup rule (see `finish_check_run`).
 const REUSABLE: &str = "SELECT result.* FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.identity_key=? AND result.outcome='pass' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'";
@@ -732,6 +745,25 @@ impl SqliteDb {
             {
                 return Err(DbError::IdempotencyConflict);
             }
+            // An integration head asks again under one key for as long as
+            // its attempt and candidate stand (every `check_reask`, and after
+            // the owner's Retry of a parked head). When its consumer was
+            // withdrawn under it (a forced Project deletion that was then
+            // refused withdraws every consumer) the stored row would answer
+            // every later ask with "nobody will answer": the head would wait
+            // its check timeout out, park, and do the same after each Retry.
+            // The Task is still in the entry that asked (the caller checked
+            // the epoch), so the same consumer waits again, for a certified
+            // result, a run in progress or a fresh run.
+            if !reuse_only && consumer.origin == CheckConsumerOrigin::Integration {
+                if let Some(revived) = self
+                    .revive_withdrawn_consumer_in_tx(&mut tx, &request, &consumer, &key, &input)
+                    .await?
+                {
+                    tx.commit().await?;
+                    return Ok(Some(revived));
+                }
+            }
             if reuse_only {
                 let reusable: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_result r JOIN check_run run ON run.id=r.run_id WHERE r.id=? AND r.certified=1 AND r.cacheable=1 AND r.outcome='pass' AND run.cacheable=1 AND run.state='succeeded')")
                     .bind(&consumer.result_id).fetch_one(&mut *tx).await?;
@@ -799,6 +831,83 @@ impl SqliteDb {
             record_entry_wait_in_tx(&mut tx, &request, &consumer.id).await?;
         }
         tx.commit().await?;
+        Ok(Some(RequestedCheckRun {
+            consumer,
+            disposition,
+        }))
+    }
+}
+
+impl SqliteDb {
+    /// `consumer` (found by its request key) was withdrawn before any answer
+    /// was applied, and its Task asks again. `None` when it was not
+    /// withdrawn, or when the only run of its identity is still being
+    /// stopped (joining that run would hand the consumer its cancellation;
+    /// the next ask looks again).
+    async fn revive_withdrawn_consumer_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        request: &CheckRunRequest,
+        consumer: &CheckConsumer,
+        key: &str,
+        input: &str,
+    ) -> Result<Option<RequestedCheckRun>> {
+        let withdrawn: bool = sqlx::query_scalar(
+            "SELECT cancelled_at IS NOT NULL AND applied_at IS NULL FROM check_consumer WHERE id=?",
+        )
+        .bind(&consumer.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !withdrawn {
+            return Ok(None);
+        }
+        let now = now_rfc3339();
+        let hit = if request.identity.inputs.reusable_inputs() {
+            sqlx::query(REUSABLE)
+                .bind(key)
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(map_result)
+                .transpose()?
+        } else {
+            None
+        };
+        let (run_id, result_id, disposition) = if let Some(result) = hit {
+            (
+                result.run_id,
+                Some(result.id),
+                CheckRequestDisposition::Reused,
+            )
+        } else if let Some(row) = sqlx::query(LIVE)
+            .bind(key)
+            .fetch_optional(&mut **tx)
+            .await?
+        {
+            let live = map_run(row)?;
+            if !matches!(live.state, CheckRunState::Queued | CheckRunState::Running) {
+                return Ok(None);
+            }
+            (live.id, None, CheckRequestDisposition::Joined)
+        } else {
+            let id = new_uuid_v4();
+            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,workspace_id,machine_id,applied_timeout_seconds,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)")
+                .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.identity.commit_sha)
+                .bind(request.identity.inputs.digest().map_err(DbError::Check)?).bind(key).bind(input).bind(request.identity.inputs.reusable_inputs())
+                .bind(new_uuid_v4()).bind(&request.workspace_id).bind(&request.machine_id).bind(i64::try_from(request.wall_timeout_seconds).unwrap_or(1800)).bind(&now).bind(&now).execute(&mut **tx).await?;
+            (id, None, CheckRequestDisposition::Scheduled)
+        };
+        sqlx::query("UPDATE check_consumer SET run_id=?,result_id=?,cancelled_at=NULL,delivery_step_id=NULL,infrastructure_retries=0 WHERE id=? AND cancelled_at IS NOT NULL AND applied_at IS NULL")
+            .bind(&run_id)
+            .bind(&result_id)
+            .bind(&consumer.id)
+            .execute(&mut **tx)
+            .await?;
+        let consumer = map_consumer(
+            sqlx::query("SELECT * FROM check_consumer WHERE id=?")
+                .bind(&consumer.id)
+                .fetch_one(&mut **tx)
+                .await?,
+        )?;
         Ok(Some(RequestedCheckRun {
             consumer,
             disposition,

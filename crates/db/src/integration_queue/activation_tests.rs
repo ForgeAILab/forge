@@ -2147,3 +2147,120 @@ async fn a_reserved_imported_head_without_a_live_continuation_is_claimable() {
     let claimed = claim(&db, &q.id, NOW, LATER).await.unwrap();
     assert_eq!(claimed.head_attempt_id.as_deref(), Some(head.id.as_str()));
 }
+
+/// A passive-stage `shadow:` row of a Task that was deleted gets no
+/// continuation step and holds no slot: nothing would ever end it. The
+/// importer's start pass deletes it. A shadow row of a live Task, one that
+/// is its queue's head, and one whose effect is unsettled or unknown stay.
+#[tokio::test]
+async fn shadow_rows_of_deleted_tasks_are_deleted_and_every_other_row_is_kept() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let mut ids = std::collections::BTreeMap::new();
+    for task in [
+        "gone", "live", "head", "unknown", "admitted", "history", "landed", "inflight", "ended",
+    ] {
+        add_task(&db, task).await;
+        let attempt = admit(&db, &q, task).await;
+        if task != "admitted" {
+            sqlx::query("UPDATE integration_attempt SET admission_key=? WHERE id=?")
+                .bind(format!("shadow:{task}:0"))
+                .bind(&attempt.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        ids.insert(task, attempt.id);
+    }
+    exec(
+        &db,
+        "UPDATE integration_attempt SET current_operation_state='uncertain' WHERE task_ref='unknown'",
+    )
+    .await;
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&ids["head"])
+        .bind(&q.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // A history row (a later admission superseded it), a row that records a
+    // landed merge, one whose effect may be in flight, and a terminal row.
+    exec(
+        &db,
+        "UPDATE integration_attempt SET current=0,state='superseded' WHERE task_ref='history'",
+    )
+    .await;
+    exec(
+        &db,
+        "UPDATE integration_attempt SET state='applied' WHERE task_ref='landed'",
+    )
+    .await;
+    exec(
+        &db,
+        "UPDATE integration_attempt SET state='reconciling' WHERE task_ref='inflight'",
+    )
+    .await;
+    exec(
+        &db,
+        "UPDATE integration_attempt SET current=0,state='cancelled' WHERE task_ref='ended'",
+    )
+    .await;
+    assert_eq!(db.delete_orphan_shadow_attempts().await.unwrap(), 0);
+    exec(
+        &db,
+        "UPDATE task SET deleted_at='2026-10-08T00:00:00Z' WHERE id<>'live'",
+    )
+    .await;
+    // The cost at start and per sweep. The delete walks the current rows
+    // (one per Task that ever merged), and the foreign key that nulls a
+    // successor's `predecessor_attempt_id` seeks its index instead of
+    // scanning the attempt history once per deleted row. `integration_queue`
+    // (one row per repo and target branch) is the only table read whole.
+    let delete: Vec<String> = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN DELETE {}",
+        super::shadow::ORPHAN_SHADOW_ATTEMPTS
+    ))
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.try_get::<String, _>("detail").unwrap())
+    .collect();
+    assert!(
+        delete
+            .iter()
+            .any(|line| line.contains("integration_attempt_current_task")),
+        "{delete:?}"
+    );
+    assert!(
+        delete
+            .iter()
+            .any(|line| line.contains("integration_attempt_predecessor")),
+        "{delete:?}"
+    );
+    assert!(
+        !delete.iter().any(|line| line == "SCAN integration_attempt"),
+        "the attempt table is scanned: {delete:?}"
+    );
+    assert_plan_uses(
+        &db,
+        super::shadow::QUEUED_WITHOUT_CONTINUATION,
+        "integration_attempt_retention",
+    )
+    .await;
+    assert_eq!(db.delete_orphan_shadow_attempts().await.unwrap(), 1);
+    assert!(db
+        .integration_attempt(&ids["gone"])
+        .await
+        .unwrap()
+        .is_none());
+    for kept in [
+        "live", "head", "unknown", "admitted", "history", "landed", "inflight", "ended",
+    ] {
+        assert!(
+            db.integration_attempt(&ids[kept]).await.unwrap().is_some(),
+            "{kept}"
+        );
+    }
+    assert_eq!(db.delete_orphan_shadow_attempts().await.unwrap(), 0);
+}

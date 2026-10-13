@@ -7793,6 +7793,117 @@ async fn a_pre_queue_merge_waiting_for_its_disconnected_daemon_merges_on_reconne
     let _ = service;
 }
 
+/// A head that was admitted before its daemon came back under another
+/// runtime id (or with another placement generation) and was never parked:
+/// the queue worker claims it with the binding it has. Through the real
+/// owner it merges from the workspace the placement names now: every effect
+/// is addressed from the current placement row, so the stale binding of the
+/// attempt reaches no daemon and nothing parks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_queued_head_bound_to_the_daemons_previous_runtime_merges_from_its_current_placement() {
+    for changed in ["runtime", "generation"] {
+        let fixture = Fixture::file_backed("forge-queue-stale-head").await;
+        let head = admit_queue_head(&fixture, &[]).await;
+        let database = fixture.harness.state.db.clone();
+        let sql = if changed == "runtime" {
+            "UPDATE integration_attempt SET runtime_id='gone-runtime' WHERE id=?"
+        } else {
+            "UPDATE integration_attempt SET placement_generation=0 WHERE id=?"
+        };
+        sqlx::query(sql)
+            .bind(&head.attempt_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        // A rebase is the first effect that names the owner.
+        std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+        git::commit_all(&fixture.checkout, "target advanced")
+            .await
+            .unwrap();
+        let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+        let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut seen = Vec::new();
+        let outcome = loop {
+            let status = task_status(&fixture, &head.task_id).await;
+            let attempts: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT id,state,failure_kind,failure_message FROM integration_attempt WHERE task_ref=? ORDER BY created_at,id",
+            )
+            .bind(&head.task_id)
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+            let line = format!("{status} {attempts:?}");
+            if seen.last() != Some(&line) {
+                seen.push(line);
+            }
+            if status == "done" {
+                break "merged";
+            }
+            if attempts.iter().any(|(_, state, _, _)| state == "parked") {
+                break "parked";
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{changed}: the stale-bound head neither merged nor parked: {seen:#?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+        // What the product does: the driver takes the Task's workspace owner
+        // from the placement as it is now, not from the binding the attempt
+        // was admitted with, so the head merges and nothing parks.
+        assert_eq!(
+            outcome, "merged",
+            "{changed}: the stale-bound head parked: {seen:#?}"
+        );
+        let tip = git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
+        assert_ne!(tip, moved_tip, "{changed}: nothing landed: {seen:#?}");
+        for file in ["feature.txt", "outside.txt"] {
+            git_sync(
+                &fixture.checkout,
+                &["cat-file", "-e", &format!("{tip}:{file}")],
+            );
+        }
+        // One rebase and one fast-forward reached the daemon, each naming
+        // the placement's runtime and generation, never the stale binding.
+        let placement = &fixture.resolved.placement;
+        let link = fixture.link.as_ref().unwrap();
+        for method in [METHOD_WORKSPACE_RESET, METHOD_WORKSPACE_MERGE] {
+            let requests = attempt_requests(link, method);
+            assert_eq!(requests.len(), 1, "{changed}: {method}: {requests:?}");
+            let params = &requests[0];
+            assert_eq!(
+                params["runtime_id"].as_str(),
+                placement.runtime_id.as_deref(),
+                "{changed}: {method}"
+            );
+            assert_eq!(params["generation"], placement.generation, "{changed}");
+            assert_eq!(params["placement_id"], placement.id.as_str(), "{changed}");
+            let owner = &params["integration"]["request"]["witness"]["workspace"];
+            assert_eq!(
+                owner["owner"]["runtime_id"].as_str(),
+                placement.runtime_id.as_deref(),
+                "{changed}: {method} witness"
+            );
+            assert_eq!(owner["generation"], placement.generation, "{changed}");
+            assert!(
+                !params.to_string().contains("gone-runtime"),
+                "{changed}: {method} was sent under the stale runtime"
+            );
+        }
+        // The same attempt merged: no successor was needed.
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM integration_attempt WHERE task_ref=?")
+                .bind(&head.task_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "{changed}: {seen:#?}");
+    }
+}
+
 /// A parked attempt still names the runtime/generation that admitted it,
 /// while reconnect recovery has verified its placement on the current owner.
 /// Recovery must replace that binding before the next rebase is requested.

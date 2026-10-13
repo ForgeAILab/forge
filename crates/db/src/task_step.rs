@@ -414,6 +414,8 @@ impl Drop for TaskStepActivity {
             .remove(&self.id);
     }
 }
+use crate::check_run::CANCEL_UNWATCHED_QUEUED_RUNS;
+
 impl SqliteDb {
     /// Check lease ownership and the producing status entry in the writer
     /// transaction that records a hook effect or checkpoint.
@@ -533,16 +535,30 @@ impl SqliteDb {
             .await?)
     }
     /// The step that asked for this check will never read its result: the
-    /// consumer is cancelled, so its delivery is stale and its run, when it
-    /// has no other consumer, is stopped by the check worker's next look.
+    /// consumer is cancelled, so its delivery is stale. A queued run it was
+    /// the last to wait for is cancelled in the same transaction (it holds
+    /// no slot and nobody claimed it, so there is nothing to stop); a run a
+    /// worker already claimed is stopped by that worker's next look.
     pub async fn cancel_abandoned_check_consumer(&self, consumer_id: &str) -> Result<bool> {
-        Ok(sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL AND applied_at IS NULL")
-            .bind(now_rfc3339())
+        let now = now_rfc3339();
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let withdrawn = sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL AND applied_at IS NULL")
+            .bind(&now)
             .bind(consumer_id)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected()
-            == 1)
+            == 1;
+        if withdrawn {
+            sqlx::query(&format!("{CANCEL_UNWATCHED_QUEUED_RUNS} AND id=(SELECT run_id FROM check_consumer WHERE id=?3)"))
+                .bind(&now)
+                .bind(&now)
+                .bind(consumer_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(withdrawn)
     }
     /// Hooks steps of this Project that still wait, suspended, for a check
     /// consumer that was cancelled under them: `(task_id, consumer_id)`.
@@ -583,15 +599,25 @@ impl SqliteDb {
             .await?)
     }
     /// Project deletion: nobody waits for this Project's unfinished check
-    /// runs any more. The check worker stops a run without consumers (a
-    /// queued one is cancelled, a running one is cancelled on its owner).
+    /// runs any more. Its queued runs are cancelled in the same transaction;
+    /// the check worker stops a claimed one on its owner.
     pub async fn cancel_project_check_consumers(&self, project_id: &str) -> Result<u64> {
-        Ok(sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE cancelled_at IS NULL AND applied_at IS NULL AND run_id IN (SELECT id FROM check_run WHERE project_id=? AND state IN ('queued','running','cancelling','cleaning','uncertain'))")
-            .bind(now_rfc3339())
+        let now = now_rfc3339();
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let withdrawn = sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE cancelled_at IS NULL AND applied_at IS NULL AND run_id IN (SELECT id FROM check_run WHERE project_id=? AND state IN ('queued','running','cancelling','cleaning','uncertain'))")
+            .bind(&now)
             .bind(project_id)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?
-            .rows_affected())
+            .rows_affected();
+        sqlx::query(&format!("{CANCEL_UNWATCHED_QUEUED_RUNS} AND project_id=?3"))
+            .bind(&now)
+            .bind(&now)
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(withdrawn)
     }
     /// The Project's check runs that have not settled: `(id, version, state)`.
     pub async fn live_project_check_runs(

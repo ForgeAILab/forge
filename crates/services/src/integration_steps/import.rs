@@ -118,22 +118,53 @@ pub async fn import_at_start(db: &Arc<SqliteDb>) -> Result<ImportReport> {
             break;
         }
     }
-    let ids: Vec<String> = sqlx::query_scalar(UNCONTINUED)
-        .fetch_all(db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+    // A shadow row of a Task deleted since gets no continuation and holds
+    // no slot: it is removed here, the one place that would list it.
+    match db.delete_orphan_shadow_attempts().await {
+        Ok(0) => {}
+        Ok(deleted) => {
+            tracing::info!(target: "services::integration_steps", deleted, "shadow attempts of deleted Tasks removed")
+        }
+        Err(error) => {
+            tracing::warn!(target: "services::integration_steps", %error, "shadow attempts of deleted Tasks were not removed; the next start retries")
+        }
+    }
+    report.continuations = enqueue_missing_continuations(db, false).await?;
+    Ok(report)
+}
+
+/// Enqueue the continuation step of every current pre-queue attempt that has
+/// none. `queued_only`: only of `queued` attempts, the rows whose claim
+/// waits for a settled continuation (`claimable_member`). The queue worker's
+/// sweep asks that way, so a row whose settled step was pruned is continued
+/// again without a restart and history rows get no new step.
+pub(crate) async fn enqueue_missing_continuations(
+    db: &Arc<SqliteDb>,
+    queued_only: bool,
+) -> Result<u32> {
+    // The sweep's read seeks the `queued` rows only; the start's lists every
+    // current pre-queue row once.
+    let ids: Vec<String> = if queued_only {
+        db.queued_imports_without_continuation().await?
+    } else {
+        sqlx::query_scalar(UNCONTINUED)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db::DbError::from)?
+    };
+    let mut enqueued = 0;
     for id in ids {
         match enqueue_continuation(db, &id).await {
-            Ok(true) => report.continuations += 1,
+            Ok(true) => enqueued += 1,
             Ok(false) => {}
-            // One unreadable row must not stop the others; the next start
-            // lists it again.
+            // One unreadable row must not stop the others; the next sweep
+            // or start lists it again.
             Err(error) => {
                 tracing::warn!(target: "services::integration_steps", attempt_id = %id, %error, "integration import continuation was not enqueued");
             }
         }
     }
-    Ok(report)
+    Ok(enqueued)
 }
 
 async fn enqueue_continuation(db: &Arc<SqliteDb>, attempt_id: &str) -> Result<bool> {
@@ -160,6 +191,20 @@ async fn enqueue_continuation(db: &Arc<SqliteDb>, attempt_id: &str) -> Result<bo
         db::now_rfc3339(),
     )?;
     let mut tx = db::begin_immediate(db.pool()).await?;
+    // One continuation per attempt, whoever asks (two sweeps, a sweep beside
+    // the start): the step's key is unique per Task and a second enqueue
+    // inserts nothing. Only the insert is counted.
+    let existed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND causation_key=?)",
+    )
+    .bind(&input.task_id)
+    .bind(&input.causation_key)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db::DbError::from)?;
+    if existed {
+        return Ok(false);
+    }
     let id = db.enqueue_step_in_tx(&mut tx, &input).await?;
     // Identity-fenced: a Task that changed status since the import still
     // gets its continuation, which then finds the entry gone and writes
@@ -423,7 +468,7 @@ impl IntegrationSteps {
 
     /// State `reason` for the imported attempt and finish the step. An
     /// intervention raises its incident with the statement, as `park` does.
-    async fn import_state(
+    pub(super) async fn import_state(
         &self,
         step: &TaskStep,
         attempt: &IntegrationAttempt,

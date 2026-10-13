@@ -3069,20 +3069,38 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
         .execute(world.db.pool())
         .await
         .unwrap();
+    let releases_before = production.worker.releases();
     let started = std::time::Instant::now();
     let admitted = world
         .service
         .admit_to_integration_queue("again")
         .await
         .expect("admitted without a conflict for the caller");
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "re-admission finishes within 10 s: {:?}",
-        started.elapsed()
-    );
+    let elapsed = started.elapsed();
     assert_ne!(admitted.id, old.id);
     assert_eq!(admitted.expected_epoch, 1);
     let released = world.attempt(&old.id).await;
+    // The order of events, whatever the load: the old head's driver
+    // released it (the signal the admission waits on) before the new entry
+    // was admitted, and the admission did not run out its wait.
+    assert_eq!(
+        production.worker.releases(),
+        releases_before + 1,
+        "the old head was released by its driver, once"
+    );
+    assert!(
+        released.updated_at <= admitted.enqueued_at,
+        "released {} before admitted {}",
+        released.updated_at,
+        admitted.enqueued_at
+    );
+    // The takeover is one driver pass after the flag. The bound is half of
+    // the admission's own wait (`RELEASE_WAIT`), so it tells a takeover on
+    // the signal from an admission that waited its wait out.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "re-admission finishes within 10 s: {elapsed:?}"
+    );
     // Released by the admission's cancel flag, or by the head's own gate
     // read finding the entry gone, whichever came first.
     assert_eq!(released.state, S::Cancelled);
@@ -3121,6 +3139,150 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
         world.attempt(&old.id).await.phase_timings,
         merged.phase_timings
     );
+}
+
+/// The order of events of a re-entry, with the admission's poll taken away:
+/// the admission flags the old head and wakes the worker, the head's driver
+/// releases it and signals the release, and that signal (nothing else) lets
+/// the admission look again. Without the signal the admission would return
+/// the conflict after `RELEASE_WAIT` and its step would spend an attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_reentry_admission_is_woken_by_the_release_of_its_old_head_not_by_its_poll() {
+    let world = World::new().await;
+    let old = world.add_task("signal", "signal.txt", "signal\n").await;
+    world.seed_execution("signal", "executor", None).await;
+    std::fs::write(world.repo().join("moved"), "moved\n").unwrap();
+    git::commit_all(&world.repo(), "target moved")
+        .await
+        .unwrap();
+    let gate = world.temp.path().join("go");
+    review_ci(
+        &world,
+        "signal",
+        &[&format!(
+            "while [ ! -f {} ]; do sleep 0.1; done",
+            gate.display()
+        )],
+    )
+    .await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the head waits for its check", || async {
+        world.attempt(&old.id).await.state == S::Checking
+    })
+    .await;
+    sqlx::query("UPDATE task SET status_epoch=status_epoch+1 WHERE id='signal'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    super::admission::test_poll::disable("signal");
+    let releases_before = production.worker.releases();
+    let task = world.task("signal").await;
+    let admitted = super::admission::admit_released(
+        &world.db,
+        world.service.merge_service.as_ref().unwrap(),
+        &task,
+        Some(&production.worker),
+    )
+    .await
+    .expect("the release of the old head woke the admission");
+    assert_ne!(admitted.id, old.id);
+    assert_eq!(production.worker.releases(), releases_before + 1);
+    let released = world.attempt(&old.id).await;
+    // By the admission's cancel flag or by the head's own gate read finding
+    // the entry gone, whichever came first: either way its driver's release.
+    assert_eq!(released.state, S::Cancelled);
+    assert!(released.updated_at <= admitted.enqueued_at);
+    std::fs::write(&gate, "go").unwrap();
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
+/// The same, through the composition the server runtime uses: the worker
+/// `TaskService::compose_integration` registers on the service (the
+/// runtime's call, `runtime/mod.rs`) is the worker every admission is handed
+/// (`TaskService::integration_worker`), and it is that worker's drivers that
+/// signal a release. With the admission's poll taken away,
+/// `admit_to_integration_queue` returns only on that signal: a service whose
+/// admissions were handed no worker, or another worker than the one that
+/// runs, would wait `RELEASE_WAIT` out and return the conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_composed_service_hands_its_admissions_the_worker_whose_release_wakes_them() {
+    let world = World::new().await;
+    assert!(
+        world.service.integration_worker().is_none(),
+        "nothing is registered before the composition"
+    );
+    let worker = world.service.integration_worker_or_embedded();
+    assert!(Arc::ptr_eq(
+        &worker,
+        &world.service.integration_worker().unwrap()
+    ));
+    // Every clone of the service (the one hooks and steps hold) sees it.
+    assert!(Arc::ptr_eq(
+        &worker,
+        &world.service.clone().integration_worker().unwrap()
+    ));
+    let old = world.add_task("composed", "composed.txt", "x\n").await;
+    world.seed_execution("composed", "executor", None).await;
+    std::fs::write(world.repo().join("moved"), "moved\n").unwrap();
+    git::commit_all(&world.repo(), "target moved")
+        .await
+        .unwrap();
+    let gate = world.temp.path().join("go-composed");
+    review_ci(
+        &world,
+        "composed",
+        &[&format!(
+            "while [ ! -f {} ]; do sleep 0.1; done",
+            gate.display()
+        )],
+    )
+    .await;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(worker.clone().run(stopped));
+    eventually("the head holds the slot", || async {
+        matches!(
+            world.attempt(&old.id).await.state,
+            S::Checking | S::Rebasing | S::Validating
+        ) && world
+            .db
+            .integration_queue(old.queue_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .head_attempt_id
+            .as_deref()
+            == Some(old.id.as_str())
+    })
+    .await;
+    eventually("the head waits for its check", || async {
+        world.attempt(&old.id).await.state == S::Checking
+    })
+    .await;
+    sqlx::query("UPDATE task SET status_epoch=status_epoch+1 WHERE id='composed'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    super::admission::test_poll::disable("composed");
+    let releases_before = worker.releases();
+    let started = std::time::Instant::now();
+    let admitted = world
+        .service
+        .admit_to_integration_queue("composed")
+        .await
+        .expect("the release of the old head woke the admission");
+    assert_ne!(admitted.id, old.id);
+    assert!(worker.releases() > releases_before);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "woken by the release, not by the end of the wait: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(world.attempt(&old.id).await.state, S::Cancelled);
+    std::fs::write(&gate, "go").unwrap();
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
 
 /// The Task's target branch changed between two entries of `merging`: the
