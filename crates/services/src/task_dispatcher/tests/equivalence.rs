@@ -594,6 +594,15 @@ async fn apply(name: &str, c: &Ctx) {
         "merging_no_hooks" => {
             task(c, "T", "merging").await;
         }
+        // Not in `SHAPES`: the recording has no line for it (see
+        // `a_subtask_resting_in_a_merge_state_is_finished_by_a_pass`).
+        "merging_subtask" => {
+            let r = task(c, "R", "in_progress").await;
+            let c1 = seed_subtask(&c.db, &r, "C1", "merging", 0).await;
+            let c2 = seed_subtask(&c.db, &r, "C2", "todo", 1).await;
+            assign_role(&c.db, &c1.id, "coder", &c.a1).await;
+            assign_role(&c.db, &c2.id, "coder", &c.a1).await;
+        }
         "merging_no_hooks_witness" => {
             let t = task(c, "T", "merging").await;
             TransitionLogRepo::insert(
@@ -1336,27 +1345,35 @@ async fn idle_bookkeeping(c: &Ctx) -> Vec<(String, i64, i64)> {
         .bind(&c.pid).fetch_all(c.db.pool()).await.unwrap()
 }
 
+/// Twenty passes over one fixture: every step or scheduler generation a
+/// pass after the second still writes is a finding.
+async fn unchanged_passes(name: &str, c: &Ctx) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut baseline = Vec::new();
+    for pass in 1..=20 {
+        tokio::time::timeout(Duration::from_secs(20), c.dispatcher.reconcile_all())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: pass {pass} timed out"))
+            .unwrap();
+        c.dispatcher.drain_steps().await.unwrap();
+        let after = idle_bookkeeping(c).await;
+        if pass == 2 {
+            baseline = after;
+        } else if pass > 2 && after != baseline {
+            findings.push(format!("{name}: pass {pass}: {baseline:?} -> {after:?}"));
+            // Report each further write once, against the pass before it.
+            baseline = after;
+        }
+    }
+    findings
+}
+
 async fn unchanged_shapes(case: usize) {
     let mut findings = Vec::new();
     for name in shapes_of_case(case) {
         let c = ctx(false).await;
         Box::pin(apply(name, &c)).await;
-        let mut baseline = Vec::new();
-        for pass in 1..=20 {
-            tokio::time::timeout(Duration::from_secs(20), c.dispatcher.reconcile_all())
-                .await
-                .unwrap_or_else(|_| panic!("{name}: pass {pass} timed out"))
-                .unwrap();
-            c.dispatcher.drain_steps().await.unwrap();
-            let after = idle_bookkeeping(&c).await;
-            if pass == 2 {
-                baseline = after;
-            } else if pass > 2 && after != baseline {
-                findings.push(format!("{name}: pass {pass}: {baseline:?} -> {after:?}"));
-                // Report each further write once, against the pass before it.
-                baseline = after;
-            }
-        }
+        findings.extend(unchanged_passes(name, &c).await);
     }
     assert!(
         findings.is_empty(),
@@ -1385,6 +1402,58 @@ unchanged_cases! {
     shapes_5_mod_8 => 5,
     shapes_6_mod_8 => 6,
     shapes_7_mod_8 => 7,
+}
+
+/// A subtask in a merge state that no entry hook finished (its row is put
+/// there, as a manual move or an entry that skipped leaves it): subtasks do
+/// not merge, so no attempt, step or park would ever own it. The first
+/// dispatcher pass finishes it by the state's landed-merge target, and the
+/// passes after it write nothing more. The shape is not in the recording of
+/// 9d9b228f, which left such a subtask resting with a clear condition.
+#[test]
+fn a_subtask_resting_in_a_merge_state_is_finished_by_a_pass() {
+    on_runtime(|| async {
+        let c = ctx(false).await;
+        Box::pin(apply("merging_subtask", &c)).await;
+        async fn state(c: &Ctx, title: &str) -> (String, String, i64) {
+            sqlx::query_as(
+                "SELECT id, status, (SELECT COUNT(*) FROM task_step WHERE task_id=task.id AND status IN ('pending','claimed')) FROM task WHERE project_id=? AND title=?",
+            )
+            .bind(&c.pid)
+            .bind(title)
+            .fetch_one(c.db.pool())
+            .await
+            .unwrap()
+        }
+        let (id, status, live_steps) = state(&c, "C1").await;
+        assert_eq!((status.as_str(), live_steps), ("merging", 0));
+        c.dispatcher.reconcile_all().await.unwrap();
+        c.dispatcher.drain_steps().await.unwrap();
+        let (_, status, _) = state(&c, "C1").await;
+        assert_eq!(status, "done", "one pass finishes the subtask");
+        let last: (String, String, String) = sqlx::query_as(
+            "SELECT from_state, to_state, trigger_reason FROM transition_log WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_one(c.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (last.0.as_str(), last.1.as_str(), last.2.as_str()),
+            (
+                "merging",
+                "done",
+                crate::integration_steps::reconcile::SUBTASK_HAS_NO_MERGE
+            )
+        );
+        // The same fixture again, under the twenty-pass guard.
+        let c = ctx(false).await;
+        Box::pin(apply("merging_subtask", &c)).await;
+        let findings = unchanged_passes("merging_subtask", &c).await;
+        assert!(findings.is_empty(), "{}", findings.join("\n"));
+        let (_, status, _) = state(&c, "C1").await;
+        assert_eq!(status, "done");
+    });
 }
 
 #[test]

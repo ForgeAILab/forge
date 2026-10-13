@@ -13,6 +13,7 @@ pub enum Step {
     Integrate,
     /// Admit a Task that is in a merge state, and that nothing owns there,
     /// to the integration queue (`TaskService::reconcile_integration_admission`).
+    /// A subtask in a merge state is finished by it instead.
     AdmitIntegration,
     RetryReviewCi,
     ReviewRefresh {
@@ -200,6 +201,10 @@ pub struct Facts {
     /// has since lifted), and that neither its owner nor a pending step
     /// stops: the reconciler admits it.
     pub missing_merge_entry: bool,
+    /// A subtask in such a state, that neither its owner nor a block stops.
+    /// Subtasks do not merge, so nothing will ever own it there: the
+    /// reconciler finishes it.
+    pub subtask_in_merge_state: bool,
 }
 pub struct Snapshot<'a> {
     pub state: &'a str,
@@ -441,7 +446,8 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // the function the `run_merge` hook calls. An accepted owner command
     // (above) runs first; a Task its owner stopped is not admitted
     // (`missing_merge_entry` is false under the Task gate).
-    if f.missing_merge_entry {
+    // A subtask found there is never admitted: the same step finishes it.
+    if f.missing_merge_entry || f.subtask_in_merge_state {
         return Next::Step(Step::AdmitIntegration);
     }
     if let Some(target) = &f.review_refresh {

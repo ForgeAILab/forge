@@ -54,6 +54,19 @@ impl HookAction for RunMerge {
             // ordinary integration handling below.
             Ok(_) | Err(_) => {}
         }
+        // A subtask has no merge of its own: its commits are on the root's
+        // branch and land with the root. It leaves the merge state the way
+        // a landed merge does, whatever Workspace or merge service exists;
+        // resting here it would have no attempt, no step and no park. The
+        // dispatcher's sweep makes the same move for a subtask found here
+        // (`TaskService::reconcile_integration_admission`).
+        if current.parent_task_id.is_some() {
+            return HookResult::Cascade {
+                to: merge_role_target(ctx, default_states::DONE),
+                reason: crate::integration_steps::reconcile::SUBTASK_HAS_NO_MERGE.to_owned(),
+                bridge: Default::default(),
+            };
+        }
         let Some(merge_service) = ctx.merge_service.as_ref() else {
             return HookResult::Skipped {
                 reason: "merge service not configured".to_string(),
@@ -94,11 +107,6 @@ impl HookAction for RunMerge {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
-        if task.parent_task_id.is_some() {
-            return HookResult::Skipped {
-                reason: "subtasks do not merge".to_string(),
-            };
-        }
         // The same step may have died inside the rebase it started: that
         // rebase is finished here, by the rule it was started under.
         match legacy_rebase_result(ctx, &task).await {
