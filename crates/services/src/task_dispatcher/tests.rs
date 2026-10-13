@@ -10500,11 +10500,11 @@ mod equivalence;
 mod lead_check;
 #[path = "tests/lead_operations.rs"]
 mod lead_operations;
-#[path = "tests/review_candidate.rs"]
-mod review_candidate;
 #[cfg(test)]
 #[path = "tests/refresh_recovery.rs"]
 mod refresh_recovery;
+#[path = "tests/review_candidate.rs"]
+mod review_candidate;
 #[path = "tests/root_lead.rs"]
 mod root_lead;
 #[path = "tests/root_replan.rs"]

@@ -113,6 +113,37 @@ impl TaskService {
             .is_some_and(|status| status.trim().is_empty()))
     }
 
+    /// The branch that could hold a human submission is on a machine that is
+    /// away. Whether there is a candidate is unknown until it returns, so
+    /// nothing is decided: the Task waits for the machine as it always did.
+    pub(crate) async fn review_candidate_workspace_away(&self, task: &Task) -> Result<bool> {
+        if latest_executor_execution_for_task(&self.db, task)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let Some(workspace) = WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        Ok(
+            db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &workspace.id)
+                .await?
+                .is_some_and(|placement| {
+                    placement.owner_kind != db::PlacementOwnerKind::Server
+                        && (placement.state == db::PlacementState::Disconnected
+                            || (placement.state == db::PlacementState::Failed
+                                && placement.failure_cause
+                                    == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout)))
+                }),
+        )
+    }
+
     /// Import human delivery evidence only when no implementation run owns
     /// this Task's candidate. No Agent, process, lease or completion cascade
     /// is manufactured: the completed row records the human submission's
@@ -160,24 +191,32 @@ impl TaskService {
         else {
             return Ok(None);
         };
-        let target =
-            crate::merge_service::target_branch(&task.merge_config, &repo.default_branch)?;
-        // Commits the target already has, and merges of the target into the
-        // branch, are not a submission: only the branch's own commits are.
-        let own = io
-            .git_read(
-                &[
-                    "rev-list",
-                    "--count",
-                    "--no-merges",
-                    &format!("{target}..{}", head.trim()),
-                ],
-                true,
-            )
+        let target = crate::merge_service::target_branch(&task.merge_config, &repo.default_branch)?;
+        // A branch that changes nothing against its merge base with the
+        // target (it is contained in the target, or only merged it) is not a
+        // submission. Both reads are ones a daemon-owned Workspace answers.
+        let fork = io
+            .git_read(&["merge-base", &target, head.trim()], true)
             .await
             .map_err(ServiceError::invalid_operation)?;
-        if own.is_some_and(|count| count.trim() == "0") {
-            return Ok(None);
+        if let Some(fork) = fork.as_deref().map(str::trim) {
+            let changed = io
+                .git_read(
+                    &[
+                        "diff",
+                        "--name-only",
+                        "-z",
+                        "--diff-filter=ACDMRTUXB",
+                        &format!("{fork}..{}", head.trim()),
+                        "--",
+                    ],
+                    true,
+                )
+                .await
+                .map_err(ServiceError::invalid_operation)?;
+            if changed.is_some_and(|paths| paths.trim_matches(['\0', '\n', ' ']).is_empty()) {
+                return Ok(None);
+            }
         }
         let base = match workspace.before_sha.as_deref() {
             Some(base) => base.to_owned(),

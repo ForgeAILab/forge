@@ -63,6 +63,15 @@ pub(super) async fn prepare_review_entry(
     {
         return Ok(None);
     }
+    // The branch is on a machine that is away: nothing is decided now.
+    if ctx
+        .task_service
+        .review_candidate_workspace_away(task)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
     let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
         .await
         .map_err(|error| error.to_string())?

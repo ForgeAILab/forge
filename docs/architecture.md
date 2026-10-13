@@ -5909,7 +5909,9 @@ not count) is a human submission and runs the ordinary configured review checks
 and reviewer. Its completed delivery-evidence row records the exact base/head
 and a human-submission summary, with no Agent, process, lease, session or logs.
 It grants no review authority by itself. Review attempts retain their execution
-foreign key and the ordinary candidate/admission fences.
+foreign key and the ordinary candidate/admission fences. While the
+Workspace's machine is away the branch cannot be read: nothing is decided, no
+"nothing to review" park is stated, and the Task waits for the machine.
 
 With no delivery candidate the review parks as
 `failure { failure_kind: review_blocked }` with `blocking_reason`

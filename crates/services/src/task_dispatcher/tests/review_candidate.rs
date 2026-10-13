@@ -119,10 +119,13 @@ async fn all_cancelled_root_without_a_lead_parks_and_owner_actions_work() {
             let current = reload(&lead.db, &root.id).await;
             assert!(
                 action == "cancel"
-                    || current.condition.read().diagnostic.as_ref().is_none_or(
-                        |annotation| annotation.blocking_reason
-                            != crate::task_service::MISSING_REVIEW_CANDIDATE
-                    ),
+                    || current
+                        .condition
+                        .read()
+                        .diagnostic
+                        .as_ref()
+                        .is_none_or(|annotation| annotation.blocking_reason
+                            != crate::task_service::MISSING_REVIEW_CANDIDATE),
                 "the park ends with the owner's decision: {:?}",
                 current.condition
             );
@@ -467,4 +470,77 @@ async fn a_branch_with_only_merges_of_its_target_is_no_candidate() {
         .await
         .unwrap();
     assert_eq!(runs, 0, "no delivery evidence is recorded");
+}
+
+/// The Task's branch is on a machine that is away: whether a human submitted
+/// work is unknown, so no "nothing to review" park is stated and nothing is
+/// written per pass. The review waits for the machine.
+#[tokio::test]
+async fn a_review_whose_machine_is_away_is_not_parked_as_empty() {
+    let db = Arc::new(sqlite_db().await);
+    let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    assert_eq!(placement.state, db::PlacementState::Disconnected);
+    let agent = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
+    // The run delivered nothing: it is no candidate.
+    sqlx::query("UPDATE execution SET status='failed' WHERE id=?")
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET status='review', version=version+1 WHERE id=?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assign_role(&db, &task.id, "reviewer", &agent).await;
+    let bus = Arc::new(EventBus::new(16));
+    let service = Arc::new(TaskService::new(db.clone(), bus.clone()));
+    let dispatcher = TaskDispatcher::new(db.clone(), bus, service);
+    let mut settled = None;
+    for pass in 1..=20 {
+        dispatcher.reconcile_all().await.unwrap();
+        dispatcher.drain_steps().await.unwrap();
+        let after = (
+            TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap(),
+            write_counts(&db).await,
+        );
+        if pass == 3 {
+            settled = Some(after);
+        } else if pass > 3 {
+            assert_eq!(Some(after), settled, "pass {pass}");
+        }
+    }
+    let waiting = settled.unwrap().0;
+    assert_eq!(waiting.status, "review");
+    assert!(
+        waiting
+            .condition
+            .read()
+            .diagnostic
+            .as_ref()
+            .is_none_or(|annotation| annotation.blocking_reason
+                != crate::task_service::MISSING_REVIEW_CANDIDATE),
+        "{:?}",
+        waiting.condition
+    );
+    assert_ne!(
+        waiting.condition.read().failure_kind,
+        Some(api_types::FailureKind::ReviewBlocked),
+        "{:?}",
+        waiting.condition
+    );
+    let park: Option<String> =
+        sqlx::query_scalar("SELECT reason_json FROM task_schedule_park WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        park.as_deref()
+            .is_some_and(|park| park.contains(r#""owner":"Machine""#)),
+        "the review waits for its machine: {park:?}"
+    );
 }

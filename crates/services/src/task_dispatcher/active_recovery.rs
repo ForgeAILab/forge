@@ -1261,6 +1261,13 @@ impl TaskDispatcher {
         {
             return Ok(false);
         }
+        if self
+            .task_service
+            .review_candidate_workspace_away(task)
+            .await?
+        {
+            return Ok(false);
+        }
         self.task_service.reconcile_review_candidate(task).await?;
         Ok(true)
     }
@@ -1274,6 +1281,16 @@ impl TaskDispatcher {
     ) -> Result<bool> {
         if task.review_passed_at.is_some() {
             return Ok(true);
+        }
+        if self
+            .task_service
+            .review_candidate_workspace_away(task)
+            .await?
+        {
+            return Err(ServiceError::conflict(format!(
+                "task {} is in review with no implementation execution to review, and its Workspace is on a machine that is away",
+                task.id
+            )));
         }
         let Some(candidate) = self
             .task_service
