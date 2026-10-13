@@ -115,13 +115,19 @@ describe('deriveColumns', () => {
     expect(columns.filter((candidate) => candidate.inheritedStates).length).toBe(1)
   })
 
-  it('gives a lead_check card on a Project workflow the exits of the gate', () => {
+  it('reads lead_check exits from the applicable workflow', () => {
+    const gate = state('lead_check', 'gate', 'In Progress', 'Lead Check')
+    gate.triggers = {
+      accept: { to: 'done', dispatch: null },
+      reject: { to: 'in_progress', dispatch: null },
+      fail: { to: 'cancelled', dispatch: null },
+    }
     const workflow: WorkflowDefinition = {
       roles: [],
       states: [
         state('todo', 'initial', 'Todo', 'Todo'),
         state('in_progress', 'active', 'In Progress', 'In Progress'),
-        state('review', 'gate', 'Review', 'Review'),
+        gate,
         state('done', 'terminal', 'Done', 'Done'),
         state('cancelled', 'terminal', 'Cancelled', 'Cancelled'),
       ],
@@ -136,17 +142,30 @@ describe('deriveColumns', () => {
     expect(getValidDropColumns(workflow, 'lead_check')).toEqual(['done', 'in_progress', 'cancelled'])
     // Never review: the step check is not a review.
     expect(workflowTriggerTargets(workflow, 'lead_check')).not.toContain('review')
-    // A workflow without those states offers nothing it cannot reach, and any
-    // other unknown state still has no edges.
+    // A missing state has no edges; the client does not synthesize a workflow.
     const bare = { ...workflow, states: [state('queued', 'initial', 'Queued', 'Queued')] }
     expect(outgoingWorkflowEdges(bare, 'lead_check')).toEqual([])
     expect(outgoingWorkflowEdges(workflow, 'some_unknown_state')).toEqual([])
   })
 
   it("cancels a lead_check card to the inherited workflow's own state, whatever the Project names its own", () => {
-    // `inherited_subtask_workflow`: the gate's Fail goes to `cancelled`. A
-    // Project that cancels to another state has no such exit for a subtask
-    // in the step check, and the server refuses the move.
+    const gate = state('lead_check', 'gate', 'In Progress', 'Lead Check')
+    gate.triggers = {
+      accept: { to: 'done', dispatch: null },
+      reject: { to: 'in_progress', dispatch: null },
+      fail: { to: 'cancelled', dispatch: null },
+    }
+    const inherited: WorkflowDefinition = {
+      roles: [],
+      configuration: [],
+      cancellation_state: 'cancelled',
+      states: [
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        gate,
+        state('done', 'terminal', 'Done', 'Done'),
+        state('cancelled', 'terminal', 'Done', 'Cancelled'),
+      ],
+    }
     const workflow: WorkflowDefinition = {
       roles: [],
       states: [
@@ -158,12 +177,15 @@ describe('deriveColumns', () => {
       configuration: [],
       cancellation_state: 'abandoned',
     }
-    expect(workflowTriggerTargets(workflow, 'lead_check')).toEqual(['done', 'in_progress'])
+    expect(getValidDropColumns(inherited, 'lead_check', deriveColumns(workflow))).toEqual([
+      'done',
+      'in_progress',
+    ])
     const withBoth = {
       ...workflow,
       states: [...workflow.states, state('cancelled', 'terminal', 'Cancelled', 'Cancelled')],
     }
-    expect(workflowTriggerTargets(withBoth, 'lead_check')).toEqual([
+    expect(getValidDropColumns(inherited, 'lead_check', deriveColumns(withBoth))).toEqual([
       'done',
       'in_progress',
       'cancelled',
@@ -196,6 +218,19 @@ describe('deriveColumns', () => {
 })
 
 describe('outgoingWorkflowEdges', () => {
+  it('does not invent exits for a state missing from the applicable workflow', () => {
+    const workflow: WorkflowDefinition = {
+      roles: [],
+      configuration: [],
+      cancellation_state: 'cancelled',
+      states: [
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        state('done', 'terminal', 'Done', 'Done'),
+        state('cancelled', 'terminal', 'Cancelled', 'Cancelled'),
+      ],
+    }
+    expect(outgoingWorkflowEdges(workflow, 'lead_check')).toEqual([])
+  })
   it('adds an implicit accept edge to the next declared state', () => {
     const workflow: WorkflowDefinition = {
       roles: [],

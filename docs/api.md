@@ -2873,6 +2873,15 @@ Web offers whose `authority` array contains `lead` show who can act. Coordinatio
 activity with `actor_type: task_lead` resolves `actor_id` to the lead's Agent
 name, retaining the ID as a fallback when the Agent cannot be read.
 
+Mission Control keeps lead-answer drafts in page state, keyed by Attention item
+ID. If a question is withdrawn during a refetch (for example after root
+cancellation or lead removal), a non-blank draft stays in the questions section
+as an inline notice with Copy draft and Dismiss draft controls. Successful answers
+clear their drafts. Coordination roots that hold their subtasks' runs do not offer
+an interactive launch from a workflow exception. The board reads a subtask's
+effective workflow from `GET /api/v1/tasks/{id}/detail` before offering or applying
+a cross-column move; top-level Tasks continue to use the Project workflow.
+
 `repo_id` is not a Task field. REST and MCP Task objects, Solo Task snapshots,
 and generated clients omit it. For work that has already run, repository
 identity is read from the execution's Workspace or Workspace lease; review,
@@ -5390,6 +5399,12 @@ context contains `project_id`, `operation_id`, `old_status`, `new_status`,
 lifecycle consumers as normal transitions but do not also publish a direct
 `task.status_changed` event. Queued cascades remain separate transitions
 and can publish their own status events.
+
+The web only patches cached Task list rows from events that carry `task_version`,
+and ignores patches older than the cached Task version. Ordinary
+`task.status_changed` envelopes have no version, so they trigger an authoritative
+refetch instead. This keeps a coalesced or out-of-order no-lead subtask cascade
+(`in_progress` → `lead_check` → `done`) from regressing a newer cached Task.
 
 `task.recovered` (`{project_id, reason}`) is published when a Task's recovery
 settles: `crash_recovery` once the post-restart recovery step has settled the

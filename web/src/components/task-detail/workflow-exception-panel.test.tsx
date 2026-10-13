@@ -2,8 +2,14 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Offer, Task } from '@/types/generated'
 import { WorkflowExceptionPanel } from './workflow-exception-panel'
-const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }))
-vi.mock('@/api/hooks', () => ({ useTaskAction: () => ({ mutate, isPending: false }) }))
+const { mutate, relations } = vi.hoisted(() => ({
+  mutate: vi.fn(),
+  relations: { subtasks: [] as { id: string }[] },
+}))
+vi.mock('@/api/hooks', () => ({
+  useTaskAction: () => ({ mutate, isPending: false }),
+  useTaskRelationsQuery: () => ({ data: relations }),
+}))
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a href="#evidence">{children}</a>,
 }))
@@ -37,8 +43,41 @@ const retry: Offer = {
   target_execution_id: null,
   propagates: false,
 }
-beforeEach(() => mutate.mockReset())
+beforeEach(() => {
+  mutate.mockReset()
+  relations.subtasks = []
+})
 describe('WorkflowExceptionPanel offers', () => {
+  it('hides interactive launch on a coordination root with a workflow exception', () => {
+    relations.subtasks = [{ id: 'subtask' }]
+    render(<WorkflowExceptionPanel task={{ ...task([retry]), status: 'in_progress' }} />)
+    expect(screen.queryByRole('button', { name: 'Open interactive' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Retry Review' })).toBeTruthy()
+  })
+  it('hides interactive launch while the root waits on its subtasks before relations load', () => {
+    const root = { ...task([]), status: 'in_progress' }
+    root.condition = {
+      kind: 'parked',
+      primary: { kind: 'children', root_id: root.id, remaining: ['subtask'] },
+      additional: [],
+      resume: { kind: 'reconcile' },
+      since: null,
+      details: root.condition.details,
+    }
+    render(<WorkflowExceptionPanel task={root} />)
+    expect(screen.queryByRole('button', { name: 'Open interactive' })).toBeNull()
+  })
+  it('keeps interactive launch for a subtask and a root in aggregate review', () => {
+    relations.subtasks = [{ id: 'subtask' }]
+    const view = render(<WorkflowExceptionPanel task={task([])} />)
+    expect(screen.getByRole('button', { name: 'Open interactive' })).toBeTruthy()
+    view.rerender(
+      <WorkflowExceptionPanel
+        task={{ ...task([]), parent_task_id: 'root', status: 'in_progress' }}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Open interactive' })).toBeTruthy()
+  })
   it('renders and applies the supplied offer at the Task version', () => {
     render(<WorkflowExceptionPanel task={task([retry])} />)
     fireEvent.click(screen.getByRole('button', { name: 'Retry Review' }))

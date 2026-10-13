@@ -155,6 +155,13 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
   Button. Show the full question, a 1–4000 character hint, and inline validation
   and server errors. Pending and successful submissions disable the form;
   failures preserve the answer. Resolved questions retain their text without a form.
+- Keep lead answer drafts in page state by Attention item ID. If a question leaves
+  the projection with a non-blank draft, replace its card in the questions section
+  with a quiet muted inline notice: “This question was withdrawn; your draft: …”.
+  Preserve whitespace, wrap long drafts, and offer small outline Copy draft and
+  Dismiss draft buttons. Announce the notice politely; a failed copy keeps the
+  draft and explains that it can be selected manually. Successful answers clear
+  their draft. Empty drafts leave no notice.
 - The Task sidebar names the wait “Lead question”, shows the question, and links
   to that Attention card's answer control. Loading, missing and failed projections
   have explicit text and a Mission Control link.

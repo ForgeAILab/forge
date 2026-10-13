@@ -424,21 +424,7 @@ export function outgoingWorkflowEdges(
   fromState: string,
 ): WorkflowEdge[] {
   const state = workflow.states.find((candidate) => candidate.name === fromState)
-  if (!state) {
-    // The step check is a state of the inherited subtask workflow. Read
-    // against a Project workflow (the board), it keeps the gate's own exits:
-    // accept to done, return to the worker, cancel.
-    if (fromState !== INHERITED_STEP_CHECK_STATE) return []
-    const exits: Array<[WorkflowTrigger, string]> = [
-      ['accept', 'done'],
-      ['reject', 'in_progress'],
-      // The inherited workflow's own cancellation state, not the Project's.
-      ['fail', 'cancelled'],
-    ]
-    return exits
-      .filter(([, to]) => workflow.states.some((candidate) => candidate.name === to))
-      .map(([trigger, to]) => ({ from: fromState, to, trigger }))
-  }
+  if (!state) return []
   const edges = Object.entries(state.triggers ?? {})
     .filter(
       (entry): entry is [WorkflowTrigger, NonNullable<(typeof state.triggers)[WorkflowTrigger]>] =>
@@ -466,10 +452,13 @@ export function workflowTriggerTargets(workflow: WorkflowDefinition, fromState: 
   return outgoingWorkflowEdges(workflow, fromState).map((edge) => edge.to)
 }
 
-export function getValidDropColumns(workflow: WorkflowDefinition, fromState: string): string[] {
+export function getValidDropColumns(
+  workflow: WorkflowDefinition,
+  fromState: string,
+  columns: BoardColumn[] = deriveColumns(workflow),
+): string[] {
   const userAgentTargets = workflowTriggerTargets(workflow, fromState)
 
-  const columns = deriveColumns(workflow)
   const result = new Set<string>()
   for (const target of userAgentTargets) {
     const col = columns.find((c) => c.states.includes(target))

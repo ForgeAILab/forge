@@ -3,7 +3,10 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Review, Task, Offer } from '@/types/generated'
 import { TaskReviewTab } from './TaskReviewTab'
 
-vi.mock('@/api/hooks', () => ({ useTaskAction: () => ({ mutate: vi.fn(), isPending: false }) }))
+vi.mock('@/api/hooks', () => ({
+  useTaskAction: () => ({ mutate: vi.fn(), isPending: false }),
+  useTaskRelationsQuery: () => ({ data: { subtasks: [] } }),
+}))
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a href="#review">{children}</a>,
