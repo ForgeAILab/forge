@@ -480,9 +480,14 @@ impl TaskDispatcher {
                     let settled = receipt["execution_id"] == e.id
                         && receipt["state"] == t.status
                         && receipt["state_entry_token"].as_str() == entry.map(|e| e.id.as_str());
+                    // A lead run that ended by asking the owner a question
+                    // has nothing to settle: its completion is not an Accept
+                    // (`lead.request_input`), and once the answer cleared the
+                    // wait the lead is dispatched again.
                     if e.status == ExecutionStatus::Completed
                         && !settled
                         && config_version == Some(project.version)
+                        && metadata["lead_input_execution_id"] != e.id
                     {
                         f.terminal_execution = Some(e.id.clone());
                     }
@@ -492,6 +497,7 @@ impl TaskDispatcher {
                         && !f.retry_pending
                         && metadata["last_execution_failure_execution_id"] != e.id
                         && !crate::project_environment::is_environment_pre_dispatch_failure(e)
+                        && !crate::task_service::execution::is_agent_paused_pre_dispatch_failure(e)
                         && crate::task_service::execution::should_block_task_for_failed_execution(e)
                     {
                         f.terminal_execution = Some(e.id.clone());

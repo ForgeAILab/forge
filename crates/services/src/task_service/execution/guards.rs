@@ -3,6 +3,19 @@ use super::*;
 /// The error an execution carries when its launch was deferred for free
 /// disk ([`TaskService::defer_launch_for_disk`]).
 pub(crate) const DISK_PRE_DISPATCH_ERROR_PREFIX: &str = "waiting for free disk before launch: ";
+/// Error prefix of a run that was admitted and then not launched because its
+/// Agent was paused in between. The Task's Agent wait is its recovery.
+pub(crate) const AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX: &str = "Agent paused before launch: ";
+
+/// A run ended by [`TaskService::defer_launch_for_paused_agent`]. It is not
+/// an execution failure of the Task: it takes no retry and no block.
+pub(crate) fn is_agent_paused_pre_dispatch_failure(execution: &db::Execution) -> bool {
+    execution.status == ExecutionStatus::Failed
+        && execution
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX))
+}
 
 impl TaskService {
     /// Refuse paused Projects before placement or launch side effects. The
@@ -327,8 +340,46 @@ impl TaskService {
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
-        self.fail_execution_before_dispatch_inner(execution_id, error, true)
+        self.fail_execution_before_dispatch_inner(execution_id, error, true, false)
             .await
+    }
+
+    /// A paused assigned Agent can revoke launch eligibility after admission.
+    /// The Agent wait owns recovery: the run ends auto-resumable under
+    /// [`AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX`], which keeps it out of the
+    /// Task's execution-failure handling (no retry spent, no block), and the
+    /// dispatcher parks the Task on the Agent until it is resumed.
+    pub(super) async fn defer_launch_for_paused_agent(
+        &self,
+        execution: &db::Execution,
+        error: &ServiceError,
+    ) -> Result<Option<db::Execution>> {
+        let ServiceError::ExecutionSetupRequired { requirements, .. } = error else {
+            return Ok(None);
+        };
+        if !requirements
+            .iter()
+            .any(|requirement| requirement.requirement_type == "role_assignment")
+        {
+            return Ok(None);
+        }
+        let Some(agent_id) = execution.agent_id.as_deref() else {
+            return Ok(None);
+        };
+        if !AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .is_some_and(|agent| agent.paused)
+        {
+            return Ok(None);
+        }
+        self.fail_execution_before_dispatch_inner(
+            &execution.id,
+            format!("{AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX}{error}"),
+            false,
+            true,
+        )
+        .await
+        .map(Some)
     }
 
     /// Terminalize a pre-dispatch execution while leaving its Task projection
@@ -391,7 +442,7 @@ impl TaskService {
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
-        self.fail_execution_before_dispatch_inner(execution_id, error, false)
+        self.fail_execution_before_dispatch_inner(execution_id, error, false, false)
             .await
     }
 
@@ -400,6 +451,7 @@ impl TaskService {
         execution_id: &str,
         error: String,
         block_task: bool,
+        auto_resume: bool,
     ) -> Result<db::Execution> {
         // A WorkspaceLease or optimistic-version mismatch here is the
         // in-transition dispatch race: the lease was pinned to the Task
@@ -415,12 +467,15 @@ impl TaskService {
         // So does a launch that waits for free disk: the Task's disk
         // capacity wait is its recovery.
         let disk_pre_dispatch = error.starts_with(DISK_PRE_DISPATCH_ERROR_PREFIX);
-        let resume_policy =
-            if transient_authority_race || environment_pre_dispatch || disk_pre_dispatch {
-                db::ResumePolicy::Auto
-            } else {
-                db::ResumePolicy::Manual
-            };
+        let resume_policy = if auto_resume
+            || transient_authority_race
+            || environment_pre_dispatch
+            || disk_pre_dispatch
+        {
+            db::ResumePolicy::Auto
+        } else {
+            db::ResumePolicy::Manual
+        };
         let current = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;

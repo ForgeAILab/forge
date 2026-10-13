@@ -232,6 +232,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     AttentionListResponse::export().expect("export AttentionListResponse");
     AttentionConsumerHealthResponse::export().expect("export AttentionConsumerHealthResponse");
     AttentionMutationRequest::export().expect("export AttentionMutationRequest");
+    AttentionResolveRequest::export().expect("export AttentionResolveRequest");
     AttentionSnoozeRequest::export().expect("export AttentionSnoozeRequest");
     MissionControlWorkItem::export().expect("export MissionControlWorkItem");
     MissionControlAgentHealth::export().expect("export MissionControlAgentHealth");

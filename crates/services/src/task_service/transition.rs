@@ -223,6 +223,11 @@ impl TaskService {
         {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
         }
+        // A root that left the state in which its lead asked a question no
+        // longer waits for the answer.
+        if previous_status != task.status {
+            task = super::lead::clear_lead_input_wait(&self.db, &task, None).await?;
+        }
         if should_clear_transient_error_annotation(&task, &new_status) {
             match TaskRepo::update(
                 &*self.db,

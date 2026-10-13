@@ -1625,6 +1625,225 @@ async fn a_paused_lead_agent_parks_the_step_on_that_agent_until_it_resumes() {
     );
 }
 
+/// A pause after admission must not turn the unlaunched check into a manual
+/// retry. The Agent's resume owns recovery and starts a fresh check.
+#[tokio::test]
+async fn resuming_a_lead_paused_between_check_admission_and_launch_starts_a_fresh_check() {
+    let steps = steps(&[PASS], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    // The admission has stored both the execution and its workspace grant.
+    // Pause at that boundary, before start_execution verifies the grant.
+    sqlx::query(&format!(
+        "CREATE TRIGGER pause_lead_before_launch AFTER INSERT ON workspace_lease
+         WHEN NEW.task_id='{}'
+         BEGIN UPDATE agent_identity SET paused=1, version=version+1 WHERE id='{}'; END",
+        child.id, steps.planner
+    ))
+    .execute(steps.db.pool())
+    .await
+    .unwrap();
+    until(
+        &steps,
+        "the unlaunched check failed and parked on its Agent",
+        async || {
+            let stored = condition(&steps.db, &child.id).await;
+            serde_json::from_str::<serde_json::Value>(&stored).is_ok_and(|stored| {
+                stored["primary"]["kind"] == "agent"
+                    && stored["primary"]["agent_id"] == steps.planner
+                    && stored["primary"]["status"] == "paused"
+            }) && executions(&steps.db, &child.id).await
+                == vec![("planner".into(), "failed".into())]
+        },
+    )
+    .await;
+    let failed: (String, String) =
+        sqlx::query_as("SELECT id,error FROM execution WHERE task_id=? AND role='planner'")
+            .bind(&child.id)
+            .fetch_one(steps.db.pool())
+            .await
+            .unwrap();
+    assert!(
+        failed.1.contains("execution setup required"),
+        "{}",
+        failed.1
+    );
+    assert_eq!(reload(&steps.db, &child.id).await.status, "lead_check");
+    assert_eq!(steps.replies.lock().unwrap().len(), 1, "nothing launched");
+    sqlx::query("DROP TRIGGER pause_lead_before_launch")
+        .execute(steps.db.pool())
+        .await
+        .unwrap();
+    db::AgentRepo::set_paused(&*steps.db, &steps.planner, false)
+        .await
+        .unwrap();
+    until(
+        &steps,
+        "resume starts a fresh check and accepts the step",
+        async || reload(&steps.db, &child.id).await.status == "done",
+    )
+    .await;
+    assert_eq!(
+        executions(&steps.db, &child.id).await,
+        vec![
+            ("planner".into(), "failed".into()),
+            ("planner".into(), "completed".into())
+        ]
+    );
+    let fresh: (String, Option<String>) = sqlx::query_as(
+        "SELECT id,parent_execution_id FROM execution WHERE task_id=? AND status='completed'",
+    )
+    .bind(&child.id)
+    .fetch_one(steps.db.pool())
+    .await
+    .unwrap();
+    assert_ne!(fresh.0, failed.0);
+    assert_eq!(fresh.1, None, "a fresh check rather than a resumed run");
+    assert_eq!(
+        log(&steps.db, &child.id).await,
+        vec![hop("lead_check", "done", None, false)]
+    );
+    assert_eq!(gate_spent(&steps.db, &child.id).await, 0);
+}
+
+/// Change `agent` with `set` at the moment a run of `task` has its execution
+/// row and workspace grant, before `start_execution` verifies the grant.
+async fn at_admission_before_launch(steps: &Steps, task: &str, agent: &str, set: &str) {
+    sqlx::query(&format!(
+        "CREATE TRIGGER change_agent_before_launch AFTER INSERT ON workspace_lease
+         WHEN NEW.task_id='{task}'
+         BEGIN UPDATE agent_identity SET {set}, version=version+1 WHERE id='{agent}'; END"
+    ))
+    .execute(steps.db.pool())
+    .await
+    .unwrap();
+}
+
+fn parked_on_paused(stored: &str, agent: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(stored).is_ok_and(|stored| {
+        stored["kind"] == "parked"
+            && stored["primary"]["kind"] == "agent"
+            && stored["primary"]["agent_id"] == agent
+            && stored["primary"]["status"] == "paused"
+    })
+}
+
+/// While the lead's Agent stays paused, the unlaunched check is not started
+/// again: one run, and the typed park that names the Agent, over ten passes.
+#[tokio::test]
+async fn a_lead_paused_before_launch_is_not_relaunched_while_it_stays_paused() {
+    let steps = steps(&[PASS], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    at_admission_before_launch(&steps, &child.id, &steps.planner, "paused=1").await;
+    until(&steps, "the step parks on its paused lead", async || {
+        parked_on_paused(&condition(&steps.db, &child.id).await, &steps.planner)
+            && !executions(&steps.db, &child.id).await.is_empty()
+    })
+    .await;
+    passes(&steps, 10).await;
+    assert_eq!(
+        executions(&steps.db, &child.id).await,
+        vec![("planner".into(), "failed".into())],
+        "no launch, defer, relaunch loop\n{}",
+        dump(&steps.db).await
+    );
+    assert!(
+        parked_on_paused(&condition(&steps.db, &child.id).await, &steps.planner),
+        "{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(reload(&steps.db, &child.id).await.status, "lead_check");
+    assert_eq!(steps.replies.lock().unwrap().len(), 1, "nothing launched");
+}
+
+/// The same race for a coder on a plain Task: the Task is not blocked for a
+/// person and is not relaunched while the Agent stays paused; it parks on
+/// the paused Agent by name, and the resume starts a fresh run.
+#[tokio::test]
+async fn a_coder_paused_before_launch_parks_on_the_agent_and_runs_when_it_resumes() {
+    let steps = steps(&[], None).await;
+    let task = seed_task(&steps.db, &steps.project, "plain", "todo", 1).await;
+    assign_role(
+        &steps.db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &steps.coder,
+    )
+    .await;
+    at_admission_before_launch(&steps, &task.id, &steps.coder, "paused=1").await;
+    until(&steps, "the Task parks on its paused coder", async || {
+        parked_on_paused(&condition(&steps.db, &task.id).await, &steps.coder)
+            && !executions(&steps.db, &task.id).await.is_empty()
+    })
+    .await;
+    passes(&steps, 10).await;
+    assert_eq!(
+        executions(&steps.db, &task.id).await,
+        vec![("coder".into(), "failed".into())],
+        "no launch, defer, relaunch loop\n{}",
+        dump(&steps.db).await
+    );
+    let parked = reload(&steps.db, &task.id).await;
+    assert!(
+        parked_on_paused(&condition(&steps.db, &task.id).await, &steps.coder),
+        "{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(parked.blocked_json, None, "not a block for a person");
+    assert_eq!(parked.error_annotation, None, "{}", dump(&steps.db).await);
+    sqlx::query("DROP TRIGGER change_agent_before_launch")
+        .execute(steps.db.pool())
+        .await
+        .unwrap();
+    db::AgentRepo::set_paused(&*steps.db, &steps.coder, false)
+        .await
+        .unwrap();
+    until(&steps, "the resume starts a fresh coder run", async || {
+        executions(&steps.db, &task.id)
+            .await
+            .iter()
+            .any(|(role, status)| role == "coder" && status != "failed")
+    })
+    .await;
+}
+
+/// An Agent archived (not paused) at the same boundary is not deferred: no
+/// resume will come. The run fails once, is not started again, and the
+/// archive sweep passes the step as for any removed lead.
+#[tokio::test]
+async fn a_lead_archived_before_launch_is_not_deferred_and_the_sweep_passes_the_step() {
+    let steps = steps(&[PASS], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    at_admission_before_launch(
+        &steps,
+        &child.id,
+        &steps.planner,
+        "archived_at='2026-01-01T00:00:00Z'",
+    )
+    .await;
+    until(&steps, "the unlaunched check failed", async || {
+        executions(&steps.db, &child.id).await == vec![("planner".into(), "failed".into())]
+    })
+    .await;
+    passes(&steps, 10).await;
+    assert_eq!(
+        executions(&steps.db, &child.id).await,
+        vec![("planner".into(), "failed".into())],
+        "{}",
+        dump(&steps.db).await
+    );
+    steps
+        .dispatcher
+        .task_service
+        .on_agent_deleted(&steps.planner)
+        .await
+        .expect("the lead's Agent is swept");
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &child.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(steps.replies.lock().unwrap().len(), 1, "nothing launched");
+}
+
 /// The lead's Agent is paused while its check runs: a pause starts nothing
 /// new and stops nothing, as for every other run. The check finishes and its
 /// verdict settles the step.
@@ -1987,4 +2206,66 @@ async fn a_step_check_that_writes_the_workspace_is_discarded_and_fails() {
     let moved = reload(&steps.db, &first.id).await;
     assert_ne!(moved.status, "done", "a failed check passes nothing");
     assert_eq!(executions(&steps.db, &second.id).await, Vec::new());
+}
+
+/// The manual exits the board and Task detail offer for a card in the step
+/// check (done, in_progress, cancelled) are the owner's own decision on the
+/// step, and the server takes each: the lead's running check is ended and
+/// its verdict is not applied afterwards.
+#[tokio::test]
+async fn the_owner_can_take_a_step_out_of_the_gate_by_hand() {
+    for target in ["done", "in_progress", "cancelled"] {
+        let steps = steps(&[HELD_FAIL], Some("second")).await;
+        let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+        until(&steps, "the step check runs", async || {
+            running_check(&steps.db, &first.id).await
+        })
+        .await;
+        let resting = reload(&steps.db, &first.id).await;
+        assert_eq!(resting.status, "lead_check");
+        let check: String = sqlx::query_scalar(
+            "SELECT id FROM execution WHERE task_id=? AND role='planner' AND status='running'",
+        )
+        .bind(&first.id)
+        .fetch_one(steps.db.pool())
+        .await
+        .unwrap();
+        // What REST's transition route passes for a manual change.
+        let options = crate::task_service::TransitionOptions::from((
+            resting.version,
+            Some("the owner decided".to_owned()),
+        ));
+        let moved = steps
+            .dispatcher
+            .task_service
+            .transition(&first.id, target.to_owned(), options)
+            .await;
+        assert!(moved.is_ok(), "{target}: {:?}", moved.err());
+        passes(&steps, 3).await;
+        steps.release.add_permits(8);
+        passes(&steps, 3).await;
+        // The check that ran when the owner decided is over. (Sent back to
+        // implementation, the step is worked on and checked again: that is a
+        // new check of new work.)
+        let status: String = sqlx::query_scalar("SELECT status FROM execution WHERE id=?")
+            .bind(&check)
+            .fetch_one(steps.db.pool())
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "running",
+            "{target}: the lead's check does not outlive the owner's decision"
+        );
+        let after = reload(&steps.db, &first.id).await;
+        if target != "in_progress" {
+            assert_eq!(after.status, target, "{}", dump(&steps.db).await);
+            assert!(!running_check(&steps.db, &first.id).await, "{target}");
+        }
+        // Passing or dropping the step by hand charges no return. (Sending
+        // it back is a return like the lead's own and may be charged as one.)
+        if target != "in_progress" {
+            assert_eq!(gate_spent(&steps.db, &first.id).await, 0, "{target}");
+        }
+        assert!(gate_spent(&steps.db, &first.id).await <= 1, "{target}");
+    }
 }

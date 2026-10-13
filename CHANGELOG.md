@@ -8,6 +8,35 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A root's lead can change the breakdown, recover a parked subtask, leave
+  hand-off notes and ask the owner a question.** The lead's planning run on
+  the root (not its step check on a subtask, which returns a verdict and
+  changes nothing) has five native operations, limited to its own root's
+  subtasks: `lead.read`, `lead.subtask` (create, update, cancel,
+  reorder, assign), `lead.recover`, `lead.handoff` and `lead.request_input`.
+  After a parked subtask the lead can retry or cancel it and add what replaces
+  it; after a rejected aggregate review it can add fix subtasks, and the root
+  returns to `in_progress` and to review when they are done. Roots without a
+  lead are not affected. New values that clients must tolerate:
+  `human_decision.boundary = lead_input` (a root in `planning` waiting for
+  the owner's answer to its lead's question); `authority` value `lead` on a
+  subtask's `retry`, `restart` and `cancel` offers; Attention items with
+  `recommended_action = answer_lead_input`; comment kinds `handoff` and
+  `request_input`; `task.adaptive` events with `actor_type = task_lead`; error
+  code `LEAD_OPERATION_REFUSED`. A lead cannot name itself as a worker
+  (`lead_self_assignment`), and a subtask counts as started after any run on
+  it that is not a step check. Migration `V202610130038` rebuilds
+  `task_comment` for the two comment kinds and keeps every row; the first
+  start after the upgrade copies the table once (measured: about 13 seconds
+  for 200,000 comments, 180 MB) and needs free disk of about that table's
+  size while it does.
+- **Resolving an Attention item that carries a lead's question needs an
+  answer.** `POST /api/v1/mission-control/attention/{id}/resolve` accepts an
+  optional `answer` (`AttentionResolveRequest`). It is required for an item
+  whose `recommended_action` is `answer_lead_input` and refused on every other
+  item; existing callers that send only `expected_version` are unchanged for
+  every existing item.
+
 - **A coordination root moves to `in_progress` when it has a subtask to run,
   and its subtasks run only while it is there.** A root Task with subtasks
   used to rest in `todo` while its subtasks ran. It now moves to its
@@ -2884,6 +2913,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Task comments return an optional `kind` (`progress`, `decision`,
+  `validation`, `blocker`, `handoff`, `request_input`).
+- A hand-off note of a root's lead is the first thing a subtask's next
+  implementation prompt shows, ahead of the description and ordinary comments.
+- What a lead may repeat is bounded on its root: 8 subtasks created per lead
+  run and 24 per budget window, 2 recoveries per subtask per budget window, 20
+  hand-off notes per subtask, one open question per root. A Retry with a new
+  budget on the root opens the next window.
 - **Web: the lead of a coordination root.** A root Task with subtasks shows a Lead picker (the `planner` role; native Agents only, a CLI Agent is listed disabled with the reason) beside its Default worker picker; a subtask shows its root's lead read-only and no picker for it; `lead_check` is rendered as the Lead Check gate on Task detail, in the subtask list, on the board's working column and as a manual transition source; refused assignments (`LEAD_REQUIRES_NATIVE_PROFILE`, `LEAD_ROLE_NOT_SUPPORTED`, `STEP_CHECK_ROLE_HELD_BY_ROOT`) read as plain messages; and the waits and budgets of the lead have words (waiting for the lead's plan, running subtasks, the spent re-plan budget, the `replan` and `lead_check` budget rows, the re-plan and skipped-gate transitions, a native lead refused on a daemon workspace).
 - **Merge-queue receipts have a retention period.** The hourly storage pass
   now empties the owner receipts and observations of merge attempts that
@@ -3209,6 +3246,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   validates the existing rework. If its root is still re-planning, the
   accepted Retry waits for the root and resumes afterward instead of losing
   its intent and restoring the spent-budget park with `recovery_required`.
+- Prevent normal WAL contention from timing out an accepted Task mutation, and restart an unlaunched lead check after its Agent resumes.
+- A Task write whose queued step was claimed and then abandoned no longer waits for ever: the waiter takes the step over when its lease lapses, and answers `task_busy` after 90 seconds under a live owner.
+- A run whose Agent is paused between admission and launch no longer spends an execution retry or shows a retry delay: the Task parks on the paused Agent at once and runs when the Agent is resumed.
 
 - A Task that re-enters `merging` while the attempt of its previous entry is
   still the head of the queue is admitted at the release of that head (the

@@ -76,6 +76,7 @@ pub(crate) use update::state_retired_auditor_notices;
 pub(crate) use update::RETIRED_AUDITOR_CONFIG;
 mod roles;
 pub(crate) use roles::RoleSweepEvent;
+pub(crate) mod lead;
 pub(crate) mod replan;
 mod subtask;
 mod transition;
@@ -91,6 +92,7 @@ pub use adaptive::{
 pub(crate) use common::latest_executor_execution_for_task;
 pub use create_subtasks::NewSubtaskInput;
 pub use dependencies::TaskDependencyAction;
+pub use lead::LeadRun;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };
@@ -1139,43 +1141,14 @@ impl TaskService {
         {
             return Ok(());
         }
-        let Some(worker) = self.check_worker() else {
+        if self.check_worker().is_none() {
             return Ok(());
-        };
+        }
         self.db.cancel_project_check_consumers(project_id).await?;
         loop {
             let live = self.db.live_project_check_runs(project_id).await?;
             if live.is_empty() {
                 return Ok(());
-            }
-            for (id, version, state) in &live {
-                if state != "queued" {
-                    continue;
-                }
-                // Only a queued run that still has a consumer the write
-                // above did not withdraw (one whose answer was already
-                // applied) is left here. It has spawned nothing: it is
-                // settled as cancelled at once instead of at the worker's
-                // next sweep.
-                let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
-                match db::CheckRunRepo::claim_check_run(
-                    &*self.db,
-                    id,
-                    *version,
-                    "project-deletion",
-                    &now_rfc3339(),
-                    &until,
-                )
-                .await
-                {
-                    Ok(run) => {
-                        if let Err(error) = worker.drive(run).await {
-                            tracing::warn!(run_id = %id, %error, "queued check run was not cancelled for Project deletion");
-                        }
-                    }
-                    Err(DbError::VersionConflict | DbError::NotFound) => {}
-                    Err(error) => return Err(error.into()),
-                }
             }
             if tokio::time::Instant::now() >= settle_until {
                 return Ok(());

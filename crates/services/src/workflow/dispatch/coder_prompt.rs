@@ -127,6 +127,9 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         "Task: {}\n\nImplementation objective:\nMake the requested code changes in the worktree and leave the task ready for review.\n",
         ctx.task.title
     );
+    if let Some(notes) = crate::workflow::dispatch::handoff_notes_section(ctx) {
+        user.push_str(&notes);
+    }
     if let Some(description) = ctx.task.description.as_deref() {
         user.push_str("\nDescription:\n");
         user.push_str(description);
@@ -155,9 +158,17 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         user.push('\n');
     }
 
-    if !ctx.comments.is_empty() {
+    if ctx
+        .comments
+        .iter()
+        .any(|comment| !crate::workflow::dispatch::is_handoff_note(comment))
+    {
         user.push_str("\nRecent comments:\n");
-        for comment in &ctx.comments {
+        for comment in ctx
+            .comments
+            .iter()
+            .filter(|comment| !crate::workflow::dispatch::is_handoff_note(comment))
+        {
             user.push_str("- ");
             user.push_str(&comment.author_name);
             user.push_str(": ");

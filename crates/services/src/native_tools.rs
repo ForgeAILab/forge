@@ -11,6 +11,7 @@ use forge_agent_host::PROJECT_CURRENT_STATE_OPERATION;
 mod project_proposals;
 mod registered_proposals;
 mod registered_reads;
+mod task_lead;
 mod task_proposals;
 mod task_records;
 #[cfg(test)]

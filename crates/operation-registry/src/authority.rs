@@ -87,10 +87,43 @@ pub enum Principal {
         execution_id: String,
         role: TaskRole,
         runtime_session_id: Option<String>,
+        /// The coordination root this execution leads: it is the planning
+        /// run on that root (a step check on a subtask leads nothing). Loaded
+        /// by the server from the running execution, never from a payload.
+        lead_root_id: Option<String>,
     },
     SystemComponent {
         name: String,
     },
+}
+impl Principal {
+    /// The same caller, whatever it leads at the moment.
+    fn same_caller(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::TaskAgent {
+                    identity_id,
+                    execution_id,
+                    role,
+                    runtime_session_id,
+                    lead_root_id: _,
+                },
+                Self::TaskAgent {
+                    identity_id: other_identity,
+                    execution_id: other_execution,
+                    role: other_role,
+                    runtime_session_id: other_session,
+                    lead_root_id: _,
+                },
+            ) => {
+                identity_id == other_identity
+                    && execution_id == other_execution
+                    && role == other_role
+                    && runtime_session_id == other_session
+            }
+            _ => self == other,
+        }
+    }
 }
 /// Task roles come from the running execution, never the tool payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +154,8 @@ pub enum PrincipalRule {
     TaskRecord,
     ProjectOrTask,
     TaskPlan,
+    /// A running execution that leads a coordination root.
+    TaskLead,
     OwnedMain,
     AgentAction,
     ProjectOrOwnedIdentity,
@@ -190,7 +225,7 @@ impl EffectiveAuthority {
     }
     pub fn narrowed(&self, current: &Self) -> Result<Self, AuthorityDenial> {
         if !current.active
-            || self.principal != current.principal
+            || !self.principal.same_caller(&current.principal)
             || self.scope_type != current.scope_type
             || self.scope_id != current.scope_id
             || self.binding_id != current.binding_id
@@ -198,6 +233,20 @@ impl EffectiveAuthority {
             return Err(AuthorityDenial::Revoked);
         }
         let mut authority = self.clone();
+        // Leading a root is a fact of the moment: it can be lost within a
+        // turn (the lead was removed) and is never gained in one.
+        if let (
+            Principal::TaskAgent { lead_root_id, .. },
+            Principal::TaskAgent {
+                lead_root_id: current_root,
+                ..
+            },
+        ) = (&mut authority.principal, &current.principal)
+        {
+            if lead_root_id != current_root {
+                *lead_root_id = None;
+            }
+        }
         authority.ceiling = self
             .ceiling
             .intersection(&current.ceiling)
@@ -245,6 +294,12 @@ impl EffectiveAuthority {
                     Principal::TaskAgent { execution_id, role, .. }
                     if !execution_id.is_empty() &&
                        (requirement.principal_rule() == PrincipalRule::TaskRecord || role.can_write_plan()))
+            }
+            PrincipalRule::TaskLead => {
+                self.scope_type == "task"
+                    && matches!(&self.principal,
+                    Principal::TaskAgent { execution_id, lead_root_id: Some(root), .. }
+                    if !execution_id.is_empty() && !root.is_empty())
             }
             PrincipalRule::OwnedMain => {
                 matches!(self.principal, Principal::MainAgent { .. })
@@ -505,6 +560,118 @@ mod tests {
         revoked.active = false;
         assert_eq!(admitted.narrowed(&revoked), Err(AuthorityDenial::Revoked));
     }
+    /// Narrowing an admitted turn compares the caller. Leading a root is
+    /// the one fact of a caller that may differ (and only for a Task Agent);
+    /// for every principal kind, any other difference is a revocation, as it
+    /// was before the lead existed.
+    #[test]
+    fn narrowing_revokes_on_any_other_caller_for_every_principal_kind() {
+        let task =
+            |identity: &str, execution: &str, role, session: Option<&str>, lead: Option<&str>| {
+                Principal::TaskAgent {
+                    identity_id: identity.into(),
+                    execution_id: execution.into(),
+                    role,
+                    runtime_session_id: session.map(str::to_owned),
+                    lead_root_id: lead.map(str::to_owned),
+                }
+            };
+        let kinds = [
+            (
+                Principal::InteractiveUser {
+                    user_id: "u".into(),
+                },
+                vec![Principal::InteractiveUser {
+                    user_id: "v".into(),
+                }],
+            ),
+            (
+                Principal::DelegatedUser {
+                    user_id: "u".into(),
+                },
+                vec![
+                    Principal::DelegatedUser {
+                        user_id: "v".into(),
+                    },
+                    Principal::InteractiveUser {
+                        user_id: "u".into(),
+                    },
+                ],
+            ),
+            (
+                Principal::MainAgent {
+                    identity_id: "a".into(),
+                },
+                vec![Principal::MainAgent {
+                    identity_id: "b".into(),
+                }],
+            ),
+            (
+                Principal::ProjectAgent {
+                    identity_id: "a".into(),
+                    project_id: "p".into(),
+                },
+                vec![
+                    Principal::ProjectAgent {
+                        identity_id: "b".into(),
+                        project_id: "p".into(),
+                    },
+                    Principal::ProjectAgent {
+                        identity_id: "a".into(),
+                        project_id: "q".into(),
+                    },
+                    Principal::MainAgent {
+                        identity_id: "a".into(),
+                    },
+                ],
+            ),
+            (
+                Principal::SystemComponent { name: "s".into() },
+                vec![Principal::SystemComponent { name: "t".into() }],
+            ),
+            (
+                task("a", "run", TaskRole::Planner, Some("s"), Some("root")),
+                vec![
+                    task("b", "run", TaskRole::Planner, Some("s"), Some("root")),
+                    task("a", "other-run", TaskRole::Planner, Some("s"), Some("root")),
+                    task("a", "run", TaskRole::Worker, Some("s"), Some("root")),
+                    task("a", "run", TaskRole::Planner, Some("t"), Some("root")),
+                    task("a", "run", TaskRole::Planner, None, Some("root")),
+                    Principal::ProjectAgent {
+                        identity_id: "a".into(),
+                        project_id: "p".into(),
+                    },
+                ],
+            ),
+        ];
+        for (principal, others) in kinds {
+            let mut admitted = authority(&["read_agent_chat"]);
+            admitted.principal = principal.clone();
+            let same = admitted.narrowed(&admitted).unwrap();
+            assert_eq!(same.principal, principal);
+            for other in others {
+                let mut current = admitted.clone();
+                current.principal = other.clone();
+                assert_eq!(
+                    admitted.narrowed(&current),
+                    Err(AuthorityDenial::Revoked),
+                    "{principal:?} vs {other:?}"
+                );
+            }
+        }
+        // The one tolerated difference: the same Task run, leading or not.
+        let mut leading = authority(&["read_agent_chat"]);
+        leading.principal = task("a", "run", TaskRole::Planner, Some("s"), Some("root"));
+        let mut plain = leading.clone();
+        plain.principal = task("a", "run", TaskRole::Planner, Some("s"), None);
+        for (admitted, current) in [(&leading, &plain), (&plain, &leading)] {
+            assert_eq!(
+                admitted.narrowed(current).unwrap().principal,
+                plain.principal,
+                "the fact is lost, never gained"
+            );
+        }
+    }
     #[test]
     fn reviewers_never_receive_workflow_authority() {
         assert!(!scope_permissions("task", "task_read", false, false).contains("propose_review"));
@@ -515,6 +682,7 @@ mod tests {
             execution_id: "review-exec".into(),
             role: TaskRole::Reviewer,
             runtime_session_id: None,
+            lead_root_id: None,
         };
         reviewer.scope_type = "task".into();
         for spec in crate::main_proposals::CATALOG.iter() {

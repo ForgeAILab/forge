@@ -235,6 +235,14 @@ impl TaskService {
                 .settle_step_check(&task, &execution, &workflow, current_state)
                 .await;
         }
+        // A lead run that asked the owner a question is never the planning
+        // gate's Accept: the root waits for the answer and the lead runs
+        // again with it (`lead.request_input`).
+        if crate::task_service::lead::lead_asked_input(&task, &execution.id) {
+            self.abandon_brokered_plan_authority(&task, &execution)
+                .await?;
+            return Ok(());
+        }
         let Some(target) = workflow
             .auto_transition_target(&task.status)
             .map(str::to_owned)

@@ -2806,6 +2806,48 @@ other roles a coordination root does not accept. A root on a daemon-owned
 placement accepts a lead, but the planner cannot run there and the root parks
 on the placement refusal.
 
+**Lead operations and what they add to the public surface.** A root's lead
+changes its breakdown with five native Task-scope operations (`lead.read`,
+`lead.subtask`, `lead.recover`, `lead.handoff`, `lead.request_input`; see
+`docs/architecture.md`, "Lead operations"). They have no REST route and no MCP
+tool. What REST, MCP and event consumers see of them:
+
+- `available_actions[].authority` may contain `lead` beside `owner` and
+  `project_agent`: on a subtask of a root with a lead, the `retry`, `restart`
+  and `cancel` offers name the lead while the subtask is parked on something
+  the lead decides, and `cancel` names it while the subtask has not started.
+  Offers to the owner and the Project Agent are unchanged.
+- `condition.reason.kind: "human_decision"` has a new `boundary`:
+  `lead_input`. A coordination root in `planning` shows it while its lead
+  waits for the owner's answer to a question. The root's subtasks show
+  `parent { cause: "planning" }` meanwhile.
+- The question is an Attention item: `attention_type: "human_input_required"`,
+  `recommended_action: "answer_lead_input"`, `details: { task_id, comment_id,
+  question, execution_id }`. `POST
+  /api/v1/mission-control/attention/{id}/resolve` takes `{ expected_version,
+  answer }` for it (`AttentionResolveRequest`; `answer` is 1 to 4000
+  characters, required for this item and refused, `400`, on any other item).
+  The answer is stored as a user comment on the root, the wait ends and the
+  lead runs again. Resolving the item without an answer is `400`.
+- Comments have an optional `kind`: the worklog kinds (`progress`,
+  `decision`, `validation`, `blocker`) and the two a lead writes, `handoff`
+  (a note on a subtask, put first in that subtask's next implementation
+  prompt) and `request_input` (the lead's question, on the root). Ordinary
+  comments have no `kind`.
+- A subtask the lead created, or an order the lead changed, is a
+  `task.adaptive` domain event whose `actor_type` is `task_lead` and whose
+  `actor_id` is the lead's Agent; its command receipt carries the same
+  principal.
+- `422 LEAD_OPERATION_REFUSED` (`details.refusal`: `outside_lead_subtree`,
+  `not_leading`, `wrong_target`, `subtask_started`, `lead_limit_reached`,
+  `action_not_offered`, `lead_input_pending`, `lead_self_assignment`) is the typed refusal of a lead
+  command. Native sessions receive it as a tool result; REST and MCP map it
+  for completeness and have no route that returns it today.
+- The budget rows `lead_subtasks`, `lead_subtasks_run:<execution>` and
+  `lead_recover:<subtask>` on a root bound what its lead may repeat. They are
+  not projected in `budgets`; a Retry with a new budget on the root resets
+  them with the root's other budgets.
+
 `repo_id` is not a Task field. REST and MCP Task objects, Solo Task snapshots,
 and generated clients omit it. For work that has already run, repository
 identity is read from the execution's Workspace or Workspace lease; review,

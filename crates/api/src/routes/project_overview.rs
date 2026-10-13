@@ -2285,7 +2285,8 @@ fn evidence_availability(value: &str) -> Option<&'static str> {
 fn principal_value(kind: &str, id: Option<&str>) -> Option<Value> {
     let kind = match kind {
         "user" => "user",
-        "agent" | "main_agent" | "project_agent" => "agent",
+        // `task_lead`: a coordination root's lead, an Agent acting from its run.
+        "agent" | "main_agent" | "project_agent" | "task_lead" => "agent",
         "worker" => "worker",
         "reviewer" => "reviewer",
         "service" => "service",

@@ -331,8 +331,8 @@ pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{
-    AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, NewSubtaskInput,
-    TaskDependencyAction, TaskProposalCommandResult, TaskService,
+    AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, LeadRun,
+    NewSubtaskInput, TaskDependencyAction, TaskProposalCommandResult, TaskService,
 };
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
@@ -347,6 +347,41 @@ pub use workspace_cleanup::{GcSettings, WorkspaceCleanupScheduler};
 pub use workspace_execution_lock::WorkspaceExecutionLockManager;
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
+
+/// Why a lead operation was refused. The value is the public reason code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadRefusal {
+    /// The target is not this root or one of its subtasks.
+    OutsideSubtree,
+    /// The caller's run does not lead this root (any more).
+    NotLeading,
+    /// The operation is for a subtask, or for the planning run on the root.
+    WrongTarget,
+    /// The subtask already had an implementation run.
+    SubtaskStarted,
+    /// A machine bound on what a lead may repeat is spent.
+    LimitReached,
+    /// The action is not offered to the lead on this subtask now.
+    ActionNotOffered,
+    /// The root already waits for an answer to an earlier question.
+    InputPending,
+    /// The lead named itself as a worker.
+    SelfAssignment,
+}
+impl LeadRefusal {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OutsideSubtree => "outside_lead_subtree",
+            Self::NotLeading => "not_leading",
+            Self::WrongTarget => "wrong_target",
+            Self::SubtaskStarted => "subtask_started",
+            Self::LimitReached => "lead_limit_reached",
+            Self::ActionNotOffered => "action_not_offered",
+            Self::InputPending => "lead_input_pending",
+            Self::SelfAssignment => "lead_self_assignment",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -498,6 +533,14 @@ pub enum ServiceError {
         task_id: String,
         root_task_id: String,
         role: String,
+    },
+
+    /// A lead operation the server refuses: the typed reason is `refusal`,
+    /// the sentence says what the lead may do instead.
+    #[error("{message}")]
+    LeadOperationRefused {
+        refusal: LeadRefusal,
+        message: String,
     },
 
     #[error("workspace reset required for task {task_id}: {reason}")]

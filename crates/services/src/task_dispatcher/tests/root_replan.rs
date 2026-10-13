@@ -7,11 +7,11 @@ use super::*;
 const PLANNER: &str = crate::workflow::default_roles::PLANNER;
 const CODER: &str = crate::workflow::default_roles::CODER;
 
-async fn spent(lead: &Lead, task: &str, key: &str) -> i64 {
+pub(super) async fn spent(lead: &Lead, task: &str, key: &str) -> i64 {
     db::budget::spent(lead.db.pool(), task, key).await.unwrap()
 }
 
-async fn log(lead: &Lead, task: &str) -> Vec<(String, String, Option<String>)> {
+pub(super) async fn log(lead: &Lead, task: &str) -> Vec<(String, String, Option<String>)> {
     sqlx::query_as(
         "SELECT from_state, to_state, bridge_kind FROM transition_log WHERE task_id=? ORDER BY created_at, rowid",
     )
@@ -23,7 +23,7 @@ async fn log(lead: &Lead, task: &str) -> Vec<(String, String, Option<String>)> {
 
 /// A coordination root in aggregate review whose only subtask is done, with
 /// a review that failed (on its checks) longer ago than the recovery grace.
-async fn root_with_failed_review(lead: &Lead, with_planner: bool) -> Task {
+pub(super) async fn root_with_failed_review(lead: &Lead, with_planner: bool) -> Task {
     let root = seed_task(&lead.db, &lead.project, "root", "review", 1).await;
     let child = seed_subtask(&lead.db, &root, "child", "done", 0).await;
     seed_completed_coder_execution(&lead.db, &child.id).await;
@@ -275,7 +275,7 @@ fn replan_exhausted(task: &Task) -> bool {
 
 /// An implementing root with a lead and two subtasks; the first one has run
 /// out of retries and is parked for a decision.
-async fn root_with_parked_child(lead: &Lead, with_planner: bool) -> (Task, Task, Task) {
+pub(super) async fn root_with_parked_child(lead: &Lead, with_planner: bool) -> (Task, Task, Task) {
     let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
     let child = seed_subtask(&lead.db, &root, "first step", "in_progress", 0).await;
     let later = seed_subtask(&lead.db, &root, "second step", "todo", 1).await;
@@ -287,7 +287,7 @@ async fn root_with_parked_child(lead: &Lead, with_planner: bool) -> (Task, Task,
     (reload(&lead.db, &root.id).await, child, later)
 }
 
-async fn park_child(lead: &Lead, child: &Task, message: &str) -> Task {
+pub(super) async fn park_child(lead: &Lead, child: &Task, message: &str) -> Task {
     let current = reload(&lead.db, &child.id).await;
     let at = now_rfc3339();
     TaskRepo::update(
@@ -513,6 +513,40 @@ async fn a_spent_replan_budget_parks_the_root_with_a_typed_park_and_an_exit() {
     passes(&lead, 3).await;
     assert_eq!(reload(&lead.db, &root.id).await.version, blocked.version);
 
+    // The owner is told: the park is an open Attention item of the root.
+    let attention = crate::AttentionService::new(Arc::clone(&lead.db));
+    while attention.project_once(100).await.unwrap().processed_events > 0 {}
+    let items: Vec<(String, String)> = sqlx::query_as(
+        "SELECT attention_type, recommended_action FROM attention_projection WHERE status = 'open'
+         AND attention_type != 'delivery_followup'
+         AND (scope_id = ?1 OR json_extract(details_json, '$.entity_id') = ?1
+              OR json_extract(details_json, '$.task_id') = ?1)",
+    )
+    .bind(&root.id)
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !items.is_empty(),
+        "a root parked on its spent re-plan budget raises Attention"
+    );
+    // What the lead may repeat was spent in this window too.
+    let mut tx = lead.db.pool().begin().await.unwrap();
+    db::budget::charge(
+        &mut tx,
+        &root.id,
+        db::budget::LEAD_SUBTASKS_KEY,
+        db::budget::LEAD_SUBTASKS_LIMIT,
+        "created-earlier",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        spent(&lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await,
+        1
+    );
+
     // The exit: the owner's retry with a fresh budget lets the lead plan.
     let service = &lead.dispatcher.task_service;
     let offers = service.test_action_values(&root.id).await.unwrap();
@@ -542,6 +576,11 @@ async fn a_spent_replan_budget_parks_the_root_with_a_typed_park_and_an_exit() {
     )
     .await;
     assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    assert_eq!(
+        spent(&lead, &root.id, db::budget::LEAD_SUBTASKS_KEY).await,
+        0,
+        "the new window is the lead's bounds' new window too"
+    );
 }
 
 /// A crash between the charge and the planning entry leaves a receipt and

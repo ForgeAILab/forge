@@ -18,6 +18,12 @@ pub const STEP_CHECK_STATE: &str = "lead_check";
 /// (its lead) and never by a row of the subtask.
 pub const STEP_CHECK_ROLE: &str = "planner";
 
+/// The principal type a command receipt and its event carry when a
+/// coordination root's lead issued the command from its run. It is not the
+/// bound Project Agent (`agent`): its authority is the running execution
+/// (the receipt's correlation id) and the root's own row of the lead's role.
+pub const TASK_LEAD_PRINCIPAL: &str = "task_lead";
+
 /// Whether `status` is a state of the inherited subtask workflow.
 pub fn is_state(status: &str) -> bool {
     STATES.contains(&status)

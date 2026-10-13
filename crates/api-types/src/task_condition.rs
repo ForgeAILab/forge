@@ -233,6 +233,9 @@ pub enum TaskCondition {
 #[ts(export)]
 pub enum HumanBoundary {
     PlanReview,
+    /// A coordination root's lead asked a question; answering the Attention
+    /// item (`recommended_action: answer_lead_input`) ends the wait.
+    LeadInput,
     ExternalMerge,
     Legacy,
 }
