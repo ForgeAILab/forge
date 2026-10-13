@@ -3,6 +3,75 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Drive the accepted mutation only after another writer has taken SQLite's
+/// write lock, so lock contention outlasts the Task queue's response ceiling.
+struct ContendedMutationExecutor {
+    db: Arc<db::SqliteDb>,
+    ready: Arc<tokio::sync::Barrier>,
+    locked: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl db::task_writer::TaskStepExecutor for ContendedMutationExecutor {
+    async fn drive_inline(&self, task_id: &str) -> db::Result<()> {
+        use db::TaskStepRepo;
+        self.ready.wait().await;
+        self.locked.notified().await;
+        let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let step = self
+            .db
+            .claim_step("contended-writer", Some(task_id), &until)
+            .await?
+            .expect("the mutation is ready");
+        db::task_writer::in_task_step(step.clone(), self.db.execute_task_mutation(&step)).await?;
+        self.db.release_step(&step.id, "contended-writer").await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_index_read_and_contended_mutation_do_not_surface_task_busy() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = file_db(&directory.path().join("contended.db")).await;
+    project(&db, "p").await;
+    let index = UsageLedgerIndex::new(db.clone());
+    index.operations().await.unwrap();
+    let ready = Arc::new(tokio::sync::Barrier::new(2));
+    let locked = Arc::new(tokio::sync::Notify::new());
+    let executor: Arc<dyn db::task_writer::TaskStepExecutor> =
+        Arc::new(ContendedMutationExecutor {
+            db: db.clone(),
+            ready: ready.clone(),
+            locked: locked.clone(),
+        });
+    db.set_task_step_executor(Arc::downgrade(&executor));
+    let writer_db = db.clone();
+    let blocker = tokio::spawn(async move {
+        ready.wait().await;
+        let mut tx = db::begin_immediate(writer_db.pool()).await.unwrap();
+        sqlx::query("UPDATE project SET name='writer' WHERE id='p'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // WAL observation still succeeds while a second writer is waiting.
+        assert_eq!(
+            index
+                .operations()
+                .await
+                .unwrap()
+                .counts
+                .task_execution_count,
+            0
+        );
+        locked.notify_one();
+        tokio::time::sleep(Duration::from_millis(5_250)).await;
+        tx.commit().await.unwrap();
+    });
+    let result =
+        TaskRepo::set_entry_barrier(&*db, "task-p", 1, Some("{}".into()), &db::now_rfc3339()).await;
+    blocker.await.unwrap();
+    result.expect("normal WAL read/write contention must not surface TaskBusy");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_readers_and_writer_on_file_db() {
     let directory = tempfile::tempdir().unwrap();

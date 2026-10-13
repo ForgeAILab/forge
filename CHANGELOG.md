@@ -3242,6 +3242,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Prevent normal WAL contention from timing out an accepted Task mutation, and restart an unlaunched lead check after its Agent resumes.
+- A Task write whose queued step was claimed and then abandoned no longer waits for ever: the waiter takes the step over when its lease lapses, and answers `task_busy` after 90 seconds under a live owner.
+- A run whose Agent is paused between admission and launch no longer spends an execution retry or shows a retry delay: the Task parks on the paused Agent at once and runs when the Agent is resumed.
+
 - A Task that re-enters `merging` while the attempt of its previous entry is
   still the head of the queue is admitted at the release of that head (the
   driver signals it) instead of at the admission's next 100 ms look.

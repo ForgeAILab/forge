@@ -267,6 +267,23 @@ impl TaskMutationReply {
     }
 }
 
+/// Longest wait on an accepted mutation that is claimed and does not settle:
+/// one step lease (after which a lost claimer's step is taken over) plus
+/// SQLite's lock timeout for the take-over's own write.
+const CLAIMED_MUTATION_WAIT: Duration = Duration::from_secs(if cfg!(test) { 4 } else { 90 });
+/// How often a waiter looks again at a claimed step whose lease has lapsed
+/// and that could not be taken over yet.
+const LAPSED_CLAIM_POLL: Duration = Duration::from_millis(250);
+
+/// Time left on a step lease; `None` once it has lapsed.
+fn lease_remaining(lease_until: &str) -> Option<Duration> {
+    let until = chrono::DateTime::parse_from_rfc3339(lease_until).ok()?;
+    (until.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .to_std()
+        .ok()
+        .filter(|left| !left.is_zero())
+}
+
 pub fn lease_deadline() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
 }
@@ -538,30 +555,68 @@ impl SqliteDb {
 
     async fn wait_task_mutation<T: DeserializeOwned>(&self, task_id: &str, id: &str) -> Result<T> {
         let notify = self.domain_event_notify();
-        let wait = async {
-            loop {
-                let changed = notify.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                let step = self
-                    .task_steps(task_id)
-                    .await?
-                    .into_iter()
-                    .find(|s| s.id == id)
-                    .ok_or(DbError::NotFound)?;
-                if let Some(reply) = step.result_json.filter(|_| {
-                    (step.status == "done" || step.status == "failed") && step.lease_until.is_none()
-                }) {
-                    let reply: TaskMutationReply =
-                        serde_json::from_str(&reply).map_err(|e| DbError::Check(e.to_string()))?;
-                    return reply.decode();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // Set when this mutation is first seen claimed.
+        let mut claimed_until = None;
+        loop {
+            let changed = notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let step = self
+                .task_steps(task_id)
+                .await?
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or(DbError::NotFound)?;
+            // How long the step's lease still holds the Task's queue.
+            let lease = step.lease_until.as_deref().and_then(lease_remaining);
+            // A settled step answers when its claimer has released it, or
+            // when the lease of a claimer that never did has lapsed.
+            if let Some(reply) = step
+                .result_json
+                .filter(|_| (step.status == "done" || step.status == "failed") && lease.is_none())
+            {
+                let reply: TaskMutationReply =
+                    serde_json::from_str(&reply).map_err(|e| DbError::Check(e.to_string()))?;
+                return reply.decode();
+            }
+            if !matches!(
+                step.status.as_str(),
+                "pending" | "claimed" | "done" | "failed"
+            ) {
+                return Err(DbError::VersionConflict);
+            }
+            let now = tokio::time::Instant::now();
+            // Like command waiters, the queue deadline bounds only the
+            // predecessor wait: a mutation that owns the lease is not
+            // answered `task_busy` while its persistence waits for SQLite's
+            // write lock. A command waiter learns of a lost claimer from its
+            // reply channel; a mutation has none, so the lease is its bound.
+            let wake = if step.status == "pending" {
+                if now >= deadline {
+                    return Err(DbError::TaskBusy {
+                        pending_steps: self.pending_steps(task_id).await?,
+                        retry_after_ms: 250,
+                    });
                 }
-                if !matches!(
-                    step.status.as_str(),
-                    "pending" | "claimed" | "done" | "failed"
-                ) {
-                    return Err(DbError::VersionConflict);
+                deadline
+            } else {
+                let ceiling = *claimed_until.get_or_insert(now + CLAIMED_MUTATION_WAIT);
+                if now >= ceiling {
+                    return Err(DbError::TaskBusy {
+                        pending_steps: self.pending_steps(task_id).await?,
+                        retry_after_ms: 250,
+                    });
                 }
+                // A notification is not the only way out: the claimer may
+                // have stopped without one. Look again when the lease lapses.
+                ceiling.min(now + lease.unwrap_or(LAPSED_CLAIM_POLL))
+            };
+            // Drive a pending head, and take over a claimed step whose lease
+            // has lapsed (its claimer stopped between claim and release).
+            // The claim is not cancelled at the queue deadline: SQLite's
+            // lock timeout bounds it.
+            if step.status == "pending" || (step.status == "claimed" && lease.is_none()) {
                 let executor = self
                     .task_step_executor
                     .lock()
@@ -575,15 +630,10 @@ impl SqliteDb {
                     // An engine head remains owned by the installed worker.
                     self.drive_mutation_head(task_id).await?;
                 }
-                changed.await;
             }
-        };
-        match tokio::time::timeout(Duration::from_secs(5), wait).await {
-            Ok(result) => result,
-            Err(_) => Err(DbError::TaskBusy {
-                pending_steps: self.pending_steps(task_id).await?,
-                retry_after_ms: 250,
-            }),
+            let _ = tokio::time::timeout_at(wake, changed).await;
+            // Re-read even at the deadline: the head may now be claimed or
+            // committed, without another notification having arrived yet.
         }
     }
 
@@ -1030,6 +1080,191 @@ mod tests {
                 .as_deref(),
             Some("blocked")
         );
+    }
+    /// How a test claimer treats the accepted mutation it claims.
+    #[derive(Clone, Copy)]
+    enum Claimer {
+        /// Claims with a one-second lease and stops before it runs the step
+        /// (a claimer cancelled or panicked between claim and settlement).
+        /// A later claim runs the step.
+        AbandonsFirstClaim,
+        /// Settles the step but never releases it (stopped between the
+        /// settlement commit and the release).
+        NeverReleases,
+        /// Holds the claim as a live owner and never settles it (a step
+        /// blocked for as long as the process lives).
+        NeverSettles,
+    }
+    struct TestClaimer {
+        db: SqliteDb,
+        mode: Claimer,
+        claims: std::sync::atomic::AtomicUsize,
+        held: std::sync::Mutex<Vec<crate::task_step::TaskStepActivity>>,
+    }
+    #[async_trait]
+    impl TaskStepExecutor for TestClaimer {
+        async fn drive_inline(&self, task_id: &str) -> Result<()> {
+            let short = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+            let lease = match self.mode {
+                Claimer::NeverSettles => lease_deadline(),
+                _ => short,
+            };
+            let Some(step) = self.db.claim_step("claimer", Some(task_id), &lease).await? else {
+                return Ok(());
+            };
+            let claim = self.claims.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                Claimer::AbandonsFirstClaim if claim == 0 => {}
+                Claimer::AbandonsFirstClaim => {
+                    in_task_step(step.clone(), self.db.execute_task_mutation(&step)).await?;
+                    self.db.release_step(&step.id, "claimer").await?;
+                }
+                Claimer::NeverReleases => {
+                    in_task_step(step.clone(), self.db.execute_task_mutation(&step)).await?;
+                }
+                Claimer::NeverSettles => {
+                    self.held
+                        .lock()
+                        .unwrap()
+                        .push(self.db.hold_task_step(&step));
+                }
+            }
+            Ok(())
+        }
+    }
+    /// The accepted mutation's wait under a claimer of `mode`, bounded by
+    /// the test so a hang is a failure and not a stuck suite.
+    async fn mutation_under(mode: Claimer) -> (SqliteDb, Arc<TestClaimer>, Result<crate::Task>) {
+        let db = fixture().await;
+        let claimer = Arc::new(TestClaimer {
+            db: db.clone(),
+            mode,
+            claims: Default::default(),
+            held: Default::default(),
+        });
+        let executor: Arc<dyn TaskStepExecutor> = claimer.clone();
+        db.set_task_step_executor(Arc::downgrade(&executor));
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            TaskRepo::set_entry_barrier(&db, "t", 1, Some("blocked".into()), &crate::now_rfc3339()),
+        )
+        .await
+        .expect("an accepted mutation's wait is bounded: it never hangs on a claimed step");
+        (db, claimer, result)
+    }
+    async fn barrier(db: &SqliteDb) -> Option<String> {
+        TaskRepo::get_by_id(db, "t", false)
+            .await
+            .unwrap()
+            .unwrap()
+            .entry_barrier_json
+    }
+    /// A claimer that stops between its claim and the settlement leaves the
+    /// step `claimed` with nobody to settle or announce it. The waiter takes
+    /// the step over when the lease has lapsed, instead of waiting for a
+    /// notification that never comes.
+    #[tokio::test]
+    async fn claimed_mutation_abandoned_by_its_claimer_is_reclaimed_when_the_lease_lapses() {
+        let (db, claimer, result) = mutation_under(Claimer::AbandonsFirstClaim).await;
+        result.expect("the reclaimed mutation applies");
+        assert_eq!(claimer.claims.load(Ordering::SeqCst), 2, "one reclaim");
+        assert_eq!(barrier(&db).await.as_deref(), Some("blocked"));
+    }
+    /// A settled step whose release was lost answers once its lease has
+    /// lapsed: the lease no longer holds the Task's queue.
+    #[tokio::test]
+    async fn settled_mutation_whose_release_was_lost_answers_when_the_lease_lapses() {
+        let (db, _claimer, result) = mutation_under(Claimer::NeverReleases).await;
+        result.expect("the settled mutation's answer is returned");
+        assert_eq!(barrier(&db).await.as_deref(), Some("blocked"));
+    }
+    /// A claimed step that a live owner never settles (a deadlock) ends the
+    /// wait with the typed busy answer; the accepted mutation stays queued.
+    #[tokio::test]
+    async fn claimed_mutation_that_never_settles_ends_in_task_busy() {
+        let (db, claimer, result) = mutation_under(Claimer::NeverSettles).await;
+        assert!(
+            matches!(
+                result,
+                Err(DbError::TaskBusy {
+                    pending_steps: 1,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(claimer.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(barrier(&db).await, None);
+        let steps = db.task_steps("t").await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].status, "claimed", "the mutation is retained");
+    }
+    /// A caller that goes away while it waits (a dropped HTTP request) leaves
+    /// its accepted mutation queued or running, never claimed without a
+    /// runner: the next write of the Task drives it and both apply.
+    #[tokio::test]
+    async fn dropped_waiter_does_not_wedge_the_next_write_of_its_task() {
+        let db = fixture().await;
+        for round in 0..20u64 {
+            let version = TaskRepo::get_by_id(&db, "t", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .version;
+            let waiter = tokio::spawn({
+                let db = db.clone();
+                let value = format!("dropped-{round}");
+                async move {
+                    TaskRepo::set_entry_barrier(
+                        &db,
+                        "t",
+                        version,
+                        Some(value),
+                        &crate::now_rfc3339(),
+                    )
+                    .await
+                }
+            });
+            // Drop the waiter at a different point of its wait each round.
+            tokio::time::sleep(Duration::from_micros(round * 150)).await;
+            waiter.abort();
+            let _ = waiter.await;
+            let next = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+                    match TaskRepo::set_entry_barrier(
+                        &db,
+                        "t",
+                        task.version,
+                        Some(format!("next-{round}")),
+                        &crate::now_rfc3339(),
+                    )
+                    .await
+                    {
+                        Ok(task) => break task,
+                        // The dropped write landed between the read and the
+                        // enqueue.
+                        Err(DbError::VersionConflict) => {}
+                        Err(error) => panic!("round {round}: {error:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("the next write is not held by a dropped waiter");
+            assert_eq!(
+                next.entry_barrier_json,
+                Some(format!("next-{round}")),
+                "round {round}"
+            );
+            assert!(
+                db.task_steps("t")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|step| !matches!(step.status.as_str(), "pending" | "claimed")),
+                "round {round}: nothing is left queued"
+            );
+        }
     }
     #[tokio::test]
     async fn accepted_annotation_rebases_after_fast_metadata_write_without_cas_retry() {
