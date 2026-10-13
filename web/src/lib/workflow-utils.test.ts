@@ -143,6 +143,33 @@ describe('deriveColumns', () => {
     expect(outgoingWorkflowEdges(workflow, 'some_unknown_state')).toEqual([])
   })
 
+  it("cancels a lead_check card to the inherited workflow's own state, whatever the Project names its own", () => {
+    // `inherited_subtask_workflow`: the gate's Fail goes to `cancelled`. A
+    // Project that cancels to another state has no such exit for a subtask
+    // in the step check, and the server refuses the move.
+    const workflow: WorkflowDefinition = {
+      roles: [],
+      states: [
+        state('todo', 'initial', 'Todo', 'Todo'),
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        state('done', 'terminal', 'Done', 'Done'),
+        state('abandoned', 'terminal', 'Abandoned', 'Abandoned'),
+      ],
+      configuration: [],
+      cancellation_state: 'abandoned',
+    }
+    expect(workflowTriggerTargets(workflow, 'lead_check')).toEqual(['done', 'in_progress'])
+    const withBoth = {
+      ...workflow,
+      states: [...workflow.states, state('cancelled', 'terminal', 'Cancelled', 'Cancelled')],
+    }
+    expect(workflowTriggerTargets(withBoth, 'lead_check')).toEqual([
+      'done',
+      'in_progress',
+      'cancelled',
+    ])
+  })
+
   it('keeps the state where the workflow itself defines lead_check', () => {
     const workflow: WorkflowDefinition = {
       roles: [],

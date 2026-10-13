@@ -21,7 +21,7 @@ import { TaskCommentsPanel } from '@/components/task-detail/task-comments-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
-import { roleAssignmentErrorMessage } from '@/lib/root-lead'
+import { roleAssignmentErrorMessage, rootHoldsRuns } from '@/lib/root-lead'
 import { productTerm } from '@/lib/i18n'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
@@ -103,7 +103,9 @@ export function TaskDetailPage({
   const rootRelationsQuery = useTaskRelationsQuery(
     taskId,
     task?.project_id ?? '',
-    initialTab === 'overview' && Boolean(task) && task?.parent_task_id == null,
+    (initialTab === 'overview' || initialTab === 'diff') &&
+      Boolean(task) &&
+      task?.parent_task_id == null,
   )
   const coderAssignment = task?.role_assignments.find(
     (assignment) => assignment.role_name === 'coder',
@@ -140,7 +142,11 @@ export function TaskDetailPage({
     'merge_failed',
     'review',
   ])
-  const canLaunch = Boolean(task && launchableStatuses.has(task.status))
+  // A root that coordinates subtasks takes no run launched by hand.
+  const runsHeldForSubtasks = Boolean(
+    task && rootHoldsRuns(task, (rootRelationsQuery.data?.subtasks.length ?? 0) > 0),
+  )
+  const canLaunch = Boolean(task && launchableStatuses.has(task.status)) && !runsHeldForSubtasks
   const hasAgents = (agentsQuery.data?.items ?? []).length > 0
 
   const hiddenTransitions = ['merging', effectiveWorkflow?.cancellation_state ?? 'cancelled']
@@ -424,8 +430,9 @@ export function TaskDetailPage({
               onStatusChange={onStatusChange}
               onAssigneeChange={onAssigneeChange}
               onDuplicateTask={onDuplicateTask}
-              onOpenLaunchDialog={() => setLaunchDialogOpen(true)}
-
+              onOpenLaunchDialog={
+                runsHeldForSubtasks ? undefined : () => setLaunchDialogOpen(true)
+              }
               onSaveRetryBudgets={onSaveRetryBudgets}
             />
           )}

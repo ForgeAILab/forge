@@ -15,6 +15,19 @@ import {
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import type { Offer, TaskAction, TaskActionsResponse } from '@/types/generated'
+import type { ActionAuthority } from '@/types/generated/bindings/ActionAuthority'
+
+const authorityLabels: Record<ActionAuthority, string> = {
+  owner: 'Owner',
+  assigned_agent: 'Assigned Agent',
+  project_agent: 'Project Agent',
+  reviewer: 'Reviewer',
+  lead: 'Lead',
+}
+
+function offerAudience(offer: Offer): string {
+  return `Who can act: ${offer.authority.map((authority) => authorityLabels[authority]).join(', ')}`
+}
 
 function values(action: TaskAction): Record<string, unknown> {
   return { ...action }
@@ -145,6 +158,7 @@ export function TaskActionButtons({
   offers: Offer[]
   transformOffers?: (offers: Offer[]) => Offer[]
 }) {
+  const id = useId()
   const command = useTaskAction()
   const [refreshed, setRefreshed] = useState<TaskActionsResponse | null>(null)
   const [selected, setSelected] = useState<Offer | null>(null)
@@ -220,16 +234,25 @@ export function TaskActionButtons({
         </p>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        {current.available_actions.map((offer) => (
-          <Button
-            key={`${offer.action.verb}:${offer.reason}`}
-            size="sm"
-            variant="outline"
-            disabled={command.isPending}
-            onClick={() => choose(offer)}
-          >
-            {offer.label}
-          </Button>
+        {current.available_actions.map((offer, index) => (
+          <div key={`${offer.action.verb}:${offer.reason}`} className="space-y-1">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={command.isPending}
+              onClick={() => choose(offer)}
+              aria-describedby={
+                offer.authority.includes('lead') ? `${id}-audience-${index}` : undefined
+              }
+            >
+              {offer.label}
+            </Button>
+            {offer.authority.includes('lead') ? (
+              <p id={`${id}-audience-${index}`} className="text-xs text-muted-foreground">
+                {offerAudience(offer)}
+              </p>
+            ) : null}
+          </div>
         ))}
       </div>
       <Dialog
@@ -243,6 +266,9 @@ export function TaskActionButtons({
             <DialogTitle>{selected?.label}</DialogTitle>
             <DialogDescription>Review the action and provide any required input.</DialogDescription>
           </DialogHeader>
+          {selected?.authority.includes('lead') ? (
+            <p className="mb-4 text-xs text-muted-foreground">{offerAudience(selected)}</p>
+          ) : null}
           {selected && action ? (
             <TaskActionFields offer={selected} action={action} onChange={setAction} />
           ) : null}

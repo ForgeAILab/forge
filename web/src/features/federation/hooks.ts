@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '@/api/client'
+import type { AttentionResolveRequest } from '@/types/generated/bindings/AttentionResolveRequest'
 import {
   cancelAgentSessionTurn,
   cancelProviderAuthorization,
@@ -603,10 +604,24 @@ export function useMissionControlQuery() {
 export function useResolveAttentionMutation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, expectedVersion }: { id: string; expectedVersion: number }) =>
-      resolveAttentionItem(id, expectedVersion),
+    mutationFn: ({
+      id,
+      expectedVersion,
+      answer,
+    }: {
+      id: string
+      expectedVersion: number
+      answer?: AttentionResolveRequest['answer']
+    }) => resolveAttentionItem(id, expectedVersion, answer),
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
+    },
+    onSuccess: (item, input) => {
+      if (input.answer === undefined) return
+      const taskId = item.scope_type === 'task' ? item.scope_id : item.details.task_id
+      if (typeof taskId === 'string') {
+        void queryClient.invalidateQueries({ queryKey: ['tasks', taskId] })
+      }
     },
   })
 }

@@ -8,6 +8,11 @@ const retryTurn = vi.hoisted(() => vi.fn())
 const resolveAttention = vi.hoisted(() => vi.fn())
 const answerEscalation = vi.hoisted(() => vi.fn())
 const turnState = vi.hoisted(() => ({ live: false }))
+vi.mock('@/api/hooks', () => ({
+  useAgentQuery: (id?: string) => ({
+    data: id === 'lead-agent' ? { name: 'Ada Lead' } : undefined,
+  }),
+}))
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children, ...props }: { children: React.ReactNode } & Record<string, unknown>) => (
@@ -324,6 +329,56 @@ describe('MissionControlPage', () => {
     } finally {
       data.needs_attention = previous
       resolveAttention.mockClear()
+    }
+  })
+
+  it('routes lead-question Resolve through the answer form instead of a version-only request', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        id: 'lead-input-1',
+        category: 'human_input_required',
+        version: 8,
+        recommended_action: 'answer_lead_input',
+        details: { question: 'Which parser?' },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.getAllByRole('button', { name: 'Resolve' })).toHaveLength(1)
+      expect(screen.getByText('Which parser?').closest('article')?.id).toBe(
+        'attention-lead-input-1',
+      )
+      fireEvent.change(screen.getByLabelText('Answer the lead'), { target: { value: 'Parser A' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+      expect(resolveAttention).toHaveBeenCalledExactlyOnceWith(
+        { id: 'lead-input-1', expectedVersion: 8, answer: 'Parser A' },
+        expect.anything(),
+      )
+    } finally {
+      data.needs_attention = previous
+      resolveAttention.mockClear()
+    }
+  })
+
+  it('names the lead Agent on a coordination activity receipt, with ID fallback', () => {
+    const previous = data.coordination_activity
+    data.coordination_activity = [
+      { ...previous[0], actor_type: 'task_lead', actor_id: 'lead-agent' },
+      {
+        ...previous[0],
+        id: 'other-lead-receipt',
+        actor_type: 'task_lead',
+        actor_id: 'unavailable-lead',
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.getByText('Lead · Ada Lead')).toBeTruthy()
+      expect(screen.getByText('Lead · unavailable-lead')).toBeTruthy()
+    } finally {
+      data.coordination_activity = previous
     }
   })
 

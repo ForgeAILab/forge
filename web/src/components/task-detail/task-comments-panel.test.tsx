@@ -18,7 +18,18 @@ const originalRevokeObjectURL = URL.revokeObjectURL
 let objectUrlCounter = 0
 
 const task = {
-  condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
+  condition: {
+    kind: 'clear',
+    details: {
+      failure_kind: null,
+      diagnostic: null,
+      interruption: null,
+      failed: false,
+      blocked: false,
+      human_wait: false,
+      entry_wait: false,
+    },
+  },
   id: 'task-1',
   project_id: 'project-1',
   title: 'Task',
@@ -87,7 +98,12 @@ function mockMediaFetch(items: TaskMediaResponse[]) {
   })
 }
 
-function renderPanel(content: string, mediaItems: TaskMediaResponse[] = []) {
+function renderPanel(
+  content: string,
+  mediaItems: TaskMediaResponse[] = [],
+  entry: Partial<Comment> = {},
+  taskOverrides: Partial<Task> = {},
+) {
   mockMediaFetch(mediaItems)
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -107,8 +123,8 @@ function renderPanel(content: string, mediaItems: TaskMediaResponse[] = []) {
   const view = render(
     <QueryClientProvider client={queryClient}>
       <TaskCommentsPanel
-        task={task}
-        comments={[comment(content)]}
+        task={{ ...task, ...taskOverrides }}
+        comments={[{ ...comment(content), ...entry }]}
         commentDraft=""
         setCommentDraft={vi.fn()}
         createComment={createComment}
@@ -147,6 +163,48 @@ describe('TaskCommentsPanel', () => {
     expect(screen.getByText('Bold').closest('strong')).not.toBeNull()
     const link = screen.getByRole('link', { name: 'Forge docs' }) as HTMLAnchorElement
     expect(link.href).toBe('https://example.com/docs')
+  })
+
+  it('attributes a handoff to the lead and tells the subtask worker it is shown first', () => {
+    renderPanel(
+      'Start with **the parser**.',
+      [],
+      { kind: 'handoff', author_type: 'agent', author_name: 'Ada', author_id: 'lead-agent' },
+      { parent_task_id: 'root-1' },
+    )
+    const card = screen.getByText('Handoff').closest('div.rounded-md')!
+    expect(screen.getByText('Lead · Ada')).toBeTruthy()
+    expect(card.className).toContain('bg-muted/30')
+    expect(
+      screen.getByText(/Shown first to the worker in its next implementation run/),
+    ).toBeTruthy()
+    expect(screen.getByText('the parser').closest('strong')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull()
+  })
+
+  it('gives a lead question a distinct quiet style and keeps its Markdown', () => {
+    renderPanel('Should we use **parser A**?', [], {
+      kind: 'request_input',
+      author_type: 'agent',
+      author_name: 'lead',
+    })
+    const card = screen.getByText('Question for the owner').closest('div.rounded-md')!
+    expect(screen.getByText('Lead')).toBeTruthy()
+    expect(card.className).toContain('border-warning/30')
+    expect(card.className).toContain('bg-warning/5')
+    expect(screen.getByText('parser A').closest('strong')).toBeTruthy()
+    expect(screen.queryByText(/Shown first to the worker/)).toBeNull()
+  })
+
+  it('keeps ordinary worklog comments styled and attributed as before', () => {
+    renderPanel('Working on the parser.', [], {
+      kind: 'progress',
+      author_type: 'agent',
+      author_name: 'Worker',
+    })
+    expect(screen.getByText('Worker')).toBeTruthy()
+    expect(screen.queryByText('Handoff')).toBeNull()
+    expect(screen.queryByText('Question for the owner')).toBeNull()
   })
 
   it('renders task-owned image previews inline', async () => {

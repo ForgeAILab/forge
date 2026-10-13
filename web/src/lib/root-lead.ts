@@ -16,10 +16,9 @@ import type {
  * implementation: the root's lead checks the step, and a root without a lead
  * skips the gate in the same step that entered it.
  *
- * Seam for the lead's operations (stage 4, not built here): the comment kinds
- * `handoff` and `request_input` belong in `task-comments-panel`, and the
- * `lead_input` human boundary belongs beside the `plan_review` wait in the
- * Task detail sidebars. Nothing in this module reads them.
+ * Lead-operation comments (`handoff`, `request_input`) are rendered in
+ * `task-comments-panel`. The `lead_input` wait in the Task sidebar links to
+ * the question's answer control in Mission Control.
  */
 
 /** The inherited subtask status between implementation and done. */
@@ -148,4 +147,24 @@ const ROLE_ASSIGNMENT_ERRORS: Record<string, string> = {
 export function roleAssignmentErrorMessage(error: unknown): string | undefined {
   const code = getApiErrorCode(error)
   return code ? ROLE_ASSIGNMENT_ERRORS[code] : undefined
+}
+
+/**
+ * Whether a root Task holds its runs for its subtasks, so no run can be
+ * launched on it by hand. A coordination root runs its lead in the planning
+ * state and its aggregate reviewer in review; the server refuses any other
+ * run (`ensure_ordered_execution_admission`). `hasSubtasks` is the subtask
+ * list when it is loaded; the root's own wait on its subtasks and its own
+ * lead say the same without it.
+ */
+export function rootHoldsRuns(
+  task: Pick<Task, 'parent_task_id' | 'status' | 'effective_lead' | 'condition'>,
+  hasSubtasks: boolean,
+): boolean {
+  if (task.parent_task_id != null || task.status === 'review') return false
+  const condition = task.condition
+  const waitsOnSubtasks =
+    condition?.kind === 'parked' &&
+    [condition.primary, ...condition.additional].some((reason) => reason.kind === 'children')
+  return hasSubtasks || waitsOnSubtasks || task.effective_lead?.source === 'own'
 }

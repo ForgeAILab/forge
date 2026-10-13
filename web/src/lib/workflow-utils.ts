@@ -432,7 +432,8 @@ export function outgoingWorkflowEdges(
     const exits: Array<[WorkflowTrigger, string]> = [
       ['accept', 'done'],
       ['reject', 'in_progress'],
-      ['fail', workflow.cancellation_state ?? 'cancelled'],
+      // The inherited workflow's own cancellation state, not the Project's.
+      ['fail', 'cancelled'],
     ]
     return exits
       .filter(([, to]) => workflow.states.some((candidate) => candidate.name === to))
