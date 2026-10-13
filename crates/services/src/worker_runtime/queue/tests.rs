@@ -9,7 +9,10 @@ use db::{EnqueueTaskStep, TaskStepRepo};
 pub(super) enum CommandPoint {
     AfterClaim,
     BeforeCommand,
+    BeforeSettle,
     BeforeReply,
+    BeforeRelease,
+    BeforeSend,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -17,6 +20,43 @@ enum CommandFault {
     Pause,
     Panic,
     Retry,
+    /// The database is busy once at the point.
+    Busy,
+    /// The claimer is slow at the point.
+    Delay,
+}
+
+/// A real SQLITE_BUSY as the worker classifies it.
+pub(super) fn busy() -> ServiceError {
+    #[derive(Debug)]
+    struct Busy;
+    impl std::fmt::Display for Busy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("database is locked")
+        }
+    }
+    impl std::error::Error for Busy {}
+    impl sqlx::error::DatabaseError for Busy {
+        fn message(&self) -> &str {
+            "database is locked"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some("5".into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    ServiceError::Db(db::DbError::Sqlx(sqlx::Error::Database(Box::new(Busy))))
 }
 
 /// A per-worker barrier: no global timing or interference between tests.
@@ -76,6 +116,19 @@ impl CommandGate {
             "injected claimer panic after claim"
         );
         self.fault == CommandFault::Retry
+    }
+    /// A fault that needs no test-side resume. True: fail busy here.
+    pub(super) async fn inject(&self, step: &TaskStep, point: CommandPoint) -> bool {
+        if step.kind != "command"
+            || point != self.point
+            || !self.first.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        if self.fault == CommandFault::Delay {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.fault == CommandFault::Busy
     }
     async fn wait(&self) {
         tokio::time::timeout(Duration::from_secs(3), self.arrived.notified())
@@ -190,6 +243,103 @@ async fn command_waiter_recovers_committed_reply_after_claimer_is_cancelled() {
         .is_empty());
 }
 
+async fn transition_under(
+    point: CommandPoint,
+    fault: CommandFault,
+    command: crate::task_service::commands::TaskCommand,
+) -> (
+    Arc<db::SqliteDb>,
+    Arc<TaskStepWorker>,
+    Result<crate::workflow::engine::TransitionResult>,
+) {
+    let (db, mut worker) = fixture().await;
+    worker.command_test_gate = Some(CommandGate::new(point, fault));
+    let worker = Arc::new(worker);
+    let answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        worker.request_command::<crate::workflow::engine::TransitionResult>("t", command),
+    )
+    .await
+    .expect("the command waiter is bounded");
+    // The inline job releases after it answers.
+    for _ in 0..200 {
+        if db.active_step_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (db, worker, answer)
+}
+
+/// The command ran and committed its effect; SQLite is busy when the step
+/// is settled. Re-queueing the step would run the command a second time.
+#[tokio::test]
+async fn command_that_ran_is_not_run_again_when_its_settlement_finds_the_database_busy() {
+    let (db, worker, answer) = transition_under(
+        CommandPoint::BeforeSettle,
+        CommandFault::Busy,
+        transition_command(),
+    )
+    .await;
+    assert_eq!(
+        answer.expect("the command's own answer").task.status,
+        "done"
+    );
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!(command.attempts, 1, "the effect is never repeated");
+    assert_eq!(command.status, "done");
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+/// The command is settled `done`; only the release of its lease finds the
+/// database busy. The caller gets the committed result, not that error.
+#[tokio::test]
+async fn committed_command_answers_its_result_when_the_release_finds_the_database_busy() {
+    let (db, _worker, answer) = transition_under(
+        CommandPoint::BeforeRelease,
+        CommandFault::Busy,
+        transition_command(),
+    )
+    .await;
+    assert_eq!(answer.expect("the committed result").task.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!((command.status.as_str(), command.attempts), ("done", 1));
+    assert_eq!(command.lease_until, None, "the release is repeated");
+}
+
+/// A waiter that reads the released step before the claimer has sent the
+/// reply must still return the command's typed error, not the stored
+/// summary of it.
+#[tokio::test]
+async fn released_command_error_keeps_its_type_when_the_waiter_reads_before_the_reply() {
+    let mut command = transition_command();
+    command.arguments["target_state"] = serde_json::json!("no_such_state");
+    let (_db, _worker, typed) = transition_under(
+        CommandPoint::BeforeSettle,
+        CommandFault::Delay,
+        command.clone(),
+    )
+    .await;
+    let typed = format!("{:?}", typed.err().expect("an unknown state is refused"));
+    let (_db, _worker, raced) =
+        transition_under(CommandPoint::BeforeSend, CommandFault::Delay, command).await;
+    assert_eq!(format!("{:?}", raced.err().expect("refused")), typed);
+}
+
 fn read_current_task_command() -> crate::task_service::commands::TaskCommand {
     crate::task_service::commands::TaskCommand {
         operation: "block_cancelled_dependencies".into(),
@@ -263,6 +413,72 @@ async fn command_waiter_dropped_while_claimed_does_not_wedge_the_next_command() 
         .lock()
         .unwrap()
         .is_empty());
+}
+
+/// A request dropped while the commit of its inline claim is in flight (an
+/// aborted HTTP request) must not leave the step claimed for a whole lease
+/// with no runner: the next command of the Task would answer `task_busy`.
+/// The waiter is polled by hand and dropped after one more poll each round,
+/// so every point where it can be suspended is covered.
+#[tokio::test]
+async fn command_waiter_dropped_at_any_await_leaves_no_claim_without_a_runner() {
+    use std::{future::Future, task::Poll};
+    let (db, worker) = fixture().await;
+    let worker = Arc::new(worker);
+    for round in 1..400usize {
+        let mut waiter =
+            Box::pin(worker.request_command::<db::Task>("t", read_current_task_command()));
+        let mut finished = false;
+        for _ in 0..round {
+            finished =
+                std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx).is_ready())).await;
+            if finished {
+                break;
+            }
+            // Let SQLite finish what the waiter asked for before the waiter
+            // is polled again or dropped.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        drop(waiter);
+        let next = tokio::time::timeout(
+            Duration::from_secs(20),
+            worker.request_command::<db::Task>("t", read_current_task_command()),
+        )
+        .await
+        .expect("the next command is bounded");
+        if let Err(error) = next {
+            let queue: Vec<_> = db
+                .task_steps("t")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|step| step.status != "done")
+                .map(|step| {
+                    format!(
+                        "{} attempts={} lease={:?} runner={}",
+                        step.status,
+                        step.attempts,
+                        step.lease_until,
+                        db.step_is_active(step)
+                    )
+                })
+                .collect();
+            panic!("round {round}: {error:?}; queue: {queue:?}");
+        }
+        assert!(
+            worker
+                .task_service
+                .task_step_replies
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "round {round}: no reply registration is left"
+        );
+        if finished {
+            return;
+        }
+    }
+    panic!("the waiter never finished");
 }
 
 #[tokio::test]

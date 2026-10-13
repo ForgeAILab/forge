@@ -3244,6 +3244,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A request aborted while it claimed its Task's queued step no longer leaves that step claimed for a whole 60-second lease with nothing running it; the next write or command of the Task used to answer `409 task_busy` (`pending_steps: 2`) until the lease lapsed. The claim, its liveness witness and its runner now belong to one background job that survives the request.
+- A Task command that ran is no longer run a second time when SQLite is busy as its step is settled, and its caller no longer gets that busy error (or the error of a failed lease release) in place of the committed result. A command's typed error is no longer flattened to a generic check error when its waiter reads the settled step just before the reply.
 - A claimed Task command no longer hangs after its claimer panics or is cancelled: waiters recover at lease expiry, return `task_busy` after 90 seconds under a live owner, and remove dropped requests' reply registrations.
 - Prevent normal WAL contention from timing out an accepted Task mutation, and restart an unlaunched lead check after its Agent resumes.
 - A Task write whose queued step was claimed and then abandoned no longer waits for ever: the waiter takes the step over when its lease lapses, and answers `task_busy` after 90 seconds under a live owner.

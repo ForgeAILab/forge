@@ -662,25 +662,43 @@ impl SqliteDb {
         if head.is_none_or(|s| s.kind != "mutation") {
             return Ok(());
         }
-        if let Some(step) = self
-            .claim_step(&crate::new_uuid_v4(), Some(task_id), &lease_deadline())
-            .await?
-        {
-            let db = self.clone();
-            let activity = db.hold_task_step(&step);
-            tokio::spawn(async move {
-                let _activity = activity;
-                let owned = step.clone();
-                let result = in_task_step(step, db.execute_task_mutation(&owned)).await;
-                if let Err(error) = result {
-                    tracing::warn!(%error,"inline Task persistence failed");
+        // The claim, its local witness and its runner belong to one spawned
+        // job, never to the waiter: a waiter dropped while the claim's commit
+        // is in flight (an aborted request) would otherwise leave the step
+        // claimed for a whole lease with nobody running it, and the next
+        // write of the Task would answer `task_busy`.
+        let db = self.clone();
+        let task_id = task_id.to_owned();
+        let (claimed, claim) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let step = match db
+                .claim_step(&crate::new_uuid_v4(), Some(&task_id), &lease_deadline())
+                .await
+            {
+                Ok(Some(step)) => step,
+                Ok(None) => {
+                    let _ = claimed.send(Ok(()));
+                    return;
                 }
-                let _ = db
-                    .release_step(&owned.id, owned.claimed_by.as_deref().unwrap_or_default())
-                    .await;
-            });
-        }
-        Ok(())
+                Err(error) => {
+                    let _ = claimed.send(Err(error));
+                    return;
+                }
+            };
+            let _activity = db.hold_task_step(&step);
+            let _ = claimed.send(Ok(()));
+            let owned = step.clone();
+            let result = in_task_step(step, db.execute_task_mutation(&owned)).await;
+            if let Err(error) = result {
+                tracing::warn!(%error,"inline Task persistence failed");
+            }
+            let _ = db
+                .release_step(&owned.id, owned.claimed_by.as_deref().unwrap_or_default())
+                .await;
+        });
+        // A job that stopped before it answered claimed nothing it still
+        // runs; the waiter's lease-bounded wait covers it.
+        claim.await.unwrap_or(Ok(()))
     }
 
     pub async fn execute_task_mutation(&self, step: &TaskStep) -> Result<()> {
@@ -1282,6 +1300,86 @@ mod tests {
                 "round {round}: nothing is left queued"
             );
         }
+    }
+    /// The CI failure "round 11: TaskBusy { pending_steps: 2 }": a waiter
+    /// dropped while the commit of its inline claim was in flight left the
+    /// step claimed for a whole lease with no runner, and the next write of
+    /// the Task answered `task_busy`. The waiter is polled by hand and
+    /// dropped after one more poll each round, so every point where it can
+    /// be suspended is covered and no round timing decides which.
+    #[tokio::test]
+    async fn waiter_dropped_at_any_await_leaves_no_claim_without_a_runner() {
+        use std::{future::Future, task::Poll};
+        let db = fixture().await;
+        for round in 1..200usize {
+            let version = TaskRepo::get_by_id(&db, "t", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .version;
+            let now = crate::now_rfc3339();
+            let mut waiter = Box::pin(TaskRepo::set_entry_barrier(
+                &db,
+                "t",
+                version,
+                Some(format!("dropped-{round}")),
+                &now,
+            ));
+            let mut finished = false;
+            for _ in 0..round {
+                finished =
+                    std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx).is_ready()))
+                        .await;
+                if finished {
+                    break;
+                }
+                // Let SQLite finish what the waiter asked for before the
+                // waiter is polled again or dropped.
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            drop(waiter);
+            let next = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+                    match TaskRepo::set_entry_barrier(
+                        &db,
+                        "t",
+                        task.version,
+                        Some(format!("next-{round}")),
+                        &crate::now_rfc3339(),
+                    )
+                    .await
+                    {
+                        Ok(task) => break task,
+                        Err(DbError::VersionConflict) => {}
+                        Err(error) => {
+                            let steps = db.task_steps("t").await.unwrap();
+                            let queue: Vec<_> = steps
+                                .iter()
+                                .filter(|step| step.status != "done")
+                                .map(|step| {
+                                    format!(
+                                        "{} attempts={} lease={:?} runner={}",
+                                        step.status,
+                                        step.attempts,
+                                        step.lease_until,
+                                        db.step_is_active(step)
+                                    )
+                                })
+                                .collect();
+                            panic!("round {round}: {error:?}; queue: {queue:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the next write is not held by a dropped waiter");
+            assert_eq!(next.entry_barrier_json, Some(format!("next-{round}")));
+            if finished {
+                return;
+            }
+        }
+        panic!("the waiter never finished");
     }
     #[tokio::test]
     async fn accepted_annotation_rebases_after_fast_metadata_write_without_cas_retry() {

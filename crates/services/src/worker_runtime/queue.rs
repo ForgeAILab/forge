@@ -329,7 +329,17 @@ impl TaskStepWorker {
                 return Err(db::DbError::VersionConflict.into());
             }
             if matches!(own.status.as_str(), "done" | "failed") && lease.is_none() {
-                if let Ok(reply) = received.try_recv() {
+                // A live claimer releases the step and then sends its typed
+                // reply. A waiter that reads the row between the two waits
+                // for that reply, briefly: the stored answer keeps an error's
+                // message but not its type.
+                if own.claimed_by.is_none() {
+                    if let Ok(Ok(reply)) =
+                        tokio::time::timeout(LAPSED_CLAIM_POLL, &mut received).await
+                    {
+                        return decode_command_reply(reply);
+                    }
+                } else if let Ok(reply) = received.try_recv() {
                     return decode_command_reply(reply);
                 }
                 // A claimer may have committed and stopped before release
@@ -403,38 +413,59 @@ impl TaskStepWorker {
         task_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let lane = sqlx::query_scalar::<_, String>("SELECT lane FROM task_step WHERE task_id=? AND status IN ('pending','claimed') ORDER BY CASE WHEN integration_started_at IS NOT NULL THEN 2 ELSE priority END DESC,seq LIMIT 1")
-                .bind(task_id).fetch_optional(self.db.pool()).await?.unwrap_or_else(||"fast".to_owned());
-            if let Some(step) = self
-                .db
-                .claim_step_lane(
-                    &db::new_uuid_v4(),
-                    Some(task_id),
-                    Some(&lane),
-                    &lease_deadline(),
-                )
-                .await?
-            {
-                let activity = self.db.hold_task_step(&step);
-                let worker = self.clone();
-                let _job = tokio::spawn(async move {
-                    let _activity = activity;
-                    #[cfg(test)]
-                    if let Some(gate) = &worker.command_test_gate {
-                        gate.pause(&worker.db, &step, tests::CommandPoint::AfterClaim)
-                            .await;
+            // The claim, its local witness and its runner belong to one
+            // spawned job, never to the waiter: a request dropped while the
+            // claim's commit is in flight would otherwise leave the step
+            // claimed for a whole lease with nobody running it, and every
+            // later command of the Task would answer `task_busy`.
+            let worker = self.clone();
+            let task_id = task_id.to_owned();
+            let (claimed, claim) = tokio::sync::oneshot::channel();
+            let _job = tokio::spawn(async move {
+                let step = match worker.claim_inline_head(&task_id).await {
+                    Ok(Some(step)) => step,
+                    Ok(None) => {
+                        let _ = claimed.send(Ok(false));
+                        return;
                     }
-                    if let Err(error) = worker.execute(step).await {
-                        tracing::warn!(%error,"inline Task step failed");
+                    Err(error) => {
+                        let _ = claimed.send(Err(error));
+                        return;
                     }
-                });
+                };
+                let _activity = worker.db.hold_task_step(&step);
+                let _ = claimed.send(Ok(true));
                 #[cfg(test)]
-                if let Some(gate) = &self.command_test_gate {
-                    gate.keep_job(_job);
+                if let Some(gate) = &worker.command_test_gate {
+                    gate.pause(&worker.db, &step, tests::CommandPoint::AfterClaim)
+                        .await;
                 }
+                if let Err(error) = worker.execute(step).await {
+                    tracing::warn!(%error,"inline Task step failed");
+                }
+            });
+            // A job that stopped before it answered holds no claim it still
+            // runs; the waiter's lease-bounded wait covers it.
+            let _claimed = claim.await.unwrap_or(Ok(false))?;
+            #[cfg(test)]
+            if let Some(gate) = self.command_test_gate.as_ref().filter(|_| _claimed) {
+                gate.keep_job(_job);
             }
             Ok(())
         })
+    }
+    async fn claim_inline_head(&self, task_id: &str) -> Result<Option<TaskStep>> {
+        let lane = sqlx::query_scalar::<_, String>("SELECT lane FROM task_step WHERE task_id=? AND status IN ('pending','claimed') ORDER BY CASE WHEN integration_started_at IS NOT NULL THEN 2 ELSE priority END DESC,seq LIMIT 1")
+            .bind(task_id).fetch_optional(self.db.pool()).await?.unwrap_or_else(||"fast".to_owned());
+        Ok(self
+            .db
+            .claim_step_lane(
+                &db::new_uuid_v4(),
+                Some(task_id),
+                Some(&lane),
+                &lease_deadline(),
+            )
+            .await?)
     }
     pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         WorkerSupervisor::new(
@@ -1181,31 +1212,81 @@ impl TaskStepWorker {
             };
             let error = result.as_ref().err().map(ToString::to_string);
             let stored = serde_json::json!({"result":result.as_ref().ok(),"error":error.as_ref().map(|message|serde_json::json!({"code":"check","message":message}))});
-            let mut tx = db::begin_immediate(self.db.pool()).await?;
-            self.db
-                .finish_step_in_tx(
-                    &mut tx,
-                    step,
-                    if result.is_ok() { "done" } else { "failed" },
-                    error.as_deref(),
-                )
-                .await?;
-            sqlx::query("UPDATE task_step SET result_json=? WHERE id=? AND claimed_by=?")
-                .bind(stored.to_string())
-                .bind(&step.id)
-                .bind(&step.claimed_by)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
+            // The command has run. A busy database here must not send the
+            // step back through `retry_step`: the next attempt would run the
+            // command a second time. Wait the lock out; if it never clears,
+            // the caller still gets the command's own answer and the step
+            // is failed, not re-queued.
+            let status = if result.is_ok() { "done" } else { "failed" };
+            let stored = stored.to_string();
+            let settled = wait_out_busy(|| async {
+                #[cfg(test)]
+                if let Some(gate) = &self.command_test_gate {
+                    if gate.inject(step, tests::CommandPoint::BeforeSettle).await {
+                        return Err(tests::busy());
+                    }
+                }
+                let mut tx = db::begin_immediate(self.db.pool()).await?;
+                self.db
+                    .finish_step_in_tx(&mut tx, step, status, error.as_deref())
+                    .await?;
+                sqlx::query("UPDATE task_step SET result_json=? WHERE id=? AND claimed_by=?")
+                    .bind(&stored)
+                    .bind(&step.id)
+                    .bind(&step.claimed_by)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                Ok(())
+            })
+            .await;
+            match settled {
+                Ok(()) => {}
+                Err(unsettled) if database_busy(&unsettled) => {
+                    tracing::error!(step_id=%step.id,error=%unsettled,"Task command ran but its result could not be recorded; the step is failed, not run again");
+                    if let Some(reply) = self
+                        .task_service
+                        .task_step_replies
+                        .lock()
+                        .expect("Task step replies")
+                        .remove(&step.id)
+                    {
+                        let _ = reply.send(result);
+                    }
+                    return Err(ServiceError::invalid_operation(format!(
+                        "Task command ran but its result could not be recorded: {unsettled}"
+                    )));
+                }
+                Err(unsettled) => return Err(unsettled),
+            }
             #[cfg(test)]
             if let Some(gate) = &self.command_test_gate {
                 gate.pause(&self.db, step, tests::CommandPoint::BeforeReply)
                     .await;
             }
-            self.db
-                .release_step(&step.id, step.claimed_by.as_deref().expect("command owner"))
-                .await?;
+            // The result is durable: a release that fails here is repeated
+            // by `execute_attempt`, and never replaces the caller's answer.
+            let released = async {
+                #[cfg(test)]
+                if let Some(gate) = &self.command_test_gate {
+                    if gate.inject(step, tests::CommandPoint::BeforeRelease).await {
+                        return Err(tests::busy());
+                    }
+                }
+                self.db
+                    .release_step(&step.id, step.claimed_by.as_deref().expect("command owner"))
+                    .await
+                    .map_err(ServiceError::from)
+            }
+            .await;
+            if let Err(error) = &released {
+                tracing::warn!(step_id=%step.id,%error,"settled Task command was not released yet");
+            }
             self.db.domain_event_notify().notify_waiters();
+            #[cfg(test)]
+            if let Some(gate) = &self.command_test_gate {
+                gate.inject(step, tests::CommandPoint::BeforeSend).await;
+            }
             if let Some(reply) = self
                 .task_service
                 .task_step_replies
