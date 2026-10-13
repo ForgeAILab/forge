@@ -10,7 +10,6 @@ use db::{
     TransitionLog, TransitionLogRepo, UpdateTask,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent, TASK_MOVED_EVENT};
-use sqlx::{query, Row};
 use tracing::Instrument;
 
 use self::{
@@ -352,9 +351,9 @@ pub(crate) async fn wake_upgraded_daemon_tasks(
     db: &db::SqliteDb,
     daemon_ids: &[String],
 ) -> crate::Result<()> {
-    let task_ids = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM task WHERE deleted_at IS NULL AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.daemon_upgrade_refusal.code') END = ?"
-    ).bind(api_types::DAEMON_UPGRADE_REQUIRED).fetch_all(db.pool()).await?;
+    let task_ids = db
+        .daemon_upgrade_refused_task_ids(api_types::DAEMON_UPGRADE_REQUIRED)
+        .await?;
     for task_id in task_ids {
         let matches = |marker: &serde_json::Value| {
             marker["code"] == api_types::DAEMON_UPGRADE_REQUIRED
@@ -921,15 +920,10 @@ impl WorkflowExecution<'_> {
         }
         // The retry is the same entry run again: a review re-run keeps who
         // asked for it, and with that its budget exemption.
-        let entered: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, bridge_kind, bridge_payload FROM transition_log WHERE task_id = ? AND to_state = ? AND status_epoch = (SELECT status_epoch FROM task WHERE id = ?) ORDER BY created_at, rowid LIMIT 1",
-        )
-        .bind(task_id)
-        .bind(&target_state)
-        .bind(task_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let entered: Option<(String, Option<String>, Option<String>)> = self
+            .db
+            .task_current_entry_first_transition_bridge(task_id, &target_state)
+            .await?;
         let bridge = entered
             .and_then(|(id, kind, payload)| {
                 db::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref()).ok()
@@ -1566,20 +1560,15 @@ impl WorkflowExecution<'_> {
                 } else {
                     let mut transaction = db::begin_immediate(self.db.pool()).await?;
         self.db.fence_current_step_in_tx(&mut transaction).await?;
-                    let version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id=?")
-                        .bind(&task_id).fetch_one(&mut *transaction).await?;
+                    let version: i64 = self.db.workflow_transition_task_version_in_tx(&mut transaction, &task_id).await?;
                     if let Some(authority) = authority.as_ref() {
-                        let project_authority = query(
-                            "SELECT version, workflow_definition FROM project WHERE id = ?",
-                        )
-                        .bind(&task.project_id)
-                        .fetch_optional(&mut *transaction)
+                        let project_authority = self.db.workflow_transition_project_authority_in_tx(&mut transaction, &task.project_id)
                         .await?
                         .ok_or(db::DbError::NotFound)?;
                         let current_project_version: i64 =
-                            project_authority.try_get("version")?;
+                            project_authority.version()?;
                         let current_workflow_definition: String =
-                            project_authority.try_get("workflow_definition")?;
+                            project_authority.workflow_definition()?;
                         if current_project_version != authority.project_version
                             || current_workflow_definition != authority.workflow_definition
                         {
@@ -1593,21 +1582,7 @@ impl WorkflowExecution<'_> {
                     // A workflow self-transition (planning -> planning on a
                     // gate reject) is also a new entry: bump it here. A step
                     // fences on status plus epoch, never on the version.
-                    let update = query(
-                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END,\n                     status_epoch = status_epoch + (status = ?)\n                 WHERE id = ? AND deleted_at IS NULL AND ((? = 0 AND version = ?) OR (? = 1 AND status = ? AND status_epoch = ?))",
-                    )
-                    .bind(&target_state)
-                    .bind(&updated_at)
-                    .bind(entry_barrier_json.as_deref())
-                    .bind(clear_review_passed_at)
-                    .bind(&target_state)
-                    .bind(&task_id)
-                    .bind(step.is_some())
-                    .bind(version)
-                    .bind(step.is_some())
-                    .bind(step.as_ref().map(|s| s.expected_status.as_str()))
-                    .bind(step.as_ref().map(|s| s.expected_epoch))
-                    .execute(&mut *transaction)
+                    let update = self.db.write_workflow_transition_state_in_tx(&mut transaction, db::WriteWorkflowTransitionStateInput { target_state: &target_state, updated_at: &updated_at, entry_barrier_json: entry_barrier_json.as_deref(), clear_review_passed_at, task_id: &task_id, has_step: step.is_some(), version, expected_status: step.as_ref().map(|s| s.expected_status.as_str()), expected_epoch: step.as_ref().map(|s| s.expected_epoch) })
                     .await?;
 
                     if update.rows_affected() != 1 {
@@ -1624,20 +1599,17 @@ impl WorkflowExecution<'_> {
                         && db::cancel_task_integration_in_tx(&mut transaction, &task_id, &updated_at).await?
                             == db::TaskIntegrationCancel::Protected
                     {
-                        let pending_steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE task_id=? AND status IN ('pending','claimed')")
-                            .bind(&task_id).fetch_one(&mut *transaction).await?;
+                        let pending_steps: i64 = self.db.workflow_transition_pending_steps_in_tx(&mut transaction, &task_id).await?;
                         return Err(db::DbError::TaskBusy { pending_steps, retry_after_ms: 250 }.into());
                     }
                     if let Some(marker)=&deferred_marker {
-                        sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch',json(?)) WHERE id=?")
-                            .bind(marker).bind(&task_id).execute(&mut *transaction).await?;
+                        self.db.set_workflow_deferred_dispatch_in_tx(&mut transaction, marker, &task_id).await?;
                     } else {
-                        sqlx::query("UPDATE task SET metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch') ELSE metadata_json END WHERE id=?").bind(&task_id).execute(&mut *transaction).await?;
+                        self.db.clear_workflow_deferred_dispatch_in_tx(&mut transaction, &task_id).await?;
                     }
                     // Carry paused integration through the status hop. Only a
                     // durable successful merge consumes this marker.
-                    sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.paused_integration.state',?) WHERE id=? AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.paused_integration.state') END=?")
-                        .bind(&target_state).bind(&task_id).bind(&current_status).execute(&mut *transaction).await?;
+                    self.db.carry_paused_integration_state_in_tx(&mut transaction, &target_state, &task_id, &current_status).await?;
                     if reopens_visible_work {
                         ProjectRepo::increment_project_work_epoch(
                             &*self.db,
@@ -1660,26 +1632,7 @@ impl WorkflowExecution<'_> {
                         updated_at.clone(),
                         workflow_snapshot,
                     );
-                    sqlx::query(
-                        "INSERT INTO transition_log (
-                            id, task_id, from_state, to_state, trigger_name, triggered_by,
-                            trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch
-                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
-                    )
-                    .bind(&transition_log_id)
-                    .bind(&task.id)
-                    .bind(&current_status)
-                    .bind(&target_state)
-                    .bind(trigger_name.as_deref())
-                    .bind(actor.display())
-                    .bind(&reason)
-                    .bind(serde_json::to_string(&hook_results).map_err(|e| ServiceError::invalid_operation(e.to_string()))?)
-                    .bind(if rejection { 1_i64 } else { 0_i64 })
-                    .bind(&updated_at)
-                    .bind(bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
-                    .bind(bridge.bridge_payload.as_ref().map(ToString::to_string))
-                    .bind(&task.id)
-                    .execute(&mut *transaction)
+                    self.db.insert_workflow_transition_log_in_tx(&mut transaction, db::InsertWorkflowTransitionLogInput { id: &transition_log_id, task_id: &task.id, from_state: &current_status, to_state: &target_state, trigger_name: trigger_name.as_deref(), triggered_by: actor.display(), trigger_reason: &reason, hook_results_json: serde_json::to_string(&hook_results).map_err(|e| ServiceError::invalid_operation(e.to_string()))?, rejection: if rejection { 1_i64 } else { 0_i64 }, created_at: &updated_at, bridge_kind: bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str), bridge_payload: bridge.bridge_payload.as_ref().map(ToString::to_string) })
                     .await?;
                     if entry_barrier_json.is_none() {
                         db::budget::fresh_entry(&mut transaction, &task.id, &transition_log_id).await?;
@@ -1862,8 +1815,10 @@ impl WorkflowExecution<'_> {
                     && entry.triggered_by == crate::worker_runtime::queue::cascade_actor().display()
             })
             .count();
-        let head: Option<String> = sqlx::query_scalar("SELECT h.head_sha FROM workspace_expected_head h JOIN workspace_placement p ON p.id=h.placement_id AND p.generation=h.generation WHERE p.task_id=? ORDER BY h.recorded_at DESC LIMIT 1")
-            .bind(&task.id).fetch_optional(self.db.pool()).await?;
+        let head: Option<String> = self
+            .db
+            .task_latest_expected_workspace_head(&task.id)
+            .await?;
         let evidence = Some(format!("{review_evidence:?}|{rebases}|{head:?}"));
         let workflow_ref = if authority.is_some() {
             crate::worker_runtime::queue::WorkflowReference::Project
