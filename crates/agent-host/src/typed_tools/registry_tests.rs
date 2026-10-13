@@ -150,6 +150,7 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                                 execution_id: "exec".into(),
                                 role: operation_registry::authority::TaskRole::Planner,
                                 runtime_session_id: None,
+                                lead_root_id: None,
                             },
                             _ => Principal::SystemComponent {
                                 name: "system".into(),
@@ -774,6 +775,7 @@ fn task_role_advertisement_matches_evaluator_and_never_grants_workflow_commands(
                         execution_id: "exec".into(),
                         role,
                         runtime_session_id: Some("session".into()),
+                        lead_root_id: None,
                     },
                     scope_type: "task".into(),
                     scope_id: "task".into(),

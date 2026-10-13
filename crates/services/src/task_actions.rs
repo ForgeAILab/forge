@@ -13,7 +13,19 @@ pub struct ActionCaller {
     pub assigned_agent: bool,
     pub project_agent: bool,
     pub reviewer: bool,
+    /// The caller is the lead of this subtask's coordination root, and the
+    /// subtask is parked on something the lead decides
+    /// (`task_hierarchy::subtask_decision_park`). It then sees the recovery
+    /// offers the Project Agent sees on this subtask, limited to
+    /// [`LEAD_RECOVERY_VERBS`].
+    pub lead: bool,
+    /// The Task is such a subtask, whoever asks: its recovery offers name
+    /// the lead in their audience.
+    pub lead_decides: bool,
 }
+
+/// The recovery actions a lead may apply to a parked subtask of its root.
+pub const LEAD_RECOVERY_VERBS: [&str; 3] = ["retry", "restart", "cancel"];
 
 impl ActionCaller {
     pub fn owner() -> Self {
@@ -26,8 +38,9 @@ impl ActionCaller {
         authorities.iter().any(|authority| match authority {
             ActionAuthority::Owner => self.owner,
             ActionAuthority::AssignedAgent => self.assigned_agent,
-            ActionAuthority::ProjectAgent => self.project_agent,
+            ActionAuthority::ProjectAgent => self.project_agent || self.lead,
             ActionAuthority::Reviewer => self.reviewer,
+            ActionAuthority::Lead => self.lead,
         })
     }
 }
@@ -1299,7 +1312,28 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         );
     }
     append_owner_advance(snapshot, &mut offers);
+    lead_audience(&snapshot.caller, &mut offers);
     offers
+}
+
+/// The lead's part of the offers of a subtask parked on something its root's
+/// lead decides: the recovery verbs the Project Agent is offered there also
+/// name the lead, and a caller that is only the lead is offered nothing else.
+fn lead_audience(caller: &ActionCaller, offers: &mut Vec<Offer>) {
+    if !caller.lead_decides {
+        return;
+    }
+    for offer in offers.iter_mut() {
+        if LEAD_RECOVERY_VERBS.contains(&offer.action.verb())
+            && offer.authority.contains(&ActionAuthority::ProjectAgent)
+            && !offer.authority.contains(&ActionAuthority::Lead)
+        {
+            offer.authority.push(ActionAuthority::Lead);
+        }
+    }
+    if caller.lead && !caller.owner && !caller.project_agent {
+        offers.retain(|offer| offer.authority.contains(&ActionAuthority::Lead));
+    }
 }
 
 fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
@@ -1415,6 +1449,8 @@ pub fn caller_for(
                 assignment.role_name == "reviewer"
                     && assignment.assignee_id.as_ref() == Some(agent_id)
             }),
+            lead: false,
+            lead_decides: false,
         },
         Actor::System { .. } => ActionCaller::default(),
     }
@@ -1460,7 +1496,13 @@ pub async fn load_snapshot(
         .await?
         .filter(|binding| binding.state == "active")
         .and_then(|binding| binding.identity_id);
-    let caller = caller_for(actor, project_agent.as_deref(), &assignments);
+    let mut caller = caller_for(actor, project_agent.as_deref(), &assignments);
+    // A subtask parked on something its root's lead decides: its recovery
+    // offers name the lead, and the lead itself is offered them.
+    if let Some(lead) = crate::task_hierarchy::lead_deciding_subtask_park(db, &task).await? {
+        caller.lead_decides = true;
+        caller.lead = matches!(actor, Actor::Agent { agent_id, .. } if *agent_id == lead);
+    }
     let role = workflow
         .states
         .iter()

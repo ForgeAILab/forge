@@ -122,10 +122,19 @@ pub enum UnknownConditionProblem {
     /// A BLOB or invalid UTF-8 value in a legacy TEXT column.
     NonText,
 }
+/// `awaiting_human_reason` of a root that waits for the owner's answer to
+/// its lead's question.
+pub const LEAD_INPUT_WAIT: &str = "lead_input";
+/// Comment kinds (`task_comment.worklog_kind`) only a root's lead writes.
+pub const COMMENT_KIND_HANDOFF: &str = "handoff";
+pub const COMMENT_KIND_REQUEST_INPUT: &str = "request_input";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanBoundary {
     PlanReview,
+    /// A coordination root's lead asked the owner a question and the root
+    /// waits in its planning state for the answer.
+    LeadInput,
     ExternalMerge,
     Legacy,
 }
@@ -1026,6 +1035,7 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
             ParkReason::HumanDecision {
                 boundary: match text(m, "awaiting_human_reason").as_deref() {
                     Some("plan_review") => HumanBoundary::PlanReview,
+                    Some(crate::LEAD_INPUT_WAIT) => HumanBoundary::LeadInput,
                     Some("pull_request_merge") => HumanBoundary::ExternalMerge,
                     _ => HumanBoundary::Legacy,
                 },

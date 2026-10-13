@@ -28,6 +28,7 @@ impl ActionCaller {
             ActionAuthority::AssignedAgent => self.assigned_agent,
             ActionAuthority::ProjectAgent => self.project_agent,
             ActionAuthority::Reviewer => self.reviewer,
+            ActionAuthority::Lead => false,
         })
     }
 }

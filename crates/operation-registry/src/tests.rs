@@ -16,6 +16,7 @@ fn catalog_is_complete_unique_and_deterministic() {
             + hand_proposals::IDS.len()
             + task_records::IDS.len()
             + task_proposals::IDS.len()
+            + task_lead::IDS.len()
     );
     assert_eq!(
         ids.len(),
@@ -1237,6 +1238,174 @@ impl task_proposals::TaskProposalContext<&'static str> for RecordingContext {
     async fn task_adaptive(&self, _: task_proposals::Adaptive) -> Result<Value, &'static str> {
         self.record("task.adaptive")
     }
+}
+
+#[async_trait::async_trait]
+impl task_lead::TaskLeadContext<&'static str> for RecordingContext {
+    async fn lead_read(&self, _: task_lead::Read) -> Result<Value, &'static str> {
+        self.record("lead.read")
+    }
+    async fn lead_subtask(&self, _: task_lead::Subtask) -> Result<Value, &'static str> {
+        self.record("lead.subtask")
+    }
+    async fn lead_recover(&self, _: task_lead::Recover) -> Result<Value, &'static str> {
+        self.record("lead.recover")
+    }
+    async fn lead_handoff(&self, _: task_lead::Handoff) -> Result<Value, &'static str> {
+        self.record("lead.handoff")
+    }
+    async fn lead_request_input(&self, _: task_lead::RequestInput) -> Result<Value, &'static str> {
+        self.record("lead.request_input")
+    }
+}
+
+/// Every lead operation: one closed contract, dispatched to its own handler,
+/// and no field that names a root, a parent, an actor or a scope.
+#[tokio::test]
+async fn lead_contracts_are_closed_and_dispatch_every_variant() {
+    let catalog = proposal_catalog();
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    let inputs = [
+        ("lead.read", json!({})),
+        ("lead.read", json!({"task_id":"child"})),
+        ("lead.subtask", json!({"action":"create","title":"Fix the build"})),
+        (
+            "lead.subtask",
+            json!({"action":"update","task_id":"child","version":1,"description":"narrower"}),
+        ),
+        (
+            "lead.subtask",
+            json!({"action":"cancel","task_id":"child","version":1,"reason":"superseded"}),
+        ),
+        ("lead.subtask", json!({"action":"reorder","ordered_task_ids":["b","a"]})),
+        ("lead.subtask", json!({"action":"assign","agent_id":"agent"})),
+        ("lead.subtask", json!({"action":"assign","task_id":"child","agent_id":"agent"})),
+        (
+            "lead.recover",
+            json!({"task_id":"child","action":{"verb":"retry"},"version":2}),
+        ),
+        ("lead.handoff", json!({"task_id":"child","note":"start from the parser"})),
+        ("lead.request_input", json!({"question":"Which database?"})),
+    ];
+    for (id, input) in &inputs {
+        let spec = catalog.lookup(id).unwrap();
+        assert!(
+            jsonschema::validator_for(&spec.canonical_schema())
+                .unwrap()
+                .is_valid(input),
+            "{id} {input}"
+        );
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            *id
+        );
+        for field in [
+            "parent_task_id",
+            "root_id",
+            "lead_root_id",
+            "project_id",
+            "execution_id",
+            "identity_id",
+            "scope",
+        ] {
+            let mut forged = input.clone();
+            forged[field] = json!("forged");
+            assert!(spec.normalize_arguments(&forged).is_err(), "{id} {field}");
+        }
+    }
+    assert_eq!(context.0.lock().unwrap().len(), inputs.len());
+    for (id, invalid) in [
+        ("lead.subtask", json!({"action":"create"})),
+        ("lead.subtask", json!({"action":"update","task_id":"child"})),
+        ("lead.subtask", json!({"action":"merge","task_id":"child"})),
+        ("lead.recover", json!({"task_id":"child","action":{"verb":"retry"}})),
+        ("lead.handoff", json!({"task_id":"child"})),
+        ("lead.request_input", json!({})),
+    ] {
+        assert!(
+            catalog.lookup(id).unwrap().dispatch(&context, invalid.clone()).await.is_err(),
+            "{id} {invalid}"
+        );
+    }
+}
+
+/// The lead operations are admitted by the principal fact alone: a planner
+/// run that leads nothing is not offered one of them, whatever it may read;
+/// a lead keeps them only while the server still says it leads that root.
+#[test]
+fn only_a_running_lead_is_admitted_to_the_lead_operations() {
+    use authority::{AuthorityFacts, EffectiveAuthority, Principal, TaskRole};
+    let authority = |role, execution: &str, lead: Option<&str>| {
+        EffectiveAuthority::resolve(AuthorityFacts {
+            principal: Principal::TaskAgent {
+                identity_id: "agent".into(),
+                execution_id: execution.into(),
+                role,
+                runtime_session_id: Some("session".into()),
+                lead_root_id: lead.map(str::to_owned),
+            },
+            scope_type: "task".into(),
+            scope_id: "root".into(),
+            profile_id: "profile".into(),
+            layers: vec![authority::scope_permissions("task", "task_read", false, false)],
+            binding_id: None,
+            setup_required: false,
+            active: true,
+        })
+    };
+    let lead = authority(TaskRole::Planner, "run", Some("root"));
+    let planner = authority(TaskRole::Planner, "run", None);
+    for id in task_lead::IDS {
+        let spec = PROPOSAL_CATALOG.lookup(id).unwrap();
+        assert!(lead.evaluate(spec).is_ok(), "{id}");
+        assert_eq!(
+            planner.evaluate(spec),
+            Err(authority::AuthorityDenial::PrincipalMismatch),
+            "{id}"
+        );
+        // No execution to attribute the effect to.
+        assert!(authority(TaskRole::Planner, "", Some("root")).evaluate(spec).is_err());
+        for role in [TaskRole::Worker, TaskRole::Reviewer] {
+            assert!(authority(role, "run", None).evaluate(spec).is_err(), "{id}");
+        }
+        // Without the Task read permission nothing is offered.
+        let mut bare = lead.clone();
+        bare.ceiling.clear();
+        assert!(bare.evaluate(spec).is_err(), "{id}");
+        // Project and Main principals never hold them.
+        let mut project = lead.clone();
+        project.principal = Principal::ProjectAgent {
+            identity_id: "agent".into(),
+            project_id: "project".into(),
+        };
+        project.scope_type = "project".into();
+        assert!(project.evaluate(spec).is_err(), "{id}");
+    }
+    // The widening this stage adds is exactly these cells and nothing else:
+    // every other registered operation answers a lead as it answers a planner.
+    for spec in READ_CATALOG.iter().chain(PROPOSAL_CATALOG.iter()) {
+        if !task_lead::IDS.contains(&spec.id) {
+            assert_eq!(lead.evaluate(spec), planner.evaluate(spec), "{}", spec.id);
+        }
+    }
+    // Losing the lead within a turn revokes the lead operations and nothing
+    // else; gaining it never widens an admitted turn.
+    let lost = lead.narrowed(&planner).unwrap();
+    let gained = planner.narrowed(&lead).unwrap();
+    let moved = lead.narrowed(&authority(TaskRole::Planner, "run", Some("other"))).unwrap();
+    for narrowed in [&lost, &gained, &moved] {
+        for id in task_lead::IDS {
+            assert!(narrowed.evaluate(PROPOSAL_CATALOG.lookup(id).unwrap()).is_err());
+        }
+        assert!(narrowed
+            .evaluate(PROPOSAL_CATALOG.lookup("task.worklog").unwrap())
+            .is_ok());
+    }
+    assert!(lead.narrowed(&lead).unwrap().evaluate(PROPOSAL_CATALOG.lookup("lead.read").unwrap()).is_ok());
+    assert_eq!(
+        lead.narrowed(&authority(TaskRole::Planner, "next-run", Some("root"))),
+        Err(authority::AuthorityDenial::Revoked)
+    );
 }
 
 #[tokio::test]

@@ -87,10 +87,43 @@ pub enum Principal {
         execution_id: String,
         role: TaskRole,
         runtime_session_id: Option<String>,
+        /// The coordination root this execution leads: its planning run on
+        /// the root, or its step check on one of the root's subtasks. Loaded
+        /// by the server from the running execution, never from a payload.
+        lead_root_id: Option<String>,
     },
     SystemComponent {
         name: String,
     },
+}
+impl Principal {
+    /// The same caller, whatever it leads at the moment.
+    fn same_caller(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::TaskAgent {
+                    identity_id,
+                    execution_id,
+                    role,
+                    runtime_session_id,
+                    lead_root_id: _,
+                },
+                Self::TaskAgent {
+                    identity_id: other_identity,
+                    execution_id: other_execution,
+                    role: other_role,
+                    runtime_session_id: other_session,
+                    lead_root_id: _,
+                },
+            ) => {
+                identity_id == other_identity
+                    && execution_id == other_execution
+                    && role == other_role
+                    && runtime_session_id == other_session
+            }
+            _ => self == other,
+        }
+    }
 }
 /// Task roles come from the running execution, never the tool payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +154,8 @@ pub enum PrincipalRule {
     TaskRecord,
     ProjectOrTask,
     TaskPlan,
+    /// A running execution that leads a coordination root.
+    TaskLead,
     OwnedMain,
     AgentAction,
     ProjectOrOwnedIdentity,
@@ -190,7 +225,7 @@ impl EffectiveAuthority {
     }
     pub fn narrowed(&self, current: &Self) -> Result<Self, AuthorityDenial> {
         if !current.active
-            || self.principal != current.principal
+            || !self.principal.same_caller(&current.principal)
             || self.scope_type != current.scope_type
             || self.scope_id != current.scope_id
             || self.binding_id != current.binding_id
@@ -198,6 +233,20 @@ impl EffectiveAuthority {
             return Err(AuthorityDenial::Revoked);
         }
         let mut authority = self.clone();
+        // Leading a root is a fact of the moment: it can be lost within a
+        // turn (the lead was removed) and is never gained in one.
+        if let (
+            Principal::TaskAgent { lead_root_id, .. },
+            Principal::TaskAgent {
+                lead_root_id: current_root,
+                ..
+            },
+        ) = (&mut authority.principal, &current.principal)
+        {
+            if lead_root_id != current_root {
+                *lead_root_id = None;
+            }
+        }
         authority.ceiling = self
             .ceiling
             .intersection(&current.ceiling)
@@ -245,6 +294,12 @@ impl EffectiveAuthority {
                     Principal::TaskAgent { execution_id, role, .. }
                     if !execution_id.is_empty() &&
                        (requirement.principal_rule() == PrincipalRule::TaskRecord || role.can_write_plan()))
+            }
+            PrincipalRule::TaskLead => {
+                self.scope_type == "task"
+                    && matches!(&self.principal,
+                    Principal::TaskAgent { execution_id, lead_root_id: Some(root), .. }
+                    if !execution_id.is_empty() && !root.is_empty())
             }
             PrincipalRule::OwnedMain => {
                 matches!(self.principal, Principal::MainAgent { .. })
@@ -515,6 +570,7 @@ mod tests {
             execution_id: "review-exec".into(),
             role: TaskRole::Reviewer,
             runtime_session_id: None,
+            lead_root_id: None,
         };
         reviewer.scope_type = "task".into();
         for spec in crate::main_proposals::CATALOG.iter() {

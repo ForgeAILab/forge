@@ -206,6 +206,7 @@ async fn load(
             });
         }
         let role = caller.role;
+        let lead_root_id = caller.lead_root_id;
         let execution = caller.execution;
         // Preserve the optional Project-binding ceiling a Task session held
         // before Task authority joined this resolver.
@@ -219,6 +220,7 @@ async fn load(
             execution_id: execution.map(|execution| execution.id).unwrap_or_default(),
             role: role.unwrap_or(TaskRole::Reviewer),
             runtime_session_id: runtime_session_id.map(str::to_owned),
+            lead_root_id,
         }
     } else if let Some(project_id) = project_id {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE id = ?")
@@ -303,6 +305,8 @@ struct TaskCaller {
     admitted: bool,
     /// Present only when exactly one does.
     execution: Option<TaskRecordExecution>,
+    /// The coordination root that one execution leads, if it leads one.
+    lead_root_id: Option<String>,
 }
 /// One lookup for Task session admission and Task record provenance. The
 /// execution's recorded session id is deliberately not compared: a resumed
@@ -379,7 +383,12 @@ async fn task_caller(
     } else {
         None
     };
+    let lead_root_id = match &execution {
+        Some(execution) => lead_root(connection, task_id, identity_id, &execution.role).await?,
+        None => None,
+    };
     Ok(TaskCaller {
+        lead_root_id,
         session: session
             .map(|session| -> Result<TaskSession> {
                 Ok(TaskSession {
@@ -392,6 +401,62 @@ async fn task_caller(
         admitted,
         execution,
     })
+}
+
+/// The coordination root a running execution of `role` on `task_id` leads.
+/// The lead's role is the step-check role (`inherited_subtask`), and it runs
+/// in two places only: on the root itself, which has subtasks and whose own
+/// row of that role names this identity, and on a subtask resting in the
+/// step-check state, whose root's row does. Execution admission already
+/// decided that the run may exist (the planning state, the lead assigned);
+/// this reads who holds the role now, so a removed or replaced lead leads
+/// nothing from its next call on. The services repeat the workflow's side of
+/// the rule at the command boundary.
+async fn lead_root(
+    connection: &mut SqliteConnection,
+    task_id: &str,
+    identity_id: &str,
+    role: &str,
+) -> Result<Option<String>> {
+    if role != crate::inherited_subtask::STEP_CHECK_ROLE {
+        return Ok(None);
+    }
+    let Some((parent, status)): Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT parent_task_id, status FROM task WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let root = match parent {
+        Some(parent) if status == crate::inherited_subtask::STEP_CHECK_STATE => parent,
+        Some(_) => return Ok(None),
+        None => {
+            let subtasks: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task WHERE parent_task_id = ? AND deleted_at IS NULL",
+            )
+            .bind(task_id)
+            .fetch_one(&mut *connection)
+            .await?;
+            if subtasks == 0 {
+                return Ok(None);
+            }
+            task_id.to_owned()
+        }
+    };
+    let holds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_role_assignment a JOIN task t ON t.id = a.task_id
+         WHERE a.task_id = ? AND a.role_name = ? AND a.assignee_type = 'agent'
+           AND a.assignee_id = ? AND t.parent_task_id IS NULL AND t.deleted_at IS NULL",
+    )
+    .bind(&root)
+    .bind(role)
+    .bind(identity_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok((holds > 0).then_some(root))
 }
 
 #[cfg(test)]

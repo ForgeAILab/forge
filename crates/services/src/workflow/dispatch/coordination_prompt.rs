@@ -30,6 +30,19 @@ Lead doctrine:
 - When you run again later, your input names why: the aggregate review rejected the combined result, or a subtask is parked and needs a decision. Read the evidence given, look at the repository, and report the fix work or the decision: which step to add, change, retry or drop, in what order, and why. Re-plans are limited; do not report the same plan twice.
 - Must not modify code or files in the workspace. Red flags: code edits, a root checklist, vague steps without a verification.";
 
+/// How the lead changes the breakdown. Stable text: the operations and
+/// their argument contracts are in the tool description.
+const LEAD_OPERATIONS: &str = "\
+Lead operations (`forge_scope_propose`, this root's subtasks only):
+- A change you only describe does not happen. Make it: `lead.subtask` creates a subtask (appended last), updates, cancels or reorders subtasks that have not started, and assigns a worker; `lead.recover` applies a recovery action offered to you on a parked subtask (retry, restart, cancel); `lead.handoff` leaves a note the subtask's next run reads first; `lead.read` returns ids, versions, states and offered actions.
+- A subtask that has started cannot be rewritten, reordered or cancelled as not started: recover it, reassign it, or leave a hand-off note.
+- After a rejected review, add the fix work as new subtasks. After a parked subtask, recover it, or cancel it and add what replaces it. If you leave a parked subtask as it is, the root waits and the Project Agent is asked.
+- `lead.request_input` asks the owner one question when you cannot decide without a person. End your run after asking; you run again with the answer.
+- Every operation is limited in number. A refusal says why; do not repeat a refused call.";
+
+/// Questions and owner notes on the root embedded in the lead's input.
+const ROOT_NOTES: usize = 10;
+
 fn bounded(text: &str) -> String {
     if text.len() <= DESCRIPTION_LIMIT {
         return text.to_owned();
@@ -188,10 +201,12 @@ impl PromptBuilder for CoordinationPlannerPromptBuilder {
         user.push_str("\nBreakdown (ordered subtasks and their current states):\n");
         for (index, task) in ctx.sub_tasks.iter().enumerate() {
             user.push_str(&format!(
-                "{}. [{}] {}\n",
+                "{}. [{}] {} (task_id {}, version {})\n",
                 index + 1,
                 task.status,
-                task.title
+                task.title,
+                task.id,
+                task.version
             ));
             if let Some(description) = task.description.as_deref() {
                 for line in bounded(description).lines() {
@@ -217,9 +232,34 @@ impl PromptBuilder for CoordinationPlannerPromptBuilder {
             });
         }
 
+        // Questions the lead asked and what the owner answered or noted on
+        // the root, newest last, bounded.
+        let notes = ctx
+            .comments
+            .iter()
+            .filter(|comment| {
+                comment.author_type == db::CommentAuthorType::User
+                    || comment.worklog_kind.as_deref() == Some(db::COMMENT_KIND_REQUEST_INPUT)
+            })
+            .collect::<Vec<_>>();
+        if !notes.is_empty() {
+            user.push_str("\nYour questions and the owner's answers and notes on this root (oldest first):\n");
+            for note in &notes[notes.len().saturating_sub(ROOT_NOTES)..] {
+                user.push_str(&format!(
+                    "- {}: {}\n",
+                    if note.author_type == db::CommentAuthorType::User {
+                        note.author_name.as_str()
+                    } else {
+                        "you asked"
+                    },
+                    bounded_to(&note.content, EVIDENCE_LIMIT / 3)
+                ));
+            }
+        }
+
         AgentPrompt {
             system: format!(
-                "You are the lead of this Forge coordination root: the planner of a feature that is delivered through ordered subtasks.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{LEAD_DOCTRINE}"
+                "You are the lead of this Forge coordination root: the planner of a feature that is delivered through ordered subtasks.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{LEAD_DOCTRINE}\n\n{LEAD_OPERATIONS}"
             ),
             user,
             tools: default_tool_names(default_roles::PLANNER),

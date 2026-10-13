@@ -523,6 +523,12 @@ impl From<ServiceError> for McpToolError {
                 "root_task_id": root_task_id,
                 "role": role
             })),
+            ServiceError::LeadOperationRefused { refusal, message } => {
+                Self::new(-32602, message).with_data(json!({
+                    "code": "LEAD_OPERATION_REFUSED",
+                    "refusal": refusal.code()
+                }))
+            }
             ServiceError::SubtaskParentClosed {
                 parent_task_id,
                 state,

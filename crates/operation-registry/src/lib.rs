@@ -12,6 +12,7 @@ pub mod project_commands;
 pub mod project_proposals;
 pub mod project_reads;
 pub mod scope_reads;
+pub mod task_lead;
 pub mod task_proposals;
 pub mod task_reads;
 pub mod task_records;
@@ -49,6 +50,7 @@ pub trait OperationContext<E>:
     + task_reads::TaskReadContext<E>
     + task_records::TaskRecordContext<E>
     + task_proposals::TaskProposalContext<E>
+    + task_lead::TaskLeadContext<E>
 {
 }
 impl<
@@ -63,7 +65,8 @@ impl<
             + hand_proposals::HandProposalContext<E>
             + task_reads::TaskReadContext<E>
             + task_records::TaskRecordContext<E>
-            + task_proposals::TaskProposalContext<E>,
+            + task_proposals::TaskProposalContext<E>
+            + task_lead::TaskLeadContext<E>,
     > OperationContext<E> for T
 {
 }
@@ -475,6 +478,7 @@ pub fn registered_operations() -> Vec<&'static str> {
         hand_proposals::IDS.to_vec(),
         task_records::IDS.to_vec(),
         task_proposals::IDS.to_vec(),
+        task_lead::IDS.to_vec(),
     ]
     .concat();
     ids.sort_unstable();
@@ -504,6 +508,7 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
         hand_proposals::IDS,
         task_records::IDS,
         task_proposals::IDS,
+        task_lead::IDS,
     ]
     .concat();
     OperationCatalog::new(
@@ -514,7 +519,8 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
             .chain(legacy_proposals::specs())
             .chain(hand_proposals::specs())
             .chain(task_records::specs())
-            .chain(task_proposals::specs()),
+            .chain(task_proposals::specs())
+            .chain(task_lead::specs()),
         &ids,
     )
     .expect("complete proposal catalog")

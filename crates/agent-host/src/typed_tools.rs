@@ -527,6 +527,7 @@ impl ScopeToolComposition {
                         execution_id: "projection".into(),
                         role,
                         runtime_session_id: None,
+                        lead_root_id: None,
                     },
                     scope_type: "task".into(),
                     scope_id: scope.scope_id.clone(),
@@ -1585,8 +1586,12 @@ fn task_operations() -> (Vec<String>, Vec<String>) {
             .iter()
             .map(|id| (*id).to_owned())
             .collect(),
+        // The lead operations are listed for every Task session and
+        // filtered by the evaluator like the rest: only a run whose principal
+        // leads a root is offered them.
         operation_registry::task_records::IDS
             .iter()
+            .chain(operation_registry::task_lead::IDS)
             .map(|id| (*id).to_owned())
             .collect(),
     )
@@ -1618,6 +1623,7 @@ fn filter_operations(
                         execution_id: "projection".into(),
                         role: operation_registry::authority::TaskRole::Planner,
                         runtime_session_id: None,
+                        lead_root_id: None,
                     }
                 } else if scope_type == CanonicalScopeType::Project
                     || project_chat.is_project_agent_chat
@@ -1801,6 +1807,8 @@ fn null_registered_payload_is_empty(arguments: &mut Value) {
     if (operation_registry::task_records::IDS
         .contains(&arguments["operation"].as_str().unwrap_or_default())
         || operation_registry::task_proposals::IDS
+            .contains(&arguments["operation"].as_str().unwrap_or_default())
+        || operation_registry::task_lead::IDS
             .contains(&arguments["operation"].as_str().unwrap_or_default()))
         && arguments.get("causation_depth").is_some_and(Value::is_null)
     {

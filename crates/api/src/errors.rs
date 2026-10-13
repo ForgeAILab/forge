@@ -413,6 +413,12 @@ impl From<ServiceError> for ApiError {
                     json!({ "task_id": task_id, "root_task_id": root_task_id, "role": role }),
                 ),
             },
+            ServiceError::LeadOperationRefused { refusal, message } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "LEAD_OPERATION_REFUSED",
+                message,
+                details: Some(json!({ "refusal": refusal.code() })),
+            },
             ServiceError::SubtaskParentClosed {
                 parent_task_id,
                 state,

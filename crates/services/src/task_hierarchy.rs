@@ -826,6 +826,60 @@ pub async fn is_subtask(db: &SqliteDb, task_id: &str) -> Result<bool> {
 // acts on it cannot disagree.
 // ---------------------------------------------------------------------------
 
+/// The subtree predicate of every lead operation: `target_id` is `root` or
+/// one of its direct subtasks, in the same Project. Called once, by the lead
+/// command boundary (`TaskService::bind_lead`), before any handler runs. A
+/// Task of another root, of another Project, a deleted one and an unknown id
+/// all answer the same typed refusal: the lead learns nothing about Tasks
+/// outside its subtree.
+pub(crate) async fn ensure_in_lead_subtree(
+    db: &SqliteDb,
+    root: &Task,
+    target_id: &str,
+) -> Result<Task> {
+    let target = if target_id == root.id {
+        Some(root.clone())
+    } else {
+        TaskRepo::get_by_id(db, target_id, false)
+            .await?
+            .filter(|task| {
+                task.project_id == root.project_id
+                    && task.parent_task_id.as_deref() == Some(root.id.as_str())
+            })
+    };
+    target.ok_or_else(|| ServiceError::LeadOperationRefused {
+        refusal: crate::LeadRefusal::OutsideSubtree,
+        message: format!(
+            "task {target_id} is not coordination root {} or one of its subtasks; a lead acts on its own root's subtasks only",
+            root.id
+        ),
+    })
+}
+
+/// The Agent that leads `task`'s root, when `task` is a subtask parked on
+/// something that lead decides ([`subtask_decision_park`]). `None` for every
+/// other Task: a root, a subtask of a root without a lead, a subtask that is
+/// not parked or parked on something that is the owner's.
+pub(crate) async fn lead_deciding_subtask_park(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<Option<String>> {
+    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+        return Ok(None);
+    };
+    if subtask_decision_park(task).is_none() {
+        return Ok(None);
+    }
+    let (root, workflow) = match coordination_root_context(db, parent_task_id).await {
+        Ok(context) => context,
+        Err(ServiceError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(root_lead(db, &root, &workflow)
+        .await?
+        .and_then(|lead| lead.assignee_id))
+}
+
 /// Database form of "this Task is a coordination root and has a lead":
 /// [`root_lead`], and only for a root that has subtasks.
 pub(crate) async fn coordination_root_lead(

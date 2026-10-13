@@ -77,6 +77,25 @@ impl Kind {
         matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
     }
 }
+/// Bounds on what a coordination root's lead may repeat. The rows live on
+/// the ROOT under these keys, in the root's budget window: only a Retry with
+/// a new budget on the root (the owner's or the Project Agent's) opens a new
+/// one, and nothing the lead can do to a subtask resets them. They are not
+/// [`Kind`]s: no other Task ever has such a row and nothing projects them.
+///
+/// Subtasks the lead created under the root, per budget window.
+pub const LEAD_SUBTASKS_KEY: &str = "lead_subtasks";
+pub const LEAD_SUBTASKS_LIMIT: i64 = 24;
+/// Subtasks one lead run (one planning run or step check) created.
+pub const LEAD_SUBTASKS_PER_RUN_LIMIT: i64 = 8;
+pub fn lead_subtasks_run_key(execution: &str) -> String {
+    format!("lead_subtasks_run:{execution}")
+}
+/// Recovery actions the lead applied to one subtask, per budget window.
+pub const LEAD_RECOVER_LIMIT: i64 = 2;
+pub fn lead_recover_key(subtask: &str) -> String {
+    format!("lead_recover:{subtask}")
+}
 /// Review-gate rejections, counted against the cancelled-review entry cap
 /// (`max_rejections - 1`); the Review kind itself is keyed `review`.
 pub const REVIEW_GATE_KEY: &str = "gate:review";

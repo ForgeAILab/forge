@@ -142,6 +142,9 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         "Task: {}\n\nObjective:\nInspect the task contract and repository, make a concise internal plan, implement the requested change, run relevant self-validation, repair failures, and report completion evidence before submitting to review.\n",
         ctx.task.title
     );
+    if let Some(notes) = crate::workflow::dispatch::handoff_notes_section(ctx) {
+        user.push_str(&notes);
+    }
     append_task_context(ctx, &mut user);
     user
 }
@@ -218,9 +221,17 @@ fn append_task_context(ctx: &AgentDispatchContext, user: &mut String) {
         user.push_str(plan);
         user.push('\n');
     }
-    if !ctx.comments.is_empty() {
+    if ctx
+        .comments
+        .iter()
+        .any(|comment| !crate::workflow::dispatch::is_handoff_note(comment))
+    {
         user.push_str("\nRecent comments:\n");
-        for comment in &ctx.comments {
+        for comment in ctx
+            .comments
+            .iter()
+            .filter(|comment| !crate::workflow::dispatch::is_handoff_note(comment))
+        {
             user.push_str("- ");
             user.push_str(&comment.author_name);
             user.push_str(": ");

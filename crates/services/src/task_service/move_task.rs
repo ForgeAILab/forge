@@ -249,6 +249,9 @@ impl TaskService {
         if previous_status == default_states::REVIEW && task.status != default_states::REVIEW {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
         }
+        if previous_status != task.status {
+            task = super::lead::clear_lead_input_wait(&self.db, &task, None).await?;
+        }
         if should_clear_transient_error_annotation(&task, &request.target_status) {
             match TaskRepo::update(
                 &*self.db,

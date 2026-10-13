@@ -29,6 +29,9 @@ use crate::{
     Result, ServiceError,
 };
 
+/// `recommended_action` of the Attention item that carries a lead's question
+/// to the owner. Resolving it takes the answer; it never wakes an Agent.
+pub const ANSWER_LEAD_INPUT: &str = "answer_lead_input";
 const CONSUMER_NAME: &str = "attention_projection";
 
 pub(crate) fn attention_consumer_name() -> &'static str {
@@ -298,7 +301,8 @@ impl AttentionService {
                     l.identity_id AS latest_identity
              FROM attention_projection a
              LEFT JOIN agent_wake_attention_latest l ON l.attention_id = a.id
-             WHERE a.status = 'open' AND a.recommended_action <> 'answer_escalation'
+             WHERE a.status = 'open'
+               AND a.recommended_action NOT IN ('answer_escalation', 'answer_lead_input')
                AND (a.snoozed_until IS NULL OR a.snoozed_until <= ?)
              ORDER BY a.scope_type, a.scope_id, a.occurred_at, a.id",
         )
@@ -1881,12 +1885,81 @@ impl AttentionService {
         id: &str,
         expected_version: i64,
     ) -> Result<AttentionProjection> {
+        self.resolve_with_answer(user_id, id, expected_version, None)
+            .await
+    }
+
+    /// Resolve an item. An item that carries a lead's question
+    /// ([`ANSWER_LEAD_INPUT`]) is resolved only with an answer: the answer
+    /// becomes a comment on the root, the root's wait ends and its lead runs
+    /// again. Every other item takes no answer.
+    pub async fn resolve_with_answer(
+        &self,
+        user_id: &str,
+        id: &str,
+        expected_version: i64,
+        answer: Option<&str>,
+    ) -> Result<AttentionProjection> {
         let current = self.authorized_attention(user_id, id).await?;
+        let answer = answer.map(str::trim).filter(|answer| !answer.is_empty());
         if current.status == "resolved" {
             if current.version != expected_version {
                 return Err(ServiceError::from(db::DbError::VersionConflict));
             }
             return Ok(current);
+        }
+        if current.recommended_action == ANSWER_LEAD_INPUT {
+            if current.version != expected_version {
+                return Err(ServiceError::from(db::DbError::VersionConflict));
+            }
+            let answer = answer.filter(|answer| answer.chars().count() <= 4000).ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "this item is a question from a Task's lead: resolve it with `answer` (1 to 4000 characters)",
+                )
+            })?;
+            let details =
+                serde_json::from_str::<Value>(&current.details_json).unwrap_or(Value::Null);
+            let (Some(task_id), Some(comment_id)) =
+                (details["task_id"].as_str(), details["comment_id"].as_str())
+            else {
+                return Err(ServiceError::invalid_operation(
+                    "Attention item has no question to answer",
+                ));
+            };
+            crate::task_service::lead::answer_lead_input(
+                &self.db, task_id, comment_id, answer, "owner",
+            )
+            .await?;
+            // The answer resolved the item with the wait. A root that had
+            // already left its planning state has no wait left: close it here.
+            let latest = self
+                .db
+                .get_attention(id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("attention", id.to_owned()))?;
+            if latest.status == "resolved" {
+                return Ok(latest);
+            }
+            return AttentionRepo::update_attention_lifecycle(
+                &*self.db,
+                UpdateAttentionLifecycle {
+                    id: id.to_owned(),
+                    expected_version: latest.version,
+                    status: "resolved".to_owned(),
+                    acknowledged_at: None,
+                    snoozed_until: Some(None),
+                    resolved_at: Some(Some(now_rfc3339())),
+                    updated_by_user_id: Some(user_id.to_owned()),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .map_err(ServiceError::from);
+        }
+        if answer.is_some() {
+            return Err(ServiceError::invalid_operation(
+                "this Attention item takes no answer",
+            ));
         }
         // Resolving an owner escalation is the owner's answer: it closes the
         // escalation and wakes the Agent, so no blocker stays un-wakeable.

@@ -371,6 +371,7 @@ impl CoordinationToolProvider {
         let task_operation = operation_registry::task_records::IDS
             .iter()
             .chain(operation_registry::task_proposals::IDS)
+            .chain(operation_registry::task_lead::IDS)
             .any(|id| *id == operation);
         if contains_authority_override(&arguments) {
             // A Task command or record that names a server-derived field was
