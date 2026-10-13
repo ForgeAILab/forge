@@ -7776,8 +7776,10 @@ foreign-key cascade.
 Operator status, milestone readiness/release persistence, workspace cleanup,
 Attention/wake projections, Task workspace admission, recovery persistence,
 Agent status/coordination, Project runtime/escalation, placement environment waits,
-first-user bootstrap, and Task governance persistence use typed `SqliteDb`
-functions in the corresponding DB aggregate modules.
+first-user bootstrap, Task governance, Agent Chat workers/native reads, workspace
+garbage collection, topic rotation, repository provisioning/location queries,
+Genesis and Project artifact commands, and chat/usage-index persistence use
+typed DB functions in the corresponding aggregate modules.
 The services retain policy and transaction ownership; queries participating in
 those transactions accept the caller's `SqliteConnection`. Read projections
 return named row structs, while SQL execution and row decoding produce `DbError`

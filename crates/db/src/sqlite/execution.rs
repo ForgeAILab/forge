@@ -2499,3 +2499,238 @@ impl SqliteDb {
         }))
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeLatestTaskExecutionRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeLatestTaskExecutionRow {
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn role_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("role")?)
+    }
+    pub fn agent_session_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("agent_session_id")?)
+    }
+    pub fn logs_path(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("logs_path")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_work_latest_task_executions(
+        &self,
+        ids: &[String],
+    ) -> crate::Result<Vec<NativeLatestTaskExecutionRow>> {
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!(
+            "SELECT task_id, id, status, role, agent_session_id, logs_path
+                 FROM (
+                     SELECT task_id, id, status, role, agent_session_id, logs_path,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY task_id ORDER BY created_at DESC, id DESC
+                            ) AS execution_rank
+                     FROM execution
+                     WHERE task_id IN ({placeholders})
+                 )
+                 WHERE execution_rank = 1"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+
+        let rows = query.fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeLatestTaskExecutionRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_running_execution_ids(&self) -> crate::Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT id FROM execution WHERE status = 'running'")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct UsageIndexExecutionRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl UsageIndexExecutionRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn duration_ms(&self) -> crate::Result<Option<f64>> {
+        Ok(self.row.try_get("duration_ms")?)
+    }
+    pub fn agent_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("agent_id")?)
+    }
+    pub fn execution_rowid(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("execution_rowid")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn present_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("present_id")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct UsageIndexExecutionDomainRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl UsageIndexExecutionDomainRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn agent_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("agent_id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct UsageIndexAgentExecutionStatsRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl UsageIndexAgentExecutionStatsRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn n(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("n")?)
+    }
+    pub fn completed(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("completed")?)
+    }
+    pub fn duration(&self) -> crate::Result<Option<f64>> {
+        Ok(self.row.try_get("duration")?)
+    }
+    pub fn running(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("running")?)
+    }
+    pub fn unstable(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("unstable")?)
+    }
+}
+
+pub async fn usage_index_agent_execution_stats_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    agent_ids_json: String,
+) -> crate::Result<Vec<UsageIndexAgentExecutionStatsRow>> {
+    let rows = sqlx::query("WITH requested AS (SELECT value AS id FROM json_each(?)) SELECT requested.id,COUNT(e.id) AS n,COALESCE(SUM(e.status='running'),0) AS running,COALESCE(SUM(e.status='completed'),0) AS completed,AVG(CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END) AS duration,COALESCE(SUM(CASE WHEN e.status!='running' AND (e.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*' OR e.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*') THEN 1 ELSE 0 END),0) AS unstable FROM requested LEFT JOIN execution e ON e.agent_id=requested.id GROUP BY requested.id",)
+.bind(agent_ids_json)
+.fetch_all(connection).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UsageIndexAgentExecutionStatsRow { row })
+        .collect())
+}
+
+pub async fn usage_index_execution_domains_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    source_ids_json: String,
+) -> crate::Result<Vec<UsageIndexExecutionDomainRow>> {
+    let rows = sqlx::query(
+        "SELECT id,agent_id,status FROM execution WHERE id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(source_ids_json)
+    .fetch_all(connection)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UsageIndexExecutionDomainRow { row })
+        .collect())
+}
+
+pub async fn usage_index_inserted_executions_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    after_rowid: i64,
+    through_rowid: i64,
+) -> crate::Result<Vec<UsageIndexExecutionRow>> {
+    let rows = sqlx::query("SELECT rowid AS execution_rowid,id,agent_id,status,created_at,updated_at,CASE WHEN status!='running' THEN (JULIANDAY(updated_at)-JULIANDAY(created_at))*86400000 END AS duration_ms FROM execution WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT 400",)
+.bind(after_rowid)
+.bind(through_rowid)
+.fetch_all(connection).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UsageIndexExecutionRow { row })
+        .collect())
+}
+
+pub struct UsageIndexChangedExecutionsOnConnectionInput<'a> {
+    pub after_revision: i64,
+    pub cursor_revision: i64,
+    pub last_id: &'a str,
+    pub through_revision: i64,
+    pub through_rowid: i64,
+    pub old_revision: i64,
+}
+
+pub async fn usage_index_changed_executions_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    input: UsageIndexChangedExecutionsOnConnectionInput<'_>,
+) -> crate::Result<Vec<UsageIndexExecutionRow>> {
+    let rows = sqlx::query("SELECT c.id,c.revision,e.id AS present_id,e.agent_id,e.status,e.created_at,e.updated_at,CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END AS duration_ms FROM usage_changed_execution c LEFT JOIN execution e ON e.id=c.id WHERE (c.revision>? OR (c.revision=? AND c.id>?)) AND c.revision<=? AND (e.rowid<=? OR e.id IS NULL) AND c.revision>?6 ORDER BY c.revision,c.id LIMIT 400",)
+.bind(input.after_revision)
+.bind(input.cursor_revision)
+.bind(input.last_id)
+.bind(input.through_revision)
+.bind(input.through_rowid)
+.bind(input.old_revision)
+.fetch_all(connection).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UsageIndexExecutionRow { row })
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+pub enum UsageIndexExecutionTextField {
+    Id,
+    AgentId,
+    Status,
+    CreatedAt,
+    UpdatedAt,
+}
+impl UsageIndexExecutionRow {
+    pub fn optional_text(
+        &self,
+        field: UsageIndexExecutionTextField,
+    ) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get(match field {
+            UsageIndexExecutionTextField::Id => "id",
+            UsageIndexExecutionTextField::AgentId => "agent_id",
+            UsageIndexExecutionTextField::Status => "status",
+            UsageIndexExecutionTextField::CreatedAt => "created_at",
+            UsageIndexExecutionTextField::UpdatedAt => "updated_at",
+        })?)
+    }
+}

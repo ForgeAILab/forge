@@ -305,3 +305,29 @@ pub(crate) async fn capture_pause_in_tx(
         .bind(detail["role"].as_str()).bind(detail["workspace_id"].as_str()).bind(detail["last_checked_at"].as_str().unwrap_or(paused_at)).bind(detail["next_check_at"].as_str().unwrap_or(paused_at)).execute(&mut **tx).await?;
     Ok(detail.to_string())
 }
+
+pub struct RepositoryProvisionReadinessIsCurrentInTxInput<'a> {
+    pub project_id: &'a str,
+    pub owner_kind: &'a str,
+    pub daemon_id: &'a str,
+    pub runtime_id: &'a str,
+    pub version: i64,
+    pub checks_digest: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_readiness_is_current_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: RepositoryProvisionReadinessIsCurrentInTxInput<'_>,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM project_machine_readiness r JOIN project p ON p.id=r.project_id WHERE r.project_id=? AND r.owner_kind=? AND r.daemon_id=? AND r.runtime_id=? AND r.version=? AND r.checks_digest=?)",)
+.bind(input.project_id)
+.bind(input.owner_kind)
+.bind(input.daemon_id)
+.bind(input.runtime_id)
+.bind(input.version)
+.bind(input.checks_digest)
+.fetch_one(connection).await?)
+    }
+}

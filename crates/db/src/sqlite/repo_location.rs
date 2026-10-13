@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     CreateRepoLocation, DbError, Page, PageRequest, RepoLocation, RepoLocationRepo, Result,
-    UpdateRepoLocation, WorkspacePlacement,
+    SortOrder, UpdateRepoLocation, WorkspacePlacement,
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite};
@@ -459,5 +459,443 @@ impl SqliteDb {
             .bind(runtime_id)
             .fetch_optional(self.pool())
             .await?)
+    }
+}
+
+pub struct ClaimRepositoryProvisionAttemptInTxInput<'a> {
+    pub repo_id: &'a str,
+    pub runtime_id: &'a str,
+    pub next_attempt_at: String,
+    pub checks_digest: &'a str,
+    pub connection_id: i64,
+    pub started_at: String,
+    pub max_attempts: i64,
+    pub now: String,
+}
+
+impl SqliteDb {
+    pub async fn claim_repository_provision_attempt_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ClaimRepositoryProvisionAttemptInTxInput<'_>,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>("INSERT INTO repo_provision_retry (repo_id, runtime_id, attempts, next_attempt_at, checks_digest, connection_id, started_at) VALUES (?, ?, 1, ?, ?, ?, ?) ON CONFLICT(repo_id, runtime_id) DO UPDATE SET attempts = CASE WHEN checks_digest <> excluded.checks_digest OR connection_id <> excluded.connection_id THEN 1 ELSE attempts + 1 END, next_attempt_at = excluded.next_attempt_at, checks_digest = excluded.checks_digest, connection_id = excluded.connection_id, started_at = excluded.started_at, last_error = CASE WHEN checks_digest <> excluded.checks_digest THEN NULL ELSE last_error END WHERE (checks_digest <> excluded.checks_digest OR connection_id <> excluded.connection_id OR (attempts < ? AND julianday(next_attempt_at) <= julianday(?))) RETURNING attempts",)
+.bind(input.repo_id)
+.bind(input.runtime_id)
+.bind(input.next_attempt_at)
+.bind(input.checks_digest)
+.bind(input.connection_id)
+.bind(input.started_at)
+.bind(input.max_attempts)
+.bind(input.now)
+.fetch_optional(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn schedule_repository_provision_successor_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        next_attempt_at: String,
+        repo_id: &str,
+        runtime_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE repo_provision_retry SET next_attempt_at = ? WHERE repo_id = ? AND runtime_id = ?",)
+.bind(next_attempt_at)
+.bind(repo_id)
+.bind(runtime_id)
+.execute(connection).await?)
+    }
+}
+
+pub struct ReleaseStaleRepositoryProvisionAttemptInput<'a> {
+    pub next_attempt_at: String,
+    pub repo_id: &'a str,
+    pub runtime_id: &'a Option<String>,
+    pub attempts: i64,
+    pub checks_digest: &'a str,
+    pub connection_id: i64,
+}
+
+impl SqliteDb {
+    pub async fn release_stale_repository_provision_attempt(
+        &self,
+        input: ReleaseStaleRepositoryProvisionAttemptInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE repo_provision_retry SET next_attempt_at=? WHERE repo_id=? AND runtime_id=? AND attempts=? AND checks_digest=? AND connection_id=?",)
+.bind(input.next_attempt_at)
+.bind(input.repo_id)
+.bind(input.runtime_id)
+.bind(input.attempts)
+.bind(input.checks_digest)
+.bind(input.connection_id)
+.execute(self.pool()).await?)
+    }
+}
+
+pub struct RecordRepositoryProvisionFailureInTxInput<'a> {
+    pub last_error: String,
+    pub next_attempt_at: String,
+    pub repo_id: &'a str,
+    pub runtime_id: &'a Option<String>,
+    pub attempts: i64,
+    pub checks_digest: &'a str,
+    pub connection_id: i64,
+    pub project_id: &'a str,
+    pub daemon_id: &'a Option<String>,
+    pub readiness_runtime_id: &'a Option<String>,
+    pub readiness_version: i64,
+}
+
+impl SqliteDb {
+    pub async fn record_repository_provision_failure_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: RecordRepositoryProvisionFailureInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE repo_provision_retry SET last_error = ?, next_attempt_at = ? WHERE repo_id = ? AND runtime_id = ? AND attempts = ? AND checks_digest = ? AND connection_id = ? AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?",)
+.bind(input.last_error)
+.bind(input.next_attempt_at)
+.bind(input.repo_id)
+.bind(input.runtime_id)
+.bind(input.attempts)
+.bind(input.checks_digest)
+.bind(input.connection_id)
+.bind(input.project_id)
+.bind(input.daemon_id)
+.bind(input.readiness_runtime_id)
+.bind(input.readiness_version)
+.execute(connection).await?)
+    }
+}
+
+pub struct RepositoryProvisionAttemptFailureInput<'a> {
+    pub repo_id: &'a str,
+    pub runtime_id: &'a Option<String>,
+    pub attempts: i64,
+    pub checks_digest: &'a str,
+    pub connection_id: i64,
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_attempt_failure(
+        &self,
+        input: RepositoryProvisionAttemptFailureInput<'_>,
+    ) -> crate::Result<Option<(Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as::<_, (Option<String>, Option<String>)>("SELECT started_at, last_error FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND attempts=? AND checks_digest=? AND connection_id=?",)
+.bind(input.repo_id)
+.bind(input.runtime_id)
+.bind(input.attempts)
+.bind(input.checks_digest)
+.bind(input.connection_id)
+.fetch_optional(self.pool()).await?)
+    }
+}
+
+pub struct RepositoryProvisionAttemptIsCurrentInput<'a> {
+    pub repo_id: &'a str,
+    pub runtime_id: &'a Option<String>,
+    pub attempts: i64,
+    pub checks_digest: &'a str,
+    pub connection_id: i64,
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_attempt_is_current(
+        &self,
+        input: RepositoryProvisionAttemptIsCurrentInput<'_>,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND attempts=? AND checks_digest=? AND connection_id=?)",)
+.bind(input.repo_id)
+.bind(input.runtime_id)
+.bind(input.attempts)
+.bind(input.checks_digest)
+.bind(input.connection_id)
+.fetch_one(self.pool()).await?)
+    }
+}
+
+pub struct ApplyRepositoryProvisionLocationInTxInput<'a> {
+    pub path: &'a Option<String>,
+    pub status: String,
+    pub last_error: &'a Option<String>,
+    pub verified: bool,
+    pub verified_at: &'a str,
+    pub updated_at: &'a str,
+    pub location_id: &'a str,
+    pub version: i64,
+}
+
+impl SqliteDb {
+    pub async fn apply_repository_provision_location_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ApplyRepositoryProvisionLocationInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE repo_location SET path=COALESCE(?,path),status=?,last_error=?,last_verified_at=CASE WHEN ? THEN ? ELSE last_verified_at END,updated_at=?,version=version+1 WHERE id=? AND version=?",)
+.bind(input.path)
+.bind(input.status)
+.bind(input.last_error)
+.bind(input.verified)
+.bind(input.verified_at)
+.bind(input.updated_at)
+.bind(input.location_id)
+.bind(input.version)
+.execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delete_verified_repository_provision_retry_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        runtime_id: &Option<String>,
+        checks_digest: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "DELETE FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND checks_digest=?",
+        )
+        .bind(repo_id)
+        .bind(runtime_id)
+        .bind(checks_digest)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_location_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        runtime_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT location_id FROM repo_provision_retry WHERE repo_id = ? AND runtime_id = ?",
+        )
+        .bind(repo_id)
+        .bind(runtime_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_location_exists_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        runtime_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM repo_location WHERE repo_id = ? AND runtime_id = ?)",
+        )
+        .bind(repo_id)
+        .bind(runtime_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+pub struct InsertRepositoryProvisionLocationInTxInput<'a> {
+    pub location_id: &'a str,
+    pub repo_id: &'a str,
+    pub daemon_id: &'a str,
+    pub runtime_id: &'a str,
+    pub path: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_repository_provision_location_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertRepositoryProvisionLocationInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("INSERT INTO repo_location (id, repo_id, owner_kind, daemon_id, runtime_id, path, kind, status, created_at, updated_at) VALUES (?, ?, 'daemon', ?, ?, ?, 'managed_clone', 'unverified', ?, ?)",)
+.bind(input.location_id)
+.bind(input.repo_id)
+.bind(input.daemon_id)
+.bind(input.runtime_id)
+.bind(input.path)
+.bind(input.created_at)
+.bind(input.updated_at)
+.execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_repository_provision_location_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        location_id: &str,
+        repo_id: &str,
+        runtime_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE repo_provision_retry SET location_id = ? WHERE repo_id = ? AND runtime_id = ?",
+        )
+        .bind(location_id)
+        .bind(repo_id)
+        .bind(runtime_id)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_location_default_changes_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        location_id: &str,
+        repo_id: &str,
+        is_default: bool,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM repo_location WHERE id = ? AND repo_id = ? AND is_default <> ?)",)
+.bind(location_id)
+.bind(repo_id)
+.bind(is_default)
+.fetch_one(connection).await?)
+    }
+}
+
+pub struct SetRepositoryLocationDefaultInTxInput<'a> {
+    pub is_default: bool,
+    pub updated_at: &'a str,
+    pub location_id: &'a str,
+    pub repo_id: &'a str,
+    pub version: i64,
+}
+
+impl SqliteDb {
+    pub async fn set_repository_location_default_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: SetRepositoryLocationDefaultInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE repo_location SET is_default = ?, version = version + 1, updated_at = ? WHERE id = ? AND repo_id = ? AND version = ?",)
+.bind(input.is_default)
+.bind(input.updated_at)
+.bind(input.location_id)
+.bind(input.repo_id)
+.bind(input.version)
+.execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn other_repository_location_defaults_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        location_id: &str,
+    ) -> crate::Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as::<_, (String, i64)>("SELECT id, version FROM repo_location WHERE repo_id = ? AND id <> ? AND is_default = 1",)
+.bind(repo_id)
+.bind(location_id)
+.fetch_all(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_other_repository_location_default_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: &str,
+        location_id: String,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE repo_location SET is_default = 0, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",)
+.bind(updated_at)
+.bind(location_id)
+.bind(version)
+.execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_location_provisioning_exists(
+        &self,
+        location_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE location_id = ?)",
+        )
+        .bind(location_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_location_reconnect_verification_ids(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM repo_location WHERE daemon_id = ?
+             AND (owner_kind = 'daemon' OR kind = 'shared_mount')
+             AND NOT EXISTS (SELECT 1 FROM repo_provision_retry j
+                             WHERE j.location_id = repo_location.id)
+             ORDER BY created_at, id",
+        )
+        .bind(daemon_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum RepoLocationPageSort {
+    CreatedAt,
+    UpdatedAt,
+    Id,
+}
+pub struct VisibleRepositoryLocationPageInput<'a> {
+    pub repo_id: &'a str,
+    pub user_id: &'a str,
+    pub sort: RepoLocationPageSort,
+    pub order: SortOrder,
+    pub limit: i64,
+    pub offset: i64,
+}
+const VISIBLE_REPOSITORY_LOCATION_PREDICATE: &str =
+    "l.repo_id = ? AND (l.daemon_id IS NULL OR EXISTS (
+            SELECT 1 FROM daemon d WHERE d.id = l.daemon_id
+            AND (d.visibility = 'global' OR d.owner_id IS NULL OR d.owner_id = ?)))";
+impl SqliteDb {
+    pub async fn visible_repository_location_page_ids(
+        &self,
+        input: VisibleRepositoryLocationPageInput<'_>,
+    ) -> crate::Result<Vec<String>> {
+        let sort = match input.sort {
+            RepoLocationPageSort::CreatedAt => "l.created_at",
+            RepoLocationPageSort::UpdatedAt => "l.updated_at",
+            RepoLocationPageSort::Id => "l.id",
+        };
+        let order = match input.order {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        };
+        let predicate = VISIBLE_REPOSITORY_LOCATION_PREDICATE;
+        Ok(sqlx::query_scalar::<_, String>(&format!(
+            "SELECT l.id FROM repo_location l WHERE {predicate} ORDER BY {sort} {order}, l.id {order} LIMIT ? OFFSET ?"
+        )).bind(input.repo_id).bind(input.user_id).bind(input.limit).bind(input.offset).fetch_all(self.pool()).await?)
+    }
+    pub async fn visible_repository_location_count(
+        &self,
+        repo_id: &str,
+        user_id: &str,
+    ) -> crate::Result<i64> {
+        let predicate = VISIBLE_REPOSITORY_LOCATION_PREDICATE;
+        Ok(sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM repo_location l WHERE {predicate}"
+        ))
+        .bind(repo_id)
+        .bind(user_id)
+        .fetch_one(self.pool())
+        .await?)
     }
 }

@@ -13,8 +13,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use db::{
     new_uuid_v4, now_rfc3339, CreateRepoLocation, DaemonRepo, DbError, Page, PageRequest,
     ProjectMemberRepo, Repo, RepoLocation, RepoLocationKind, RepoLocationOwnerKind,
-    RepoLocationRepo, RepoLocationStatus, RepoRepo, Runtime, RuntimeRepo, SortBy, SortOrder,
-    SqliteDb, TaskRepo, UpdateRepoLocation,
+    RepoLocationRepo, RepoLocationStatus, RepoRepo, Runtime, RuntimeRepo, SortBy, SqliteDb,
+    TaskRepo, UpdateRepoLocation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -380,29 +380,29 @@ impl RepoLocationService {
             }
         };
         let sort = match page.sort_by {
-            SortBy::CreatedAt => "l.created_at",
-            SortBy::UpdatedAt => "l.updated_at",
-            SortBy::Id => "l.id",
+            SortBy::CreatedAt => db::RepoLocationPageSort::CreatedAt,
+            SortBy::UpdatedAt => db::RepoLocationPageSort::UpdatedAt,
+            SortBy::Id => db::RepoLocationPageSort::Id,
             _ => {
                 return Err(ServiceError::Domain(
                     "locations sort_by must be created_at, updated_at, or id".to_owned(),
                 ))
             }
         };
-        let order = match page.sort_order {
-            SortOrder::Asc => "ASC",
-            SortOrder::Desc => "DESC",
-        };
+        let order = page.sort_order;
         let limit = db::clamp_page_limit(Some(page.limit));
         // Apply daemon visibility before both the page boundary and the count.
-        let predicate = "l.repo_id = ? AND (l.daemon_id IS NULL OR EXISTS (
-            SELECT 1 FROM daemon d WHERE d.id = l.daemon_id
-            AND (d.visibility = 'global' OR d.owner_id IS NULL OR d.owner_id = ?)))";
-        let ids: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT l.id FROM repo_location l WHERE {predicate} ORDER BY {sort} {order}, l.id {order} LIMIT ? OFFSET ?"
-        ))
-        .bind(repo_id).bind(user_id).bind(limit + 1).bind(offset)
-        .fetch_all(self.db.pool()).await?;
+        let ids: Vec<String> = self
+            .db
+            .visible_repository_location_page_ids(db::VisibleRepositoryLocationPageInput {
+                repo_id,
+                user_id,
+                sort,
+                order,
+                limit: limit + 1,
+                offset,
+            })
+            .await?;
         let has_more = ids.len() > limit as usize;
         let mut items = Vec::new();
         for id in ids.into_iter().take(limit as usize) {
@@ -412,13 +412,9 @@ impl RepoLocationService {
         }
         let total_count = if page.include_total {
             Some(
-                sqlx::query_scalar(&format!(
-                    "SELECT COUNT(*) FROM repo_location l WHERE {predicate}"
-                ))
-                .bind(repo_id)
-                .bind(user_id)
-                .fetch_one(self.db.pool())
-                .await?,
+                self.db
+                    .visible_repository_location_count(repo_id, user_id)
+                    .await?,
             )
         } else {
             None
@@ -457,30 +453,50 @@ impl RepoLocationService {
         // its merge queues: refused (`409 integration_unresolved`) while a
         // merge into the repository has an unknown result or an owner effect
         // outstanding. In the transaction of the write it guards.
-        let changes: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM repo_location WHERE id = ? AND repo_id = ? AND is_default <> ?)",
-        )
-        .bind(location_id)
-        .bind(repo_id)
-        .bind(request.is_default)
-        .fetch_one(&mut *transaction)
-        .await?;
+        let changes: bool = self
+            .db
+            .repository_location_default_changes_in_tx(
+                &mut transaction,
+                location_id,
+                repo_id,
+                request.is_default,
+            )
+            .await?;
         if changes {
             db::refuse_default_change_while_integration_unresolved(&mut transaction, location_id)
                 .await?;
         }
-        let result = sqlx::query("UPDATE repo_location SET is_default = ?, version = version + 1, updated_at = ? WHERE id = ? AND repo_id = ? AND version = ?")
-            .bind(request.is_default).bind(&now).bind(location_id).bind(repo_id).bind(request.version)
-            .execute(&mut *transaction).await?;
+        let result = self
+            .db
+            .set_repository_location_default_in_tx(
+                &mut transaction,
+                db::SetRepositoryLocationDefaultInTxInput {
+                    is_default: request.is_default,
+                    updated_at: &now,
+                    location_id,
+                    repo_id,
+                    version: request.version,
+                },
+            )
+            .await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict.into());
         }
         if request.is_default {
-            let defaults: Vec<(String, i64)> = sqlx::query_as("SELECT id, version FROM repo_location WHERE repo_id = ? AND id <> ? AND is_default = 1")
-                .bind(repo_id).bind(location_id).fetch_all(&mut *transaction).await?;
+            let defaults: Vec<(String, i64)> = self
+                .db
+                .other_repository_location_defaults_in_tx(&mut transaction, repo_id, location_id)
+                .await?;
             for (id, version) in defaults {
-                let result = sqlx::query("UPDATE repo_location SET is_default = 0, version = version + 1, updated_at = ? WHERE id = ? AND version = ?")
-                    .bind(&now).bind(id).bind(version).execute(&mut *transaction).await?;
+                let result = self
+                    .db
+                    .clear_other_repository_location_default_in_tx(
+                        &mut transaction,
+                        &now,
+                        id,
+                        version,
+                    )
+                    .await?;
                 if result.rows_affected() != 1 {
                     return Err(DbError::VersionConflict.into());
                 }
@@ -511,13 +527,10 @@ impl RepoLocationService {
     /// record of the location differs from the server's). `Ok(None)`: the
     /// location is gone, or provisioning owns its verification right now.
     pub async fn reverify(&self, location_id: &str) -> Result<Option<RepoLocation>> {
-        let provisioning: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE location_id = ?)",
-        )
-        .bind(location_id)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(DbError::from)?;
+        let provisioning: bool = self
+            .db
+            .repository_location_provisioning_exists(location_id)
+            .await?;
         if provisioning {
             return Ok(None);
         }
@@ -538,16 +551,10 @@ impl RepoLocationService {
         // Provisioning owns verification and full checks until its retry row
         // is removed. A delayed handshake scan must not mark that clone ready
         // or invalidate the provisioning job's location-version witness.
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM repo_location WHERE daemon_id = ?
-             AND (owner_kind = 'daemon' OR kind = 'shared_mount')
-             AND NOT EXISTS (SELECT 1 FROM repo_provision_retry j
-                             WHERE j.location_id = repo_location.id)
-             ORDER BY created_at, id",
-        )
-        .bind(daemon_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let ids: Vec<String> = self
+            .db
+            .repository_location_reconnect_verification_ids(daemon_id)
+            .await?;
         let mut verified = 0;
         for id in ids {
             let result = async {

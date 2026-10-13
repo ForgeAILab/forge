@@ -446,3 +446,127 @@ impl SqliteDb {
             .collect())
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct GenesisControlTransferReceiptRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl GenesisControlTransferReceiptRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn continuation_turn_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("continuation_turn_id")?)
+    }
+    pub fn genesis_session_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("genesis_session_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_control_transfer_receipt(
+        &self,
+        operation: &str,
+        source_turn_id: &str,
+    ) -> crate::Result<Option<GenesisControlTransferReceiptRow>> {
+        let rows = sqlx::query(
+            "SELECT id,
+                    json_extract(outcome_json, '$.admitted_turn_id') AS continuation_turn_id,
+                    json_extract(outcome_json, '$.session_id') AS genesis_session_id
+             FROM command_receipt
+             WHERE operation = ?
+               AND json_extract(outcome_json, '$.source_turn_id') = ?
+               AND json_extract(outcome_json, '$.control_transfer') = 1
+             ORDER BY committed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(operation)
+        .bind(source_turn_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| GenesisControlTransferReceiptRow { row }))
+    }
+}
+
+pub struct ArtifactCommandConflictingInputDigestInput<'a> {
+    pub principal_type: &'a str,
+    pub principal_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub operation: &'a str,
+    pub idempotency_key: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn artifact_command_conflicting_input_digest(
+        &self,
+        input: ArtifactCommandConflictingInputDigestInput<'_>,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT input_digest FROM command_receipt
+             WHERE principal_type = ? AND principal_id = ? AND scope_type = ?
+               AND scope_id = ? AND operation = ? AND idempotency_key = ?
+             LIMIT 1",
+        )
+        .bind(input.principal_type)
+        .bind(input.principal_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.operation)
+        .bind(input.idempotency_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct ArtifactReplayCommandInputDigestInput<'a> {
+    pub principal_type: &'a str,
+    pub principal_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub operation: &'a str,
+    pub idempotency_key: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn artifact_replay_command_input_digest(
+        &self,
+        input: ArtifactReplayCommandInputDigestInput<'_>,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT input_digest FROM command_receipt
+             WHERE principal_type = ? AND principal_id = ? AND scope_type = ?
+               AND scope_id = ? AND operation = ? AND idempotency_key = ?
+             LIMIT 1",
+        )
+        .bind(input.principal_type)
+        .bind(input.principal_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.operation)
+        .bind(input.idempotency_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_replay_input_digest(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        operation: &str,
+        idempotency_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT input_digest FROM command_receipt
+         WHERE scope_type = ? AND scope_id = ? AND operation = ?
+           AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(operation)
+        .bind(idempotency_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

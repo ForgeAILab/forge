@@ -1464,3 +1464,338 @@ impl SqliteDb {
         .await?)
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MainTurnPortfolioProjectRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MainTurnPortfolioProjectRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn charter_status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_status")?)
+    }
+    pub fn current_charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_portfolio_projects(
+        &self,
+        account_id: &str,
+    ) -> crate::Result<Vec<MainTurnPortfolioProjectRow>> {
+        let rows = sqlx::query(
+            "SELECT id, version, updated_at, paused_at, charter_status,
+                    current_charter_revision_id
+             FROM project
+             WHERE owner_id = ?
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 20",
+        )
+        .bind(account_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MainTurnPortfolioProjectRow { row })
+            .collect())
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeOwnedProjectSummaryRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeOwnedProjectSummaryRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("name")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn task_count(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("task_count")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativePortfolioProjectRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativePortfolioProjectRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("name")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_paused_project_reason(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT system_pause_reason FROM project WHERE id = ? AND paused_at IS NOT NULL",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_portfolio_projects(
+        &self,
+        account_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<NativePortfolioProjectRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, paused_at, created_at, updated_at
+             FROM project WHERE owner_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativePortfolioProjectRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_version(&self, project_id: &str) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_owned_project_summary(
+        &self,
+        project_id: &str,
+        account_id: &str,
+    ) -> crate::Result<Option<NativeOwnedProjectSummaryRow>> {
+        let rows = sqlx::query(
+            "SELECT p.id, p.name, p.paused_at, p.created_at, p.updated_at,
+                    COUNT(t.id) AS task_count
+             FROM project AS p
+             LEFT JOIN task AS t ON t.project_id = p.id AND t.deleted_at IS NULL
+             WHERE p.id = ? AND p.owner_id = ?
+             GROUP BY p.id",
+        )
+        .bind(project_id)
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| NativeOwnedProjectSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_pause_reason(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT system_pause_reason FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_scope_summary(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<NativeScopeSummaryRow>> {
+        let rows = sqlx::query("SELECT id, name FROM project WHERE id = ?")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(rows.map(|row| NativeScopeSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_root_project_exists(&self, project_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?)")
+                .bind(project_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn provisioning_current_project_settings_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<String> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id=?")
+                .bind(project_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+pub async fn provisioning_project_settings_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> crate::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id=?")
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ValidationProjectCharterSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ValidationProjectCharterSourceRow {
+    pub fn current_charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_project_charter_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ValidationProjectCharterSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ValidationProjectCharterSourceRow { row }))
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ChatUsageProjectScopeRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ChatUsageProjectScopeRow {
+    pub fn owner_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("owner_id")?)
+    }
+    pub fn name(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("name")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_usage_project_scope(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ChatUsageProjectScopeRow>> {
+        let rows = sqlx::query("SELECT owner_id, name FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(rows.map(|row| ChatUsageProjectScopeRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_command_project_version(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn direct_project_command_project_id(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_action_target_project_id(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_action_project_owner(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT owner_id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}

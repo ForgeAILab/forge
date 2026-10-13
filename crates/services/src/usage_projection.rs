@@ -159,11 +159,11 @@ struct EventSourceMetadata {
 }
 
 fn event_source_metadata_from_row(
-    row: &sqlx::sqlite::SqliteRow,
+    row: &impl db::UsageEventSourceMetadataRead,
     event: &UsageEvent,
 ) -> Result<EventSourceMetadata> {
-    let rate_source_kind: Option<String> = sqlx::Row::try_get(row, "rate_source_kind")?;
-    let selection_source_kind: Option<String> = sqlx::Row::try_get(row, "selection_source_kind")?;
+    let rate_source_kind: Option<String> = row.rate_source_kind()?;
+    let selection_source_kind: Option<String> = row.selection_source_kind()?;
     let source_kind = rate_source_kind
         .or(selection_source_kind)
         .map(|value| match value.as_str() {
@@ -172,19 +172,15 @@ fn event_source_metadata_from_row(
             _ => Err(invalid_transition()),
         })
         .transpose()?;
-    let selection_freshness: Option<String> =
-        sqlx::Row::try_get(row, "selection_catalog_freshness")?;
-    let estimate_freshness: Option<String> = sqlx::Row::try_get(row, "estimate_catalog_freshness")?;
+    let selection_freshness: Option<String> = row.selection_catalog_freshness()?;
+    let estimate_freshness: Option<String> = row.estimate_catalog_freshness()?;
     let freshness = estimate_freshness
         .or(selection_freshness)
         .map(|value| parse_source_freshness(&value))
         .transpose()?;
-    let selection_rate_revision_id: Option<String> =
-        sqlx::Row::try_get(row, "selection_rate_revision_id")?;
-    let selection_catalog_snapshot_id: Option<String> =
-        sqlx::Row::try_get(row, "selection_catalog_snapshot_id")?;
-    let rate_catalog_snapshot_id: Option<String> =
-        sqlx::Row::try_get(row, "rate_catalog_snapshot_id")?;
+    let selection_rate_revision_id: Option<String> = row.selection_rate_revision_id()?;
+    let selection_catalog_snapshot_id: Option<String> = row.selection_catalog_snapshot_id()?;
+    let rate_catalog_snapshot_id: Option<String> = row.rate_catalog_snapshot_id()?;
     let rate_revision_id = event
         .rate_revision_id
         .clone()
@@ -194,9 +190,9 @@ fn event_source_metadata_from_row(
         .clone()
         .or(rate_catalog_snapshot_id)
         .or(selection_catalog_snapshot_id);
-    let catalog_digest: Option<String> = sqlx::Row::try_get(row, "catalog_digest")?;
-    let effective_at: Option<String> = sqlx::Row::try_get(row, "rate_effective_at")?;
-    let fetched_at: Option<String> = sqlx::Row::try_get(row, "catalog_fetched_at")?;
+    let catalog_digest: Option<String> = row.catalog_digest()?;
+    let effective_at: Option<String> = row.rate_effective_at()?;
+    let fetched_at: Option<String> = row.catalog_fetched_at()?;
     Ok(EventSourceMetadata {
         source_kind,
         rate_revision_id,

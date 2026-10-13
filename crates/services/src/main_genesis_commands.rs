@@ -29,7 +29,6 @@ use forge_agent_host::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::{
     agent_chat_policy::guard_agent_chat_content,
@@ -460,31 +459,26 @@ impl MainGenesisCommandService {
             return self.replay_start(receipt).await;
         }
 
-        let active_session: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM product_genesis_session
-             WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&account_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let active_session: Option<String> = self
+            .db
+            .genesis_start_active_session_in_tx(&mut transaction, &account_id)
+            .await?;
         if let Some(active_session) = active_session {
             return Err(ServiceError::ProductGenesisActiveSession {
                 session_id: active_session,
             });
         }
         if let Some(source_turn_id) = source.turn_id.as_deref() {
-            let live_source: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM agent_chat_turn_job
-                 WHERE id = ? AND chat_id = ? AND triggering_message_id = ?
-                   AND responder_identity_id = ? AND status = 'leased'",
-            )
-            .bind(source_turn_id)
-            .bind(&chat.id)
-            .bind(&source.message_id)
-            .bind(&actor_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
+            let live_source: Option<i64> = self
+                .db
+                .genesis_start_live_source_turn_in_tx(
+                    &mut transaction,
+                    source_turn_id,
+                    &chat.id,
+                    &source.message_id,
+                    &actor_id,
+                )
+                .await?;
             if live_source.is_none() {
                 return Err(ServiceError::Conflict(
                     "the Main turn that requested Product Genesis is no longer active".to_owned(),
@@ -498,62 +492,56 @@ impl MainGenesisCommandService {
                     "serialize Product Genesis source message: {error}"
                 ))
             })?;
-        sqlx::query(
-            "INSERT INTO product_genesis_session (
-                id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
-                initial_idea, lifecycle, source_message_ids_json,
-                preferred_project_agent_identity_id, version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'discovering', ?, ?, 1, ?, ?)",
-        )
-        .bind(&session_id)
-        .bind(&account_id)
-        .bind(&chat.id)
-        .bind(crate::PRODUCT_GENESIS_PROMPT_VERSION)
-        .bind(&prompt)
-        .bind(maturity.as_str())
-        .bind(&guarded.content)
-        .bind(&source_message_ids_json)
-        .bind(input.request.preferred_project_agent_identity_id.as_deref())
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *transaction)
-        .await?;
+        self.db
+            .insert_main_genesis_session_in_tx(
+                &mut transaction,
+                db::InsertMainGenesisSessionInTxInput {
+                    session_id: &session_id,
+                    account_id: &account_id,
+                    chat_id: &chat.id,
+                    prompt_revision: crate::PRODUCT_GENESIS_PROMPT_VERSION,
+                    prompt_body: &prompt,
+                    maturity: maturity.as_str(),
+                    initial_idea: &guarded.content,
+                    source_message_ids_json: &source_message_ids_json,
+                    preferred_identity_id: input
+                        .request
+                        .preferred_project_agent_identity_id
+                        .as_deref(),
+                    created_at: &now,
+                    updated_at: &now,
+                },
+            )
+            .await?;
 
-        let instruction_revision = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(revision), 0) + 1
-             FROM agent_chat_instruction_revision WHERE chat_id = ?",
-        )
-        .bind(&chat.id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "INSERT INTO agent_chat_instruction_revision (
-                id, chat_id, source_type, source_id, revision, body,
-                content_guard_json, sensitivity, created_by_type, created_by_id,
-                created_at
-             ) VALUES (?, ?, 'native', ?, ?, ?, '{}', 'internal',
-                       'product_genesis', ?, ?)",
-        )
-        .bind(new_uuid_v4())
-        .bind(&chat.id)
-        .bind(&session_id)
-        .bind(instruction_revision)
-        .bind(&prompt)
-        .bind(&account_id)
-        .bind(&now)
-        .execute(&mut *transaction)
-        .await?;
-        let updated = sqlx::query(
-            "UPDATE agent_chat
-             SET instruction_revision = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND kind = 'account_main' AND account_id = ? AND status = 'ready'",
-        )
-        .bind(instruction_revision)
-        .bind(&now)
-        .bind(&chat.id)
-        .bind(&account_id)
-        .execute(&mut *transaction)
-        .await?;
+        let instruction_revision = self
+            .db
+            .genesis_next_chat_instruction_revision_in_tx(&mut transaction, &chat.id)
+            .await?;
+        self.db
+            .insert_genesis_chat_instruction_in_tx(
+                &mut transaction,
+                db::InsertGenesisChatInstructionInTxInput {
+                    id: new_uuid_v4(),
+                    chat_id: &chat.id,
+                    source_id: &session_id,
+                    revision: instruction_revision,
+                    body: &prompt,
+                    account_id: &account_id,
+                    created_at: &now,
+                },
+            )
+            .await?;
+        let updated = self
+            .db
+            .set_main_chat_genesis_instruction_in_tx(
+                &mut transaction,
+                instruction_revision,
+                &now,
+                &chat.id,
+                &account_id,
+            )
+            .await?;
         if updated.rows_affected() != 1 {
             return Err(ServiceError::Conflict(
                 "Main Agent setup changed while Product Genesis was starting".to_owned(),
@@ -694,23 +682,14 @@ impl MainGenesisCommandService {
     }
 
     async fn main_chat_for_account(&self, account_id: &str) -> Result<AgentChat> {
-        let chat_id = sqlx::query_scalar::<_, String>(
-            "SELECT chat.id
-             FROM agent_chat AS chat
-             JOIN account_main_agent_binding AS binding
-               ON binding.account_id = chat.account_id
-              AND binding.state = 'active'
-             WHERE chat.account_id = ? AND chat.kind = 'account_main'
-               AND chat.status = 'ready'
-             ORDER BY chat.created_at ASC, chat.id ASC LIMIT 1",
-        )
-        .bind(account_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::ExecutionSetupRequired {
-            message: "Main Agent setup is required before starting Product Genesis".to_owned(),
-            requirements: vec![api_types::SetupRequirement::new("main_agent")],
-        })?;
+        let chat_id = self
+            .db
+            .genesis_start_ready_main_chat_id(account_id)
+            .await?
+            .ok_or_else(|| ServiceError::ExecutionSetupRequired {
+                message: "Main Agent setup is required before starting Product Genesis".to_owned(),
+                requirements: vec![api_types::SetupRequirement::new("main_agent")],
+            })?;
         AgentChatRepo::get_agent_chat(&*self.db, &chat_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent_chat", chat_id))
@@ -782,22 +761,16 @@ impl MainGenesisCommandService {
                 create_visible_message: true,
             }),
             MainGenesisStartPrincipal::MainAgent { identity_id, .. } => {
-                let row = sqlx::query(
-                    "SELECT id, triggering_message_id, correlation_id, causation_depth
-                     FROM agent_chat_turn_job
-                     WHERE chat_id = ? AND responder_identity_id = ? AND status = 'leased'
-                     ORDER BY created_at DESC, id DESC LIMIT 1",
-                )
-                .bind(&chat.id)
-                .bind(identity_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| ServiceError::AuthorizationDenied {
-                    message: "genesis.start requires the currently leased Main Chat turn"
-                        .to_owned(),
-                })?;
-                let turn_id: String = row.try_get("id")?;
-                let message_id: String = row.try_get("triggering_message_id")?;
+                let row = self
+                    .db
+                    .genesis_start_leased_main_turn(&chat.id, identity_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::AuthorizationDenied {
+                        message: "genesis.start requires the currently leased Main Chat turn"
+                            .to_owned(),
+                    })?;
+                let turn_id: String = row.id()?;
+                let message_id: String = row.triggering_message_id()?;
                 let message = AgentChatMessageRepo::get_agent_chat_message(&*self.db, &message_id)
                     .await?
                     .filter(|message| {
@@ -813,8 +786,8 @@ impl MainGenesisCommandService {
                     message_id,
                     turn_id: Some(turn_id),
                     content: message.content,
-                    source_correlation_id: Some(row.try_get("correlation_id")?),
-                    source_causation_depth: row.try_get("causation_depth")?,
+                    source_correlation_id: Some(row.correlation_id()?),
+                    source_causation_depth: row.causation_depth()?,
                     create_visible_message: false,
                 })
             }
@@ -841,18 +814,15 @@ impl MainGenesisCommandService {
                 });
             }
         }
-        let discovery_revision = sqlx::query_scalar::<_, String>(
-            "SELECT current_revision_id FROM operating_skill
-             WHERE id = ? AND lifecycle = 'active'",
-        )
-        .bind(MAIN_OPERATING_SKILL_KEY)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Product Genesis operating skill is unavailable for turn admission",
-            )
-        })?;
+        let discovery_revision = self
+            .db
+            .genesis_active_main_skill_revision_id(MAIN_OPERATING_SKILL_KEY)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Product Genesis operating skill is unavailable for turn admission",
+                )
+            })?;
         responder.operating_skill_revision = Some(discovery_revision);
         responder.require_frozen()?;
         let trigger_content_digest = content_digest(content)?;
@@ -1058,17 +1028,13 @@ impl MainGenesisCommandService {
         }
         let session_id = match input.request.genesis_session_id.as_deref() {
             Some(id) => id.to_owned(),
-            None => sqlx::query_scalar::<_, String>(
-                "SELECT id FROM product_genesis_session
-                 WHERE account_id = ? AND lifecycle = 'discovering'
-                 ORDER BY updated_at DESC, id DESC LIMIT 1",
-            )
-            .bind(&account_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::not_found("product_genesis_session", account_id.clone())
-            })?,
+            None => self
+                .db
+                .genesis_discovering_session_id(&account_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("product_genesis_session", account_id.clone())
+                })?,
         };
         let genesis = ProductGenesisService::for_sqlite(Arc::clone(&self.db));
         let session = genesis.get(&session_id).await?;
@@ -1154,20 +1120,19 @@ impl MainGenesisCommandService {
                     message: "authority_revoked".into(),
                 })?;
         }
-        let changed = sqlx::query(
-            "UPDATE product_genesis_session
-             SET preferred_project_agent_identity_id = ?, version = version + 1,
-                 updated_at = ?
-             WHERE id = ? AND account_id = ? AND lifecycle = 'discovering'
-               AND version = ?",
-        )
-        .bind(&selection.identity_id)
-        .bind(&now)
-        .bind(&session.id)
-        .bind(&account_id)
-        .bind(input.request.expected_session_version)
-        .execute(&mut *transaction)
-        .await?;
+        let changed = self
+            .db
+            .set_genesis_preferred_project_identity_in_tx(
+                &mut transaction,
+                db::SetGenesisPreferredProjectIdentityInTxInput {
+                    identity_id: &selection.identity_id,
+                    updated_at: &now,
+                    session_id: &session.id,
+                    account_id: &account_id,
+                    version: input.request.expected_session_version,
+                },
+            )
+            .await?;
         if changed.rows_affected() != 1 {
             return Err(ServiceError::Db(db::DbError::VersionConflict));
         }
@@ -1369,15 +1334,14 @@ impl MainGenesisCommandService {
             }
             MainGenesisDraftPrincipal::MainAgent { identity_id, scope } => {
                 let identity_id = required_value("Main identity id", identity_id)?;
-                let row = sqlx::query(
-                    "SELECT owner_id, paused, archived_at
-                     FROM agent_identity WHERE id = ?",
-                )
-                .bind(&identity_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.clone()))?;
-                let owner_id: Option<String> = row.try_get("owner_id")?;
+                let row = self
+                    .db
+                    .genesis_draft_identity_owner(&identity_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::not_found("agent_identity", identity_id.clone())
+                    })?;
+                let owner_id: Option<String> = row.owner_id()?;
                 let account_id = owner_id.ok_or_else(|| ServiceError::AuthorizationDenied {
                     message: "Main identity is not bound to an account".to_owned(),
                 })?;
@@ -1392,16 +1356,15 @@ impl MainGenesisCommandService {
                         account_id.clone()
                     }
                     CanonicalScopeType::AgentChat => {
-                        let chat =
-                            sqlx::query("SELECT kind, account_id FROM agent_chat WHERE id = ?")
-                                .bind(&scope.scope_id)
-                                .fetch_optional(self.db.pool())
-                                .await?
-                                .ok_or_else(|| {
-                                    ServiceError::not_found("agent_chat", scope.scope_id.clone())
-                                })?;
-                        let kind: String = chat.try_get("kind")?;
-                        let chat_account: Option<String> = chat.try_get("account_id")?;
+                        let chat = self
+                            .db
+                            .genesis_draft_main_chat_scope(&scope.scope_id)
+                            .await?
+                            .ok_or_else(|| {
+                                ServiceError::not_found("agent_chat", scope.scope_id.clone())
+                            })?;
+                        let kind: String = chat.kind()?;
+                        let chat_account: Option<String> = chat.account_id()?;
                         if kind != "account_main"
                             || chat_account.as_deref() != Some(account_id.as_str())
                         {
@@ -1444,33 +1407,19 @@ impl MainGenesisCommandService {
         let MainGenesisDraftPrincipal::MainAgent { identity_id, scope } = principal else {
             return Ok(());
         };
-        let eligible: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM agent_identity AS identity
-             JOIN account_main_agent_binding AS binding
-               ON binding.identity_id = identity.id
-              AND binding.account_id = identity.owner_id
-              AND binding.state = 'active'
-             JOIN agent_chat AS chat
-               ON chat.account_id = binding.account_id
-              AND chat.kind = 'account_main'
-             WHERE identity.id = ?
-               AND identity.owner_id = ?
-               AND identity.paused = 0
-               AND identity.archived_at IS NULL
-               AND (? <> 'agent_chat' OR chat.id = ?)
-             LIMIT 1",
-        )
-        .bind(identity_id)
-        .bind(account_id)
-        .bind(if scope.scope_type == CanonicalScopeType::AgentChat {
-            "agent_chat"
-        } else {
-            "account"
-        })
-        .bind(&scope.scope_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let eligible: Option<i64> = self
+            .db
+            .genesis_current_main_principal(
+                identity_id,
+                account_id,
+                if scope.scope_type == CanonicalScopeType::AgentChat {
+                    "agent_chat"
+                } else {
+                    "account"
+                },
+                &scope.scope_id,
+            )
+            .await?;
         if eligible.is_none() {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Main identity is not the active account Main binding".to_owned(),
@@ -1574,17 +1523,13 @@ impl MainGenesisCommandService {
     )> {
         let session_id = match request.genesis_session_id.as_deref() {
             Some(id) => id.to_owned(),
-            None => sqlx::query_scalar::<_, String>(
-                "SELECT id FROM product_genesis_session
-                 WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
-                 ORDER BY updated_at DESC, id DESC LIMIT 1",
-            )
-            .bind(account_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::not_found("product_genesis_session", account_id.to_owned())
-            })?,
+            None => self
+                .db
+                .genesis_current_active_session_id(account_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("product_genesis_session", account_id.to_owned())
+                })?,
         };
         let session = crate::ProductGenesisService::for_sqlite(Arc::clone(&self.db))
             .get(&session_id)

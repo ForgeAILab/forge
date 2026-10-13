@@ -689,3 +689,106 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+impl SqliteDb {
+    pub async fn native_ready_workspace_path(
+        &self,
+        workspace_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT worktree_path FROM workspace WHERE id = ? AND status = 'ready'",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_live_worktree_paths(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT worktree_path FROM workspace WHERE status != 'cleaned'",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_task_statuses(&self, task_id: &str) -> crate::Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT status FROM workspace WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_path_prefix_statuses(
+        &self,
+        prefix: String,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT status FROM workspace
+                     WHERE substr(worktree_path, 1, length(?1)) = ?1",
+        )
+        .bind(prefix)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_build_eviction_candidates(
+        &self,
+        limit: i64,
+    ) -> crate::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT task_id, worktree_path FROM workspace
+             WHERE status = 'ready' ORDER BY updated_at, id LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_measurement_candidates(
+        &self,
+        prefix: String,
+        limit: i64,
+    ) -> crate::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT id, worktree_path FROM workspace
+                     WHERE status NOT IN ('cleaned', 'cleaning')
+                       AND substr(worktree_path, 1, length(?1)) = ?1
+                     ORDER BY disk_measured_at IS NOT NULL, disk_measured_at, id LIMIT ?2",
+        )
+        .bind(prefix)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_workspace_gc_measurement(
+        &self,
+        bytes: Option<i64>,
+        measured_at: String,
+        workspace_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE workspace SET disk_bytes = COALESCE(?, disk_bytes), disk_measured_at = ?
+                 WHERE id = ? AND status NOT IN ('cleaned', 'cleaning')",
+        )
+        .bind(bytes)
+        .bind(measured_at)
+        .bind(workspace_id)
+        .execute(self.pool())
+        .await?)
+    }
+}

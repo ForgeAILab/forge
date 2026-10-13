@@ -1932,3 +1932,145 @@ pub use task::{WorkspaceLeaseRoleAssignmentRow, WorkspaceLeaseTaskAssignmentRow}
 pub use workspace_lease::InsertIssuedWorkspaceLeaseInTxInput;
 
 pub use orchestration::task_governance_document_revision_source_on_pool;
+
+pub use agent::{FrozenProjectTurnBindingRow, ProjectTurnBindingAuthorityRow};
+
+pub use orchestration::{
+    FrozenTurnOperatingSkillRow, MainTurnGenesisInstructionRow, MainTurnOperatingSkillRow,
+    ProjectTurnAdmissionReceiptRow, ProjectTurnApprovalEventRow, ProjectTurnCharterApprovalRow,
+    ProjectTurnOperatingSkillRow,
+};
+
+pub use project::MainTurnPortfolioProjectRow;
+
+pub use agent_chat::{
+    ChatTurnProtectedInteractionRow, ClaimFifoChatTurnInTxInput, ExpiredChatTurnLeaseRow,
+    FailChatTurnExpiredInteractionInTxInput, FailChatTurnMissingInteractionInTxInput,
+    FailChatTurnWithoutInteractionInTxInput, ParkedChatTurnInteractionRow,
+    ProjectTurnAdmissionHandoffRow, RecoverExpiredChatTurnLeaseInTxInput,
+};
+
+pub use command_receipt::GenesisControlTransferReceiptRow;
+
+pub use orchestration::{
+    InsertNativeProjectCommandObservationInput, NativeApprovedProjectCharterRow,
+    NativeDiscoverySessionRow,
+};
+
+pub use project::{NativeOwnedProjectSummaryRow, NativePortfolioProjectRow};
+
+pub use task_comment::NativeProjectWorklogRow;
+
+pub use shared_media::NativeProjectArtifactRow;
+
+pub use task::NativeWorkTaskRow;
+
+pub use domain_event::NativeScopeEventRow;
+
+pub use task_dependency::NativeTaskDependencyRow;
+
+pub use execution::NativeLatestTaskExecutionRow;
+
+pub use agent::{NativeScopeSummaryField, NativeScopeSummaryRow};
+
+pub use agent_chat_topic::TopicRotationIntentRow;
+
+pub use embedded_agent::{
+    ReserveTopicRotationSuccessorSessionInTxInput, TopicRotationScopeWorkspaceRow,
+};
+
+pub use agent_chat::TopicRotationHistoryMessageRow;
+
+pub use repo_location::{
+    ApplyRepositoryProvisionLocationInTxInput, ClaimRepositoryProvisionAttemptInTxInput,
+    InsertRepositoryProvisionLocationInTxInput, RecordRepositoryProvisionFailureInTxInput,
+    ReleaseStaleRepositoryProvisionAttemptInput, RepositoryProvisionAttemptFailureInput,
+    RepositoryProvisionAttemptIsCurrentInput,
+};
+
+pub use project::provisioning_project_settings_on_connection;
+
+pub use environment_readiness::RepositoryProvisionReadinessIsCurrentInTxInput;
+
+pub use task::RepositoryProvisionTaskWaitInput;
+
+pub use orchestration::{
+    InsertMainGenesisSessionInTxInput, SetGenesisPreferredProjectIdentityInTxInput,
+};
+
+pub use agent_chat::{
+    GenesisDraftMainChatScopeRow, GenesisStartLeasedMainTurnRow,
+    InsertGenesisChatInstructionInTxInput,
+};
+
+pub use agent::GenesisDraftIdentityOwnerRow;
+
+pub use orchestration::{
+    ArtifactDocumentApprovalSourceRow, ValidationAcceptanceCheckSourceRow,
+    ValidationCommandObservationSourceRow,
+};
+
+pub use project::ValidationProjectCharterSourceRow;
+
+pub use command_receipt::{
+    ArtifactCommandConflictingInputDigestInput, ArtifactReplayCommandInputDigestInput,
+};
+
+pub use shared_media::EvidenceAttachmentSourceRow;
+
+pub use orchestration::{
+    ApplyProductGenesisSetupInput, InsertProductGenesisSessionInTxInput,
+    ProductGenesisSessionSourceRow, ProductGenesisSourceMessagesRow,
+    TransitionProductGenesisSessionInput,
+};
+
+pub use agent_chat::InsertProductGenesisInstructionInTxInput;
+
+pub use pricing::{
+    usage_index_actual_rowids_on_connection, usage_index_affected_agents_on_connection,
+    usage_index_changed_estimates_on_connection, usage_index_changed_invocations_on_connection,
+    usage_index_citation_event_ids_on_connection,
+    usage_index_effective_event_sources_on_connection, usage_index_watermarks_on_connection,
+    UsageIndexActualRowidsRow, UsageIndexAffectedAgentRow,
+    UsageIndexAffectedAgentsOnConnectionInput, UsageIndexCitationEventIdsOnConnectionInput,
+    UsageIndexEffectiveEventRow, UsageIndexEstimateChangeRow, UsageIndexInvocationChangeRow,
+    UsageIndexWatermarksRow,
+};
+
+pub use execution::{
+    usage_index_agent_execution_stats_on_connection, usage_index_changed_executions_on_connection,
+    usage_index_execution_domains_on_connection, usage_index_inserted_executions_on_connection,
+    UsageIndexAgentExecutionStatsRow, UsageIndexChangedExecutionsOnConnectionInput,
+    UsageIndexExecutionDomainRow, UsageIndexExecutionRow,
+};
+
+pub use pricing::usage_index_source_batch_on_connection;
+
+pub use pricing::{UsageEventSourceMetadataRead, UsageIndexAffectedAgentField};
+
+pub use execution::UsageIndexExecutionTextField;
+
+pub use project::ChatUsageProjectScopeRow;
+
+pub use orchestration::ChatUsageHandedOffProjectIdInput;
+
+pub use chat_ledger::ChatTopicSummaryUsageRow;
+
+pub use orchestration::{
+    MilestoneArtifactReferenceSourceRow, MilestoneReleaseReadinessCandidateRow,
+    MilestoneReplayReadinessSourceRow,
+};
+
+pub use orchestration::{
+    DecisionArtifactRenderSourceInput, DecisionArtifactRenderSourceRow,
+    DecisionGoverningCharterSourceRow, DecisionGoverningDocumentSourceRow,
+    ProjectDecisionCommandSourceRow,
+};
+
+pub use agent::DirectProjectActorStatusRow;
+
+pub use agent_chat::DirectProjectChatScopeRow;
+
+pub use repo_location::SetRepositoryLocationDefaultInTxInput;
+
+pub use repo_location::{RepoLocationPageSort, VisibleRepositoryLocationPageInput};

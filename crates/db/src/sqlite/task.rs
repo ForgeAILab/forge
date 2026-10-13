@@ -4272,3 +4272,276 @@ impl SqliteDb {
         Ok(rows.map(|row| WorkspaceLeaseRoleAssignmentRow { row }))
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeWorkTaskRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeWorkTaskRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn condition_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("condition_json")?)
+    }
+    pub fn parent_task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("parent_task_id")?)
+    }
+    pub fn subtask_order(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("subtask_order")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn title(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("title")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn priority(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("priority")?)
+    }
+    pub fn assignee_type(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("assignee_type")?)
+    }
+    pub fn assignee_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("assignee_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_work_tasks(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<NativeWorkTaskRow>> {
+        let rows = sqlx::query(
+            "SELECT id, parent_task_id, subtask_order, version,
+                            title, status, priority, assignee_type, assignee_id,
+                            condition_json
+                     FROM task WHERE project_id = ? AND deleted_at IS NULL
+                     ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeWorkTaskRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_scope_work_task(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Vec<NativeWorkTaskRow>> {
+        let rows = sqlx::query(
+            "SELECT id, parent_task_id, subtask_order, version,
+                        title, status, priority, assignee_type, assignee_id,
+                        condition_json
+                     FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeWorkTaskRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_task_project_id(&self, task_id: &str) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_task_scope_summary(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<NativeScopeSummaryRow>> {
+        let rows =
+            sqlx::query("SELECT id, project_id, title, status, priority FROM task WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(rows.map(|row| NativeScopeSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_task_log_references(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM review
+                WHERE task_id = ?1 AND status IN ('running', 'awaiting_human')
+             ) OR EXISTS (
+                SELECT 1 FROM attention_projection
+                WHERE status <> 'resolved'
+                  AND ((scope_type = 'task' AND scope_id = ?1)
+                       OR json_extract(details_json, '$.task_id') = ?1
+                       OR json_extract(details_json, '$.task.id') = ?1)
+             )",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_legacy_log_task_exists(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
+                .bind(task_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_root_task_exists(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
+                .bind(task_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_task_active_uses(&self, task_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS (
+                SELECT 1 FROM execution
+                WHERE (task_id = ?1 OR workspace_id IN (SELECT id FROM workspace WHERE task_id = ?1))
+                  AND status = 'running'
+             ) OR EXISTS (
+                SELECT 1 FROM workspace_lease wl
+                LEFT JOIN execution e ON e.id = wl.execution_id
+                WHERE (wl.task_id = ?1
+                       OR e.workspace_id IN (SELECT id FROM workspace WHERE task_id = ?1))
+                  AND wl.status = 'active'
+             ) OR EXISTS (
+                SELECT 1 FROM task child JOIN execution e ON e.task_id = child.id
+                WHERE child.parent_task_id = ?1 AND e.status = 'running'
+             )",)
+.bind(task_id)
+.fetch_one(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_provision_environment_wait_tasks(
+        &self,
+        project_id: &str,
+        machine_json: &str,
+    ) -> crate::Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as::<_, (String, i64)>("SELECT id,version FROM task WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?)",)
+.bind(project_id)
+.bind(machine_json)
+.fetch_all(self.pool()).await?)
+    }
+}
+
+pub struct RepositoryProvisionTaskWaitInput<'a> {
+    pub task_id: &'a str,
+    pub reason: &'a str,
+    pub version: i64,
+    pub machine_json: &'a str,
+    pub project_id: &'a str,
+    pub daemon_id: &'a Option<String>,
+    pub runtime_id: &'a Option<String>,
+    pub readiness_version: i64,
+}
+impl SqliteDb {
+    pub async fn record_repository_provision_task_wait_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: RepositoryProvisionTaskWaitInput<'_>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
+.bind(input.reason).bind(input.task_id).bind(input.version).bind(input.machine_json).bind(input.project_id).bind(input.daemon_id).bind(input.runtime_id).bind(input.readiness_version).identity_fenced().execute_in_tx(tx).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_observed_task_status(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT status FROM task
+                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_definition_task_reference(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_governed_task_reference(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1
+                 FROM task AS t
+                 JOIN project_task_governance AS g ON g.task_id = t.id
+                 WHERE t.id = ? AND t.project_id = ?
+                 LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_task_reference(
+        &self,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1",
+        )
+        .bind(id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

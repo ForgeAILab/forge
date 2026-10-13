@@ -152,21 +152,10 @@ impl WorkspaceCleanupScheduler {
     /// This database's identity as a workspace-root owner: created once and
     /// kept with the data, so a reset database is a different owner.
     async fn gc_owner_id(&self) -> Result<String> {
-        sqlx::query(
-            "INSERT INTO system_setting (key, value, updated_at) VALUES (?, ?, ?)
-             ON CONFLICT(key) DO NOTHING",
-        )
-        .bind(OWNER_KEY)
-        .bind(db::new_uuid_v4())
-        .bind(now_rfc3339())
-        .execute(self.db.pool())
-        .await?;
-        Ok(
-            sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
-                .bind(OWNER_KEY)
-                .fetch_one(self.db.pool())
-                .await?,
-        )
+        self.db
+            .insert_workspace_gc_owner(OWNER_KEY, db::new_uuid_v4(), now_rfc3339())
+            .await?;
+        Ok(self.db.workspace_gc_owner_value(OWNER_KEY).await?)
     }
 
     /// Whether this database owns `root` right now. Read-only on disk.
@@ -194,16 +183,10 @@ impl WorkspaceCleanupScheduler {
             "reason": reason,
         })
         .to_string();
-        let written = sqlx::query(
-            "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-             WHERE system_setting.value != excluded.value",
-        )
-        .bind(STATUS_KEY)
-        .bind(value)
-        .bind(now_rfc3339())
-        .execute(self.db.pool())
-        .await;
+        let written = self
+            .db
+            .record_workspace_gc_status(STATUS_KEY, value, now_rfc3339())
+            .await;
         if let Err(error) = written {
             tracing::warn!(%error, "workspace gc status not recorded");
         }
@@ -377,21 +360,7 @@ impl WorkspaceCleanupScheduler {
     /// No review of the Task is open (running or waiting for a person) and
     /// no attention item about it is unresolved.
     async fn task_logs_unreferenced(&self, task_id: &str) -> Result<bool> {
-        let referenced = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (
-                SELECT 1 FROM review
-                WHERE task_id = ?1 AND status IN ('running', 'awaiting_human')
-             ) OR EXISTS (
-                SELECT 1 FROM attention_projection
-                WHERE status <> 'resolved'
-                  AND ((scope_type = 'task' AND scope_id = ?1)
-                       OR json_extract(details_json, '$.task_id') = ?1
-                       OR json_extract(details_json, '$.task.id') = ?1)
-             )",
-        )
-        .bind(task_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let referenced = self.db.workspace_gc_task_log_references(task_id).await?;
         Ok(referenced == 0)
     }
 
@@ -514,15 +483,9 @@ impl WorkspaceCleanupScheduler {
             // worktree still on record is known too, whatever it is.
             let records = async {
                 let repositories: Vec<(String, Option<String>)> =
-                    sqlx::query_as("SELECT id, local_path FROM repo")
-                        .fetch_all(self.db.pool())
-                        .await?;
-                let worktrees: Vec<String> = sqlx::query_scalar(
-                    "SELECT worktree_path FROM workspace WHERE status != 'cleaned'",
-                )
-                .fetch_all(self.db.pool())
-                .await?;
-                Ok::<_, sqlx::Error>((repositories, worktrees))
+                    self.db.workspace_gc_repository_paths().await?;
+                let worktrees: Vec<String> = self.db.workspace_gc_live_worktree_paths().await?;
+                Ok::<_, db::DbError>((repositories, worktrees))
             };
             match records.await {
                 Ok((repositories, worktrees)) => {
@@ -606,11 +569,7 @@ impl WorkspaceCleanupScheduler {
         .unwrap_or_default();
         let mut known = HashSet::new();
         for name in names {
-            let exists =
-                sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
-                    .bind(&name)
-                    .fetch_one(self.db.pool())
-                    .await;
+            let exists = self.db.workspace_gc_legacy_log_task_exists(&name).await;
             if matches!(exists, Ok(found) if found != 0) {
                 known.insert(name);
             }
@@ -699,29 +658,13 @@ impl WorkspaceCleanupScheduler {
     }
 
     async fn classify_root(&self, name: &str) -> Result<RootClass> {
-        let project =
-            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?)")
-                .bind(name)
-                .fetch_one(self.db.pool())
-                .await?;
+        let project = self.db.workspace_gc_root_project_exists(name).await?;
         if project != 0 {
             return Ok(RootClass::Live);
         }
-        let mut statuses =
-            sqlx::query_scalar::<_, String>("SELECT status FROM workspace WHERE task_id = ?")
-                .bind(name)
-                .fetch_all(self.db.pool())
-                .await?;
+        let mut statuses = self.db.workspace_gc_task_statuses(name).await?;
         for prefix in self.root_prefixes(name) {
-            statuses.extend(
-                sqlx::query_scalar::<_, String>(
-                    "SELECT status FROM workspace
-                     WHERE substr(worktree_path, 1, length(?1)) = ?1",
-                )
-                .bind(prefix)
-                .fetch_all(self.db.pool())
-                .await?,
-            );
+            statuses.extend(self.db.workspace_gc_path_prefix_statuses(prefix).await?);
         }
         if statuses.iter().any(|status| status != "cleaned") {
             return Ok(RootClass::Live);
@@ -731,10 +674,7 @@ impl WorkspaceCleanupScheduler {
         }
         // A create has its directory before its workspace row, but never
         // before its Task.
-        let task = sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
-            .bind(name)
-            .fetch_one(self.db.pool())
-            .await?;
+        let task = self.db.workspace_gc_root_task_exists(name).await?;
         Ok(if task != 0 {
             RootClass::Live
         } else {
@@ -762,25 +702,7 @@ impl WorkspaceCleanupScheduler {
     /// A running execution or an active lease of the Task or of a workspace
     /// it owns.
     async fn task_is_active(&self, task_id: &str) -> Result<bool> {
-        let active = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (
-                SELECT 1 FROM execution
-                WHERE (task_id = ?1 OR workspace_id IN (SELECT id FROM workspace WHERE task_id = ?1))
-                  AND status = 'running'
-             ) OR EXISTS (
-                SELECT 1 FROM workspace_lease wl
-                LEFT JOIN execution e ON e.id = wl.execution_id
-                WHERE (wl.task_id = ?1
-                       OR e.workspace_id IN (SELECT id FROM workspace WHERE task_id = ?1))
-                  AND wl.status = 'active'
-             ) OR EXISTS (
-                SELECT 1 FROM task child JOIN execution e ON e.task_id = child.id
-                WHERE child.parent_task_id = ?1 AND e.status = 'running'
-             )",
-        )
-        .bind(task_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let active = self.db.workspace_gc_task_active_uses(task_id).await?;
         Ok(active != 0)
     }
 
@@ -854,11 +776,7 @@ impl WorkspaceCleanupScheduler {
     }
 
     async fn running_execution_ids(&self) -> Result<Vec<String>> {
-        Ok(
-            sqlx::query_scalar::<_, String>("SELECT id FROM execution WHERE status = 'running'")
-                .fetch_all(self.db.pool())
-                .await?,
-        )
+        Ok(self.db.workspace_gc_running_execution_ids().await?)
     }
 
     /// The Task-root directory name of a recorded worktree path, when the
@@ -892,13 +810,10 @@ impl WorkspaceCleanupScheduler {
         if !blocking(under_floor.clone()).await.unwrap_or(false) {
             return Ok(());
         }
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT task_id, worktree_path FROM workspace
-             WHERE status = 'ready' ORDER BY updated_at, id LIMIT ?",
-        )
-        .bind(EVICTION_CANDIDATES)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .workspace_gc_build_eviction_candidates(EVICTION_CANDIDATES)
+            .await?;
         let mut tasks = HashMap::new();
         for (task_id, worktree_path) in rows {
             if let Some(name) = self.task_root_name(&worktree_path) {
@@ -979,16 +894,9 @@ impl WorkspaceCleanupScheduler {
             // `<root>//` → `<root>/`: every worktree under this root.
             let prefix = prefix.trim_end_matches('/').to_owned() + "/";
             rows.extend(
-                sqlx::query_as::<_, (String, String)>(
-                    "SELECT id, worktree_path FROM workspace
-                     WHERE status NOT IN ('cleaned', 'cleaning')
-                       AND substr(worktree_path, 1, length(?1)) = ?1
-                     ORDER BY disk_measured_at IS NOT NULL, disk_measured_at, id LIMIT ?2",
-                )
-                .bind(prefix)
-                .bind(MEASURE_LIMIT)
-                .fetch_all(self.db.pool())
-                .await?,
+                self.db
+                    .workspace_gc_measurement_candidates(prefix, MEASURE_LIMIT)
+                    .await?,
             );
         }
         for (workspace_id, worktree_path) in rows {
@@ -1004,15 +912,13 @@ impl WorkspaceCleanupScheduler {
             }
             // A root too large to walk inside one pass keeps `disk_bytes`
             // NULL and moves to the back of the queue.
-            sqlx::query(
-                "UPDATE workspace SET disk_bytes = COALESCE(?, disk_bytes), disk_measured_at = ?
-                 WHERE id = ? AND status NOT IN ('cleaned', 'cleaning')",
-            )
-            .bind(measured.map(|bytes| i64::try_from(bytes).unwrap_or(i64::MAX)))
-            .bind(now_rfc3339())
-            .bind(&workspace_id)
-            .execute(self.db.pool())
-            .await?;
+            self.db
+                .record_workspace_gc_measurement(
+                    measured.map(|bytes| i64::try_from(bytes).unwrap_or(i64::MAX)),
+                    now_rfc3339(),
+                    &workspace_id,
+                )
+                .await?;
         }
         Ok(())
     }

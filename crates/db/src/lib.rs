@@ -164,3 +164,141 @@ pub use sqlite::{
 };
 
 pub use sqlite::task_governance_document_revision_source_on_pool;
+
+pub use sqlite::{FrozenProjectTurnBindingRow, ProjectTurnBindingAuthorityRow};
+
+pub use sqlite::{
+    FrozenTurnOperatingSkillRow, MainTurnGenesisInstructionRow, MainTurnOperatingSkillRow,
+    ProjectTurnAdmissionReceiptRow, ProjectTurnApprovalEventRow, ProjectTurnCharterApprovalRow,
+    ProjectTurnOperatingSkillRow,
+};
+
+pub use sqlite::MainTurnPortfolioProjectRow;
+
+pub use sqlite::{
+    ChatTurnProtectedInteractionRow, ClaimFifoChatTurnInTxInput, ExpiredChatTurnLeaseRow,
+    FailChatTurnExpiredInteractionInTxInput, FailChatTurnMissingInteractionInTxInput,
+    FailChatTurnWithoutInteractionInTxInput, ParkedChatTurnInteractionRow,
+    ProjectTurnAdmissionHandoffRow, RecoverExpiredChatTurnLeaseInTxInput,
+};
+
+pub use sqlite::GenesisControlTransferReceiptRow;
+
+pub use sqlite::{
+    InsertNativeProjectCommandObservationInput, NativeApprovedProjectCharterRow,
+    NativeDiscoverySessionRow,
+};
+
+pub use sqlite::{NativeOwnedProjectSummaryRow, NativePortfolioProjectRow};
+
+pub use sqlite::NativeProjectWorklogRow;
+
+pub use sqlite::NativeProjectArtifactRow;
+
+pub use sqlite::NativeWorkTaskRow;
+
+pub use sqlite::NativeScopeEventRow;
+
+pub use sqlite::NativeTaskDependencyRow;
+
+pub use sqlite::NativeLatestTaskExecutionRow;
+
+pub use sqlite::{NativeScopeSummaryField, NativeScopeSummaryRow};
+
+pub use sqlite::TopicRotationIntentRow;
+
+pub use sqlite::{ReserveTopicRotationSuccessorSessionInTxInput, TopicRotationScopeWorkspaceRow};
+
+pub use sqlite::TopicRotationHistoryMessageRow;
+
+pub use sqlite::{
+    ApplyRepositoryProvisionLocationInTxInput, ClaimRepositoryProvisionAttemptInTxInput,
+    InsertRepositoryProvisionLocationInTxInput, RecordRepositoryProvisionFailureInTxInput,
+    ReleaseStaleRepositoryProvisionAttemptInput, RepositoryProvisionAttemptFailureInput,
+    RepositoryProvisionAttemptIsCurrentInput,
+};
+
+pub use sqlite::provisioning_project_settings_on_connection;
+
+pub use sqlite::RepositoryProvisionReadinessIsCurrentInTxInput;
+
+pub use sqlite::RepositoryProvisionTaskWaitInput;
+
+pub use sqlite::{InsertMainGenesisSessionInTxInput, SetGenesisPreferredProjectIdentityInTxInput};
+
+pub use sqlite::{
+    GenesisDraftMainChatScopeRow, GenesisStartLeasedMainTurnRow,
+    InsertGenesisChatInstructionInTxInput,
+};
+
+pub use sqlite::GenesisDraftIdentityOwnerRow;
+
+pub use sqlite::{
+    ArtifactDocumentApprovalSourceRow, ValidationAcceptanceCheckSourceRow,
+    ValidationCommandObservationSourceRow,
+};
+
+pub use sqlite::ValidationProjectCharterSourceRow;
+
+pub use sqlite::{
+    ArtifactCommandConflictingInputDigestInput, ArtifactReplayCommandInputDigestInput,
+};
+
+pub use sqlite::EvidenceAttachmentSourceRow;
+
+pub use sqlite::{
+    ApplyProductGenesisSetupInput, InsertProductGenesisSessionInTxInput,
+    ProductGenesisSessionSourceRow, ProductGenesisSourceMessagesRow,
+    TransitionProductGenesisSessionInput,
+};
+
+pub use sqlite::InsertProductGenesisInstructionInTxInput;
+
+pub use sqlite::{
+    usage_index_actual_rowids_on_connection, usage_index_affected_agents_on_connection,
+    usage_index_changed_estimates_on_connection, usage_index_changed_invocations_on_connection,
+    usage_index_citation_event_ids_on_connection,
+    usage_index_effective_event_sources_on_connection, usage_index_watermarks_on_connection,
+    UsageIndexActualRowidsRow, UsageIndexAffectedAgentRow,
+    UsageIndexAffectedAgentsOnConnectionInput, UsageIndexCitationEventIdsOnConnectionInput,
+    UsageIndexEffectiveEventRow, UsageIndexEstimateChangeRow, UsageIndexInvocationChangeRow,
+    UsageIndexWatermarksRow,
+};
+
+pub use sqlite::{
+    usage_index_agent_execution_stats_on_connection, usage_index_changed_executions_on_connection,
+    usage_index_execution_domains_on_connection, usage_index_inserted_executions_on_connection,
+    UsageIndexAgentExecutionStatsRow, UsageIndexChangedExecutionsOnConnectionInput,
+    UsageIndexExecutionDomainRow, UsageIndexExecutionRow,
+};
+
+pub use sqlite::usage_index_source_batch_on_connection;
+
+pub use sqlite::{UsageEventSourceMetadataRead, UsageIndexAffectedAgentField};
+
+pub use sqlite::UsageIndexExecutionTextField;
+
+pub use sqlite::ChatUsageProjectScopeRow;
+
+pub use sqlite::ChatUsageHandedOffProjectIdInput;
+
+pub use sqlite::ChatTopicSummaryUsageRow;
+
+pub use sqlite::{
+    MilestoneArtifactReferenceSourceRow, MilestoneReleaseReadinessCandidateRow,
+    MilestoneReplayReadinessSourceRow,
+};
+
+pub use sqlite::{
+    DecisionArtifactRenderSourceInput, DecisionArtifactRenderSourceRow,
+    DecisionGoverningCharterSourceRow, DecisionGoverningDocumentSourceRow,
+    ProjectDecisionCommandSourceRow,
+};
+
+pub use sqlite::DirectProjectActorStatusRow;
+
+pub use sqlite::DirectProjectChatScopeRow;
+
+pub use sqlite::SetRepositoryLocationDefaultInTxInput;
+
+pub use sqlite::{RepoLocationPageSort, VisibleRepositoryLocationPageInput};

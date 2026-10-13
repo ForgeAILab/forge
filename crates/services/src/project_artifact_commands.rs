@@ -20,7 +20,6 @@ use db::{
 };
 use serde::{ser::SerializeStruct, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::{
     AgentActionProvenance, CommandContext, CommandPrincipal, CommandScope, CommandScopeType,
@@ -265,14 +264,10 @@ impl ProjectArtifactCommandService {
         // workspace -- but a named Task is always verified, so provenance is
         // either genuinely absent or genuinely true, never merely asserted.
         if let Some(observed_task_id) = command.observed_task_id.as_deref() {
-            let observed_task_status: Option<String> = sqlx::query_scalar(
-                "SELECT status FROM task
-                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
-            )
-            .bind(observed_task_id)
-            .bind(&command.project_id)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let observed_task_status: Option<String> = self
+                .db
+                .validation_observed_task_status(observed_task_id, &command.project_id)
+                .await?;
             let observed_task_status = observed_task_status.ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "observed_task_id must name a Task in this Project that produced the observation",
@@ -285,14 +280,10 @@ impl ProjectArtifactCommandService {
             }
         }
         if let Some(asset_id) = command.evidence_asset_id.as_deref() {
-            let asset_belongs: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM media_asset
-                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
-            )
-            .bind(asset_id)
-            .bind(&command.project_id)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let asset_belongs: Option<i64> = self
+                .db
+                .validation_evidence_asset_in_project(asset_id, &command.project_id)
+                .await?;
             if asset_belongs.is_none() {
                 return Err(ServiceError::invalid_operation(
                     "evidence_asset_id must name a captured artifact in this Project",
@@ -327,25 +318,23 @@ impl ProjectArtifactCommandService {
             ));
         }
 
-        let check = sqlx::query(
-            "SELECT version, source_kind FROM project_milestone_check
-             WHERE id = ? AND project_id = ? AND milestone_id = ?
-               AND definition_revision_id = ?",
-        )
-        .bind(&command.check_id)
-        .bind(&command.project_id)
-        .bind(&command.milestone_id)
-        .bind(&current_definition_revision_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("project_milestone_check", &command.check_id))?;
-        let source_kind: String = check.try_get("source_kind")?;
+        let check = self
+            .db
+            .validation_acceptance_check_source(
+                &command.check_id,
+                &command.project_id,
+                &command.milestone_id,
+                &current_definition_revision_id,
+            )
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project_milestone_check", &command.check_id))?;
+        let source_kind: String = check.source_kind()?;
         if source_kind == "manual" {
             return Err(ServiceError::invalid_operation(
                 "a manual acceptance check is attested by a user, not recorded by an agent",
             ));
         }
-        let expected_check_version: i64 = check.try_get("version")?;
+        let expected_check_version: i64 = check.version()?;
         let command_observations = self
             .verified_command_observations(&command, &current_definition_revision_id, outcome)
             .await?;
@@ -354,15 +343,13 @@ impl ProjectArtifactCommandService {
         // Readiness re-derives it when it reads the result, so deriving it
         // here keeps a stale caller from binding a result to authority that
         // has already moved.
-        let governance = sqlx::query(
-            "SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1",
-        )
-        .bind(&command.project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("project", &command.project_id))?;
+        let governance = self
+            .db
+            .validation_project_charter_source(&command.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", &command.project_id))?;
         let governing_charter_revision_id: String = governance
-            .try_get::<Option<String>, _>("current_charter_revision_id")?
+            .current_charter_revision_id()?
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 ServiceError::conflict(
@@ -460,59 +447,50 @@ impl ProjectArtifactCommandService {
         // Verification must postdate the work it verifies: the newest delivered
         // Task bound to this milestone, or the definition itself when no Task
         // has landed yet.
-        let delivered_at: Option<String> = sqlx::query_scalar(
-            "SELECT MAX(t.updated_at) FROM project_task_governance g
-             JOIN task t ON t.id = g.task_id
-             WHERE g.milestone_id = ? AND t.project_id = ? AND t.status = 'done'
-               AND t.deleted_at IS NULL",
-        )
-        .bind(&command.milestone_id)
-        .bind(&command.project_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let delivered_at: Option<String> = self
+            .db
+            .validation_latest_delivered_task_at(&command.milestone_id, &command.project_id)
+            .await?;
         let watermark = match delivered_at {
             Some(delivered_at) => delivered_at,
             None => {
-                sqlx::query_scalar("SELECT created_at FROM project_milestone_revision WHERE id = ?")
-                    .bind(definition_revision_id)
-                    .fetch_one(self.db.pool())
+                self.db
+                    .validation_milestone_definition_created_at(definition_revision_id)
                     .await?
             }
         };
         let mut observations = Vec::with_capacity(command.observed_command_ids.len());
         for observation_id in &command.observed_command_ids {
-            let row = sqlx::query(
-                "SELECT program, args_json, exit_code, success, output_digest, created_at
-                 FROM project_command_observation
-                 WHERE id = ? AND project_id = ? AND actor_identity_id = ?",
-            )
-            .bind(observation_id)
-            .bind(&command.project_id)
-            .bind(&command.authorization.principal_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "observed_command_id {observation_id} is not a command this Agent ran in \
+            let row = self
+                .db
+                .validation_command_observation_source(
+                    observation_id,
+                    &command.project_id,
+                    &command.authorization.principal_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "observed_command_id {observation_id} is not a command this Agent ran in \
                      this Project; cite the observation_id forge_task_command returned"
-                ))
-            })?;
-            let created_at: String = row.try_get("created_at")?;
+                    ))
+                })?;
+            let created_at: String = row.created_at()?;
             if created_at <= watermark {
                 return Err(ServiceError::invalid_operation(format!(
                     "observed_command_id {observation_id} predates the delivered work; run the \
                      delivered software again and cite the new observation"
                 )));
             }
-            let args: Value = serde_json::from_str(&row.try_get::<String, _>("args_json")?)
-                .unwrap_or(Value::Array(Vec::new()));
+            let args: Value =
+                serde_json::from_str(&row.args_json()?).unwrap_or(Value::Array(Vec::new()));
             observations.push(json!({
                 "id": observation_id,
-                "program": row.try_get::<String, _>("program")?,
+                "program": row.program()?,
                 "args": args,
-                "exit_code": row.try_get::<Option<i64>, _>("exit_code")?,
-                "success": row.try_get::<i64, _>("success")? == 1,
-                "output_digest": row.try_get::<String, _>("output_digest")?,
+                "exit_code": row.exit_code()?,
+                "success": row.success()? == 1,
+                "output_digest": row.output_digest()?,
                 "recorded_at": created_at,
             }));
         }
@@ -852,13 +830,10 @@ impl ProjectArtifactCommandService {
         let rendered_view = crate::render_project_document(&document.title, kind, &command.content);
         let content_json = crate::render_project_document_json(&command.content);
         let effective_lifecycle = effective_document_lifecycle(&document, command.lifecycle)?;
-        let revision_number: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(revision), 0) + 1
-             FROM project_document_revision WHERE document_id = ?",
-        )
-        .bind(&command.document_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let revision_number: i64 = self
+            .db
+            .artifact_next_document_revision(&command.document_id)
+            .await?;
         let revision_id = new_uuid_v4();
         let created_at = now_rfc3339();
         let result_json = json!({
@@ -1265,20 +1240,19 @@ impl ProjectArtifactCommandService {
         if existing.is_some() {
             return Ok(existing);
         }
-        let existing_digest: Option<String> = sqlx::query_scalar(
-            "SELECT input_digest FROM command_receipt
-             WHERE principal_type = ? AND principal_id = ? AND scope_type = ?
-               AND scope_id = ? AND operation = ? AND idempotency_key = ?
-             LIMIT 1",
-        )
-        .bind(context.principal().principal_type())
-        .bind(context.principal().principal_id())
-        .bind(context.canonical_scope().scope_type().as_str())
-        .bind(context.canonical_scope().scope_id())
-        .bind(context.operation())
-        .bind(context.idempotency_key())
-        .fetch_optional(self.db.pool())
-        .await?;
+        let existing_digest: Option<String> = self
+            .db
+            .artifact_command_conflicting_input_digest(
+                db::ArtifactCommandConflictingInputDigestInput {
+                    principal_type: context.principal().principal_type(),
+                    principal_id: context.principal().principal_id(),
+                    scope_type: context.canonical_scope().scope_type().as_str(),
+                    scope_id: context.canonical_scope().scope_id(),
+                    operation: context.operation(),
+                    idempotency_key: context.idempotency_key(),
+                },
+            )
+            .await?;
         if existing_digest.is_some_and(|digest| digest != context.input_digest()) {
             return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
         }
@@ -1324,20 +1298,17 @@ impl ProjectArtifactCommandService {
         // Exact-digest lookup intentionally returns no row for altered input.
         // Detect that identity collision before any domain lookup so the
         // caller receives idempotency_conflict rather than a version error.
-        let existing_digest: Option<String> = sqlx::query_scalar(
-            "SELECT input_digest FROM command_receipt
-             WHERE principal_type = ? AND principal_id = ? AND scope_type = ?
-               AND scope_id = ? AND operation = ? AND idempotency_key = ?
-             LIMIT 1",
-        )
-        .bind(context.principal().principal_type())
-        .bind(context.principal().principal_id())
-        .bind(context.canonical_scope().scope_type().as_str())
-        .bind(context.canonical_scope().scope_id())
-        .bind(context.operation())
-        .bind(context.idempotency_key())
-        .fetch_optional(self.db.pool())
-        .await?;
+        let existing_digest: Option<String> = self
+            .db
+            .artifact_replay_command_input_digest(db::ArtifactReplayCommandInputDigestInput {
+                principal_type: context.principal().principal_type(),
+                principal_id: context.principal().principal_id(),
+                scope_type: context.canonical_scope().scope_type().as_str(),
+                scope_id: context.canonical_scope().scope_id(),
+                operation: context.operation(),
+                idempotency_key: context.idempotency_key(),
+            })
+            .await?;
         if existing_digest.is_some_and(|digest| digest != context.input_digest()) {
             return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
         }
@@ -1621,14 +1592,9 @@ async fn authorize_project_principal(
             }
         }
         "agent" => {
-            let bound: Option<String> = sqlx::query_scalar(
-                "SELECT identity_id FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(&authorization.principal_id)
-            .fetch_optional(db.pool())
-            .await?;
+            let bound: Option<String> = db
+                .artifact_authorized_project_identity(project_id, &authorization.principal_id)
+                .await?;
             if bound.is_some() {
                 Ok(())
             } else {
@@ -1648,49 +1614,38 @@ async fn load_project_media_attachment(
     db: &SqliteDb,
     attachment_id: &str,
 ) -> Result<Option<ProjectMediaAttachment>> {
-    let row = sqlx::query(
-        "SELECT id, project_id, asset_id, attachment_kind, task_media_id, task_id,
-                milestone_id, milestone_check_id, source_task_id, source_execution_id,
-                source_validation_id, source_task_version, source_context_digest,
-                source_definition_revision_id, acceptance_check_ids_json, caption, evidence_kind,
-                checksum, availability, project_url, author_type, author_id,
-                authorization_json, version, created_at, deleted_at, updated_at
-         FROM project_media_attachment WHERE id = ? AND attachment_kind = 'evidence'",
-    )
-    .bind(attachment_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = db.evidence_attachment_source(attachment_id).await?;
     let attachment = row
         .map(
-            |row| -> std::result::Result<ProjectMediaAttachment, sqlx::Error> {
+            |row| -> std::result::Result<ProjectMediaAttachment, db::DbError> {
                 Ok(ProjectMediaAttachment {
-                    id: row.try_get("id")?,
-                    project_id: row.try_get("project_id")?,
-                    asset_id: row.try_get("asset_id")?,
-                    attachment_kind: row.try_get("attachment_kind")?,
-                    task_media_id: row.try_get("task_media_id")?,
-                    task_id: row.try_get("task_id")?,
-                    milestone_id: row.try_get("milestone_id")?,
-                    milestone_check_id: row.try_get("milestone_check_id")?,
-                    source_task_id: row.try_get("source_task_id")?,
-                    source_execution_id: row.try_get("source_execution_id")?,
-                    source_validation_id: row.try_get("source_validation_id")?,
-                    source_task_version: row.try_get("source_task_version")?,
-                    source_context_digest: row.try_get("source_context_digest")?,
-                    source_definition_revision_id: row.try_get("source_definition_revision_id")?,
-                    acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
-                    caption: row.try_get("caption")?,
-                    evidence_kind: row.try_get("evidence_kind")?,
-                    checksum: row.try_get("checksum")?,
-                    availability: row.try_get("availability")?,
-                    project_url: row.try_get("project_url")?,
-                    author_type: row.try_get("author_type")?,
-                    author_id: row.try_get("author_id")?,
-                    authorization_json: row.try_get("authorization_json")?,
-                    version: row.try_get("version")?,
-                    created_at: row.try_get("created_at")?,
-                    deleted_at: row.try_get("deleted_at")?,
-                    updated_at: row.try_get("updated_at")?,
+                    id: row.id()?,
+                    project_id: row.project_id()?,
+                    asset_id: row.asset_id()?,
+                    attachment_kind: row.attachment_kind()?,
+                    task_media_id: row.task_media_id()?,
+                    task_id: row.task_id()?,
+                    milestone_id: row.milestone_id()?,
+                    milestone_check_id: row.milestone_check_id()?,
+                    source_task_id: row.source_task_id()?,
+                    source_execution_id: row.source_execution_id()?,
+                    source_validation_id: row.source_validation_id()?,
+                    source_task_version: row.source_task_version()?,
+                    source_context_digest: row.source_context_digest()?,
+                    source_definition_revision_id: row.source_definition_revision_id()?,
+                    acceptance_check_ids_json: row.acceptance_check_ids_json()?,
+                    caption: row.caption()?,
+                    evidence_kind: row.evidence_kind()?,
+                    checksum: row.checksum()?,
+                    availability: row.availability()?,
+                    project_url: row.project_url()?,
+                    author_type: row.author_type()?,
+                    author_id: row.author_id()?,
+                    authorization_json: row.authorization_json()?,
+                    version: row.version()?,
+                    created_at: row.created_at()?,
+                    deleted_at: row.deleted_at()?,
+                    updated_at: row.updated_at()?,
                 })
             },
         )
@@ -1702,36 +1657,27 @@ async fn load_document_approval(
     db: &SqliteDb,
     approval_id: &str,
 ) -> Result<Option<ProjectDocumentApprovalRecord>> {
-    let row = sqlx::query(
-        "SELECT id, document_id, revision_id, principal_type, principal_id,
-                authorization_basis, authorization_action, explicit_event,
-                authorization_occurred_at, content_digest, rendered_digest,
-                lifecycle, idempotency_key, version, created_at, updated_at
-         FROM project_document_approval WHERE id = ?",
-    )
-    .bind(approval_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = db.artifact_document_approval_source(approval_id).await?;
     let approval = row
         .map(
-            |row| -> std::result::Result<ProjectDocumentApprovalRecord, sqlx::Error> {
+            |row| -> std::result::Result<ProjectDocumentApprovalRecord, db::DbError> {
                 Ok(ProjectDocumentApprovalRecord {
-                    id: row.try_get("id")?,
-                    document_id: row.try_get("document_id")?,
-                    revision_id: row.try_get("revision_id")?,
-                    principal_type: row.try_get("principal_type")?,
-                    principal_id: row.try_get("principal_id")?,
-                    authorization_basis: row.try_get("authorization_basis")?,
-                    authorization_action: row.try_get("authorization_action")?,
-                    explicit_event: row.try_get("explicit_event")?,
-                    authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-                    content_digest: row.try_get("content_digest")?,
-                    rendered_digest: row.try_get("rendered_digest")?,
-                    lifecycle: row.try_get("lifecycle")?,
-                    idempotency_key: row.try_get("idempotency_key")?,
-                    version: row.try_get("version")?,
-                    created_at: row.try_get("created_at")?,
-                    updated_at: row.try_get("updated_at")?,
+                    id: row.id()?,
+                    document_id: row.document_id()?,
+                    revision_id: row.revision_id()?,
+                    principal_type: row.principal_type()?,
+                    principal_id: row.principal_id()?,
+                    authorization_basis: row.authorization_basis()?,
+                    authorization_action: row.authorization_action()?,
+                    explicit_event: row.explicit_event()?,
+                    authorization_occurred_at: row.authorization_occurred_at()?,
+                    content_digest: row.content_digest()?,
+                    rendered_digest: row.rendered_digest()?,
+                    lifecycle: row.lifecycle()?,
+                    idempotency_key: row.idempotency_key()?,
+                    version: row.version()?,
+                    created_at: row.created_at()?,
+                    updated_at: row.updated_at()?,
                 })
             },
         )

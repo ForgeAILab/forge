@@ -1879,3 +1879,402 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProjectTurnBindingAuthorityRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProjectTurnBindingAuthorityRow {
+    pub fn state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("state")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("identity_id")?)
+    }
+    pub fn operating_skill_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("operating_skill_revision_id")?)
+    }
+    pub fn policy_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_revision")?)
+    }
+    pub fn policy_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_digest")?)
+    }
+    pub fn charter_id_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_id")?)
+    }
+    pub fn charter_revision_id_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
+    pub fn charter_setup_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_setup_required")?)
+    }
+    pub fn admission_receipt_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("admission_receipt_id")?)
+    }
+    pub fn charter_approval_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_approval_id")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct FrozenProjectTurnBindingRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl FrozenProjectTurnBindingRow {
+    pub fn identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("identity_id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn autonomy_policy_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("autonomy_policy_json")?)
+    }
+    pub fn permission_ceiling_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("permission_ceiling_json")?)
+    }
+    pub fn policy_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_revision")?)
+    }
+    pub fn policy_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_digest")?)
+    }
+    pub fn state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("state")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn frozen_project_turn_binding(
+        &self,
+        binding_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<FrozenProjectTurnBindingRow>> {
+        let rows = sqlx::query(
+            "SELECT identity_id, profile_id, state, version, autonomy_policy_json,
+                            permission_ceiling_json,
+                            operating_skill_revision_id, policy_revision, policy_digest
+                     FROM project_agent_binding
+                     WHERE id = ? AND project_id = ?",
+        )
+        .bind(binding_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| FrozenProjectTurnBindingRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_account_permission_ceiling(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_binding_authority(
+        &self,
+        binding_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectTurnBindingAuthorityRow>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, state, version, identity_id,
+                    operating_skill_revision_id, policy_revision, policy_digest,
+                    charter_id, charter_revision_id, charter_setup_required,
+                    admission_receipt_id, charter_approval_id
+             FROM project_agent_binding
+             WHERE id = ? AND project_id = ?",
+        )
+        .bind(binding_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectTurnBindingAuthorityRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_verify_workspace_path(
+        &self,
+        identity_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT workspace_path FROM agent_context_scope
+             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?
+               AND workspace_access = 'project_verify'
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(identity_id)
+        .bind(scope_type)
+        .bind(scope_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct NativeScopeSummaryRow {
+    pub(crate) row: sqlx::sqlite::SqliteRow,
+}
+impl NativeScopeSummaryRow {
+    pub fn text(&self, field: NativeScopeSummaryField) -> crate::Result<String> {
+        Ok(self.row.try_get(field.as_str())?)
+    }
+    pub fn integer(&self, field: NativeScopeSummaryField) -> crate::Result<i64> {
+        Ok(self.row.try_get(field.as_str())?)
+    }
+}
+#[derive(Clone, Copy)]
+pub enum NativeScopeSummaryField {
+    Id,
+    Name,
+    Title,
+    Status,
+    Paused,
+    Visibility,
+    ScopeType,
+    ScopeId,
+    ProjectId,
+    Priority,
+}
+impl NativeScopeSummaryField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Name => "name",
+            Self::Title => "title",
+            Self::Status => "status",
+            Self::Paused => "paused",
+            Self::Visibility => "visibility",
+            Self::ScopeType => "scope_type",
+            Self::ScopeId => "scope_id",
+            Self::ProjectId => "project_id",
+            Self::Priority => "priority",
+        }
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_account_scope_summary(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<NativeScopeSummaryRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, status, paused, visibility FROM agent_identity WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| NativeScopeSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn topic_rotation_main_binding(
+        &self,
+        account_id: &str,
+    ) -> crate::Result<Option<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>("SELECT identity_id, profile_id FROM account_main_agent_binding WHERE account_id = ? AND state = 'active'",)
+.bind(account_id)
+.fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn topic_rotation_project_binding(
+        &self,
+        project_id: &Option<String>,
+    ) -> crate::Result<Option<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>("SELECT identity_id, profile_id FROM project_agent_binding WHERE project_id = ? AND state = 'active'",)
+.bind(project_id)
+.fetch_optional(self.pool()).await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct GenesisDraftIdentityOwnerRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl GenesisDraftIdentityOwnerRow {
+    pub fn owner_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("owner_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_draft_identity_owner(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Option<GenesisDraftIdentityOwnerRow>> {
+        let rows = sqlx::query(
+            "SELECT owner_id, paused, archived_at
+                     FROM agent_identity WHERE id = ?",
+        )
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| GenesisDraftIdentityOwnerRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_current_main_principal(
+        &self,
+        identity_id: &str,
+        account_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1
+             FROM agent_identity AS identity
+             JOIN account_main_agent_binding AS binding
+               ON binding.identity_id = identity.id
+              AND binding.account_id = identity.owner_id
+              AND binding.state = 'active'
+             JOIN agent_chat AS chat
+               ON chat.account_id = binding.account_id
+              AND chat.kind = 'account_main'
+             WHERE identity.id = ?
+               AND identity.owner_id = ?
+               AND identity.paused = 0
+               AND identity.archived_at IS NULL
+               AND (? <> 'agent_chat' OR chat.id = ?)
+             LIMIT 1",
+        )
+        .bind(identity_id)
+        .bind(account_id)
+        .bind(scope_type)
+        .bind(scope_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn artifact_authorized_project_identity(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT identity_id FROM project_agent_binding
+                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_authorized_project_identity(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT identity_id FROM project_agent_binding
+                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_authorized_project_identity(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM project_agent_binding
+                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct DirectProjectActorStatusRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl DirectProjectActorStatusRow {
+    pub fn paused(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("paused")?)
+    }
+    pub fn archived_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("archived_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn direct_project_actor_status(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Option<DirectProjectActorStatusRow>> {
+        let rows =
+            sqlx::query("SELECT paused, archived_at FROM agent_identity WHERE id = ? LIMIT 1")
+                .bind(identity_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(rows.map(|row| DirectProjectActorStatusRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn direct_project_command_bound_identity(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT identity_id FROM project_agent_binding
+             WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_action_active_project_binding(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT project_id FROM project_agent_binding
+                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

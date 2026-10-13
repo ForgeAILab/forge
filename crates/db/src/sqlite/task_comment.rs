@@ -170,3 +170,100 @@ impl SqliteDb {
         Ok(true)
     }
 }
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeProjectWorklogRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeProjectWorklogRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn title(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("title")?)
+    }
+    pub fn worklog_kind(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("worklog_kind")?)
+    }
+    pub fn role_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("role")?)
+    }
+    pub fn execution_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("execution_id")?)
+    }
+    pub fn content(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_ingested_task_comment(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task_comment WHERE task_id = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(idempotency_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_task_worklog_exists(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_comment
+                 WHERE task_id = ? AND idempotency_key = ?
+             )",
+        )
+        .bind(task_id)
+        .bind(idempotency_key)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_worklog(
+        &self,
+        project_id: &str,
+        task_filter: Option<&str>,
+        task_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<NativeProjectWorklogRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.task_id, c.worklog_kind, c.role, c.execution_id,
+                    c.content, c.created_at, t.title
+             FROM task_comment c
+             JOIN task t ON t.id = c.task_id
+             WHERE t.project_id = ? AND t.deleted_at IS NULL
+               AND c.author_type = 'agent'
+               AND (? IS NULL OR c.task_id = ?)
+             ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(task_filter)
+        .bind(task_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeProjectWorklogRow { row })
+            .collect())
+    }
+}

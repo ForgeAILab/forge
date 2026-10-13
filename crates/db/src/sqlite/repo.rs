@@ -360,3 +360,15 @@ impl SqliteDb {
         )
     }
 }
+
+impl SqliteDb {
+    pub async fn workspace_gc_repository_paths(
+        &self,
+    ) -> crate::Result<Vec<(String, Option<String>)>> {
+        Ok(
+            sqlx::query_as::<_, (String, Option<String>)>("SELECT id, local_path FROM repo")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
