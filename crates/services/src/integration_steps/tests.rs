@@ -990,6 +990,26 @@ async fn a_root_conflict_can_reopen_for_a_corrective_subtask() {
     let reopened = world.task("root-repair").await;
     assert_eq!(reopened.status, "merge_failed");
     assert!(reopened.condition.integration_wait().is_none());
+    // The ejected attempt keeps its row and its statement (the lineage the
+    // next admission links to) and holds no place in the queue; nothing was
+    // admitted or merged by the send-back.
+    assert_eq!(
+        reopened
+            .condition
+            .integration_reason()
+            .map(|reason| reason.attempt_id().as_str().to_owned()),
+        Some(a.id.clone())
+    );
+    assert!(reopened.condition.integration_handoff_ready());
+    assert_eq!(
+        world
+            .scalar::<String>(
+                "SELECT group_concat(state) FROM integration_attempt WHERE task_ref=?",
+                "root-repair"
+            )
+            .await,
+        "ejected"
+    );
     assert!(matches!(
         reopened.condition,
         db::TaskCondition::Parked {

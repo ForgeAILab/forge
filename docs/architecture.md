@@ -4019,10 +4019,13 @@ a machine capped at one run (`max_concurrent_runs: 1`, a supported setting)
 does not show its only running Task as a capacity waiter, and a wait recorded
 earlier is retired at that same observation. The run's follow-up (retry, review
 entry check, reviewer) asks for a slot only after that execution has ended.
-An unavailable Agent asks for no slot. Reconciliation retires an earlier
-machine/Project capacity wait before parking on that Agent, even when its
-initial dispatch is skipped. Startup therefore cannot leave a capacity wait
-behind when recovery cancelled the last holder and the Agent is paused.
+A paused Agent asks for no slot. A Task that has not started is not dispatched
+while its Agent is unavailable, so reconciliation asks the dispatch's capacity
+question for it when it carries a machine/Project capacity wait: a wait nobody
+holds is retired and the Task parks on its Agent, a wait that is still real
+(an offline Agent on a full machine) is kept. Startup therefore cannot leave a
+capacity wait behind when recovery cancelled the last holder and the Agent is
+paused. A started Task is asked by its role admission check, as before.
 The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
 counts as parked until dispatch observes a different outcome; a plain edit does
 not un-park it, and its metadata change moves the Project list revision used by

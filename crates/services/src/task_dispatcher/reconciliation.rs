@@ -1382,14 +1382,13 @@ impl TaskDispatcher {
                         | crate::agent_service::EffectiveStatus::Busy
                 )
             );
-            let waits = deferred_dispatch::current_dispatch_disposition(&p.read.task).is_some_and(
-                |wait| {
+            let waits =
+                deferred_dispatch::current_dispatch_disposition(&p.read.task).is_some_and(|wait| {
                     matches!(
                         wait.capability.as_str(),
                         "machine_capacity" | "project_capacity"
                     )
-                },
-            );
+                });
             (unavailable && waits)
                 .then(|| agents.agents.iter().find(|agent| &agent.id == id))
                 .flatten()
