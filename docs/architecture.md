@@ -5646,8 +5646,8 @@ Project is paused the sweep leaves the Task to the pause, Retry is withheld
 like every other retry and the summary hints `resume_project`. A candidate
 that is already contained in the target is reported as merged after the head
 check; no commit is added to the target. Retry is refused, and the park kept,
-when the Task's worktree and branch are both gone or the machine that owns a
-daemon checkout does not answer. When the legacy execution exists but names
+when the Task's worktree and branch are both gone or the Task has no
+workspace at all. When the legacy execution exists but names
 no workspace, the head's review authority cannot be proven: the attempt is
 sent back to the repair state and nothing merges. Every other `corrupt_import`
 cause keeps the earlier policy: the row is history and the sweep admits the
