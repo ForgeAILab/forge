@@ -123,8 +123,9 @@ impl TaskService {
         if matches!(
             workflow.state_kind(&parent.status),
             Some(api_types::StateKind::Backlog | api_types::StateKind::Terminal)
-        ) || workflow.canonical_phase_for_state(&parent.status)
-            == api_types::CanonicalPhase::Review
+        ) || (workflow.state_kind(&parent.status) == Some(api_types::StateKind::Gate)
+            && workflow.canonical_phase_for_state(&parent.status)
+                == api_types::CanonicalPhase::Review)
         {
             return Err(ServiceError::invalid_operation(format!(
                 "subtask {} cannot execute while coordination root {} is in {}",

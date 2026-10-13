@@ -451,18 +451,32 @@ impl TaskService {
                                         let cleared = self
                                             .reset_root_review_budget_for_reopen(&task, guidance)
                                             .await?;
-                                        self.apply_gate_decision(
+                                        let target = snapshot
+                                            .workflow
+                                            .outgoing_trigger_targets(&task.status)
+                                            .find(|(trigger, _)| {
+                                                *trigger == WorkflowTrigger::Reject
+                                            })
+                                            .map(|(_, target)| target)
+                                            .or_else(|| {
+                                                snapshot
+                                                    .workflow
+                                                    .gate_reject_target(&task.status)
+                                                    .map(str::to_owned)
+                                            })
+                                            .expect("root reopen offer guarantees a reject route");
+                                        self.transition_recovery_rejection(
                                             &cleared,
-                                            &snapshot.workflow,
-                                            WorkflowTrigger::Reject,
-                                            Some(guidance.clone()),
-                                            actor.clone(),
-                                            false,
+                                            target,
+                                            guidance.clone(),
+                                            &actor,
+                                            Default::default(),
                                         )
                                         .await
                                     }),
                                 )
                                 .await?;
+                            self.handoff_manual_integration_repair(&reopened).await?;
                             let fresh = self.task_action_snapshot(&reopened.id, &actor).await?;
                             self.hold_waiting_task(
                                 &fresh,

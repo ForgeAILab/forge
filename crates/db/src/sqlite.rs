@@ -940,7 +940,8 @@ impl SqliteDb {
                         matches!(
                             state.kind,
                             api_types::StateKind::Backlog | api_types::StateKind::Terminal
-                        ) || state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                        ) || (state.kind == api_types::StateKind::Gate
+                            && state.canonical_phase == Some(api_types::CanonicalPhase::Review))
                     })
                     || parsed_workflow
                         .as_ref()
@@ -948,7 +949,7 @@ impl SqliteDb {
                         == Some(parent_status.as_str())
                     || matches!(
                         parent_status.as_str(),
-                        "backlog" | "review" | "merging" | "merge_failed" | "done" | "cancelled"
+                        "backlog" | "review" | "merging" | "done" | "cancelled"
                     );
                 let parent_has_blocker = parent_row
                     .try_get::<Option<String>, _>("blocked_json")?

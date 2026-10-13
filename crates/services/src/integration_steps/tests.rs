@@ -941,6 +941,164 @@ async fn a_redelivered_send_back_repeats_no_comment_charge_or_transition() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_root_conflict_can_reopen_for_a_corrective_subtask() {
+    let world = World::new().await;
+    let a = world.add_task("root-repair", "f", "one\n").await;
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,created_at,updated_at) VALUES('finished-child','p','root-repair','child','done',?,?)")
+        .bind(&now).bind(&now).execute(world.db.pool()).await.unwrap();
+    let asked = world.place(&a.id, "rebasing", 2).await;
+    world
+        .set(
+            &a.id,
+            "state='ejected',conflict_paths_json='[\"f\"]',failure_message='conflict in f'",
+        )
+        .await;
+    world.ask(&asked, IntegrationStepAction::SendBack).await;
+    settled(
+        &world,
+        "root-repair",
+        IntegrationStepAction::SendBack,
+        "done",
+    )
+    .await;
+    let offers = world
+        .service
+        .task_action_offers(
+            "root-repair",
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+        )
+        .await
+        .unwrap();
+    let send_back = offers
+        .available_actions
+        .iter()
+        .find(|offer| offer.reason == "root_review_reopen")
+        .expect("a root conflict has a corrective-work action");
+    assert_eq!(send_back.action.verb(), "send_back");
+    world
+        .service
+        .perform_task_action(
+            "root-repair",
+            api_types::TaskAction::SendBack {
+                guidance: "resolve f in a corrective subtask".into(),
+            },
+            offers.version,
+        )
+        .await
+        .unwrap();
+    let reopened = world.task("root-repair").await;
+    assert_eq!(reopened.status, "merge_failed");
+    assert!(reopened.condition.integration_wait().is_none());
+    assert!(matches!(
+        reopened.condition,
+        db::TaskCondition::Parked {
+            primary: db::ParkReason::Held { .. },
+            ..
+        }
+    ));
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    crate::task_hierarchy::ensure_parent_accepts_subtasks(&reopened, &workflow).unwrap();
+    assert_eq!(
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM execution WHERE task_id=? AND status='running'",
+                "root-repair"
+            )
+            .await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manually_repaired_root_hands_integration_ownership_to_fresh_review() {
+    let world = World::new().await;
+    let a = world
+        .add_task(
+            "manual-root",
+            "f",
+            "<<<<<<< ours\none\n=======\ntwo\n>>>>>>> theirs\n",
+        )
+        .await;
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,created_at,updated_at) VALUES('manual-child','p','manual-root','child','done',?,?)")
+        .bind(&now).bind(&now).execute(world.db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('manual-reviewer','manual-root','reviewer','user','owner',?,?)")
+        .bind(&now).bind(&now).execute(world.db.pool()).await.unwrap();
+    let asked = world.place(&a.id, "rebasing", 2).await;
+    world
+        .set(
+            &a.id,
+            "state='ejected',conflict_paths_json='[\"f\"]',failure_message='conflict in f'",
+        )
+        .await;
+    world.ask(&asked, IntegrationStepAction::SendBack).await;
+    settled(
+        &world,
+        "manual-root",
+        IntegrationStepAction::SendBack,
+        "done",
+    )
+    .await;
+    std::fs::write(world.tree("manual-root").join("f"), "resolved\n").unwrap();
+    git::commit_all(&world.tree("manual-root"), "manual repair")
+        .await
+        .unwrap();
+    let offers = world
+        .service
+        .task_action_offers(
+            "manual-root",
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+        )
+        .await
+        .unwrap();
+    assert!(offers
+        .available_actions
+        .iter()
+        .any(|offer| offer.reason == "manual_merge_repair"));
+    world
+        .service
+        .perform_task_action(
+            "manual-root",
+            api_types::TaskAction::retry(),
+            offers.version,
+        )
+        .await
+        .unwrap();
+    // The action is accepted into recovery; the real dispatcher, not the
+    // Task-step worker alone, issues its replay command.
+    sqlx::query("UPDATE project SET primary_repo_id='r' WHERE id='p'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let dispatcher = crate::TaskDispatcher::new(
+        world.db.clone(),
+        world.bus.clone(),
+        Arc::new(world.service.clone()),
+    );
+    eventually(
+        "manual repair reaches review and gives ownership away",
+        || async {
+            dispatcher.reconcile_all().await.unwrap();
+            let task = world.task("manual-root").await;
+            task.status == "review"
+                && task.condition.integration_wait().is_none()
+                && task.condition.integration_handoff_ready()
+        },
+    )
+    .await;
+    assert_eq!(
+        world
+            .scalar::<i64>(
+                "SELECT COUNT(*) FROM execution WHERE task_id=? AND status='running'",
+                "manual-root"
+            )
+            .await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn send_back_routes_a_red_check_and_a_lost_review_through_merge_failed() {
     let world = World::new().await;
     // A red check on the rebased commit: the coder's, under the merge-fix

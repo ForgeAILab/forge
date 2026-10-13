@@ -189,6 +189,89 @@ pub(super) async fn root_with_child(lead: &Lead, with_planner: bool) -> (Task, T
     (reload(&lead.db, &root.id).await, child)
 }
 
+#[tokio::test]
+async fn an_offered_hold_stops_a_child_with_an_inherited_coder() {
+    let lead = lead_fixture(false).await;
+    let (_, child) = root_with_child(&lead, false).await;
+    until(&lead, "the inherited coder is running", async || {
+        !ExecutionRepo::list_running_by_task(&*lead.db, &child.id)
+            .await
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    assert!(
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*lead.db, &child.id, "coder")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let service = &lead.dispatcher.task_service;
+    let offers = service
+        .task_action_offers(&child.id, &Actor::user(api_types::UserActionSource::Api))
+        .await
+        .unwrap();
+    let hold = offers
+        .available_actions
+        .iter()
+        .find(|offer| offer.action.verb() == "hold")
+        .unwrap();
+    assert_eq!(hold.reason, "execution_running");
+    service
+        .perform_task_action(&child.id, hold.action.clone(), offers.version)
+        .await
+        .unwrap();
+    let held = reload(&lead.db, &child.id).await;
+    assert_eq!(held.status, "in_progress");
+    assert_eq!(
+        held.condition.read().failure_kind,
+        Some(api_types::FailureKind::ManualStop)
+    );
+    assert!(ExecutionRepo::list_running_by_task(&*lead.db, &child.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(service
+        .task_action_offers(&child.id, &Actor::user(api_types::UserActionSource::Api))
+        .await
+        .unwrap()
+        .available_actions
+        .iter()
+        .any(|offer| offer.action.verb() == "release"));
+}
+
+#[tokio::test]
+async fn a_corrective_child_runs_under_an_active_root_in_the_review_phase() {
+    let lead = lead_fixture(false).await;
+    let root = seed_task(
+        &lead.db,
+        &lead.project,
+        "root repairing aggregate",
+        "merge_failed",
+        1,
+    )
+    .await;
+    let child = seed_subtask(&lead.db, &root, "corrective child", "todo", 0).await;
+    assign_role(&lead.db, &root.id, "coder", &lead.coder).await;
+    until(
+        &lead,
+        "the corrective child starts in the root's repair state",
+        async || {
+            !ExecutionRepo::list_running_by_task(&*lead.db, &child.id)
+                .await
+                .unwrap()
+                .is_empty()
+        },
+    )
+    .await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "merge_failed");
+    assert!(ExecutionRepo::list_running_by_task(&*lead.db, &root.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(reload(&lead.db, &child.id).await.status, "in_progress");
+}
+
 /// The failing-first test of stage 1. While the root plans, its subtask is
 /// held with a typed park and has no execution; the planner's success moves
 /// the root to its implementation state and the subtask is dispatched.

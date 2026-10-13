@@ -480,6 +480,32 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "Cancel Task",
         );
     }
+    // A coordination root has no implementation execution to repair an
+    // ejected aggregate branch. Its owner can reopen the working state,
+    // held, and add a corrective subtask through the existing send-back path.
+    if snapshot.coordination_root
+        && !held
+        && !running
+        && state.kind == StateKind::Gate
+        && target(WorkflowTrigger::Reject)
+            .or_else(|| workflow.gate_reject_target(&task.status).map(str::to_owned))
+            .is_some_and(|target| workflow.state_kind(&target) == Some(StateKind::Active))
+        && !(exhausted && task.status == "review")
+        && matches!(
+            task.condition.integration_wait(),
+            Some(api_types::IntegrationReason::Repair { .. })
+        )
+    {
+        offer(
+            TaskAction::SendBack {
+                guidance: String::new(),
+            },
+            &["guidance"],
+            &[Owner],
+            "root_review_reopen",
+            "Reopen for a Corrective Subtask",
+        );
+    }
     if let db::TaskCondition::Parked {
         primary: db::ParkReason::Integration { reason },
         ..
@@ -2221,6 +2247,31 @@ pub(crate) mod tests {
             let expected = available_actions(&snapshot);
             snapshot.task.condition = condition.restate_legacy(&input);
             assert_eq!(available_actions(&snapshot), expected);
+        }
+    }
+
+    #[test]
+    fn a_root_repair_park_offers_corrective_work_at_either_gate() {
+        for state in ["review", "merging"] {
+            let mut snapshot = snapshot(state, None);
+            snapshot.coordination_root = true;
+            snapshot.task.condition = integration_conditions()
+                .into_iter()
+                .find(|condition| {
+                    matches!(
+                        condition.integration_reason(),
+                        Some(api_types::IntegrationReason::Repair { .. })
+                    )
+                })
+                .unwrap();
+            let offers = available_actions(&snapshot);
+            let reopen = offers
+                .iter()
+                .find(|offer| offer.reason == "root_review_reopen")
+                .unwrap();
+            assert_eq!(reopen.action.verb(), "send_back");
+            assert_eq!(reopen.authority, vec![api_types::ActionAuthority::Owner]);
+            assert!(offers.iter().all(|offer| offer.action.verb() != "retry"));
         }
     }
 

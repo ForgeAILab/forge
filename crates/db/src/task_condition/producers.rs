@@ -215,10 +215,11 @@ pub(crate) async fn derive(
             statement,
             Some(
                 ConditionStatement::IntegrationCleared { .. }
+                    | ConditionStatement::IntegrationHandedOff { .. }
                     | ConditionStatement::CheckCleared { .. }
             )
         ) {
-        // Clearing integration restores the other owners' current mapping,
+        // Clearing or handing off integration restores the other owners' current mapping,
         // including a Deferred timer whose continuation integration stood over.
         facts.condition_of(&snapshot.input.view())
     } else {

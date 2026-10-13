@@ -3283,6 +3283,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Startup reconciliation retires obsolete machine/Project capacity waits when
+  the assigned Agent is unavailable, including a paused Agent whose last run
+  was cancelled by crash recovery. The Task names the Agent that can unblock it.
+- Hold on a subtask with an inherited coder now stops the run and records its
+  manual hold instead of returning a version conflict after cancelling the run.
+- A coordination root with a conflicting aggregate branch offers Send back
+  for a corrective subtask. Completing manual merge repair hands integration
+  ownership to fresh review instead of leaving the root parked on an ejected
+  attempt with no way forward. Corrective children can execute under the
+  active `merge_failed` root instead of being refused as though it were a
+  review gate.
+
 - Interrupted review-refresh recovery now uses one entry-keyed durable cascade and honors existing failure parks. An unrecoverable `merge_failed` Task raises Attention with Restart/Cancel instead of appending two failed recovery commands on every dispatcher pass; transient recovery uses the Task-step worker's bounded retries. A Task whose machine is away waits for the machine instead; if the park is lifted while the Task stays in `merge_failed`, one new recovery attempt runs (it used to be swallowed by the ended one, leaving the Task with no step and no park).
 - Paused-integration resume, unchanged merge-admission refusals, and accepted role retries waiting for machine capacity no longer append recovery/admission commands on every dispatcher pass. Accepted retries keep their intent and proceed when capacity is released.
 - A planner failure while its Agent is paused no longer leaves the Task clear

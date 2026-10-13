@@ -726,6 +726,54 @@ async fn handed_off_repair_and_review_are_ready_without_a_fake_running_execution
     }
 }
 
+#[tokio::test]
+async fn handing_off_repair_restores_the_owner_recovery_deadline() {
+    let db = db().await;
+    task(&db, "manual-recovery").await;
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET metadata_json=? WHERE id='manual-recovery'")
+        .bind(json!({"deferred_dispatch":{"not_before":"2099-01-01T00:00:00Z","reason":"accepted owner repair","target_state":"review"}}).to_string())
+        .execute(&mut *tx).await.unwrap();
+    db.sync_condition_in_tx(&mut tx, "manual-recovery")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let baseline = read(&db, "manual-recovery").await.condition;
+    assert!(matches!(baseline, TaskCondition::Deferred { .. }));
+    let reason = reasons()
+        .into_iter()
+        .find(|reason| matches!(reason, IntegrationReason::Repair { .. }))
+        .unwrap();
+    let step = claim(&db, "manual-recovery").await;
+    crate::task_writer::in_task_step(step, async {
+        state(&db, "manual-recovery", &reason).await;
+        assert!(read(&db, "manual-recovery")
+            .await
+            .condition
+            .integration_wait()
+            .is_some());
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        db.state_integration_condition_in_tx(
+            &mut tx,
+            "manual-recovery",
+            &ConditionStatement::IntegrationHandedOff {
+                attempt_id: reason.attempt_id().clone(),
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let after = read(&db, "manual-recovery").await;
+        assert!(matches!(after.condition, TaskCondition::Deferred { .. }));
+        assert_eq!(after.condition.read().retry, baseline.read().retry);
+        assert!(after.condition.integration_wait().is_none());
+        assert_eq!(after.condition.integration_reason(), Some(&reason));
+        assert!(after.condition.integration_handoff_ready());
+        db.check_task_condition_invariant(&after).await.unwrap();
+    })
+    .await;
+}
+
 /// One reason of each behaviour: an ordinary wait, a repair that carries
 /// lineage, and an owner blocker.
 fn sample_reasons() -> Vec<IntegrationReason> {

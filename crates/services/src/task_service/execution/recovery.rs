@@ -1921,7 +1921,7 @@ impl TaskService {
         Ok(recovered)
     }
 
-    async fn transition_recovery_rejection(
+    pub(crate) async fn transition_recovery_rejection(
         &self,
         task: &Task,
         target_state: String,
@@ -2681,6 +2681,30 @@ impl TaskService {
             .await
     }
 
+    /// The owner, rather than a merge-fix execution, completed the repair or
+    /// reopened a coordination root for corrective subtasks. Retain attempt
+    /// lineage but give scheduling ownership back to the workflow.
+    pub(crate) async fn handoff_manual_integration_repair(&self, task: &Task) -> Result<()> {
+        if let Some(api_types::IntegrationReason::Repair { attempt_id, .. }) =
+            task.condition.integration_reason()
+        {
+            if !task.condition.integration_handoff_ready() {
+                let mut tx = db::begin_immediate(self.db.pool()).await?;
+                self.db
+                    .state_integration_condition_in_tx(
+                        &mut tx,
+                        &task.id,
+                        &db::ConditionStatement::IntegrationHandedOff {
+                            attempt_id: attempt_id.clone(),
+                        },
+                    )
+                    .await?;
+                tx.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn recover_manual_merge_repair_for_review(
         &self,
         task: Task,
@@ -2715,6 +2739,7 @@ impl TaskService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation("manual merge repair has no reject route")
             })?;
+        self.handoff_manual_integration_repair(&task).await?;
         let recovered = self
             .transition_recovery_rejection(
                 &task,

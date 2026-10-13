@@ -3353,6 +3353,20 @@ Unavailable commands return HTTP 409, code `action_unavailable`, and current `de
 
 Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
+Hold validates the effective coder assignment on a subtask, including an
+inherited root coder. The ordinary offered-version and reassignment fences
+still apply; inheriting a role does not cause a spurious version conflict.
+
+A coordination root whose aggregate branch conflicts with the integration
+target offers `send_back` (`root_review_reopen`, required `guidance`) at the
+merge gate and at an `integration/repair` park in review. It takes the gate's
+reject transition and holds the root in implementation so the owner can add
+a corrective subtask, then Release to run it and return through aggregate
+review. If the owner repairs the checkout manually, the existing manual
+merge-repair Retry hands ownership to fresh review. Both paths retain the
+attempt lineage and launch no coder on the root. The action objects and park
+enums are unchanged.
+
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
 MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Native action reasons/guidance live inside that object; the retired generic envelope `reason`/`decision` properties are removed. Single-Task reads include caller-filtered offers; REST and MCP Task lists omit offers and MCP Task pages use `items`. The Project Agent's admitted native `work.read` projection carries live per-Task offers and versions. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.

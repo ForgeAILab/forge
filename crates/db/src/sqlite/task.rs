@@ -45,7 +45,7 @@ pub(super) async fn effective_execution_assignment_in_tx(
     let holder = assignment_holder_in_tx(transaction, task_id, role_name).await?;
     if holder != task_id {
         return Ok(sqlx::query(
-            "SELECT id, assignee_type, assignee_id, updated_at
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
         )
         .bind(&holder)
@@ -54,7 +54,7 @@ pub(super) async fn effective_execution_assignment_in_tx(
         .await?);
     }
     Ok(sqlx::query(
-        "SELECT assignment.id,
+        "SELECT assignment.id, assignment.task_id, assignment.role_name, assignment.created_at,
                 assignment.assignee_type,
                 assignment.assignee_id,
                 assignment.updated_at
@@ -775,35 +775,31 @@ async fn set_error_annotation_if_no_running_execution_inner(
     // execution's blocker. Interactive stops intentionally have no workflow
     // assignment dependency and pass `None` here.
     if let Some(role_name) = expected_assignment_role {
-        let holder = assignment_holder_in_tx(&mut transaction, id, role_name).await?;
-        let actual_assignment = sqlx::query(
-            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
-             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-        )
-        .bind(&holder)
-        .bind(role_name)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .map(|row| -> Result<TaskRoleAssignment> {
-            let assignee_type = row
-                .try_get::<Option<String>, _>("assignee_type")?
-                .map(|value| {
-                    value
-                        .parse::<AssigneeKind>()
-                        .map_err(|_| DbError::InvalidTransition)
+        // Stop and start must fence the same effective assignment, including
+        // a child's inherited coder and its root-owned step-check lead.
+        let actual_assignment =
+            effective_execution_assignment_in_tx(&mut transaction, id, role_name)
+                .await?
+                .map(|row| -> Result<TaskRoleAssignment> {
+                    let assignee_type = row
+                        .try_get::<Option<String>, _>("assignee_type")?
+                        .map(|value| {
+                            value
+                                .parse::<AssigneeKind>()
+                                .map_err(|_| DbError::InvalidTransition)
+                        })
+                        .transpose()?;
+                    Ok::<TaskRoleAssignment, DbError>(TaskRoleAssignment {
+                        id: row.try_get("id")?,
+                        task_id: row.try_get("task_id")?,
+                        role_name: row.try_get("role_name")?,
+                        assignee_type,
+                        assignee_id: row.try_get("assignee_id")?,
+                        created_at: row.try_get("created_at")?,
+                        updated_at: row.try_get("updated_at")?,
+                    })
                 })
                 .transpose()?;
-            Ok::<TaskRoleAssignment, DbError>(TaskRoleAssignment {
-                id: row.try_get("id")?,
-                task_id: row.try_get("task_id")?,
-                role_name: row.try_get("role_name")?,
-                assignee_type,
-                assignee_id: row.try_get("assignee_id")?,
-                created_at: row.try_get("created_at")?,
-                updated_at: row.try_get("updated_at")?,
-            })
-        })
-        .transpose()?;
         let assignment_matches = match (actual_assignment, expected_assignment) {
             (None, None) => true,
             (Some(actual), Some(expected)) => {

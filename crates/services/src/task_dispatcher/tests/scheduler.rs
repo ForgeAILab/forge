@@ -194,6 +194,58 @@ async fn a_capacity_wait_writes_nothing_while_it_waits() {
     }
 }
 
+#[tokio::test]
+async fn startup_replaces_a_stale_slot_wait_with_the_paused_agent_that_owns_it() {
+    let (db, project, agent, _repo, ws) = fixture().await;
+    db.server_run_cap
+        .set(Some(1), 1, &config::embedded_machine_id());
+    let busy = seed_task(&db, &project, "interrupted run", "in_progress", 0).await;
+    assign_role(&db, &busy.id, "coder", &agent).await;
+    seed_running_execution(&db, &busy.id, &agent, "coder").await;
+    let waiting = seed_task(&db, &project, "slot waiter", "todo", 0).await;
+    assign_role(&db, &waiting.id, "coder", &agent).await;
+    let (old, _) = build_dispatcher(db.clone(), ws.path()).await;
+    old.check_once_and_drain().await.unwrap();
+    assert_eq!(
+        deferred_dispatch::current_dispatch_disposition(&reload(&db, &waiting.id).await)
+            .unwrap()
+            .capability,
+        "machine_capacity"
+    );
+    // The execution is recovered before the new dispatcher's first pass;
+    // the Agent was paused before shutdown, so it cannot take a freed slot.
+    AgentRepo::set_paused(&*db, &agent, true).await.unwrap();
+    crate::CrashRecovery::new(db.clone(), Arc::new(EventBus::new(64)))
+        .run_recovery()
+        .await
+        .unwrap();
+    old.drain_steps().await.unwrap();
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM execution WHERE status='running'").await,
+        0
+    );
+    let (restarted, mut launches) = build_dispatcher(db.clone(), ws.path()).await;
+    restarted.check_once_and_drain().await.unwrap();
+    let parked = reload(&db, &waiting.id).await;
+    assert!(deferred_dispatch::current_dispatch_disposition(&parked).is_none());
+    assert!(
+        matches!(&parked.condition, db::TaskCondition::Parked { primary: db::ParkReason::Agent { agent_id, status }, .. } if agent_id == &agent && status == "paused"),
+        "{:?}",
+        parked.condition
+    );
+    assert!(launches.try_recv().is_err());
+    restarted.task_service.cancel_task(&busy.id).await.unwrap();
+    AgentRepo::set_paused(&*db, &agent, false).await.unwrap();
+    restarted.check_once_and_drain().await.unwrap();
+    assert!(
+        ExecutionRepo::list_running_by_task(&*db, &waiting.id)
+            .await
+            .unwrap()
+            .len()
+            == 1
+    );
+}
+
 /// Freed capacity kicks the waiters it can admit: the Task that waited on the
 /// Project limit is admitted on the pass after the slot frees.
 #[tokio::test]

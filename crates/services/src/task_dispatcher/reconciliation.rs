@@ -1348,6 +1348,40 @@ impl TaskDispatcher {
         gate: bool,
     ) -> bool {
         let mut failed = false;
+        // An unavailable Agent asks for no run slot. In particular, startup
+        // can recover the last holder while its Agent is paused: the initial
+        // dispatch below will then be skipped, so it cannot retire the old wait.
+        let target = p
+            .facts
+            .initial_target
+            .as_ref()
+            .map(|(_, _, id)| id)
+            .or_else(|| p.facts.role_target.as_ref().map(|(_, id)| id));
+        if target.is_some_and(|id| {
+            !matches!(
+                agents.statuses.get(id),
+                Some(
+                    crate::agent_service::EffectiveStatus::Active
+                        | crate::agent_service::EffectiveStatus::Busy
+                )
+            )
+        }) && deferred_dispatch::current_dispatch_disposition(&p.read.task).is_some_and(|wait| {
+            matches!(
+                wait.capability.as_str(),
+                "machine_capacity" | "project_capacity"
+            )
+        }) {
+            let retired: Result<()> = async {
+                deferred_dispatch::clear_capacity_wait(&self.db, &p.read.task).await?;
+                self.reread(p, project).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = retired {
+                tracing::warn!(task_id = %p.read.task.id, %error, "obsolete capacity wait could not be retired");
+                return true;
+            }
+        }
         let probe = next_step::next_step(&Snapshot {
             state: &p.read.task.status,
             condition: &p.read.condition,

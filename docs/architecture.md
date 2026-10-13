@@ -4019,6 +4019,10 @@ a machine capped at one run (`max_concurrent_runs: 1`, a supported setting)
 does not show its only running Task as a capacity waiter, and a wait recorded
 earlier is retired at that same observation. The run's follow-up (retry, review
 entry check, reviewer) asks for a slot only after that execution has ended.
+An unavailable Agent asks for no slot. Reconciliation retires an earlier
+machine/Project capacity wait before parking on that Agent, even when its
+initial dispatch is skipped. Startup therefore cannot leave a capacity wait
+behind when recovery cancelled the last holder and the Agent is paused.
 The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
 counts as parked until dispatch observes a different outcome; a plain edit does
 not un-park it, and its metadata change moves the Project list revision used by
@@ -5904,6 +5908,12 @@ replace validation of that install's retained owner evidence.
 
 The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only. A role-launching offer (`start`, role `retry`, `release`) is made for one role, resolved in one place (`workflow::action_role`): the role of the Task's state, else the role of the state a claim would enter (the first outgoing Active state, else the first Gate). The Agent the offer needs, the role stored with the queued action, its replay and the claim all use that role, so `start` on a `todo` Task runs its coder, waits for capacity when the coder is busy, and is not offered while that Agent is paused or offline.
 
+The stop fence uses the same effective assignment as execution admission:
+a child's own coder, else its parent's coder; the step-check lead is the
+root's assignment. Hold retains the offered Task-version check and the exact
+assignment/state-entry fences; an inherited assignment does not manufacture
+a version conflict after the execution has already been stopped.
+
 Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
 
 Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. `release` is the owner's decision on the run the hold stopped: when no Agent can take the Task at that moment (the Agent or the Project is paused) the release clears the hold and marks that stopped run resumable (`resume_policy = auto`), so the dispatcher starts the role again as soon as the Agent is available instead of treating the stopped run as one that still needs a decision. Only that run is marked: the Task's latest non-interactive run, and only when the user stopped it (`cancelled` with `stop_reason = user_cancelled`). A run that failed or was stopped for any other reason (executor failure, timeout, stall, lost machine) keeps `resume_policy = manual` and its own recovery, and the mark is undone when the release loses its version race. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
@@ -6576,7 +6586,16 @@ and without spending merge-fix budget. Crash recovery recognizes the same marker
 and completes an interrupted refresh. A conflicting rebase cannot dispatch work
 on the non-executing root, so Forge leaves the root visibly blocked with a manual
 workspace-repair action that returns the repaired branch through aggregate
-review before retrying integration. A failed or
+review before retrying integration. That action explicitly hands the attempt's
+repair statement back to the workflow, retaining its lineage. The owner can
+also `send_back` (`root_review_reopen`) from either the merge gate or a root
+already parked on `integration/repair` in review: the root takes its reject
+transition and is held in implementation so a corrective subtask can be
+added. Release runs the child and then fresh aggregate review. No root coder
+is launched, no new park kind is used, and this owner decision spends no
+automatic re-plan budget. Execution admission follows the same Active-state
+rule as scheduling: `merge_failed` permits corrective children even though
+it belongs to the review phase; review-phase Gates do not. A failed or
 blocked child stops the sequence at that child so the Project Agent can inspect
 evidence, reassign it, or otherwise coordinate recovery.
 

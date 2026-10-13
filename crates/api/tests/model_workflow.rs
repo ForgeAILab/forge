@@ -3123,6 +3123,15 @@ impl World {
                     .filter(|offer| {
                         offer["reason"] != "root_review_reopen" || !reopened.contains(&index)
                     })
+                    // Corrective work in this harness is supplied through
+                    // subtasks. Prefer that offered route to claiming that a
+                    // manual edit of the root's checkout has been completed.
+                    .filter(|offer| {
+                        offer["reason"] != "manual_merge_repair"
+                            || !offers
+                                .iter()
+                                .any(|other| other["reason"] == "root_review_reopen")
+                    })
                     .cloned()
                     .collect();
                 if !forward.is_empty() {
@@ -3462,7 +3471,7 @@ async fn run_all(mut cases: Vec<(String, Vec<Step>)>, avoid: bool) {
 }
 
 /// Seeds every run covers, so a regression in one of them is a stable failure.
-const FIXED_SEEDS: [u64; 5] = [1, 2, 3, 5, 8];
+const FIXED_SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 610875980, 207044633, 749274245];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_sequences_keep_every_task_live() {
