@@ -5900,9 +5900,10 @@ replace validation of that install's retained owner evidence.
 
 ### Task condition actions
 
-**Review without an Agent delivery.** This applies only to a review gate whose
-reviewer role is assigned to an Agent; human reviewers, owner-approval gates and
-check-only gates behave as before. A Task (not a coordination root) whose branch
+**Review without an Agent delivery.** This applies to a review gate whose
+reviewer role is assigned to an Agent or that has checks configured (without a
+candidate the reviewer is refused dispatch and the checks are skipped); human
+reviewers and owner-approval gates without checks behave as before. A Task (not a coordination root) whose branch
 has commits of its own that the target does not have (merges of the target do
 not count) is a human submission and runs the ordinary configured review checks
 and reviewer. Its completed delivery-evidence row records the exact base/head

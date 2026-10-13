@@ -45,9 +45,10 @@ pub(super) async fn prepare_review_entry(
     {
         return Ok(None);
     }
-    // Only an Agent reviewer is refused dispatch for want of a candidate.
-    // A human reviewer, an owner-approval gate and a check-only gate keep
-    // the decisions and checks they always had.
+    // An Agent reviewer is refused dispatch for want of a candidate and
+    // configured checks are skipped without one. A human reviewer and an
+    // owner-approval gate wait for a person and keep the decisions they
+    // always had.
     let agent_reviewer = match effective_role(state) {
         Some(role) => get_role_assignment(ctx, role)
             .await?
@@ -57,7 +58,9 @@ pub(super) async fn prepare_review_entry(
             }),
         None => false,
     };
-    if !agent_reviewer || task.review_passed_at.is_some() {
+    if !(agent_reviewer || !review_ci_steps(&ctx.state_config)?.is_empty())
+        || task.review_passed_at.is_some()
+    {
         return Ok(None);
     }
     let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)

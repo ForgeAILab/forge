@@ -1156,8 +1156,9 @@ const ALLOWED: &[&str] = &[
     // `todo`. A completion flag on a root that still has a subtask left is
     // no longer attempted (and refused) as an aggregate-review advance.
     "RootKickoff",
-    // An Agent reviewer with no delivered work to review: instead of a
-    // refused dispatch on a `clear` Task, the review parks for the owner.
+    // An Agent reviewer or configured checks with no delivered work to
+    // review: instead of a refused dispatch or skipped checks on a `clear`
+    // Task, the review parks for the owner.
     "MissingReviewCandidate",
 ];
 

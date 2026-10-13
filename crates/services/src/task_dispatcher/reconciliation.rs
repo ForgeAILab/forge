@@ -570,7 +570,7 @@ impl TaskDispatcher {
                     .reasons()
                     .any(|reason| matches!(reason, db::ParkReason::DispatchRefusal { .. })))
             && self
-                .reconcile_missing_review_candidate(&p.workflow, &p.read.task)
+                .reconcile_missing_review_candidate(project, &p.workflow, &p.read.task)
                 .await?
             && !self.reread(p, project).await?
         {
