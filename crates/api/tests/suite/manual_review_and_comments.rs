@@ -556,6 +556,239 @@ async fn approve_review_cascades_via_merge() {
     );
 }
 
+/// The owner's Retry of a review entry, end to end through REST, when the
+/// server's login shell gives no environment and the review-CI
+/// infrastructure budget runs out on that entry. The Retry re-enters
+/// `review`; its entry cannot identify its check, asks its bounded number of
+/// times and states the interruption; the budget is spent, so the Task
+/// parks with the typed exhausted cause and offers Retry (nothing re-enters
+/// by itself any more). Once the shell answers, that Retry runs the review:
+/// one check run, and a Review with its CI result that waits for the person.
+/// The Task has no Agent (a person reviews it): the offered Retry Entry
+/// Checks used to be refused with "accepted role action lost its Agent".
+#[tokio::test]
+async fn the_owners_retry_of_a_review_entry_parks_on_the_exhausted_ci_budget_and_the_offered_retry_runs_the_review(
+) {
+    let temp = common::TestDir::new("forge-review-entry-retry");
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("create repo dir");
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
+    run_git(&repo_path, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_path, &["config", "user.name", "Test"]);
+    std::fs::write(repo_path.join("file.txt"), "base\n").expect("write file");
+    run_git(&repo_path, &["add", "."]);
+    run_git(&repo_path, &["commit", "-m", "initial"]);
+    let task_id = new_uuid_v4();
+    let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
+    std::fs::create_dir_all(worktree_path.parent().unwrap()).expect("create worktree parent");
+    run_git(
+        &repo_path,
+        &[
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "-b",
+            &::workspace::task_branch_name(&task_id),
+        ],
+    );
+    std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("write feature");
+    run_git(&worktree_path, &["add", "."]);
+    run_git(&worktree_path, &["commit", "-m", "feature"]);
+
+    let workspace_root = common::TestDir::new("forge-review-entry-retry-workspaces");
+    let harness = test_app(workspace_root.path()).await;
+    let (task_id, _) = seed_awaiting_human_review_with_workspace(
+        &harness.state.db,
+        &task_id,
+        &repo_path,
+        &worktree_path,
+    )
+    .await;
+    set_review_ci_steps(&harness.state.db, &task_id, &["true"]).await;
+    let database = harness.state.db.clone();
+    let actions = format!("/api/v1/tasks/{task_id}/actions");
+    services::check_runner::policy::silence_login_shell_for_test(&database, true)
+        .await
+        .unwrap();
+    let retry = |app: axum::Router, actions: String| async move {
+        let version = common::task_action_version(&app, &actions).await;
+        let _: TaskResponse = json_request(
+            &app,
+            Method::POST,
+            &actions,
+            json!({"version": version, "action": {"verb": "retry"}}),
+            StatusCode::OK,
+        )
+        .await;
+    };
+    let reviews_before = ReviewRepo::list_by_task(&*database, &task_id)
+        .await
+        .unwrap()
+        .len();
+
+    retry(harness.app.clone(), actions.clone()).await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    let interrupted = common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(interrupted.status, "review");
+    let stated = |database: std::sync::Arc<db::SqliteDb>, task_id: String| async move {
+        let task = TaskRepo::get_by_id(&*database, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let annotation: serde_json::Value = serde_json::from_str(
+            task.error_annotation
+                .as_deref()
+                .expect("the interruption is stated"),
+        )
+        .unwrap();
+        (task, annotation)
+    };
+    // The owner's Retry opened a new episode: its first interruption is
+    // stated with a re-entry the Task makes by itself.
+    let (task, annotation) = stated(database.clone(), task_id.clone()).await;
+    assert_eq!(
+        annotation["blocking_reason"], "review_ci_infrastructure",
+        "{annotation}"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(task.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["deferred_dispatch"]["target_state"], "review");
+    let limit = i64::from(db::budget::Kind::ReviewCiInfrastructure.default_limit());
+    assert_eq!(
+        db::budget::spent(
+            database.pool(),
+            &task_id,
+            db::budget::Kind::ReviewCiInfrastructure.key()
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    // The episode's later re-entries failed the same way, up to the last
+    // one the budget allows; that one is due now and the dispatcher makes
+    // it.
+    sqlx::query(
+        "UPDATE task_budget SET spent=? WHERE task_id=? AND kind='review_ci_infrastructure'",
+    )
+    .bind(limit - 1)
+    .bind(&task_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.not_before','2020-01-01T00:00:00+00:00') WHERE id=?")
+        .bind(&task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let dispatcher = services::TaskDispatcher::new(
+        harness.state.db.clone(),
+        harness.state.event_bus.clone(),
+        harness.state.task_service.clone(),
+    );
+    dispatcher.check_once().await.unwrap();
+    let parked = common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(parked.status, "review");
+    let (task, annotation) = stated(database.clone(), task_id.clone()).await;
+    assert_eq!(
+        annotation["blocking_reason"], "review_ci_infrastructure_exhausted",
+        "{annotation}"
+    );
+    assert!(
+        annotation["message"]
+            .as_str()
+            .unwrap()
+            .contains("login shell did not report"),
+        "{annotation}"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(task.metadata_json.as_deref().unwrap_or("{}")).unwrap();
+    assert!(
+        metadata.get("deferred_dispatch").is_none(),
+        "an exhausted budget does not re-enter by itself: {metadata}"
+    );
+    // No command ran: no Review was added, no check exists.
+    let reviews = ReviewRepo::list_by_task(&*database, &task_id)
+        .await
+        .unwrap();
+    assert!(
+        reviews.len() <= reviews_before
+            && reviews.iter().all(|review| !matches!(
+                review.status,
+                db::ReviewStatus::Running | db::ReviewStatus::Passed | db::ReviewStatus::Failed
+            )),
+        "{:?}",
+        reviews
+            .iter()
+            .map(|review| (review.attempt_number, review.status.clone()))
+            .collect::<Vec<_>>()
+    );
+    let checks: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM check_run)+(SELECT COUNT(*) FROM check_consumer)",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(checks, 0);
+    // The offer the owner sees through REST.
+    let offers: api_types::TaskActionsResponse = common::parse_response(
+        common::raw_empty_request(&harness.app, Method::GET, &actions).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        offers
+            .available_actions
+            .iter()
+            .any(|offer| offer.action.verb() == "retry"),
+        "Retry is offered on the exhausted park: {:?}",
+        offers
+            .available_actions
+            .iter()
+            .map(|offer| (offer.action.verb().to_owned(), offer.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // The shell answers again; the offered Retry runs the review.
+    services::check_runner::policy::silence_login_shell_for_test(&database, false)
+        .await
+        .unwrap();
+    retry(harness.app.clone(), actions.clone()).await;
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    let settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    let review = ReviewRepo::list_by_task(&*database, &task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .unwrap();
+    // The entry ran its CI and the Review waits for the person, as the
+    // Task's review did before the Retry.
+    assert_eq!(review.status, db::ReviewStatus::AwaitingHuman);
+    let details: serde_json::Value = serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0, "{details}");
+    assert_eq!(settled.status, "review");
+    let task = TaskRepo::get_by_id(&*database, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.error_annotation, None, "the park is lifted");
+    let runs: Vec<String> = sqlx::query_scalar("SELECT state FROM check_run")
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs, vec!["succeeded".to_owned()], "one check, run once");
+}
+
 #[tokio::test]
 async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
     let temp = common::TestDir::new("forge-rerun-review-pass");
