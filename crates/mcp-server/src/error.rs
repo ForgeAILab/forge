@@ -439,8 +439,7 @@ impl From<ServiceError> for McpToolError {
                 Self::new(-32029, "dependency gate").with_data(json!({ "code": "setup_required" }))
             }
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
-            ServiceError::InvalidOperation { message }
-            | ServiceError::SubtaskDispatchWait { message } => Self::new(-32602, message),
+            ServiceError::InvalidOperation { message } => Self::new(-32602, message),
             ServiceError::AuthorizationDenied { message } => {
                 Self::new(-32003, message).with_data(json!({ "code": "authorization.invalid" }))
             }

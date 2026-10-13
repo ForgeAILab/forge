@@ -317,6 +317,14 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         || condition.is_some_and(|kind| {
             kind.is_budget_exhausted_annotation() || kind.is_retry_exhausted_metadata()
         });
+    // A subtask resting in its step check with that gate's budget spent is
+    // parked by the gate's own entry (`check_retry_budget` writes
+    // `retry_exhausted` there): its recovery is a new budget window and a
+    // new entry, not another run under the spent one. Every other gate keeps
+    // the recovery its condition names.
+    let step_gate_exhausted = gate_exhausted
+        && task.parent_task_id.is_some()
+        && task.status == crate::workflow::default_states::LEAD_CHECK;
     let blocked_execution_id = snapshot
         .annotation()
         .and_then(|annotation| annotation.blocked_execution_id);
@@ -811,7 +819,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             // A coordination root parked on its spent re-plan budget has no
             // run to retry: the fresh budget is the whole recovery, and the
             // root's own next step (re-plan, or its aggregate review) follows.
-            if !gate_exhausted
+            if !step_gate_exhausted
                 && condition == Some(FailureKind::RetryExhausted)
                 && role.is_some()
                 && (snapshot.has_agent && !snapshot.project_paused)

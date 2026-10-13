@@ -1093,7 +1093,11 @@ async fn retry_of_a_spent_lead_check_waits_for_the_roots_replan() {
     let refused = crate::task_hierarchy::ensure_subtask_dispatch_order(&steps.db, &waiting)
         .await
         .expect_err("the root is still planning");
-    assert!(matches!(refused, ServiceError::SubtaskDispatchWait { .. }));
+    assert!(crate::task_hierarchy::is_subtask_wait_refusal(&refused));
+    assert!(
+        matches!(refused, ServiceError::InvalidOperation { .. }),
+        "callers are refused as before"
+    );
     for refusal in [refused, ServiceError::Db(db::DbError::VersionConflict)] {
         assert!(steps
             .dispatcher
@@ -1107,6 +1111,12 @@ async fn retry_of_a_spent_lead_check_waits_for_the_roots_replan() {
             "the admission race retains Retry"
         );
     }
+    assert!(
+        crate::deferred_dispatch::queued_recovery(&reload(&steps.db, &first.id).await)
+            .unwrap()
+            .awaits_hierarchy,
+        "the refusal is recorded on the accepted action"
+    );
     assert_eq!(
         executions(&steps.db, &first.id).await.len(),
         5,
@@ -2241,6 +2251,9 @@ async fn the_owner_can_take_a_step_out_of_the_gate_by_hand() {
             .transition(&first.id, target.to_owned(), options)
             .await;
         assert!(moved.is_ok(), "{target}: {:?}", moved.err());
+        // The owner's own move out of the gate, sending it back included,
+        // is not a return the lead made: it charges nothing.
+        assert_eq!(gate_spent(&steps.db, &first.id).await, 0, "{target}");
         passes(&steps, 3).await;
         steps.release.add_permits(8);
         passes(&steps, 3).await;

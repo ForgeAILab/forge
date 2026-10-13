@@ -3246,6 +3246,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   validates the existing rework. If its root is still re-planning, the
   accepted Retry waits for the root and resumes afterward instead of losing
   its intent and restoring the spent-budget park with `recovery_required`.
+  The same holds for every accepted action on a subtask (the owner's Retry,
+  a lead's or the Project Agent's recovery, a start by hand) while its root
+  is planning, held, blocked or not started, or an earlier sibling is
+  unfinished: the subtask shows the parent wait and the action runs when the
+  hierarchy admits it. No error code or status changes.
 - Prevent normal WAL contention from timing out an accepted Task mutation, and restart an unlaunched lead check after its Agent resumes.
 - A Task write whose queued step was claimed and then abandoned no longer waits for ever: the waiter takes the step over when its lease lapses, and answers `task_busy` after 90 seconds under a live owner.
 - A run whose Agent is paused between admission and launch no longer spends an execution retry or shows a retry delay: the Task parks on the paused Agent at once and runs when the Agent is resumed.

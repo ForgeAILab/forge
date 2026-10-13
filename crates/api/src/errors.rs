@@ -271,8 +271,7 @@ impl From<ServiceError> for ApiError {
                 details: Some(json!({ "details": error.to_string() })),
             },
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
-            ServiceError::InvalidOperation { message }
-            | ServiceError::SubtaskDispatchWait { message } => Self::invalid_operation(message),
+            ServiceError::InvalidOperation { message } => Self::invalid_operation(message),
             ServiceError::ExecutionAlreadyRunning {
                 scope,
                 execution_id,

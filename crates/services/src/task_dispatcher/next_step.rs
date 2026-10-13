@@ -160,8 +160,9 @@ pub struct Facts {
     pub retry_pending: bool,
     pub review_ci_retry: bool,
     pub queued_recovery: bool,
-    /// The accepted intent launches a role and must wait for child admission.
-    pub queued_role_launch: bool,
+    /// The accepted action needs the hierarchy to admit this subtask: it
+    /// launches a role, or the hierarchy already refused its replay.
+    pub queued_needs_admission: bool,
     pub review_refresh: Option<String>,
     pub terminal_execution: Option<String>,
     pub failed_review: bool,
@@ -410,26 +411,16 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         if f.dependency_wait {
             return condition_park(s.condition);
         }
-        // Behind a root whose lead is planning, the accepted action waits
-        // like the subtask itself: replaying it would only be refused by the
-        // order check and park the subtask again. The root's return to its
+        // An accepted action that needs the hierarchy's admission waits like
+        // the subtask itself while the hierarchy does not admit it, whatever
+        // the cause (the root plans, is held, is blocked or has not started;
+        // an earlier sibling is unfinished) and whoever accepted it (the
+        // owner's Retry, the lead's `lead.recover`, the Project Agent's
+        // recovery, a start by hand). Replaying it would only be refused by
+        // the order check. The intent is kept; the root's return to its
         // implementation state marks its subtasks, and the action runs then.
-        // (The lead's own `lead.recover` is such an action.)
-        if let Some((parent_id, cause)) = f
-            .parent_wait
-            .as_ref()
-            .filter(|(_, cause)| cause == "planning")
-        {
-            return park(
-                Reason::ParentWait {
-                    parent_id: parent_id.clone(),
-                    cause: cause.clone(),
-                },
-                Owner::Worker,
-                Action::WaitForOwner,
-            );
-        }
-        if f.queued_role_launch && !f.child_ready {
+        // An action that needs no admission is replayed as usual.
+        if f.queued_needs_admission && !f.child_ready {
             return match &f.parent_wait {
                 Some((parent_id, cause)) => parent_park(parent_id, cause),
                 None => park(
@@ -1285,10 +1276,15 @@ mod tests {
             ("planning", Owner::Worker, Action::WaitForOwner),
             ("held", Owner::User, Action::ReleaseHold),
             ("blocked", Owner::ProjectAgent, Action::SettleChildren),
+            (
+                "not_coordinating",
+                Owner::ProjectAgent,
+                Action::SettleChildren,
+            ),
         ] {
             let mut facts = Facts {
                 queued_recovery: true,
-                queued_role_launch: true,
+                queued_needs_admission: true,
                 parent_wait: Some(("root".to_owned(), cause.to_owned())),
                 ..Default::default()
             };
@@ -1311,12 +1307,22 @@ mod tests {
                     recovery
                 )
             );
-            facts.queued_role_launch = false;
+            facts.queued_needs_admission = false;
             assert_eq!(resolve(&facts), Next::Step(Step::QueuedRecovery));
-            facts.queued_role_launch = true;
+            facts.queued_needs_admission = true;
             facts.child_ready = true;
             facts.parent_wait = None;
             assert_eq!(resolve(&facts), Next::Step(Step::QueuedRecovery));
+            // The root implements and an earlier sibling is unfinished.
+            facts.child_ready = false;
+            assert_eq!(
+                resolve(&facts),
+                park(
+                    Reason::Children,
+                    Owner::ProjectAgent,
+                    Action::SettleChildren
+                )
+            );
         }
     }
 

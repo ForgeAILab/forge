@@ -437,7 +437,6 @@ pub fn outcome_for_service_error_with_correction(
             None,
         ),
         ServiceError::InvalidOperation { .. }
-        | ServiceError::SubtaskDispatchWait { .. }
         | ServiceError::TerminalInvalidInput { .. }
         | ServiceError::TaskActionUnavailable { .. }
         | ServiceError::Conflict(_)

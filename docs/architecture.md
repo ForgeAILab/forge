@@ -6310,17 +6310,36 @@ auto-attached after-enter check is not added to a gate that already checks on
 entry). A subtask never enters a merge state (the inherited workflow has
 none), so merge-queue returns of the root never spend this budget.
 
-The gate's spent ledger selects gate-budget recovery even when its park is
-encoded as `retry_exhausted`; execution-budget recovery does not reset that
-ledger. Retry resets the budget and creates a new gate entry, then retains
-the lead's accepted role continuation while the root re-plans. The child
-shows `parent { cause: planning }` until the root returns to implementation.
-Queued role actions obey the same parent and sibling admission rules as
-ordinary dispatch. Because the root and child have separate writers,
-admission may lose after an eligibility read: `SubtaskDispatchWait` and a
-role launch's database authority conflict retain the accepted intent rather
-than restoring its old park. The root's status change marks its children
-for scheduling, so the continuation runs when the root releases them.
+A subtask resting in `lead_check` with the gate's ledger spent is offered
+gate-budget recovery even though the gate's park is encoded as
+`retry_exhausted` (execution-budget recovery does not reset that ledger; no
+other gate's offer changes). Retry resets the budget and creates a new gate
+entry; the role launch that continues it is an accepted action like any
+other.
+
+One rule covers every accepted action on a subtask whose hierarchy does not
+admit it, whatever the cause (the root plans, is held, is blocked or has
+not started; an earlier sibling is unfinished) and whoever accepted it (the
+owner's Retry, the lead's `lead.recover`, the Project Agent's recovery, a
+start by hand). An action that needs the hierarchy's admission is not
+replayed while the subtask is not next in its root's order: `next_step`
+parks the subtask on its parent (`parent { cause }`, or the children park
+behind an earlier sibling) and the intent stays queued. A role launch
+always needs admission. Any other action needs it once the hierarchy has
+refused its replay (a move to a working state): the refusal is recorded on
+the intent (`queued_recovery.awaits_hierarchy`) instead of restoring the old
+park, so the next pass shows the parent wait. An action that needs no
+admission (a retry of entry checks, a decision that ends the subtask) is
+replayed whatever the root does. Because the root and child have separate
+writers, admission may lose after an eligibility read: the hierarchy's
+refusal, and a role launch's database authority conflict, keep the accepted
+intent. The hierarchy's refusals remain `invalid operation` to every
+caller. The root's status change marks its children for scheduling, so the
+action runs when the root releases them.
+
+An owner's manual move out of `lead_check`, a send-back to implementation
+included, charges no `gate:lead_check` return (`db::budget::transition`:
+an owner's move spends nothing).
 
 Removing the root's lead stops a step check that is still running
 (`TaskService::wake_step_checks_of`) and the subtask passes the gate in the

@@ -433,11 +433,6 @@ pub enum ServiceError {
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },
 
-    /// A child's ordered admission waits for its root or an earlier sibling.
-    /// An accepted action keeps its intent until the hierarchy releases it.
-    #[error("invalid operation: {message}")]
-    SubtaskDispatchWait { message: String },
-
     /// A slot that admits one execution at a time is occupied right now.
     ///
     /// This is inherently transient — the named execution will reach a

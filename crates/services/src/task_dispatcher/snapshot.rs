@@ -327,8 +327,8 @@ impl TaskDispatcher {
         f.queued_recovery = metadata
             .get(deferred_dispatch::QUEUED_RECOVERY_KEY)
             .is_some_and(|intent| !intent.is_null());
-        f.queued_role_launch =
-            deferred_dispatch::queued_recovery(t).is_some_and(|intent| intent.launches_role());
+        f.queued_needs_admission = deferred_dispatch::queued_recovery(t)
+            .is_some_and(|intent| intent.needs_subtask_admission());
         let mut deadline = None;
         for execution in r
             .executions
