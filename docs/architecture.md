@@ -6114,8 +6114,9 @@ while it never started), and a caller that is only the lead is offered nothing
 else. "Started" is any run on the subtask other than a step check, whatever
 the Project's workflow calls its implementation role. Assign is
 `reassign_role`, the command REST's role assignment uses, after the same
-Project usability check (owner and pricing admission included); the lead may
-name any Agent usable in the Project except itself.
+Project usability check: the lead's assignment passes exactly the admission
+an owner's assignment passes, and the lead may name any Agent usable in the
+Project except itself.
 
 Every operation carries the envelope's `dedupe_key`. Version checks are the
 subtask's `version` (update, cancel, recover) and the root's version and the
